@@ -57,6 +57,46 @@ def test_route_business_document_query():
     assert result["need_retrieval"] is True
 
 
+def test_local_bundle_uses_multilingual_checkpoint_for_both_routes(monkeypatch, tmp_path):
+    multilingual = tmp_path / "multilingual"
+    multilingual.mkdir()
+    (multilingual / "rl_agent_config.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(laya_router.settings, "laya_model_path", str(tmp_path))
+
+    specs = laya_router._model_specs()
+
+    assert specs["english"] == (str(tmp_path), "multilingual")
+    assert specs["multilingual"] == (str(tmp_path), "multilingual")
+
+
+def test_local_multilingual_bundle_predicts_with_one_cached_model(monkeypatch, tmp_path):
+    multilingual = tmp_path / "multilingual"
+    multilingual.mkdir()
+    (multilingual / "rl_agent_config.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(laya_router.settings, "laya_model_path", str(tmp_path))
+
+    calls = []
+
+    class FakeRouter:
+        def predict(self, state, questions, **kwargs):
+            calls.append(kwargs.get("model"))
+            return {
+                "answers": {
+                    "intent_type": {"choice": "factual_lookup", "confidence": 0.9},
+                    "domain_topic": {"choice": "general"},
+                },
+                "routing": {"model": kwargs.get("model", "unexpected")},
+            }
+
+    monkeypatch.setattr(laya_router, "_ROUTER", FakeRouter())
+    monkeypatch.setattr(laya_router, "_ROUTER_INIT_ERROR", None)
+    result = route_query("What database does the project currently use?")
+
+    assert result["model"] == "multilingual"
+    assert calls == ["multilingual"]
+
+
 def test_route_does_not_skip_grounding_for_factual_query(monkeypatch):
     class FakeRouter:
         def predict(self, state, questions):
@@ -98,6 +138,23 @@ def test_failed_prediction_disables_repeated_model_loads(monkeypatch):
     assert first["model"] == "fallback"
     assert second["model"] == "fallback"
     assert calls == 1
+
+
+def test_invalid_local_model_path_is_cached_as_safe_fallback(monkeypatch, tmp_path):
+    monkeypatch.setattr(laya_router.settings, "laya_model_path", str(tmp_path / "missing"))
+    laya_router.reset_laya_router_for_tests()
+
+    first = route_query("Mã bí mật kiểm thử của Continuum AI là gì?")
+    first_error = laya_router._ROUTER_INIT_ERROR
+    second = route_query("Xin chào")
+    second_error = laya_router._ROUTER_INIT_ERROR
+
+    assert first["model"] == "fallback"
+    assert first["need_retrieval"] is True
+    assert second["model"] == "fallback"
+    assert second["need_retrieval"] is True
+    assert first_error
+    assert first_error == second_error
 
 
 @pytest.mark.asyncio
