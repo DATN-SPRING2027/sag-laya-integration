@@ -1,0 +1,697 @@
+"""模型配置端点：GET 脱敏、PUT 持久化+生效、密钥保留、非法值 422、连接测试（离线）。
+
+全程离线且**不留全局副作用**：`finally` 删除 settings 表行 + 还原被改的 `settings` 单例字段，
+避免跨测试泄漏（端点会就地覆盖进程级单例）。连接测试只验证「未配置」分支（无网络）。
+"""
+
+import logging
+
+import httpx
+import pytest
+
+from sag_api.core.config import Settings, settings
+
+_RESTORE = (
+    "llm_provider",
+    "llm_base_url",
+    "llm_model",
+    "llm_temperature",
+    "llm_timeout_ms",
+    "llm_max_retries",
+    "search_strategy",
+    "document_chunk_max_tokens",
+    "document_chunk_mode",
+    "search_top_k",
+    "sag_language",
+    "llm_api_key",
+    "embedding_model",
+    "embedding_base_url",
+    "embedding_api_key",
+    "embedding_dimensions",
+    "document_parser",
+    "mineru_provider",
+    "mineru_base_url",
+    "mineru_api_key",
+    "mineru_version",
+    "mineru_official_model",
+    "timezone",
+    "document_extract_concurrency",
+)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("http://localhost:3000", ["http://localhost:3000"]),
+        (
+            "http://localhost:3000,https://sag.example.com",
+            ["http://localhost:3000", "https://sag.example.com"],
+        ),
+        ('["http://localhost:3000"]', ["http://localhost:3000"]),
+    ],
+)
+def test_cors_origins_env_formats(monkeypatch, raw, expected):
+    monkeypatch.setenv("SAG_CORS_ORIGINS", raw)
+    assert Settings(_env_file=None).cors_origins == expected
+
+
+def test_legacy_atomic_env_strategy_maps_to_precise(monkeypatch):
+    monkeypatch.setenv("SAG_SEARCH_STRATEGY", "atomic")
+    assert Settings(_env_file=None).search_strategy == "multi"
+
+
+def test_chinese_query_segmentation_is_enabled_by_default(monkeypatch):
+    monkeypatch.delenv("SAG_SEARCH_CHINESE_SEGMENTATION_ENABLED", raising=False)
+
+    assert Settings(_env_file=None).search_chinese_segmentation_enabled is True
+
+
+def test_chinese_query_segmentation_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("SAG_SEARCH_CHINESE_SEGMENTATION_ENABLED", "false")
+
+    assert Settings(_env_file=None).search_chinese_segmentation_enabled is False
+
+
+def test_timezone_defaults_to_beijing_and_rejects_invalid(monkeypatch):
+    monkeypatch.delenv("SAG_TIMEZONE", raising=False)
+    assert Settings(_env_file=None).timezone == "Asia/Shanghai"
+    monkeypatch.setenv("SAG_TIMEZONE", "UTC")
+    assert Settings(_env_file=None).timezone == "UTC"
+    monkeypatch.setenv("SAG_TIMEZONE", "Mars/Olympus")
+    with pytest.raises(ValueError):
+        Settings(_env_file=None)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("HTTP://SAG.EXAMPLE.COM:18080/", "http://sag.example.com:18080"),
+        ("https://sag.example.com/local/sag/", "https://sag.example.com/local/sag"),
+        ("http://[::1]:18080/", "http://[::1]:18080"),
+    ],
+)
+def test_dsh_public_url_is_canonical_http_origin_or_proxy_base(monkeypatch, raw, expected):
+    monkeypatch.delenv("SAG_DSH_PUBLIC_URL", raising=False)
+
+    assert Settings(_env_file=None, dsh_public_url=raw).dsh_public_url == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "sag.example.com:8000",
+        "ftp://sag.example.com",
+        "http://user:secret@sag.example.com",
+        "http://sag.example.com?next=evil",
+        "http://sag.example.com/#fragment",
+        "http://sag.example.com/prefix//nested",
+    ],
+)
+def test_dsh_public_url_rejects_noncanonical_or_credential_bearing_values(monkeypatch, raw):
+    monkeypatch.delenv("SAG_DSH_PUBLIC_URL", raising=False)
+
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, dsh_public_url=raw)
+
+
+def test_provider_base_urls_default_to_302_china_endpoint(monkeypatch):
+    for name in ("SAG_LLM_BASE_URL", "SAG_EMBEDDING_BASE_URL", "SAG_MINERU_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    configured = Settings(_env_file=None)
+    assert configured.llm_provider == "openai"
+    assert configured.llm_base_url == "https://api.302ai.cn/v1"
+    assert configured.embedding_base_url == "https://api.302ai.cn/v1"
+    assert configured.mineru_base_url == "https://api.302ai.cn"
+
+
+def test_mineru_provider_defaults_to_302(monkeypatch):
+    monkeypatch.delenv("SAG_MINERU_PROVIDER", raising=False)
+    monkeypatch.delenv("SAG_MINERU_OFFICIAL_MODEL", raising=False)
+
+    configured = Settings(_env_file=None)
+
+    assert configured.mineru_provider == "302"
+    assert configured.mineru_official_model == "vlm"
+
+
+def test_legacy_mineru_net_override_selects_official_provider():
+    from sag_api.services.settings_service import _normalize_overrides
+
+    official = _normalize_overrides(
+        {"mineru_base_url": "https://mineru.net/api/v4/file-urls/batch"}
+    )
+    proxied = _normalize_overrides({"mineru_base_url": "https://api.302ai.cn"})
+
+    assert official["mineru_provider"] == "official"
+    assert proxied["mineru_provider"] == "302"
+
+
+@pytest.mark.parametrize(
+    "stale_base_url",
+    ["https://api.302ai.cn", "https://api.302ai.cn/"],
+)
+def test_official_provider_repairs_stale_302_mineru_base_url(stale_base_url):
+    from sag_api.services.settings_service import _normalize_overrides
+
+    normalized = _normalize_overrides(
+        {
+            "mineru_provider": "official",
+            "mineru_base_url": stale_base_url,
+        }
+    )
+
+    assert normalized["mineru_provider"] == "official"
+    assert normalized["mineru_base_url"] == "https://mineru.net/api/v4"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_provider", "expected_base_url"),
+    [
+        # 显式 302 + 官方 URL：provider 跟随 URL 主机切换为官方
+        (
+            {"mineru_provider": "302", "mineru_base_url": "https://mineru.net/api/v4"},
+            "official",
+            "https://mineru.net/api/v4",
+        ),
+        (
+            {
+                "mineru_provider": "302",
+                "mineru_base_url": "https://mineru.net/api/v4/file-urls/batch",
+            },
+            "official",
+            "https://mineru.net/api/v4/file-urls/batch",
+        ),
+        # 显式 302 + 302 URL：保持 302 不动
+        (
+            {"mineru_provider": "302", "mineru_base_url": "https://api.302ai.cn"},
+            "302",
+            "https://api.302ai.cn",
+        ),
+        # 未设 provider 时按 URL 主机推断（既有行为）
+        (
+            {"mineru_base_url": "https://mineru.net/api/v4"},
+            "official",
+            "https://mineru.net/api/v4",
+        ),
+        # 官方 + 旧 302 地址（含尾斜杠）仍修复为官方默认地址（既有行为）
+        (
+            {"mineru_provider": "official", "mineru_base_url": "https://api.302ai.cn/"},
+            "official",
+            "https://mineru.net/api/v4",
+        ),
+    ],
+)
+def test_mineru_provider_follows_base_url_host(
+    raw, expected_provider, expected_base_url
+):
+    from sag_api.services.settings_service import _normalize_overrides
+
+    normalized = _normalize_overrides(raw)
+
+    assert normalized["mineru_provider"] == expected_provider
+    assert normalized["mineru_base_url"] == expected_base_url
+
+
+def test_default_model_output_limit_is_20000(monkeypatch):
+    monkeypatch.delenv("SAG_LLM_MAX_TOKENS", raising=False)
+    assert Settings(_env_file=None).llm_max_tokens == 20_000
+
+
+def test_database_model_config_overrides_environment_default():
+    from sag_api.services.settings_service import apply_overrides
+
+    configured = Settings(_env_file=None, llm_model="environment-model")
+    apply_overrides(configured, {"llm_model": "database-model"})
+
+    assert configured.llm_model == "database-model"
+
+
+def test_explicit_llm_lock_preserves_environment_values():
+    from sag_api.services.settings_service import apply_overrides
+
+    configured = Settings(
+        _env_file=None,
+        llm_model="environment-model",
+        lock_llm_config=True,
+    )
+    apply_overrides(configured, {"llm_model": "database-model"})
+
+    assert configured.llm_model == "environment-model"
+
+
+@pytest.mark.asyncio
+async def test_legacy_atomic_db_strategy_is_migrated():
+    from sqlalchemy import delete, select
+
+    from sag_api.core.db import SessionLocal, init_db
+    from sag_api.db.models import Setting
+    from sag_api.services.settings_service import apply_startup_overrides
+
+    await init_db()
+    previous = {
+        field: getattr(settings, field)
+        for field in (
+            "search_strategy",
+            "llm_base_url",
+            "embedding_base_url",
+            "mineru_base_url",
+        )
+    }
+    try:
+        async with SessionLocal() as session:
+            await session.execute(delete(Setting).where(Setting.scope == "global", Setting.key == "model_config"))
+            session.add(
+                Setting(
+                    scope="global",
+                    key="model_config",
+                    value={
+                        "search_strategy": "atomic",
+                        "llm_base_url": "https://api.302.ai/v1",
+                        "embedding_base_url": "https://api.302.ai/v1",
+                        "mineru_base_url": "https://api.302.ai",
+                    },
+                )
+            )
+            await session.commit()
+
+        await apply_startup_overrides(SessionLocal)
+        assert settings.search_strategy == "multi"
+        assert settings.llm_base_url == "https://api.302ai.cn/v1"
+        assert settings.embedding_base_url == "https://api.302ai.cn/v1"
+        assert settings.mineru_base_url == "https://api.302ai.cn"
+
+        async with SessionLocal() as session:
+            row = await session.scalar(select(Setting).where(Setting.scope == "global", Setting.key == "model_config"))
+            assert row is not None
+            assert row.value["search_strategy"] == "multi"
+            assert row.value["llm_base_url"] == "https://api.302ai.cn/v1"
+            assert row.value["embedding_base_url"] == "https://api.302ai.cn/v1"
+            assert row.value["mineru_base_url"] == "https://api.302ai.cn"
+    finally:
+        async with SessionLocal() as session:
+            await session.execute(delete(Setting).where(Setting.scope == "global", Setting.key == "model_config"))
+            await session.commit()
+        for field, value in previous.items():
+            setattr(settings, field, value)
+
+
+async def _register(c, email):
+    r = await c.post("/api/v1/auth/register", json={"email": email, "password": "password123"})
+    assert r.status_code == 201, r.text
+    assert r.json()["user"]["created_at"].endswith(("Z", "+00:00"))
+    return {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+
+@pytest.mark.asyncio
+async def test_model_config_crud_masking_and_test(monkeypatch: pytest.MonkeyPatch):
+    from sqlalchemy import delete, select
+
+    from sag_api.core.db import SessionLocal
+    from sag_api.db.models import Document, Setting, Source, User
+    from sag_api.enums import DocumentStatus
+    from sag_api.main import app
+
+    snapshot = {k: getattr(settings, k) for k in _RESTORE}
+    seeded_source_id: str | None = None
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+                A = await _register(c, "modelcfg@t.com")
+
+                preferences = (await c.get("/api/v1/system/preferences", headers=A)).json()
+                assert preferences["timezone"] == snapshot["timezone"]
+                changed = await c.put(
+                    "/api/v1/system/preferences",
+                    headers=A,
+                    json={"timezone": "UTC"},
+                )
+                assert changed.status_code == 200
+                assert changed.json()["timezone"] == "UTC"
+                assert settings.timezone == "UTC"
+                assert (await c.get("/api/v1/system/capabilities")).json()["timezone"] == "UTC"
+                invalid_timezone = await c.put(
+                    "/api/v1/system/preferences",
+                    headers=A,
+                    json={"timezone": "Mars/Olympus"},
+                )
+                assert invalid_timezone.status_code == 422
+
+                # GET：密钥脱敏为 *_set，离线下未配置
+                body = (await c.get("/api/v1/system/model-config", headers=A)).json()
+                assert "llm_api_key" not in body and body["llm_api_key_set"] is False
+                assert body["llm_provider"] == "openai"
+                assert "mineru_api_key" not in body and body["mineru_api_key_set"] is False
+                assert body["effective_document_parser"] == "markitdown"
+                assert body["mineru_provider"] == "302"
+                assert body["mineru_official_model"] == "vlm"
+                assert body["document_extract_concurrency"] == 30
+                assert body["document_chunk_max_tokens"] == 1_000
+                assert body["document_chunk_mode"] == "standard"
+                assert body["llm_timeout_ms"] == 60_000
+                assert body["llm_max_retries"] == 2
+                assert "search_top_k" in body and "sag_language" in body
+                assert body["sources"]["llm_model"] in {"default", "database", "environment_policy"}
+                assert body["locked_fields"] == []
+
+                providers = (await c.get("/api/v1/system/model-providers", headers=A)).json()
+                assert [provider["id"] for provider in providers] == [
+                    "openai",
+                    "anthropic",
+                    "gemini",
+                ]
+                assert providers[0]["default_model"] == body["llm_model"]
+                assert "litellm_prefix" not in providers[0]
+
+                # 连接测试（未配置）→ 立即 ok False，无网络
+                t = (await c.post("/api/v1/system/model-config/test", headers=A)).json()
+                assert t["ok"] is False and "message" in t
+
+                # 测试表单草稿：应使用未保存的 provider / key，但不写入全局配置。
+                from sag_api.generation.llm import LLMClient
+
+                observed: dict = {}
+
+                async def fake_complete(client, _messages):
+                    observed["provider"] = client._settings.llm_provider
+                    observed["model"] = client._settings.llm_model
+                    observed["key"] = client._settings.llm_api_key
+                    return "pong"
+
+                monkeypatch.setattr(LLMClient, "complete", fake_complete)
+                draft = await c.post(
+                    "/api/v1/system/model-config/test",
+                    headers=A,
+                    json={
+                        "llm_provider": "gemini",
+                        "llm_base_url": None,
+                        "llm_api_key": "draft-secret",
+                        "llm_model": "gemini-3.5-flash",
+                    },
+                )
+                assert draft.status_code == 200
+                assert draft.json() == {
+                    "ok": True,
+                    "message": "连接成功 · gemini / gemini-3.5-flash",
+                }
+                assert observed == {
+                    "provider": "gemini",
+                    "model": "gemini-3.5-flash",
+                    "key": "draft-secret",
+                }
+                assert "draft-secret" not in draft.text
+                assert settings.llm_provider == snapshot["llm_provider"]
+                assert settings.llm_api_key == snapshot["llm_api_key"]
+
+                # PUT 非密钥字段 → 持久化 + 生效 + capabilities 反映
+                r = await c.put(
+                    "/api/v1/system/model-config",
+                    headers=A,
+                    json={
+                        "llm_provider": "anthropic",
+                        "llm_model": "test-model-x",
+                        "llm_timeout_ms": 45_000,
+                        "llm_max_retries": 3,
+                        "document_chunk_max_tokens": 1_600,
+                        "document_chunk_mode": "heading_strict",
+                        "search_top_k": 5,
+                        "sag_language": "en",
+                    },
+                )
+                assert r.status_code == 200, r.text
+                assert r.json()["config"]["llm_model"] == "test-model-x"
+                assert r.json()["config"]["llm_provider"] == "anthropic"
+                assert r.json()["config"]["sources"]["llm_model"] == "database"
+                assert "llm_api_key" not in r.json()["config"]["sources"]
+                assert r.json()["capabilities"]["llm_provider"] == "anthropic"
+                assert r.json()["capabilities"]["llm_model"] == "test-model-x"
+                assert settings.llm_model == "test-model-x"  # 单例即时生效
+                assert settings.llm_provider == "anthropic"
+                assert settings.llm_timeout_ms == 45_000
+                assert settings.llm_max_retries == 3
+                assert settings.document_chunk_max_tokens == 1_600
+                assert settings.document_chunk_mode == "heading_strict"
+                runtime_settings = app.state.knowledge_runtime._settings
+                assert app.state.llm._settings is runtime_settings
+                assert app.state.engine_manager._settings is runtime_settings
+                assert runtime_settings.llm_model == "test-model-x"
+                assert runtime_settings.llm_provider == "anthropic"
+                assert runtime_settings.document_chunk_max_tokens == 1_600
+                assert runtime_settings.search_top_k == 5
+                g = (await c.get("/api/v1/system/model-config", headers=A)).json()
+                assert g["llm_model"] == "test-model-x" and g["search_top_k"] == 5
+                assert g["sag_language"] == "en"
+                assert g["llm_timeout_ms"] == 45_000 and g["llm_max_retries"] == 3
+                assert g["document_chunk_max_tokens"] == 1_600
+                assert g["document_chunk_mode"] == "heading_strict"
+
+                # 已入库文档仍使用旧向量空间时，禁止直接切换 Embedding 身份。
+                previous_embedding = (
+                    settings.embedding_model,
+                    settings.embedding_dimensions,
+                )
+                async with SessionLocal() as s:
+                    source = Source(
+                        name="embedding-guard",
+                        sag_source_config_id="embedding-guard-source",
+                    )
+                    s.add(source)
+                    await s.flush()
+                    seeded_source_id = source.id
+                    s.add(
+                        Document(
+                            source_id=source.id,
+                            filename="indexed.md",
+                            content_type="text/markdown",
+                            storage_path="/tmp/indexed.md",
+                            status=DocumentStatus.READY,
+                            sag_source_id="indexed-document",
+                        )
+                    )
+                    await s.commit()
+
+                incompatible = await c.put(
+                    "/api/v1/system/model-config",
+                    headers=A,
+                    json={
+                        "embedding_model": "replacement-embedding",
+                        "embedding_dimensions": 1_536,
+                    },
+                )
+                assert incompatible.status_code == 409
+                assert "已有入库文档" in incompatible.text
+                assert (
+                    settings.embedding_model,
+                    settings.embedding_dimensions,
+                ) == previous_embedding
+                assert (
+                    runtime_settings.embedding_model,
+                    runtime_settings.embedding_dimensions,
+                ) == previous_embedding
+                async with SessionLocal() as s:
+                    stored_config = await s.scalar(
+                        select(Setting).where(
+                            Setting.scope == "global",
+                            Setting.key == "model_config",
+                        )
+                    )
+                    assert stored_config is not None
+                    assert stored_config.value.get("embedding_model") != "replacement-embedding"
+
+                compatible = await c.put(
+                    "/api/v1/system/model-config",
+                    headers=A,
+                    json={
+                        "embedding_base_url": "https://embedding.example/v1",
+                        "embedding_api_key": "sk-embedding-replacement",
+                    },
+                )
+                assert compatible.status_code == 200
+                assert compatible.json()["config"]["embedding_api_key_set"] is True
+                assert runtime_settings.embedding_base_url == "https://embedding.example/v1"
+                assert runtime_settings.embedding_api_key == "sk-embedding-replacement"
+                assert "sk-embedding-replacement" not in compatible.text
+
+                # 密钥：设假 key → set=True 且不回显明文
+                r = await c.put(
+                    "/api/v1/system/model-config",
+                    headers=A,
+                    json={
+                        "llm_base_url": "https://api.302.ai/v1",
+                        "llm_api_key": "sk-fake-xyz",
+                    },
+                )
+                assert r.json()["config"]["llm_base_url"] == "https://api.302ai.cn/v1"
+                assert r.json()["config"]["llm_api_key_set"] is True
+                assert "sk-fake" not in r.text
+
+                # 升级前已配置 302 的用户可在服务端复用旧 Key，一键补齐 MinerU。
+                r = await c.post("/api/v1/system/model-config/mineru/302", headers=A)
+                assert r.status_code == 200
+                assert r.json()["config"]["mineru_provider"] == "302"
+                assert r.json()["config"]["mineru_base_url"] == "https://api.302ai.cn"
+                assert r.json()["config"]["mineru_api_key_set"] is True
+                assert "sk-fake" not in r.text
+                assert runtime_settings.mineru_provider == "302"
+                assert runtime_settings.mineru_base_url == "https://api.302ai.cn"
+                assert runtime_settings.mineru_api_key == "sk-fake-xyz"
+                # 留空提交 → 保留原 key（仍 set），同时更新其他字段
+                r = await c.put(
+                    "/api/v1/system/model-config",
+                    headers=A,
+                    json={"llm_api_key": "", "llm_model": "m2"},
+                )
+                assert r.json()["config"]["llm_api_key_set"] is True
+                assert r.json()["config"]["llm_model"] == "m2"
+
+                # 文档解析配置与密钥同样支持持久化、脱敏和即时生效。
+                r = await c.put(
+                    "/api/v1/system/model-config",
+                    headers=A,
+                    json={
+                        "document_parser": "auto",
+                        "mineru_provider": "official",
+                        "mineru_base_url": "https://mineru.net/api/v4/file-urls/batch",
+                        "mineru_api_key": "sk-mineru-fake",
+                        "mineru_version": "2.5",
+                        "mineru_official_model": "vlm",
+                        "document_extract_concurrency": 7,
+                    },
+                )
+                parser_config = r.json()["config"]
+                assert parser_config["mineru_api_key_set"] is True
+                assert parser_config["mineru_provider"] == "official"
+                assert parser_config["mineru_official_model"] == "vlm"
+                assert parser_config["effective_document_parser"] == "mineru"
+                assert parser_config["document_extract_concurrency"] == 7
+                assert "sk-mineru-fake" not in r.text
+
+                # 非法值 → 422（Literal / 越界）
+                assert (
+                    await c.put("/api/v1/system/model-config", headers=A, json={"search_strategy": "nope"})
+                ).status_code == 422
+                assert (
+                    await c.put("/api/v1/system/model-config", headers=A, json={"llm_provider": "nope"})
+                ).status_code == 422
+                assert (
+                    await c.put("/api/v1/system/model-config", headers=A, json={"search_strategy": "atomic"})
+                ).status_code == 422
+                assert (
+                    await c.put("/api/v1/system/model-config", headers=A, json={"search_top_k": 999})
+                ).status_code == 422
+                assert (
+                    await c.put("/api/v1/system/model-config", headers=A, json={"document_parser": None})
+                ).status_code == 422
+                assert (
+                    await c.put(
+                        "/api/v1/system/model-config",
+                        headers=A,
+                        json={"document_extract_concurrency": 0},
+                    )
+                ).status_code == 422
+                for invalid in (
+                    {"llm_timeout_ms": 999},
+                    {"llm_timeout_ms": None},
+                    {"llm_max_retries": 11},
+                    {"llm_max_retries": None},
+                    {"document_chunk_max_tokens": 99},
+                    {"document_chunk_max_tokens": None},
+                    {"document_chunk_mode": "overlap"},
+                    {"document_chunk_mode": None},
+                ):
+                    assert (await c.put("/api/v1/system/model-config", headers=A, json=invalid)).status_code == 422
+                assert (
+                    await c.put(
+                        "/api/v1/system/model-config",
+                        headers=A,
+                        json={"document_extract_concurrency": None},
+                    )
+                ).status_code == 422
+    finally:
+        async with SessionLocal() as s:
+            if seeded_source_id is not None:
+                await s.execute(delete(Document).where(Document.source_id == seeded_source_id))
+                await s.execute(delete(Source).where(Source.id == seeded_source_id))
+            await s.execute(
+                delete(Setting).where(
+                    Setting.scope == "global",
+                    Setting.key.in_(["model_config", "system_preferences"]),
+                )
+            )
+            await s.execute(delete(User).where(User.email == "modelcfg@t.com"))
+            await s.commit()
+        for key, value in snapshot.items():
+            setattr(settings, key, value)
+
+
+def test_startup_warns_when_env_differs_from_persisted_config(monkeypatch, caplog):
+    """env 改了、持久化 model_config 仍是旧值时必须告警（此前完全静默）。"""
+    from sag_api.services import settings_service
+
+    monkeypatch.setenv("SAG_LLM_TIMEOUT_MS", "180000")
+    with caplog.at_level(logging.WARNING, logger="sag.settings"):
+        settings_service._warn_persisted_beats_env({"llm_timeout_ms": 60_000})
+
+    assert "llm_timeout_ms" in caplog.text
+    assert "60000" not in caplog.text
+    assert "180000" not in caplog.text
+
+
+@pytest.mark.parametrize("env_value", [None, "", "   ", "60000"])
+def test_startup_silent_when_env_matches_or_is_unset(env_value, monkeypatch, caplog):
+    """env 未设置或与持久化值一致时不应产生噪音。"""
+    from sag_api.services import settings_service
+
+    monkeypatch.delenv("SAG_LLM_TIMEOUT_MS", raising=False)
+    if env_value is not None:
+        monkeypatch.setenv("SAG_LLM_TIMEOUT_MS", env_value)
+    with caplog.at_level(logging.WARNING, logger="sag.settings"):
+        settings_service._warn_persisted_beats_env({"llm_timeout_ms": 60_000})
+
+    assert caplog.text == ""
+
+
+def test_startup_warns_for_secret_mismatch_without_printing_values(monkeypatch, caplog):
+    """密钥字段只提示存在差异，绝不把值写进日志。"""
+    from sag_api.services import settings_service
+
+    monkeypatch.setenv("SAG_LLM_API_KEY", "env-key")
+    with caplog.at_level(logging.WARNING, logger="sag.settings"):
+        settings_service._warn_persisted_beats_env({"llm_api_key": "persisted-key"})
+
+    assert "llm_api_key" in caplog.text
+    assert "env-key" not in caplog.text
+    assert "persisted-key" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("field", "env_value", "persisted", "warns"),
+    [
+        ("llm_timeout_ms", "180000", 60_000, False),
+        ("llm_api_key", "env-key", "persisted-key", False),
+        ("embedding_model", "new-model", "old-model", True),
+    ],
+)
+def test_startup_warning_respects_llm_lock(field, env_value, persisted, warns, monkeypatch, caplog):
+    from sag_api.services import settings_service
+
+    monkeypatch.setattr(settings_service._settings, "lock_llm_config", True)
+    monkeypatch.setenv(f"SAG_{field.upper()}", env_value)
+    with caplog.at_level(logging.WARNING, logger="sag.settings"):
+        settings_service._warn_persisted_beats_env({field: persisted})
+
+    assert (field in caplog.text) is warns
+
+
+def test_startup_warning_does_not_print_endpoint_credentials(monkeypatch, caplog):
+    from sag_api.services import settings_service
+
+    monkeypatch.setenv("SAG_LLM_BASE_URL", "https://new.example.test/v1")
+    persisted = "https://user:test-password@example.test/v1?token=test-token"
+    with caplog.at_level(logging.WARNING, logger="sag.settings"):
+        settings_service._warn_persisted_beats_env({"llm_base_url": persisted})
+
+    assert "llm_base_url" in caplog.text
+    assert "test-password" not in caplog.text
+    assert "test-token" not in caplog.text
+    assert "https://" not in caplog.text
