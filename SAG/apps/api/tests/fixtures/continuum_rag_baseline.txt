@@ -1,0 +1,8 @@
+Continuum AI Retrieval Baseline Test
+
+Mã bí mật kiểm thử của Continuum AI là CTM-92841.
+
+Mã CTM-92841 chỉ được sử dụng để kiểm tra rằng tài liệu đã được parse,
+chunk, index và retrieval thành công.
+
+Dịch vụ thử nghiệm sử dụng Redis để kiểm tra kết nối cache.
