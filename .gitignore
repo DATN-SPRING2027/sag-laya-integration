@@ -32,6 +32,7 @@ coverage/
 *.tsbuildinfo
 
 # Local runtime data
+.data/
 *.db
 *.sqlite
 *.sqlite3
