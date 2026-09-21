@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from threading import Lock
 from typing import Any
 
@@ -16,13 +17,30 @@ _ROUTER_INIT_ERROR: str | None = None
 _ROUTER_LOCK = Lock()
 
 
+def _local_bundle_is_multilingual_only() -> bool:
+    if not settings.laya_model_path:
+        return False
+    model_root = Path(settings.laya_model_path).expanduser()
+    return not (model_root / "rl_agent_config.json").is_file() and (
+        model_root / "multilingual" / "rl_agent_config.json"
+    ).is_file()
+
+
 def _model_specs() -> dict[str, object]:
     """Return model specs for either an explicit local checkpoint or HF cache."""
     if settings.laya_model_path:
-        model_root = settings.laya_model_path
+        model_root = Path(settings.laya_model_path).expanduser()
+        root_checkpoint = (model_root / "rl_agent_config.json").is_file()
+        multilingual_checkpoint = (model_root / "multilingual" / "rl_agent_config.json").is_file()
+        if root_checkpoint and multilingual_checkpoint:
+            return {
+                "english": (str(model_root), None),
+                "multilingual": (str(model_root), "multilingual"),
+            }
+        local_spec = (str(model_root), None) if root_checkpoint else (str(model_root), "multilingual")
         return {
-            "english": (model_root, None),
-            "multilingual": (model_root, "multilingual"),
+            "english": local_spec,
+            "multilingual": local_spec,
         }
     return {
         "english": ("convaiinnovations/laya", None),
@@ -136,7 +154,8 @@ def route_query(query: str, context: dict[str, Any] | None = None) -> dict[str, 
 
     start_time = time.perf_counter()
     try:
-        pred = router.predict(state, questions)
+        predict_kwargs = {"model": "multilingual"} if _local_bundle_is_multilingual_only() else {}
+        pred = router.predict(state, questions, **predict_kwargs)
         elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
 
         answers = pred.get("answers", {})
