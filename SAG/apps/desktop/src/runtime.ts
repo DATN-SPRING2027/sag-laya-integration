@@ -18,7 +18,6 @@ import {
 import {
   desktopApiEnvironment,
   localHttpOrigin,
-  storageBootstrapPolicy,
 } from "./runtime-policy";
 
 export interface ManagedRuntime {
@@ -132,7 +131,6 @@ function startPythonRuntime(
       SAG_SECRET_KEY: secretKey,
       SAG_CORS_ORIGINS: webOrigin,
       ...desktopApiEnvironment(desktopConfig.apiHost, desktopConfig.apiPort),
-      SAG_STORAGE_BOOTSTRAP_POLICY: storageBootstrapPolicy(process.platform),
     },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,

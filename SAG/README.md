@@ -83,7 +83,7 @@ Upload a document once. SAG parses it, splits it into chunks, embeds it, extract
 | Agent chat | Multi-turn answers grounded in selected sources, with clickable citations |
 | Integration | Self-hosted REST/OpenAPI, OpenAI-compatible chat, MCP, and the `zleap-sag` Python package |
 
-The product is deliberately local-first and single-user. It starts with SQLite and LanceDB, requires no external database, and keeps a clear path to PostgreSQL/pgvector and other production backends.
+The product uses PostgreSQL for metadata and Qdrant for vectors.
 
 ---
 
@@ -354,9 +354,9 @@ Default persistence:
 
 | Runtime | Application metadata | Knowledge engine | Location |
 | --- | --- | --- | --- |
-| Docker default | SQLite | SQLite + LanceDB | Docker volume `sagdata` |
-| Local development | SQLite | SQLite + LanceDB | `apps/api/.data/` |
-| PostgreSQL override | PostgreSQL | PostgreSQL + pgvector | `pgdata` and `sagdata` volumes |
+| Docker default | PostgreSQL | Qdrant | `pgdata`, `qdrantdata`, and `sagdata` volumes |
+| Local development | PostgreSQL | Qdrant | `apps/api/.data/` for OCTX/uploads |
+| PostgreSQL + Qdrant override | PostgreSQL | Qdrant | `pgdata`, `qdrantdata`, and `sagdata` volumes |
 
 `docker compose down` preserves data. **`docker compose down -v` permanently deletes the database, knowledge index, and uploaded files.**
 
@@ -421,10 +421,11 @@ Start the backend and frontend in separate terminals from the repository root.
 
 ```bash
 # Terminal 1: API at http://localhost:8000
+docker compose up -d db qdrant
 cd apps/api
 python -m venv .venv
 . .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[dev,postgres]"
 cp .env.example .env
 uvicorn sag_api.main:app --reload
 ```
@@ -530,13 +531,13 @@ config = EngineConfig.from_env()
 
 | API | Purpose |
 | --- | --- |
-| `await engine.start()` | Initialize connections; local SQLite/LanceDB schema is created automatically |
+| `await engine.start()` | Initialize PostgreSQL and Qdrant connections; vector collections are created automatically |
 | `await engine.aclose()` | Close engine resources; handled automatically by `async with` |
 | `await engine.chunk(source)` | Parse and chunk a path or raw string without persisting it |
 | `await engine.ingest(path, ...)` | Parse one document, chunk it, embed it, and persist chunks/vectors |
 | `await engine.extract(...)` | Extract and persist the event-entity index for the current source |
 | `await engine.search(query, strategy=..., top_k=...)` | Return a typed `SearchResult` with `sections` and timing/statistics |
-| `await engine.init_schema()` | Idempotently initialize production schemas; not needed for the default local stack |
+| `await engine.init_schema()` | Idempotently initialize PostgreSQL and Qdrant schemas |
 
 Typed results are available from `zleap.sag.results`: `ChunkResult`, `IngestResult`, `ExtractResult`, and `SearchResult`. All engine exceptions derive from `SagError`, so application boundaries can catch one base type.
 
@@ -553,12 +554,14 @@ The UI exposes only **Fast** and **Precise** retrieval modes. Precise maps to SA
 
 | Deployment | Relational storage | Vector storage | Package extra |
 | --- | --- | --- | --- |
-| Local default | SQLite | LanceDB | none |
+| This application | PostgreSQL | Qdrant | built-in adapter |
 | Single database | PostgreSQL | pgvector | `zleap-sag[postgres]` |
 | Production split | MySQL/PostgreSQL/OceanBase | Elasticsearch | `zleap-sag[mysql]`, `[postgres]`, `[es]` |
 | Single database | OceanBase 4.3.3+ | OceanBase vector | `zleap-sag[mysql]` |
 
 Changing `EngineConfig` changes the backend without changing ingest/extract/search calls. Current engine connections are process-global, so use one `EngineConfig` per process.
+
+The upstream package table above remains available for other `zleap-sag` integrations.
 
 For the full package configuration, extras, examples, and changelog, see the [`zleap-sag` package page](https://pypi.org/project/zleap-sag/).
 
@@ -637,9 +640,9 @@ Document ingestion is processed by the background job queue. Check the returned 
 
 For a frontend served from another origin, add it to `SAG_CORS_ORIGINS`. If the API address changes, rebuild the Web image with the matching `NEXT_PUBLIC_API_BASE`.
 
-### PostgreSQL/pgvector deployment
+### PostgreSQL/Qdrant deployment
 
-The optional production override moves application metadata and engine storage to PostgreSQL/pgvector:
+The default Compose stack uses PostgreSQL for application metadata and Qdrant for vector storage. The production override additionally enforces production credentials:
 
 ```bash
 cp .env.example .env
@@ -650,7 +653,7 @@ docker compose -f compose.yaml -f compose.postgres.yaml config
 docker compose -f compose.yaml -f compose.postgres.yaml up -d --build
 ```
 
-Set real `SAG_CORS_ORIGINS` and `NEXT_PUBLIC_API_BASE` values before server deployment. Back up both `pgdata` and `sagdata` before upgrades.
+Set real `SAG_CORS_ORIGINS` and `NEXT_PUBLIC_API_BASE` values before server deployment. Back up `pgdata`, `qdrantdata`, and `sagdata` before upgrades.
 
 ---
 

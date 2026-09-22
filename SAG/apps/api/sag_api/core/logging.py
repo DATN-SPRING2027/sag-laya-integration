@@ -37,7 +37,6 @@ def configure_logging(level: str = "INFO") -> None:
         "httpx",
         "httpcore",
         "openai",
-        "lancedb",
         "aiosqlite",
         "LiteLLM",
         "LiteLLM Router",

@@ -7,7 +7,7 @@
 - **LLM / embedding**（抽取与答案生成）：`llm_*` / `embedding_*`
 - **文档解析**（PDF / Office 等转 Markdown）：`document_parser` / `mineru_*`
 
-默认零依赖：SQLite 元数据 + zleap-sag 本地 LanceDB。生产可整体切到 Postgres。
+默认配置：PostgreSQL 元数据 + Qdrant 向量存储。
 """
 
 from __future__ import annotations
@@ -64,10 +64,10 @@ class Settings(BaseSettings):
     dify_search_strategy: SearchStrategy = "vector"
 
     # ── sag 元数据库 ───────────────────────────────────────────────────
-    database_url: str = "sqlite+aiosqlite:///./.data/sag.db"
+    database_url: str = "postgresql+asyncpg://sag:sag@localhost:5432/sag"
 
     # ── 存储 ────────────────────────────────────────────────────────────
-    data_dir: str = "./.data/engine"  # zleap-sag data_dir（LanceDB + SQLite）
+    data_dir: str = "./.data/engine"  # OCTX、上传文件和运行时状态
     upload_dir: str = "./.data/uploads"  # 上传原始文件落盘
     max_upload_mb: int = 25  # 单文件上传上限
     job_concurrency: int = 2  # 后台处理并发
@@ -122,21 +122,18 @@ class Settings(BaseSettings):
     octx_vector_progress_interval_seconds: float = Field(default=1.0, ge=0.1, le=10.0)
 
     # ── zleap-sag 后端选择 ─────────────────────────────────────────────
-    # None → 零基础设施（LanceDB + 内置 SQLite，落在 data_dir）
-    sag_vector_provider: Literal["lancedb", "es", "pgvector", "oceanbase"] = "lancedb"
-    sag_relational_provider: Literal["sqlite", "postgres", "mysql", "oceanbase"] | None = None
+    sag_vector_provider: Literal["es", "pgvector", "qdrant", "oceanbase"] = "qdrant"
+    sag_relational_provider: Literal["sqlite", "postgres", "mysql", "oceanbase"] = "postgres"
     sag_language: Literal["zh", "en"] = "zh"
-    # 仅对默认 SQLite + LanceDB 的 0.7.1 存量库执行旁路、可回滚升级。
-    storage_upgrade_enabled: bool = True
-    # Windows 桌面端临时使用全新工作区，避免任何旧引擎目录迁移。
-    storage_bootstrap_policy: Literal["prompt", "windows_fresh"] = "prompt"
 
-    # 生产单库（pgvector）时复用同一 Postgres —— 由这些字段拼装
+    # PostgreSQL 元数据连接字段
     sag_pg_host: str = "localhost"
     sag_pg_port: int = 5432
     sag_pg_user: str = "sag"
     sag_pg_password: str = "sag"
     sag_pg_database: str = "sag"
+    sag_qdrant_url: str = "http://localhost:6333"
+    sag_qdrant_api_key: str | None = None
 
     # ── LLM（答案生成 + 抽取）─────────────────────────────────────────
     # 协议、路由规则和技术默认值统一由 model_providers 注册表维护。
@@ -186,7 +183,7 @@ class Settings(BaseSettings):
 
     # ── 检索默认 ────────────────────────────────────────────────────────
     # multi_es_fast：默认策略。相关率平均比 vector 高 ~14 个百分点；
-    # vector store 不支持 lexical(pgvector/oceanbase) 时由 engine_manager 自动降级为 vector。
+    # vector store 不支持 lexical(pgvector/qdrant/oceanbase) 时由 engine_manager 自动降级为 vector。
     search_strategy: SearchStrategy = "multi_es_fast"
     search_top_k: int = 8
     # 全库检索先选有界信源候选；@ 显式范围同样受此硬上限保护。

@@ -66,20 +66,6 @@ describe("unauthorized request ownership", () => {
     });
   }
 
-  it("leaves choice endpoint 401 handling to the storage bootstrap gate", async () => {
-    const location = { href: "http://localhost/", host: "localhost" };
-    vi.stubGlobal("window", { location });
-    setToken("expired-token");
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(unauthorizedResponse()));
-
-    await expect(api.chooseStorageBootstrap("migrate")).rejects.toMatchObject({
-      status: 401,
-    } satisfies Partial<ApiError>);
-
-    expect(document.cookie).toContain("expired-token");
-    expect(location.href).toBe("http://localhost/");
-  });
-
   it("clears credentials and redirects an ordinary endpoint 401", async () => {
     const location = { href: "http://localhost/", host: "localhost" };
     vi.stubGlobal("window", { location });

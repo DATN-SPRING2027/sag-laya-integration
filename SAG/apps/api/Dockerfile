@@ -5,7 +5,7 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
-# 默认镜像只安装本地 SQLite/LanceDB 所需依赖；生产覆盖传 postgres。
+# 默认镜像安装 PostgreSQL/Qdrant 部署所需依赖。
 ARG SAG_API_EXTRAS=""
 
 RUN apt-get update \

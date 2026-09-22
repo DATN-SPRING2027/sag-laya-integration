@@ -43,6 +43,8 @@ SAG/logs/
 # Downloaded model checkpoints. Keep a small README or config pointer instead.
 SAG/models/laya/
 models/
+!SAG/apps/api/sag_api/db/models/
+!SAG/apps/api/sag_api/db/models/**
 *.safetensors
 *.bin
 *.pt

@@ -185,12 +185,8 @@ async def ready(request: Request) -> JSONResponse:
         return JSONResponse(status_code=503, content={"status": "unavailable", "db": False})
 
     runtime = getattr(request.app.state, "knowledge_runtime", None)
-    coordinator = getattr(request.app.state, "storage_bootstrap", None)  # [storage-bootstrap]
     if runtime is None or not runtime.ready:
-        content: dict[str, object] = {"status": "unavailable", "db": True}
-        if coordinator is not None:
-            content["phase"] = coordinator.public_status()["phase"]
-        return JSONResponse(status_code=503, content=content)
+        return JSONResponse(status_code=503, content={"status": "unavailable", "db": True})
     return JSONResponse(content={"status": "ready", "db": True})
 
 

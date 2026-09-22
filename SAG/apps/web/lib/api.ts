@@ -26,8 +26,6 @@ import type {
   Source,
   SourceGraphResponse,
   SourceMcpDescriptor,
-  StorageBootstrapStatus,
-  StorageChoice,
   SystemPreferences,
   Thread,
   TokenResponse,
@@ -658,16 +656,6 @@ export const api = {
       body: JSON.stringify(b),
     }),
   me: () => request<User>("/api/v1/auth/me"),
-  storageBootstrap: () =>
-    request<StorageBootstrapStatus>("/api/v1/system/storage-bootstrap", {
-      redirectOnUnauthorized: false,
-    }),
-  chooseStorageBootstrap: (choice: StorageChoice) =>
-    request<StorageBootstrapStatus>("/api/v1/system/storage-bootstrap/choice", {
-      method: "POST",
-      body: JSON.stringify({ choice }),
-      redirectOnUnauthorized: false,
-    }),
   capabilities: () => request<Capabilities>("/api/v1/system/capabilities"),
   getSystemPreferences: () =>
     request<SystemPreferences>("/api/v1/system/preferences"),

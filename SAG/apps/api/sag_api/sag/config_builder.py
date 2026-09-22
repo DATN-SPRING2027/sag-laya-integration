@@ -2,7 +2,7 @@
 
 支持信源级覆盖（`overrides`）——目前支持 `language`，未来可扩展 `entity_types` 等。
 0.8.2 变更:`storage_mode` 必填;向量库改为显式 VectorConfig 家族
-(LanceDB / Elasticsearch / PgVector / OceanBase),不再使用 vector_provider 字符串。
+(Elasticsearch / PgVector / Qdrant / OceanBase),不再使用 vector_provider 字符串。
 """
 
 from __future__ import annotations
@@ -24,24 +24,22 @@ from zleap.sag.config import (
 from zleap.sag.core.ai.structured import StructuredOutputMode
 
 from sag_api.core.config import Settings
+from sag_api.sag.qdrant_store import QdrantVectorConfig
 
 # LLM 未配置时的占位符：允许 EngineConfig 构造 / start() 建 schema（离线路径），
 # 真正的 ingest / extract / search 会在运行时因缺少凭证而报错（服务层已前置守卫）。
 _PLACEHOLDER = "not-configured"
 
-# SAG 的向量后端取值 → 0.8.2 的 VectorConfig 构造。lancedb 由 EngineConfig 从
-# data_dir 自动派生（vector=None），其余需显式连接配置。
-_VECTOR_PROVIDERS = frozenset({"lancedb", "es", "pgvector", "oceanbase"})
-
-
 def _build_vector(settings: Settings) -> Any:
     provider = settings.sag_vector_provider
-    if provider == "lancedb":
-        return None  # EngineConfig 派生 data_dir/lancedb
     if provider == "es":
         # 0.8.2 要求 hosts;SAG 未提供 ES 地址配置时退回本地默认。
         # TODO(REQ-7/配置):新增 SAG_ES_HOSTS 设置项,生产显式配置。
         return ElasticsearchVectorConfig(hosts=["http://localhost:9200"])
+    if provider == "qdrant":
+        # zleap-sag 0.12's EngineConfig has no Qdrant model; the validated
+        # config is replaced with QdrantVectorConfig after construction below.
+        return ElasticsearchVectorConfig(hosts=[settings.sag_qdrant_url])
     if provider == "pgvector":
         return PgVectorConfig(
             connection=PostgresConnectionConfig(
@@ -110,7 +108,7 @@ def build_engine_config(settings: Settings, *, overrides: dict[str, Any] | None 
         timeout=settings.embedding_timeout,
     )
 
-    return EngineConfig(
+    config = EngineConfig(
         storage_mode="normal",
         llm=llm,
         embedding=embedding,
@@ -123,3 +121,13 @@ def build_engine_config(settings: Settings, *, overrides: dict[str, Any] | None 
             acquire_timeout_seconds=float(max(30, settings.embedding_timeout)),
         ),
     )
+    if settings.sag_vector_provider == "qdrant":
+        return config.model_copy(
+            update={
+                "vector": QdrantVectorConfig(
+                    url=settings.sag_qdrant_url,
+                    api_key=settings.sag_qdrant_api_key,
+                )
+            }
+        )
+    return config

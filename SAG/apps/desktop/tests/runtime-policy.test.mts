@@ -4,14 +4,7 @@ import test from "node:test";
 import {
   desktopApiEnvironment,
   localHttpOrigin,
-  storageBootstrapPolicy,
 } from "../src/runtime-policy.ts";
-
-test("uses a fresh non-migrating workspace only for packaged Windows", () => {
-  assert.equal(storageBootstrapPolicy("win32"), "windows_fresh");
-  assert.equal(storageBootstrapPolicy("darwin"), "prompt");
-  assert.equal(storageBootstrapPolicy("linux"), "prompt");
-});
 
 test("injects the actual desktop API address as the canonical DSH URL", () => {
   assert.deepEqual(desktopApiEnvironment("127.0.0.1", 18080), {

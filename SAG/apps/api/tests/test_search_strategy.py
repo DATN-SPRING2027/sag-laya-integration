@@ -279,6 +279,9 @@ async def test_vector_search_many_uses_one_cross_source_embedding(monkeypatch):
     assert request.filters.children[0].field == "data_source_id"
     assert outcome.sections[0].chunk_id == "chunk-2"
     assert outcome.stats["chunk_recall"] == "batch-vector"
+    assert outcome.stats["requested_strategy"] == "vector"
+    assert outcome.stats["effective_strategy"] == "vector"
+    assert outcome.stats["fallback_used"] is False
 
 
 @pytest.mark.asyncio
@@ -387,7 +390,7 @@ async def test_multi_es_fast_uses_zleap_082_typed_search_contract(monkeypatch):
     from sag_api.core.config import settings
     from sag_api.sag.engine_manager import EngineManager
 
-    monkeypatch.setattr(settings, "sag_vector_provider", "lancedb")
+    monkeypatch.setattr(settings, "sag_vector_provider", "es")
     manager = EngineManager(settings)
     captured_strategies: list[str] = []
 
@@ -468,7 +471,7 @@ def test_strategies_capability_report_marks_multi_es_disabled_on_pgvector(monkey
     assert disabled_entry["reason"] == "vector_provider_lacks_lexical"
     assert "pgvector" in disabled_entry["message"]
 
-    monkeypatch.setattr(settings, "sag_vector_provider", "lancedb")
+    monkeypatch.setattr(settings, "sag_vector_provider", "es")
     ok_report = EngineManager.strategies_capability_report(settings)
     assert set(ok_report["enabled"]) == {"vector", "multi", "multi_es_fast"}
     assert ok_report["disabled"] == {}
@@ -509,7 +512,7 @@ async def test_eval_compare_returns_two_strategies_and_skips_judge(monkeypatch):
     from sag_api.main import app
     from sag_api.sag.dto import RetrievedSection, SearchOutcome
 
-    monkeypatch.setattr(settings, "sag_vector_provider", "lancedb")
+    monkeypatch.setattr(settings, "sag_vector_provider", "es")
 
     class StubEngine:
         async def provision(self, *_args, **_kwargs):
@@ -742,6 +745,7 @@ async def test_multi_search_uses_prefiltered_batch_recall_when_sources_are_hidde
     from sag_api.sag import RetrievedSection, SearchOutcome
     from sag_api.sag.engine_manager import EngineManager
 
+    monkeypatch.setattr(settings, "sag_vector_provider", "es")
     manager = EngineManager(settings)
     batch_calls = 0
     legacy_calls = 0

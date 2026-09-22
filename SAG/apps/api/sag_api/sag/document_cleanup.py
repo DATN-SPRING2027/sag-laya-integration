@@ -26,24 +26,8 @@ def _batches(values: tuple[str, ...], size: int = 500) -> Iterator[tuple[str, ..
         yield values[start : start + size]
 
 
-def _lance_literal(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
-
-
 async def _delete_vector_ids(client: Any, index: str, ids: tuple[str, ...]) -> None:
     if not ids:
-        return
-
-    # zleap-sag 0.7.1 has no bulk-delete facade. Keep provider details contained here
-    # so deleting thousands of derived rows does not become thousands of transactions.
-    open_table = getattr(client, "_open_table", None)
-    if callable(open_table):
-        table = await open_table(index)
-        if table is None:
-            return
-        for batch in _batches(ids):
-            values = ", ".join(_lance_literal(value) for value in batch)
-            await table.delete(f"id IN ({values})")
         return
 
     raw_client = getattr(client, "client", client)

@@ -24,7 +24,6 @@ def is_runtime_submodule(name):
 
 for package in (
     "jieba",
-    "lancedb",
     "magika",
     "markitdown",
     "tiktoken",
@@ -71,7 +70,6 @@ for package in (
     "jieba-py",
     "sag-api",
     "zleap-sag",
-    "lancedb",
     "litellm",
     "markitdown",
     "mcp",
