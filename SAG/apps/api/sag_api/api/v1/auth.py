@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -43,21 +43,18 @@ async def register(body: RegisterRequest, session: AsyncSession = Depends(get_se
 @router.post("/login", response_model=TokenResponse)
 async def login(
     body: LoginRequest,
-    request: Request,
     session: AsyncSession = Depends(get_session),
 ) -> TokenResponse:
     if settings.auth_mode == "password":
         user = await authenticate(session, email=body.email, password=body.password or "")
     else:
-        coordinator = getattr(request.app.state, "storage_bootstrap", None)  # [storage-bootstrap]
-        maintenance_login = coordinator is not None and not coordinator.runtime_ready()  # [storage-bootstrap]
         user = await authenticate_or_register(
             session,
             name=body.name,
             email="",
             password=None,
-            allow_create=not maintenance_login,
-            exact_existing=maintenance_login,
+            allow_create=True,
+            exact_existing=False,
         )
     return TokenResponse(access_token=create_access_token(user.id), user=UserOut.model_validate(user))
 

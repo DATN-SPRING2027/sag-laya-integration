@@ -1,4 +1,4 @@
-"""Knowledge runtime lifecycle, installed only after storage bootstrap is ready."""
+"""Knowledge runtime lifecycle."""
 
 from __future__ import annotations
 

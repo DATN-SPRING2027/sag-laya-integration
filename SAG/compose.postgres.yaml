@@ -1,17 +1,31 @@
-# 可选的生产覆盖：
+# PostgreSQL + Qdrant production deployment:
 # docker compose -f compose.yaml -f compose.postgres.yaml up -d --build
 services:
   db:
-    image: pgvector/pgvector:pg16
+    image: postgres:16
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-sag}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请先在 .env 中设置 POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB:-sag}
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./deploy/init-db:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sag} -d ${POSTGRES_DB:-sag}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:v1.14.1
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-}
+    volumes:
+      - qdrantdata:/qdrant/storage
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${QDRANT_PORT:-6333}:6333"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -H 'api-key: ${QDRANT_API_KEY:-}' http://localhost:6333/healthz"]
       interval: 5s
       timeout: 5s
       retries: 12
@@ -24,14 +38,18 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      qdrant:
+        condition: service_healthy
     environment:
       SAG_ENVIRONMENT: prod
       SAG_DEBUG: "false"
       SAG_SECRET_KEY: ${SAG_SECRET_KEY:?请先在 .env 中设置 SAG_SECRET_KEY}
       SAG_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-sag}:${POSTGRES_PASSWORD:?请先在 .env 中设置 POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-sag}
       SAG_DATA_DIR: /data/sag
-      SAG_SAG_VECTOR_PROVIDER: pgvector
+      SAG_SAG_VECTOR_PROVIDER: qdrant
       SAG_SAG_RELATIONAL_PROVIDER: postgres
+      SAG_SAG_QDRANT_URL: http://qdrant:6333
+      SAG_SAG_QDRANT_API_KEY: ${QDRANT_API_KEY:-}
       SAG_SAG_PG_HOST: db
       SAG_SAG_PG_PORT: "5432"
       SAG_SAG_PG_USER: ${POSTGRES_USER:-sag}
@@ -40,3 +58,4 @@ services:
 
 volumes:
   pgdata:
+  qdrantdata:

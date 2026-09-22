@@ -215,37 +215,6 @@ def test_storage_restores_digest_verified_release_from_migration_preservation(tm
     assert storage.resolve_key(key).read_bytes() == package.read_bytes()
 
 
-def test_default_storage_recovers_artifact_into_active_engine(tmp_path, monkeypatch):
-    """A fresh workspace restores preserved releases into its active engine."""
-    from sag_api.core.config import Settings
-    from sag_api.services import octx_transfer_service
-
-    package, digest = _create_test_octx(tmp_path, "migrated")
-    key = f"releases/asset/1.0.0/{digest[7:]}.octx"
-    configured_dir = tmp_path / "engine"
-    active_dir = tmp_path / "engine-0.8.2-fresh"
-    preserved = (
-        tmp_path
-        / ".storage-upgrades"
-        / "zleap-sag-0.7.1-to-0.8.2"
-        / "original-engine"
-        / "octx"
-        / key
-    )
-    preserved.parent.mkdir(parents=True)
-    preserved.write_bytes(package.read_bytes())
-    test_settings = Settings(data_dir=str(configured_dir), _env_file=None)
-    test_settings.activate_data_dir(active_dir)
-    monkeypatch.setattr(octx_transfer_service, "settings", test_settings)
-
-    storage = octx_transfer_service.default_octx_storage()
-    restored = storage.resolve_release(key, digest)
-
-    assert restored == active_dir / "octx" / key
-    assert not (configured_dir / "octx").exists()
-    assert restored.read_bytes() == package.read_bytes()
-
-
 def test_storage_copies_preserved_release_when_hard_links_are_denied(tmp_path, monkeypatch):
     """macOS filesystem policy must not block restoration when hard-linking is denied."""
     import errno

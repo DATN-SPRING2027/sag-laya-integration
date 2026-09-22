@@ -1,14 +1,49 @@
 name: sag
 
-# 默认面向个人本地使用：SQLite + LanceDB，无需额外数据库服务。
-# 数据统一写入 sagdata 卷，重建容器不会丢失。
+# 默认部署使用 PostgreSQL + Qdrant。
+# 数据写入 pgdata、qdrantdata 和 sagdata 卷，重建容器不会丢失。
 services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sag}
+      POSTGRES_DB: ${POSTGRES_DB:-sag}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sag} -d ${POSTGRES_DB:-sag}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:v1.14.1
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-}
+    volumes:
+      - qdrantdata:/qdrant/storage
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${QDRANT_PORT:-6333}:6333"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -H 'api-key: ${QDRANT_API_KEY:-}' http://localhost:6333/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
   api:
     build:
       context: ./apps/api
       dockerfile: Dockerfile
       args:
-        SAG_API_EXTRAS: ""
+        SAG_API_EXTRAS: postgres
+    depends_on:
+      db:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
     environment:
       SAG_ENVIRONMENT: ${SAG_ENVIRONMENT:-dev}
       SAG_DEBUG: "false"
@@ -29,11 +64,18 @@ services:
       SAG_DIFY_API_KEY: ${SAG_DIFY_API_KEY:-}
       # Dify 专用检索策略；默认 vector 以降低外部知识库请求延迟。
       SAG_DIFY_SEARCH_STRATEGY: ${SAG_DIFY_SEARCH_STRATEGY:-vector}
-      # 四个斜杠表示容器内绝对路径 /data/sag.db。
-      SAG_DATABASE_URL: sqlite+aiosqlite:////data/sag.db
+      SAG_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-sag}:${POSTGRES_PASSWORD:-sag}@db:5432/${POSTGRES_DB:-sag}
       SAG_DATA_DIR: /data/engine
       SAG_UPLOAD_DIR: /data/uploads
-      SAG_SAG_VECTOR_PROVIDER: lancedb
+      SAG_SAG_VECTOR_PROVIDER: qdrant
+      SAG_SAG_RELATIONAL_PROVIDER: postgres
+      SAG_SAG_QDRANT_URL: http://qdrant:6333
+      SAG_SAG_QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      SAG_SAG_PG_HOST: db
+      SAG_SAG_PG_PORT: "5432"
+      SAG_SAG_PG_USER: ${POSTGRES_USER:-sag}
+      SAG_SAG_PG_PASSWORD: ${POSTGRES_PASSWORD:-sag}
+      SAG_SAG_PG_DATABASE: ${POSTGRES_DB:-sag}
       SAG_SAG_LANGUAGE: ${SAG_SAG_LANGUAGE:-zh}
       # LLM / Embedding / MinerU（留空也能启动，之后可在设置页配置）
       SAG_LLM_PROVIDER: ${SAG_LLM_PROVIDER:-openai}
@@ -108,4 +150,6 @@ services:
     restart: unless-stopped
 
 volumes:
+  pgdata:
+  qdrantdata:
   sagdata:

@@ -16,7 +16,7 @@ dev: ## 提示：分别在两个终端运行 make api / make web
 	@echo "在一个终端运行:  make api"
 	@echo "在另一个终端运行: make web"
 
-api: ## 启动后端（本地零依赖 SQLite+LanceDB，热重载，局域网可访问）
+api: ## 启动后端（PostgreSQL + Qdrant，热重载，局域网可访问）
 	cd apps/api && . .venv/bin/activate && uvicorn sag_api.main:app --reload --host 0.0.0.0 --port 8000
 
 web: ## 启动前端（Next dev，局域网可访问）
@@ -39,7 +39,7 @@ release-dry-run: ## 校验 tag-only 发布条件，不创建或推送 tag
 	@test -n "$(VERSION)" || (echo "VERSION 必填，例如：make release-dry-run VERSION=1.4.0" && exit 1)
 	node scripts/release-public.mjs --tag-only "$(VERSION)" --dry-run
 
-compose-config: ## 校验默认 Docker 配置（SQLite + LanceDB）
+compose-config: ## 校验默认 Docker 配置（PostgreSQL + Qdrant）
 	docker compose config --quiet
 
 compose-up: ## Docker 快速启动（web + api，数据持久化）
@@ -54,7 +54,7 @@ compose-logs: ## 持续查看 Docker 日志
 compose-down: ## 停止 compose
 	docker compose down
 
-compose-up-postgres: ## 使用 Postgres + pgvector 覆盖启动（需先配置 .env）
+compose-up-postgres: ## 使用 Postgres + Qdrant 覆盖启动（需先配置 .env）
 	docker compose -f compose.yaml -f compose.postgres.yaml up -d --build
 
 compose-down-postgres: ## 停止 Postgres 覆盖部署

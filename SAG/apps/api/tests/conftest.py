@@ -13,6 +13,8 @@ os.environ.setdefault("SAG_UPLOAD_DIR", f"{_TMP}/uploads")
 os.environ["SAG_DSH_CONNECTION_FILE"] = f"{_TMP}/dsh-connection.json"
 os.environ.setdefault("SAG_DEBUG", "false")
 os.environ.setdefault("SAG_SAG_LANGUAGE", "zh")
+os.environ.setdefault("SAG_SAG_VECTOR_PROVIDER", "qdrant")
+os.environ.setdefault("SAG_SAG_RELATIONAL_PROVIDER", "sqlite")
 os.environ.setdefault("SAG_AUTH_MODE", "password")
 # The suite intentionally shares one temporary SQLite database. Startup warmup
 # would otherwise provision sources persisted by earlier cases in the background
@@ -27,58 +29,16 @@ os.environ["SAG_MINERU_BASE_URL"] = ""
 
 
 @pytest.fixture(autouse=True)
-def _isolate_app_lifespan_from_storage_upgrade_probe(monkeypatch: pytest.MonkeyPatch):
-    """Unrelated lifespan tests start from a ready coordinator without probing shared stores.
-
-    Patches the integration seam (sag_api.upgrades.integration), the only place
-    outside sag_api/upgrades/ that wires the bootstrap into the app.
-    """
-    from sag_api.upgrades.contracts import StorageBootstrapPhase, StorageBootstrapStatus
-
-    class ReadyStorageBootstrapCoordinator:
-        def __init__(self, _settings, _session_factory, *, on_ready=None):
-            self.on_ready = on_ready
-            self._status = StorageBootstrapStatus(
-                StorageBootstrapPhase.READY,
-                "current_0_8",
-                "0.8.2",
-                stage="ready",
-                runtime_ready=True,
-            )
-
-        async def inspect(self):
-            return self._status
-
-        async def wait(self) -> None:
-            return None
-
-        def runtime_ready(self) -> bool:
-            return True
-
-        def public_status(self, *, authenticated: bool = False):
-            del authenticated
-            return {
-                "phase": self._status.phase.value,
-                "runtime_ready": self._status.runtime_ready,
-            }
-
-    monkeypatch.setattr(
-        "sag_api.upgrades.integration.StorageBootstrapCoordinator",
-        ReadyStorageBootstrapCoordinator,
-    )
-
-
-@pytest.fixture(autouse=True)
 async def _isolate_persisted_jobs():
     """A test must not recover queued jobs created by an earlier app lifespan."""
     yield
     if "sag_api.core.db" not in sys.modules:
         return
 
+    from sag_api.db.models import Document, Job
     from sqlalchemy import delete, inspect
 
     from sag_api.core.db import SessionLocal, engine
-    from sag_api.db.models import Document, Job
     from sag_api.enums import DocumentStatus
 
     async with engine.connect() as connection:

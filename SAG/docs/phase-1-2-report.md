@@ -108,7 +108,6 @@ SAG_ENABLE_LAYA=false
 
 Các file tiện ích local:
 
-- [`local_embedding_server.py`](../tools/local_embedding_server.py)
 - [`local_llm_server.py`](../tools/local_llm_server.py)
 
 ## 4. Checkpoint A — Direct retrieval

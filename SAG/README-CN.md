@@ -83,7 +83,7 @@ SAG 不是传统 RAG 与 GraphRAG 的融合，而是一套替代二者的原创�
 | Agent 对话 | 基于指定信源进行多轮问答，并提供可点击引用 |
 | 对外集成 | 自托管 REST/OpenAPI、OpenAI 兼容接口、MCP 与 `zleap-sag` Python 包 |
 
-产品默认面向本地单用户场景。它使用 SQLite 与 LanceDB 即可启动，不依赖外部数据库，同时保留迁移至 PostgreSQL/pgvector 等生产后端的路径。
+产品使用 PostgreSQL 保存元数据，并使用 Qdrant 保存向量。
 
 ---
 
@@ -344,9 +344,9 @@ docker compose up -d --build       # 重建服务，不删除数据卷
 
 | 运行方式 | 应用元数据 | 知识引擎 | 保存位置 |
 | --- | --- | --- | --- |
-| Docker 默认 | SQLite | SQLite + LanceDB | Docker 数据卷 `sagdata` |
-| 本地开发 | SQLite | SQLite + LanceDB | `apps/api/.data/` |
-| PostgreSQL 覆盖 | PostgreSQL | PostgreSQL + pgvector | `pgdata` 与 `sagdata` 数据卷 |
+| Docker 默认 | PostgreSQL | Qdrant | `pgdata`、`qdrantdata` 与 `sagdata` 数据卷 |
+| 本地开发 | PostgreSQL | Qdrant | `apps/api/.data/` 保存 OCTX/上传文件 |
+| PostgreSQL + Qdrant 覆盖 | PostgreSQL | Qdrant | `pgdata`、`qdrantdata` 与 `sagdata` 数据卷 |
 
 `docker compose down` 会保留数据。**`docker compose down -v` 会永久删除数据库、知识索引和已上传文件。**
 
@@ -443,7 +443,7 @@ Electron 客户端将同一套 Next.js 应用与本地 FastAPI 后端一起打�
 
 [`zleap-sag`](https://pypi.org/project/zleap-sag/) 是 SAG 应用底层持续维护的 Python 引擎。发行包名为 `zleap-sag`，导入路径为 `zleap.sag`，要求 Python 3.11+，采用 MIT 许可。当前应用要求 `zleap-sag>=0.7.1`。
 
-安装默认的零基础设施版本：
+安装 Python 引擎包：
 
 ```bash
 pip install zleap-sag
@@ -520,7 +520,7 @@ config = EngineConfig.from_env()
 
 | API | 作用 |
 | --- | --- |
-| `await engine.start()` | 初始化连接；本地 SQLite/LanceDB 会自动创建结构 |
+| `await engine.start()` | 初始化 PostgreSQL/Qdrant 连接并自动创建向量集合 |
 | `await engine.aclose()` | 关闭引擎资源；使用 `async with` 时自动执行 |
 | `await engine.chunk(source)` | 解析并分块路径或原始字符串，但不写入数据库 |
 | `await engine.ingest(path, ...)` | 解析单个文档、分块、向量化并持久化 chunks/vectors |
@@ -543,10 +543,12 @@ config = EngineConfig.from_env()
 
 | 部署方式 | 关系型存储 | 向量存储 | 安装 extra |
 | --- | --- | --- | --- |
-| 本地默认 | SQLite | LanceDB | 无 |
+| 本项目 | PostgreSQL | Qdrant | 内置适配器 |
 | 单数据库 | PostgreSQL | pgvector | `zleap-sag[postgres]` |
 | 生产拆分 | MySQL/PostgreSQL/OceanBase | Elasticsearch | `zleap-sag[mysql]`、`[postgres]`、`[es]` |
 | 单数据库 | OceanBase 4.3.3+ | OceanBase vector | `zleap-sag[mysql]` |
+
+本项目在 PostgreSQL/Qdrant 部署配置中提供 Qdrant 适配器；上表保留 `zleap-sag` 官方后端说明。
 
 只需修改 `EngineConfig` 即可切换后端，导入、抽取和检索代码保持不变。当前引擎连接是进程级全局资源，因此一个进程只使用一份 `EngineConfig`。
 
@@ -627,9 +629,9 @@ curl -s -X POST "$BASE/sources/$SOURCE_ID/search" \
 
 如果自定义前端与 API 不同源，请将前端地址加入 `SAG_CORS_ORIGINS`。API 地址改变时，还要用对应的 `NEXT_PUBLIC_API_BASE` 重新构建 Web 镜像。
 
-### PostgreSQL/pgvector 部署
+### PostgreSQL/Qdrant 部署
 
-可选的生产覆盖会将应用元数据与知识引擎迁移到 PostgreSQL/pgvector：
+默认 Compose 已使用 PostgreSQL 保存应用元数据、使用 Qdrant 保存向量；生产覆盖会额外强制生产凭据：
 
 ```bash
 cp .env.example .env
@@ -640,7 +642,7 @@ docker compose -f compose.yaml -f compose.postgres.yaml config
 docker compose -f compose.yaml -f compose.postgres.yaml up -d --build
 ```
 
-服务器部署前应设置真实的 `SAG_CORS_ORIGINS` 与 `NEXT_PUBLIC_API_BASE`。升级前同时备份 `pgdata` 和 `sagdata`。
+服务器部署前应设置真实的 `SAG_CORS_ORIGINS` 与 `NEXT_PUBLIC_API_BASE`。升级前备份 `pgdata`、`qdrantdata` 和 `sagdata`。
 
 ---
 

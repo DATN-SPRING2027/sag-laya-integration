@@ -200,29 +200,6 @@ def _vector_array(values: list[list[float]], *, dimension: int):
     return pa.array(values, type=pa.list_(pa.float32(), dimension))
 
 
-def _normalize_arrow_vector_column(vectors: Any):
-    """Accept fixed or uniformly sized Arrow float32 vectors without Python materialization."""
-    import pyarrow as pa
-    import pyarrow.compute as pc
-
-    if vectors.null_count:
-        raise ValueError("LanceDB vector column contains null values")
-    if pa.types.is_fixed_size_list(vectors.type):
-        if not pa.types.is_float32(vectors.type.value_type):
-            raise ValueError("LanceDB vector column must use float32")
-        return vectors
-    if not (pa.types.is_list(vectors.type) or pa.types.is_large_list(vectors.type)):
-        raise ValueError("LanceDB vector column has an unsupported type")
-    if not pa.types.is_float32(vectors.type.value_type):
-        raise ValueError("LanceDB vector column must use float32")
-    lengths = pc.list_value_length(vectors)
-    minimum = pc.min(lengths).as_py()
-    maximum = pc.max(lengths).as_py()
-    if minimum is None or minimum < 1 or minimum != maximum:
-        raise ValueError("LanceDB vector column has inconsistent dimensions")
-    return pa.FixedSizeListArray.from_arrays(vectors.flatten(), int(minimum))
-
-
 def _role_records(workspace: Path) -> dict[str, list[tuple[str, dict[str, Any]]]]:
     chunks = _read_jsonl(workspace / "data/chunks.jsonl")
     events = _read_jsonl(workspace / "data/events.jsonl")
@@ -251,73 +228,6 @@ def _role_records(workspace: Path) -> dict[str, list[tuple[str, dict[str, Any]]]
     }
 
 
-async def _iter_lancedb_vector_batches(
-    vector_store: Any,
-    index: str,
-    vector_field: str,
-    *,
-    role: str,
-    routing: str | None,
-    batch_size: int,
-    manifest: Any = None,
-    records_by_local_id: dict[str, tuple[str, dict[str, Any]]] | None = None,
-):
-    """Stream one LanceDB role in a single query without Python vector values."""
-    import pyarrow as pa
-    import pyarrow.compute as pc
-    from lancedb.query import ColumnOrdering
-
-    table = await vector_store._open_table(index)
-    if table is None:
-        return
-    if routing:
-        escaped_routing = routing.replace("'", "''")
-        predicate = f"source_config_id = '{escaped_routing}'"
-    else:
-        if records_by_local_id is None:
-            raise ValueError("LanceDB manifest export requires source routing")
-        record_ids = records_by_local_id.keys()
-        quoted = ",".join("'" + record_id.replace("'", "''") + "'" for record_id in record_ids)
-        predicate = f"id IN ({quoted})"
-    query = (
-        table.query()
-        .where(predicate)
-        .select(["id", vector_field])
-        .order_by([ColumnOrdering(column_name="id")])
-    )
-    reader = await query.to_batches(max_batch_length=batch_size)
-    seen: set[str] = set()
-    async for batch in reader:
-        ids = [str(value) for value in batch.column("id").to_pylist()]
-        if manifest is not None:
-            selected = manifest.lookup(role, ids)
-        else:
-            assert records_by_local_id is not None
-            selected = {
-                local_id: (
-                    records_by_local_id[local_id][0],
-                    input_sha256(render_role_input(role, records_by_local_id[local_id][1])),
-                )
-                for local_id in ids
-                if local_id in records_by_local_id
-            }
-        batch_seen: set[str] = set()
-        positions: list[int] = []
-        for position, record_id in enumerate(ids):
-            if record_id not in selected or record_id in seen or record_id in batch_seen:
-                continue
-            batch_seen.add(record_id)
-            positions.append(position)
-        selected_ids = [ids[position] for position in positions]
-        if not selected_ids:
-            continue
-        seen.update(selected_ids)
-        vectors = _normalize_arrow_vector_column(batch.column(vector_field))
-        if len(positions) != batch.num_rows:
-            vectors = pc.take(vectors, pa.array(positions, type=pa.int32()))
-        yield [selected[local_id] for local_id in selected_ids], vectors
-
-
 async def _fetch_vector_fields(
     vector_store: Any,
     index: str,
@@ -330,13 +240,6 @@ async def _fetch_vector_fields(
     if callable(custom):
         return dict(await custom(index, record_ids, fields))
     module = type(vector_store).__module__
-    if module.endswith("lancedb_store"):
-        table = await vector_store._open_table(index)
-        if table is None:
-            return {}
-        quoted = ",".join("'" + record_id.replace("'", "''") + "'" for record_id in record_ids)
-        rows = await table.query().where(f"id IN ({quoted})").select(["id", *fields]).to_list()
-        return {str(row["id"]): dict(row) for row in rows}
     if module.endswith(("pgvector_store", "oceanbase_store")):
         from sqlalchemy import bindparam, text
 
@@ -393,7 +296,6 @@ async def write_existing_vector_payload(
     vectors_dir.mkdir(exist_ok=False)
     profiles: list[dict[str, Any]] = []
     written_roles: set[str] = set()
-    lance_arrow_native = type(vector_store).__module__.endswith("lancedb_store")
     manifest = VectorExportManifest(manifest_path) if manifest_path is not None else None
     role_rows = _role_records(root) if manifest is None else {role: [] for role in ROLE_TARGETS}
     try:
@@ -411,156 +313,86 @@ async def write_existing_vector_payload(
             dimension: int | None = None
             complete = True
             try:
-                if lance_arrow_native:
-                    rows_by_local_id = None if manifest is not None else {
-                        role_sources[record_id]: (record_id, record)
-                        for record_id, record in rows
-                    }
-                    completed = 0
-                    vector_batches = _iter_lancedb_vector_batches(
+                if manifest is not None:
+                    batches = enumerate(manifest.iter_batches(role, batch_size=batch_size))
+                else:
+                    batches = enumerate(
+                        rows[offset : offset + batch_size] for offset in range(0, len(rows), batch_size)
+                    )
+                completed = 0
+                for _, raw_batch in batches:
+                    if manifest is not None:
+                        local_ids = [local_id for local_id, _, _ in raw_batch]
+                        output_records = [(record_id, input_hash) for _, record_id, input_hash in raw_batch]
+                        batch = None
+                    else:
+                        batch = raw_batch
+                        local_ids = [role_sources[record_id] for record_id, _ in batch]
+                        output_records = [
+                            (record_id, input_sha256(render_role_input(role, record))) for record_id, record in batch
+                        ]
+                    if on_progress is not None:
+                        await on_progress(
+                            {
+                                "phase": "vectors",
+                                "kind": role,
+                                "completed": completed,
+                                "total": total,
+                            }
+                        )
+                    stored = await _fetch_vector_fields(
                         vector_store,
                         index,
-                        vector_field,
-                        role=role,
+                        local_ids,
+                        [vector_field],
                         routing=routing,
-                        batch_size=batch_size,
-                        manifest=manifest,
-                        records_by_local_id=rows_by_local_id,
                     )
-                    async for output_records, vector_values in vector_batches:
-                        if on_progress is not None:
-                            await on_progress(
-                                {
-                                    "phase": "vectors",
-                                    "kind": role,
-                                    "completed": completed,
-                                    "total": total,
-                                }
-                            )
-                        current_dimension = vector_values.type.list_size
-                        if dimension is None:
-                            dimension = current_dimension
-                            schema = pa.schema(
-                                [
-                                    pa.field("record_id", pa.string(), nullable=False),
-                                    pa.field("input_sha256", pa.string(), nullable=False),
-                                    pa.field("vector", pa.list_(pa.float32(), dimension), nullable=False),
-                                ]
-                            )
-                            writer = ipc.new_file(sink, schema)
-                        if current_dimension != dimension:
-                            complete = False
-                            break
-                        assert writer is not None and schema is not None
-                        writer.write_batch(
-                            pa.RecordBatch.from_arrays(
-                                [
-                                    pa.array([record_id for record_id, _ in output_records], type=pa.string()),
-                                    pa.array([input_hash for _, input_hash in output_records], type=pa.string()),
-                                    vector_values,
-                                ],
-                                schema=schema,
-                            )
-                        )
-                        completed += len(output_records)
-                        if on_progress is not None:
-                            await on_progress(
-                                {
-                                    "phase": "vectors",
-                                    "kind": role,
-                                    "completed": completed,
-                                    "total": total,
-                                }
-                            )
-                        del vector_values, output_records
-                        gc.collect()
-                        pa.default_memory_pool().release_unused()
-                    if completed != total:
+                    if any(
+                        local_id not in stored or stored[local_id].get(vector_field) is None for local_id in local_ids
+                    ):
                         complete = False
-                else:
-                    if manifest is not None:
-                        batches = enumerate(manifest.iter_batches(role, batch_size=batch_size))
-                    else:
-                        batches = enumerate(
-                            rows[offset : offset + batch_size]
-                            for offset in range(0, len(rows), batch_size)
-                        )
-                    completed = 0
-                    for _, raw_batch in batches:
-                        if manifest is not None:
-                            local_ids = [local_id for local_id, _, _ in raw_batch]
-                            output_records = [(record_id, input_hash) for _, record_id, input_hash in raw_batch]
-                            batch = None
-                        else:
-                            batch = raw_batch
-                            local_ids = [role_sources[record_id] for record_id, _ in batch]
-                            output_records = [
-                                (record_id, input_sha256(render_role_input(role, record)))
-                                for record_id, record in batch
+                        break
+                    values = [_float_vector(stored[local_id][vector_field]) for local_id in local_ids]
+                    current_dimension = len(values[0])
+                    if dimension is None:
+                        dimension = current_dimension
+                        schema = pa.schema(
+                            [
+                                pa.field("record_id", pa.string(), nullable=False),
+                                pa.field("input_sha256", pa.string(), nullable=False),
+                                pa.field("vector", pa.list_(pa.float32(), dimension), nullable=False),
                             ]
-                        if on_progress is not None:
-                            await on_progress(
-                                {
-                                    "phase": "vectors",
-                                    "kind": role,
-                                    "completed": completed,
-                                    "total": total,
-                                }
-                            )
-                        stored = await _fetch_vector_fields(
-                            vector_store,
-                            index,
-                            local_ids,
-                            [vector_field],
-                            routing=routing,
                         )
-                        if any(
-                            local_id not in stored or stored[local_id].get(vector_field) is None
-                            for local_id in local_ids
-                        ):
-                            complete = False
-                            break
-                        values = [_float_vector(stored[local_id][vector_field]) for local_id in local_ids]
-                        current_dimension = len(values[0])
-                        if dimension is None:
-                            dimension = current_dimension
-                            schema = pa.schema(
-                                [
-                                    pa.field("record_id", pa.string(), nullable=False),
-                                    pa.field("input_sha256", pa.string(), nullable=False),
-                                    pa.field("vector", pa.list_(pa.float32(), dimension), nullable=False),
-                                ]
-                            )
-                            writer = ipc.new_file(sink, schema)
-                        if current_dimension != dimension or any(len(vector) != dimension for vector in values):
-                            complete = False
-                            break
-                        assert writer is not None and schema is not None
-                        writer.write_batch(
-                            pa.RecordBatch.from_arrays(
-                                [
-                                    pa.array([record_id for record_id, _ in output_records], type=pa.string()),
-                                    pa.array([input_hash for _, input_hash in output_records], type=pa.string()),
-                                    _vector_array(values, dimension=dimension),
-                                ],
-                                schema=schema,
-                            )
-                        )
-                        completed += len(output_records)
-                        if on_progress is not None:
-                            await on_progress(
-                                {
-                                    "phase": "vectors",
-                                    "kind": role,
-                                    "completed": completed,
-                                    "total": total,
-                                }
-                            )
-                        del stored, values, output_records
-                        gc.collect()
-                        pa.default_memory_pool().release_unused()
-                    if completed != total:
+                        writer = ipc.new_file(sink, schema)
+                    if current_dimension != dimension or any(len(vector) != dimension for vector in values):
                         complete = False
+                        break
+                    assert writer is not None and schema is not None
+                    writer.write_batch(
+                        pa.RecordBatch.from_arrays(
+                            [
+                                pa.array([record_id for record_id, _ in output_records], type=pa.string()),
+                                pa.array([input_hash for _, input_hash in output_records], type=pa.string()),
+                                _vector_array(values, dimension=dimension),
+                            ],
+                            schema=schema,
+                        )
+                    )
+                    completed += len(output_records)
+                    if on_progress is not None:
+                        await on_progress(
+                            {
+                                "phase": "vectors",
+                                "kind": role,
+                                "completed": completed,
+                                "total": total,
+                            }
+                        )
+                    del stored, values, output_records
+                    gc.collect()
+                    pa.default_memory_pool().release_unused()
+                if completed != total:
+                    complete = False
             except Exception as error:
                 complete = False
                 logger.warning("OCTX vector role export skipped role=%s error=%s", role, error)

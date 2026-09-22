@@ -337,10 +337,11 @@ async def test_single_source_timeout_includes_lock_queue(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_search_source_candidates_use_database_limit_and_explicit_order(monkeypatch):
+    from sag_api.db.models import Source
+
     from sag_api.core.config import settings
     from sag_api.core.db import SessionLocal
     from sag_api.core.errors import ValidationError
-    from sag_api.db.models import Source
     from sag_api.main import app
     from sag_api.services.source_service import search_source_candidates
 
@@ -387,7 +388,7 @@ async def test_multi_es_fast_uses_zleap_082_typed_search_contract(monkeypatch):
     from sag_api.core.config import settings
     from sag_api.sag.engine_manager import EngineManager
 
-    monkeypatch.setattr(settings, "sag_vector_provider", "lancedb")
+    monkeypatch.setattr(settings, "sag_vector_provider", "es")
     manager = EngineManager(settings)
     captured_strategies: list[str] = []
 
@@ -468,7 +469,7 @@ def test_strategies_capability_report_marks_multi_es_disabled_on_pgvector(monkey
     assert disabled_entry["reason"] == "vector_provider_lacks_lexical"
     assert "pgvector" in disabled_entry["message"]
 
-    monkeypatch.setattr(settings, "sag_vector_provider", "lancedb")
+    monkeypatch.setattr(settings, "sag_vector_provider", "es")
     ok_report = EngineManager.strategies_capability_report(settings)
     assert set(ok_report["enabled"]) == {"vector", "multi", "multi_es_fast"}
     assert ok_report["disabled"] == {}
@@ -509,7 +510,7 @@ async def test_eval_compare_returns_two_strategies_and_skips_judge(monkeypatch):
     from sag_api.main import app
     from sag_api.sag.dto import RetrievedSection, SearchOutcome
 
-    monkeypatch.setattr(settings, "sag_vector_provider", "lancedb")
+    monkeypatch.setattr(settings, "sag_vector_provider", "es")
 
     class StubEngine:
         async def provision(self, *_args, **_kwargs):

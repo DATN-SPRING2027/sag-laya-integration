@@ -400,9 +400,9 @@ class EngineManager:
     }
 
     _VECTOR_PROVIDER_LEXICAL_SUPPORT: dict[str, bool] = {
-        "lancedb": True,
         "es": True,
         "pgvector": False,
+        "qdrant": False,
         "oceanbase": False,
     }
 

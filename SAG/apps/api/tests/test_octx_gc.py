@@ -25,8 +25,9 @@ async def gc_sessions(tmp_path):
 
 @pytest.mark.asyncio
 async def test_installation_gc_rejects_current_active_partition(gc_sessions):
-    from sag_api.core.errors import ConflictError
     from sag_api.db.models import OctxAsset, OctxInstallation, OctxRelease, Source
+
+    from sag_api.core.errors import ConflictError
     from sag_api.enums import (
         ConnectorKind,
         OctxAssetOwnership,
@@ -85,8 +86,6 @@ async def test_installation_gc_rejects_current_active_partition(gc_sessions):
 async def test_installation_gc_deletes_only_expired_retained_partition(
     gc_sessions, tmp_path
 ):
-    from zleap.sag.db.models import DataSource
-
     from sag_api.db.models import (
         Document,
         OctxAsset,
@@ -94,6 +93,8 @@ async def test_installation_gc_deletes_only_expired_retained_partition(
         OctxRelease,
         Source,
     )
+    from zleap.sag.db.models import DataSource
+
     from sag_api.enums import (
         ConnectorKind,
         DocumentStatus,
@@ -112,17 +113,16 @@ async def test_installation_gc_deletes_only_expired_retained_partition(
         sag_session.add(DataSource(id="src_retained", name="Old"))
         await sag_session.commit()
 
-    deleted: list[tuple[str, str]] = []
-
-    class Table:
-        async def delete(self, expression: str) -> None:
-            deleted.append((self.name, expression))
+    deleted: list[tuple[str, tuple[str, ...]]] = []
 
     class VectorClient:
-        async def _open_table(self, index: str):
-            table = Table()
-            table.name = index
-            return table
+        async def query(self, index: str, _request):
+            from types import SimpleNamespace
+
+            return [SimpleNamespace(id=f"{index}-id")]
+
+        async def delete(self, index: str, ids: tuple[str, ...]) -> None:
+            deleted.append((index, ids))
 
     try:
         async with gc_sessions() as session:
@@ -194,10 +194,7 @@ async def test_installation_gc_deletes_only_expired_retained_partition(
             "event_entity_vectors",
             "entity_vectors",
         }
-        assert all(
-            expression == "data_source_id = 'src_retained'"
-            for _, expression in deleted
-        )
+        assert all(ids == (f"{index}-id",) for index, ids in deleted)
     finally:
         await sag_engine.dispose()
 
@@ -205,6 +202,7 @@ async def test_installation_gc_deletes_only_expired_retained_partition(
 @pytest.mark.asyncio
 async def test_transfer_gc_removes_only_expired_terminal_staging(gc_sessions, tmp_path):
     from sag_api.db.models import OctxTransfer
+
     from sag_api.enums import OctxTransferDirection, OctxTransferStatus
     from sag_api.octx.storage import OctxStorage
     from sag_api.services.octx_gc_service import gc_expired_transfers

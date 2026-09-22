@@ -630,13 +630,7 @@ async def test_rebuild_vectors_falls_back_to_generation_when_reuse_preparation_f
 
 
 def test_vector_arrow_conversion_reuses_float_lists_without_flattening_them() -> None:
-    import pyarrow as pa
-
-    from sag_api.sag.octx_vector_protocol import (
-        _float_vector,
-        _normalize_arrow_vector_column,
-        _vector_array,
-    )
+    from sag_api.sag.octx_vector_protocol import _float_vector, _vector_array
 
     stored = [0.1, 0.2, 0.3]
 
@@ -646,13 +640,6 @@ def test_vector_arrow_conversion_reuses_float_lists_without_flattening_them() ->
         pytest.approx([0.1, 0.2, 0.3]),
         pytest.approx([0.4, 0.5, 0.6]),
     ]
-    variable = pa.array([[0.1, 0.2], [0.3, 0.4]], type=pa.list_(pa.float32()))
-    normalized = _normalize_arrow_vector_column(variable)
-    assert pa.types.is_fixed_size_list(normalized.type)
-    assert normalized.type.list_size == 2
-    assert normalized.to_pylist() == variable.to_pylist()
-
-
 def test_reused_vector_batch_size_stays_inside_memory_budget() -> None:
     from sag_api.sag.octx_vector_rebuilder import _effective_reuse_batch_size
 
@@ -669,128 +656,6 @@ def test_octx_reuse_optimization_has_safe_defaults() -> None:
     assert configured.octx_arrow_vector_reuse_enabled is True
     assert configured.octx_reused_vector_batch_size == 500
     assert configured.octx_vector_progress_interval_seconds == 1.0
-
-
-async def test_lancedb_arrow_stream_exports_large_role_without_python_vector_materialization(tmp_path: Path) -> None:
-    import re
-
-    import pyarrow as pa
-    import pyarrow.ipc as ipc
-
-    row_count = 5001
-    workspace = tmp_path / "workspace"
-    records = [
-        {
-            "id": f"chunk-{index:05d}",
-            "document_id": "doc-1",
-            "ordinal": index,
-            "heading": f"Heading {index}",
-            "text": f"Body {index}",
-        }
-        for index in range(row_count)
-    ]
-    _write_jsonl(workspace / "data/chunks.jsonl", records)
-    _write_jsonl(workspace / "data/events.jsonl", [])
-    _write_jsonl(workspace / "data/entities.jsonl", [])
-    _write_jsonl(workspace / "relations/event-entities.jsonl", [])
-
-    vectors = {f"local-{index:05d}": [float(index), float(index + 1)] for index in range(row_count)}
-    streamed_ids = [*vectors, "local-00000", "local-extra"]
-    vectors["local-extra"] = [-1.0, -1.0]
-
-    class Query:
-        def __init__(self) -> None:
-            self.ids: list[str] = []
-
-        def where(self, predicate: str):
-            self.ids = list(streamed_ids) if "source_config_id" in predicate else re.findall(r"'([^']+)'", predicate)
-            return self
-
-        def select(self, _fields: list[str]):
-            return self
-
-        def order_by(self, _ordering):
-            self.ids.sort()
-            return self
-
-        async def to_batches(self, *, max_batch_length: int):
-            assert max_batch_length <= 500
-            ids = list(reversed(self.ids)) if len(self.ids) <= 500 else self.ids
-            schema = pa.schema(
-                [
-                    pa.field("id", pa.string()),
-                    pa.field("heading_vector", pa.list_(pa.float32(), 2)),
-                ]
-            )
-            batch = pa.RecordBatch.from_arrays(
-                [
-                    pa.array(ids, type=pa.string()),
-                    pa.array([vectors[record_id] for record_id in ids], type=pa.list_(pa.float32(), 2)),
-                ],
-                schema=schema,
-            )
-            class AsyncReader:
-                def __aiter__(self):
-                    async def batches():
-                        for offset in range(0, len(ids), max_batch_length):
-                            yield batch.slice(offset, max_batch_length)
-
-                    return batches()
-
-            return AsyncReader()
-
-        async def to_list(self):
-            raise AssertionError("Arrow-native export must not materialize vectors as Python lists")
-
-    class Table:
-        query_count = 0
-
-        def query(self):
-            self.query_count += 1
-            return Query()
-
-    table = Table()
-
-    class LanceStore:
-        async def _open_table(self, _index: str):
-            return table
-
-    LanceStore.__module__ = "zleap.sag.core.storage.lancedb_store"
-
-    class Embedding:
-        model = "test/embedding"
-        base_url = "https://embedding.invalid/v1"
-        dimensions = 2
-
-    from sag_api.sag.octx_vector_manifest import VectorExportManifest
-
-    manifest_path = tmp_path / "vector-export.sqlite3"
-    with VectorExportManifest(manifest_path) as manifest:
-        for index, record in enumerate(records):
-            manifest.add(
-                "chunk.heading",
-                f"local-{index:05d}",
-                record["id"],
-                input_sha256(render_role_input("chunk.heading", record)),
-            )
-
-    roles = await write_existing_vector_payload(
-        workspace,
-        LanceStore(),
-        Embedding(),
-        manifest_path=manifest_path,
-        routing="source-config-1",
-        batch_size=500,
-    )
-
-    assert roles == {"chunk.heading"}
-    assert table.query_count == 1
-    with pa.memory_map(str(workspace / "vectors/chunk_heading.arrow"), "r") as source:
-        table = ipc.open_file(source).read_all()
-    assert table.num_rows == row_count
-    assert table.column("record_id").to_pylist()[:2] == ["chunk-00000", "chunk-00001"]
-    assert table.column("vector")[0].as_py() == pytest.approx([0.0, 1.0])
-    assert table.column("vector")[-1].as_py() == pytest.approx([5000.0, 5001.0])
 
 
 async def test_write_vector_payload_creates_valid_vectors_v01_package(tmp_path: Path) -> None:
@@ -985,73 +850,6 @@ async def test_write_vector_payload_creates_valid_vectors_v01_package(tmp_path: 
 
     assert fallback == [vector_b]
     assert fallback_embedding.calls == [["A"]]
-
-    from zleap.sag import DataEngine
-    from zleap.sag.core.adapters.models import Filter, VectorQuery
-
-    from sag_api.core.config import Settings
-    from sag_api.sag.config_builder import build_engine_config
-    from sag_api.sag.octx_importer import import_structured_plan
-    from sag_api.sag.octx_vector_rebuilder import rebuild_vectors
-
-    target_dir = tmp_path / "target-engine"
-    settings = Settings(
-        data_dir=str(target_dir),
-        llm_api_key="fixture",
-        embedding_api_key="fixture",
-        embedding_dimensions=9,
-        _env_file=None,
-    )
-    data_engine = DataEngine(build_engine_config(settings), health_check=False)
-    await data_engine.start()
-    sessions = data_engine.resources.relational.session_factory()
-
-    class CompatibleNoEmbedding:
-        model = "test/embedding"
-        base_url = "https://embedding.invalid/v1"
-        dimensions = 9
-
-        async def batch_generate(self, _texts):
-            raise AssertionError("full compatible package must skip all Embedding calls")
-
-    try:
-        await import_structured_plan(
-            plan_path,
-            namespace,
-            source_config_id="shadow-vectors-v02",
-            source_name="Shadow",
-            session_factory=sessions,
-        )
-        stats = await rebuild_vectors(
-            "shadow-vectors-v02",
-            {},
-            session_factory=sessions,
-            embedding_client=CompatibleNoEmbedding(),
-            vector_store=data_engine.resources.vector,
-            package_path=package,
-            plan_path=plan_path,
-        )
-        names = await data_engine.resources.vector.schema_object_names()
-        hits = await data_engine.resources.vector.query(
-            "source_chunks",
-            VectorQuery(
-                vector=vector_a,
-                vector_field="content_vector",
-                filters=Filter.eq("data_source_id", "shadow-vectors-v02"),
-                limit=1,
-            ),
-        )
-    finally:
-        await data_engine.aclose()
-
-    assert stats == {"chunks": 1, "events": 1, "entities": 1, "event_entities": 1}
-    assert names >= {
-        "source_chunks",
-        "event_vectors_wide",
-        "entity_vectors",
-        "event_entity_vectors",
-    }
-    assert hits and hits[0].payload["data_source_id"] == "shadow-vectors-v02"
 
     existing_workspace = tmp_path / "existing-workspace"
     shutil.copytree(workspace, existing_workspace)

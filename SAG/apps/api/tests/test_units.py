@@ -43,9 +43,9 @@ def test_model_provider_registry_is_the_public_source_of_truth():
 
 def test_build_engine_config_zero_infra():
     cfg = build_engine_config(settings)
-    # 0.8.2:向量后端为显式 VectorConfig 家族;lancedb 由 EngineConfig 从 data_dir 派生
+    # Tests use SQLite metadata; vectors still use the application Qdrant adapter.
     assert cfg.vector is not None
-    assert cfg.vector.provider == "lancedb"
+    assert cfg.vector.provider == "qdrant"
     assert cfg.storage_mode == "normal"
     assert cfg.relational is not None
     assert cfg.relational.provider == "sqlite"  # 零基础设施:由 data_dir 派生 SQLite
@@ -147,7 +147,7 @@ async def test_embedding_request_respects_configured_dimensions(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("provider", ["lancedb", "es", "pgvector", "oceanbase"])
+@pytest.mark.parametrize("provider", ["es", "pgvector", "oceanbase"])
 async def test_unconfigured_embedding_prebuilds_vector_schema_with_legacy_default(provider):
     from zleap.sag.core.storage.schema import prepare_vector_schema
 

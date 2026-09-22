@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,9 +18,7 @@ from sag_api.core.db import SessionLocal, dispose_db, init_db
 from sag_api.core.error_taxonomy import ErrorCode, ErrorLayer, ErrorStage
 from sag_api.core.errors import ApiError
 from sag_api.core.logging import RequestContextMiddleware, configure_logging, get_logger
-
-# [storage-bootstrap] 唯一允许的 upgrades 包入口；删除 sag_api/upgrades/ 时还原本行
-from sag_api.upgrades.integration import bind_storage_bootstrap, install_storage_bootstrap_middleware
+from sag_api.runtime import KnowledgeRuntime
 
 log = get_logger("app")
 
@@ -57,21 +56,15 @@ async def lifespan(app: FastAPI):
     except OSError as error:
         log.warning("DSH 本机连接文件刷新失败：%s", error)
 
-    # [storage-bootstrap] 引导用户迁移存量数据；删除 sag_api/upgrades/ 时连同下方 finally 中标注的两行一起还原
-    storage_bootstrap = bind_storage_bootstrap(app, settings, SessionLocal)
-    storage_status = await storage_bootstrap.inspect()
+    runtime = KnowledgeRuntime(settings, SessionLocal, active_path=Path(settings.data_dir))
 
     try:
-        if storage_status.runtime_ready:
-            await storage_bootstrap.install_runtime()
-        else:
-            log.info("存储引导等待用户选择 phase=%s", storage_status.phase.value)
+        await runtime.start(app)
         yield
     finally:
         failures: list[BaseException] = []
         for cleanup in (
-            storage_bootstrap.wait,  # [storage-bootstrap]
-            storage_bootstrap.stop_runtime,  # [storage-bootstrap]
+            runtime.stop,
             dispose_db,
         ):
             try:
@@ -109,8 +102,6 @@ def create_app() -> FastAPI:
             r")(:\d+)?"
         )
     app.add_middleware(CORSMiddleware, **cors_kwargs)
-    # [storage-bootstrap] 存储引导期间拦截未就绪请求（删除 sag_api/upgrades/ 时还原本行）
-    install_storage_bootstrap_middleware(app)
     # 请求追踪（放在 CORS 之后添加 → 更外层执行，最先分配 request_id）
     app.add_middleware(RequestContextMiddleware)
 

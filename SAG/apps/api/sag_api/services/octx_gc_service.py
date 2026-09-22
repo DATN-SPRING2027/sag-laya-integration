@@ -29,15 +29,10 @@ _TERMINAL_TRANSFER_STATUSES = {
 }
 
 
-def _literal(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
-
-
 async def _delete_vector_partition(
     client: Any, index: str, source_config_id: str
 ) -> None:
-    """按 data_source_id 删除一个分区:优先 0.8.2 VectorStore(query+delete),
-    兼容测试/遗留客户端形态(_open_table / delete_by_query / _engine)。"""
+    """按 data_source_id 删除一个分区。"""
     from zleap.sag.core.adapters.models import Filter, VectorQuery
 
     if callable(getattr(client, "query", None)):
@@ -47,13 +42,6 @@ async def _delete_vector_partition(
         )
         if hits:
             await client.delete(index, tuple(str(hit.id) for hit in hits))
-        return
-
-    open_table = getattr(client, "_open_table", None)
-    if callable(open_table):
-        table = await open_table(index)
-        if table is not None:
-            await table.delete(f"data_source_id = {_literal(source_config_id)}")
         return
 
     raw_client = getattr(client, "client", client)
