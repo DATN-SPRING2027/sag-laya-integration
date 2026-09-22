@@ -22,8 +22,9 @@ sag 的后端服务：FastAPI + `zleap-sag`。
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[dev,postgres]"
 cp .env.example .env
+docker compose up -d db qdrant
 uvicorn sag_api.main:app --reload --host 0.0.0.0 --port 8000
 ```
 

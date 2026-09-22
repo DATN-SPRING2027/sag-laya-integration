@@ -279,6 +279,9 @@ async def test_vector_search_many_uses_one_cross_source_embedding(monkeypatch):
     assert request.filters.children[0].field == "data_source_id"
     assert outcome.sections[0].chunk_id == "chunk-2"
     assert outcome.stats["chunk_recall"] == "batch-vector"
+    assert outcome.stats["requested_strategy"] == "vector"
+    assert outcome.stats["effective_strategy"] == "vector"
+    assert outcome.stats["fallback_used"] is False
 
 
 @pytest.mark.asyncio
@@ -337,11 +340,10 @@ async def test_single_source_timeout_includes_lock_queue(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_search_source_candidates_use_database_limit_and_explicit_order(monkeypatch):
-    from sag_api.db.models import Source
-
     from sag_api.core.config import settings
     from sag_api.core.db import SessionLocal
     from sag_api.core.errors import ValidationError
+    from sag_api.db.models import Source
     from sag_api.main import app
     from sag_api.services.source_service import search_source_candidates
 
@@ -743,6 +745,7 @@ async def test_multi_search_uses_prefiltered_batch_recall_when_sources_are_hidde
     from sag_api.sag import RetrievedSection, SearchOutcome
     from sag_api.sag.engine_manager import EngineManager
 
+    monkeypatch.setattr(settings, "sag_vector_provider", "es")
     manager = EngineManager(settings)
     batch_calls = 0
     legacy_calls = 0

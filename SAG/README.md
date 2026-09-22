@@ -421,10 +421,11 @@ Start the backend and frontend in separate terminals from the repository root.
 
 ```bash
 # Terminal 1: API at http://localhost:8000
+docker compose up -d db qdrant
 cd apps/api
 python -m venv .venv
 . .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[dev,postgres]"
 cp .env.example .env
 uvicorn sag_api.main:app --reload
 ```

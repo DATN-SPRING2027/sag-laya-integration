@@ -3641,9 +3641,11 @@ desktop = [
 ]
 dev = [
     { name = "anyio" },
+    { name = "asyncpg" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
+    { name = "zleap-sag", extra = ["postgres"] },
 ]
 postgres = [
     { name = "asyncpg" },
@@ -3655,6 +3657,7 @@ requires-dist = [
     { name = "aiosqlite", specifier = ">=0.20" },
     { name = "alembic", specifier = ">=1.13" },
     { name = "anyio", marker = "extra == 'dev'", specifier = ">=4.4" },
+    { name = "asyncpg", marker = "extra == 'dev'", specifier = ">=0.29" },
     { name = "asyncpg", marker = "extra == 'postgres'", specifier = ">=0.29" },
     { name = "bcrypt", specifier = ">=4.1" },
     { name = "charset-normalizer", specifier = ">=3.3,<4" },
@@ -3682,6 +3685,7 @@ requires-dist = [
     { name = "tzdata", specifier = ">=2024.1" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
     { name = "zleap-sag", specifier = "==0.12.0" },
+    { name = "zleap-sag", extras = ["postgres"], marker = "extra == 'dev'", specifier = "==0.12.0" },
     { name = "zleap-sag", extras = ["postgres"], marker = "extra == 'postgres'", specifier = "==0.12.0" },
 ]
 provides-extras = ["postgres", "dev", "desktop"]

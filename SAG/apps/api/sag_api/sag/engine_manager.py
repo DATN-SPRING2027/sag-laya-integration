@@ -1074,7 +1074,16 @@ class EngineManager:
                             "fallback_used": True,
                         },
                     )
-                return outcome
+                return SearchOutcome(
+                    query=outcome.query,
+                    sections=outcome.sections,
+                    stats={
+                        **outcome.stats,
+                        "requested_strategy": strategy,
+                        "effective_strategy": strategy,
+                        "fallback_used": False,
+                    },
+                )
             except asyncio.CancelledError:
                 raise
             except TimeoutError:

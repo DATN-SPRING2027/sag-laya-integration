@@ -411,10 +411,11 @@ docs/assets/readme/         README 配图与示意图
 
 ```bash
 # 终端 1：API，地址 http://localhost:8000
+docker compose up -d db qdrant
 cd apps/api
 python -m venv .venv
 . .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[dev,postgres]"
 cp .env.example .env
 uvicorn sag_api.main:app --reload
 ```
