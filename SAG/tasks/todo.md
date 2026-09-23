@@ -7,6 +7,8 @@
 - [ ] Xác nhận `SAG_LAYA_DEVICE=cpu` hoặc device triển khai thực tế.
 - [ ] Xác nhận LLM provider/model trong Settings.
 - [ ] Xác nhận Document/Job states và response contract của Laya.
+- [ ] Xác nhận `SAG_SAG_RELATIONAL_PROVIDER=postgres` và PostgreSQL connection hoạt động.
+- [ ] Xác nhận `SAG_SAG_VECTOR_PROVIDER=qdrant`, Qdrant endpoint/API key hoạt động và secret không xuất hiện trong log.
 
 ## Phase 1 — Upload và Job
 
@@ -24,7 +26,8 @@
 - [ ] Kiểm tra text normalization.
 - [ ] Kiểm tra chunk size và overlap.
 - [ ] Kiểm tra metadata chunk.
-- [ ] Kiểm tra embedding/vector indexing.
+- [ ] Kiểm tra embedding và vector indexing vào Qdrant.
+- [ ] Kiểm tra Qdrant collection dimension và chunk payload metadata.
 - [ ] Kiểm tra idempotency khi reprocess.
 - [ ] Kiểm tra Document chỉ chuyển `READY` sau indexing.
 - [ ] Kiểm tra trạng thái `FAILED` và error message.
@@ -34,6 +37,7 @@
 - [ ] Upload một tài liệu mẫu.
 - [ ] Chờ Document chuyển `READY`.
 - [ ] Tìm được một đoạn nội dung đã biết.
+- [ ] Xác nhận vector và metadata đã tồn tại trong Qdrant sau khi Document chuyển `READY`.
 - [ ] Reprocess không tạo duplicate.
 
 ## Phase 3 — Laya Local routing
@@ -48,11 +52,13 @@
 
 ## Phase 4 — Retrieval và context
 
-- [ ] Xác định retrieval tool chính.
+- [ ] Xác định retrieval tool chính và Qdrant là vector path production.
+- [ ] Kiểm tra `multi` fallback về `vector` khi Qdrant không hỗ trợ lexical search.
 - [ ] Kiểm tra query được truyền nguyên vẹn.
 - [ ] Kiểm tra top-k/chunk ranking.
 - [ ] Kiểm tra loại duplicate chunk.
 - [ ] Kiểm tra metadata/citation.
+- [ ] Kiểm tra filter source/document/user/team được chuyển thành Qdrant payload filter.
 - [ ] Kiểm tra empty context.
 - [ ] Kiểm tra giới hạn context window.
 
@@ -79,6 +85,7 @@
 
 - [ ] Unit tests.
 - [ ] Integration test upload → READY → search.
+- [ ] Smoke test upload → PostgreSQL metadata + Qdrant vector → READY → search với storage thật.
 - [ ] E2E test upload → hỏi → retrieval → answer.
 - [ ] Đo latency first-load của Laya.
 - [ ] Đo latency inference của Laya.

@@ -31,6 +31,7 @@ Mục tiêu cuối cùng là người dùng có thể upload tài liệu, đợi
 - Laya Local đã được tích hợp ở bước phân loại câu hỏi.
 - Laya Local hiện chỉ route câu hỏi; chưa xử lý trực tiếp từng tài liệu hoặc thay thế embedding/vector search.
 - LLM trong trang Settings là model sinh câu trả lời cuối cùng, không phải Laya Local.
+- PostgreSQL là relational store chính cho user, source, document, job và OCTX state; Qdrant là vector store chính cho embedding và retrieval.
 - Cấu hình Laya Local hiện dùng biến môi trường:
 
 ```env
@@ -59,6 +60,16 @@ SAG_LAYA_DEVICE=cpu
 - Với câu hỏi factual/knowledge hoặc kết quả Laya không chắc chắn, vẫn cho phép SAG tìm kiếm tài liệu.
 - Laya không được làm mất context của câu hỏi chỉ vì model trả về nhãn `noul` hoặc confidence thấp.
 - Nếu Laya lỗi hoặc chưa load được model, SAG phải có fallback và vẫn xử lý được câu hỏi theo cơ chế retrieval hiện có.
+
+### 3.3. Quyết định storage và indexing
+
+- `sag_relational_provider=postgres` là cấu hình relational mặc định.
+- `sag_vector_provider=qdrant` là cấu hình vector mặc định.
+- PostgreSQL lưu metadata và trạng thái nghiệp vụ; Qdrant lưu vector collection, payload chunk và kết quả vector search.
+- Embedding provider/model vẫn là một cấu hình độc lập với Qdrant. Qdrant chỉ lưu và tìm vector, không tự tạo embedding.
+- Qdrant phải được cấu hình bằng endpoint/API key qua environment; secret không được commit.
+- Vì Qdrant không cung cấp lexical search trong adapter hiện tại, strategy `multi` có thể fallback về `vector`. Test phải kiểm tra cả strategy yêu cầu và strategy thực tế.
+- Unit test có thể dùng in-memory/mock Qdrant, nhưng Checkpoint A và integration test phải có ít nhất một lần chạy với Qdrant thật (local container hoặc Qdrant Cloud).
 
 ## 4. Kế hoạch theo phase
 
@@ -135,8 +146,10 @@ SAG_LAYA_DEVICE=cpu
 - [ ] Thiết kế chunking theo heading/đoạn/trang, có overlap hợp lý.
 - [ ] Gắn metadata vào từng chunk: `document_id`, source, page, section, title và timestamps.
 - [ ] Tạo embedding hoặc dữ liệu search theo pipeline hiện có của SAG.
+- [ ] Tạo hoặc kiểm tra Qdrant collection với dimension khớp embedding model và lưu payload metadata của chunk.
 - [ ] Lưu chunk/index theo transaction hoặc cơ chế idempotent.
 - [ ] Xóa hoặc thay thế index cũ khi reprocess.
+- [ ] Đảm bảo bản ghi Document/Job trong PostgreSQL và vector/payload tương ứng trong Qdrant không bị lệch.
 - [ ] Ghi log theo từng stage để biết lỗi xảy ra ở parse, chunk, embedding hay persist.
 - [ ] Đảm bảo worker không làm mất trạng thái cuối cùng nếu một tài liệu bị lỗi.
 
@@ -147,6 +160,7 @@ SAG_LAYA_DEVICE=cpu
 - [ ] Nếu parse/indexing lỗi, Document chuyển `FAILED` và có error message có thể hiển thị.
 - [ ] Reprocess không tạo duplicate chunk hoặc duplicate vector.
 - [ ] Có thể tìm thấy một đoạn nội dung đã biết bằng truy vấn tương ứng.
+- [ ] Query không làm mất metadata dùng cho source/document/page/citation trong payload Qdrant.
 
 **Phụ thuộc:** Phase 1.
 
@@ -167,6 +181,7 @@ SAG_LAYA_DEVICE=cpu
 - [ ] Document chuyển đúng sang `READY`.
 - [ ] Có thể truy vấn trực tiếp và nhận được chunk liên quan.
 - [ ] Reprocess và failure path đã được kiểm tra.
+- [ ] Đã kiểm tra bằng đúng cấu hình PostgreSQL + Qdrant của môi trường triển khai.
 - [ ] Không có secret trong log hoặc file cấu hình đã commit.
 
 ---
@@ -218,6 +233,7 @@ SAG_LAYA_DEVICE=cpu
 **Công việc:**
 
 - [ ] Xác định tool retrieval chính: `search_context`, entity search hoặc tool tương đương.
+- [ ] Xác định Qdrant là vector path chính và ghi rõ behavior khi `multi` fallback về `vector`.
 - [ ] Đảm bảo query gốc của người dùng được giữ nguyên khi tìm kiếm.
 - [ ] Truyền filter theo source, document, quyền truy cập hoặc domain nếu có.
 - [ ] Xếp hạng và giới hạn số chunk trả về.
@@ -314,6 +330,7 @@ SAG_LAYA_DEVICE=cpu
 - [ ] Test Laya greeting, câu hỏi factual, tiếng Việt, fallback và model unavailable.
 - [ ] Đo thời gian parse, indexing, Laya first-load, Laya inference, retrieval và LLM.
 - [ ] Theo dõi số lượng job `FAILED`, thời gian xử lý và lỗi theo stage.
+- [ ] Có smoke test với PostgreSQL và Qdrant thật; không chỉ dựa vào mock adapter.
 - [ ] Kiểm tra memory/CPU khi Laya chạy CPU.
 - [ ] Kiểm tra xử lý đồng thời nhiều request hỏi và nhiều job upload.
 - [ ] Tạo bộ tài liệu mẫu và bộ câu hỏi chuẩn để regression test.
@@ -380,7 +397,7 @@ Phase 7: Test + observability
 
 ## 8. Các điểm cần xác nhận trước khi triển khai tiếp
 
-- [ ] SAG đang dùng vector database/index nào cho retrieval production?
+- [x] SAG dùng PostgreSQL cho relational state và Qdrant cho vector retrieval production.
 - [ ] Embedding model hiện tại là model nào và chạy ở đâu?
 - [ ] Có yêu cầu filter quyền truy cập theo user/source/document không?
 - [ ] Cần hỗ trợ thêm định dạng nào ngoài PDF, DOCX và TXT?
