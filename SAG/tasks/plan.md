@@ -63,11 +63,17 @@ SAG_LAYA_DEVICE=cpu
 
 ### 3.3. Quyết định storage và indexing
 
+Ranh giới ownership giữa Continuum BE và SAG được ghi rõ trong
+[`docs/data-ownership-and-storage.md`](../docs/data-ownership-and-storage.md).
+BE sở hữu user/project/team/permission; SAG sở hữu metadata RAG trong
+PostgreSQL và vector trong Qdrant.
+
 - `sag_relational_provider=postgres` là cấu hình relational mặc định.
 - `sag_vector_provider=qdrant` là cấu hình vector mặc định.
 - PostgreSQL lưu metadata và trạng thái nghiệp vụ; Qdrant lưu vector collection, payload chunk và kết quả vector search.
 - Embedding provider/model vẫn là một cấu hình độc lập với Qdrant. Qdrant chỉ lưu và tìm vector, không tự tạo embedding.
 - Qdrant phải được cấu hình bằng endpoint/API key qua environment; secret không được commit.
+- Quyền truy cập tài liệu phải được truyền từ BE bằng external ID/scope đã xác thực; SAG không tin tưởng `project_id` hoặc permission do frontend tự gửi.
 - Vì Qdrant không cung cấp lexical search trong adapter hiện tại, strategy `multi` có thể fallback về `vector`. Test phải kiểm tra cả strategy yêu cầu và strategy thực tế.
 - Unit test có thể dùng in-memory/mock Qdrant, nhưng Checkpoint A và integration test phải có ít nhất một lần chạy với Qdrant thật (local container hoặc Qdrant Cloud).
 
