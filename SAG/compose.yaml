@@ -20,17 +20,14 @@ services:
 
   qdrant:
     image: qdrant/qdrant:v1.14.1
+    # Local fallback only. The API can use Qdrant Cloud through
+    # SAG_SAG_QDRANT_URL/SAG_SAG_QDRANT_API_KEY without depending on this service.
     environment:
       QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-}
     volumes:
       - qdrantdata:/qdrant/storage
     ports:
       - "${BIND_ADDRESS:-127.0.0.1}:${QDRANT_PORT:-6333}:6333"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS -H 'api-key: ${QDRANT_API_KEY:-}' http://localhost:6333/healthz"]
-      interval: 5s
-      timeout: 5s
-      retries: 12
     restart: unless-stopped
 
   api:
@@ -41,8 +38,6 @@ services:
         SAG_API_EXTRAS: postgres
     depends_on:
       db:
-        condition: service_healthy
-      qdrant:
         condition: service_healthy
     environment:
       SAG_ENVIRONMENT: ${SAG_ENVIRONMENT:-dev}
@@ -69,8 +64,10 @@ services:
       SAG_UPLOAD_DIR: /data/uploads
       SAG_SAG_VECTOR_PROVIDER: qdrant
       SAG_SAG_RELATIONAL_PROVIDER: postgres
-      SAG_SAG_QDRANT_URL: http://qdrant:6333
-      SAG_SAG_QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      # Use the configured Qdrant Cloud endpoint by default; local Qdrant remains
+      # available as a fallback when SAG_SAG_QDRANT_URL is left unset.
+      SAG_SAG_QDRANT_URL: ${SAG_SAG_QDRANT_URL:-http://qdrant:6333}
+      SAG_SAG_QDRANT_API_KEY: ${SAG_SAG_QDRANT_API_KEY:-}
       SAG_SAG_PG_HOST: db
       SAG_SAG_PG_PORT: "5432"
       SAG_SAG_PG_USER: ${POSTGRES_USER:-sag}

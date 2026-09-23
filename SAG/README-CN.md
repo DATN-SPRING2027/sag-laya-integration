@@ -340,11 +340,21 @@ git pull --ff-only                 # 更新本地代码
 docker compose up -d --build       # 重建服务，不删除数据卷
 ```
 
+Docker 中的 API 从仓库根目录 `.env` 读取 Qdrant 配置。配置 Qdrant Cloud 时，使用：
+
+```env
+SAG_SAG_QDRANT_URL=https://<cluster-endpoint>
+SAG_SAG_QDRANT_API_KEY=<qdrant-api-key>
+```
+
+`apps/api/.env` 只用于直接在宿主机启动 API；`docker compose` 不会自动读取该文件。
+如果 `SAG_SAG_QDRANT_URL` 留空，API 会回退到 Compose 中的本地 `qdrant` 服务。
+
 默认持久化方式：
 
 | 运行方式 | 应用元数据 | 知识引擎 | 保存位置 |
 | --- | --- | --- | --- |
-| Docker 默认 | PostgreSQL | Qdrant | `pgdata`、`qdrantdata` 与 `sagdata` 数据卷 |
+| Docker 默认 | PostgreSQL | Qdrant Cloud（或本地 fallback） | `pgdata` 与 `sagdata` 数据卷；本地 Qdrant 使用 `qdrantdata` |
 | 本地开发 | PostgreSQL | Qdrant | `apps/api/.data/` 保存 OCTX/上传文件 |
 | PostgreSQL + Qdrant 覆盖 | PostgreSQL | Qdrant | `pgdata`、`qdrantdata` 与 `sagdata` 数据卷 |
 
