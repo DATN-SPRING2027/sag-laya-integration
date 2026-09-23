@@ -91,6 +91,11 @@ SAG_SAG_QDRANT_URL=https://<cluster-endpoint>
 SAG_SAG_QDRANT_API_KEY=<secret>
 ```
 
+Khi chạy bằng Docker Compose, hai biến Qdrant phải đặt trong `SAG/.env` ở
+thư mục gốc của Compose. `SAG/apps/api/.env` chỉ được đọc khi chạy API trực
+tiếp trên host; Compose không tự nạp file đó. Nếu không cấu hình endpoint,
+Compose dùng Qdrant local tại `http://qdrant:6333` làm fallback.
+
 Không commit API key hoặc credential thật vào repository.
 
 ## Phạm vi hiện tại và việc cần làm

@@ -350,11 +350,23 @@ git pull --ff-only                 # update the source checkout
 docker compose up -d --build       # rebuild without deleting volumes
 ```
 
+The API reads its Qdrant configuration from the repository-root `.env` when
+running in Docker Compose. For Qdrant Cloud, set:
+
+```env
+SAG_SAG_QDRANT_URL=https://<cluster-endpoint>
+SAG_SAG_QDRANT_API_KEY=<qdrant-api-key>
+```
+
+`apps/api/.env` is used only when the API runs directly on the host;
+`docker compose` does not load that file automatically. If
+`SAG_SAG_QDRANT_URL` is empty, the API falls back to the local `qdrant` service.
+
 Default persistence:
 
 | Runtime | Application metadata | Knowledge engine | Location |
 | --- | --- | --- | --- |
-| Docker default | PostgreSQL | Qdrant | `pgdata`, `qdrantdata`, and `sagdata` volumes |
+| Docker default | PostgreSQL | Qdrant Cloud (or local fallback) | `pgdata` and `sagdata` volumes; local Qdrant uses `qdrantdata` |
 | Local development | PostgreSQL | Qdrant | `apps/api/.data/` for OCTX/uploads |
 | PostgreSQL + Qdrant override | PostgreSQL | Qdrant | `pgdata`, `qdrantdata`, and `sagdata` volumes |
 
