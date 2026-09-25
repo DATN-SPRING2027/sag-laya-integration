@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 _QUERY_NOISE = (
     "知识库",
@@ -59,8 +59,79 @@ _LEGACY_TERM_RE = re.compile(
 # analogue of the Chinese segmentation that lets contiguous queries match
 # spaced evidence.
 _ALNUM_SUBTOKEN_RE = re.compile(r"[a-z]+|[0-9]+")
+_EXACT_TERM_RE = re.compile(r'"([^"\n]+)"|“([^”\n]+)”|「([^」\n]+)」|《([^》\n]+)》')
+_IDENTIFIER_RE = re.compile(
+    r"\b(?:ERR[_-][A-Z0-9_-]+|HTTP[_ -]?\d{3}|[A-Z][A-Z0-9_]{2,}|"
+    r"[A-Za-z]+[_-]\d+[A-Za-z0-9._-]*|v\d+(?:\.\d+)+)\b"
+)
+_PATH_RE = re.compile(
+    r"(?:/[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=%-]+|[A-Za-z]:\\[^\s]+|\b[\w-]+(?:\.[\w-]+){1,})"
+)
+_TEMPORAL_CUES = (
+    "trước",
+    "sau",
+    "từ",
+    "đến",
+    "khi",
+    "hiện tại",
+    "lúc đó",
+    "phiên bản",
+    "version",
+    "release",
+    "năm",
+    "tháng",
+    "ngày",
+)
+_RELATION_CUES = (
+    "liên quan",
+    "phụ thuộc",
+    "dùng bởi",
+    "kết nối",
+    "thuộc",
+    "gây ra",
+    "dẫn đến",
+    "khác gì",
+    "so sánh",
+    "compare",
+    "versus",
+    " vs ",
+)
+_GLOBAL_CUES = (
+    "tổng quan",
+    "toàn bộ",
+    "các chủ đề",
+    "kiến trúc chung",
+    "những vấn đề chính",
+    "xu hướng",
+    "bức tranh",
+    "overview",
+)
 
 Segmenter = Callable[[str], Iterable[str]]
+
+
+@dataclass(frozen=True, slots=True)
+class QueryFeatures:
+    """Deterministic signals shared by query routing and lexical retrieval."""
+
+    exact_terms: tuple[str, ...] = ()
+    identifier_terms: tuple[str, ...] = ()
+    path_terms: tuple[str, ...] = ()
+    temporal_cues: tuple[str, ...] = ()
+    relation_cues: tuple[str, ...] = ()
+    global_cues: tuple[str, ...] = ()
+    multi_hop: bool = False
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "exact_terms": list(self.exact_terms),
+            "identifier_terms": list(self.identifier_terms),
+            "path_terms": list(self.path_terms),
+            "temporal_cues": list(self.temporal_cues),
+            "relation_cues": list(self.relation_cues),
+            "global_cues": list(self.global_cues),
+            "multi_hop": self.multi_hop,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +141,7 @@ class QueryAnalysis:
     lookup_terms: tuple[str, ...]
     chinese_segmentation_used: bool
     expanded_terms: tuple[str, ...] = ()
+    features: QueryFeatures = field(default_factory=QueryFeatures)
 
 
 def normalize_lexical_text(value: str) -> str:
@@ -81,6 +153,49 @@ def _remove_query_noise(query: str) -> str:
     for phrase in _QUERY_NOISE:
         cleaned = cleaned.replace(phrase, " ")
     return cleaned
+
+
+def _unique_values(values: Iterable[str], *, limit: int = 8) -> tuple[str, ...]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = value.strip()
+        key = normalize_lexical_text(item)
+        if not item or not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+        if len(result) >= limit:
+            break
+    return tuple(result)
+
+
+def extract_query_features(query: str) -> QueryFeatures:
+    """Extract bounded, non-LLM query signals for routing and trace output."""
+
+    text = query.strip()
+    lowered = text.lower()
+    exact_terms = _unique_values(
+        match.group(index)
+        for match in _EXACT_TERM_RE.finditer(text)
+        for index in range(1, 5)
+        if match.group(index)
+    )
+    identifier_terms = _unique_values(match.group(0) for match in _IDENTIFIER_RE.finditer(text))
+    path_terms = _unique_values(match.group(0) for match in _PATH_RE.finditer(text))
+    temporal_cues = _unique_values(cue for cue in _TEMPORAL_CUES if cue in lowered)
+    relation_cues = _unique_values(cue.strip() for cue in _RELATION_CUES if cue in lowered)
+    global_cues = _unique_values(cue for cue in _GLOBAL_CUES if cue in lowered)
+    multi_hop = len(relation_cues) >= 2 or any(cue in lowered for cue in ("dẫn đến", "vì vậy", "từ đó"))
+    return QueryFeatures(
+        exact_terms=exact_terms,
+        identifier_terms=identifier_terms,
+        path_terms=path_terms,
+        temporal_cues=temporal_cues,
+        relation_cues=relation_cues,
+        global_cues=global_cues,
+        multi_hop=multi_hop,
+    )
 
 
 def _is_valid_term(value: str) -> bool:
@@ -180,16 +295,18 @@ def analyze_query(
 ) -> QueryAnalysis:
     cleaned = _remove_query_noise(query)
     phrase = normalize_lexical_text(cleaned)
+    features = extract_query_features(query)
     legacy_terms, legacy_expanded_terms = _legacy_query_terms(cleaned)
     legacy_lookup_terms = _lookup_terms(legacy_terms, phrase)
     chinese_runs = _chinese_runs(cleaned)
     if not segmentation_enabled or not chinese_runs:
         return QueryAnalysis(
-            phrase,
-            legacy_terms,
-            legacy_lookup_terms,
-            False,
-            legacy_expanded_terms,
+            normalized_phrase=phrase,
+            scoring_terms=legacy_terms,
+            lookup_terms=legacy_lookup_terms,
+            chinese_segmentation_used=False,
+            expanded_terms=legacy_expanded_terms,
+            features=features,
         )
 
     try:
@@ -199,19 +316,21 @@ def analyze_query(
         )
     except Exception:  # noqa: BLE001 -- retrieval must survive tokenizer failure
         return QueryAnalysis(
-            phrase,
-            legacy_terms,
-            legacy_lookup_terms,
-            False,
-            legacy_expanded_terms,
+            normalized_phrase=phrase,
+            scoring_terms=legacy_terms,
+            lookup_terms=legacy_lookup_terms,
+            chinese_segmentation_used=False,
+            expanded_terms=legacy_expanded_terms,
+            features=features,
         )
 
     return QueryAnalysis(
-        phrase,
-        scoring_terms,
-        _lookup_terms(scoring_terms, phrase),
-        True,
-        expanded_terms,
+        normalized_phrase=phrase,
+        scoring_terms=scoring_terms,
+        lookup_terms=_lookup_terms(scoring_terms, phrase),
+        chinese_segmentation_used=True,
+        expanded_terms=expanded_terms,
+        features=features,
     )
 
 

@@ -144,3 +144,83 @@ create a fresh Phase 4 backend branch from origin/main
 ```
 
 Next: Phase 4 — connect Laya routing to retrieval/context flow.
+
+---
+
+## I. Phase 3 Query Flow Integration Review
+
+> Branch: `feat/Thang-laya-query-flow-be-api`
+> Base: `origin/main`
+> Scope: integrate the existing Laya router and deterministic query analysis into
+> the API search flow; retrieval fusion, evidence context, citations and
+> ingestion/index work are explicitly out of scope.
+
+### Review result
+
+```
+Review Gate: PASS for the Phase 3 query-flow scope
+Blocking findings: None
+```
+
+### Routing contract
+
+| Input/result | API behavior | Trace evidence |
+| --- | --- | --- |
+| CHAT with confidence `>= 0.65` | Skip chunk/event retrieval and answer-generation stream | `retrieval=skipped`, `coarse_intent=CHAT` |
+| KNOWLEDGE or factual Vietnamese query | Preserve the original query and run retrieval | `retrieval=required` |
+| Exact identifier/path such as `ERR_TIMEOUT` | Preserve the identifier and user source scope | `query_analysis.features.identifier_terms` |
+| Low-confidence or AMBIGUOUS | Keep retrieval enabled | `coarse_intent=AMBIGUOUS` |
+| Laya unavailable or prediction error | Fall back to retrieval without exposing the exception | `fallback_used=true`, stable `fallback_reason` |
+
+The response `stats.query_route` record contains the original query, selected
+source scope, coarse intent, confidence, Laya model, requested/effective
+strategy, deterministic query features, reason codes, retrieval/fallback state,
+and retrieval-side fallback status. The original `SearchRequest` query and
+source scope are not replaced by normalized lexical terms or Laya output.
+
+### Verification
+
+Focused API routing/search tests:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q tests/test_laya_router.py tests/test_search_strategy.py tests/test_search_stream.py
+```
+
+Result: `34 passed`
+
+Query-analysis and retrieval regression:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q tests/test_laya_router.py tests/test_search_strategy.py tests/test_search_stream.py tests/test_query_analysis.py tests/test_retrieval_relevance.py
+```
+
+Result: `63 passed`
+
+Lint:
+
+```powershell
+.\.venv\Scripts\ruff.exe check sag_api/services/query_analysis.py sag_api/services/laya_router.py sag_api/api/v1/search.py tests/test_laya_router.py tests/test_search_strategy.py tests/test_search_stream.py
+```
+
+Result: `All checks passed`
+
+The full API suite completed with `612 passed, 1 skipped, 6 failed, 1 error`.
+The remaining failures/errors are outside this diff and are environment or
+existing-baseline issues: agentic time-tool expectation, GB18030 text
+normalization, platform path/permission behavior on Windows, settings/LLM
+defaults, and SQLite teardown locking. No Phase 3 focused test failed.
+
+### Impact and handoff
+
+```
+Database: NO
+Migration: NO
+Schema/config contract: NO
+Ingestion/index lane: NO
+Retrieval fusion/evidence/citation: NO
+Security: no raw Laya exception is returned in the query trace
+```
+
+Next phase may build retrieval fusion/evidence/citation on top of the stable
+`query_route` trace; it must keep the Phase 3 high-confidence CHAT gate and
+retrieval fallback behavior.

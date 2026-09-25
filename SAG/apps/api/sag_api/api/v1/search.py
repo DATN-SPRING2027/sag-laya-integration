@@ -4,7 +4,7 @@ import asyncio
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +22,7 @@ from sag_api.core.error_taxonomy import ErrorCode
 from sag_api.core.errors import ApiError, ValidationError
 from sag_api.core.logging import get_logger
 from sag_api.db.models import Source, User
+from sag_api.enums import SEARCH_STRATEGIES, normalize_search_strategy
 from sag_api.generation import LLMClient
 from sag_api.sag import EngineManager, RetrievedSection, SearchOutcome
 from sag_api.schemas.insight import EntityOut, GraphRelationOut
@@ -38,6 +39,8 @@ from sag_api.schemas.search import (
     SectionOut,
 )
 from sag_api.services.eval.llm_judge import judge_pairwise
+from sag_api.services.laya_router import CHAT_HIGH_CONFIDENCE, route_query
+from sag_api.services.query_analysis import analyze_query
 from sag_api.services.retrieval_service import (
     EventScoreMap,
     recall_event_scores,
@@ -56,6 +59,136 @@ class _EventGraphFields(TypedDict):
     events: list[SearchEventOut]
     entities: list[EntityOut]
     relations: list[GraphRelationOut]
+
+
+@dataclass(slots=True)
+class _QueryRoutePlan:
+    strategy: str
+    need_retrieval: bool
+    trace: dict[str, Any]
+
+
+def _query_feature_reason_codes(features: Any) -> list[str]:
+    reasons: list[str] = []
+    if features.exact_terms:
+        reasons.append("EXACT_PHRASE")
+    if features.identifier_terms:
+        reasons.append("EXACT_IDENTIFIER")
+    if features.path_terms:
+        reasons.append("EXACT_PATH_OR_SYMBOL")
+    if features.temporal_cues:
+        reasons.append("TEMPORAL_CUE")
+    if features.relation_cues:
+        reasons.append("RELATION_CUE")
+    if features.global_cues:
+        reasons.append("GLOBAL_CUE")
+    if features.multi_hop:
+        reasons.append("MULTI_HOP_CUE")
+    return reasons
+
+
+def _build_query_route(
+    query: str,
+    source_ids: list[str] | None,
+    requested_strategy: str | None,
+) -> _QueryRoutePlan:
+    analysis = analyze_query(query, segmentation_enabled=settings.search_chinese_segmentation_enabled)
+    route_error = False
+    try:
+        laya = route_query(query)
+    except Exception:  # noqa: BLE001 - Laya must never break retrieval
+        laya = {
+            "coarse_intent": "AMBIGUOUS",
+            "is_chitchat": False,
+            "need_retrieval": True,
+            "suggested_strategy": "multi",
+            "confidence": 0.0,
+            "model": "fallback",
+            "fallback_used": True,
+            "fallback_reason": "laya_route_error",
+            "reason_codes": ["LAYA_ROUTE_ERROR"],
+        }
+        route_error = True
+
+    confidence = laya.get("confidence", 0.0)
+    try:
+        confidence = max(0.0, min(1.0, float(confidence)))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    coarse_intent = str(laya.get("coarse_intent") or "").upper()
+    if not coarse_intent:
+        if bool(laya.get("is_chitchat")) and confidence >= CHAT_HIGH_CONFIDENCE:
+            coarse_intent = "CHAT"
+        elif bool(laya.get("need_retrieval", True)):
+            coarse_intent = "KNOWLEDGE"
+        else:
+            coarse_intent = "AMBIGUOUS"
+    if coarse_intent not in {"CHAT", "KNOWLEDGE", "COMMAND", "AMBIGUOUS"}:
+        coarse_intent = "AMBIGUOUS"
+    if coarse_intent == "CHAT" and confidence < CHAT_HIGH_CONFIDENCE:
+        coarse_intent = "AMBIGUOUS"
+    need_retrieval = coarse_intent != "CHAT"
+
+    configured_strategy = normalize_search_strategy(settings.search_strategy)
+    suggested_strategy = normalize_search_strategy(str(laya.get("suggested_strategy") or configured_strategy))
+    if suggested_strategy not in SEARCH_STRATEGIES:
+        suggested_strategy = configured_strategy if configured_strategy in SEARCH_STRATEGIES else "vector"
+    effective_strategy = normalize_search_strategy(requested_strategy or suggested_strategy)
+    if effective_strategy not in SEARCH_STRATEGIES:
+        effective_strategy = configured_strategy if configured_strategy in SEARCH_STRATEGIES else "vector"
+
+    fallback_used = bool(laya.get("fallback_used")) or route_error
+    fallback_reason = laya.get("fallback_reason")
+    if route_error:
+        fallback_reason = "laya_route_error"
+    reason_codes = [str(value) for value in (laya.get("reason_codes") or [])]
+    if requested_strategy:
+        reason_codes.append("EXPLICIT_STRATEGY")
+    reason_codes.extend(code for code in _query_feature_reason_codes(analysis.features) if code not in reason_codes)
+    trace = {
+        "version": "query-flow-v1",
+        "query_original": query,
+        "scope_source_ids": list(source_ids) if source_ids is not None else None,
+        "coarse_intent": coarse_intent,
+        "confidence": round(confidence, 4),
+        "model": laya.get("model", "fallback"),
+        "suggested_strategy": suggested_strategy,
+        "requested_strategy": requested_strategy or "auto",
+        "effective_strategy": effective_strategy,
+        "retrieval": "skipped" if not need_retrieval else "fallback" if fallback_used else "required",
+        "fallback_used": fallback_used,
+        "fallback_reason": fallback_reason,
+        "reason_codes": reason_codes,
+        "query_analysis": {
+            "normalized_phrase": analysis.normalized_phrase,
+            "lookup_terms": list(analysis.lookup_terms),
+            "features": analysis.features.as_dict(),
+        },
+    }
+    return _QueryRoutePlan(
+        strategy=effective_strategy,
+        need_retrieval=need_retrieval,
+        trace=trace,
+    )
+
+
+def _with_query_route_stats(
+    stats: dict[str, Any],
+    plan: _QueryRoutePlan,
+) -> dict[str, Any]:
+    merged = dict(stats)
+    trace = dict(plan.trace)
+    engine_fallback = bool(merged.get("fallback_used"))
+    engine_effective = merged.get("effective_strategy")
+    if engine_effective:
+        trace["effective_strategy"] = engine_effective
+    trace["retrieval_fallback_used"] = engine_fallback
+    if engine_fallback:
+        trace["fallback_used"] = True
+        trace["retrieval"] = "fallback"
+        trace["fallback_reason"] = trace["fallback_reason"] or "retrieval_strategy_fallback"
+    merged["query_route"] = trace
+    return merged
 
 
 def _source_hits(events: list[SearchEventOut]) -> list[SearchSourceHitOut]:
@@ -163,6 +296,24 @@ async def _prepare_global_search(
     engine_manager: EngineManager,
     body: GlobalSearchRequest,
 ) -> _PreparedGlobalSearch:
+    route_plan = _build_query_route(body.query, body.source_ids, body.strategy)
+    if not route_plan.need_retrieval:
+        stats = _with_query_route_stats(
+            {
+                "sources": 0,
+                "requested_strategy": route_plan.strategy,
+                "effective_strategy": None,
+                "fallback_used": False,
+            },
+            route_plan,
+        )
+        outcome = SearchOutcome(query=body.query, sections=[], stats=stats)
+        return _PreparedGlobalSearch(
+            sources=[],
+            outcome=outcome,
+            response=SearchResponse(query=body.query, sections=[], stats=stats),
+        )
+
     sources = await search_source_candidates(session, body.source_ids)
     # Retrieval and answer generation can be long-running. End the read-only
     # transaction as soon as source identity has been materialized so an SSE
@@ -170,11 +321,12 @@ async def _prepare_global_search(
     # engine or model. SessionLocal uses expire_on_commit=False.
     await session.commit()
     if not sources:
-        outcome = SearchOutcome(query=body.query, sections=[], stats={"sources": 0})
+        stats = _with_query_route_stats({"sources": 0}, route_plan)
+        outcome = SearchOutcome(query=body.query, sections=[], stats=stats)
         return _PreparedGlobalSearch(
             sources=[],
             outcome=outcome,
-            response=SearchResponse(query=body.query, sections=[], stats=outcome.stats),
+            response=SearchResponse(query=body.query, sections=[], stats=stats),
         )
 
     refs = {source.sag_source_config_id: source for source in sources}
@@ -183,7 +335,7 @@ async def _prepare_global_search(
             engine_manager,
             sources,
             body.query,
-            strategy=body.strategy,
+            strategy=route_plan.strategy,
             top_k=body.top_k,
         ),
         recall_event_scores(
@@ -199,12 +351,15 @@ async def _prepare_global_search(
         refs,
         event_scores=event_scores,
     )
-    stats = {
-        **outcome.stats,
-        "event_candidates": len(event_scores),
-        "event_hits": len(graph_fields["events"]),
-        "event_recall": "vector+chunk" if event_scores else "chunk",
-    }
+    stats = _with_query_route_stats(
+        {
+            **outcome.stats,
+            "event_candidates": len(event_scores),
+            "event_hits": len(graph_fields["events"]),
+            "event_recall": "vector+chunk" if event_scores else "chunk",
+        },
+        route_plan,
+    )
 
     section_outputs = []
     for section in outcome.sections:
@@ -221,9 +376,9 @@ async def _prepare_global_search(
 
     return _PreparedGlobalSearch(
         sources=sources,
-        outcome=outcome,
+        outcome=SearchOutcome(query=body.query, sections=outcome.sections, stats=stats),
         response=SearchResponse(
-            query=outcome.query,
+            query=body.query,
             sections=section_outputs,
             **graph_fields,
             source_hits=_source_hits(graph_fields["events"]),
@@ -286,21 +441,43 @@ async def search(
 ) -> SearchResponse:
     source = await get_source(session, source_id)
     refs = {source.sag_source_config_id: source}
-    outcome, event_scores = await asyncio.gather(
-        retrieve_relevant_sections(
-            engine_manager,
-            [source],
-            body.query,
-            strategy=body.strategy,
-            top_k=body.top_k,
-        ),
-        recall_event_scores(
-            engine_manager,
-            body.query,
-            refs,
-            limit=body.top_k,
-        ),
-    )
+    route_plan = _build_query_route(body.query, [source_id], body.strategy)
+    if route_plan.need_retrieval:
+        outcome, event_scores = await asyncio.gather(
+            retrieve_relevant_sections(
+                engine_manager,
+                [source],
+                body.query,
+                strategy=route_plan.strategy,
+                top_k=body.top_k,
+            ),
+            recall_event_scores(
+                engine_manager,
+                body.query,
+                refs,
+                limit=body.top_k,
+            ),
+        )
+        stats = _with_query_route_stats(
+            {
+                **outcome.stats,
+                "event_candidates": len(event_scores),
+            },
+            route_plan,
+        )
+        outcome = SearchOutcome(query=body.query, sections=outcome.sections, stats=stats)
+    else:
+        event_scores = {}
+        stats = _with_query_route_stats(
+            {
+                "sources": 0,
+                "requested_strategy": route_plan.strategy,
+                "effective_strategy": None,
+                "fallback_used": False,
+            },
+            route_plan,
+        )
+        outcome = SearchOutcome(query=body.query, sections=[], stats=stats)
     for section in outcome.sections:
         section.source_config_id = section.source_config_id or source.sag_source_config_id
     graph_fields = await _event_graph_fields(
@@ -311,20 +488,19 @@ async def search(
     )
     # 对外 source_id = sag 信源 id（可路由 / 取原文），不泄漏引擎内部 id
     return SearchResponse(
-        query=outcome.query,
+        query=body.query,
         sections=[
             SectionOut(**{**s.model_dump(), "source_id": source.id}, source_name=source.name) for s in outcome.sections
         ],
         **graph_fields,
         source_hits=_source_hits(graph_fields["events"]),
         summary=await synthesize_search_answer(
-            outcome.query,
+            body.query,
             outcome.sections,
             llm=llm,
         ),
         stats={
             **outcome.stats,
-            "event_candidates": len(event_scores),
             "event_hits": len(graph_fields["events"]),
             "event_recall": "vector+chunk" if event_scores else "chunk",
         },

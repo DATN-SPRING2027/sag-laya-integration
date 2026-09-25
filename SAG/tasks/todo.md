@@ -48,11 +48,19 @@ Nguồn chuẩn: [Workflow v1.1](../docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1
 
 ## Phase 3 — Laya & Query Analyzer
 
-- [ ] Kiểm tra coarse intent CHAT/KNOWLEDGE/COMMAND/AMBIGUOUS và giữ query gốc/user scope.
-- [ ] Chỉ bỏ retrieval với CHAT confidence cao; low-confidence/AMBIGUOUS vẫn fallback.
-- [ ] Kiểm tra Laya lazy/singleton, timeout/init failure và fallback khi unavailable.
-- [ ] Trích deterministic exact terms, identifiers, paths, entities, relation cues, temporal filters, global cues và multi-hop cues.
-- [ ] Kiểm tra lỗi/nhãn Laya không xóa query hoặc context.
+- [x] Kiểm tra coarse intent CHAT/KNOWLEDGE/COMMAND/AMBIGUOUS và giữ query gốc/user scope.
+- [x] Chỉ bỏ retrieval với CHAT confidence cao; low-confidence/AMBIGUOUS vẫn fallback.
+- [x] Kiểm tra Laya lazy/singleton, timeout/init failure và fallback khi unavailable.
+- [x] Trích deterministic exact terms, identifiers, paths, relation/temporal/global/multi-hop cues cho query trace.
+- [x] Kiểm tra lỗi/nhãn Laya không xóa query hoặc context.
+
+### Phase 3 review — API query flow
+
+- [x] Tích hợp Laya và query analysis vào `/search`, `/search/stream` và source-scoped search flow.
+- [x] Ghi `query_route` trace: coarse intent, confidence, requested/effective strategy, query analysis, scope và fallback reason.
+- [x] Regression greeting, factual tiếng Việt, exact identifier, ambiguous/low-confidence và Laya error.
+- [x] Giữ ngoài phạm vi Phase 3 này: retrieval fusion, evidence context, citation và ingestion/index lane.
+- [x] Evidence: [phase-3-review-report.md](../docs/phase-3-review-report.md).
 
 ## Phase 4 — Retrieval Engine v1
 

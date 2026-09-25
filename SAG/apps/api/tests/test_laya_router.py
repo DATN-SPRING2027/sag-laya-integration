@@ -46,6 +46,7 @@ def test_route_greeting_vietnamese():
     assert "confidence" in result
     assert "latency_ms" in result
     # Chào hỏi tiếng Việt phải được nhận diện là chitchat
+    assert result["coarse_intent"] == "CHAT"
     assert result["is_chitchat"] is True
     assert result["need_retrieval"] is False
 
@@ -53,6 +54,28 @@ def test_route_greeting_vietnamese():
 def test_route_business_document_query():
     result = route_query("Quy trình xin thanh toán chi phí công tác và hóa đơn tài chính của công ty")
     assert "query" in result
+    assert result["coarse_intent"] == "KNOWLEDGE"
+    assert result["is_chitchat"] is False
+    assert result["need_retrieval"] is True
+
+
+def test_low_confidence_chat_is_ambiguous_and_keeps_retrieval(monkeypatch):
+    class UncertainRouter:
+        def predict(self, state, questions):
+            return {
+                "answers": {
+                    "intent_type": {"choice": "chit_chat", "confidence": 0.5},
+                    "domain_topic": {"choice": "general"},
+                },
+                "routing": {"model": "fake"},
+            }
+
+    monkeypatch.setattr(laya_router, "_ROUTER", UncertainRouter())
+    monkeypatch.setattr(laya_router, "_ROUTER_INIT_ERROR", None)
+
+    result = route_query("Bạn khỏe không?")
+
+    assert result["coarse_intent"] == "AMBIGUOUS"
     assert result["is_chitchat"] is False
     assert result["need_retrieval"] is True
 
@@ -138,6 +161,9 @@ def test_failed_prediction_disables_repeated_model_loads(monkeypatch):
     assert first["model"] == "fallback"
     assert second["model"] == "fallback"
     assert calls == 1
+    assert first["coarse_intent"] == "AMBIGUOUS"
+    assert first["fallback_used"] is True
+    assert first["fallback_reason"] == "laya_predict_failed"
 
 
 def test_invalid_local_model_path_is_cached_as_safe_fallback(monkeypatch, tmp_path):
@@ -151,6 +177,9 @@ def test_invalid_local_model_path_is_cached_as_safe_fallback(monkeypatch, tmp_pa
 
     assert first["model"] == "fallback"
     assert first["need_retrieval"] is True
+    assert first["coarse_intent"] == "AMBIGUOUS"
+    assert first["fallback_used"] is True
+    assert first["fallback_reason"] == "laya_unavailable"
     assert second["model"] == "fallback"
     assert second["need_retrieval"] is True
     assert first_error
