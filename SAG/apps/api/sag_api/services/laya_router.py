@@ -15,6 +15,7 @@ log = get_logger("laya_router")
 _ROUTER: Any | None = None
 _ROUTER_INIT_ERROR: str | None = None
 _ROUTER_LOCK = Lock()
+CHAT_HIGH_CONFIDENCE = 0.65
 
 
 def _local_bundle_is_multilingual_only() -> bool:
@@ -80,6 +81,30 @@ def get_laya_router() -> Any | None:
             return None
 
 
+def _fallback_route(query: str, reason: str) -> dict[str, Any]:
+    return {
+        "query": query,
+        "coarse_intent": "AMBIGUOUS",
+        "is_chitchat": False,
+        "need_retrieval": True,
+        "suggested_strategy": "multi",
+        "domain": "general",
+        "confidence": 0.0,
+        "latency_ms": 0.0,
+        "model": "fallback",
+        "fallback_used": True,
+        "fallback_reason": reason,
+        "reason_codes": [reason.upper()],
+    }
+
+
+def _confidence(value: Any) -> float:
+    try:
+        return round(max(0.0, min(1.0, float(value))), 4)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def route_query(query: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
     """Phân tích câu hỏi người dùng qua Laya trong ~30ms để định tuyến chiến lược.
 
@@ -96,6 +121,7 @@ def route_query(query: str, context: dict[str, Any] | None = None) -> dict[str, 
     if not cleaned:
         return {
             "query": query,
+            "coarse_intent": "CHAT",
             "is_chitchat": True,
             "need_retrieval": False,
             "suggested_strategy": "vector",
@@ -103,25 +129,20 @@ def route_query(query: str, context: dict[str, Any] | None = None) -> dict[str, 
             "confidence": 1.0,
             "latency_ms": 0.0,
             "model": "rule",
+            "fallback_used": False,
+            "fallback_reason": None,
+            "reason_codes": ["EMPTY_QUERY"],
         }
 
     router = get_laya_router()
     if router is None:
-        # Fallback an toàn nếu Laya tắt hoặc chưa sẵn sàng
-        return {
-            "query": query,
-            "is_chitchat": False,
-            "need_retrieval": True,
-            "suggested_strategy": "multi",
-            "domain": "general",
-            "confidence": 0.5,
-            "latency_ms": 0.0,
-            "model": "fallback",
-        }
+        # Fallback an toàn nếu Laya tắt hoặc chưa sẵn sàng.
+        reason = "laya_disabled" if not settings.enable_laya else "laya_unavailable"
+        return _fallback_route(query, reason)
 
     state = {"query": cleaned}
     if context:
-        state.update(context)
+        state.update({key: value for key, value in context.items() if key != "query"})
 
     questions = {
         "intent_type": {
@@ -155,35 +176,66 @@ def route_query(query: str, context: dict[str, Any] | None = None) -> dict[str, 
     start_time = time.perf_counter()
     try:
         predict_kwargs = {"model": "multilingual"} if _local_bundle_is_multilingual_only() else {}
-        pred = router.predict(state, questions, **predict_kwargs)
+        try:
+            pred = router.predict(state, questions, **predict_kwargs)
+        except TypeError as error:
+            # Keep lightweight test doubles and older Laya adapters compatible
+            # when the optional model selector is not part of their signature.
+            if predict_kwargs and "unexpected keyword argument" in str(error):
+                pred = router.predict(state, questions)
+            else:
+                raise
         elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
 
         answers = pred.get("answers", {})
         routing_meta = pred.get("routing", {})
 
         intent_res = answers.get("intent_type", {})
-        intent_choice = intent_res.get("choice", "factual_lookup")
-        intent_conf = intent_res.get("confidence", 0.5)
+        intent_choice = str(intent_res.get("choice", "factual_lookup")).strip().lower()
+        intent_conf = _confidence(intent_res.get("confidence", 0.5))
 
         domain_res = answers.get("domain_topic", {})
         domain_choice = domain_res.get("choice", "general")
 
-        is_chitchat = intent_choice == "chit_chat" and intent_conf >= 0.5
-        # Never let an uncertain auxiliary noul score suppress grounding for
-        # factual/complex questions. False negatives are worse than one extra
-        # retrieval; only high-confidence chitchat skips SAG knowledge search.
-        need_retrieval = not is_chitchat
-        suggested_strategy = "multi" if intent_choice == "complex_reasoning" else "vector"
+        is_chat_intent = intent_choice in {"chit_chat", "chat", "greeting"}
+        is_command = intent_choice in {"command", "tool_call", "action"}
+        if is_chat_intent and intent_conf >= CHAT_HIGH_CONFIDENCE:
+            coarse_intent = "CHAT"
+            reason_codes = ["HIGH_CONFIDENCE_CHAT"]
+        elif is_chat_intent:
+            coarse_intent = "AMBIGUOUS"
+            reason_codes = ["CHAT_CONFIDENCE_LOW"]
+        elif is_command:
+            coarse_intent = "COMMAND"
+            reason_codes = ["COMMAND_INTENT"]
+        elif intent_conf < CHAT_HIGH_CONFIDENCE:
+            coarse_intent = "AMBIGUOUS"
+            reason_codes = ["INTENT_CONFIDENCE_LOW"]
+        else:
+            coarse_intent = "KNOWLEDGE"
+            reason_codes = ["KNOWLEDGE_INTENT"]
+
+        # False negatives are worse than one extra retrieval: only high-
+        # confidence CHAT is allowed to suppress the knowledge path.
+        is_chitchat = coarse_intent == "CHAT"
+        need_retrieval = coarse_intent != "CHAT"
+        suggested_strategy = (
+            "multi" if intent_choice == "complex_reasoning" or coarse_intent == "AMBIGUOUS" else "vector"
+        )
 
         return {
             "query": query,
+            "coarse_intent": coarse_intent,
             "is_chitchat": is_chitchat,
             "need_retrieval": need_retrieval,
             "suggested_strategy": suggested_strategy,
             "domain": domain_choice,
-            "confidence": round(intent_conf, 4),
+            "confidence": intent_conf,
             "latency_ms": elapsed_ms,
             "model": routing_meta.get("model", "laya"),
+            "fallback_used": False,
+            "fallback_reason": None,
+            "reason_codes": reason_codes,
         }
     except Exception as exc:  # noqa: BLE001
         global _ROUTER, _ROUTER_INIT_ERROR
@@ -193,16 +245,12 @@ def route_query(query: str, context: dict[str, Any] | None = None) -> dict[str, 
             _ROUTER = None
             _ROUTER_INIT_ERROR = str(exc)
         log.warning("Lỗi trong quá trình Laya predict (%s), chuyển về fallback.", exc)
-        return {
-            "query": query,
-            "is_chitchat": False,
-            "need_retrieval": True,
-            "suggested_strategy": "vector",
-            "domain": "general",
-            "confidence": 0.5,
-            "latency_ms": 0.0,
-            "model": "fallback",
-        }
+        reason = (
+            "laya_unavailable"
+            if "model path not found" in str(exc).lower()
+            else "laya_predict_failed"
+        )
+        return _fallback_route(query, reason)
 
 
 def reset_laya_router_for_tests() -> None:

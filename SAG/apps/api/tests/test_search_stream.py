@@ -102,11 +102,25 @@ async def _search(
     llm,
     *,
     request_overrides: dict | None = None,
+    route_result: dict | None = None,
 ) -> list[tuple[str, dict]]:
+    from sag_api.api.v1 import search as search_api
     from sag_api.core.deps import get_engine_manager
     from sag_api.main import app
 
     engine = SearchEngine()
+    route_result = route_result or {
+        "coarse_intent": "KNOWLEDGE",
+        "is_chitchat": False,
+        "need_retrieval": True,
+        "suggested_strategy": "vector",
+        "confidence": 0.99,
+        "model": "fake",
+        "fallback_used": False,
+        "fallback_reason": None,
+    }
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(search_api, "route_query", lambda query, context=None: {**route_result, "query": query})
     app.dependency_overrides[get_engine_manager] = lambda: engine
     try:
         transport = httpx.ASGITransport(app=app)
@@ -128,6 +142,7 @@ async def _search(
                 return _events(response.text)
     finally:
         app.dependency_overrides.pop(get_engine_manager, None)
+        monkeypatch.undo()
 
 
 @pytest.mark.asyncio
@@ -184,6 +199,31 @@ async def test_search_stream_provider_failure_completes_with_grounded_fallback()
     ]
     assert events[1][1]["delta"] == "未完成的内容"
     assert "[1]" in events[-1][1]["summary"]
+
+
+@pytest.mark.asyncio
+async def test_search_stream_skips_retrieval_for_high_confidence_chat():
+    llm = StreamingLLM(["không được gọi"])
+    events = await _search(
+        llm,
+        request_overrides={"query": "Xin chào"},
+        route_result={
+            "coarse_intent": "CHAT",
+            "is_chitchat": True,
+            "need_retrieval": False,
+            "suggested_strategy": "vector",
+            "confidence": 0.99,
+            "model": "fake",
+            "fallback_used": False,
+            "fallback_reason": None,
+        },
+    )
+
+    assert [name for name, _payload in events] == ["result", "completed"]
+    assert events[0][1]["query"] == "Xin chào"
+    assert events[0][1]["sections"] == []
+    assert events[0][1]["stats"]["query_route"]["retrieval"] == "skipped"
+    assert llm.stream_calls == 0
 
 
 @pytest.mark.asyncio

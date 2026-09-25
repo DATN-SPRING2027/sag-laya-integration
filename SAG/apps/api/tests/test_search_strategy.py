@@ -1,6 +1,7 @@
 """全局搜索只公开快速/精确两档，并始终保持信源 fan-out 边界。"""
 
 import asyncio
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -13,14 +14,46 @@ from sqlalchemy import delete
 async def _register(client: httpx.AsyncClient) -> dict[str, str]:
     response = await client.post(
         "/api/v1/auth/register",
-        json={"email": "search-strategy@t.com", "password": "password123"},
+        json={"email": f"search-strategy-{uuid.uuid4().hex}@t.com", "password": "password123"},
     )
     assert response.status_code == 201, response.text
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
 
 
 @pytest.mark.asyncio
-async def test_global_search_forwards_validated_strategy():
+async def test_query_route_offloads_laya_prediction_from_event_loop(monkeypatch):
+    from sag_api.api.v1 import search as search_api
+
+    event_loop_thread = threading.get_ident()
+    route_thread: int | None = None
+
+    def blocking_route(query, context=None):
+        nonlocal route_thread
+        route_thread = threading.get_ident()
+        return {
+            "query": query,
+            "coarse_intent": "KNOWLEDGE",
+            "is_chitchat": False,
+            "need_retrieval": True,
+            "suggested_strategy": "vector",
+            "confidence": 0.99,
+            "model": "fake",
+            "fallback_used": False,
+            "fallback_reason": None,
+        }
+
+    monkeypatch.setattr(search_api, "route_query", blocking_route)
+
+    plan = await search_api._build_query_route("câu hỏi factual", None, None)
+
+    assert plan.need_retrieval is True
+    assert route_thread is not None
+    assert route_thread != event_loop_thread
+
+
+@pytest.mark.asyncio
+async def test_global_search_forwards_validated_strategy(monkeypatch):
+    from sag_api.api.v1 import search as search_api
     from sag_api.core.deps import get_engine_manager
     from sag_api.main import app
     from sag_api.sag.dto import (
@@ -36,6 +69,7 @@ async def test_global_search_forwards_validated_strategy():
         strategy: str | None = None
         top_k: int | None = None
         event_top_k: int | None = None
+        query: str | None = None
 
         def __init__(self):
             self.started: set[str] = set()
@@ -54,6 +88,7 @@ async def test_global_search_forwards_validated_strategy():
             await self._meet_parallel_gate("chunks")
             self.strategy = strategy
             self.top_k = top_k
+            self.query = query
             source_config_id = targets[0][0]
             return SearchOutcome(
                 query=query,
@@ -108,6 +143,21 @@ async def test_global_search_forwards_validated_strategy():
             )
 
     engine = RecordingEngine()
+    monkeypatch.setattr(
+        search_api,
+        "route_query",
+        lambda query, context=None: {
+            "query": query,
+            "coarse_intent": "KNOWLEDGE",
+            "is_chitchat": False,
+            "need_retrieval": True,
+            "suggested_strategy": "multi",
+            "confidence": 0.99,
+            "model": "fake",
+            "fallback_used": False,
+            "fallback_reason": None,
+        },
+    )
     app.dependency_overrides[get_engine_manager] = lambda: engine
     try:
         transport = httpx.ASGITransport(app=app)
@@ -133,6 +183,7 @@ async def test_global_search_forwards_validated_strategy():
                 )
                 assert response.status_code == 200, response.text
                 assert engine.strategy == "multi"
+                assert engine.query == "策略测试"
                 # 对外仍返回 7 条；内部有界扩大候选池，之后统一重排与过滤。
                 assert engine.top_k == 21
                 assert engine.event_top_k == 7
@@ -144,6 +195,10 @@ async def test_global_search_forwards_validated_strategy():
                 assert result["stats"]["event_candidates"] == 1
                 assert result["stats"]["event_hits"] == 1
                 assert result["stats"]["event_recall"] == "vector+chunk"
+                assert result["stats"]["query_route"]["query_original"] == "策略测试"
+                assert result["stats"]["query_route"]["requested_strategy"] == "multi"
+                assert result["stats"]["query_route"]["effective_strategy"] == "multi"
+                assert result["stats"]["query_route"]["fallback_used"] is False
                 assert "[1]" in result["summary"]
                 assert result["events"][0]["title"] == "外卖骑手收入变化"
                 assert result["events"][0]["chunk_id"] == "event-chunk-not-in-section-results"
@@ -165,6 +220,151 @@ async def test_global_search_forwards_validated_strategy():
                     json={"query": "策略测试", "strategy": "unknown"},
                 )
                 assert invalid.status_code == 422
+    finally:
+        app.dependency_overrides.pop(get_engine_manager, None)
+
+
+@pytest.mark.asyncio
+async def test_global_search_skips_retrieval_for_high_confidence_chat(monkeypatch):
+    from sag_api.api.v1 import search as search_api
+    from sag_api.core.deps import get_engine_manager
+    from sag_api.main import app
+
+    class FailingEngine:
+        async def provision(self, *_args, **_kwargs):
+            return None
+
+        async def search_many(self, *_args, **_kwargs):
+            raise AssertionError("CHAT query must not call retrieval")
+
+        async def search_event_scores(self, *_args, **_kwargs):
+            raise AssertionError("CHAT query must not call event retrieval")
+
+    monkeypatch.setattr(
+        search_api,
+        "route_query",
+        lambda query, context=None: {
+            "query": query,
+            "coarse_intent": "CHAT",
+            "is_chitchat": True,
+            "need_retrieval": False,
+            "suggested_strategy": "vector",
+            "confidence": 0.99,
+            "model": "fake",
+            "fallback_used": False,
+            "fallback_reason": None,
+        },
+    )
+    engine = FailingEngine()
+    app.dependency_overrides[get_engine_manager] = lambda: engine
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+                headers = await _register(client)
+                source = await client.post(
+                    "/api/v1/sources",
+                    headers=headers,
+                    json={"name": "chat route test"},
+                )
+                response = await client.post(
+                    "/api/v1/search",
+                    headers=headers,
+                    json={
+                        "query": "Xin chào",
+                        "source_ids": [source.json()["id"]],
+                    },
+                )
+
+                assert response.status_code == 200, response.text
+                payload = response.json()
+                assert payload["query"] == "Xin chào"
+                assert payload["sections"] == []
+                trace = payload["stats"]["query_route"]
+                assert trace["coarse_intent"] == "CHAT"
+                assert trace["retrieval"] == "skipped"
+                assert trace["fallback_used"] is False
+    finally:
+        app.dependency_overrides.pop(get_engine_manager, None)
+
+
+@pytest.mark.asyncio
+async def test_global_search_falls_back_when_laya_errors_without_losing_scope(monkeypatch):
+    from sag_api.api.v1 import search as search_api
+    from sag_api.core.deps import get_engine_manager
+    from sag_api.main import app
+    from sag_api.sag.dto import RetrievedSection, SearchOutcome, SourceGraphInfo
+
+    class RetrievalEngine:
+        query: str | None = None
+
+        async def provision(self, *_args, **_kwargs):
+            return None
+
+        async def search_many(self, targets, query, *, strategy=None, top_k=None):
+            self.query = query
+            return SearchOutcome(
+                query=query,
+                sections=[
+                    RetrievedSection(
+                        chunk_id="identifier-chunk",
+                        heading="Error code",
+                        content="ERR_TIMEOUT is retriable.",
+                        score=0.9,
+                        source_config_id=targets[0][0],
+                    )
+                ],
+                stats={
+                    "requested_strategy": strategy,
+                    "effective_strategy": "vector",
+                    "fallback_used": True,
+                },
+            )
+
+        async def search_event_scores(self, *_args, **_kwargs):
+            return {}
+
+        async def graph_for_sections(self, *_args, **_kwargs):
+            return SourceGraphInfo()
+
+    def broken_laya(_query, _context=None):
+        raise RuntimeError("checkpoint token must stay internal")
+
+    monkeypatch.setattr(search_api, "route_query", broken_laya)
+    engine = RetrievalEngine()
+    app.dependency_overrides[get_engine_manager] = lambda: engine
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+                headers = await _register(client)
+                source = await client.post(
+                    "/api/v1/sources",
+                    headers=headers,
+                    json={"name": "identifier route test"},
+                )
+                source_id = source.json()["id"]
+                response = await client.post(
+                    "/api/v1/search",
+                    headers=headers,
+                    json={
+                        "query": "ERR_TIMEOUT",
+                        "source_ids": [source_id],
+                    },
+                )
+
+                assert response.status_code == 200, response.text
+                payload = response.json()
+                assert payload["query"] == "ERR_TIMEOUT"
+                assert engine.query == "ERR_TIMEOUT"
+                trace = payload["stats"]["query_route"]
+                assert trace["coarse_intent"] == "AMBIGUOUS"
+                assert trace["retrieval"] == "fallback"
+                assert trace["fallback_used"] is True
+                assert trace["fallback_reason"] == "laya_route_error"
+                assert trace["scope_source_ids"] == [source_id]
+                assert "ERR_TIMEOUT" in trace["query_analysis"]["features"]["identifier_terms"]
+                assert "checkpoint token" not in response.text
     finally:
         app.dependency_overrides.pop(get_engine_manager, None)
 
