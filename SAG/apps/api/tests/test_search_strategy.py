@@ -1,6 +1,7 @@
 """全局搜索只公开快速/精确两档，并始终保持信源 fan-out 边界。"""
 
 import asyncio
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -17,6 +18,37 @@ async def _register(client: httpx.AsyncClient) -> dict[str, str]:
     )
     assert response.status_code == 201, response.text
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+
+@pytest.mark.asyncio
+async def test_query_route_offloads_laya_prediction_from_event_loop(monkeypatch):
+    from sag_api.api.v1 import search as search_api
+
+    event_loop_thread = threading.get_ident()
+    route_thread: int | None = None
+
+    def blocking_route(query, context=None):
+        nonlocal route_thread
+        route_thread = threading.get_ident()
+        return {
+            "query": query,
+            "coarse_intent": "KNOWLEDGE",
+            "is_chitchat": False,
+            "need_retrieval": True,
+            "suggested_strategy": "vector",
+            "confidence": 0.99,
+            "model": "fake",
+            "fallback_used": False,
+            "fallback_reason": None,
+        }
+
+    monkeypatch.setattr(search_api, "route_query", blocking_route)
+
+    plan = await search_api._build_query_route("câu hỏi factual", None, None)
+
+    assert plan.need_retrieval is True
+    assert route_thread is not None
+    assert route_thread != event_loop_thread
 
 
 @pytest.mark.asyncio

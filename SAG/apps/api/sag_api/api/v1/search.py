@@ -87,7 +87,7 @@ def _query_feature_reason_codes(features: Any) -> list[str]:
     return reasons
 
 
-def _build_query_route(
+async def _build_query_route(
     query: str,
     source_ids: list[str] | None,
     requested_strategy: str | None,
@@ -95,7 +95,7 @@ def _build_query_route(
     analysis = analyze_query(query, segmentation_enabled=settings.search_chinese_segmentation_enabled)
     route_error = False
     try:
-        laya = route_query(query)
+        laya = await asyncio.to_thread(route_query, query)
     except Exception:  # noqa: BLE001 - Laya must never break retrieval
         laya = {
             "coarse_intent": "AMBIGUOUS",
@@ -296,7 +296,7 @@ async def _prepare_global_search(
     engine_manager: EngineManager,
     body: GlobalSearchRequest,
 ) -> _PreparedGlobalSearch:
-    route_plan = _build_query_route(body.query, body.source_ids, body.strategy)
+    route_plan = await _build_query_route(body.query, body.source_ids, body.strategy)
     if not route_plan.need_retrieval:
         stats = _with_query_route_stats(
             {
@@ -441,7 +441,7 @@ async def search(
 ) -> SearchResponse:
     source = await get_source(session, source_id)
     refs = {source.sag_source_config_id: source}
-    route_plan = _build_query_route(body.query, [source_id], body.strategy)
+    route_plan = await _build_query_route(body.query, [source_id], body.strategy)
     if route_plan.need_retrieval:
         outcome, event_scores = await asyncio.gather(
             retrieve_relevant_sections(
