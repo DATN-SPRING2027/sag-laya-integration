@@ -365,7 +365,7 @@ Mọi ID thực thể phải được sinh theo công thức tất định để
 
 Mở rộng cấu trúc từ `apps/api/sag_api/core/error_taxonomy.py`:
 
-### 6.1. Ma Trận ErrorLayer & ErrorStage Mới
+### 6.1. Ma Trận ErrorLayer & ErrorStage Mở Rộng
 - **`ErrorLayer`**:
   - `CLIENT`: Lỗi client gửi sai định dạng, file quá lớn, header thiếu.
   - `API`: Lỗi validation, thiếu tenant/project scope.
@@ -376,7 +376,20 @@ Mở rộng cấu trúc từ `apps/api/sag_api/core/error_taxonomy.py`:
   - `ROUTING`: Lỗi giải thuật Leiden, vi phạm ràng buộc chất lượng cây.
 
 - **`ErrorStage`**:
-  - `RECEIVE` $\rightarrow$ `PARSE` $\rightarrow$ `DEDUP` $\rightarrow$ `SEARCH_INDEX` $\rightarrow$ `KNOWLEDGE_EXTRACT` $\rightarrow$ `GRAPH_LINK` $\rightarrow$ `TREE_BUILD` $\rightarrow$ `ROUTING` $\rightarrow$ `RETRIEVE` $\rightarrow$ `SYNTHESIZE`.
+  - *Kế thừa đầy đủ các stage hiện hữu* từ `apps/api/sag_api/core/error_taxonomy.py`:
+    - Ingestion gốc: `upload`, `parse`, `chunk`, `embed`, `extract`, `persist`
+    - Hỏi đáp & Agent: `retrieve`, `generate`, `tool`
+    - Cấu hình & Bảo mật ngang: `config`, `auth`, `unknown`
+    - OCTX lifecycle: `octx_upload`, `octx_validate`, `octx_resolve`, `octx_import`, `octx_index`, `octx_switch`, `octx_export`, `octx_publish`
+  - *Bổ sung các stage mới* cho Two-Lane Ingestion & Tree Knowledge:
+    - `receive`: Nhận và kiểm tra hash file tại endpoint
+    - `dedup`: Khử trùng lặp nội dung canonical blocks
+    - `search_index`: Upsert vector dense/sparse vào Qdrant
+    - `knowledge_extract`: Trích xuất thực thể, sự kiện tri thức (E0/E1/E2)
+    - `graph_link`: Xây dựng đồ thị liên kết đa tín hiệu
+    - `tree_build`: Phân cụm Leiden và sinh cây tri thức phân cấp
+    - `routing`: Quyết định điều hướng nhánh cây
+    - `synthesize`: Tổng hợp câu trả lời cuối cùng kèm trích dẫn
 
 ### 6.2. Cấu Trúc Khung Lỗi Chuẩn Hóa (Standard Error Envelope)
 
@@ -384,8 +397,14 @@ Mở rộng cấu trúc từ `apps/api/sag_api/core/error_taxonomy.py`:
 class ErrorDetail(BaseModel):
     error_layer: Literal["client", "api", "engine", "llm", "store", "laya", "routing"]
     error_stage: Literal[
-        "receive", "parse", "dedup", "search_index", 
-        "knowledge_extract", "graph_link", "tree_build", "routing", "retrieve", "synthesize"
+        # Các stage hiện hành trong codebase:
+        "upload", "parse", "chunk", "embed", "extract", "persist",
+        "retrieve", "generate", "tool", "config", "auth", "unknown",
+        "octx_upload", "octx_validate", "octx_resolve", "octx_import",
+        "octx_index", "octx_switch", "octx_export", "octx_publish",
+        # Các stage bổ sung cho Two-Lane & Tree Routing:
+        "receive", "dedup", "search_index", "knowledge_extract",
+        "graph_link", "tree_build", "routing", "synthesize"
     ]
     error_code: str
     message: str
@@ -399,17 +418,24 @@ class ErrorDetail(BaseModel):
 ## 7. Hợp Đồng Định Tuyến, Chiến Lược & Manifests (Pillar 4)
 
 ### 7.1. Hợp Đồng Laya Coarse Intent (Preserved Contract)
-Khớp chính xác với triển khai đã kiểm chứng tại `apps/api/sag_api/services/laya_router.py`:
+Khớp chính xác 100% với kết quả trả về của hàm `route_query()` tại `apps/api/sag_api/services/laya_router.py`:
 
 ```python
 class LayaIntentResult(BaseModel):
+    query: str
     coarse_intent: Literal["CHAT", "KNOWLEDGE", "COMMAND", "AMBIGUOUS"]
+    is_chitchat: bool
+    need_retrieval: bool
+    suggested_strategy: Literal["vector", "multi"] = "vector"
+    domain: str = "general"
     confidence: float
-    is_fallback: bool
-    fallback_reason: str | None
-    model_name: str = "multilingual"
+    latency_ms: float = 0.0
+    model: str = "laya"
+    fallback_used: bool = False
+    fallback_reason: str | None = None
+    reason_codes: list[str] = Field(default_factory=list)
 
-# Quy tắc chuyển tiếp:
+# Quy tắc chuyển tiếp nghiệp vụ:
 # IF coarse_intent == "CHAT" AND confidence >= 0.65 THEN:
 #     need_retrieval = False
 # ELSE:
