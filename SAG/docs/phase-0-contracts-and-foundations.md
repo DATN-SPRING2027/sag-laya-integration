@@ -244,7 +244,7 @@ CREATE TABLE IF NOT EXISTS search_units (
     document_version_id UUID NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
     block_from_id UUID NOT NULL REFERENCES canonical_blocks(id),
     block_to_id UUID NOT NULL REFERENCES canonical_blocks(id),
-    security_partition_id VARCHAR(64) NOT NULL DEFAULT 'public',
+    security_partition_id VARCHAR(64) NOT NULL, -- Bắt buộc chỉ định rõ (ví dụ: 'public', 'team_backend', 'internal'), cấm default để chống rò rỉ dữ liệu mật
     content_hash VARCHAR(64) NOT NULL,
     token_count INTEGER NOT NULL,
     page_from INTEGER NOT NULL,
@@ -255,7 +255,24 @@ CREATE TABLE IF NOT EXISTS search_units (
 CREATE INDEX IF NOT EXISTS idx_search_units_version ON search_units (document_version_id);
 CREATE INDEX IF NOT EXISTS idx_search_units_security ON search_units (security_partition_id);
 
--- 8. Bảng quản lý trạng thái search của project (Blue-Green dual pointer)
+-- 8. Bảng lưu trữ cạnh đồ thị tri thức (Knowledge Graph Edges)
+CREATE TABLE IF NOT EXISTS knowledge_graph_edges (
+    id UUID PRIMARY KEY,
+    project_id VARCHAR(64) NOT NULL,
+    source_unit_id UUID NOT NULL REFERENCES search_units(id) ON DELETE CASCADE,
+    target_unit_id UUID NOT NULL REFERENCES search_units(id) ON DELETE CASCADE,
+    edge_type VARCHAR(32) NOT NULL, -- LEXICAL_COOCCUR, STRUCTURAL_ADJACENT, SEMANTIC_SIMILAR, ENTITY_SHARED
+    weight FLOAT NOT NULL DEFAULT 1.0,
+    calibrated_weight FLOAT NOT NULL DEFAULT 1.0,
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_knowledge_graph_edges_pair_type UNIQUE (source_unit_id, target_unit_id, edge_type)
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_graph_edges_project ON knowledge_graph_edges (project_id);
+CREATE INDEX IF NOT EXISTS idx_knowledge_graph_edges_source ON knowledge_graph_edges (source_unit_id);
+CREATE INDEX IF NOT EXISTS idx_knowledge_graph_edges_target ON knowledge_graph_edges (target_unit_id);
+
+-- 9. Bảng quản lý trạng thái search của project (Blue-Green dual pointer)
 CREATE TABLE IF NOT EXISTS project_search_state (
     project_id VARCHAR(64) PRIMARY KEY,
     slot_a_tree_version VARCHAR(64),
@@ -267,7 +284,7 @@ CREATE TABLE IF NOT EXISTS project_search_state (
     last_switched_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- 9. Bảng Tree Manifest kiểm soát chất lượng cây tri thức
+-- 10. Bảng Tree Manifest kiểm soát chất lượng cây tri thức
 CREATE TABLE IF NOT EXISTS tree_manifests (
     tree_version VARCHAR(64) PRIMARY KEY,
     project_id VARCHAR(64) NOT NULL,
@@ -569,9 +586,9 @@ Mọi truy vấn Cosine Similarity trên Qdrant **bắt buộc** truyền bộ l
 ### 9.1. Upload Tài Liệu Có Idempotency & Versioning
 - **Endpoint**: `POST /api/v1/projects/{project_id}/documents/upload`
 - **Headers**:
-  - `X-Continuum-User-Id`: ID người thực hiện
-  - `Idempotency-Key`: Khóa chống lặp (UUID hoặc client token)
-  - `X-Continuum-Security-Partition`: Phân vùng bảo mật (`public`, `team_backend`...)
+  - `X-Continuum-User-Id`: ID người thực hiện (Bắt buộc)
+  - `Idempotency-Key`: Khóa chống lặp (UUID hoặc client token, Bắt buộc)
+  - `X-Continuum-Security-Partition`: Phân vùng bảo mật (`public`, `team_backend`... Bắt buộc. Nếu thiếu header này, API lập tức từ chối với mã HTTP 400 `MISSING_SECURITY_PARTITION` để ngăn chặn lộ lọt dữ liệu)
 - **Form Data**: `file` (multipart binary), `source_published_at` (optional ISO timestamp)
 - **Thuật toán xử lý Idempotency & Kiểm tra Xung Đột Payload (Conflict Detection)**:
   1. Khi nhận request kèm header `Idempotency-Key`, server xác định `idempotency_key = client_token.strip()`.
@@ -601,10 +618,16 @@ Mọi truy vấn Cosine Similarity trên Qdrant **bắt buộc** truyền bộ l
            }
          }
          ```
-  5. **Nếu chưa tồn tại**:
+  5. **Nếu chưa tồn tại (Xử lý đồng thời & Phục hồi Race Condition)**:
      - Mở transaction database: xác định logical document (hoặc tạo mới), tính toán `version_no` tiếp theo, chèn `document_versions` (với `file_hash = incoming_payload_hash`, `search_status = 'PENDING'`, `knowledge_status = 'NOT_STARTED'`), chèn `source_snapshots`, và tạo `ingestion_runs` với `(tenant_id, project_id, idempotency_key, payload_hash = incoming_payload_hash)`.
-     - Đưa job vào Celery / background worker queue.
-     - Trả về mã HTTP 201 Created với `"is_duplicate": false`.
+     - **Cơ chế phục hồi Race Condition khi 2 request đến cùng mili-giây**:
+       - Cả hai request có thể đều vượt qua bước kiểm tra 3 và cố gắng INSERT `ingestion_runs`.
+       - Request 1 INSERT thành công. Request 2 gặp lỗi `UniqueViolation` tại ràng buộc `uq_ingestion_runs_tenant_project_idempotency`.
+       - Transaction của Request 2 rollback việc tạo version thừa. Khối `try/except UniqueViolation` của server bắt lỗi, thực hiện lại `SELECT` để đọc bản ghi do Request 1 vừa tạo, sau đó so sánh `incoming_payload_hash`:
+         - Nếu trùng khớp: Trả về **HTTP 200 OK** (`"is_duplicate": true`) kèm thông tin run của Request 1.
+         - Nếu khác hash: Trả về **HTTP 409 Conflict** (`IDEMPOTENCY_PAYLOAD_MISMATCH`).
+       - Nhờ cơ chế này, client gửi concurrent retries luôn nhận được kết quả idempotent hợp lệ mà không bao giờ gặp lỗi sập 500.
+     - Sau khi INSERT thành công: Đưa job vào Celery / background worker queue và trả về HTTP 201 Created (`"is_duplicate": false`).
 - **Response 201 Created**:
   ```json
   {
@@ -717,7 +740,7 @@ Mọi truy vấn Cosine Similarity trên Qdrant **bắt buộc** truyền bộ l
 Theo [plan.md](../tasks/plan.md), Phase 0 đạt cổng nghiệm thu khi thỏa mãn toàn bộ các tiêu chí:
 
 - [x] **Tiêu chí 1: Khảo sát & Gap Matrix hoàn tất**: Đã đối chiếu toàn diện hiện trạng code (`db/models/`, `api/v1/`, `services/`, `jobs/`) với đặc tả `Workflow v1.1`.
-- [x] **Tiêu chí 2: Thực thể & Định danh chốt chuẩn**: Đã ban hành cấu trúc DDL PostgreSQL 16 chi tiết cho 9 bảng (`documents`, `document_versions`, `source_snapshots`, `ingestion_runs`, `stage_runs`, `canonical_blocks`, `search_units`, `project_search_state`, `tree_manifests`) và công thức sinh UUIDv5.
+- [x] **Tiêu chí 2: Thực thể & Định danh chốt chuẩn**: Đã ban hành cấu trúc DDL PostgreSQL 16 chi tiết cho 10 bảng (`documents`, `document_versions`, `source_snapshots`, `ingestion_runs`, `stage_runs`, `canonical_blocks`, `search_units`, `knowledge_graph_edges`, `project_search_state`, `tree_manifests`) và công thức sinh UUIDv5.
 - [x] **Tiêu chí 3: Ngữ nghĩa Readiness tách rời**: Đã quy định ranh giới độc lập giữa `SEARCH_READY` (Hybrid retrieval khả dụng) và `KNOWLEDGE_READY` (Tree enrichment). Sự cố tại nhánh Knowledge không hạ Search capability.
 - [x] **Tiêu chí 4: Hợp đồng Query & Manifests**: Chuẩn hóa xong Pydantic contract cho Laya coarse-intent, deterministic features, Query Strategy Planner, Retrieval Trace và Tree Manifest quality gates.
 - [x] **Tiêu chí 5: Phân vùng bảo mật & Rollback**: Thiết lập cơ chế Qdrant pre-filtering chống rò rỉ dữ liệu và cơ chế chuyển đổi Dual-Slot A/B $< 100\text{ms}$.
