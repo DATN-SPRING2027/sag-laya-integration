@@ -107,10 +107,11 @@ Hệ thống Phase 0 chuẩn hóa mô hình dữ liệu quan hệ, chuyển từ
 │  - storage_uri: VARCHAR(1024)    │  │  - project_id: VARCHAR(64)       │
 │  - original_filename: VARCHAR    │  │  - document_version_id: UUID (FK)│
 │  - mime_type: VARCHAR(128)       │  │  - idempotency_key: VARCHAR(64)  │
-│  - byte_size: BIGINT             │  │  - current_stage: VARCHAR(32)    │
-│  - checksum_sha256: VARCHAR(64)  │  │  - status: VARCHAR(32)           │
-│  - created_at: TIMESTAMPTZ       │  │  - attempt_count: INTEGER        │
-└──────────────────────────────────┘  │  - error_layer: VARCHAR(32)      │
+│  - byte_size: BIGINT             │  │  - payload_hash: VARCHAR(64)     │
+│  - checksum_sha256: VARCHAR(64)  │  │  - current_stage: VARCHAR(32)    │
+│  - created_at: TIMESTAMPTZ       │  │  - status: VARCHAR(32)           │
+└──────────────────────────────────┘  │  - attempt_count: INTEGER        │
+                                      │  - error_layer: VARCHAR(32)      │
                                       │  - error_code: VARCHAR(64)       │
                                       │  - started_at, completed_at      │
                                       └──────────────────┬───────────────┘
@@ -190,6 +191,7 @@ CREATE TABLE IF NOT EXISTS ingestion_runs (
     project_id VARCHAR(64) NOT NULL,
     document_version_id UUID NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
     idempotency_key VARCHAR(64) NOT NULL,
+    payload_hash VARCHAR(64) NOT NULL,
     current_stage VARCHAR(32) NOT NULL DEFAULT 'RECEIVE',
     status VARCHAR(32) NOT NULL DEFAULT 'QUEUED',
     attempt_count INTEGER NOT NULL DEFAULT 1,
@@ -296,7 +298,8 @@ Mọi ID thực thể phải được sinh theo công thức tất định để
    $$\text{unit\_id} = \text{UUIDv5}(\text{NAMESPACE\_URL}, f\text{"sag:unit:\{version\_id\}:\{ordinal\}"})$$
    $$\text{point\_id} = \text{UUIDv5}(\text{NAMESPACE\_URL}, f\text{"sag:qdrant:search\_units:\{unit\_id\}"})$$
 5. **Idempotency Key Engine**:
-   $$\text{idempotency\_key} = \text{SHA-256}(f\text{"\{tenant\_id\}:\{project\_id\}:\{file\_hash\}:\{client\_token\}"})$$
+   $$\text{idempotency\_key} = \text{client\_token}\quad (\text{chuỗi token client gửi qua header, độ dài } \le 64)$$
+   *Lưu ý bảo mật & toàn vẹn dữ liệu*: Tuyệt đối không nhúng `file_hash` vào `idempotency_key`. Khi client gửi lại cùng một `Idempotency-Key` nhưng đi kèm file/payload khác, hệ thống tra cứu theo `(tenant_id, project_id, idempotency_key)` và phát hiện sự sai khác của `payload_hash` để từ chối bằng lỗi **HTTP 409 Conflict** (`IDEMPOTENCY_PAYLOAD_MISMATCH`), ngăn chặn tình trạng vô tình nạp tài liệu khác dưới cùng một transaction token.
 
 ---
 
@@ -570,14 +573,36 @@ Mọi truy vấn Cosine Similarity trên Qdrant **bắt buộc** truyền bộ l
   - `Idempotency-Key`: Khóa chống lặp (UUID hoặc client token)
   - `X-Continuum-Security-Partition`: Phân vùng bảo mật (`public`, `team_backend`...)
 - **Form Data**: `file` (multipart binary), `source_published_at` (optional ISO timestamp)
-- **Thuật toán xử lý Idempotency & Pre-allocation Lookup**:
-  1. Khi nhận request kèm header `Idempotency-Key`, server tính toán / xác định `idempotency_key = SHA-256(tenant_id:project_id:file_hash:client_token)` theo công thức tại Section 4.
-  2. Server thực hiện truy vấn bảng `ingestion_runs` theo cặp khóa `(tenant_id, project_id, idempotency_key)` **trước khi tạo bất kỳ bản ghi `document_version` mới nào**.
-  3. **Nếu bản ghi đã tồn tại**:
-     - Lấy thông tin `document_version_id` và `id` của run đó từ database.
-     - Trả về ngay lập tức mã HTTP 200 OK với cờ `"is_duplicate": true`, không cấp phát version mới và không trigger lại background pipeline.
-  4. **Nếu chưa tồn tại**:
-     - Mở transaction database: xác định logical document (hoặc tạo mới), tính toán `version_no` tiếp theo, chèn `document_versions` (với `search_status = 'PENDING'`, `knowledge_status = 'NOT_STARTED'`), chèn `source_snapshots`, và tạo `ingestion_runs` với `(tenant_id, project_id, idempotency_key)`.
+- **Thuật toán xử lý Idempotency & Kiểm tra Xung Đột Payload (Conflict Detection)**:
+  1. Khi nhận request kèm header `Idempotency-Key`, server xác định `idempotency_key = client_token.strip()`.
+  2. Server tính toán `incoming_payload_hash = SHA-256(file_bytes)`.
+  3. Server thực hiện truy vấn bảng `ingestion_runs` theo cặp khóa `(tenant_id, project_id, idempotency_key)` **trước khi tạo bất kỳ bản ghi `document_version` mới nào**:
+     ```sql
+     SELECT id, document_version_id, payload_hash, status 
+     FROM ingestion_runs 
+     WHERE tenant_id = :tenant_id AND project_id = :project_id AND idempotency_key = :idempotency_key;
+     ```
+  4. **Nếu bản ghi đã tồn tại**:
+     - **Kiểm tra Payload tương ứng**:
+       - *Trường hợp trùng khớp (Valid Retry)*: `incoming_payload_hash == existing_run.payload_hash`. Server trả về ngay lập tức mã HTTP 200 OK với thông tin của `document_version_id` và `id` hiện có, gán cờ `"is_duplicate": true`, không cấp phát version mới và không chạy lại pipeline.
+       - *Trường hợp xung đột (Reused Key with Different Payload)*: `incoming_payload_hash != existing_run.payload_hash`. Server lập tức từ chối và trả về mã **HTTP 409 Conflict**:
+         ```json
+         {
+           "error_layer": "client",
+           "error_stage": "receive",
+           "error_code": "IDEMPOTENCY_PAYLOAD_MISMATCH",
+           "message": "Idempotency key is already bound to a different file payload hash. Reusing an idempotency key across different file contents is forbidden.",
+           "retryable": false,
+           "attempt_count": 1,
+           "context": {
+             "idempotency_key": "req_upload_abc123",
+             "existing_payload_hash": "e3b0c442...",
+             "incoming_payload_hash": "a591a6d4..."
+           }
+         }
+         ```
+  5. **Nếu chưa tồn tại**:
+     - Mở transaction database: xác định logical document (hoặc tạo mới), tính toán `version_no` tiếp theo, chèn `document_versions` (với `file_hash = incoming_payload_hash`, `search_status = 'PENDING'`, `knowledge_status = 'NOT_STARTED'`), chèn `source_snapshots`, và tạo `ingestion_runs` với `(tenant_id, project_id, idempotency_key, payload_hash = incoming_payload_hash)`.
      - Đưa job vào Celery / background worker queue.
      - Trả về mã HTTP 201 Created với `"is_duplicate": false`.
 - **Response 201 Created**:
