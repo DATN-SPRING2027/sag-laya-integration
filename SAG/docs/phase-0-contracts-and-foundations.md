@@ -92,6 +92,8 @@ Hệ thống Phase 0 chuẩn hóa mô hình dữ liệu quan hệ, chuyển từ
 │  - valid_from: TIMESTAMPTZ (Thời điểm bắt đầu có hiệu lực)             │
 │  - valid_to: TIMESTAMPTZ (Thời điểm hết hiệu lực, Default: 9999-12-31) │
 │  - status: VARCHAR(32) (RECEIVED, PARSED, SEARCH_READY...)             │
+│  - search_status: VARCHAR(32) (PENDING, INDEXING, SEARCH_READY, FAILED)│
+│  - knowledge_status: VARCHAR(32) (NOT_STARTED, ..., FAILED_RETRYABLE)  │
 │  - search_ready_at: TIMESTAMPTZ                                        │
 │  - knowledge_ready_at: TIMESTAMPTZ                                     │
 └──────────────────┬──────────────────────────────────┬──────────────────┘
@@ -101,14 +103,16 @@ Hệ thống Phase 0 chuẩn hóa mô hình dữ liệu quan hệ, chuyển từ
 ┌──────────────────▼───────────────┐  ┌───────────────▼──────────────────┐
 │         source_snapshots         │  │          ingestion_runs          │
 │  - id: UUID (Primary Key)        │  │  - id: UUID (Primary Key)        │
-│  - document_version_id: UUID (FK)│  │  - document_version_id: UUID (FK)│
-│  - storage_uri: VARCHAR(1024)    │  │  - idempotency_key: VARCHAR(64)  │
-│  - original_filename: VARCHAR    │  │  - current_stage: VARCHAR(32)    │
-│  - mime_type: VARCHAR(128)       │  │  - status: VARCHAR(32)           │
-│  - byte_size: BIGINT             │  │  - attempt_count: INTEGER        │
-│  - checksum_sha256: VARCHAR(64)  │  │  - error_layer: VARCHAR(32)      │
-│  - created_at: TIMESTAMPTZ       │  │  - error_code: VARCHAR(64)       │
-└──────────────────────────────────┘  │  - started_at, completed_at      │
+│  - document_version_id: UUID (FK)│  │  - tenant_id: VARCHAR(64)        │
+│  - storage_uri: VARCHAR(1024)    │  │  - project_id: VARCHAR(64)       │
+│  - original_filename: VARCHAR    │  │  - document_version_id: UUID (FK)│
+│  - mime_type: VARCHAR(128)       │  │  - idempotency_key: VARCHAR(64)  │
+│  - byte_size: BIGINT             │  │  - current_stage: VARCHAR(32)    │
+│  - checksum_sha256: VARCHAR(64)  │  │  - status: VARCHAR(32)           │
+│  - created_at: TIMESTAMPTZ       │  │  - attempt_count: INTEGER        │
+└──────────────────────────────────┘  │  - error_layer: VARCHAR(32)      │
+                                      │  - error_code: VARCHAR(64)       │
+                                      │  - started_at, completed_at      │
                                       └──────────────────┬───────────────┘
                                                          │ 1
                                                          │ N
@@ -154,6 +158,8 @@ CREATE TABLE IF NOT EXISTS document_versions (
     valid_from TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     valid_to TIMESTAMPTZ NOT NULL DEFAULT '9999-12-31 23:59:59+00',
     status VARCHAR(32) NOT NULL DEFAULT 'RECEIVED',
+    search_status VARCHAR(32) NOT NULL DEFAULT 'PENDING',
+    knowledge_status VARCHAR(32) NOT NULL DEFAULT 'NOT_STARTED',
     search_ready_at TIMESTAMPTZ,
     knowledge_ready_at TIMESTAMPTZ,
     metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -162,6 +168,8 @@ CREATE TABLE IF NOT EXISTS document_versions (
 );
 CREATE INDEX IF NOT EXISTS idx_document_versions_hash ON document_versions (file_hash);
 CREATE INDEX IF NOT EXISTS idx_document_versions_temporal ON document_versions (valid_from, valid_to);
+CREATE INDEX IF NOT EXISTS idx_document_versions_search_status ON document_versions (search_status);
+CREATE INDEX IF NOT EXISTS idx_document_versions_knowledge_status ON document_versions (knowledge_status);
 
 -- 3. Bảng snapshot file gốc
 CREATE TABLE IF NOT EXISTS source_snapshots (
@@ -178,6 +186,8 @@ CREATE TABLE IF NOT EXISTS source_snapshots (
 -- 4. Bảng vòng chạy nạp tài liệu (Ingestion Run)
 CREATE TABLE IF NOT EXISTS ingestion_runs (
     id UUID PRIMARY KEY,
+    tenant_id VARCHAR(64) NOT NULL,
+    project_id VARCHAR(64) NOT NULL,
     document_version_id UUID NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
     idempotency_key VARCHAR(64) NOT NULL,
     current_stage VARCHAR(32) NOT NULL DEFAULT 'RECEIVE',
@@ -191,8 +201,9 @@ CREATE TABLE IF NOT EXISTS ingestion_runs (
     started_at TIMESTAMPTZ,
     completed_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uq_ingestion_runs_idempotency UNIQUE (document_version_id, idempotency_key)
+    CONSTRAINT uq_ingestion_runs_tenant_project_idempotency UNIQUE (tenant_id, project_id, idempotency_key)
 );
+CREATE INDEX IF NOT EXISTS idx_ingestion_runs_tenant_project ON ingestion_runs (tenant_id, project_id);
 CREATE INDEX IF NOT EXISTS idx_ingestion_runs_status ON ingestion_runs (status);
 
 -- 5. Bảng chi tiết từng stage thực thi
@@ -344,9 +355,9 @@ Mọi ID thực thể phải được sinh theo công thức tất định để
 ```
 
 ### 5.2. Nguyên Tắc Cách Ly Sự Cố (Failure Isolation Principles)
-1. **Nguyên tắc Độc lập Năng lực**: Làn Ingestion đến `SEARCH_READY` chỉ thực thi các tác vụ deterministic (Parse $\rightarrow$ Chunk $\rightarrow$ Hash $\rightarrow$ Embed $\rightarrow$ Qdrant Upsert). Không có LLM phụ thuộc ở làn này.
-2. **Không Khóa Chức Năng**: Khi nhánh làm giàu tri thức gặp lỗi (LLM quá tải, timeout, Leiden graph không hội tụ), trạng thái của DocumentVersion **giữ nguyên `SEARCH_READY`**, chỉ chuyển cờ `knowledge_status = FAILED_RETRYABLE`.
-3. **Fallback Tuyệt Đối**: Bất kỳ khi nào Knowledge Tree bị lỗi hoặc chưa sẵn sàng (`KNOWLEDGE_READY = False`), mọi truy vấn tự động kích hoạt **Global Hybrid Retrieval** để đảm bảo người dùng luôn nhận được câu trả lời và trích dẫn chuẩn xác.
+1. **Nguyên tắc Độc lập Năng lực**: Làn Ingestion đến `SEARCH_READY` chỉ thực thi các tác vụ deterministic (Parse $\rightarrow$ Chunk $\rightarrow$ Hash $\rightarrow$ Embed $\rightarrow$ Qdrant Upsert). Không có LLM phụ thuộc ở làn này. Cột `search_status` phản ánh trạng thái làn tìm kiếm độc lập (`PENDING` $\rightarrow$ `INDEXING` $\rightarrow$ `SEARCH_READY` hoặc `FAILED`).
+2. **Không Khóa Chức Năng**: Khi nhánh làm giàu tri thức gặp lỗi (LLM quá tải, timeout, Leiden graph không hội tụ), `search_status` của `document_versions` **vẫn giữ nguyên `SEARCH_READY`**, chỉ chuyển cờ `knowledge_status = FAILED_RETRYABLE` (hoặc `FAILED_FATAL`). Cột tổng quan `status` vẫn báo hiệu tài liệu đã sẵn sàng phục vụ tìm kiếm với chế độ Hybrid Fallback, không làm gián đoạn trải nghiệm người dùng.
+3. **Fallback Tuyệt Đối**: Bất kỳ khi nào Knowledge Tree bị lỗi hoặc chưa sẵn sàng (`knowledge_status != 'KNOWLEDGE_READY'`), mọi truy vấn tự động kích hoạt **Global Hybrid Retrieval** để đảm bảo người dùng luôn nhận được câu trả lời và trích dẫn chuẩn xác.
 
 ---
 
@@ -533,6 +544,16 @@ Mọi truy vấn Cosine Similarity trên Qdrant **bắt buộc** truyền bộ l
   - `Idempotency-Key`: Khóa chống lặp (UUID hoặc client token)
   - `X-Continuum-Security-Partition`: Phân vùng bảo mật (`public`, `team_backend`...)
 - **Form Data**: `file` (multipart binary), `source_published_at` (optional ISO timestamp)
+- **Thuật toán xử lý Idempotency & Pre-allocation Lookup**:
+  1. Khi nhận request kèm header `Idempotency-Key`, server tính toán / xác định `idempotency_key = SHA-256(tenant_id:project_id:file_hash:client_token)` theo công thức tại Section 4.
+  2. Server thực hiện truy vấn bảng `ingestion_runs` theo cặp khóa `(tenant_id, project_id, idempotency_key)` **trước khi tạo bất kỳ bản ghi `document_version` mới nào**.
+  3. **Nếu bản ghi đã tồn tại**:
+     - Lấy thông tin `document_version_id` và `id` của run đó từ database.
+     - Trả về ngay lập tức mã HTTP 200 OK với cờ `"is_duplicate": true`, không cấp phát version mới và không trigger lại background pipeline.
+  4. **Nếu chưa tồn tại**:
+     - Mở transaction database: xác định logical document (hoặc tạo mới), tính toán `version_no` tiếp theo, chèn `document_versions` (với `search_status = 'PENDING'`, `knowledge_status = 'NOT_STARTED'`), chèn `source_snapshots`, và tạo `ingestion_runs` với `(tenant_id, project_id, idempotency_key)`.
+     - Đưa job vào Celery / background worker queue.
+     - Trả về mã HTTP 201 Created với `"is_duplicate": false`.
 - **Response 201 Created**:
   ```json
   {
@@ -542,6 +563,8 @@ Mọi truy vấn Cosine Similarity trên Qdrant **bắt buộc** truyền bộ l
     "run_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
     "file_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "status": "RECEIVED",
+    "search_status": "PENDING",
+    "knowledge_status": "NOT_STARTED",
     "is_duplicate": false
   }
   ```
@@ -554,6 +577,8 @@ Mọi truy vấn Cosine Similarity trên Qdrant **bắt buộc** truyền bộ l
     "document_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
     "version_no": 1,
     "status": "SEARCH_READY",
+    "search_status": "SEARCH_READY",
+    "knowledge_status": "EXTRACTING",
     "search_ready": true,
     "knowledge_ready": false,
     "current_stage": "KNOWLEDGE_EXTRACT",
