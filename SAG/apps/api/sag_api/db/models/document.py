@@ -13,9 +13,19 @@ class Document(IDMixin, TimestampMixin, Base):
     __table_args__ = (
         Index("ix_documents_source_sag_source", "source_id", "sag_source_id"),
         Index("ix_documents_source_active_created", "source_id", "is_active", "created_at"),
+        Index("ix_documents_tenant_project_logical", "tenant_id", "project_id", "logical_source_id"),
     )
 
-    source_id: Mapped[str] = mapped_column(ForeignKey("sources.id", ondelete="CASCADE"), index=True)
+    tenant_id: Mapped[str] = mapped_column(
+        String(64), default="tenant_continuum_default", server_default="tenant_continuum_default"
+    )
+    project_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    owner_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    logical_source_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+
+    source_id: Mapped[str | None] = mapped_column(
+        ForeignKey("sources.id", ondelete="CASCADE"), index=True, nullable=True
+    )
     filename: Mapped[str] = mapped_column(String(512))
     content_type: Mapped[str] = mapped_column(String(128), default="application/octet-stream")
     size_bytes: Mapped[int] = mapped_column(Integer, default=0)
@@ -28,13 +38,13 @@ class Document(IDMixin, TimestampMixin, Base):
     progress: Mapped[int] = mapped_column(Integer, default=0)
     token_usage: Mapped[int] = mapped_column(BigInteger, default=0)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # 失败归属：责任层（api/engine/llm/store）与链路环节（parse/chunk/extract/...），
-    # 便于研发从导出日志直接定位。仅在 status=failed 时有值。
+    # Failure attribution: responsibility layer (api/engine/llm/store) and pipeline stage (parse/chunk/extract/...),
+    # facilitating debugging directly from export logs. Populated only when status=failed.
     error_layer: Mapped[str | None] = mapped_column(String(16), nullable=True)
     error_stage: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    # zleap-sag ingest 返回的 source_id（用于溯源）
+    # zleap-sag ingest returned source_id (for provenance tracking)
     sag_source_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    # OCTX 更新先写入影子 installation；最终切换时只暴露新文档版本。
+    # OCTX updates are staged in shadow installation; final cutover exposes only the new document revision.
     octx_installation_id: Mapped[str | None] = mapped_column(
         ForeignKey("octx_installations.id", ondelete="SET NULL"), nullable=True, index=True
     )

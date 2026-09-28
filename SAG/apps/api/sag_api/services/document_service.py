@@ -1,19 +1,41 @@
-"""文档领域逻辑：上传落盘 → 登记 → 入队处理。"""
+"""Document domain logic: upload persistence -> registration -> enqueue processing."""
 
 from __future__ import annotations
 
 import os
+import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 
 from sqlalchemy import case, func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sag_api.core.errors import ConflictError, NotFoundError
+from sag_api.core.config import settings
+from sag_api.core.error_taxonomy import ErrorLayer, ErrorStage
+from sag_api.core.errors import ConflictError, NotFoundError, ValidationError
+from sag_api.core.identity import (
+    compute_payload_hash,
+    generate_doc_id,
+    generate_version_id,
+    normalize_idempotency_key,
+)
 from sag_api.db.base import new_id
 from sag_api.db.models import Document, Job, Source
+from sag_api.db.models.routing_rag import (
+    DocumentVersion,
+    IngestionRun,
+    SourceSnapshot,
+    StageRun,
+)
 from sag_api.enums import DocumentStatus, JobStatus, JobType
 from sag_api.jobs import JobQueue
 from sag_api.jobs.scheduling import DELETE_PRIORITY, RESUME_PRIORITY, set_scheduler
+from sag_api.schemas.routing_rag import (
+    DocumentUploadResponse,
+    DocumentVersionStatusResponse,
+    StageProgressItem,
+)
 from sag_api.services.source_operation_service import touch_source_revision
 
 
@@ -42,7 +64,7 @@ async def list_documents(session: AsyncSession, source_id: str) -> list[Document
 async def get_document(session: AsyncSession, source: Source, document_id: str) -> Document:
     doc = await session.get(Document, document_id)
     if doc is None or doc.source_id != source.id or not doc.is_active:
-        raise NotFoundError("文档不存在")
+        raise NotFoundError("Document not found")
     return doc
 
 
@@ -57,7 +79,7 @@ async def get_public_document(
         DocumentStatus.DELETING,
         DocumentStatus.DELETE_FAILED,
     }:
-        raise NotFoundError("文档不存在")
+        raise NotFoundError("Document not found")
     return document
 
 
@@ -81,6 +103,10 @@ async def create_document_from_upload(
 
     document = Document(
         id=doc_id,
+        tenant_id="default",
+        project_id=source.id,
+        owner_id="system",
+        logical_source_id=safe_name,
         source_id=source.id,
         filename=safe_name,
         content_type=content_type or "application/octet-stream",
@@ -107,11 +133,11 @@ async def create_document_from_upload(
 
 
 def _format_messages(messages: list[dict]) -> str:
-    lines = ["# 消息", ""]
+    lines = ["# Messages", ""]
     for m in messages:
-        who = m.get("author") or m.get("role") or "消息"
-        ts = f"（{m['ts']}）" if m.get("ts") else ""
-        lines.append(f"**{who}**{ts}：{m.get('text') or ''}")
+        who = m.get("author") or m.get("role") or "Message"
+        ts = f" ({m['ts']})" if m.get("ts") else ""
+        lines.append(f"**{who}**{ts}: {m.get('text') or ''}")
     return "\n\n".join(lines)
 
 
@@ -125,17 +151,17 @@ async def ingest_content(
     upload_dir: str,
     job_queue: JobQueue,
 ) -> Document:
-    """统一写入：把文本 / 一批消息归一为文档 → 复用 ingest/extract 管线（持续写入）。"""
+    """Unified ingestion: normalize text or a batch of messages into a document -> reuse ingest/extract pipeline (continuous ingestion)."""
     from sag_api.core.errors import ValidationError
 
     if messages:
         content = _format_messages(messages)
-        filename = f"{title or f'消息-{len(messages)}条'}.md"
+        filename = f"{title or f'messages-{len(messages)}'}.md"
     elif text:
         content = (f"# {title}\n\n" if title else "") + text
-        filename = f"{title or '文本'}.md"
+        filename = f"{title or 'text'}.md"
     else:
-        raise ValidationError("请提供 text 或 messages")
+        raise ValidationError("Please provide text or messages")
 
     document, _job = await create_document_from_upload(
         session,
@@ -158,7 +184,7 @@ async def reprocess_document(
 ) -> Job:
     document = await get_document(session, source, document_id)
     if document.status in {DocumentStatus.DELETING, DocumentStatus.DELETE_FAILED}:
-        raise ConflictError("文档正在删除或删除失败，无法重新处理")
+        raise ConflictError("Document is deleting or deletion failed, cannot reprocess")
     latest = await session.scalar(select(Job).where(Job.document_id == document.id).order_by(Job.created_at.desc()))
     if latest is not None and latest.status in {
         JobStatus.QUEUED,
@@ -224,7 +250,7 @@ async def reprocess_document(
         )
         if existing is not None:
             return existing
-        raise ConflictError("文档状态已变化，请刷新后重试")
+        raise ConflictError("Document state has changed, please refresh and retry")
     await session.refresh(document)
     if restart_from_scratch:
         await _refresh_source_counts(session, source)
@@ -246,7 +272,7 @@ async def reprocess_document(
         source_id=source.id,
         document_id=document.id,
         status=JobStatus.QUEUED,
-        # 上次失败若已创建 MinerU 任务，重新处理应继续轮询而不是再次计费。
+        # If previous failure already created a MinerU task, reprocessing should continue polling instead of charging again.
         payload=payload,
     )
     session.add(job)
@@ -292,7 +318,7 @@ def _source_document_filter(source_id: str):
 
 
 def _source_sum_clause(source_id: str, column):
-    """仅统计 READY 文档的分块/事件列求和。"""
+    """Sum chunk and event counts only for READY documents."""
     return (
         select(
             func.coalesce(
@@ -311,10 +337,10 @@ def _source_sum_clause(source_id: str, column):
 
 
 async def _refresh_source_counts(session: AsyncSession, source: Source) -> None:
-    """原子重算信源聚合计数。
+    """Atomically recalculate source aggregate counts.
 
-    删除任务与文档级变更（上传/删除等）可并发提交；用单条 UPDATE 在数据库
-    层串行化计数写入，避免「先 SELECT 后赋值」在两者交错时丢失计数。
+    Deletion tasks and document-level changes (upload/delete, etc.) can be committed concurrently;
+    use a single UPDATE at the database layer to serialize count updates, avoiding lost updates from interleaved SELECT-then-assign.
     """
     document_count = (
         select(func.count(Document.id))
@@ -393,23 +419,23 @@ async def _raise_document_control_conflict(
     await session.rollback()
     current = await session.get(Document, document_id, populate_existing=True)
     if current is None:
-        raise ConflictError("文档已删除，请刷新后重试")
+        raise ConflictError("Document has been deleted, please refresh and retry")
     if current.status in {DocumentStatus.DELETING, DocumentStatus.DELETE_FAILED}:
-        raise ConflictError(f"文档正在删除或删除失败，无法{action}")
+        raise ConflictError(f"Document is deleting or deletion failed, cannot {action}")
     raise ConflictError(fallback)
 
 
 async def pause_document(session: AsyncSession, source: Source, document_id: str) -> Job:
-    """协作式暂停：已开始的分块跑完并保存断点，不再领取新分块。"""
+    """Cooperative pause: complete and save checkpoint for in-flight chunks, then stop picking up new chunks."""
     document = await get_document(session, source, document_id)
     if document.status in {DocumentStatus.DELETING, DocumentStatus.DELETE_FAILED}:
-        raise ConflictError("文档正在删除或删除失败，无法停止抽取")
+        raise ConflictError("Document is deleting or deletion failed, cannot stop extraction")
     if document.status not in {
         DocumentStatus.PENDING,
         DocumentStatus.LOADING,
         DocumentStatus.EXTRACTING,
     }:
-        raise ConflictError("抽取任务已经结束或状态已变化，无法停止")
+        raise ConflictError("Extraction task has completed or state has changed, cannot stop")
     document_record_id = document.id
     expected_document_status = document.status
     job = await session.scalar(
@@ -426,8 +452,8 @@ async def pause_document(session: AsyncSession, source: Source, document_id: str
         await _raise_document_control_conflict(
             session,
             document_record_id,
-            action="停止抽取",
-            fallback="当前文档没有可停止的抽取任务",
+            action="stop extraction",
+            fallback="The current document has no stoppable extraction task",
         )
 
     if job.status == JobStatus.QUEUED:
@@ -444,12 +470,12 @@ async def pause_document(session: AsyncSession, source: Source, document_id: str
         await _raise_document_control_conflict(
             session,
             document_record_id,
-            action="停止抽取",
-            fallback="文档或抽取任务状态已变化，请刷新后重试",
+            action="stop extraction",
+            fallback="Document or extraction task state has changed, please refresh and retry",
         )
 
     if job.status != JobStatus.RUNNING:
-        raise ConflictError("抽取任务已经结束，无法停止")
+        raise ConflictError("Extraction task has ended, cannot stop")
     if await _commit_document_job_transition(
         session,
         document,
@@ -463,8 +489,8 @@ async def pause_document(session: AsyncSession, source: Source, document_id: str
     await _raise_document_control_conflict(
         session,
         document_record_id,
-        action="停止抽取",
-        fallback="文档或抽取任务状态已变化，请刷新后重试",
+        action="stop extraction",
+        fallback="Document or extraction task state has changed, please refresh and retry",
     )
 
 
@@ -475,12 +501,12 @@ async def resume_document(
     *,
     job_queue: JobQueue,
 ) -> Job:
-    """把暂停任务原样重新入队，处理器会跳过断点中已完成的分块。"""
+    """Re-enqueue paused task as-is; processor will skip chunks already completed in checkpoint."""
     document = await get_document(session, source, document_id)
     if document.status in {DocumentStatus.DELETING, DocumentStatus.DELETE_FAILED}:
-        raise ConflictError("文档正在删除或删除失败，无法继续")
+        raise ConflictError("Document is deleting or deletion failed, cannot resume")
     if document.status != DocumentStatus.PAUSED:
-        raise ConflictError("当前文档不是已暂停状态，无法继续")
+        raise ConflictError("The current document is not paused, cannot resume")
     document_record_id = document.id
     job = await session.scalar(
         select(Job)
@@ -496,8 +522,8 @@ async def resume_document(
         await _raise_document_control_conflict(
             session,
             document_record_id,
-            action="继续",
-            fallback="当前文档没有可继续的暂停任务",
+            action="resume",
+            fallback="The current document has no resumable paused task",
         )
 
     payload = dict(job.payload or {})
@@ -509,7 +535,7 @@ async def resume_document(
     )
     if is_legacy_checkpoint:
         if not os.path.isfile(document.storage_path):
-            raise ConflictError("旧版抽取断点无法恢复，且原文件已不存在；请重新上传原文件")
+            raise ConflictError("Legacy extraction checkpoint cannot be restored and original file no longer exists; please re-upload original file")
         payload.pop("process_checkpoint", None)
     payload.pop("pause_requested", None)
     payload["resume_requested"] = True
@@ -537,8 +563,8 @@ async def resume_document(
         await _raise_document_control_conflict(
             session,
             document_record_id,
-            action="继续",
-            fallback="文档或抽取任务状态已变化，请刷新后重试",
+            action="resume",
+            fallback="Document or extraction task state has changed, please refresh and retry",
         )
     await _enqueue_persisted_job(job_queue, job.id)
     return job
@@ -654,7 +680,7 @@ async def delete_document(
                     populate_existing=True,
                 )
                 if current_source is None:
-                    raise NotFoundError("信源不存在")
+                    raise NotFoundError("Source not found")
                 return await delete_document(
                     session,
                     current_source,
@@ -697,7 +723,7 @@ async def delete_document(
             )
             if completed is not None:
                 return completed
-            raise ConflictError("文档状态已变化，请刷新后重试")
+            raise ConflictError("Document state has changed, please refresh and retry")
         completed_at = datetime.now(UTC)
         completed = Job(
             type=JobType.DELETE_DOCUMENT,
@@ -752,7 +778,7 @@ async def delete_document(
                 .limit(1)
             )
             if existing is None:
-                raise ConflictError("文档状态已变化，请刷新后重试")
+                raise ConflictError("Document state has changed, please refresh and retry")
             if job_queue is not None:
                 job_queue.begin_source_maintenance(source_record_id, existing.id)
                 await _enqueue_persisted_job(job_queue, existing.id)
@@ -796,3 +822,317 @@ async def delete_document(
         job_queue.begin_source_maintenance(source.id, delete_job.id)
         await _enqueue_persisted_job(job_queue, delete_job.id)
     return delete_job
+
+
+# ============================================================================
+# Knowledge Routing RAG: Multi-Tenant Project Document Upload & Versioning
+# ============================================================================
+
+
+def _check_upload_file(filename: str, file_bytes: bytes) -> None:
+    """Validate file content, size, and allowed extensions."""
+    if not file_bytes:
+        raise ValidationError("Uploaded file cannot be empty")
+    max_size = getattr(settings, "max_upload_size_bytes", 50 * 1024 * 1024)
+    if len(file_bytes) > max_size:
+        raise ValidationError(f"File size exceeds maximum allowed ({max_size} bytes)")
+    allowed = settings.allowed_upload_exts
+    if allowed:
+        ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        if ext not in allowed:
+            pretty = "、".join(sorted(e.lstrip(".") for e in allowed))
+            raise ValidationError(f"Unsupported file extension. Allowed: {pretty}")
+
+
+def _save_snapshot_file(version_id: str, original_filename: str, file_bytes: bytes) -> str:
+    """Persist raw file bytes to snapshot storage on disk."""
+    base_dir = Path(settings.effective_data_dir) / "snapshots" / version_id
+    base_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(original_filename).name or "source.bin"
+    target_path = base_dir / safe_name
+    target_path.write_bytes(file_bytes)
+    return str(target_path.resolve())
+
+
+async def handle_document_upload(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    project_id: str,
+    owner_id: str,
+    security_partition_id: str,
+    client_token: str,
+    file_bytes: bytes,
+    original_filename: str,
+    content_type: str = "application/octet-stream",
+    logical_source_id: str | None = None,
+    source_published_at: datetime | None = None,
+) -> DocumentUploadResponse:
+    """Process an upload request with strict ACL partition, idempotency, and versioning.
+
+    Handles concurrent retries with race-condition recovery.
+    """
+    if not security_partition_id or not security_partition_id.strip():
+        raise ValidationError(
+            "X-Continuum-Security-Partition header is required to enforce data isolation"
+        )
+    if not client_token or not client_token.strip():
+        raise ValidationError("Idempotency-Key header is required for upload")
+
+    _check_upload_file(original_filename, file_bytes)
+
+    payload_hash = compute_payload_hash(file_bytes)
+    idempotency_key = normalize_idempotency_key(client_token)
+    logical_id = (logical_source_id or original_filename).strip()
+
+    # Step 1: Pre-allocation lookup by (tenant_id, project_id, idempotency_key)
+    lookup_stmt = select(IngestionRun).where(
+        IngestionRun.tenant_id == tenant_id,
+        IngestionRun.project_id == project_id,
+        IngestionRun.idempotency_key == idempotency_key,
+    )
+    existing_run = (await session.execute(lookup_stmt)).scalar_one_or_none()
+
+    if existing_run:
+        # Check payload match
+        if existing_run.payload_hash != payload_hash:
+            raise ConflictError(
+                f"Idempotency key is already bound to a different file payload hash. "
+                f"Reusing an idempotency key across different file contents is forbidden. "
+                f"(incoming={payload_hash}, existing={existing_run.payload_hash})",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+                code="IDEMPOTENCY_PAYLOAD_MISMATCH",
+                retryable=False,
+            )
+        doc_ver = await session.get(DocumentVersion, existing_run.document_version_id)
+        return DocumentUploadResponse(
+            document_id=doc_ver.document_id if doc_ver else "",
+            version_no=doc_ver.version_no if doc_ver else 1,
+            version_id=existing_run.document_version_id,
+            run_id=existing_run.id,
+            file_hash=payload_hash,
+            status=doc_ver.status if doc_ver else "RECEIVED",
+            search_status=doc_ver.search_status if doc_ver else "PENDING",
+            knowledge_status=doc_ver.knowledge_status if doc_ver else "NOT_STARTED",
+            is_duplicate=True,
+        )
+
+    # Step 2: Attempt creation in transaction with savepoint to recover race condition
+    try:
+        async with session.begin_nested():
+            # Check or create logical document
+            doc_stmt = select(Document).where(
+                Document.tenant_id == tenant_id,
+                Document.project_id == project_id,
+                Document.logical_source_id == logical_id,
+            )
+            doc = (await session.execute(doc_stmt)).scalar_one_or_none()
+
+            if not doc:
+                doc_id = generate_doc_id(tenant_id, project_id, logical_id)
+                doc = Document(
+                    id=doc_id,
+                    tenant_id=tenant_id,
+                    project_id=project_id,
+                    owner_id=owner_id,
+                    logical_source_id=logical_id,
+                    filename=original_filename,
+                    content_type=content_type,
+                    size_bytes=len(file_bytes),
+                    storage_path="",
+                )
+                session.add(doc)
+                await session.flush()
+                version_no = 1
+                supersedes_id = None
+            else:
+                # Find latest version for this document
+                v_stmt = (
+                    select(DocumentVersion)
+                    .where(DocumentVersion.document_id == doc.id)
+                    .order_by(DocumentVersion.version_no.desc())
+                    .limit(1)
+                )
+                latest_ver = (await session.execute(v_stmt)).scalar_one_or_none()
+                if latest_ver and latest_ver.file_hash == payload_hash:
+                    # Same hash and same identity -> reuse existing version number
+                    version_no = latest_ver.version_no
+                    supersedes_id = latest_ver.supersedes_id
+                else:
+                    version_no = (latest_ver.version_no + 1) if latest_ver else 1
+                    supersedes_id = latest_ver.id if latest_ver else None
+
+            version_id = generate_version_id(doc.id, version_no)
+
+            existing_ver = await session.get(DocumentVersion, version_id)
+            if not existing_ver:
+                storage_path = _save_snapshot_file(version_id, original_filename, file_bytes)
+                doc.storage_path = storage_path
+
+                doc_version = DocumentVersion(
+                    id=version_id,
+                    document_id=doc.id,
+                    version_no=version_no,
+                    file_hash=payload_hash,
+                    supersedes_id=supersedes_id,
+                    source_published_at=source_published_at,
+                    status="RECEIVED",
+                    search_status="PENDING",
+                    knowledge_status="NOT_STARTED",
+                    metadata_json={"security_partition_id": security_partition_id},
+                )
+                session.add(doc_version)
+                await session.flush()
+
+                snapshot = SourceSnapshot(
+                    id=str(uuid.uuid4()),
+                    document_version_id=version_id,
+                    storage_uri=storage_path,
+                    original_filename=original_filename,
+                    mime_type=content_type,
+                    byte_size=len(file_bytes),
+                    checksum_sha256=payload_hash,
+                )
+                session.add(snapshot)
+            else:
+                doc_version = existing_ver
+
+            run_id = str(uuid.uuid4())
+            run = IngestionRun(
+                id=run_id,
+                tenant_id=tenant_id,
+                project_id=project_id,
+                document_version_id=doc_version.id,
+                idempotency_key=idempotency_key,
+                payload_hash=payload_hash,
+                current_stage="RECEIVE",
+                status="QUEUED",
+            )
+            session.add(run)
+
+            stage_run = StageRun(
+                id=str(uuid.uuid4()),
+                run_id=run_id,
+                stage="receive",
+                status="SUCCESS",
+                duration_ms=10.0,
+                metrics_json={"byte_size": len(file_bytes)},
+            )
+            session.add(stage_run)
+            await session.flush()
+
+        await session.commit()
+        return DocumentUploadResponse(
+            document_id=doc.id,
+            version_no=doc_version.version_no,
+            version_id=doc_version.id,
+            run_id=run.id,
+            file_hash=payload_hash,
+            status=doc_version.status,
+            search_status=doc_version.search_status,
+            knowledge_status=doc_version.knowledge_status,
+            is_duplicate=False,
+        )
+    except IntegrityError:
+        # Race condition recovery: concurrent insert with same (tenant_id, project_id, idempotency_key)
+        await session.rollback()
+        stmt = select(IngestionRun).where(
+            IngestionRun.tenant_id == tenant_id,
+            IngestionRun.project_id == project_id,
+            IngestionRun.idempotency_key == idempotency_key,
+        )
+        existing = (await session.execute(stmt)).scalar_one_or_none()
+        if existing:
+            if existing.payload_hash != payload_hash:
+                raise ConflictError(
+                    f"Idempotency key is already bound to a different file payload hash. "
+                    f"Reusing an idempotency key across different file contents is forbidden. "
+                    f"(incoming={payload_hash}, existing={existing.payload_hash})",
+                    layer=ErrorLayer.CLIENT,
+                    stage=ErrorStage.UPLOAD,
+                    code="IDEMPOTENCY_PAYLOAD_MISMATCH",
+                    retryable=False,
+                )
+            doc_ver = await session.get(DocumentVersion, existing.document_version_id)
+            return DocumentUploadResponse(
+                document_id=doc_ver.document_id if doc_ver else "",
+                version_no=doc_ver.version_no if doc_ver else 1,
+                version_id=existing.document_version_id,
+                run_id=existing.id,
+                file_hash=payload_hash,
+                status=doc_ver.status if doc_ver else "RECEIVED",
+                search_status=doc_ver.search_status if doc_ver else "PENDING",
+                knowledge_status=doc_ver.knowledge_status if doc_ver else "NOT_STARTED",
+                is_duplicate=True,
+            )
+        raise
+
+
+async def get_document_version_status(
+    session: AsyncSession,
+    *,
+    project_id: str,
+    document_id: str,
+    version_no: int,
+) -> DocumentVersionStatusResponse:
+    """Retrieve fine-grained readiness and stage execution progress for a document version."""
+    stmt = (
+        select(DocumentVersion)
+        .join(Document, Document.id == DocumentVersion.document_id)
+        .where(
+            Document.project_id == project_id,
+            DocumentVersion.document_id == document_id,
+            DocumentVersion.version_no == version_no,
+        )
+    )
+    doc_ver = (await session.execute(stmt)).scalar_one_or_none()
+    if not doc_ver:
+        raise NotFoundError(
+            f"Document version {document_id}/v{version_no} not found in project {project_id}"
+        )
+
+    run_stmt = (
+        select(IngestionRun)
+        .where(IngestionRun.document_version_id == doc_ver.id)
+        .order_by(IngestionRun.created_at.desc())
+        .limit(1)
+    )
+    latest_run = (await session.execute(run_stmt)).scalar_one_or_none()
+
+    stage_progress: dict[str, StageProgressItem] = {}
+    err_info = None
+    current_stage = "UNKNOWN"
+
+    if latest_run:
+        current_stage = latest_run.current_stage
+        sr_stmt = (
+            select(StageRun)
+            .where(StageRun.run_id == latest_run.id)
+            .order_by(StageRun.created_at.asc())
+        )
+        stages = (await session.execute(sr_stmt)).scalars().all()
+        for s in stages:
+            stage_progress[s.stage] = StageProgressItem(
+                status=s.status, duration_ms=s.duration_ms
+            )
+        if latest_run.error_code:
+            err_info = {
+                "layer": latest_run.error_layer,
+                "stage": latest_run.error_stage,
+                "code": latest_run.error_code,
+                "message": latest_run.error_message,
+            }
+
+    return DocumentVersionStatusResponse(
+        document_id=doc_ver.document_id,
+        version_no=doc_ver.version_no,
+        status=doc_ver.status,
+        search_status=doc_ver.search_status,
+        knowledge_status=doc_ver.knowledge_status,
+        search_ready=(doc_ver.search_status == "SEARCH_READY"),
+        knowledge_ready=(doc_ver.knowledge_status == "KNOWLEDGE_READY"),
+        current_stage=current_stage,
+        stage_progress=stage_progress,
+        error=err_info,
+    )

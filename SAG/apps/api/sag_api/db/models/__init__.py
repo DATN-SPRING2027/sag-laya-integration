@@ -1,4 +1,4 @@
-"""ORM 模型聚合导入 —— 保证 Base.metadata 注册全部表。"""
+"""ORM models aggregate import — ensures Base.metadata registers all tables."""
 
 from sag_api.db.models.agent import Agent, AgentBinding, Message, Thread
 from sag_api.db.models.document import Document
@@ -11,6 +11,17 @@ from sag_api.db.models.octx import (
     OctxRelease,
     OctxSourceBinding,
     OctxTransfer,
+)
+from sag_api.db.models.routing_rag import (
+    CanonicalBlock,
+    DocumentVersion,
+    IngestionRun,
+    KnowledgeGraphEdge,
+    ProjectSearchState,
+    SearchUnit,
+    SourceSnapshot,
+    StageRun,
+    TreeManifest,
 )
 from sag_api.db.models.setting import Setting
 from sag_api.db.models.source import Source
@@ -26,8 +37,14 @@ from sag_api.db.models.user import User
 __all__ = [
     "Agent",
     "AgentBinding",
+    "CanonicalBlock",
     "Document",
+    "DocumentVersion",
+    "ExplorationSession",
+    "ExplorationStep",
+    "IngestionRun",
     "Job",
+    "KnowledgeGraphEdge",
     "Message",
     "OctxAsset",
     "OctxDocumentBinding",
@@ -36,15 +53,18 @@ __all__ = [
     "OctxRelease",
     "OctxSourceBinding",
     "OctxTransfer",
+    "ProjectSearchState",
+    "SearchUnit",
     "Setting",
     "Source",
+    "SourceSnapshot",
+    "StageRun",
     "Thread",
-    "User",
-    "ExplorationSession",
-    "ExplorationStep",
+    "TreeManifest",
     "UniverseDirtySource",
     "UniverseOverview",
     "UniversePartition",
+    "User",
 ]
 
 

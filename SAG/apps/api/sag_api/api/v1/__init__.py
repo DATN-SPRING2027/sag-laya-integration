@@ -39,6 +39,7 @@ for _module in (
     laya,
 ):
     api_router.include_router(_module.router)
+api_router.include_router(documents.project_router)
 api_router.include_router(search.global_router)
 
 __all__ = ["api_router"]
