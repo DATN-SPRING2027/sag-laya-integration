@@ -4,11 +4,12 @@ Nguồn chuẩn: [Workflow v1.1](../docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1
 
 ## Phase 0 — Contracts & Foundations
 
-- [ ] Map flow upload, worker/job, search, query, schema, config và ACL hiện có; ghi rõ code tái sử dụng và gap.
-- [ ] Chốt Document/Version/SourceSnapshot/IngestionRun, stable ID, idempotency key, provenance và temporal fields.
-- [ ] Chốt stage/status/error contract và ý nghĩa riêng của SEARCH_READY, KNOWLEDGE_READY, FAILED.
-- [ ] Chốt Laya, query features/planner, retrieval trace, index/tree manifest và config version contracts.
-- [ ] Chốt tenant/project/security scope; rà migration, compatibility và rollback.
+- [x] Map flow upload, worker/job, search, query, schema, config và ACL hiện có; ghi rõ code tái sử dụng và gap.
+- [x] Chốt Document/Version/SourceSnapshot/IngestionRun, stable ID, idempotency key, provenance và temporal fields.
+- [x] Chốt stage/status/error contract và ý nghĩa riêng của SEARCH_READY, KNOWLEDGE_READY, FAILED.
+- [x] Chốt Laya, query features/planner, retrieval trace, index/tree manifest và config version contracts.
+- [x] Chốt tenant/project/security scope; rà migration, compatibility và rollback.
+- [x] Evidence: [phase-0-contracts-and-foundations.md](../docs/phase-0-contracts-and-foundations.md).
 
 ## Phase 1 — Upload & Versioned Source
 
