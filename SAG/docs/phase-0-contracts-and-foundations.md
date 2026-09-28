@@ -137,7 +137,7 @@ CREATE TABLE IF NOT EXISTS documents (
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uq_documents_project_logical_source UNIQUE (project_id, logical_source_id)
+    CONSTRAINT uq_documents_tenant_project_logical_source UNIQUE (tenant_id, project_id, logical_source_id)
 );
 CREATE INDEX IF NOT EXISTS idx_documents_tenant_project ON documents (tenant_id, project_id);
 
@@ -245,8 +245,10 @@ CREATE INDEX IF NOT EXISTS idx_search_units_security ON search_units (security_p
 -- 8. Bảng quản lý trạng thái search của project (Blue-Green dual pointer)
 CREATE TABLE IF NOT EXISTS project_search_state (
     project_id VARCHAR(64) PRIMARY KEY,
-    active_tree_version VARCHAR(64),
+    slot_a_tree_version VARCHAR(64),
+    slot_b_tree_version VARCHAR(64),
     active_routing_slot VARCHAR(16) NOT NULL DEFAULT 'SLOT_A', -- SLOT_A hoặc SLOT_B
+    active_tree_version VARCHAR(64),
     previous_tree_version VARCHAR(64),
     active_search_epoch BIGINT NOT NULL DEFAULT 1,
     last_switched_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -274,7 +276,7 @@ CREATE INDEX IF NOT EXISTS idx_tree_manifests_project ON tree_manifests (project
 ### 4.3. Công Thức Sinh Định Danh Bất Biến (Deterministic Stable ID Formulas)
 Mọi ID thực thể phải được sinh theo công thức tất định để đảm bảo khả năng tái tạo:
 1. **Document ID**:
-   $$\text{doc\_id} = \text{UUIDv5}(\text{NAMESPACE\_URL}, f\text{"sag:doc:\{project\_id\}:\{logical\_source\_id\}"})$$
+   $$\text{doc\_id} = \text{UUIDv5}(\text{NAMESPACE\_URL}, f\text{"sag:doc:\{tenant\_id\}:\{project\_id\}:\{logical\_source\_id\}"})$$
 2. **Document Version ID**:
    $$\text{version\_id} = \text{UUIDv5}(\text{NAMESPACE\_URL}, f\text{"sag:ver:\{doc\_id\}:\{version\_no\}"})$$
 3. **Canonical Block ID**:
@@ -283,7 +285,7 @@ Mọi ID thực thể phải được sinh theo công thức tất định để
    $$\text{unit\_id} = \text{UUIDv5}(\text{NAMESPACE\_URL}, f\text{"sag:unit:\{version\_id\}:\{ordinal\}"})$$
    $$\text{point\_id} = \text{UUIDv5}(\text{NAMESPACE\_URL}, f\text{"sag:qdrant:search\_units:\{unit\_id\}"})$$
 5. **Idempotency Key Engine**:
-   $$\text{idempotency\_key} = \text{SHA-256}(f\text{"\{project\_id\}:\{file\_hash\}:\{client\_token\}"})$$
+   $$\text{idempotency\_key} = \text{SHA-256}(f\text{"\{tenant\_id\}:\{project\_id\}:\{file\_hash\}:\{client\_token\}"})$$
 
 ---
 
@@ -372,7 +374,7 @@ class ErrorDetail(BaseModel):
     error_layer: Literal["client", "api", "engine", "llm", "store", "laya", "routing"]
     error_stage: Literal[
         "receive", "parse", "dedup", "search_index", 
-        "knowledge_extract", "graph_link", "tree_build", "routing", "retrieve"
+        "knowledge_extract", "graph_link", "tree_build", "routing", "retrieve", "synthesize"
     ]
     error_code: str
     message: str
@@ -493,6 +495,7 @@ Quy định ngưỡng nghiệm thu trước khi chuyển trạng thái cây sang
 
 ```json
 {
+  "tenant_id": "tenant_continuum_default",
   "project_id": "proj_12345",
   "security_partition_id": "team_backend",
   "document_version_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
@@ -507,10 +510,11 @@ Quy định ngưỡng nghiệm thu trước khi chuyển trạng thái cây sang
 ```
 
 **Quy tắc lọc trước (Pre-filtering)**:
-Mọi truy vấn Cosine Similarity trên Qdrant **bắt buộc** truyền bộ lọc `must`:
+Mọi truy vấn Cosine Similarity trên Qdrant **bắt buộc** truyền bộ lọc `must` bao gồm cả `tenant_id`, `project_id` và `security_partition_id`:
 ```json
 {
   "must": [
+    { "key": "tenant_id", "match": { "value": "tenant_continuum_default" } },
     { "key": "project_id", "match": { "value": "proj_12345" } },
     { "key": "security_partition_id", "match": { "any": ["public", "team_backend"] } }
   ]
@@ -607,14 +611,18 @@ Mọi truy vấn Cosine Similarity trên Qdrant **bắt buộc** truyền bộ l
 2. **Không phá vỡ API client hiện hành**: Route cũ `/sources/{id}/documents` được chuyển thành wrapper gọi nội bộ vào service phiên bản mới.
 
 ### 10.2. Quy Trình Rollback Khẩn Cấp Dưới 100ms (Emergency Rollback)
-1. **Rollback Cây Tri Thức (Active Pointer Switch)**:
-   - Nếu cây phiên bản mới ở `SLOT_B` gây suy giảm Routing Recall hoặc dính lỗi logic, API thực hiện câu lệnh duy nhất:
+1. **Rollback Cây Tri Thức (Active Pointer & Version Switch)**:
+   - Nếu cây phiên bản mới ở `SLOT_B` gây suy giảm Routing Recall hoặc dính lỗi logic, API thực hiện câu lệnh duy nhất hoán đổi slot và chuyển con trỏ `active_tree_version` về `previous_tree_version`:
      ```sql
      UPDATE project_search_state 
-     SET active_routing_slot = 'SLOT_A', last_switched_at = CURRENT_TIMESTAMP 
+     SET active_routing_slot = CASE WHEN active_routing_slot = 'SLOT_B' THEN 'SLOT_A' ELSE 'SLOT_B' END,
+         active_tree_version = previous_tree_version,
+         previous_tree_version = active_tree_version,
+         active_search_epoch = active_search_epoch + 1,
+         last_switched_at = CURRENT_TIMESTAMP 
      WHERE project_id = :project_id;
      ```
-   - Thời gian thực thi: $< 5\text{ms}$. Hệ thống phục hồi ngay lập tức về cây cũ mà không cần re-index.
+   - Thời gian thực thi: $< 5\text{ms}$. Toàn bộ các worker tìm kiếm và online retrieval tự động nhận diện `active_tree_version` cũ và `active_search_epoch` mới mà không cần re-index.
 2. **Rollback Qdrant Point Batch**:
    - Khi một `IngestionRun` thất bại ở stage `SEARCH_INDEX`, toàn bộ vector rác được dọn dẹp bằng bộ lọc điểm:
      ```python
