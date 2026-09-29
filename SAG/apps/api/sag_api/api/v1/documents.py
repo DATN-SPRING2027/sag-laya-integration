@@ -107,6 +107,55 @@ async def _read_upload_file_bounded(file: UploadFile, max_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
+def _verify_mime_signature(filename: str, file_bytes: bytes) -> None:
+    """Xác thực chữ ký nhị phân (magic bytes) đối chiếu với phần mở rộng tệp.
+
+    Ngăn chặn việc giả mạo phần mở rộng file (extension deception) hoặc chèn mã độc.
+    """
+    if not file_bytes:
+        return
+    name = filename.lower()
+    ext = ("." + name.rsplit(".", 1)[1]) if "." in name else ""
+
+    if ext == ".pdf":
+        if not file_bytes.startswith(b"%PDF-"):
+            raise ValidationError(
+                f"Định dạng nội dung không khớp phần mở rộng: tệp '{filename}' thiếu chữ ký PDF hợp lệ (%PDF-)",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            )
+    elif ext in {".docx", ".pptx", ".xlsx", ".epub"}:
+        if not (
+            file_bytes.startswith(b"PK\x03\x04")
+            or file_bytes.startswith(b"PK\x05\x06")
+            or file_bytes.startswith(b"PK\x07\x08")
+        ):
+            raise ValidationError(
+                f"Định dạng nội dung không khớp phần mở rộng: tệp '{filename}' ({ext}) thiếu chữ ký ZIP container hợp lệ (PK)",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            )
+    elif ext == ".xls":
+        if not file_bytes.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+            raise ValidationError(
+                f"Định dạng nội dung không khớp phần mở rộng: tệp '{filename}' thiếu chữ ký OLE2 container hợp lệ",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            )
+    elif ext in {".txt", ".md", ".markdown", ".text", ".csv", ".tsv", ".json", ".html", ".htm"}:
+        if (
+            file_bytes.startswith(b"MZ")
+            or file_bytes.startswith(b"\x7fELF")
+            or file_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+            or file_bytes.startswith(b"\xff\xd8\xff")
+        ):
+            raise ValidationError(
+                f"Tệp nhị phân hoặc hình ảnh trá hình dưới phần mở rộng văn bản '{ext}' không được phép cho '{filename}'",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            )
+
+
 @router.get("", response_model=list[DocumentOut])
 async def list_(
     source_id: str,
@@ -466,6 +515,7 @@ async def upload_document_version(
 
     max_upload_bytes = getattr(settings, "max_upload_size_bytes", None) or (settings.max_upload_mb * 1024 * 1024)
     file_bytes = await _read_upload_file_bounded(file, max_upload_bytes)
+    _verify_mime_signature(filename, file_bytes)
 
     result = await handle_document_upload(
         session,
@@ -511,4 +561,5 @@ async def query_document_version_status(
         project_id=project_id,
         document_id=document_id,
         version_no=version_no,
+        principal=principal,
     )

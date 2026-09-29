@@ -24,17 +24,19 @@ class VerifiedPrincipal:
     roles: tuple[str, ...] = ()
 
     def has_project_access(self, project_id: str) -> bool:
-        """Verify whether principal is authorized to operate within project_id."""
+        """Xác minh quyền truy cập project. Mặc định đóng (fail-closed) nếu scope rỗng."""
         if "*" in self.allowed_projects:
             return True
         if not self.allowed_projects:
-            return True
+            return False
         return project_id in self.allowed_projects
 
     def has_partition_access(self, partition_id: str) -> bool:
-        """Verify whether principal is authorized for given security partition."""
-        if "*" in self.allowed_partitions or not self.allowed_partitions:
+        """Xác minh quyền truy cập security partition. Mặc định đóng (fail-closed) nếu scope rỗng."""
+        if "*" in self.allowed_partitions:
             return True
+        if not self.allowed_partitions:
+            return False
         return partition_id in self.allowed_partitions
 
 

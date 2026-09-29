@@ -628,17 +628,8 @@ async def test_worker_transitions_ingestion_run_and_document_version(client: htt
             async def process_document(self, *args, **kwargs):
                 return MockOutcome()
 
-        # If doc.source_id is None, create a dummy source
-        if not doc.source_id:
-            source = Source(
-                id=f"src_{doc.id}",
-                name="Worker Test Source",
-                sag_source_config_id=f"cfg_{doc.id}",
-            )
-            session.add(source)
-            await session.flush()
-            doc.source_id = source.id
-            await session.commit()
+        # Verify that project upload automatically maps and populates doc.source_id (Comment #9)
+        assert doc.source_id is not None
 
         job = Job(
             id=f"job_{run_id}",
@@ -661,6 +652,211 @@ async def test_worker_transitions_ingestion_run_and_document_version(client: htt
         assert updated_run.completed_at is not None
 
         ver = await session.get(DocumentVersion, version_id)
-        assert ver.status == "READY"
-        assert ver.search_status == "READY"
+        assert ver.status == "SEARCH_READY"
+        assert ver.search_status == "SEARCH_READY"
         assert ver.search_ready_at is not None
+        assert ver.knowledge_status == "NOT_STARTED"
+
+
+# ============================================================================
+# Additional Tests Addressing Review Findings (PR #8 Review Comments)
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_fail_closed_empty_scope_forbidden(client: httpx.AsyncClient):
+    """Verify that an empty allowed_projects or allowed_partitions scope fails closed with 403 (Comment #7)."""
+    # 1. Empty allowed_projects
+    auth_empty_projects = make_auth_header(user_id="user_empty_proj", allowed_projects=[])
+    res1 = await client.post(
+        "/api/v1/projects/proj_any/documents/upload",
+        headers={
+            **auth_empty_projects,
+            "X-Continuum-User-Id": "user_empty_proj",
+            "Idempotency-Key": "key_empty_proj_01",
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("test.txt", b"Hello", "text/plain")},
+    )
+    assert res1.status_code == 403
+    assert "not authorized to access project" in res1.text
+
+    # 2. Empty allowed_partitions
+    auth_empty_partitions = make_auth_header(
+        user_id="user_empty_part",
+        allowed_projects=["proj_ok"],
+        allowed_partitions=[],
+    )
+    res2 = await client.post(
+        "/api/v1/projects/proj_ok/documents/upload",
+        headers={
+            **auth_empty_partitions,
+            "X-Continuum-User-Id": "user_empty_part",
+            "Idempotency-Key": "key_empty_part_01",
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("test.txt", b"Hello", "text/plain")},
+    )
+    assert res2.status_code == 403
+    assert "not authorized for security partition" in res2.text
+
+
+@pytest.mark.asyncio
+async def test_secret_key_bearer_credential_rejected(client: httpx.AsyncClient):
+    """Verify that passing settings.secret_key directly as bearer token is rejected with 401 (Comment #8)."""
+    res = await client.post(
+        "/api/v1/projects/proj_secret_test/documents/upload",
+        headers={
+            "Authorization": f"Bearer {settings.secret_key}",
+            "X-Continuum-User-Id": "admin",
+            "Idempotency-Key": "key_secret_bearer_01",
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("test.txt", b"Secret token test", "text/plain")},
+    )
+    assert res.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_mime_signature_mismatch_rejected(client: httpx.AsyncClient):
+    """Verify that files with mismatched binary signatures (e.g. text disguised as PDF) are rejected with 422 (Comment #15)."""
+    project_id = "proj_mime_test"
+    auth_header = make_auth_header(user_id="user_mime", allowed_projects=[project_id])
+
+    # Text bytes uploaded as .pdf without %PDF- magic bytes
+    res = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_mime",
+            "Idempotency-Key": "key_mime_invalid_pdf",
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("fake.pdf", b"This is plain text pretending to be PDF", "application/pdf")},
+    )
+    assert res.status_code == 422
+    assert "thiếu chữ ký PDF" in res.text or "PDF" in res.text
+
+
+@pytest.mark.asyncio
+async def test_replay_idempotency_different_logical_source_conflict(client: httpx.AsyncClient):
+    """Verify that reusing the same Idempotency-Key with a different logical_source_id raises 409 Conflict (Comment #14)."""
+    project_id = "proj_idemp_source_test"
+    auth_header = make_auth_header(user_id="user_idemp", allowed_projects=[project_id])
+    payload = b"Common document payload content"
+
+    # First request with logical_source_id = "source_A"
+    res1 = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_idemp",
+            "Idempotency-Key": "shared_idem_key_01",
+            "X-Continuum-Security-Partition": "public",
+        },
+        data={"logical_source_id": "logical_doc_alpha"},
+        files={"file": ("doc_a.txt", payload, "text/plain")},
+    )
+    assert res1.status_code == 201
+
+    # Second request with SAME idempotency key and SAME bytes, but DIFFERENT logical_source_id = "source_B"
+    res2 = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_idemp",
+            "Idempotency-Key": "shared_idem_key_01",
+            "X-Continuum-Security-Partition": "public",
+        },
+        data={"logical_source_id": "logical_doc_beta"},
+        files={"file": ("doc_b.txt", payload, "text/plain")},
+    )
+    assert res2.status_code == 409
+    assert "IDEMPOTENCY_IDENTITY_MISMATCH" in res2.text or "logical source" in res2.text
+
+
+@pytest.mark.asyncio
+async def test_new_version_closes_previous_temporal_validity(client: httpx.AsyncClient):
+    """Verify that when a new version is uploaded, the previous version's valid_to is closed at effective time (Comment #13)."""
+    project_id = "proj_temporal_test"
+    auth_header = make_auth_header(user_id="user_temporal", allowed_projects=[project_id])
+    logical_source = "temporal_contract_doc"
+
+    # Version 1
+    res1 = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_temporal",
+            "Idempotency-Key": "key_temp_v1",
+            "X-Continuum-Security-Partition": "public",
+        },
+        data={"logical_source_id": logical_source},
+        files={"file": ("contract.txt", b"Version 1 Contract Content", "text/plain")},
+    )
+    assert res1.status_code == 201
+    v1_id = res1.json()["version_id"]
+
+    # Version 2
+    res2 = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_temporal",
+            "Idempotency-Key": "key_temp_v2",
+            "X-Continuum-Security-Partition": "public",
+        },
+        data={"logical_source_id": logical_source},
+        files={"file": ("contract.txt", b"Version 2 Updated Contract Content", "text/plain")},
+    )
+    assert res2.status_code == 201
+    v2_id = res2.json()["version_id"]
+
+    async with SessionLocal() as session:
+        v1 = await session.get(DocumentVersion, v1_id)
+        v2 = await session.get(DocumentVersion, v2_id)
+        assert v1 is not None and v2 is not None
+        # Previous version validity must be closed (not far future 9999)
+        assert v1.valid_to.year < 9000
+        # Version 2 validity starts when version 1 validity ends
+        assert abs((v2.valid_from - v1.valid_to).total_seconds()) < 1.0
+
+
+@pytest.mark.asyncio
+async def test_status_endpoint_forbidden_for_unauthorized_partition(client: httpx.AsyncClient):
+    """Verify that querying status for a document version in an unauthorized security partition returns 403 (Comment #12)."""
+    project_id = "proj_status_auth_test"
+    auth_uploader = make_auth_header(
+        user_id="uploader",
+        allowed_projects=[project_id],
+        allowed_partitions=["finance_confidential"],
+    )
+
+    # Upload document to private partition
+    res_up = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_uploader,
+            "X-Continuum-User-Id": "uploader",
+            "Idempotency-Key": "key_status_auth_01",
+            "X-Continuum-Security-Partition": "finance_confidential",
+        },
+        files={"file": ("financials.txt", b"Secret balance sheet", "text/plain")},
+    )
+    assert res_up.status_code == 201
+    data = res_up.json()
+    doc_id = data["document_id"]
+    version_no = data["version_no"]
+
+    # Principal without finance_confidential partition access tries to query status
+    auth_viewer_restricted = make_auth_header(
+        user_id="viewer_restricted",
+        allowed_projects=[project_id],
+        allowed_partitions=["public"],
+    )
+    res_status = await client.get(
+        f"/api/v1/projects/{project_id}/documents/{doc_id}/versions/{version_no}/status",
+        headers=auth_viewer_restricted,
+    )
+    assert res_status.status_code == 403
+    assert "not authorized to access security partition" in res_status.text

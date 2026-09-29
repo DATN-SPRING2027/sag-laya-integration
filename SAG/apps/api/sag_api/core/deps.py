@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import secrets
 from typing import Literal
 
 import jwt
@@ -127,8 +129,10 @@ async def get_verified_principal(
         raise AuthError("Missing authentication token", code=ErrorCode.UNAUTHORIZED)
 
     token = creds.credentials
-    # Support direct shared secret for internal services if configured
-    if settings.secret_key and token == settings.secret_key:
+    # Hỗ trợ credential riêng biệt (service_api_key) cho internal service nếu được cấu hình.
+    # Tuyệt đối không chấp nhận settings.secret_key (khóa ký HMAC) làm bearer token.
+    service_api_key = getattr(settings, "service_api_key", None) or os.getenv("SAG_SERVICE_API_KEY")
+    if service_api_key and secrets.compare_digest(token, service_api_key):
         principal = VerifiedPrincipal(
             user_id="service:internal",
             tenant_id="tenant_continuum_default",

@@ -13,8 +13,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.config import settings
 from sag_api.core.error_taxonomy import ErrorLayer, ErrorStage
-from sag_api.core.errors import ConflictError, NotFoundError, ValidationError
+from sag_api.core.errors import ConflictError, ForbiddenError, NotFoundError, ValidationError
 from sag_api.core.identity import (
+    VerifiedPrincipal,
     compute_payload_hash,
     generate_doc_id,
     generate_version_id,
@@ -28,7 +29,7 @@ from sag_api.db.models.routing_rag import (
     SourceSnapshot,
     StageRun,
 )
-from sag_api.enums import DocumentStatus, JobStatus, JobType
+from sag_api.enums import ConnectorKind, DocumentStatus, JobStatus, JobType, SourceType
 from sag_api.jobs import JobQueue
 from sag_api.jobs.scheduling import DELETE_PRIORITY, RESUME_PRIORITY, set_scheduler
 from sag_api.schemas.routing_rag import (
@@ -862,6 +863,27 @@ def _save_snapshot_file(payload_hash: str, original_filename: str, file_bytes: b
     return str(target_path.resolve())
 
 
+async def get_or_create_project_source(session: AsyncSession, project_id: str) -> Source:
+    """Ánh xạ project_id sang một SAG Source tương ứng để phục vụ worker xử lý và bảo toàn toàn vẹn dữ liệu."""
+    config_id = f"proj_{project_id}"[:64]
+    stmt = select(Source).where(Source.sag_source_config_id == config_id).limit(1)
+    source = (await session.execute(stmt)).scalar_one_or_none()
+    if source is not None:
+        return source
+
+    source = Source(
+        name=f"Project {project_id}",
+        description=f"Auto-provisioned source for project {project_id}",
+        source_type=SourceType.DOCUMENT,
+        connector_kind=ConnectorKind.FILE_UPLOAD,
+        sag_source_config_id=config_id,
+        config={},
+    )
+    session.add(source)
+    await session.flush()
+    return source
+
+
 async def handle_document_upload(
     session: AsyncSession,
     *,
@@ -891,6 +913,11 @@ async def handle_document_upload(
 
     _check_upload_file(original_filename, file_bytes)
 
+    # Ánh xạ project_id sang SAG Source nếu chưa truyền source_id để đảm bảo tính tương thích với worker và DB
+    if not source_id:
+        proj_source = await get_or_create_project_source(session, project_id)
+        source_id = proj_source.id
+
     payload_hash = compute_payload_hash(file_bytes)
     idempotency_key = normalize_idempotency_key(client_token)
     logical_id = (logical_source_id or original_filename).strip()
@@ -916,6 +943,18 @@ async def handle_document_upload(
                 retryable=False,
             )
         doc_ver = await session.get(DocumentVersion, existing_run.document_version_id)
+        if doc_ver:
+            bound_doc = await session.get(Document, doc_ver.document_id)
+            if bound_doc and bound_doc.logical_source_id != logical_id:
+                raise ConflictError(
+                    f"Idempotency key is already bound to logical source '{bound_doc.logical_source_id}'. "
+                    f"Reusing an idempotency key across different logical sources is forbidden "
+                    f"(incoming='{logical_id}', existing='{bound_doc.logical_source_id}')",
+                    layer=ErrorLayer.CLIENT,
+                    stage=ErrorStage.UPLOAD,
+                    code="IDEMPOTENCY_IDENTITY_MISMATCH",
+                    retryable=False,
+                )
         return DocumentUploadResponse(
             document_id=doc_ver.document_id if doc_ver else "",
             version_no=doc_ver.version_no if doc_ver else 1,
@@ -948,6 +987,7 @@ async def handle_document_upload(
                 )
                 doc = (await session.execute(doc_stmt)).scalar_one_or_none()
 
+                now_utc = datetime.now(UTC)
                 if not doc:
                     doc_id = generate_doc_id(tenant_id, project_id, logical_id)
                     doc = Document(
@@ -1002,9 +1042,14 @@ async def handle_document_upload(
                             knowledge_status=latest_ver.knowledge_status,
                             is_duplicate=True,
                         )
+                    elif latest_ver:
+                        # Đóng khoảng hiệu lực của phiên bản cũ tại thời điểm phiên bản mới bắt đầu (Comment #13)
+                        latest_ver.valid_to = now_utc
+                        version_no = latest_ver.version_no + 1
+                        supersedes_id = latest_ver.id
                     else:
-                        version_no = (latest_ver.version_no + 1) if latest_ver else 1
-                        supersedes_id = latest_ver.id if latest_ver else None
+                        version_no = 1
+                        supersedes_id = None
 
                 version_id = generate_version_id(doc.id, version_no)
 
@@ -1017,6 +1062,8 @@ async def handle_document_upload(
                         file_hash=payload_hash,
                         supersedes_id=supersedes_id,
                         source_published_at=source_published_at,
+                        valid_from=now_utc,
+                        valid_to=datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC),
                         status="RECEIVED",
                         search_status="PENDING",
                         knowledge_status="NOT_STARTED",
@@ -1107,6 +1154,18 @@ async def handle_document_upload(
                         retryable=False,
                     )
                 doc_ver = await session.get(DocumentVersion, existing.document_version_id)
+                if doc_ver:
+                    bound_doc = await session.get(Document, doc_ver.document_id)
+                    if bound_doc and bound_doc.logical_source_id != logical_id:
+                        raise ConflictError(
+                            f"Idempotency key is already bound to logical source '{bound_doc.logical_source_id}'. "
+                            f"Reusing an idempotency key across different logical sources is forbidden "
+                            f"(incoming='{logical_id}', existing='{bound_doc.logical_source_id}')",
+                            layer=ErrorLayer.CLIENT,
+                            stage=ErrorStage.UPLOAD,
+                            code="IDEMPOTENCY_IDENTITY_MISMATCH",
+                            retryable=False,
+                        )
                 return DocumentUploadResponse(
                     document_id=doc_ver.document_id if doc_ver else "",
                     version_no=doc_ver.version_no if doc_ver else 1,
@@ -1149,10 +1208,11 @@ async def get_document_version_status(
     project_id: str,
     document_id: str,
     version_no: int,
+    principal: VerifiedPrincipal | None = None,
 ) -> DocumentVersionStatusResponse:
     """Retrieve fine-grained readiness and stage execution progress for a document version."""
     stmt = (
-        select(DocumentVersion)
+        select(DocumentVersion, Document)
         .join(Document, Document.id == DocumentVersion.document_id)
         .where(
             Document.project_id == project_id,
@@ -1160,11 +1220,25 @@ async def get_document_version_status(
             DocumentVersion.version_no == version_no,
         )
     )
-    doc_ver = (await session.execute(stmt)).scalar_one_or_none()
-    if not doc_ver:
+    result = (await session.execute(stmt)).first()
+    if not result:
         raise NotFoundError(
             f"Document version {document_id}/v{version_no} not found in project {project_id}"
         )
+    doc_ver, doc = result
+
+    # Kiểm tra ủy quyền tenant và security partition (Comment #12)
+    if principal is not None:
+        if not principal.is_service and doc.tenant_id != principal.tenant_id:
+            raise ForbiddenError(
+                f"Principal '{principal.user_id}' belongs to tenant '{principal.tenant_id}' "
+                f"but document belongs to tenant '{doc.tenant_id}'"
+            )
+        partition = (doc_ver.metadata_json or {}).get("security_partition_id")
+        if partition and not principal.has_partition_access(partition):
+            raise ForbiddenError(
+                f"Principal '{principal.user_id}' is not authorized to access security partition '{partition}'"
+            )
 
     run_stmt = (
         select(IngestionRun)

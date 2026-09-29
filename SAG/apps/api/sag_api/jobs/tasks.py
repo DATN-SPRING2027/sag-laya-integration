@@ -500,9 +500,17 @@ async def _process_document_unlocked(
             ingestion_run.completed_at = datetime.now(UTC)
             ver = await session.get(DocumentVersion, ingestion_run.document_version_id)
             if ver:
-                ver.status = "READY"
-                ver.search_status = "READY"
-                ver.search_ready_at = datetime.now(UTC)
+                # Xác minh chỉ số tìm kiếm (chunks) đã thực sự được nạp hợp lệ trước khi đánh dấu SEARCH_READY (Comment #11)
+                if outcome.chunk_count > 0:
+                    ver.status = "SEARCH_READY"
+                    ver.search_status = "SEARCH_READY"
+                    ver.search_ready_at = datetime.now(UTC)
+                else:
+                    ver.status = "FAILED"
+                    ver.search_status = "FAILED"
+                # knowledge_status duy trì độc lập theo hợp đồng Phase 0 (chỉ chuyển khi tree/graph hoàn tất)
+                if ver.knowledge_status != "KNOWLEDGE_READY":
+                    ver.knowledge_status = "NOT_STARTED"
     await session.commit()
     log.info(
         "Xử lý tài liệu hoàn thành doc=%s parser=%s cached=%s chunks=%d events=%d tokens=%d",
