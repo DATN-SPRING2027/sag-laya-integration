@@ -56,36 +56,17 @@ async def test_global_search_forwards_validated_strategy(monkeypatch):
     from sag_api.api.v1 import search as search_api
     from sag_api.core.deps import get_engine_manager
     from sag_api.main import app
-    from sag_api.sag.dto import (
-        EntityInfo,
-        GraphAssociationInfo,
-        GraphEventInfo,
-        RetrievedSection,
-        SearchOutcome,
-        SourceGraphInfo,
-    )
+    from sag_api.sag.dto import RetrievedSection, SearchOutcome
 
     class RecordingEngine:
         strategy: str | None = None
         top_k: int | None = None
-        event_top_k: int | None = None
         query: str | None = None
-
-        def __init__(self):
-            self.started: set[str] = set()
-            self.parallel_gate = asyncio.Event()
-
-        async def _meet_parallel_gate(self, channel: str) -> None:
-            self.started.add(channel)
-            if len(self.started) == 2:
-                self.parallel_gate.set()
-            await asyncio.wait_for(self.parallel_gate.wait(), timeout=1)
 
         async def provision(self, *_args):
             return None
 
         async def search_many(self, targets, query, *, strategy=None, top_k=None):
-            await self._meet_parallel_gate("chunks")
             self.strategy = strategy
             self.top_k = top_k
             self.query = query
@@ -104,43 +85,11 @@ async def test_global_search_forwards_validated_strategy(monkeypatch):
                 stats={"strategy": strategy},
             )
 
-        async def search_event_scores(self, query, sources_by_config, *, limit=None):
-            await self._meet_parallel_gate("events")
-            self.event_top_k = limit
-            source_config_id = next(iter(sources_by_config))
-            # The directly recalled event belongs to another chunk. This is the
-            # sparse-event case that chunk-only graph mapping used to lose.
-            return {(source_config_id, "event-1"): 0.94}
+        async def search_event_scores(self, *_args, **_kwargs):
+            raise AssertionError("P4 global retrieval must not recall graph events")
 
-        async def graph_for_sections(self, sections, sources_by_config, **kwargs):
-            source_config_id = sections[0].source_config_id
-            assert kwargs["event_scores"] == {(source_config_id, "event-1"): 0.94}
-            return SourceGraphInfo(
-                events=[
-                    GraphEventInfo(
-                        id="event-1",
-                        source_config_id=source_config_id,
-                        source_id="document-1",
-                        chunk_id="event-chunk-not-in-section-results",
-                        title="外卖骑手收入变化",
-                        summary="报告分析了工作时长、技能与收入之间的关系。",
-                        category="劳动研究",
-                        score=0.94,
-                    )
-                ],
-                entities=[
-                    EntityInfo(
-                        id="entity-1",
-                        name="外卖骑手",
-                        type="职业",
-                        description="平台配送劳动者",
-                        heat=1,
-                    )
-                ],
-                associations=[
-                    GraphAssociationInfo(event_id="event-1", entity_id="entity-1")
-                ],
-            )
+        async def graph_for_sections(self, *_args, **_kwargs):
+            raise AssertionError("P4 global retrieval must not project graph fields")
 
     engine = RecordingEngine()
     monkeypatch.setattr(
@@ -186,26 +135,23 @@ async def test_global_search_forwards_validated_strategy(monkeypatch):
                 assert engine.query == "策略测试"
                 # 对外仍返回 7 条；内部有界扩大候选池，之后统一重排与过滤。
                 assert engine.top_k == 21
-                assert engine.event_top_k == 7
-                assert engine.started == {"chunks", "events"}
                 assert response.json()["stats"]["strategy"] == "multi"
                 result = response.json()
                 assert result["stats"]["requested_top_k"] == 7
                 assert result["stats"]["candidate_top_k"] == 21
-                assert result["stats"]["event_candidates"] == 1
-                assert result["stats"]["event_hits"] == 1
-                assert result["stats"]["event_recall"] == "vector+chunk"
+                assert result["stats"]["fusion_method"] == "rrf"
+                assert result["stats"]["fusion_retrievers"] == 1
+                assert "event_candidates" not in result["stats"]
+                assert "event_hits" not in result["stats"]
                 assert result["stats"]["query_route"]["query_original"] == "策略测试"
                 assert result["stats"]["query_route"]["requested_strategy"] == "multi"
                 assert result["stats"]["query_route"]["effective_strategy"] == "multi"
                 assert result["stats"]["query_route"]["fallback_used"] is False
                 assert "[1]" in result["summary"]
-                assert result["events"][0]["title"] == "外卖骑手收入变化"
-                assert result["events"][0]["chunk_id"] == "event-chunk-not-in-section-results"
-                assert result["events"][0]["summary"].startswith("报告分析")
-                assert result["events"][0]["source_id"] == source.json()["id"]
-                assert result["entities"][0]["name"] == "外卖骑手"
-                assert result["relations"][0]["kind"] == "mentions"
+                assert result["events"] == []
+                assert result["entities"] == []
+                assert result["relations"] == []
+                assert result["source_hits"] == []
 
                 deprecated = await client.post(
                     "/api/v1/search",

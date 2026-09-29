@@ -14,7 +14,7 @@ import pytest
 from sag_api.core.config import Settings
 from sag_api.core.errors import UpstreamError
 from sag_api.generation import LLMClient
-from sag_api.sag import RetrievedSection, SearchOutcome, SourceGraphInfo
+from sag_api.sag import RetrievedSection, SearchOutcome
 from sag_api.services.retrieval_service import stream_synthesize_search_answer
 
 
@@ -38,7 +38,10 @@ class SearchEngine:
         )
 
     async def graph_for_sections(self, *_args, **_kwargs):
-        return SourceGraphInfo()
+        raise AssertionError("P4 global retrieval must not project graph fields")
+
+    async def search_event_scores(self, *_args, **_kwargs):
+        raise AssertionError("P4 global retrieval must not recall graph events")
 
 
 class StreamingLLM:
@@ -161,6 +164,9 @@ async def test_search_stream_emits_true_deltas_then_canonical_response():
     initial = events[0][1]
     assert initial["summary"] == ""
     assert initial["sections"][0]["chunk_id"] == "chunk-1"
+    assert initial["events"] == []
+    assert initial["entities"] == []
+    assert initial["relations"] == []
     assert [payload["delta"] for name, payload in events if name == "summary.delta"] == [
         "骑手",
         "需要规划能力",

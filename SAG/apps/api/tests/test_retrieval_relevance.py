@@ -58,6 +58,50 @@ def test_rerank_accepts_split_evidence_for_contiguous_chinese_query():
     assert [item.chunk_id for item in result.sections] == ["target"]
 
 
+def test_rank_fusion_is_independent_of_retriever_score_scales():
+    semantic = [
+        section("a", "câu hỏi A", "bằng chứng câu hỏi cho A", 0.95),
+        section("b", "câu hỏi B", "bằng chứng câu hỏi cho B", 0.8),
+        section("c", "câu hỏi C", "bằng chứng câu hỏi cho C", 0.7),
+    ]
+    lexical = [
+        section("a", "câu hỏi A", "bằng chứng câu hỏi cho A", 0.99),
+        section("c", "câu hỏi C", "bằng chứng câu hỏi cho C", 0.6),
+        section("b", "câu hỏi B", "bằng chứng câu hỏi cho B", 0.2),
+    ]
+
+    baseline = rerank_sections("câu hỏi", semantic, lexical=lexical, limit=8)
+    rescaled = rerank_sections(
+        "câu hỏi",
+        [item.model_copy(update={"score": item.score * 1000}) for item in semantic],
+        lexical=[item.model_copy(update={"score": item.score / 1000}) for item in lexical],
+        limit=8,
+    )
+
+    assert [item.chunk_id for item in baseline.sections] == ["a", "b", "c"]
+    assert [item.chunk_id for item in rescaled.sections] == ["a", "b", "c"]
+    assert all(0.0 <= item.score <= 1.0 for item in rescaled.sections)
+
+
+def test_rank_fusion_deduplicates_candidates_by_source_and_chunk():
+    semantic = [
+        section("shared", "câu hỏi", "bản trùng ngắn", 0.9),
+        section("shared", "câu hỏi", "bản trùng dài hơn trong semantic", 0.8),
+        section("semantic-only", "câu hỏi", "semantic evidence", 0.7),
+    ]
+    lexical = [
+        section("shared", "câu hỏi", "bản trùng dài nhất trong lexical result", 0.99),
+        section("lexical-only", "câu hỏi", "lexical evidence", 0.5),
+    ]
+
+    result = rerank_sections("câu hỏi", semantic, lexical=lexical, limit=8)
+
+    assert result.candidate_count == 3
+    assert len({item.chunk_id for item in result.sections}) == 3
+    shared = next(item for item in result.sections if item.chunk_id == "shared")
+    assert shared.content == "bản trùng dài nhất trong lexical result"
+
+
 @pytest.mark.asyncio
 async def test_contiguous_and_spaced_chinese_queries_return_same_core_evidence():
     from uuid import uuid4

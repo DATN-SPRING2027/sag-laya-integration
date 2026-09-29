@@ -330,34 +330,15 @@ async def _prepare_global_search(
         )
 
     refs = {source.sag_source_config_id: source for source in sources}
-    outcome, event_scores = await asyncio.gather(
-        retrieve_relevant_sections(
-            engine_manager,
-            sources,
-            body.query,
-            strategy=route_plan.strategy,
-            top_k=body.top_k,
-        ),
-        recall_event_scores(
-            engine_manager,
-            body.query,
-            refs,
-            limit=body.top_k,
-        ),
-    )
-    graph_fields = await _event_graph_fields(
+    outcome = await retrieve_relevant_sections(
         engine_manager,
-        outcome.sections,
-        refs,
-        event_scores=event_scores,
+        sources,
+        body.query,
+        strategy=route_plan.strategy,
+        top_k=body.top_k,
     )
     stats = _with_query_route_stats(
-        {
-            **outcome.stats,
-            "event_candidates": len(event_scores),
-            "event_hits": len(graph_fields["events"]),
-            "event_recall": "vector+chunk" if event_scores else "chunk",
-        },
+        outcome.stats,
         route_plan,
     )
 
@@ -380,8 +361,6 @@ async def _prepare_global_search(
         response=SearchResponse(
             query=body.query,
             sections=section_outputs,
-            **graph_fields,
-            source_hits=_source_hits(graph_fields["events"]),
             stats=stats,
         ),
     )
