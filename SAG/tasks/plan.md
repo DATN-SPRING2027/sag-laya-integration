@@ -49,6 +49,17 @@ citation, no-answer flow, Knowledge Graph hoặc Knowledge Routing Tree.
   fail-closed permission scope contract và SAG có mapping tương ứng; sau đó cần
   lọc scope trước dense/lexical retrieval và thêm ACL leakage/pre-top-k tests.
 
+### Follow-up review fix — 2026-09-30
+
+- Semantic-only relevance gate không còn dùng absolute `semantic_floor`; mỗi
+  candidate được so với semantic score cao nhất trong cùng kết quả, dùng ngưỡng
+  tỷ lệ `0.68`. Regression xác nhận ranking/relevance giữ nguyên khi score bị
+  nhân hoặc chia `1000`.
+- Frontend global SearchPanel hiện chuyển sang `ResultList` khi `events` rỗng;
+  response contract vẫn giữ các graph fields dưới dạng mảng rỗng.
+- ACL authority/resolver và source-scope mapping vẫn thiếu; đây tiếp tục là
+  blocker P1 của PR.
+
 ### Decision gate trước implementation
 
 Phải chốt một nguồn quyền authoritative cho P4:

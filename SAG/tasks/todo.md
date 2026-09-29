@@ -81,6 +81,7 @@ Nguồn chuẩn: [Workflow v1.1](../docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1
 - [ ] Fail closed khi ACL resolver/prefilter lỗi; không fallback sang unfiltered evidence. Chưa thể kiểm chứng nếu chưa có resolver/prefilter.
 - [x] Fuse semantic + lexical bằng RRF, không cộng raw score khác scale; score đầu ra chuẩn hóa về `[0, 1]` và ghi `fusion_method`/candidate counts.
 - [x] Dedupe candidate theo source/chunk và dùng tie-break xác định; giữ ưu tiên exact lexical trước expansion-only match. Regression xác nhận scale raw score không đổi ranking.
+- [x] Chuẩn hóa semantic-only relevance gate theo tỷ lệ so với score cao nhất trong cùng candidate set; test xác nhận scale `0.95/0.8` và `0.00095/0.0008` giữ cùng kết quả.
 - [x] Global `/search` và `/search/stream` bỏ event/graph retrieval trong P4; response giữ graph arrays rỗng. Source-scoped P3 path không đổi.
 - [x] Relevance/search strategy regressions: `test_retrieval_relevance.py`, `test_search_strategy.py`, `test_search_stream.py` pass.
 - [ ] ACL leakage/blackhole và pre-top-k filtering regressions: chưa thực hiện vì không có authority/mapping contract để tạo test xác thực.

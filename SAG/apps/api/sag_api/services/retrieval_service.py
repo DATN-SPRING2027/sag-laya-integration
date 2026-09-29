@@ -183,6 +183,7 @@ _BOILERPLATE = (
 )
 _CITATION_RE = re.compile(r"\[(\d+)]")
 _RRF_K = 60
+_SEMANTIC_RELATIVE_RELEVANCE_FLOOR = 0.68
 
 
 def _section_key(section: RetrievedSection) -> tuple[str, str]:
@@ -331,7 +332,6 @@ def rerank_sections(
         (max(0.0, float(section.score or 0.0)) for section in semantic_by_key.values()),
         default=0.0,
     )
-    semantic_floor = max(0.35, top_semantic_score * 0.68)
     lexical_scores = {
         key: _lexical_relevance(query, section, analysis=effective)
         for key, section in merged.items()
@@ -349,6 +349,7 @@ def rerank_sections(
         semantic_rank = semantic_ranks.get(key)
         lexical_rank = lexical_ranks.get(key)
         raw = max(0.0, float(semantic_by_key[key].score or 0.0)) if key in semantic_by_key else 0.0
+        relative_semantic_score = raw / top_semantic_score if top_semantic_score > 0 else 0.0
         lexical_score = lexical_scores[key]
         exact = key in exact_keys
         lexical_match = lexical_rank is not None
@@ -363,7 +364,9 @@ def rerank_sections(
         if has_lexical_signal:
             relevant = lexical_match or lexical_score >= 0.2
         else:
-            relevant = raw >= semantic_floor
+            # The ratio preserves the cutoff under positive score rescaling and
+            # avoids treating provider-specific score units as a relevance contract.
+            relevant = relative_semantic_score >= _SEMANTIC_RELATIVE_RELEVANCE_FLOOR
         if not relevant:
             continue
         rank_sum = sum(rank for rank in (semantic_rank, lexical_rank) if rank is not None)

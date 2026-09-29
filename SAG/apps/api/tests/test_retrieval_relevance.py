@@ -102,6 +102,24 @@ def test_rank_fusion_deduplicates_candidates_by_source_and_chunk():
     assert shared.content == "bản trùng dài nhất trong lexical result"
 
 
+def test_semantic_only_relevance_gate_is_invariant_to_score_scale():
+    semantic = [
+        section("strong", "主题甲", "主题甲的语义证据。", 0.95),
+        section("related", "主题乙", "主题乙的语义证据。", 0.8),
+        section("noise", "页脚", "版权与导航信息。", 0.1),
+    ]
+
+    baseline = rerank_sections("zebraquasar", semantic, limit=8)
+    rescaled = rerank_sections(
+        "zebraquasar",
+        [item.model_copy(update={"score": item.score / 1000}) for item in semantic],
+        limit=8,
+    )
+
+    assert [item.chunk_id for item in baseline.sections] == ["strong", "related"]
+    assert [item.chunk_id for item in rescaled.sections] == ["strong", "related"]
+
+
 @pytest.mark.asyncio
 async def test_contiguous_and_spaced_chinese_queries_return_same_core_evidence():
     from uuid import uuid4
