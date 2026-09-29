@@ -5,10 +5,37 @@ Defined according to Section 4.3 of phase-0-contracts-and-foundations.md.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
 import uuid
 
 NAMESPACE_SAG = uuid.NAMESPACE_URL
+
+
+@dataclass(frozen=True)
+class VerifiedPrincipal:
+    """Verified principal identity and authorized boundary scopes."""
+
+    user_id: str
+    tenant_id: str
+    allowed_projects: frozenset[str]
+    allowed_partitions: frozenset[str]
+    is_service: bool = False
+    roles: tuple[str, ...] = ()
+
+    def has_project_access(self, project_id: str) -> bool:
+        """Verify whether principal is authorized to operate within project_id."""
+        if "*" in self.allowed_projects:
+            return True
+        if not self.allowed_projects:
+            return True
+        return project_id in self.allowed_projects
+
+    def has_partition_access(self, partition_id: str) -> bool:
+        """Verify whether principal is authorized for given security partition."""
+        if "*" in self.allowed_partitions or not self.allowed_partitions:
+            return True
+        return partition_id in self.allowed_partitions
 
 
 def generate_doc_id(tenant_id: str, project_id: str, logical_source_id: str) -> str:

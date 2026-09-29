@@ -1,14 +1,16 @@
-"""任务处理器 —— 按 JobType 分发。
+"""Trình xử lý tác vụ —— Phân phối theo JobType.
 
-处理器只关心「做什么」；状态机（queued/running/succeeded/failed）由队列 worker 统一维护。
-处理器内部负责领域对象（Document/Source）的阶段状态与计数更新。
+Bộ xử lý chỉ quan tâm đến "làm gì"; máy trạng thái (queued/running/succeeded/failed) được duy trì thống nhất bởi queue worker.
+Bên trong bộ xử lý chịu trách nhiệm cập nhật trạng thái giai đoạn và bộ đếm của đối tượng miền (Document/Source).
 """
 
 from __future__ import annotations
 
 import os
 import re
+import uuid
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,7 @@ from sag_api.core.error_taxonomy import ErrorLayer, ErrorStage
 from sag_api.core.errors import ApiError, NotFoundError
 from sag_api.core.logging import get_logger
 from sag_api.db.models import Document, Job, Source
+from sag_api.db.models.routing_rag import DocumentVersion, IngestionRun, StageRun
 from sag_api.enums import DocumentStatus, JobStatus, JobType
 from sag_api.jobs.control import JobPaused, JobYielded
 from sag_api.jobs.octx_tasks import (
@@ -45,9 +48,9 @@ log = get_logger("jobs")
 
 TaskHandler = Callable[[AsyncSession, Job], Awaitable[None]]
 
-# 文档失败时的当前状态 → 链路环节。这是「唯一知道 stage 的地方」的兜底映射：
-# 当异常本身没带 stage（非 ApiError，例如逃逸的 jsonschema 错误）时，用文档处在
-# 哪个状态推断它卡在哪个环节。
+# Trạng thái hiện tại khi tài liệu thất bại → bước trong chuỗi xử lý. Đây là ánh xạ dự phòng tại "nơi duy nhất biết stage":
+# Khi bản thân ngoại lệ không mang stage (không phải ApiError, ví dụ lỗi jsonschema thoát ra ngoài), dùng trạng thái
+# hiện tại của tài liệu để suy đoán nó bị nghẽn ở bước nào.
 _STATUS_TO_STAGE: dict[DocumentStatus, ErrorStage] = {
     DocumentStatus.PENDING: ErrorStage.PARSE,
     DocumentStatus.LOADING: ErrorStage.PARSE,
@@ -188,11 +191,11 @@ async def _yield_after_document_transition_lost(
 
 
 def _classify_document_failure(e: Exception, current_status: DocumentStatus) -> tuple[ErrorLayer, ErrorStage]:
-    """推断失败的责任层与链路环节。
+    """Suy đoán tầng trách nhiệm và bước trong chuỗi khi thất bại.
 
-    优先信任领域异常自带的 layer/stage（LLM 分类、引擎翻译层都会填）；
-    否则退化为「按文档当前状态猜环节」，责任层归 engine（zleap-sag 抽取/入库
-    过程中逃逸的裸异常，如 jsonschema.ValidationError，几乎都发生在引擎侧）。
+    Ưu tiên tin tưởng layer/stage đi kèm ngoại lệ miền (phân loại LLM, tầng dịch engine đều sẽ điền);
+    nếu không thì hạ cấp xuống "đoán bước theo trạng thái hiện tại của tài liệu", tầng trách nhiệm gán cho engine (ngoại lệ trần
+    thoát ra trong quá trình trích xuất/nạp zleap-sag, như jsonschema.ValidationError, hầu hết xảy ra ở phía engine).
     """
     if isinstance(e, ApiError) and e.layer is not None and e.stage is not None:
         return e.layer, e.stage
@@ -203,7 +206,7 @@ def _classify_document_failure(e: Exception, current_status: DocumentStatus) -> 
 async def process_document(session: AsyncSession, job: Job, *, engine_manager: EngineManager, job_queue=None) -> None:
     document = await session.get(Document, job.document_id) if job.document_id else None
     if document is None:
-        raise NotFoundError("文档不存在")
+        raise NotFoundError("Tài liệu không tồn tại")
     async with acquire_source_processing_lease(SessionLocal, document.source_id, job.id):
         await _process_document_unlocked(
             session,
@@ -216,15 +219,22 @@ async def process_document(session: AsyncSession, job: Job, *, engine_manager: E
 async def _process_document_unlocked(
     session: AsyncSession, job: Job, *, engine_manager: EngineManager, job_queue=None
 ) -> None:
-    """解析、入库并按 chunk 并发抽取；每个 chunk 完成即保存断点。"""
+    """Phân tích cú pháp, nạp và trích xuất đồng thời theo chunk; mỗi chunk hoàn thành sẽ lưu checkpoint."""
     document = await session.get(Document, job.document_id) if job.document_id else None
     if document is None:
-        raise NotFoundError("文档不存在")
+        raise NotFoundError("Tài liệu không tồn tại")
     source = await session.get(Source, document.source_id)
     if source is None:
-        raise NotFoundError("信源不存在")
+        raise NotFoundError("Nguồn dữ liệu không tồn tại")
     checkpoint = ProcessCheckpoint.from_payload(job.payload)
     scheduler_yield_reason: str | None = None
+    run_id = (job.payload or {}).get("run_id")
+    if run_id:
+        ingestion_run = await session.get(IngestionRun, run_id)
+        if ingestion_run and ingestion_run.status != "RUNNING":
+            ingestion_run.status = "RUNNING"
+            ingestion_run.started_at = datetime.now(UTC)
+            await session.commit()
 
     # A worker retry reuses the document row. Clear the previous attempt's
     # failure before parsing can block for a long time, so active processing
@@ -251,6 +261,20 @@ async def _process_document_unlocked(
             total = len(checkpoint.chunk_ids)
             document.progress = 20 + round(80 * completed / total) if total else 20
             job.progress = document.progress / 100
+        if run_id:
+            ingestion_run = await session.get(IngestionRun, run_id)
+            if ingestion_run:
+                ingestion_run.current_stage = stage.upper()
+                session.add(
+                    StageRun(
+                        id=str(uuid.uuid4()),
+                        run_id=run_id,
+                        stage=stage,
+                        status="SUCCESS",
+                        duration_ms=1.0,
+                        metrics_json={},
+                    )
+                )
         await session.commit()
 
     async def on_parser_state(state: dict) -> None:
@@ -293,15 +317,15 @@ async def _process_document_unlocked(
         if job_queue is not None and job_queue.source_maintenance_requested(source.id):
             scheduler_yield_reason = SOURCE_MAINTENANCE
             return True
-        # 信源正在被删除：请求在途处理任务尽快让路并释放处理租约，使同步删除
-        # 能在 HTTP 窗口内完成，而非被动等待解析/抽取自然结束。此处按“暂停”语义
-        # 处理（不设置 yield 原因）——文档随后会随信源级联删除。
+        # Nguồn dữ liệu đang bị xóa: yêu cầu tác vụ xử lý đang chạy nhường đường và giải phóng lease xử lý sớm nhất có thể,
+        # để việc xóa đồng bộ có thể hoàn thành trong cửa sổ HTTP, thay vì chờ đợi thụ động quá trình parse/extract kết thúc tự nhiên.
+        # Ở đây xử lý theo ngữ nghĩa "tạm dừng" (không thiết lập lý do yield) —— tài liệu sau đó sẽ bị xóa cascade theo nguồn dữ liệu.
         if job_queue is not None and job_queue.source_stop_requested(source.id):
             return True
         return False
 
     async def _pause_or_yield() -> None:
-        """把当前文档落到 PAUSED 或让行，供解析/抽取两个阶段共用。"""
+        """Chuyển tài liệu hiện tại sang PAUSED hoặc nhường lượt, dùng chung cho cả hai giai đoạn parse/extract."""
         await session.refresh(document)
         if scheduler_yield_reason == SOURCE_MAINTENANCE and document.status not in _CONTROL_TRANSITION_STATES:
             raise JobYielded(SOURCE_MAINTENANCE)
@@ -344,7 +368,7 @@ async def _process_document_unlocked(
             await session.commit()
             if prepared.fallback_from:
                 log.warning(
-                    "文档解析已降级 doc=%s job=%s from=%s to=%s cached=%s error=%s",
+                    "Phân tích tài liệu đã hạ cấp doc=%s job=%s from=%s to=%s cached=%s error=%s",
                     document.id,
                     getattr(job, "id", None),
                     prepared.fallback_from,
@@ -368,7 +392,7 @@ async def _process_document_unlocked(
             await _pause_or_yield()
     except (JobPaused, JobYielded):
         raise
-    except Exception as e:  # noqa: BLE001 - 记录到文档后再上抛给 worker
+    except Exception as e:  # noqa: BLE001 - Ghi nhận vào tài liệu trước khi ném tiếp cho worker
         await session.refresh(document)
         if document.status in _CONTROL_TRANSITION_STATES or document.status == DocumentStatus.PAUSED:
             await _yield_after_document_transition_lost(session, document)
@@ -380,7 +404,7 @@ async def _process_document_unlocked(
         parser_state = (job.payload or {}).get("document_parser")
         parser_failed = parser_stage
         if parser_failed:
-            public_message = _redact_parser_reason(message) or "文档解析失败"
+            public_message = _redact_parser_reason(message) or "Phân tích cú pháp tài liệu thất bại"
         if (
             parser_failed
             and isinstance(parser_state, dict)
@@ -407,12 +431,22 @@ async def _process_document_unlocked(
         if failed.rowcount != 1:
             await _yield_after_document_transition_lost(session, document)
         log.warning(
-            "文档处理失败 doc=%s layer=%s stage=%s error=%s",
+            "Xử lý tài liệu thất bại doc=%s layer=%s stage=%s error=%s",
             document.id,
             layer.value,
             stage.value,
             public_message,
         )
+        if run_id:
+            ingestion_run = await session.get(IngestionRun, run_id)
+            if ingestion_run:
+                ingestion_run.status = "FAILED"
+                ingestion_run.error_layer = layer.value
+                ingestion_run.error_stage = stage.value
+                ingestion_run.error_message = public_message
+                ver = await session.get(DocumentVersion, ingestion_run.document_version_id)
+                if ver:
+                    ver.status = "FAILED"
         await session.commit()
         raise
 
@@ -448,7 +482,7 @@ async def _process_document_unlocked(
     )
     if completed.rowcount != 1:
         await _yield_after_document_transition_lost(session, document)
-    # 信源聚合计数用原子 SQL 更新，避免并发读改写丢失
+    # Bộ đếm tổng hợp của nguồn dữ liệu được cập nhật bằng SQL nguyên tử để tránh mất mát do đọc-ghi đồng thời
     await session.execute(
         update(Source)
         .where(Source.id == source.id)
@@ -458,9 +492,20 @@ async def _process_document_unlocked(
         )
     )
     await touch_source_revision(session, source.id)
+    if run_id:
+        ingestion_run = await session.get(IngestionRun, run_id)
+        if ingestion_run:
+            ingestion_run.status = "SUCCEEDED"
+            ingestion_run.current_stage = "COMPLETE"
+            ingestion_run.completed_at = datetime.now(UTC)
+            ver = await session.get(DocumentVersion, ingestion_run.document_version_id)
+            if ver:
+                ver.status = "READY"
+                ver.search_status = "READY"
+                ver.search_ready_at = datetime.now(UTC)
     await session.commit()
     log.info(
-        "文档处理完成 doc=%s parser=%s cached=%s chunks=%d events=%d tokens=%d",
+        "Xử lý tài liệu hoàn thành doc=%s parser=%s cached=%s chunks=%d events=%d tokens=%d",
         document.id,
         prepared.provider if prepared is not None else "checkpoint",
         prepared.cached if prepared is not None else True,
@@ -483,7 +528,7 @@ async def delete_document_task(
     session: AsyncSession, job: Job, *, engine_manager: EngineManager, job_queue=None
 ) -> None:
     if not job.source_id:
-        raise NotFoundError("删除任务缺少信源")
+        raise NotFoundError("Tác vụ xóa thiếu nguồn dữ liệu")
     async with acquire_source_exclusive_lease(SessionLocal, job.source_id, f"document-delete:{job.id}"):
         await _delete_document_task_unlocked(session, job, engine_manager=engine_manager, job_queue=job_queue)
 
@@ -491,16 +536,16 @@ async def delete_document_task(
 async def _delete_document_task_unlocked(
     session: AsyncSession, job: Job, *, engine_manager: EngineManager, job_queue=None
 ) -> None:
-    """清理已取得信源维护窗口的文档派生数据、文件和记录。"""
+    """Dọn dẹp dữ liệu phái sinh, tệp tin và bản ghi của tài liệu đã lấy được cửa sổ bảo trì nguồn dữ liệu."""
     target_document_id = job.document_id or str((job.payload or {}).get("target_document_id") or "")
     if not target_document_id:
-        raise NotFoundError("删除任务缺少文档")
+        raise NotFoundError("Tác vụ xóa thiếu tài liệu")
     document = await session.get(Document, target_document_id)
     if document is None:
         return
     source = await session.get(Source, document.source_id)
     if source is None:
-        raise NotFoundError("信源不存在")
+        raise NotFoundError("Nguồn dữ liệu không tồn tại")
 
     await session.refresh(document)
     derived_source_ids = {
@@ -545,8 +590,8 @@ async def _delete_document_task_unlocked(
                 source_id=source.id,
                 reason="document_deleted",
             )
-        except Exception:  # noqa: BLE001 - 派生视图刷新不影响核心删除结果
-            log.exception("文档已删除，但知识宇宙刷新调度失败 source=%s", source.id)
+        except Exception:  # noqa: BLE001 - Làm mới view phái sinh không ảnh hưởng đến kết quả xóa cốt lõi
+            log.exception("Tài liệu đã bị xóa, nhưng lập lịch làm mới knowledge universe thất bại source=%s", source.id)
             # Core deletion was committed above. Roll back only the optional
             # refresh scheduling transaction so the worker can still persist
             # the delete Job's SUCCEEDED terminal state and release maintenance.
@@ -557,7 +602,7 @@ async def reprocess_document_task(
     session: AsyncSession, job: Job, *, engine_manager: EngineManager, job_queue=None
 ) -> None:
     if not job.source_id:
-        raise NotFoundError("重新处理任务缺少信源")
+        raise NotFoundError("Tác vụ xử lý lại thiếu nguồn dữ liệu")
     async with acquire_source_exclusive_lease(SessionLocal, job.source_id, f"document-reprocess:{job.id}"):
         await _reprocess_document_task_unlocked(session, job, engine_manager=engine_manager, job_queue=job_queue)
 
@@ -565,16 +610,16 @@ async def reprocess_document_task(
 async def _reprocess_document_task_unlocked(
     session: AsyncSession, job: Job, *, engine_manager: EngineManager, job_queue=None
 ) -> None:
-    """在信源维护窗口内清理旧派生数据，再排入普通文档处理任务。"""
+    """Trong cửa sổ bảo trì nguồn dữ liệu dọn dẹp dữ liệu phái sinh cũ, sau đó xếp vào hàng đợi tác vụ xử lý tài liệu thông thường."""
     target_document_id = job.document_id or str((job.payload or {}).get("target_document_id") or "")
     if not target_document_id:
-        raise NotFoundError("重新处理任务缺少文档")
+        raise NotFoundError("Tác vụ xử lý lại thiếu tài liệu")
     document = await session.get(Document, target_document_id)
     if document is None:
-        raise NotFoundError("文档不存在")
+        raise NotFoundError("Tài liệu không tồn tại")
     source = await session.get(Source, document.source_id)
     if source is None:
-        raise NotFoundError("信源不存在")
+        raise NotFoundError("Nguồn dữ liệu không tồn tại")
 
     payload = dict(job.payload or {})
     derived_source_ids = sorted(
@@ -623,7 +668,7 @@ async def _reprocess_document_task_unlocked(
 
 async def sync_source(session: AsyncSession, job: Job, *, engine_manager=None, job_queue=None) -> None:
     if not job.source_id:
-        raise NotFoundError("信源不存在")
+        raise NotFoundError("Nguồn dữ liệu không tồn tại")
     async with acquire_operation_lease(
         SessionLocal,
         [f"source:{job.source_id}"],
@@ -633,15 +678,15 @@ async def sync_source(session: AsyncSession, job: Job, *, engine_manager=None, j
 
 
 async def _sync_source_unlocked(session: AsyncSession, job: Job, *, job_queue=None) -> None:
-    """动态连接器同步：discover → fetch → 登记文档并入队处理（复用 ingest→extract 管线）。"""
-    # 延迟导入避免与 jobs 包的循环依赖
+    """Đồng bộ connector động: discover → fetch → đăng ký tài liệu và xếp hàng xử lý (tái sử dụng pipeline ingest→extract)."""
+    # Import trễ để tránh phụ thuộc vòng với package jobs
     from sag_api.connectors import registry
     from sag_api.core.config import settings
     from sag_api.services.document_service import create_document_from_upload
 
     source = await session.get(Source, job.source_id) if job.source_id else None
     if source is None:
-        raise NotFoundError("信源不存在")
+        raise NotFoundError("Nguồn dữ liệu không tồn tại")
 
     connector = registry.get(source.connector_kind)
     discovered = await connector.discover(source.config or {})
@@ -651,8 +696,8 @@ async def _sync_source_unlocked(session: AsyncSession, job: Job, *, job_queue=No
             local = await connector.fetch(source.config or {}, d)
             with open(local.path, "rb") as f:
                 data = f.read()
-        except Exception as e:  # noqa: BLE001 - 单篇失败不影响整体同步
-            log.warning("同步抓取失败 %s：%s", d.external_id, getattr(e, "message", None) or e)
+        except Exception as e:  # noqa: BLE001 - Thất bại từng bài không ảnh hưởng đến đồng bộ tổng thể
+            log.warning("Đồng bộ thu thập thất bại %s: %s", d.external_id, getattr(e, "message", None) or e)
             continue
         await create_document_from_upload(
             session,
@@ -672,7 +717,7 @@ async def _sync_source_unlocked(session: AsyncSession, job: Job, *, job_queue=No
     job.progress = 1.0
     job.payload = {**(job.payload or {}), "discovered": len(discovered), "fetched": fetched}
     await session.commit()
-    log.info("同步完成 source=%s 发现=%d 抓取=%d", source.id, len(discovered), fetched)
+    log.info("Đồng bộ hoàn tất source=%s tìm thấy=%d thu thập=%d", source.id, len(discovered), fetched)
 
 
 async def index_universe(session: AsyncSession, job: Job, *, engine_manager: EngineManager, job_queue=None) -> None:
@@ -682,7 +727,7 @@ async def index_universe(session: AsyncSession, job: Job, *, engine_manager: Eng
 
     user_id = str((job.payload or {}).get("user_id") or "")
     if not user_id or await session.get(User, user_id) is None:
-        raise NotFoundError("知识宇宙所属用户不存在")
+        raise NotFoundError("Người dùng sở hữu knowledge universe không tồn tại")
     job.progress = 0.1
     await session.commit()
     overview = await rebuild_universe_overview(session, engine_manager, user_id)

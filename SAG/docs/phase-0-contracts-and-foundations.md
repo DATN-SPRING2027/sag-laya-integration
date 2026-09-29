@@ -707,7 +707,10 @@ Mọi truy vấn Cosine Similarity trên Qdrant **bắt buộc** truyền bộ l
 
 ### 10.1. Chiến Lược Tương Thích Ngược (Backward Compatibility)
 1. **Bảo toàn dữ liệu cũ**: Bảng `documents` cũ được ánh xạ sang mô hình mới bằng cách gán `version_no = 1`, `logical_source_id = filename`, tính hash từ file trên đĩa để nạp vào `document_versions`.
-2. **Không phá vỡ API client hiện hành**: Route cũ `/sources/{id}/documents` được chuyển thành wrapper gọi nội bộ vào service phiên bản mới.
+2. **Không phá vỡ API client hiện hành & Ranh giới chuyển đổi (Migration Boundary)**:
+   - Trong **Phase 0**, giữ nguyên tính độc lập và luồng hoạt động ổn định của route cũ `/api/v1/sources/{source_id}/documents` nhằm phục vụ tương thích ngược tuyệt đối cho desktop client và các bài kiểm tra hiện hữu.
+   - Endpoint mới scoped theo dự án `/api/v1/projects/{project_id}/documents/upload` triển khai trọn vẹn hợp đồng đặc tả Phase 0: xác thực principal và ủy quyền phân vùng bảo mật (Security Partition ACL), định danh tài liệu UUIDv5, tính bất biến payload snapshot content-addressed, dedup nội dung và liên kết phiên bản `supersedes_id`.
+   - Việc chuyển đổi hoàn toàn (cutover) route cũ `/sources/{source_id}/documents` thành wrapper hợp nhất với service phiên bản mới được hoạch định triển khai chính thức trong **Phase 1** sau khi hoàn tất migration dữ liệu đa người dùng.
 
 ### 10.2. Quy Trình Rollback Khẩn Cấp Dưới 100ms (Emergency Rollback)
 1. **Rollback Cây Tri Thức (Active Pointer & Version Switch)**:

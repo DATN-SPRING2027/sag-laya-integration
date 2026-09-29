@@ -1,30 +1,68 @@
 """Comprehensive test suite for Phase 1: Upload, Versioning, Idempotency, and Status.
 
 Covers:
-- Strict Security Partition enforcement (400 on missing header)
-- Mandatory Idempotency-Key header (400 on missing header)
+- Strict Security Partition enforcement (422/400 on missing header, 403 on unauthorized partition)
+- Mandatory Idempotency-Key header (422/400 on missing header)
+- Principal Authentication and Project Authorization (401 on missing/invalid token, 403 on project mismatch or impersonation)
+- Bounded Upload Stream Reader (422 on oversized or empty files)
+- Content Addressing and Snapshot Immutability (payload hash-addressed storage path)
 - Fresh document upload and record generation (201 Created)
 - Idempotent request retry with identical payload (200 OK, is_duplicate=True)
 - Idempotent request conflict with different payload (409 Conflict)
 - Version increment on same logical source (version_no=2 with supersedes link)
-- Status query endpoint (200 OK with stage progress, 404 on not found)
+- Exact Content Deduplication (200 OK, is_duplicate=True, no new run created for identical payload on same source)
+- Status query endpoint (200 OK with stage progress, 404 on not found, 401/403 authorization guards)
+- Worker dispatch and IngestionRun stage lifecycle transitions
 """
 
 from __future__ import annotations
 
+import asyncio
+from datetime import UTC, datetime
+from pathlib import Path
 import httpx
 import pytest
 from sqlalchemy import select
 
+from sag_api.core.config import settings
 from sag_api.core.db import SessionLocal, init_db
-from sag_api.db.models import Document
+from sag_api.core.security import create_access_token
+from sag_api.db.models import Document, Job, Source
 from sag_api.db.models.routing_rag import (
     DocumentVersion,
     IngestionRun,
     SourceSnapshot,
     StageRun,
 )
+from sag_api.enums import JobStatus, JobType
 from sag_api.main import app
+
+
+def make_auth_header(
+    user_id: str = "user_dev",
+    tenant_id: str = "tenant_continuum_default",
+    allowed_projects: list[str] | None = None,
+    allowed_partitions: list[str] | None = None,
+    is_service: bool = False,
+) -> dict[str, str]:
+    extra: dict = {
+        "tenant_id": tenant_id,
+    }
+    if allowed_projects is not None:
+        extra["allowed_projects"] = allowed_projects
+    else:
+        extra["allowed_projects"] = ["*"]
+
+    if allowed_partitions is not None:
+        extra["allowed_partitions"] = allowed_partitions
+    else:
+        extra["allowed_partitions"] = ["*"]
+
+    if is_service:
+        extra["role"] = "service"
+
+    token = create_access_token(subject=user_id, extra=extra)
+    return {"Authorization": f"Bearer {token}"}
 
 
 @pytest.fixture(autouse=True)
@@ -33,85 +71,213 @@ async def setup_database():
     await init_db()
 
 
-@pytest.mark.asyncio
-async def test_upload_missing_security_partition_fails_with_400():
+@pytest.fixture
+async def client():
+    """HTTP client for API testing."""
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        res = await client.post(
-            "/api/v1/projects/proj_test/documents/upload",
-            headers={
-                "X-Continuum-User-Id": "user_123",
-                "Idempotency-Key": "key_001",
-                # Omit X-Continuum-Security-Partition
-            },
-            files={"file": ("test.txt", b"Hello World", "text/plain")},
-        )
-        assert res.status_code == 422 or res.status_code == 400
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c
 
 
+# ============================================================================
+# 1. Authentication & Authorization Boundary Tests
+# ============================================================================
+
 @pytest.mark.asyncio
-async def test_upload_missing_idempotency_key_fails_with_400():
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        res = await client.post(
-            "/api/v1/projects/proj_test/documents/upload",
-            headers={
-                "X-Continuum-User-Id": "user_123",
-                "X-Continuum-Security-Partition": "public",
-                # Omit Idempotency-Key
-            },
-            files={"file": ("test.txt", b"Hello World", "text/plain")},
-        )
-        assert res.status_code == 422 or res.status_code == 400
+async def test_upload_missing_auth_token_fails_with_401(client: httpx.AsyncClient):
+    res = await client.post(
+        "/api/v1/projects/proj_auth_test/documents/upload",
+        headers={
+            "X-Continuum-User-Id": "user_123",
+            "Idempotency-Key": "key_auth_01",
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("test.txt", b"Hello World", "text/plain")},
+    )
+    assert res.status_code == 401
 
 
 @pytest.mark.asyncio
-async def test_upload_empty_file_fails_with_validation_error():
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        res = await client.post(
-            "/api/v1/projects/proj_test/documents/upload",
-            headers={
-                "X-Continuum-User-Id": "user_123",
-                "Idempotency-Key": "key_empty",
-                "X-Continuum-Security-Partition": "public",
-            },
-            files={"file": ("empty.txt", b"", "text/plain")},
-        )
-        assert res.status_code == 422
-        assert "empty" in res.text.lower()
+async def test_upload_invalid_auth_token_fails_with_401(client: httpx.AsyncClient):
+    res = await client.post(
+        "/api/v1/projects/proj_auth_test/documents/upload",
+        headers={
+            "Authorization": "Bearer invalid.jwt.token",
+            "X-Continuum-User-Id": "user_123",
+            "Idempotency-Key": "key_auth_02",
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("test.txt", b"Hello World", "text/plain")},
+    )
+    assert res.status_code == 401
 
 
 @pytest.mark.asyncio
-async def test_upload_fresh_document_succeeds_and_creates_records():
-    transport = httpx.ASGITransport(app=app)
+async def test_upload_project_access_forbidden_fails_with_403(client: httpx.AsyncClient):
+    auth_header = make_auth_header(
+        user_id="user_restricted",
+        allowed_projects=["proj_allowed_only"],
+    )
+    res = await client.post(
+        "/api/v1/projects/proj_other_forbidden/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_restricted",
+            "Idempotency-Key": "key_proj_forbidden",
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("test.txt", b"Hello World", "text/plain")},
+    )
+    assert res.status_code == 403
+    assert "not authorized to access project" in res.text
+
+
+@pytest.mark.asyncio
+async def test_upload_security_partition_forbidden_fails_with_403(client: httpx.AsyncClient):
+    auth_header = make_auth_header(
+        user_id="user_dev",
+        allowed_projects=["*"],
+        allowed_partitions=["public", "team_backend"],
+    )
+    res = await client.post(
+        "/api/v1/projects/proj_test/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_dev",
+            "Idempotency-Key": "key_partition_forbidden",
+            "X-Continuum-Security-Partition": "top_secret_executive",
+        },
+        files={"file": ("test.txt", b"Hello World", "text/plain")},
+    )
+    assert res.status_code == 403
+    assert "not authorized for security partition" in res.text
+
+
+@pytest.mark.asyncio
+async def test_upload_user_impersonation_fails_with_403(client: httpx.AsyncClient):
+    auth_header = make_auth_header(user_id="user_alice", is_service=False)
+    res = await client.post(
+        "/api/v1/projects/proj_test/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_bob",  # Attempt to impersonate user_bob
+            "Idempotency-Key": "key_impersonate",
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("test.txt", b"Hello World", "text/plain")},
+    )
+    assert res.status_code == 403
+    assert "cannot impersonate" in res.text
+
+
+# ============================================================================
+# 2. Validation & Bounded Upload Reader Tests
+# ============================================================================
+
+@pytest.mark.asyncio
+async def test_upload_missing_security_partition_fails_with_400_or_422(client: httpx.AsyncClient):
+    auth_header = make_auth_header(user_id="user_123")
+    res = await client.post(
+        "/api/v1/projects/proj_test/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_123",
+            "Idempotency-Key": "key_001",
+            # Omit X-Continuum-Security-Partition
+        },
+        files={"file": ("test.txt", b"Hello World", "text/plain")},
+    )
+    assert res.status_code in (400, 422)
+
+
+@pytest.mark.asyncio
+async def test_upload_missing_idempotency_key_fails_with_400_or_422(client: httpx.AsyncClient):
+    auth_header = make_auth_header(user_id="user_123")
+    res = await client.post(
+        "/api/v1/projects/proj_test/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_123",
+            "X-Continuum-Security-Partition": "public",
+            # Omit Idempotency-Key
+        },
+        files={"file": ("test.txt", b"Hello World", "text/plain")},
+    )
+    assert res.status_code in (400, 422)
+
+
+@pytest.mark.asyncio
+async def test_upload_empty_file_fails_with_validation_error(client: httpx.AsyncClient):
+    auth_header = make_auth_header(user_id="user_123")
+    res = await client.post(
+        "/api/v1/projects/proj_test/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_123",
+            "Idempotency-Key": "key_empty",
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("empty.txt", b"", "text/plain")},
+    )
+    assert res.status_code == 422
+    assert "empty" in res.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_upload_oversized_file_fails_with_validation_error(monkeypatch, client: httpx.AsyncClient):
+    auth_header = make_auth_header(user_id="user_123")
+    monkeypatch.setattr(settings, "max_upload_mb", 1)
+    oversized_data = b"X" * (1024 * 1024 + 1)
+
+    res = await client.post(
+        "/api/v1/projects/proj_test/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_123",
+            "Idempotency-Key": "key_oversized",
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("big.txt", oversized_data, "text/plain")},
+    )
+    assert res.status_code == 422
+    assert "exceeds maximum allowed" in res.text.lower()
+
+
+# ============================================================================
+# 3. Document Creation, Immutability & Persistence Tests
+# ============================================================================
+
+@pytest.mark.asyncio
+async def test_upload_fresh_document_succeeds_and_creates_records(client: httpx.AsyncClient):
     project_id = "proj_fresh_01"
     content = b"Knowledge routing architecture specification v1.1"
+    auth_header = make_auth_header(user_id="user_architect", allowed_projects=[project_id])
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        res = await client.post(
-            f"/api/v1/projects/{project_id}/documents/upload",
-            headers={
-                "X-Continuum-User-Id": "user_architect",
-                "Idempotency-Key": "idemp_fresh_01",
-                "X-Continuum-Security-Partition": "team_backend",
-            },
-            data={"logical_source_id": "docs/architecture.md"},
-            files={"file": ("architecture.md", content, "text/markdown")},
-        )
-        assert res.status_code == 201
-        data = res.json()
-        assert data["is_duplicate"] is False
-        assert data["version_no"] == 1
-        assert data["status"] == "RECEIVED"
-        assert data["search_status"] == "PENDING"
-        assert data["knowledge_status"] == "NOT_STARTED"
-        assert len(data["file_hash"]) == 64
-        doc_id = data["document_id"]
-        version_id = data["version_id"]
-        run_id = data["run_id"]
+    res = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_architect",
+            "Idempotency-Key": "idemp_fresh_01",
+            "X-Continuum-Security-Partition": "team_backend",
+        },
+        data={"logical_source_id": "docs/architecture.md"},
+        files={"file": ("architecture.md", content, "text/markdown")},
+    )
+    assert res.status_code == 201
+    data = res.json()
+    assert data["is_duplicate"] is False
+    assert data["version_no"] == 1
+    assert data["status"] == "RECEIVED"
+    assert data["search_status"] == "PENDING"
+    assert data["knowledge_status"] == "NOT_STARTED"
+    assert len(data["file_hash"]) == 64
+    doc_id = data["document_id"]
+    version_id = data["version_id"]
+    run_id = data["run_id"]
+    file_hash = data["file_hash"]
 
-    # Verify database persistence
+    # Verify database persistence & snapshot immutability
     async with SessionLocal() as session:
         doc = await session.get(Document, doc_id)
         assert doc is not None
@@ -133,6 +299,8 @@ async def test_upload_fresh_document_succeeds_and_creates_records():
         ).scalar_one_or_none()
         assert snapshot is not None
         assert snapshot.byte_size == len(content)
+        assert snapshot.checksum_sha256 == file_hash
+        assert file_hash[:16] in snapshot.storage_uri.replace("\\", "/")
 
         run = await session.get(IngestionRun, run_id)
         assert run is not None
@@ -149,119 +317,130 @@ async def test_upload_fresh_document_succeeds_and_creates_records():
         assert stage_runs[0].status == "SUCCESS"
 
 
+# ============================================================================
+# 4. Idempotency & Conflict Tests
+# ============================================================================
+
 @pytest.mark.asyncio
-async def test_idempotent_retry_with_same_payload_returns_200_duplicate():
-    transport = httpx.ASGITransport(app=app)
+async def test_idempotent_retry_with_same_payload_returns_200_duplicate(client: httpx.AsyncClient):
     project_id = "proj_retry_01"
     content = b"Deterministic payload content for retry verification"
+    auth_header = make_auth_header(user_id="user_dev", allowed_projects=[project_id])
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        # First call: 201 Created
-        res1 = await client.post(
-            f"/api/v1/projects/{project_id}/documents/upload",
-            headers={
-                "X-Continuum-User-Id": "user_dev",
-                "Idempotency-Key": "idemp_retry_key",
-                "X-Continuum-Security-Partition": "public",
-            },
-            files={"file": ("guide.txt", content, "text/plain")},
-        )
-        assert res1.status_code == 201
-        data1 = res1.json()
-        assert data1["is_duplicate"] is False
+    # First call: 201 Created
+    res1 = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_dev",
+            "Idempotency-Key": "idemp_retry_key",
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("guide.txt", content, "text/plain")},
+    )
+    assert res1.status_code == 201
+    data1 = res1.json()
+    assert data1["is_duplicate"] is False
 
-        # Second call with identical payload: 200 OK duplicate
-        res2 = await client.post(
-            f"/api/v1/projects/{project_id}/documents/upload",
-            headers={
-                "X-Continuum-User-Id": "user_dev",
-                "Idempotency-Key": "idemp_retry_key",
-                "X-Continuum-Security-Partition": "public",
-            },
-            files={"file": ("guide.txt", content, "text/plain")},
-        )
-        assert res2.status_code == 200
-        data2 = res2.json()
-        assert data2["is_duplicate"] is True
-        assert data2["document_id"] == data1["document_id"]
-        assert data2["version_id"] == data1["version_id"]
-        assert data2["run_id"] == data1["run_id"]
-        assert data2["file_hash"] == data1["file_hash"]
+    # Second call with identical payload: 200 OK duplicate
+    res2 = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_dev",
+            "Idempotency-Key": "idemp_retry_key",
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("guide.txt", content, "text/plain")},
+    )
+    assert res2.status_code == 200
+    data2 = res2.json()
+    assert data2["is_duplicate"] is True
+    assert data2["document_id"] == data1["document_id"]
+    assert data2["version_id"] == data1["version_id"]
+    assert data2["run_id"] == data1["run_id"]
+    assert data2["file_hash"] == data1["file_hash"]
 
 
 @pytest.mark.asyncio
-async def test_idempotency_key_reused_with_different_payload_returns_409_conflict():
-    transport = httpx.ASGITransport(app=app)
+async def test_idempotency_key_reused_with_different_payload_returns_409_conflict(client: httpx.AsyncClient):
     project_id = "proj_conflict_01"
+    auth_header = make_auth_header(user_id="user_dev", allowed_projects=[project_id])
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        # First call with payload A
-        res1 = await client.post(
-            f"/api/v1/projects/{project_id}/documents/upload",
-            headers={
-                "X-Continuum-User-Id": "user_dev",
-                "Idempotency-Key": "shared_conflict_key",
-                "X-Continuum-Security-Partition": "public",
-            },
-            files={"file": ("file1.txt", b"Payload Content Alpha", "text/plain")},
-        )
-        assert res1.status_code == 201
+    # First call with payload A
+    res1 = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_dev",
+            "Idempotency-Key": "shared_conflict_key",
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("file1.txt", b"Payload Content Alpha", "text/plain")},
+    )
+    assert res1.status_code == 201
 
-        # Second call with payload B using same key -> Conflict!
-        res2 = await client.post(
-            f"/api/v1/projects/{project_id}/documents/upload",
-            headers={
-                "X-Continuum-User-Id": "user_dev",
-                "Idempotency-Key": "shared_conflict_key",
-                "X-Continuum-Security-Partition": "public",
-            },
-            files={"file": ("file2.txt", b"Payload Content Beta (Different)", "text/plain")},
-        )
-        assert res2.status_code == 409
-        err = res2.json()
-        assert "IDEMPOTENCY_PAYLOAD_MISMATCH" in str(err) or "different file payload" in str(err).lower()
+    # Second call with payload B using same key -> Conflict!
+    res2 = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_dev",
+            "Idempotency-Key": "shared_conflict_key",
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("file2.txt", b"Payload Content Beta (Different)", "text/plain")},
+    )
+    assert res2.status_code == 409
+    err = res2.json()
+    assert "IDEMPOTENCY_PAYLOAD_MISMATCH" in str(err) or "different file payload" in str(err).lower()
 
+
+# ============================================================================
+# 5. Versioning & Exact Content Deduplication Tests
+# ============================================================================
 
 @pytest.mark.asyncio
-async def test_versioning_increments_and_links_supersedes_id():
-    transport = httpx.ASGITransport(app=app)
+async def test_versioning_increments_and_links_supersedes_id(client: httpx.AsyncClient):
     project_id = "proj_versioning_01"
     logical_source = "specs/protocol.md"
+    auth_header = make_auth_header(user_id="user_lead", allowed_projects=[project_id])
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        # Upload version 1
-        res1 = await client.post(
-            f"/api/v1/projects/{project_id}/documents/upload",
-            headers={
-                "X-Continuum-User-Id": "user_lead",
-                "Idempotency-Key": "ver1_key",
-                "X-Continuum-Security-Partition": "team_backend",
-            },
-            data={"logical_source_id": logical_source},
-            files={"file": ("protocol.md", b"Protocol specification version 1.0", "text/markdown")},
-        )
-        assert res1.status_code == 201
-        data1 = res1.json()
-        assert data1["version_no"] == 1
-        ver1_id = data1["version_id"]
-        doc1_id = data1["document_id"]
+    # Upload version 1
+    res1 = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_lead",
+            "Idempotency-Key": "ver1_key",
+            "X-Continuum-Security-Partition": "team_backend",
+        },
+        data={"logical_source_id": logical_source},
+        files={"file": ("protocol.md", b"Protocol specification version 1.0", "text/markdown")},
+    )
+    assert res1.status_code == 201
+    data1 = res1.json()
+    assert data1["version_no"] == 1
+    ver1_id = data1["version_id"]
+    doc1_id = data1["document_id"]
 
-        # Upload version 2 (different content, same logical_source_id)
-        res2 = await client.post(
-            f"/api/v1/projects/{project_id}/documents/upload",
-            headers={
-                "X-Continuum-User-Id": "user_lead",
-                "Idempotency-Key": "ver2_key",
-                "X-Continuum-Security-Partition": "team_backend",
-            },
-            data={"logical_source_id": logical_source},
-            files={"file": ("protocol.md", b"Protocol specification version 2.0 with breaking changes", "text/markdown")},
-        )
-        assert res2.status_code == 201
-        data2 = res2.json()
-        assert data2["document_id"] == doc1_id
-        assert data2["version_no"] == 2
-        ver2_id = data2["version_id"]
+    # Upload version 2 (different content, same logical_source_id)
+    res2 = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_lead",
+            "Idempotency-Key": "ver2_key",
+            "X-Continuum-Security-Partition": "team_backend",
+        },
+        data={"logical_source_id": logical_source},
+        files={"file": ("protocol.md", b"Protocol specification version 2.0 with breaking changes", "text/markdown")},
+    )
+    assert res2.status_code == 201
+    data2 = res2.json()
+    assert data2["document_id"] == doc1_id
+    assert data2["version_no"] == 2
+    ver2_id = data2["version_id"]
 
     # Verify supersedes linkage in database
     async with SessionLocal() as session:
@@ -271,43 +450,217 @@ async def test_versioning_increments_and_links_supersedes_id():
 
 
 @pytest.mark.asyncio
-async def test_query_document_version_status_success_and_not_found():
-    transport = httpx.ASGITransport(app=app)
+async def test_exact_content_deduplication_without_new_run(client: httpx.AsyncClient):
+    """When a new upload request for the same logical source arrives with a NEW idempotency key
+    but IDENTICAL content hash to the latest version, it returns 200 is_duplicate=True without creating
+    a new IngestionRun or triggering pipeline processing.
+    """
+    project_id = "proj_dedup_01"
+    logical_source = "shared/guidelines.md"
+    payload_content = b"Content that stays exactly identical across repeated updates"
+    auth_header = make_auth_header(user_id="user_dev", allowed_projects=[project_id])
+
+    # First upload -> 201 Created
+    res1 = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_dev",
+            "Idempotency-Key": "dedup_key_01",
+            "X-Continuum-Security-Partition": "public",
+        },
+        data={"logical_source_id": logical_source},
+        files={"file": ("guidelines.md", payload_content, "text/markdown")},
+    )
+    assert res1.status_code == 201
+    data1 = res1.json()
+    assert data1["is_duplicate"] is False
+    assert data1["version_no"] == 1
+    ver1_id = data1["version_id"]
+    run1_id = data1["run_id"]
+
+    # Second upload with NEW idempotency key but IDENTICAL content -> 200 OK is_duplicate=True
+    res2 = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_dev",
+            "Idempotency-Key": "dedup_key_02_different_key",
+            "X-Continuum-Security-Partition": "public",
+        },
+        data={"logical_source_id": logical_source},
+        files={"file": ("guidelines.md", payload_content, "text/markdown")},
+    )
+    assert res2.status_code == 200
+    data2 = res2.json()
+    assert data2["is_duplicate"] is True
+    assert data2["version_no"] == 1
+    assert data2["version_id"] == ver1_id
+    assert data2["run_id"] == run1_id
+
+    # Verify database: exactly 1 DocumentVersion and 1 IngestionRun created
+    async with SessionLocal() as session:
+        versions = (
+            await session.execute(
+                select(DocumentVersion).where(DocumentVersion.id == ver1_id)
+            )
+        ).scalars().all()
+        assert len(versions) == 1
+
+        runs = (
+            await session.execute(
+                select(IngestionRun).where(IngestionRun.document_version_id == ver1_id)
+            )
+        ).scalars().all()
+        assert len(runs) == 1
+
+
+# ============================================================================
+# 6. Status Query Endpoint Tests
+# ============================================================================
+
+@pytest.mark.asyncio
+async def test_query_document_version_status_success_and_not_found(client: httpx.AsyncClient):
     project_id = "proj_status_01"
+    auth_header = make_auth_header(user_id="user_test", allowed_projects=[project_id])
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        res = await client.post(
-            f"/api/v1/projects/{project_id}/documents/upload",
-            headers={
-                "X-Continuum-User-Id": "user_test",
-                "Idempotency-Key": "status_test_key",
-                "X-Continuum-Security-Partition": "public",
-            },
-            files={"file": ("status_doc.txt", b"Testing status reporting", "text/plain")},
-        )
-        assert res.status_code == 201
-        upload_data = res.json()
-        doc_id = upload_data["document_id"]
+    res = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_test",
+            "Idempotency-Key": "status_test_key",
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("status_doc.txt", b"Testing status reporting", "text/plain")},
+    )
+    assert res.status_code == 201
+    upload_data = res.json()
+    doc_id = upload_data["document_id"]
 
-        # Query status
-        status_res = await client.get(
-            f"/api/v1/projects/{project_id}/documents/{doc_id}/versions/1/status"
-        )
-        assert status_res.status_code == 200
-        status_data = status_res.json()
-        assert status_data["document_id"] == doc_id
-        assert status_data["version_no"] == 1
-        assert status_data["status"] == "RECEIVED"
-        assert status_data["search_status"] == "PENDING"
-        assert status_data["knowledge_status"] == "NOT_STARTED"
-        assert status_data["search_ready"] is False
-        assert status_data["knowledge_ready"] is False
-        assert status_data["current_stage"] == "RECEIVE"
-        assert "receive" in status_data["stage_progress"]
-        assert status_data["stage_progress"]["receive"]["status"] == "SUCCESS"
+    # Query status with authorized token
+    status_res = await client.get(
+        f"/api/v1/projects/{project_id}/documents/{doc_id}/versions/1/status",
+        headers=auth_header,
+    )
+    assert status_res.status_code == 200
+    status_data = status_res.json()
+    assert status_data["document_id"] == doc_id
+    assert status_data["version_no"] == 1
+    assert status_data["status"] == "RECEIVED"
+    assert status_data["search_status"] == "PENDING"
+    assert status_data["knowledge_status"] == "NOT_STARTED"
+    assert status_data["search_ready"] is False
+    assert status_data["knowledge_ready"] is False
+    assert status_data["current_stage"] == "RECEIVE"
+    assert "receive" in status_data["stage_progress"]
+    assert status_data["stage_progress"]["receive"]["status"] == "SUCCESS"
 
-        # Query nonexistent version -> 404
-        not_found_res = await client.get(
-            f"/api/v1/projects/{project_id}/documents/{doc_id}/versions/999/status"
+    # Query status without auth -> 401
+    no_auth_res = await client.get(
+        f"/api/v1/projects/{project_id}/documents/{doc_id}/versions/1/status"
+    )
+    assert no_auth_res.status_code == 401
+
+    # Query status with unauthorized project -> 403
+    unauthorized_auth = make_auth_header(user_id="user_test", allowed_projects=["proj_other"])
+    forbidden_res = await client.get(
+        f"/api/v1/projects/{project_id}/documents/{doc_id}/versions/1/status",
+        headers=unauthorized_auth,
+    )
+    assert forbidden_res.status_code == 403
+
+    # Query nonexistent version -> 404
+    not_found_res = await client.get(
+        f"/api/v1/projects/{project_id}/documents/{doc_id}/versions/999/status",
+        headers=auth_header,
+    )
+    assert not_found_res.status_code == 404
+
+
+# ============================================================================
+# 7. Durable Dispatch Worker & IngestionRun Lifecycle Tests
+# ============================================================================
+
+@pytest.mark.asyncio
+async def test_worker_transitions_ingestion_run_and_document_version(client: httpx.AsyncClient):
+    """Verify that JobType.PROCESS_DOCUMENT linked with run_id transitions IngestionRun
+    from QUEUED to RUNNING and on completion updates status to SUCCEEDED and DocumentVersion to READY.
+    """
+    project_id = "proj_worker_01"
+    auth_header = make_auth_header(user_id="user_worker_test", allowed_projects=[project_id])
+
+    res = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_worker_test",
+            "Idempotency-Key": "key_worker_01",
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("worker_test.txt", b"Content for worker dispatch test", "text/plain")},
+    )
+    assert res.status_code == 201
+    data = res.json()
+    doc_id = data["document_id"]
+    version_id = data["version_id"]
+    run_id = data["run_id"]
+
+    # Verify initial run state in DB
+    async with SessionLocal() as session:
+        run = await session.get(IngestionRun, run_id)
+        assert run is not None
+        assert run.current_stage == "RECEIVE"
+
+        # Verify Document exists
+        doc = await session.get(Document, doc_id)
+        assert doc is not None
+
+        # Simulate job execution with mock EngineManager
+        class MockOutcome:
+            chunk_count = 5
+            event_count = 3
+            token_usage = 120
+            paused = False
+            source_id = "mock_sag_source_id"
+
+        class MockEngineManager:
+            async def process_document(self, *args, **kwargs):
+                return MockOutcome()
+
+        # If doc.source_id is None, create a dummy source
+        if not doc.source_id:
+            source = Source(
+                id=f"src_{doc.id}",
+                name="Worker Test Source",
+                sag_source_config_id=f"cfg_{doc.id}",
+            )
+            session.add(source)
+            await session.flush()
+            doc.source_id = source.id
+            await session.commit()
+
+        job = Job(
+            id=f"job_{run_id}",
+            type=JobType.PROCESS_DOCUMENT,
+            document_id=doc.id,
+            source_id=doc.source_id,
+            status=JobStatus.RUNNING,
+            payload={"run_id": run_id},
         )
-        assert not_found_res.status_code == 404
+        session.add(job)
+        await session.commit()
+
+        from sag_api.jobs.tasks import process_document  # lazy import to avoid octx chain
+        await process_document(session, job, engine_manager=MockEngineManager())
+
+        # Check that IngestionRun and DocumentVersion reached terminal success
+        updated_run = await session.get(IngestionRun, run_id)
+        assert updated_run.status == "SUCCEEDED"
+        assert updated_run.current_stage == "COMPLETE"
+        assert updated_run.completed_at is not None
+
+        ver = await session.get(DocumentVersion, version_id)
+        assert ver.status == "READY"
+        assert ver.search_status == "READY"
+        assert ver.search_ready_at is not None

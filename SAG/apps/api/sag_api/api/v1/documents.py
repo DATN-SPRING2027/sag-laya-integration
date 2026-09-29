@@ -24,8 +24,11 @@ from sag_api.core.deps import (
     get_current_user_or_connector,
     get_engine_manager,
     get_job_queue,
+    get_verified_principal,
 )
-from sag_api.core.errors import ApiError, ConflictError, NotFoundError, ValidationError
+from sag_api.core.error_taxonomy import ErrorLayer, ErrorStage
+from sag_api.core.errors import ApiError, ConflictError, ForbiddenError, NotFoundError, ValidationError
+from sag_api.core.identity import VerifiedPrincipal
 from sag_api.core.logging import get_logger
 from sag_api.db.models import User
 from sag_api.enums import DocumentStatus
@@ -77,6 +80,31 @@ def _check_extension(filename: str | None) -> None:
 def _upload_filename(filename: str | None) -> str:
     """Strip client paths from multipart filenames on POSIX and Windows."""
     return (filename or "upload").replace("\\", "/").rsplit("/", maxsplit=1)[-1] or "upload"
+
+
+async def _read_upload_file_bounded(file: UploadFile, max_bytes: int) -> bytes:
+    """Read upload stream in chunks, aborting immediately if limit is exceeded."""
+    chunk_size = 64 * 1024  # 64 KB
+    chunks: list[bytes] = []
+    total_bytes = 0
+
+    while True:
+        chunk = await file.read(chunk_size)
+        if not chunk:
+            break
+        total_bytes += len(chunk)
+        if total_bytes > max_bytes:
+            raise ValidationError(
+                f"File size exceeds maximum allowed ({max_bytes} bytes / {settings.max_upload_mb}MB)",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            )
+        chunks.append(chunk)
+
+    if total_bytes == 0:
+        raise ValidationError("Uploaded file cannot be empty", layer=ErrorLayer.CLIENT, stage=ErrorStage.UPLOAD)
+
+    return b"".join(chunks)
 
 
 @router.get("", response_model=list[DocumentOut])
@@ -384,25 +412,74 @@ async def upload_document_version(
     file: UploadFile = File(...),
     source_published_at: datetime | None = Form(None),
     logical_source_id: str | None = Form(None),
-    x_continuum_user_id: str = Header(..., alias="X-Continuum-User-Id"),
     idempotency_key: str = Header(..., alias="Idempotency-Key"),
-    x_continuum_security_partition: str = Header(..., alias="X-Continuum-Security-Partition"),
-    x_continuum_tenant_id: str = Header("tenant_continuum_default", alias="X-Continuum-Tenant-Id"),
+    x_continuum_user_id: str | None = Header(None, alias="X-Continuum-User-Id"),
+    x_continuum_security_partition: str | None = Header(None, alias="X-Continuum-Security-Partition"),
+    x_continuum_tenant_id: str | None = Header(None, alias="X-Continuum-Tenant-Id"),
+    principal: VerifiedPrincipal = Depends(get_verified_principal),
     session: AsyncSession = Depends(get_session),
+    job_queue: JobQueue | None = Depends(get_job_queue),
 ) -> DocumentUploadResponse:
-    file_bytes = await file.read()
+    # Scope check 1: Project membership boundary
+    if not principal.has_project_access(project_id):
+        raise ForbiddenError(
+            f"Principal '{principal.user_id}' is not authorized to access project '{project_id}'"
+        )
+
+    # Scope check 2: Owner identity / prevent caller impersonation
+    if x_continuum_user_id:
+        if not principal.is_service and x_continuum_user_id != principal.user_id:
+            raise ForbiddenError(
+                f"Caller cannot impersonate user '{x_continuum_user_id}' with principal '{principal.user_id}'"
+            )
+        owner_id = x_continuum_user_id
+    else:
+        owner_id = principal.user_id
+
+    # Scope check 3: Tenant scope
+    if x_continuum_tenant_id:
+        if not principal.is_service and x_continuum_tenant_id != principal.tenant_id:
+            raise ForbiddenError(
+                f"Tenant mismatch: caller requested '{x_continuum_tenant_id}' but principal belongs to '{principal.tenant_id}'"
+            )
+        tenant_id = x_continuum_tenant_id
+    else:
+        tenant_id = principal.tenant_id
+
+    # Scope check 4: Security partition authorization
+    partition = x_continuum_security_partition
+    if not partition or not partition.strip():
+        if principal.allowed_partitions and "*" not in principal.allowed_partitions:
+            partition = next(iter(principal.allowed_partitions))
+        else:
+            raise ValidationError(
+                "X-Continuum-Security-Partition header is required to enforce data isolation"
+            )
+
+    if not principal.has_partition_access(partition):
+        raise ForbiddenError(
+            f"Principal '{principal.user_id}' is not authorized for security partition '{partition}'"
+        )
+
+    filename = _upload_filename(file.filename)
+    _check_extension(filename)
+
+    max_upload_bytes = getattr(settings, "max_upload_size_bytes", None) or (settings.max_upload_mb * 1024 * 1024)
+    file_bytes = await _read_upload_file_bounded(file, max_upload_bytes)
+
     result = await handle_document_upload(
         session,
-        tenant_id=x_continuum_tenant_id,
+        tenant_id=tenant_id,
         project_id=project_id,
-        owner_id=x_continuum_user_id,
-        security_partition_id=x_continuum_security_partition,
+        owner_id=owner_id,
+        security_partition_id=partition,
         client_token=idempotency_key,
         file_bytes=file_bytes,
-        original_filename=file.filename or "upload.bin",
+        original_filename=filename,
         content_type=file.content_type or "application/octet-stream",
         logical_source_id=logical_source_id,
         source_published_at=source_published_at,
+        job_queue=job_queue,
     )
 
     if result.is_duplicate:
@@ -422,8 +499,13 @@ async def query_document_version_status(
     project_id: str,
     document_id: str,
     version_no: int,
+    principal: VerifiedPrincipal = Depends(get_verified_principal),
     session: AsyncSession = Depends(get_session),
 ) -> DocumentVersionStatusResponse:
+    if not principal.has_project_access(project_id):
+        raise ForbiddenError(
+            f"Principal '{principal.user_id}' is not authorized to access project '{project_id}'"
+        )
     return await get_document_version_status(
         session,
         project_id=project_id,

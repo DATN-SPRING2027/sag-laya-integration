@@ -95,6 +95,7 @@ async def create_document_from_upload(
 ) -> tuple[Document, Job]:
     doc_id = new_id()
     safe_name = os.path.basename(filename) or "upload"
+
     dest_dir = os.path.join(upload_dir, source.id)
     os.makedirs(dest_dir, exist_ok=True)
     storage_path = os.path.join(dest_dir, f"{doc_id}_{safe_name}")
@@ -103,10 +104,6 @@ async def create_document_from_upload(
 
     document = Document(
         id=doc_id,
-        tenant_id="default",
-        project_id=source.id,
-        owner_id="system",
-        logical_source_id=safe_name,
         source_id=source.id,
         filename=safe_name,
         content_type=content_type or "application/octet-stream",
@@ -844,13 +841,24 @@ def _check_upload_file(filename: str, file_bytes: bytes) -> None:
             raise ValidationError(f"Unsupported file extension. Allowed: {pretty}")
 
 
-def _save_snapshot_file(version_id: str, original_filename: str, file_bytes: bytes) -> str:
-    """Persist raw file bytes to snapshot storage on disk."""
-    base_dir = Path(settings.effective_data_dir) / "snapshots" / version_id
+def _save_snapshot_file(payload_hash: str, original_filename: str, file_bytes: bytes) -> str:
+    """Persist raw file bytes to immutable, content-addressed snapshot storage.
+
+    Storage path format: snapshots/{hash[:2]}/{hash}/{safe_name}
+    Guarantees that different payloads never share paths and cannot overwrite each other,
+    preserving immutability under concurrent version allocation races.
+    """
+    safe_name = os.path.basename(original_filename) or "source.bin"
+    base_dir = Path(settings.effective_data_dir) / "snapshots" / payload_hash[:2] / payload_hash
     base_dir.mkdir(parents=True, exist_ok=True)
-    safe_name = Path(original_filename).name or "source.bin"
     target_path = base_dir / safe_name
-    target_path.write_bytes(file_bytes)
+
+    if target_path.exists() and target_path.stat().st_size == len(file_bytes):
+        return str(target_path.resolve())
+
+    tmp_path = base_dir / f".tmp_{uuid.uuid4().hex}"
+    tmp_path.write_bytes(file_bytes)
+    tmp_path.replace(target_path)
     return str(target_path.resolve())
 
 
@@ -867,6 +875,8 @@ async def handle_document_upload(
     content_type: str = "application/octet-stream",
     logical_source_id: str | None = None,
     source_published_at: datetime | None = None,
+    job_queue: JobQueue | None = None,
+    source_id: str | None = None,
 ) -> DocumentUploadResponse:
     """Process an upload request with strict ACL partition, idempotency, and versioning.
 
@@ -918,155 +928,219 @@ async def handle_document_upload(
             is_duplicate=True,
         )
 
-    # Step 2: Attempt creation in transaction with savepoint to recover race condition
-    try:
-        async with session.begin_nested():
-            # Check or create logical document
-            doc_stmt = select(Document).where(
-                Document.tenant_id == tenant_id,
-                Document.project_id == project_id,
-                Document.logical_source_id == logical_id,
-            )
-            doc = (await session.execute(doc_stmt)).scalar_one_or_none()
+    # Step 2: Persist raw payload to immutable content-addressed storage
+    storage_path = _save_snapshot_file(payload_hash, original_filename, file_bytes)
 
-            if not doc:
-                doc_id = generate_doc_id(tenant_id, project_id, logical_id)
-                doc = Document(
-                    id=doc_id,
+    # Step 3: Attempt creation in transaction with serialization and retry on race conditions
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            async with session.begin_nested():
+                # Check or create logical document with row lock
+                doc_stmt = (
+                    select(Document)
+                    .where(
+                        Document.tenant_id == tenant_id,
+                        Document.project_id == project_id,
+                        Document.logical_source_id == logical_id,
+                    )
+                    .with_for_update()
+                )
+                doc = (await session.execute(doc_stmt)).scalar_one_or_none()
+
+                if not doc:
+                    doc_id = generate_doc_id(tenant_id, project_id, logical_id)
+                    doc = Document(
+                        id=doc_id,
+                        tenant_id=tenant_id,
+                        project_id=project_id,
+                        owner_id=owner_id,
+                        logical_source_id=logical_id,
+                        source_id=source_id,
+                        filename=original_filename,
+                        content_type=content_type,
+                        size_bytes=len(file_bytes),
+                        storage_path=storage_path,
+                        status=DocumentStatus.PENDING,
+                    )
+                    session.add(doc)
+                    await session.flush()
+                    version_no = 1
+                    supersedes_id = None
+                else:
+                    doc.storage_path = storage_path
+                    if source_id and not doc.source_id:
+                        doc.source_id = source_id
+
+                    # Find latest version for this document under row lock
+                    v_stmt = (
+                        select(DocumentVersion)
+                        .where(DocumentVersion.document_id == doc.id)
+                        .order_by(DocumentVersion.version_no.desc())
+                        .limit(1)
+                        .with_for_update()
+                    )
+                    latest_ver = (await session.execute(v_stmt)).scalar_one_or_none()
+                    if latest_ver and latest_ver.file_hash == payload_hash:
+                        # Exact duplicate: Cùng hash + cùng source identity
+                        # Duplicate policy: Do NOT parse again or schedule pipeline!
+                        run_stmt = (
+                            select(IngestionRun)
+                            .where(IngestionRun.document_version_id == latest_ver.id)
+                            .order_by(IngestionRun.created_at.desc())
+                            .limit(1)
+                        )
+                        existing_run = (await session.execute(run_stmt)).scalar_one_or_none()
+                        return DocumentUploadResponse(
+                            document_id=doc.id,
+                            version_no=latest_ver.version_no,
+                            version_id=latest_ver.id,
+                            run_id=existing_run.id if existing_run else "",
+                            file_hash=payload_hash,
+                            status=latest_ver.status,
+                            search_status=latest_ver.search_status,
+                            knowledge_status=latest_ver.knowledge_status,
+                            is_duplicate=True,
+                        )
+                    else:
+                        version_no = (latest_ver.version_no + 1) if latest_ver else 1
+                        supersedes_id = latest_ver.id if latest_ver else None
+
+                version_id = generate_version_id(doc.id, version_no)
+
+                existing_ver = await session.get(DocumentVersion, version_id)
+                if not existing_ver:
+                    doc_version = DocumentVersion(
+                        id=version_id,
+                        document_id=doc.id,
+                        version_no=version_no,
+                        file_hash=payload_hash,
+                        supersedes_id=supersedes_id,
+                        source_published_at=source_published_at,
+                        status="RECEIVED",
+                        search_status="PENDING",
+                        knowledge_status="NOT_STARTED",
+                        metadata_json={"security_partition_id": security_partition_id},
+                    )
+                    session.add(doc_version)
+                    await session.flush()
+
+                    snapshot = SourceSnapshot(
+                        id=str(uuid.uuid4()),
+                        document_version_id=version_id,
+                        storage_uri=storage_path,
+                        original_filename=original_filename,
+                        mime_type=content_type,
+                        byte_size=len(file_bytes),
+                        checksum_sha256=payload_hash,
+                    )
+                    session.add(snapshot)
+                else:
+                    doc_version = existing_ver
+
+                run_id = str(uuid.uuid4())
+                initial_status = "QUEUED" if job_queue is not None else "PENDING_DISPATCH"
+                run = IngestionRun(
+                    id=run_id,
                     tenant_id=tenant_id,
                     project_id=project_id,
-                    owner_id=owner_id,
-                    logical_source_id=logical_id,
-                    filename=original_filename,
-                    content_type=content_type,
-                    size_bytes=len(file_bytes),
-                    storage_path="",
+                    document_version_id=doc_version.id,
+                    idempotency_key=idempotency_key,
+                    payload_hash=payload_hash,
+                    current_stage="RECEIVE",
+                    status=initial_status,
                 )
-                session.add(doc)
-                await session.flush()
-                version_no = 1
-                supersedes_id = None
-            else:
-                # Find latest version for this document
-                v_stmt = (
-                    select(DocumentVersion)
-                    .where(DocumentVersion.document_id == doc.id)
-                    .order_by(DocumentVersion.version_no.desc())
-                    .limit(1)
-                )
-                latest_ver = (await session.execute(v_stmt)).scalar_one_or_none()
-                if latest_ver and latest_ver.file_hash == payload_hash:
-                    # Same hash and same identity -> reuse existing version number
-                    version_no = latest_ver.version_no
-                    supersedes_id = latest_ver.supersedes_id
-                else:
-                    version_no = (latest_ver.version_no + 1) if latest_ver else 1
-                    supersedes_id = latest_ver.id if latest_ver else None
+                session.add(run)
 
-            version_id = generate_version_id(doc.id, version_no)
-
-            existing_ver = await session.get(DocumentVersion, version_id)
-            if not existing_ver:
-                storage_path = _save_snapshot_file(version_id, original_filename, file_bytes)
-                doc.storage_path = storage_path
-
-                doc_version = DocumentVersion(
-                    id=version_id,
-                    document_id=doc.id,
-                    version_no=version_no,
-                    file_hash=payload_hash,
-                    supersedes_id=supersedes_id,
-                    source_published_at=source_published_at,
-                    status="RECEIVED",
-                    search_status="PENDING",
-                    knowledge_status="NOT_STARTED",
-                    metadata_json={"security_partition_id": security_partition_id},
-                )
-                session.add(doc_version)
-                await session.flush()
-
-                snapshot = SourceSnapshot(
+                stage_run = StageRun(
                     id=str(uuid.uuid4()),
-                    document_version_id=version_id,
-                    storage_uri=storage_path,
-                    original_filename=original_filename,
-                    mime_type=content_type,
-                    byte_size=len(file_bytes),
-                    checksum_sha256=payload_hash,
+                    run_id=run_id,
+                    stage="receive",
+                    status="SUCCESS",
+                    duration_ms=10.0,
+                    metrics_json={"byte_size": len(file_bytes)},
                 )
-                session.add(snapshot)
-            else:
-                doc_version = existing_ver
+                session.add(stage_run)
 
-            run_id = str(uuid.uuid4())
-            run = IngestionRun(
-                id=run_id,
-                tenant_id=tenant_id,
-                project_id=project_id,
-                document_version_id=doc_version.id,
-                idempotency_key=idempotency_key,
-                payload_hash=payload_hash,
-                current_stage="RECEIVE",
-                status="QUEUED",
-            )
-            session.add(run)
-
-            stage_run = StageRun(
-                id=str(uuid.uuid4()),
-                run_id=run_id,
-                stage="receive",
-                status="SUCCESS",
-                duration_ms=10.0,
-                metrics_json={"byte_size": len(file_bytes)},
-            )
-            session.add(stage_run)
-            await session.flush()
-
-        await session.commit()
-        return DocumentUploadResponse(
-            document_id=doc.id,
-            version_no=doc_version.version_no,
-            version_id=doc_version.id,
-            run_id=run.id,
-            file_hash=payload_hash,
-            status=doc_version.status,
-            search_status=doc_version.search_status,
-            knowledge_status=doc_version.knowledge_status,
-            is_duplicate=False,
-        )
-    except IntegrityError:
-        # Race condition recovery: concurrent insert with same (tenant_id, project_id, idempotency_key)
-        await session.rollback()
-        stmt = select(IngestionRun).where(
-            IngestionRun.tenant_id == tenant_id,
-            IngestionRun.project_id == project_id,
-            IngestionRun.idempotency_key == idempotency_key,
-        )
-        existing = (await session.execute(stmt)).scalar_one_or_none()
-        if existing:
-            if existing.payload_hash != payload_hash:
-                raise ConflictError(
-                    f"Idempotency key is already bound to a different file payload hash. "
-                    f"Reusing an idempotency key across different file contents is forbidden. "
-                    f"(incoming={payload_hash}, existing={existing.payload_hash})",
-                    layer=ErrorLayer.CLIENT,
-                    stage=ErrorStage.UPLOAD,
-                    code="IDEMPOTENCY_PAYLOAD_MISMATCH",
-                    retryable=False,
+                # Create durable Job record for background processing
+                job = Job(
+                    type=JobType.PROCESS_DOCUMENT,
+                    source_id=doc.source_id,
+                    document_id=doc.id,
+                    status=JobStatus.QUEUED,
+                    payload={
+                        "run_id": run_id,
+                        "document_version_id": doc_version.id,
+                        "project_id": project_id,
+                        "tenant_id": tenant_id,
+                    },
                 )
-            doc_ver = await session.get(DocumentVersion, existing.document_version_id)
-            return DocumentUploadResponse(
-                document_id=doc_ver.document_id if doc_ver else "",
-                version_no=doc_ver.version_no if doc_ver else 1,
-                version_id=existing.document_version_id,
-                run_id=existing.id,
-                file_hash=payload_hash,
-                status=doc_ver.status if doc_ver else "RECEIVED",
-                search_status=doc_ver.search_status if doc_ver else "PENDING",
-                knowledge_status=doc_ver.knowledge_status if doc_ver else "NOT_STARTED",
-                is_duplicate=True,
+                session.add(job)
+
+                if source_id:
+                    await session.execute(
+                        update(Source)
+                        .where(Source.id == source_id)
+                        .values(document_count=Source.document_count + 1)
+                    )
+                    await touch_source_revision(session, source_id)
+
+                await session.flush()
+                break
+        except IntegrityError:
+            # Race condition recovery: concurrent insert with same (tenant_id, project_id, idempotency_key)
+            stmt = select(IngestionRun).where(
+                IngestionRun.tenant_id == tenant_id,
+                IngestionRun.project_id == project_id,
+                IngestionRun.idempotency_key == idempotency_key,
             )
-        raise
+            existing = (await session.execute(stmt)).scalar_one_or_none()
+            if existing:
+                if existing.payload_hash != payload_hash:
+                    raise ConflictError(
+                        f"Idempotency key is already bound to a different file payload hash. "
+                        f"Reusing an idempotency key across different file contents is forbidden. "
+                        f"(incoming={payload_hash}, existing={existing.payload_hash})",
+                        layer=ErrorLayer.CLIENT,
+                        stage=ErrorStage.UPLOAD,
+                        code="IDEMPOTENCY_PAYLOAD_MISMATCH",
+                        retryable=False,
+                    )
+                doc_ver = await session.get(DocumentVersion, existing.document_version_id)
+                return DocumentUploadResponse(
+                    document_id=doc_ver.document_id if doc_ver else "",
+                    version_no=doc_ver.version_no if doc_ver else 1,
+                    version_id=existing.document_version_id,
+                    run_id=existing.id,
+                    file_hash=payload_hash,
+                    status=doc_ver.status if doc_ver else "RECEIVED",
+                    search_status=doc_ver.search_status if doc_ver else "PENDING",
+                    knowledge_status=doc_ver.knowledge_status if doc_ver else "NOT_STARTED",
+                    is_duplicate=True,
+                )
+            if attempt == max_retries - 1:
+                raise
+
+    await session.commit()
+
+    # Durable enqueue after transaction commit
+    if job_queue is not None:
+        try:
+            await _enqueue_persisted_job(job_queue, job.id)
+        except Exception as exc:
+            log.warning("Failed to enqueue job %s to queue: %s", job.id, exc)
+
+    return DocumentUploadResponse(
+        document_id=doc.id,
+        version_no=doc_version.version_no,
+        version_id=doc_version.id,
+        run_id=run.id,
+        file_hash=payload_hash,
+        status=doc_version.status,
+        search_status=doc_version.search_status,
+        knowledge_status=doc_version.knowledge_status,
+        is_duplicate=False,
+    )
 
 
 async def get_document_version_status(
@@ -1130,8 +1204,8 @@ async def get_document_version_status(
         status=doc_ver.status,
         search_status=doc_ver.search_status,
         knowledge_status=doc_ver.knowledge_status,
-        search_ready=(doc_ver.search_status == "SEARCH_READY"),
-        knowledge_ready=(doc_ver.knowledge_status == "KNOWLEDGE_READY"),
+        search_ready=(doc_ver.search_status in ("SEARCH_READY", "READY")),
+        knowledge_ready=(doc_ver.knowledge_status in ("KNOWLEDGE_READY", "READY")),
         current_stage=current_stage,
         stage_progress=stage_progress,
         error=err_info,
