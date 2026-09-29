@@ -76,16 +76,21 @@ Nguồn chuẩn: [Workflow v1.1](../docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1
 
 ### P4 task proposal — Global retrieval, ACL và fusion
 
-- [ ] **Decision gate ACL còn mở:** BE/Continuum là authority; workflow đề xuất scope `tenant + project + security_partition_id`, nhưng chưa tìm thấy resolver quyền project/source chạy được và SAG `Source` chưa có mapping scope này. Không coi client `source_ids` là quyền.
-- [ ] Enforce allowed scope trước dense/sparse candidate retrieval và giữ logical-delete/reprocess prefilter hiện có. Chưa triển khai vì thiếu resolver + mapping đáng tin cậy.
-- [ ] Fail closed khi ACL resolver/prefilter lỗi; không fallback sang unfiltered evidence. Chưa thể kiểm chứng nếu chưa có resolver/prefilter.
+- [x] **Quyết định ACL:** BE/Continuum là authority; SAG nhận signed principal assertion đã xác minh và mapping allowed Project→Source. Project→Source là boundary hiện tại; client `source_ids` chỉ narrowing filter. Runtime verifier/mapping chưa có trong repo.
+- [x] Thêm seam `SearchACLScope.authorized_source_ids`; explicit request được giao với scope trước khi truy vấn Source. Không gửi `source_ids` thì chọn candidate chỉ trong tập authorized, vẫn theo candidate limit hiện có.
+- [x] Dense và lexical nhận cùng candidate Source list trước candidate generation/top-k; giữ logical-delete/reprocess prefilter hiện tại.
+- [x] Fail closed khi scope thiếu (`503` trên request/`error` event trên SSE); scope rỗng hoặc request giao rỗng trả 0 evidence và không gọi retriever.
+- [ ] Wire signed assertion verifier, real Project→Source mapping, unmapped-source denial và legacy backfill; đây là blocker runtime/P1, không giải quyết bằng fake resolver.
 - [x] Fuse semantic + lexical bằng RRF, không cộng raw score khác scale; score đầu ra chuẩn hóa về `[0, 1]` và ghi `fusion_method`/candidate counts.
 - [x] Dedupe candidate theo source/chunk và dùng tie-break xác định; giữ ưu tiên exact lexical trước expansion-only match. Regression xác nhận scale raw score không đổi ranking.
 - [x] Chuẩn hóa semantic-only relevance gate theo tỷ lệ so với score cao nhất trong cùng candidate set; test xác nhận scale `0.95/0.8` và `0.00095/0.0008` giữ cùng kết quả.
 - [x] Global `/search` và `/search/stream` bỏ event/graph retrieval trong P4; response giữ graph arrays rỗng. Source-scoped P3 path không đổi.
 - [x] Relevance/search strategy regressions: `test_retrieval_relevance.py`, `test_search_strategy.py`, `test_search_stream.py` pass.
-- [ ] ACL leakage/blackhole và pre-top-k filtering regressions: chưa thực hiện vì không có authority/mapping contract để tạo test xác thực.
+- [x] ACL seam regressions: implicit scope, requested∩authorized, unauthorized/empty request, dense/lexical cùng scope, empty authorization, missing scope fail-closed trên `/search` và `/search/stream`; test dùng fake scope.
+- [ ] Production ACL leakage/revoke/backfill tests với real assertion và Project→Source mapping; test double không được tính là P1/runtime acceptance.
 - [x] Không dùng Knowledge Graph/Tree trong global P4 retrieval; không sửa ingestion/index lane hoặc shared contract/config.
+
+**Trạng thái:** P4 retrieval/fusion và fail-closed integration seam đã có code/tests. ACL runtime/P1 acceptance vẫn **BLOCKED** vì chưa có trusted assertion verifier và SAG Project→Source mapping/backfill; PR phải giữ Draft.
 
 ## Checkpoint A — SEARCH_READY end-to-end
 

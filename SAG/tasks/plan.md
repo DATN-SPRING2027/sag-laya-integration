@@ -60,16 +60,46 @@ citation, no-answer flow, Knowledge Graph hoặc Knowledge Routing Tree.
 - ACL authority/resolver và source-scope mapping vẫn thiếu; đây tiếp tục là
   blocker P1 của PR.
 
+### ACL search integration seam — 2026-09-30
+
+- Global `/search`, `/search/stream` và `/search/eval-compare` nhận một
+  `SearchACLScope` nội bộ có `authorized_source_ids`. Dependency hiện trả `None`
+  mặc định vì repo chưa có trusted resolver; truy vấn cần retrieval dừng bằng
+  `503`, không rơi về global candidate selection. High-confidence CHAT vẫn bỏ
+  retrieval nên không cần scope.
+- Khi scope được cấp, explicit `source_ids` chỉ được giao với
+  `authorized_source_ids`; khi không gửi ID, candidate Sources được chọn chỉ từ
+  tập authorized và vẫn giữ candidate limit hiện có. Scope rỗng trả rỗng trước
+  dense/lexical retrieval. Hai retriever nhận cùng danh sách Source; response
+  cũng loại section không map được về Source trong scope.
+- Test dùng fake scope để kiểm tra intersection, implicit scope, empty scope,
+  fail-closed, dense/lexical parity và stream behavior. Đây chỉ là kiểm chứng
+  contract tại seam, không phải nghiệm thu ACL production.
+- Quyết định kiến trúc đã chốt: BE/Continuum là authority và cấp signed
+  principal assertion; SAG xác minh assertion rồi dùng `allowed_project_ids`
+  qua Project→Source mapping đáng tin cậy. P4 không tự diễn giải membership/role,
+  không thêm IAM/JWKS/shared config hoặc mapping schema. Source chưa map sẽ không
+  searchable khi mapping runtime được triển khai.
+- **P4 retrieval/fusion code có ACL integration seam fail-closed; ACL/P1 runtime
+  acceptance vẫn BLOCKED** cho tới khi có assertion verifier thật, mapping
+  Project→Source/backfill và runtime cross-project/cross-organization leakage
+  tests.
+
 ### Decision gate trước implementation
 
-Phải chốt một nguồn quyền authoritative cho P4:
+Kiến trúc quyền đã chốt; runtime contract/mapping vẫn là dependency riêng:
 
-1. **ACL contract đã tồn tại ở ngoài repo**: cung cấp resolver trả về allowed
-   source/document IDs hoặc Qdrant filter cho principal; branch này chỉ tích hợp
-   resolver vào candidate scope và fail closed khi resolver lỗi.
-2. **ACL cần xây trong SAG**: phải thống nhất trước việc thêm schema/migration hoặc
-   một shared permission contract. Đây là deliverable database/shared contract
-   riêng, không tự ý đưa vào branch backend retrieval chỉ sửa các file dự kiến.
+1. BE/Continuum xác thực user/organization và quyết định Project permission,
+   sau đó cấp signed principal assertion. SAG không tự diễn giải role hoặc
+   membership.
+2. Assertion mang project scope; SAG ánh xạ allowed projects sang Source IDs từ
+   mapping có source of truth rõ ràng. Project→Source là authorization boundary
+   hiện tại; Document/Version kế thừa scope Source.
+3. P4 chỉ nhận `authorized_source_ids` ở seam nội bộ. Không thêm JWT/JWKS
+   framework, shared authorization contract/config hoặc schema/migration khi
+   chưa có deliverable đã thống nhất.
+4. Resolver/mapping runtime chưa tồn tại; mặc định fail closed. Dùng fake scope
+   chỉ để phát triển và test integration logic, không đánh dấu P1 hoàn thành.
 
 Không chọn cách coi `body.source_ids` là ACL: đây là input do client gửi, không
 phải bằng chứng user được phép xem.
@@ -78,19 +108,26 @@ phải bằng chứng user được phép xem.
 
 #### Task P4.0 — Chốt ACL boundary
 
-- [ ] Xác định principal scope và resolver authoritative.
-- [ ] Xác định hành vi với explicit unauthorized source: lọc im lặng hay lỗi,
-      không để lộ existence ngoài policy.
-- [ ] Xác định filter granularity: source, document hoặc document-version.
-- [ ] Chốt fail-closed behavior và trace fields không lộ permission data.
+- [x] Chốt BE/Continuum là permission authority; SAG chỉ nhận scope đã được
+      xác thực/resolve. Runtime assertion verifier còn là dependency.
+- [x] Chốt Project→Source là granularity hiện tại; Document/Version kế thừa
+      Source. Explicit unauthorized IDs bị giao với authorized scope.
+- [x] Chốt không có verified scope thì global retrieval trả lỗi fail-closed;
+      scope rỗng không sinh candidate.
+- [ ] Hoàn tất signed assertion contract/verifier và mapping/backfill runtime
+      theo deliverable P1 riêng.
 
 #### Task P4.1 — ACL-safe global candidate scope
 
-- [ ] Resolve allowed scope trước khi gọi dense, sparse hoặc event path.
-- [ ] Áp cùng filter cho vector batch và lexical grep trước top-k/candidate cap.
-- [ ] Giữ logical-delete/reprocess barrier hiện có và không fallback sang
-      unfiltered retrieval khi prefilter ACL thất bại.
-- [ ] Chỉ trả section có scope được phép; không rely solely on post-filter.
+- [x] Yêu cầu authorized scope trước khi gọi global dense hoặc lexical retrieval;
+      dependency thiếu scope fail-closed trước candidate generation.
+- [x] Giao requested IDs với authorized IDs; scope implicit/empty cũng chỉ dùng
+      authorized Sources. Cùng Source list đi vào dense batch và lexical grep.
+- [x] Giữ logical-delete/reprocess barrier; không có fallback unfiltered khi
+      ACL scope thiếu hoặc rỗng.
+- [x] Chỉ trả section có `source_config_id` nằm trong candidate Source scope;
+      guard response là defense-in-depth, không thay prefilter.
+- [ ] Cắm real resolver và mapping Project→Source, gồm revoke/backfill semantics.
 
 #### Task P4.2 — Rank fusion ổn định
 
@@ -104,9 +141,10 @@ phải bằng chứng user được phép xem.
 
 #### Task P4.3 — Global query-flow integration
 
-- [ ] Giữ P3 `query_route` và strategy/fallback trace.
-- [ ] Đảm bảo `/search` và `/search/stream` dùng cùng ACL + fusion path.
-- [ ] Không thêm dependency vào Knowledge Graph/Tree; event/graph response hiện
+- [x] Giữ P3 `query_route` và strategy/fallback trace.
+- [x] Đảm bảo `/search`, `/search/stream` và `eval-compare` dùng cùng scope
+      resolver/helper trước retrieval.
+- [x] Không thêm dependency vào Knowledge Graph/Tree; event/graph response hiện
       có chỉ giữ nguyên nếu không làm thay đổi evidence ACL contract.
 
 #### Task P4.4 — Regression và review gate
@@ -115,8 +153,10 @@ phải bằng chứng user được phép xem.
       duplicate candidate và deterministic ordering.
 - [ ] Fusion: raw score scale khác nhau không làm một retriever lấn át do scale;
       rank agreement và tie-break ổn định.
-- [ ] ACL: forbidden source/document không xuất hiện; filter xảy ra trước top-k;
-      cả dense và lexical đều bị lọc; ACL resolver/prefilter lỗi thì fail closed.
+- [x] ACL seam tests: intersection, implicit scope, empty scope, unauthorized
+      request, dense/lexical parity, fail-closed `/search` và stream.
+- [ ] Production ACL: real assertion, Project→Source mapping/backfill, revoke
+      behavior và cross-project/cross-organization leakage tests.
 - [ ] API: global `/search`, `/search/stream`, source scope và P3 trace không
       regression.
 - [ ] Cập nhật `tasks/todo.md` và Phase 4 review evidence sau khi code pass.
