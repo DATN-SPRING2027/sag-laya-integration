@@ -1,4 +1,4 @@
-"""异步数据库引擎与会话。"""
+"""Asynchronous database engine and session management."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from sag_api.db.base import Base
 
 
 def _ensure_sqlite_dir(url: str) -> None:
-    """SQLite 文件所在目录不存在时先创建。"""
+    """Create the parent directory if it does not exist for SQLite."""
     marker = "sqlite+aiosqlite:///"
     if url.startswith(marker):
         path = url[len(marker) :]
@@ -35,8 +35,8 @@ engine: AsyncEngine = create_async_engine(
     pool_pre_ping=True,
 )
 
-# SQLite：外键约束 + 并发友好（WAL 读写并行，busy_timeout 让写入等待而非立即报锁；
-# 30s 上限覆盖 CI 慢盘下知识宇宙重建等跨事务写竞争）
+# SQLite: foreign keys enabled + concurrency friendly (WAL parallel read/write, busy_timeout
+# lets writes wait instead of locking immediately; 30s ceiling covers slow CI disk contention)
 if settings.database_url.startswith("sqlite"):
 
     @event.listens_for(engine.sync_engine, "connect")
@@ -56,8 +56,8 @@ async def get_session() -> AsyncIterator[AsyncSession]:
         yield session
 
 
-# 已存在的表需要补的新列（dev 轻量增量迁移；生产用 Alembic）。
-# create_all 只建新表、不改旧表，故对演进列做幂等 ADD COLUMN。
+# Incremental columns for existing tables (lightweight dev migrations; production uses Alembic).
+# create_all only creates new tables and does not alter existing tables, so we idempotently ADD COLUMN for evolving fields.
 _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
     "agents": {"is_default": "BOOLEAN NOT NULL DEFAULT FALSE"},
     "documents": {
@@ -74,6 +74,10 @@ _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
         "parser_status": "VARCHAR(16)",
         "fallback_from": "VARCHAR(16)",
         "fallback_reason": "TEXT",
+        "tenant_id": "VARCHAR(64) NOT NULL DEFAULT 'tenant_continuum_default'",
+        "project_id": "VARCHAR(64)",
+        "owner_id": "VARCHAR(64)",
+        "logical_source_id": "VARCHAR(128)",
     },
     "threads": {"archived": "BOOLEAN NOT NULL DEFAULT FALSE"},
     "messages": {
@@ -93,6 +97,7 @@ _INDEX_UPGRADES = (
     "CREATE INDEX IF NOT EXISTS ix_messages_thread_created_id ON messages (thread_id, created_at, id)",
     "CREATE INDEX IF NOT EXISTS ix_documents_source_sag_source ON documents (source_id, sag_source_id)",
     "CREATE INDEX IF NOT EXISTS ix_documents_source_active_created ON documents (source_id, is_active, created_at)",
+    "CREATE INDEX IF NOT EXISTS ix_documents_tenant_project_logical ON documents (tenant_id, project_id, logical_source_id)",
 )
 
 
@@ -122,7 +127,7 @@ async def _ensure_indexes() -> None:
 
 
 async def init_db() -> None:
-    """开发态建表（生产用 Alembic）。导入 models 以注册到 metadata。"""
+    """Initialize tables in development (production uses Alembic). Import models to register into metadata."""
     from sag_api.db import models  # noqa: F401
 
     async with engine.begin() as conn:

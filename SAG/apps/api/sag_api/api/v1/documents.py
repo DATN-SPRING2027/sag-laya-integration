@@ -2,8 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from datetime import datetime
 
-from fastapi import APIRouter, Depends, File, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    Header,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.config import settings
@@ -13,8 +24,11 @@ from sag_api.core.deps import (
     get_current_user_or_connector,
     get_engine_manager,
     get_job_queue,
+    get_verified_principal,
 )
-from sag_api.core.errors import ApiError, ConflictError, NotFoundError, ValidationError
+from sag_api.core.error_taxonomy import ErrorLayer, ErrorStage
+from sag_api.core.errors import ApiError, ConflictError, ForbiddenError, NotFoundError, ValidationError
+from sag_api.core.identity import VerifiedPrincipal
 from sag_api.core.logging import get_logger
 from sag_api.db.models import User
 from sag_api.enums import DocumentStatus
@@ -28,10 +42,16 @@ from sag_api.sag import EngineManager
 from sag_api.schemas.common import Ok
 from sag_api.schemas.document import DocumentOut, IngestRequest
 from sag_api.schemas.job import JobOut
+from sag_api.schemas.routing_rag import (
+    DocumentUploadResponse,
+    DocumentVersionStatusResponse,
+)
 from sag_api.services.document_service import (
     create_document_from_upload,
     delete_document,
+    get_document_version_status,
     get_public_document,
+    handle_document_upload,
     ingest_content,
     list_documents,
     pause_document,
@@ -42,23 +62,98 @@ from sag_api.services.source_operation_service import source_document_mutation
 from sag_api.services.source_service import get_source
 
 router = APIRouter(prefix="/sources/{source_id}/documents", tags=["documents"])
+project_router = APIRouter(prefix="/projects/{project_id}/documents", tags=["documents"])
 log = get_logger("documents")
 
 
 def _check_extension(filename: str | None) -> None:
-    """按白名单校验上传扩展名（空白名单 = 不限制）。"""
+    """Validate upload extension against whitelist (empty whitelist = no limit)."""
     allowed = settings.allowed_upload_exts
     if not allowed:
         return
     name = (filename or "").lower()
     if "." not in name or ("." + name.rsplit(".", 1)[1]) not in allowed:
-        pretty = "、".join(sorted(e.lstrip(".") for e in allowed))
-        raise ValidationError(f"不支持的文件类型。可上传：{pretty}")
+        pretty = ", ".join(sorted(e.lstrip(".") for e in allowed))
+        raise ValidationError(f"Unsupported file type. Allowed extensions: {pretty}")
 
 
 def _upload_filename(filename: str | None) -> str:
     """Strip client paths from multipart filenames on POSIX and Windows."""
     return (filename or "upload").replace("\\", "/").rsplit("/", maxsplit=1)[-1] or "upload"
+
+
+async def _read_upload_file_bounded(file: UploadFile, max_bytes: int) -> bytes:
+    """Read upload stream in chunks, aborting immediately if limit is exceeded."""
+    chunk_size = 64 * 1024  # 64 KB
+    chunks: list[bytes] = []
+    total_bytes = 0
+
+    while True:
+        chunk = await file.read(chunk_size)
+        if not chunk:
+            break
+        total_bytes += len(chunk)
+        if total_bytes > max_bytes:
+            raise ValidationError(
+                f"File size exceeds maximum allowed ({max_bytes} bytes / {settings.max_upload_mb}MB)",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            )
+        chunks.append(chunk)
+
+    if total_bytes == 0:
+        raise ValidationError("Uploaded file cannot be empty", layer=ErrorLayer.CLIENT, stage=ErrorStage.UPLOAD)
+
+    return b"".join(chunks)
+
+
+def _verify_mime_signature(filename: str, file_bytes: bytes) -> None:
+    """Xác thực chữ ký nhị phân (magic bytes) đối chiếu với phần mở rộng tệp.
+
+    Ngăn chặn việc giả mạo phần mở rộng file (extension deception) hoặc chèn mã độc.
+    """
+    if not file_bytes:
+        return
+    name = filename.lower()
+    ext = ("." + name.rsplit(".", 1)[1]) if "." in name else ""
+
+    if ext == ".pdf":
+        if not file_bytes.startswith(b"%PDF-"):
+            raise ValidationError(
+                f"Định dạng nội dung không khớp phần mở rộng: tệp '{filename}' thiếu chữ ký PDF hợp lệ (%PDF-)",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            )
+    elif ext in {".docx", ".pptx", ".xlsx", ".epub"}:
+        if not (
+            file_bytes.startswith(b"PK\x03\x04")
+            or file_bytes.startswith(b"PK\x05\x06")
+            or file_bytes.startswith(b"PK\x07\x08")
+        ):
+            raise ValidationError(
+                f"Định dạng nội dung không khớp phần mở rộng: tệp '{filename}' ({ext}) thiếu chữ ký ZIP container hợp lệ (PK)",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            )
+    elif ext == ".xls":
+        if not file_bytes.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+            raise ValidationError(
+                f"Định dạng nội dung không khớp phần mở rộng: tệp '{filename}' thiếu chữ ký OLE2 container hợp lệ",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            )
+    elif ext in {".txt", ".md", ".markdown", ".text", ".csv", ".tsv", ".json", ".html", ".htm"}:
+        if (
+            file_bytes.startswith(b"MZ")
+            or file_bytes.startswith(b"\x7fELF")
+            or file_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+            or file_bytes.startswith(b"\xff\xd8\xff")
+        ):
+            raise ValidationError(
+                f"Tệp nhị phân hoặc hình ảnh trá hình dưới phần mở rộng văn bản '{ext}' không được phép cho '{filename}'",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            )
 
 
 @router.get("", response_model=list[DocumentOut])
@@ -95,7 +190,7 @@ async def upload(
                 filename,
                 request_id,
             )
-            raise ValidationError("文件夹导入批次标识无效") from None
+            raise ValidationError("Invalid folder import batch identifier") from None
 
     data: bytes | None = None
     try:
@@ -103,9 +198,9 @@ async def upload(
         max_upload_bytes = settings.max_upload_mb * 1024 * 1024
         data = await file.read(max_upload_bytes + 1)
         if not data:
-            raise ValidationError("文件内容为空")
+            raise ValidationError("File content is empty")
         if len(data) > max_upload_bytes:
-            raise ValidationError(f"文件超过 {settings.max_upload_mb}MB 上限")
+            raise ValidationError(f"File size exceeds the {settings.max_upload_mb}MB limit")
         if folder_import_id is not None:
             log.info(
                 "folder_import_upload operation=upload outcome=started batch_id=%s source_id=%s "
@@ -163,7 +258,7 @@ async def ingest(
     session: AsyncSession = Depends(get_session),
     job_queue: JobQueue = Depends(get_job_queue),
 ) -> DocumentOut:
-    """统一写入接口：外部系统持续推送文本 / 消息进入信源。"""
+    """Unified ingestion endpoint: external systems continuously push text or messages into source."""
     async with source_document_mutation(SessionLocal, source_id, "document-ingest"):
         source = await get_source(session, source_id)
         document = await ingest_content(
@@ -196,7 +291,7 @@ async def get_file(
     _user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
-    """原始文件（预览/下载）。文件已被清理时返回 404。"""
+    """Original file (preview/download). Returns 404 when file has been cleaned up."""
     import os
 
     from fastapi.responses import FileResponse
@@ -206,9 +301,9 @@ async def get_file(
     source = await get_source(session, source_id)
     document = await get_public_document(session, source, document_id)
     if document.octx_installation_id:
-        raise NotFoundError("OCTX 数据包未包含原始文件，请查看解析内容")
+        raise NotFoundError("OCTX bundle does not contain the original file; inspect parsed content instead")
     if not document.storage_path or not os.path.isfile(document.storage_path):
-        raise NotFoundError("原始文件不存在或已被清理")
+        raise NotFoundError("Original file does not exist or has been cleaned up")
     return FileResponse(
         document.storage_path,
         media_type=document.content_type or "application/octet-stream",
@@ -224,7 +319,7 @@ async def get_preview(
     _user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
-    """返回浏览器可直接消费的预览；文本统一转为 UTF-8，下载仍保留原字节。"""
+    """Return preview directly consumable by browser; text is normalized to UTF-8 while download preserves raw bytes."""
     import os
 
     from fastapi.responses import FileResponse, Response
@@ -232,14 +327,14 @@ async def get_preview(
     source = await get_source(session, source_id)
     document = await get_public_document(session, source, document_id)
     if document.octx_installation_id:
-        raise NotFoundError("OCTX 数据包未包含原始文件，请查看解析内容")
+        raise NotFoundError("OCTX bundle does not contain the original file; inspect parsed content instead")
     if not document.storage_path or not os.path.isfile(document.storage_path):
-        raise NotFoundError("原始文件不存在或已被清理")
+        raise NotFoundError("Original file does not exist or has been cleaned up")
     if is_text_preview(document.filename, document.content_type):
         try:
             decoded = await asyncio.to_thread(read_text_file, document.storage_path)
         except TextDecodingError as error:
-            raise ValidationError(f"文本预览编码识别失败：{error}") from error
+            raise ValidationError(f"Failed to identify text preview encoding: {error}") from error
         return Response(
             content=decoded.text,
             media_type="text/plain; charset=utf-8",
@@ -261,17 +356,17 @@ async def get_parsed(
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
 ):
-    """返回文档成功入库时保存的整篇 Markdown，不在读取时触发重新解析。"""
+    """Return full Markdown saved upon successful ingestion without triggering re-parse on read."""
     from fastapi.responses import Response
 
     source = await get_source(session, source_id)
     document = await get_public_document(session, source, document_id)
     if document.status != DocumentStatus.READY:
         if document.status == DocumentStatus.FAILED:
-            raise ConflictError(document.error or "文档解析失败，暂无解析内容")
-        raise ConflictError("文档尚未解析完成")
+            raise ConflictError(document.error or "Document parsing failed, no parsed content available")
+        raise ConflictError("Document parsing is still in progress")
     if not document.sag_source_id:
-        raise NotFoundError("解析内容不存在，请重新处理文档")
+        raise NotFoundError("Parsed content not found, please reprocess the document")
 
     markdown = await engine_manager.get_document_markdown(
         source.sag_source_config_id,
@@ -279,7 +374,7 @@ async def get_parsed(
         source=source,
     )
     if not markdown:
-        raise NotFoundError("解析内容不存在，请重新处理文档")
+        raise NotFoundError("Parsed content not found, please reprocess the document")
     return Response(content=markdown, media_type="text/markdown")
 
 
@@ -347,4 +442,124 @@ async def delete_(
             document_id,
             job_queue=job_queue,
         )
-    return Ok(detail="文档已删除")
+    return Ok(detail="Document deleted")
+
+
+# ============================================================================
+# Knowledge Routing RAG: Project-Scoped Document Upload & Status Endpoints
+# ============================================================================
+
+
+@project_router.post(
+    "/upload",
+    response_model=DocumentUploadResponse,
+    summary="Upload a document version with strict idempotency and ACL partition",
+)
+async def upload_document_version(
+    project_id: str,
+    response: Response,
+    file: UploadFile = File(...),
+    source_published_at: datetime | None = Form(None),
+    logical_source_id: str | None = Form(None),
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    x_continuum_user_id: str | None = Header(None, alias="X-Continuum-User-Id"),
+    x_continuum_security_partition: str | None = Header(None, alias="X-Continuum-Security-Partition"),
+    x_continuum_tenant_id: str | None = Header(None, alias="X-Continuum-Tenant-Id"),
+    principal: VerifiedPrincipal = Depends(get_verified_principal),
+    session: AsyncSession = Depends(get_session),
+    job_queue: JobQueue | None = Depends(get_job_queue),
+) -> DocumentUploadResponse:
+    # Scope check 1: Project membership boundary
+    if not principal.has_project_access(project_id):
+        raise ForbiddenError(
+            f"Principal '{principal.user_id}' is not authorized to access project '{project_id}'"
+        )
+
+    # Scope check 2: Owner identity / prevent caller impersonation
+    if x_continuum_user_id:
+        if not principal.is_service and x_continuum_user_id != principal.user_id:
+            raise ForbiddenError(
+                f"Caller cannot impersonate user '{x_continuum_user_id}' with principal '{principal.user_id}'"
+            )
+        owner_id = x_continuum_user_id
+    else:
+        owner_id = principal.user_id
+
+    # Scope check 3: Tenant scope
+    if x_continuum_tenant_id:
+        if not principal.is_service and x_continuum_tenant_id != principal.tenant_id:
+            raise ForbiddenError(
+                f"Tenant mismatch: caller requested '{x_continuum_tenant_id}' but principal belongs to '{principal.tenant_id}'"
+            )
+        tenant_id = x_continuum_tenant_id
+    else:
+        tenant_id = principal.tenant_id
+
+    # Scope check 4: Security partition authorization
+    partition = x_continuum_security_partition
+    if not partition or not partition.strip():
+        if principal.allowed_partitions and "*" not in principal.allowed_partitions:
+            partition = next(iter(principal.allowed_partitions))
+        else:
+            raise ValidationError(
+                "X-Continuum-Security-Partition header is required to enforce data isolation"
+            )
+
+    if not principal.has_partition_access(partition):
+        raise ForbiddenError(
+            f"Principal '{principal.user_id}' is not authorized for security partition '{partition}'"
+        )
+
+    filename = _upload_filename(file.filename)
+    _check_extension(filename)
+
+    max_upload_bytes = getattr(settings, "max_upload_size_bytes", None) or (settings.max_upload_mb * 1024 * 1024)
+    file_bytes = await _read_upload_file_bounded(file, max_upload_bytes)
+    _verify_mime_signature(filename, file_bytes)
+
+    result = await handle_document_upload(
+        session,
+        tenant_id=tenant_id,
+        project_id=project_id,
+        owner_id=owner_id,
+        security_partition_id=partition,
+        client_token=idempotency_key,
+        file_bytes=file_bytes,
+        original_filename=filename,
+        content_type=file.content_type or "application/octet-stream",
+        logical_source_id=logical_source_id,
+        source_published_at=source_published_at,
+        job_queue=job_queue,
+    )
+
+    if result.is_duplicate:
+        response.status_code = status.HTTP_200_OK
+    else:
+        response.status_code = status.HTTP_201_CREATED
+
+    return result
+
+
+@project_router.get(
+    "/{document_id}/versions/{version_no}/status",
+    response_model=DocumentVersionStatusResponse,
+    summary="Query fine-grained readiness and stage execution progress for a document version",
+)
+async def query_document_version_status(
+    project_id: str,
+    document_id: str,
+    version_no: int,
+    principal: VerifiedPrincipal = Depends(get_verified_principal),
+    session: AsyncSession = Depends(get_session),
+) -> DocumentVersionStatusResponse:
+    if not principal.has_project_access(project_id):
+        raise ForbiddenError(
+            f"Principal '{principal.user_id}' is not authorized to access project '{project_id}'"
+        )
+    return await get_document_version_status(
+        session,
+        project_id=project_id,
+        document_id=document_id,
+        version_no=version_no,
+        principal=principal,
+    )

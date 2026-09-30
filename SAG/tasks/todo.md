@@ -4,20 +4,22 @@ Nguồn chuẩn: [Workflow v1.1](../docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1
 
 ## Phase 0 — Contracts & Foundations
 
-- [ ] Map flow upload, worker/job, search, query, schema, config và ACL hiện có; ghi rõ code tái sử dụng và gap.
-- [ ] Chốt Document/Version/SourceSnapshot/IngestionRun, stable ID, idempotency key, provenance và temporal fields.
-- [ ] Chốt stage/status/error contract và ý nghĩa riêng của SEARCH_READY, KNOWLEDGE_READY, FAILED.
-- [ ] Chốt Laya, query features/planner, retrieval trace, index/tree manifest và config version contracts.
-- [ ] Chốt tenant/project/security scope; rà migration, compatibility và rollback.
+- [x] Map flow upload, worker/job, search, query, schema, config và ACL hiện có; ghi rõ code tái sử dụng và gap.
+- [x] Chốt Document/Version/SourceSnapshot/IngestionRun, stable ID, idempotency key, provenance và temporal fields.
+- [x] Chốt stage/status/error contract và ý nghĩa riêng của SEARCH_READY, KNOWLEDGE_READY, FAILED.
+- [x] Chốt Laya, query features/planner, retrieval trace, index/tree manifest và config version contracts.
+- [x] Chốt tenant/project/security scope; rà migration, compatibility và rollback.
+- [x] Evidence: [phase-0-contracts-and-foundations.md](../docs/phase-0-contracts-and-foundations.md).
 
 ## Phase 1 — Upload & Versioned Source
 
-- [ ] Giữ validation quyền, extension, MIME signature, size và policy trước khi xử lý file.
-- [ ] Stream/checksum source; xác nhận source identity và duplicate policy.
-- [ ] Tạo/liên kết Document, Version, SourceSnapshot, IngestionRun trong transaction.
-- [ ] Kiểm tra bốn trường hợp cùng hash/cùng identity, cùng hash/khác nguồn, hash mới/cùng identity, hash mới/nguồn mới.
-- [ ] Đảm bảo frontend retry dùng idempotency key, không tạo workflow trùng.
-- [ ] Ghi stage/status/error cho worker; xác nhận status API và UI phản ánh tiến trình/lỗi/retry.
+- [x] Giữ validation quyền, extension, MIME signature, size và policy trước khi xử lý file.
+- [x] Stream/checksum source; xác nhận source identity và duplicate policy.
+- [x] Tạo/liên kết Document, Version, SourceSnapshot, IngestionRun trong transaction.
+- [x] Kiểm tra bốn trường hợp cùng hash/cùng identity, cùng hash/khác nguồn, hash mới/cùng identity, hash mới/nguồn mới.
+- [x] Đảm bảo frontend retry dùng idempotency key, không tạo workflow trùng.
+- [x] Ghi stage/status/error cho worker; xác nhận status API và UI phản ánh tiến trình/lỗi/retry.
+- [x] Evidence: [test_phase_1_upload_and_versioning.py](../apps/api/tests/test_phase_1_upload_and_versioning.py) (8/8 passed).
 
 ## Phase 2A — Canonical Extraction
 
