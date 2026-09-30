@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import uuid
 from datetime import UTC, datetime
@@ -863,9 +864,14 @@ def _save_snapshot_file(payload_hash: str, original_filename: str, file_bytes: b
     return str(target_path.resolve())
 
 
-async def get_or_create_project_source(session: AsyncSession, project_id: str) -> Source:
-    """Ánh xạ project_id sang một SAG Source tương ứng để phục vụ worker xử lý và bảo toàn toàn vẹn dữ liệu."""
-    config_id = f"proj_{project_id}"[:64]
+async def get_or_create_project_source(
+    session: AsyncSession,
+    tenant_id: str,
+    project_id: str,
+) -> Source:
+    """Ánh xạ (tenant_id, project_id) sang một SAG Source tương ứng để phục vụ worker xử lý và bảo toàn toàn vẹn dữ liệu."""
+    hash_digest = hashlib.sha256(f"{tenant_id}:{project_id}".encode("utf-8")).hexdigest()[:32]
+    config_id = f"tp_{hash_digest}"
     stmt = select(Source).where(Source.sag_source_config_id == config_id).limit(1)
     source = (await session.execute(stmt)).scalar_one_or_none()
     if source is not None:
@@ -873,11 +879,15 @@ async def get_or_create_project_source(session: AsyncSession, project_id: str) -
 
     source = Source(
         name=f"Project {project_id}",
-        description=f"Auto-provisioned source for project {project_id}",
+        description=f"Auto-provisioned source for project {project_id} (tenant {tenant_id})",
         source_type=SourceType.DOCUMENT,
         connector_kind=ConnectorKind.FILE_UPLOAD,
         sag_source_config_id=config_id,
-        config={},
+        config={
+            "is_project_source": True,
+            "tenant_id": tenant_id,
+            "project_id": project_id,
+        },
     )
     session.add(source)
     await session.flush()
@@ -913,9 +923,9 @@ async def handle_document_upload(
 
     _check_upload_file(original_filename, file_bytes)
 
-    # Ánh xạ project_id sang SAG Source nếu chưa truyền source_id để đảm bảo tính tương thích với worker và DB
+    # Ánh xạ (tenant_id, project_id) sang SAG Source nếu chưa truyền source_id để đảm bảo tính tương thích với worker và DB
     if not source_id:
-        proj_source = await get_or_create_project_source(session, project_id)
+        proj_source = await get_or_create_project_source(session, tenant_id, project_id)
         source_id = proj_source.id
 
     payload_hash = compute_payload_hash(file_bytes)
@@ -988,7 +998,9 @@ async def handle_document_upload(
                 doc = (await session.execute(doc_stmt)).scalar_one_or_none()
 
                 now_utc = datetime.now(UTC)
+                is_new_doc = False
                 if not doc:
+                    is_new_doc = True
                     doc_id = generate_doc_id(tenant_id, project_id, logical_id)
                     doc = Document(
                         id=doc_id,
@@ -1109,7 +1121,7 @@ async def handle_document_upload(
                 )
                 session.add(stage_run)
 
-                # Create durable Job record for background processing
+                # Create durable Job record for background processing with immutable snapshot storage_path
                 job = Job(
                     type=JobType.PROCESS_DOCUMENT,
                     source_id=doc.source_id,
@@ -1120,11 +1132,12 @@ async def handle_document_upload(
                         "document_version_id": doc_version.id,
                         "project_id": project_id,
                         "tenant_id": tenant_id,
+                        "storage_path": storage_path,
                     },
                 )
                 session.add(job)
 
-                if source_id:
+                if source_id and is_new_doc:
                     await session.execute(
                         update(Source)
                         .where(Source.id == source_id)
@@ -1227,18 +1240,19 @@ async def get_document_version_status(
         )
     doc_ver, doc = result
 
-    # Kiểm tra ủy quyền tenant và security partition (Comment #12)
+    # Kiểm tra ủy quyền tenant và security partition (Fail-closed)
     if principal is not None:
-        if not principal.is_service and doc.tenant_id != principal.tenant_id:
-            raise ForbiddenError(
-                f"Principal '{principal.user_id}' belongs to tenant '{principal.tenant_id}' "
-                f"but document belongs to tenant '{doc.tenant_id}'"
-            )
-        partition = (doc_ver.metadata_json or {}).get("security_partition_id")
-        if partition and not principal.has_partition_access(partition):
-            raise ForbiddenError(
-                f"Principal '{principal.user_id}' is not authorized to access security partition '{partition}'"
-            )
+        if not principal.is_service:
+            if doc.tenant_id != principal.tenant_id:
+                raise ForbiddenError(
+                    f"Principal '{principal.user_id}' belongs to tenant '{principal.tenant_id}' "
+                    f"but document belongs to tenant '{doc.tenant_id}'"
+                )
+            partition = (doc_ver.metadata_json or {}).get("security_partition_id")
+            if not partition or not principal.has_partition_access(partition):
+                raise ForbiddenError(
+                    f"Principal '{principal.user_id}' is not authorized to access security partition '{partition or 'NONE'}'"
+                )
 
     run_stmt = (
         select(IngestionRun)

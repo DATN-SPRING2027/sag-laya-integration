@@ -97,6 +97,7 @@ _INDEX_UPGRADES = (
     "CREATE INDEX IF NOT EXISTS ix_messages_thread_created_id ON messages (thread_id, created_at, id)",
     "CREATE INDEX IF NOT EXISTS ix_documents_source_sag_source ON documents (source_id, sag_source_id)",
     "CREATE INDEX IF NOT EXISTS ix_documents_source_active_created ON documents (source_id, is_active, created_at)",
+    "CREATE INDEX IF NOT EXISTS ix_documents_tenant_project_logical ON documents (tenant_id, project_id, logical_source_id)",
 )
 
 

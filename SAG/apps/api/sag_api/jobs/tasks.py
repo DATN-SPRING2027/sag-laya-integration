@@ -349,11 +349,12 @@ async def _process_document_unlocked(
     try:
         prepared = None
         parser_stage = False
+        target_storage_path = (job.payload or {}).get("storage_path") or document.storage_path
         if not checkpoint.chunk_ids:
             parser_stage = True
             try:
                 prepared = await prepare_document(
-                    document.storage_path,
+                    target_storage_path,
                     settings,
                     state=(job.payload or {}).get("document_parser"),
                     on_state=on_parser_state,
@@ -386,7 +387,7 @@ async def _process_document_unlocked(
             should_pause=should_pause,
             max_concurrency=settings.document_extract_concurrency,
             document_title=Path(document.filename).stem.strip(),
-            original_path=document.storage_path if prepared is not None else None,
+            original_path=target_storage_path if prepared is not None else None,
         )
         if outcome.paused:
             await _pause_or_yield()

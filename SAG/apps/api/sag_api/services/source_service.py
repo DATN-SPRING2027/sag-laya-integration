@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sag_api.connectors import registry
 from sag_api.core.config import settings
 from sag_api.core.error_taxonomy import ErrorCode
-from sag_api.core.errors import ApiError, NotFoundError, ValidationError
+from sag_api.core.errors import ApiError, ForbiddenError, NotFoundError, ValidationError
 from sag_api.core.logging import get_logger
 from sag_api.db.base import new_id
 from sag_api.db.models import AgentBinding, Job, Source
@@ -25,7 +25,10 @@ log = get_logger("services.source")
 
 async def list_sources(session: AsyncSession) -> list[Source]:
     rows = await session.execute(select(Source).order_by(Source.created_at.desc()))
-    return list(rows.scalars().all())
+    return [
+        s for s in rows.scalars().all()
+        if not (isinstance(s.config, dict) and s.config.get("is_project_source"))
+    ]
 
 
 async def search_source_candidates(
@@ -48,7 +51,10 @@ async def search_source_candidates(
             )
         rows = await session.execute(select(Source).where(Source.id.in_(ordered_ids)))
         by_id = {source.id: source for source in rows.scalars().all()}
-        return [by_id[source_id] for source_id in ordered_ids if source_id in by_id]
+        return [
+            by_id[source_id] for source_id in ordered_ids
+            if source_id in by_id and not (isinstance(by_id[source_id].config, dict) and by_id[source_id].config.get("is_project_source"))
+        ]
 
     rows = await session.execute(
         select(Source)
@@ -60,13 +66,25 @@ async def search_source_candidates(
         )
         .limit(limit)
     )
-    return list(rows.scalars().all())
+    return [
+        s for s in rows.scalars().all()
+        if not (isinstance(s.config, dict) and s.config.get("is_project_source"))
+    ]
 
 
-async def get_source(session: AsyncSession, source_id: str) -> Source:
+async def get_source(
+    session: AsyncSession,
+    source_id: str,
+    *,
+    allow_project_source: bool = False,
+) -> Source:
     source = await session.get(Source, source_id)
     if source is None:
         raise NotFoundError("信源不存在")
+    if not allow_project_source and isinstance(source.config, dict) and source.config.get("is_project_source"):
+        raise ForbiddenError(
+            "Nguồn dữ liệu dự án được bảo vệ và không thể truy cập qua route không có scope. Hãy sử dụng API /projects/{project_id}/documents."
+        )
     return source
 
 
