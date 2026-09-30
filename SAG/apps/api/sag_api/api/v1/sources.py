@@ -20,7 +20,7 @@ from sag_api.mcp.server import MCP_TOOL_DETAILS, MCP_TOOL_NAMES
 from sag_api.sag import EngineManager
 from sag_api.schemas.common import Ok
 from sag_api.schemas.job import JobOut
-from sag_api.schemas.source import ConnectorOut, SourceCreate, SourceOut, SourceUpdate
+from sag_api.schemas.source import ConnectorOut, SourceCreate, SourceCreateOut, SourceOut, SourceUpdate
 from sag_api.services.source_operation_service import acquire_source_exclusive_lease
 from sag_api.services.source_service import (
     create_source,
@@ -48,16 +48,16 @@ async def list_(
     return [SourceOut.model_validate(s) for s in await list_sources(session, principal=principal)]
 
 
-@router.post("", response_model=SourceOut, status_code=201)
+@router.post("", response_model=SourceCreateOut, status_code=201)
 async def create(
     body: SourceCreate,
     _user: User = Depends(get_current_user_or_connector),
-    _principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
-) -> SourceOut:
-    source = await create_source(session, body, engine_manager=engine_manager)
-    return SourceOut.model_validate(source)
+) -> SourceCreateOut:
+    source = await create_source(session, body, principal=principal, engine_manager=engine_manager)
+    return SourceCreateOut(**SourceOut.model_validate(source).model_dump(), mapping_state="PENDING")
 
 
 @router.get("/{source_id}", response_model=SourceOut)

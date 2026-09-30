@@ -123,7 +123,12 @@ trusted mechanism, such as a BE-issued mapping command/service grant bound to
 not interpret user role names. Until then, only the owner-approved
 `scripts/source_project_acl.py` operator/backfill process may confirm mappings;
 user-facing Source creation cannot make a Source searchable by supplying a
-client Project ID.
+client Project ID. `POST /sources` may persist a requested mapping as
+`PENDING`, after checking that the Project is in the verified principal's read
+scope. Its response reports `mapping_state: "PENDING"`; only the existing
+owner-approved workflow can confirm it. If the Project is omitted, creation
+may infer the only readable Project, but it must reject an ambiguous multi-
+Project scope rather than pick one.
 
 ### Normal Source creation and connector ingestion
 

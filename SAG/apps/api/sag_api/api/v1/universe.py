@@ -23,7 +23,7 @@ from sag_api.schemas.universe import (
     UniverseTimelineIn,
     UniverseTimelineSliceOut,
 )
-from sag_api.services.source_service import get_authorized_source, search_source_candidates
+from sag_api.services.source_service import get_authorized_source, get_authorized_source_ids, search_source_candidates
 from sag_api.services.universe_service import (
     get_exploration,
     list_explorations,
@@ -131,17 +131,22 @@ async def explorations(
     session: AsyncSession = Depends(get_session),
 ) -> list[ExplorationSessionOut]:
     rows = await list_explorations(session, user.id, limit=limit)
-    visible: list[tuple[object, int]] = []
-    for item, count in rows:
-        source_ids = list(dict.fromkeys(item.source_ids or []))
-        if not source_ids:
-            continue
-        authorized = await search_source_candidates(
+    requested_source_ids = list(
+        dict.fromkeys(source_id for item, _count in rows for source_id in (item.source_ids or []))
+    )
+    authorized_source_ids = (
+        await get_authorized_source_ids(
             session,
             principal=principal,
-            requested_source_ids=source_ids,
-        ) if source_ids else []
-        if len(authorized) == len(source_ids):
+            requested_source_ids=requested_source_ids,
+        )
+        if requested_source_ids
+        else set()
+    )
+    visible: list[tuple[object, int]] = []
+    for item, count in rows:
+        source_ids = set(item.source_ids or [])
+        if not source_ids or source_ids.issubset(authorized_source_ids):
             visible.append((item, count))
     return [
         ExplorationSessionOut(

@@ -188,6 +188,8 @@ def _install_authorized_project_for_api_tests(monkeypatch):
     """
     from datetime import UTC, datetime
 
+    from sqlalchemy import select
+
     from sag_api.api.v1 import sources as sources_api
     from sag_api.core.db import SessionLocal
     from sag_api.core.principal_assertion import VerifiedPrincipal, require_principal_assertion
@@ -212,17 +214,23 @@ def _install_authorized_project_for_api_tests(monkeypatch):
     async def create_mapped_source(*args, **kwargs):
         source = await real_create_source(*args, **kwargs)
         async with SessionLocal() as session:
-            session.add(
-                SourceProjectMapping(
+            mapping = await session.scalar(
+                select(SourceProjectMapping).where(SourceProjectMapping.source_id == source.id)
+            )
+            if mapping is None:
+                mapping = SourceProjectMapping(
                     source_id=source.id,
                     organization_id="pytest-org",
                     project_id="pytest-project",
-                    state="CONFIRMED",
-                    confirmed_at=datetime.now(UTC),
-                    confirmed_by="pytest-owner",
-                    approval_ref="test-fixture",
+                    state="PENDING",
                 )
-            )
+                session.add(mapping)
+            mapping.organization_id = "pytest-org"
+            mapping.project_id = "pytest-project"
+            mapping.state = "CONFIRMED"
+            mapping.confirmed_at = datetime.now(UTC)
+            mapping.confirmed_by = "pytest-owner"
+            mapping.approval_ref = "test-fixture"
             await session.commit()
         return source
 

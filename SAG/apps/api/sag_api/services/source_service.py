@@ -5,14 +5,14 @@ from __future__ import annotations
 import os
 import shutil
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.connectors import registry
 from sag_api.core.config import settings
 from sag_api.core.error_taxonomy import ErrorCode
-from sag_api.core.errors import ApiError, NotFoundError, ServiceUnavailableError, ValidationError
+from sag_api.core.errors import ApiError, ForbiddenError, NotFoundError, ServiceUnavailableError, ValidationError
 from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal
 from sag_api.db.base import new_id
@@ -23,20 +23,14 @@ from sag_api.sag import EngineManager
 from sag_api.schemas.source import SourceCreate, SourceUpdate
 
 log = get_logger("services.source")
+SOURCE_ID_LOOKUP_BATCH_SIZE = 500
 
 
 def _authorized_source_statement(principal: VerifiedPrincipal):
-    unambiguous_source_ids = (
-        select(SourceProjectMapping.source_id)
-        .where(SourceProjectMapping.state.in_(("PENDING", "CONFIRMED")))
-        .group_by(SourceProjectMapping.source_id)
-        .having(func.count(SourceProjectMapping.id) == 1)
-    )
     return (
         select(Source)
         .join(SourceProjectMapping, SourceProjectMapping.source_id == Source.id)
         .where(
-            Source.id.in_(unambiguous_source_ids),
             SourceProjectMapping.state == "CONFIRMED",
             SourceProjectMapping.organization_id == principal.organization_id,
             SourceProjectMapping.project_id.in_(principal.allowed_project_ids),
@@ -143,14 +137,19 @@ async def get_authorized_source_ids(
     ordered_ids = list(dict.fromkeys(source_id.strip() for source_id in requested_source_ids if source_id.strip()))
     if not ordered_ids or not principal.allowed_project_ids:
         return set()
-    try:
-        rows = await session.execute(
-            _authorized_source_statement(principal).where(Source.id.in_(ordered_ids)).with_only_columns(Source.id)
-        )
-    except SQLAlchemyError as error:
-        log.exception("source scope resolution failed operation=validate requested_count=%d", len(ordered_ids))
-        raise ServiceUnavailableError("Source authorization mapping is unavailable") from error
-    authorized = set(rows.scalars().all())
+    authorized: set[str] = set()
+    for start in range(0, len(ordered_ids), SOURCE_ID_LOOKUP_BATCH_SIZE):
+        batch = ordered_ids[start : start + SOURCE_ID_LOOKUP_BATCH_SIZE]
+        try:
+            rows = await session.execute(
+                _authorized_source_statement(principal)
+                .where(Source.id.in_(batch))
+                .with_only_columns(Source.id)
+            )
+        except SQLAlchemyError as error:
+            log.exception("source scope resolution failed operation=validate requested_count=%d", len(ordered_ids))
+            raise ServiceUnavailableError("Source authorization mapping is unavailable") from error
+        authorized.update(rows.scalars().all())
     log.info(
         "source scope validated requested_source_count=%d effective_source_count=%d",
         len(ordered_ids),
@@ -167,8 +166,26 @@ async def get_source(session: AsyncSession, source_id: str) -> Source:
 
 
 async def create_source(
-    session: AsyncSession, data: SourceCreate, *, engine_manager: EngineManager
+    session: AsyncSession,
+    data: SourceCreate,
+    *,
+    engine_manager: EngineManager,
+    principal: VerifiedPrincipal | None = None,
 ) -> Source:
+    project_id: str | None = None
+    if principal is not None:
+        if not principal.allowed_project_ids:
+            raise ForbiddenError("A readable Project is required to request Source assignment")
+        project_id = data.project_id
+        if project_id is None:
+            if len(principal.allowed_project_ids) != 1:
+                raise ValidationError("project_id is required when the principal can access multiple Projects")
+            project_id = next(iter(principal.allowed_project_ids))
+        if project_id != project_id.strip():
+            raise ValidationError("project_id must not contain leading or trailing whitespace")
+        if project_id not in principal.allowed_project_ids:
+            raise ForbiddenError("The requested Project is outside the principal scope")
+
     connector = registry.get(data.connector_kind)
     connector.validate_config(data.config)
     source_type = CONNECTOR_SOURCE_TYPE.get(data.connector_kind, SourceType.DOCUMENT)
@@ -182,6 +199,17 @@ async def create_source(
         config=data.config or {},
     )
     session.add(source)
+    if principal is not None:
+        await session.flush()
+        session.add(
+            SourceProjectMapping(
+                source_id=source.id,
+                organization_id=principal.organization_id,
+                project_id=project_id,
+                state="PENDING",
+                mapping_version=1,
+            )
+        )
     await session.commit()
     await session.refresh(source)
 
@@ -191,6 +219,7 @@ async def create_source(
         await engine_manager.provision(source.sag_source_config_id, source)
     except ApiError as e:
         log.warning("信源引擎预建失败，回滚信源 %s：%s", source.sag_source_config_id, e.message)
+        await session.execute(delete(SourceProjectMapping).where(SourceProjectMapping.source_id == source.id))
         await session.delete(source)
         await session.commit()
         raise

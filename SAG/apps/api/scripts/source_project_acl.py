@@ -16,6 +16,8 @@ from sqlalchemy import func, inspect, select
 
 from sag_api.db.models import Document, Source, SourceProjectMapping
 
+SOURCE_LOOKUP_BATCH_SIZE = 500
+
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -118,12 +120,12 @@ def _read_mapping_file(path: Path) -> tuple[list[dict[str, str]], str]:
 async def _apply(session, rows: list[dict[str, str]], digest: str, approved_by: str, write: bool) -> None:
     if not approved_by.strip() or approved_by != approved_by.strip():
         raise ValueError("approved-by must be a non-empty canonical operator ID")
-    sources = {
-        source.id: source
-        for source in (
-            await session.execute(select(Source).where(Source.id.in_([row["source_id"] for row in rows])))
-        ).scalars().all()
-    }
+    source_ids = [row["source_id"] for row in rows]
+    sources: dict[str, Source] = {}
+    for start in range(0, len(source_ids), SOURCE_LOOKUP_BATCH_SIZE):
+        batch = source_ids[start : start + SOURCE_LOOKUP_BATCH_SIZE]
+        result = await session.execute(select(Source).where(Source.id.in_(batch)))
+        sources.update({source.id: source for source in result.scalars().all()})
     if len(sources) != len(rows):
         raise ValueError("CSV contains one or more Source IDs that do not exist")
     current = await _latest_mappings(session)

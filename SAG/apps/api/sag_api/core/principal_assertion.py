@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 import jwt
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
 from starlette.requests import Request
 
 from sag_api.core.config import settings
@@ -121,7 +122,7 @@ class PrincipalAssertionVerifier:
         self.max_project_ids = max_project_ids
         self._jwks_loader = jwks_loader
         self._clock = clock
-        self._keys: dict[str, dict[str, Any]] = {}
+        self._keys: dict[str, RSAPublicKey] = {}
         self._cache_expires_at = 0.0
         self._last_unknown_kid_refresh_at = float("-inf")
         self._lock = asyncio.Lock()
@@ -142,16 +143,15 @@ class PrincipalAssertionVerifier:
             raise AuthError("Principal assertion signing key is not allowed")
 
         keys = await self._get_keys()
-        jwk_key = keys.get(key_id)
-        if jwk_key is None:
+        public_key = keys.get(key_id)
+        if public_key is None:
             keys = await self._get_keys(force_refresh=True)
-            jwk_key = keys.get(key_id)
-        if jwk_key is None:
+            public_key = keys.get(key_id)
+        if public_key is None:
             log.warning("principal assertion denied reason=unknown_kid")
             raise AuthError("Principal assertion signing key is unknown")
 
         try:
-            public_key = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(jwk_key))
             if public_key.key_size < 2048:
                 raise AuthError("Principal assertion signing key is too weak")
             claims = jwt.decode(
@@ -226,7 +226,7 @@ class PrincipalAssertionVerifier:
     def _valid_identifier(value: object) -> bool:
         return isinstance(value, str) and bool(value.strip()) and value == value.strip() and len(value) <= 256
 
-    async def _get_keys(self, *, force_refresh: bool = False) -> dict[str, dict[str, Any]]:
+    async def _get_keys(self, *, force_refresh: bool = False) -> dict[str, RSAPublicKey]:
         now = self._clock()
         if not force_refresh and self._keys and now < self._cache_expires_at:
             return self._keys
@@ -250,7 +250,7 @@ class PrincipalAssertionVerifier:
                 raise
             except Exception as error:  # noqa: BLE001 - trust service boundary
                 raise ServiceUnavailableError("Principal verification keys are unavailable") from error
-            keys: dict[str, dict[str, Any]] = {}
+            keys: dict[str, RSAPublicKey] = {}
             for item in document["keys"]:
                 if not isinstance(item, dict):
                     continue
@@ -267,7 +267,15 @@ class PrincipalAssertionVerifier:
                 ):
                     if kid in keys:
                         raise ServiceUnavailableError("Principal verification key set contains duplicate key IDs")
-                    keys[kid] = item
+                    try:
+                        public_key = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(item))
+                    except (jwt.PyJWTError, ValueError, TypeError, AttributeError) as error:
+                        raise ServiceUnavailableError(
+                            "Principal verification key set contains an invalid RSA key"
+                        ) from error
+                    if public_key.key_size < 2048:
+                        raise ServiceUnavailableError("Principal verification key set contains a weak RSA key")
+                    keys[kid] = public_key
             self._keys = keys
             self._cache_expires_at = now + min(max(self.cache_ttl_seconds, 1), 60)
             return self._keys

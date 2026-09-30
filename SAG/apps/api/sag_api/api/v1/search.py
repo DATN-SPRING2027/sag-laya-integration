@@ -366,7 +366,7 @@ async def _prepare_global_search(
 
     section_outputs = []
     for section in outcome.sections:
-        source = next((item for item in sources if item.sag_source_config_id == section.source_config_id), None)
+        source = refs.get(section.source_config_id or "")
         section_outputs.append(
             SectionOut(
                 **{

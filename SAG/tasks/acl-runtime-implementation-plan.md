@@ -37,9 +37,11 @@ the signed assertion and owns the confirmed Project→Source mapping.
   precedes candidate generation or file/engine access.
 - **Disabled:** MCP stdio; global Universe manifest and rebuild; global P4 graph,
   event, KG and Tree projection.
-- **Constrained:** created/imported Sources stay unmapped and inaccessible until
-  an owner-approved mapping exists. OCTX import into an existing Source checks
-  the requested destination before applying it.
+- **Constrained:** user-created Sources may store a requested Project mapping as
+  `PENDING`; they remain inaccessible until owner approval confirms the mapping.
+  Imported Sources stay unmapped until an owner-approved mapping exists. OCTX
+  import into an existing Source checks the requested destination before
+  applying it.
 - **Awaiting integration/review:** Continuum assertion issuance and JWKS,
   trusted BFF header overwrite/stripping, scoped service grants for Dify/MCP,
   production DB migration approval, mapping writer/revoke authority and

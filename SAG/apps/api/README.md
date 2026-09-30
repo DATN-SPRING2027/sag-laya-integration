@@ -51,6 +51,13 @@ a Project mapping. Production trust configuration, key rotation, mapping writer,
 and legacy backfill still require their respective owners' approval; the local
 contract tests are not production ACL acceptance.
 
+`POST /sources` may receive `project_id` as a requested assignment. The API
+checks that it is in the verified principal's readable Project scope and stores
+the mapping as `PENDING`; the response includes `mapping_state: "PENDING"`.
+When `project_id` is omitted, the API may use the sole readable Project; callers
+with multiple readable Projects must specify one. Pending Sources remain
+inaccessible until an owner confirms the mapping through the approved workflow.
+
 Global P4 retrieval uses dense/lexical RRF and emits no graph fields. Source-
 scoped P3 graph/event recall runs only after Source authorization. Universe
 global manifest/rebuild and MCP stdio remain disabled until their data paths can
