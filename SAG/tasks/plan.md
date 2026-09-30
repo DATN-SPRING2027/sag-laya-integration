@@ -60,6 +60,16 @@ citation, no-answer flow, Knowledge Graph hoặc Knowledge Routing Tree.
 - ACL authority/resolver và source-scope mapping vẫn thiếu; đây tiếp tục là
   blocker P1 của PR.
 
+### Retrieval review follow-up — 2026-09-30
+
+- Deduplicated semantic sections retain the maximum retriever score while the
+  longer deterministic representative supplies the returned content.
+- Relevance is evaluated per candidate: a lexical hit on one result no longer
+  disables the relative semantic gate for other dense candidates.
+- Search and Dify API schemas document that `score` is a normalized RRF rank
+  score, not cosine similarity or a probability. Dify's `score_threshold` is
+  applied to this RRF score; callers must tune it accordingly.
+
 ### ACL search integration seam — 2026-09-30
 
 - Global `/search`, `/search/stream` và `/search/eval-compare` nhận một

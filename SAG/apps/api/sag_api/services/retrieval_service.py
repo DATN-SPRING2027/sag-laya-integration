@@ -294,8 +294,18 @@ def rerank_sections(
                 section.heading,
                 section.content,
             )
+            best_score = max(
+                float(previous.score or 0.0),
+                float(section.score or 0.0),
+            )
             if current_preference > previous_preference:
-                representatives[key] = section
+                representatives[key] = section.model_copy(
+                    update={"score": best_score}
+                )
+            else:
+                representatives[key] = previous.model_copy(
+                    update={"score": best_score}
+                )
         preferred_keys = preferred_keys or set()
         ordered_keys = sorted(
             ranks,
@@ -336,10 +346,6 @@ def rerank_sections(
         key: _lexical_relevance(query, section, analysis=effective)
         for key, section in merged.items()
     }
-    has_lexical_signal = any(
-        key in lexical_ranks or score >= 0.2
-        for key, score in lexical_scores.items()
-    )
     active_retrievers = int(bool(semantic_ranks)) + int(bool(lexical_ranks))
     ideal_rrf_score = active_retrievers / (_RRF_K + 1)
     ranked: list[tuple[float, int, int, int, tuple[str, str], RetrievedSection]] = []
@@ -361,12 +367,13 @@ def rerank_sections(
             if rank is not None
         )
         fused_score = min(1.0, reciprocal_rank_score / ideal_rrf_score)
-        if has_lexical_signal:
-            relevant = lexical_match or lexical_score >= 0.2
-        else:
-            # The ratio preserves the cutoff under positive score rescaling and
-            # avoids treating provider-specific score units as a relevance contract.
-            relevant = relative_semantic_score >= _SEMANTIC_RELATIVE_RELEVANCE_FLOOR
+        # Each candidate may pass through either retrieval signal. The relative
+        # semantic gate stays active even when another candidate has a lexical hit.
+        relevant = (
+            lexical_match
+            or lexical_score >= 0.2
+            or relative_semantic_score >= _SEMANTIC_RELATIVE_RELEVANCE_FLOOR
+        )
         if not relevant:
             continue
         rank_sum = sum(rank for rank in (semantic_rank, lexical_rank) if rank is not None)
