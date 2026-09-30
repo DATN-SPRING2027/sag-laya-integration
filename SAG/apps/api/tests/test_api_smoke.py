@@ -9,7 +9,8 @@ import pytest
 
 
 @pytest.mark.asyncio
-async def test_end_to_end_offline():
+async def test_end_to_end_offline(monkeypatch):
+    from sag_api.api.v1 import search as search_api
     from sag_api.main import app
 
     transport = httpx.ASGITransport(app=app)
@@ -51,6 +52,11 @@ async def test_end_to_end_offline():
             r = await c.post("/api/v1/sources", headers=H, json={"name": "手册"})
             assert r.status_code == 201
             sid = r.json()["id"]
+            monkeypatch.setitem(
+                app.dependency_overrides,
+                search_api.get_search_acl_scope,
+                lambda: search_api.SearchACLScope(frozenset({sid})),
+            )
             assert r.json()["source_type"] == "document"
             # 共享测试库 → 用存在性/按 id 定位而非精确计数
             def _find(sources):

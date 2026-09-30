@@ -29,7 +29,14 @@ class SectionOut(BaseModel):
     chunk_id: str | None
     heading: str
     content: str
-    score: float
+    score: float = Field(
+        description=(
+            "Normalized reciprocal-rank fusion (RRF) score in [0, 1]. "
+            "When dense and lexical retrieval are both active, a top-ranked candidate "
+            "returned by only one retriever can score 0.5. This is not cosine "
+            "similarity or a relevance probability."
+        )
+    )
     rank: int
     source_id: str | None
     source_name: str | None = None

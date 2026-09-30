@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Any, TypedDict
 
 from fastapi import APIRouter, Depends, Request
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
@@ -19,7 +20,7 @@ from sag_api.core.deps import (
     get_llm,
 )
 from sag_api.core.error_taxonomy import ErrorCode
-from sag_api.core.errors import ApiError, ValidationError
+from sag_api.core.errors import ApiError, ServiceUnavailableError, ValidationError
 from sag_api.core.logging import get_logger
 from sag_api.db.models import Source, User
 from sag_api.enums import SEARCH_STRATEGIES, normalize_search_strategy
@@ -66,6 +67,59 @@ class _QueryRoutePlan:
     strategy: str
     need_retrieval: bool
     trace: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class SearchACLScope:
+    """Source IDs resolved by the trusted authorization layer for one request."""
+
+    authorized_source_ids: frozenset[str]
+
+
+def get_search_acl_scope(_request: Request) -> SearchACLScope | None:
+    """Fail-closed seam for a trusted resolver using server-authenticated request state."""
+    return None
+
+
+async def _authorized_search_sources(
+    session: AsyncSession,
+    requested_source_ids: list[str] | None,
+    acl_scope: SearchACLScope | None,
+) -> list[Source]:
+    if acl_scope is None:
+        raise ServiceUnavailableError("可信搜索授权范围暂不可用")
+
+    authorized_ids = {
+        source_id
+        for source_id in acl_scope.authorized_source_ids
+        if isinstance(source_id, str) and source_id.strip()
+    }
+    limit = settings.search_source_candidate_limit
+
+    if requested_source_ids is not None:
+        effective_ids = list(
+            dict.fromkeys(
+                source_id for source_id in requested_source_ids if source_id in authorized_ids
+            )
+        )
+        if not effective_ids:
+            return []
+        return await search_source_candidates(session, effective_ids)
+
+    if not authorized_ids:
+        return []
+    rows = await session.execute(
+        select(Source)
+        .where(Source.id.in_(authorized_ids))
+        .order_by(
+            Source.chunk_count.desc(),
+            Source.event_count.desc(),
+            Source.updated_at.desc(),
+            Source.id,
+        )
+        .limit(limit)
+    )
+    return list(rows.scalars().all())
 
 
 def _query_feature_reason_codes(features: Any) -> list[str]:
@@ -295,6 +349,7 @@ async def _prepare_global_search(
     session: AsyncSession,
     engine_manager: EngineManager,
     body: GlobalSearchRequest,
+    acl_scope: SearchACLScope | None,
 ) -> _PreparedGlobalSearch:
     route_plan = await _build_query_route(body.query, body.source_ids, body.strategy)
     if not route_plan.need_retrieval:
@@ -314,7 +369,7 @@ async def _prepare_global_search(
             response=SearchResponse(query=body.query, sections=[], stats=stats),
         )
 
-    sources = await search_source_candidates(session, body.source_ids)
+    sources = await _authorized_search_sources(session, body.source_ids, acl_scope)
     # Retrieval and answer generation can be long-running. End the read-only
     # transaction as soon as source identity has been materialized so an SSE
     # request never occupies a pooled database connection while waiting on the
@@ -330,34 +385,30 @@ async def _prepare_global_search(
         )
 
     refs = {source.sag_source_config_id: source for source in sources}
-    outcome, event_scores = await asyncio.gather(
-        retrieve_relevant_sections(
-            engine_manager,
-            sources,
-            body.query,
-            strategy=route_plan.strategy,
-            top_k=body.top_k,
-        ),
-        recall_event_scores(
-            engine_manager,
-            body.query,
-            refs,
-            limit=body.top_k,
-        ),
-    )
-    graph_fields = await _event_graph_fields(
+    outcome = await retrieve_relevant_sections(
         engine_manager,
-        outcome.sections,
-        refs,
-        event_scores=event_scores,
+        sources,
+        body.query,
+        strategy=route_plan.strategy,
+        top_k=body.top_k,
+    )
+    permitted_config_ids = set(refs)
+    permitted_sections = [
+        section
+        for section in outcome.sections
+        if section.source_config_id in permitted_config_ids
+    ]
+    acl_filtered_candidates = len(outcome.sections) - len(permitted_sections)
+    outcome = SearchOutcome(
+        query=outcome.query,
+        sections=permitted_sections,
+        stats={
+            **outcome.stats,
+            "acl_filtered_candidates": acl_filtered_candidates,
+        },
     )
     stats = _with_query_route_stats(
-        {
-            **outcome.stats,
-            "event_candidates": len(event_scores),
-            "event_hits": len(graph_fields["events"]),
-            "event_recall": "vector+chunk" if event_scores else "chunk",
-        },
+        outcome.stats,
         route_plan,
     )
 
@@ -380,8 +431,6 @@ async def _prepare_global_search(
         response=SearchResponse(
             query=body.query,
             sections=section_outputs,
-            **graph_fields,
-            source_hits=_source_hits(graph_fields["events"]),
             stats=stats,
         ),
     )
@@ -515,9 +564,10 @@ async def global_search(
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
     llm: LLMClient = Depends(get_llm),
+    acl_scope: SearchACLScope | None = Depends(get_search_acl_scope),
 ) -> SearchResponse:
     """全局搜索；connector 只返回结构化证据，JWT 可生成摘要并保存探索。"""
-    prepared = await _prepare_global_search(session, engine_manager, body)
+    prepared = await _prepare_global_search(session, engine_manager, body, acl_scope)
     if request.state.auth_kind == "connector":
         return prepared.response.model_copy(
             update={"summary": "", "exploration_id": None},
@@ -543,6 +593,7 @@ async def global_search_stream(
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
     llm: LLMClient = Depends(get_llm),
+    acl_scope: SearchACLScope | None = Depends(get_search_acl_scope),
 ) -> EventSourceResponse:
     """Stream a grounded summary after returning the stable retrieval result."""
 
@@ -551,7 +602,7 @@ async def global_search_stream(
             # Run retrieval inside the response task: EventSourceResponse can
             # send keep-alive pings immediately and cancel this work as soon as
             # the browser starts a newer search or disconnects.
-            prepared = await _prepare_global_search(session, engine_manager, body)
+            prepared = await _prepare_global_search(session, engine_manager, body, acl_scope)
             yield _sse("result", prepared.response.model_dump(mode="json"))
             summary = ""
             async for update in stream_synthesize_search_answer(
@@ -620,6 +671,8 @@ async def _run_one_strategy(
     section_outputs: list[SectionOut] = []
     for section in outcome.sections:
         source = source_refs.get(section.source_config_id or "")
+        if source is None:
+            continue
         section_outputs.append(
             SectionOut(
                 **{
@@ -643,6 +696,7 @@ async def eval_compare(
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
     llm: LLMClient = Depends(get_llm),
+    acl_scope: SearchACLScope | None = Depends(get_search_acl_scope),
 ) -> EvalCompareResponse:
     """把同一 query 在多个策略下各跑一次,可选让 LLM pairwise 打分。
 
@@ -659,7 +713,7 @@ async def eval_compare(
     if len(ordered_strategies) < 2:
         raise ValidationError("eval-compare 至少需要两个不同策略")
 
-    sources = await search_source_candidates(session, body.source_ids)
+    sources = await _authorized_search_sources(session, body.source_ids, acl_scope)
     await session.commit()  # 释放 DB 连接;检索阶段可能长跑
 
     source_refs = {source.sag_source_config_id: source for source in sources}

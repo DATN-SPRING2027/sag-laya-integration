@@ -24,9 +24,9 @@ def test_rerank_prefers_direct_query_evidence_and_filters_unrelated_candidates()
     result = rerank_sections(
         "张杰最近有什么公益动态",
         [
-            section("noise", "平台首页", "这是与体育赛事有关的热门内容。", 0.96),
+            section("noise", "平台首页", "这是与体育赛事有关的热门内容。", 0.45),
             section("answer", "张杰公益行动", "张杰为乡村儿童建设音乐教室。", 0.74),
-            section("other", "其他歌手", "另一位歌手发布了新专辑。", 0.7),
+            section("other", "其他歌手", "另一位歌手发布了新专辑。", 0.4),
         ],
         limit=8,
     )
@@ -56,6 +56,128 @@ def test_rerank_accepts_split_evidence_for_contiguous_chinese_query():
     )
 
     assert [item.chunk_id for item in result.sections] == ["target"]
+
+
+def test_rank_fusion_is_independent_of_retriever_score_scales():
+    semantic = [
+        section("a", "câu hỏi A", "bằng chứng câu hỏi cho A", 0.95),
+        section("b", "câu hỏi B", "bằng chứng câu hỏi cho B", 0.8),
+        section("c", "câu hỏi C", "bằng chứng câu hỏi cho C", 0.7),
+    ]
+    lexical = [
+        section("a", "câu hỏi A", "bằng chứng câu hỏi cho A", 0.99),
+        section("c", "câu hỏi C", "bằng chứng câu hỏi cho C", 0.6),
+        section("b", "câu hỏi B", "bằng chứng câu hỏi cho B", 0.2),
+    ]
+
+    baseline = rerank_sections("câu hỏi", semantic, lexical=lexical, limit=8)
+    rescaled = rerank_sections(
+        "câu hỏi",
+        [item.model_copy(update={"score": item.score * 1000}) for item in semantic],
+        lexical=[item.model_copy(update={"score": item.score / 1000}) for item in lexical],
+        limit=8,
+    )
+
+    assert [item.chunk_id for item in baseline.sections] == ["a", "b", "c"]
+    assert [item.chunk_id for item in rescaled.sections] == ["a", "b", "c"]
+    assert all(0.0 <= item.score <= 1.0 for item in rescaled.sections)
+
+
+def test_rank_fusion_deduplicates_candidates_by_source_and_chunk():
+    semantic = [
+        section("shared", "câu hỏi", "bản trùng ngắn", 0.9),
+        section("shared", "câu hỏi", "bản trùng dài hơn trong semantic", 0.8),
+        section("semantic-only", "câu hỏi", "semantic evidence", 0.7),
+    ]
+    lexical = [
+        section("shared", "câu hỏi", "bản trùng dài nhất trong lexical result", 0.99),
+        section("lexical-only", "câu hỏi", "lexical evidence", 0.5),
+    ]
+
+    result = rerank_sections("câu hỏi", semantic, lexical=lexical, limit=8)
+
+    assert result.candidate_count == 3
+    assert len({item.chunk_id for item in result.sections}) == 3
+    shared = next(item for item in result.sections if item.chunk_id == "shared")
+    assert shared.content == "bản trùng dài nhất trong lexical result"
+
+
+def test_semantic_only_relevance_gate_is_invariant_to_score_scale():
+    semantic = [
+        section("strong", "主题甲", "主题甲的语义证据。", 0.95),
+        section("related", "主题乙", "主题乙的语义证据。", 0.8),
+        section("noise", "页脚", "版权与导航信息。", 0.1),
+    ]
+
+    baseline = rerank_sections("zebraquasar", semantic, limit=8)
+    rescaled = rerank_sections(
+        "zebraquasar",
+        [item.model_copy(update={"score": item.score / 1000}) for item in semantic],
+        limit=8,
+    )
+
+    assert [item.chunk_id for item in baseline.sections] == ["strong", "related"]
+    assert [item.chunk_id for item in rescaled.sections] == ["strong", "related"]
+
+
+def test_semantic_dedup_keeps_best_score_with_longest_representative():
+    result = rerank_sections(
+        "zebraquasar",
+        [
+            section("duplicate", "主题甲", "short high-confidence result", 0.95),
+            section(
+                "duplicate",
+                "主题甲",
+                "longer representative with a lower semantic score",
+                0.45,
+            ),
+            section("related", "主题乙", "related semantic evidence", 0.8),
+        ],
+        limit=8,
+    )
+
+    by_chunk = {item.chunk_id: item for item in result.sections}
+    assert set(by_chunk) == {"duplicate", "related"}
+    assert by_chunk["duplicate"].content == (
+        "longer representative with a lower semantic score"
+    )
+
+
+def test_semantic_relevance_survives_lexical_signal_from_another_candidate():
+    query = "fiscal outlook zebraquasar"
+    lexical_hit = section(
+        "lexical", "Fiscal outlook", "Fiscal outlook for zebraquasar.", 0.7
+    )
+    result = rerank_sections(
+        query,
+        [
+            section(
+                "dense",
+                "Margins outlook",
+                "Forecasts project contracting margins and falling future sales.",
+                0.95,
+            ),
+            lexical_hit,
+            section("weak", "Appendix", "Unrelated footer material.", 0.2),
+        ],
+        lexical=[lexical_hit],
+        limit=8,
+    )
+
+    assert {item.chunk_id for item in result.sections} == {"dense", "lexical"}
+
+
+def test_rrf_score_is_normalized_rank_score_for_single_retriever_candidates():
+    result = rerank_sections(
+        "needle phrase",
+        [section("semantic-only", "Dense", "Semantic evidence.", 0.95)],
+        lexical=[section("lexical-only", "Lexical", "Lexical evidence.", 0.8)],
+        limit=8,
+    )
+
+    scores = {item.chunk_id: item.score for item in result.sections}
+    assert set(scores) == {"semantic-only", "lexical-only"}
+    assert all(score == pytest.approx(0.5) for score in scores.values())
 
 
 @pytest.mark.asyncio

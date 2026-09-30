@@ -672,6 +672,7 @@ async def test_local_discovery_mode_rejects_public_docker_port_binding(
 async def test_connector_token_calls_approved_knowledge_apis(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    from sag_api.api.v1 import search as search_api
     from sag_api.sag.dto import ChunkInfo
 
     async with _connector_api_resource() as (
@@ -727,6 +728,11 @@ async def test_connector_token_calls_approved_knowledge_apis(
         read = await client.get(
             f"/api/v1/sources/{source_id}/chunks/chunk-for-dsh",
             headers=connector_headers,
+        )
+        monkeypatch.setitem(
+            app.dependency_overrides,
+            search_api.get_search_acl_scope,
+            lambda: search_api.SearchACLScope(frozenset({source_id})),
         )
         searched = await client.post(
             "/api/v1/search",
@@ -892,7 +898,7 @@ async def test_connector_global_search_is_structured_only(
 
     save_calls = 0
 
-    async def fake_prepare(session, _engine_manager, body):
+    async def fake_prepare(session, _engine_manager, body, _acl_scope=None):
         source = await session.get(Source, body.source_ids[0])
         assert source is not None
         section = RetrievedSection(
@@ -942,6 +948,11 @@ async def test_connector_global_search_is_structured_only(
         _source_ids,
     ):
         app.state.llm = spy_llm
+        monkeypatch.setitem(
+            app.dependency_overrides,
+            search_module.get_search_acl_scope,
+            lambda: search_module.SearchACLScope(frozenset({source_id})),
+        )
         request = {
             "query": "structured search",
             "source_ids": [source_id],

@@ -20,6 +20,15 @@ async def _register(client: httpx.AsyncClient) -> dict[str, str]:
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
 
 
+def _allow_search_sources(app, source_ids: list[str]) -> None:
+    """Install an explicit test-only authorization decision for global search."""
+    from sag_api.api.v1 import search as search_api
+
+    app.dependency_overrides[search_api.get_search_acl_scope] = lambda: search_api.SearchACLScope(
+        frozenset(source_ids)
+    )
+
+
 @pytest.mark.asyncio
 async def test_query_route_offloads_laya_prediction_from_event_loop(monkeypatch):
     from sag_api.api.v1 import search as search_api
@@ -56,36 +65,17 @@ async def test_global_search_forwards_validated_strategy(monkeypatch):
     from sag_api.api.v1 import search as search_api
     from sag_api.core.deps import get_engine_manager
     from sag_api.main import app
-    from sag_api.sag.dto import (
-        EntityInfo,
-        GraphAssociationInfo,
-        GraphEventInfo,
-        RetrievedSection,
-        SearchOutcome,
-        SourceGraphInfo,
-    )
+    from sag_api.sag.dto import RetrievedSection, SearchOutcome
 
     class RecordingEngine:
         strategy: str | None = None
         top_k: int | None = None
-        event_top_k: int | None = None
         query: str | None = None
-
-        def __init__(self):
-            self.started: set[str] = set()
-            self.parallel_gate = asyncio.Event()
-
-        async def _meet_parallel_gate(self, channel: str) -> None:
-            self.started.add(channel)
-            if len(self.started) == 2:
-                self.parallel_gate.set()
-            await asyncio.wait_for(self.parallel_gate.wait(), timeout=1)
 
         async def provision(self, *_args):
             return None
 
         async def search_many(self, targets, query, *, strategy=None, top_k=None):
-            await self._meet_parallel_gate("chunks")
             self.strategy = strategy
             self.top_k = top_k
             self.query = query
@@ -104,43 +94,11 @@ async def test_global_search_forwards_validated_strategy(monkeypatch):
                 stats={"strategy": strategy},
             )
 
-        async def search_event_scores(self, query, sources_by_config, *, limit=None):
-            await self._meet_parallel_gate("events")
-            self.event_top_k = limit
-            source_config_id = next(iter(sources_by_config))
-            # The directly recalled event belongs to another chunk. This is the
-            # sparse-event case that chunk-only graph mapping used to lose.
-            return {(source_config_id, "event-1"): 0.94}
+        async def search_event_scores(self, *_args, **_kwargs):
+            raise AssertionError("P4 global retrieval must not recall graph events")
 
-        async def graph_for_sections(self, sections, sources_by_config, **kwargs):
-            source_config_id = sections[0].source_config_id
-            assert kwargs["event_scores"] == {(source_config_id, "event-1"): 0.94}
-            return SourceGraphInfo(
-                events=[
-                    GraphEventInfo(
-                        id="event-1",
-                        source_config_id=source_config_id,
-                        source_id="document-1",
-                        chunk_id="event-chunk-not-in-section-results",
-                        title="外卖骑手收入变化",
-                        summary="报告分析了工作时长、技能与收入之间的关系。",
-                        category="劳动研究",
-                        score=0.94,
-                    )
-                ],
-                entities=[
-                    EntityInfo(
-                        id="entity-1",
-                        name="外卖骑手",
-                        type="职业",
-                        description="平台配送劳动者",
-                        heat=1,
-                    )
-                ],
-                associations=[
-                    GraphAssociationInfo(event_id="event-1", entity_id="entity-1")
-                ],
-            )
+        async def graph_for_sections(self, *_args, **_kwargs):
+            raise AssertionError("P4 global retrieval must not project graph fields")
 
     engine = RecordingEngine()
     monkeypatch.setattr(
@@ -170,6 +128,7 @@ async def test_global_search_forwards_validated_strategy(monkeypatch):
                     json={"name": "检索策略测试源"},
                 )
                 assert source.status_code == 201, source.text
+                _allow_search_sources(app, [source.json()["id"]])
 
                 response = await client.post(
                     "/api/v1/search",
@@ -186,26 +145,23 @@ async def test_global_search_forwards_validated_strategy(monkeypatch):
                 assert engine.query == "策略测试"
                 # 对外仍返回 7 条；内部有界扩大候选池，之后统一重排与过滤。
                 assert engine.top_k == 21
-                assert engine.event_top_k == 7
-                assert engine.started == {"chunks", "events"}
                 assert response.json()["stats"]["strategy"] == "multi"
                 result = response.json()
                 assert result["stats"]["requested_top_k"] == 7
                 assert result["stats"]["candidate_top_k"] == 21
-                assert result["stats"]["event_candidates"] == 1
-                assert result["stats"]["event_hits"] == 1
-                assert result["stats"]["event_recall"] == "vector+chunk"
+                assert result["stats"]["fusion_method"] == "rrf"
+                assert result["stats"]["fusion_retrievers"] == 1
+                assert "event_candidates" not in result["stats"]
+                assert "event_hits" not in result["stats"]
                 assert result["stats"]["query_route"]["query_original"] == "策略测试"
                 assert result["stats"]["query_route"]["requested_strategy"] == "multi"
                 assert result["stats"]["query_route"]["effective_strategy"] == "multi"
                 assert result["stats"]["query_route"]["fallback_used"] is False
                 assert "[1]" in result["summary"]
-                assert result["events"][0]["title"] == "外卖骑手收入变化"
-                assert result["events"][0]["chunk_id"] == "event-chunk-not-in-section-results"
-                assert result["events"][0]["summary"].startswith("报告分析")
-                assert result["events"][0]["source_id"] == source.json()["id"]
-                assert result["entities"][0]["name"] == "外卖骑手"
-                assert result["relations"][0]["kind"] == "mentions"
+                assert result["events"] == []
+                assert result["entities"] == []
+                assert result["relations"] == []
+                assert result["source_hits"] == []
 
                 deprecated = await client.post(
                     "/api/v1/search",
@@ -222,6 +178,9 @@ async def test_global_search_forwards_validated_strategy(monkeypatch):
                 assert invalid.status_code == 422
     finally:
         app.dependency_overrides.pop(get_engine_manager, None)
+        from sag_api.api.v1 import search as search_api
+
+        app.dependency_overrides.pop(search_api.get_search_acl_scope, None)
 
 
 @pytest.mark.asyncio
@@ -344,6 +303,7 @@ async def test_global_search_falls_back_when_laya_errors_without_losing_scope(mo
                     json={"name": "identifier route test"},
                 )
                 source_id = source.json()["id"]
+                _allow_search_sources(app, [source_id])
                 response = await client.post(
                     "/api/v1/search",
                     headers=headers,
@@ -367,6 +327,255 @@ async def test_global_search_falls_back_when_laya_errors_without_losing_scope(mo
                 assert "checkpoint token" not in response.text
     finally:
         app.dependency_overrides.pop(get_engine_manager, None)
+        from sag_api.api.v1 import search as search_api
+
+        app.dependency_overrides.pop(search_api.get_search_acl_scope, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "requested_mode", ["omitted", "intersection", "unauthorized-only", "empty"]
+)
+async def test_global_search_applies_same_authorized_scope_before_dense_and_lexical(
+    requested_mode,
+    monkeypatch,
+):
+    from sag_api.api.v1 import search as search_api
+    from sag_api.core.deps import get_engine_manager
+    from sag_api.main import app
+    from sag_api.sag.dto import RetrievedSection, SearchOutcome
+
+    class ScopeRecordingEngine:
+        def __init__(self):
+            self.dense_targets: list[str] = []
+            self.lexical_targets: list[str] = []
+            self.dense_scores: dict[str, float] = {}
+
+        async def provision(self, *_args, **_kwargs):
+            return None
+
+        async def search_many(self, targets, query, *, strategy=None, top_k=None):
+            self.dense_targets = [source.id for _config_id, source in targets]
+            candidates = [
+                RetrievedSection(
+                    chunk_id=f"dense-{source.id}",
+                    heading="authorized evidence",
+                    content="authorized evidence supports the requested topic",
+                    score=self.dense_scores[source.id],
+                    source_config_id=config_id,
+                )
+                for config_id, source in targets
+            ]
+            candidates.sort(key=lambda section: -section.score)
+            return SearchOutcome(query=query, sections=candidates[:top_k], stats={})
+
+        async def grep_chunks(self, source_config_id, term, *, source=None, limit=None, **_kwargs):
+            del term, limit
+            self.lexical_targets.append(source.id)
+            return [
+                {
+                    "chunk_id": f"lexical-{source_config_id}",
+                    "heading": "authorized evidence",
+                    "snippet": "authorized evidence supports the requested topic",
+                    "source_id": f"document-{source_config_id}",
+                }
+            ]
+
+    engine = ScopeRecordingEngine()
+    monkeypatch.setattr(
+        search_api,
+        "route_query",
+        lambda query, context=None: {
+            "query": query,
+            "coarse_intent": "KNOWLEDGE",
+            "need_retrieval": True,
+            "suggested_strategy": "vector",
+            "confidence": 0.99,
+            "model": "fake",
+        },
+    )
+    app.dependency_overrides[get_engine_manager] = lambda: engine
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+                headers = await _register(client)
+                allowed = await client.post(
+                    "/api/v1/sources", headers=headers, json={"name": "allowed source"}
+                )
+                denied = await client.post(
+                    "/api/v1/sources", headers=headers, json={"name": "denied source"}
+                )
+                assert allowed.status_code == denied.status_code == 201
+                allowed_id = allowed.json()["id"]
+                denied_id = denied.json()["id"]
+                engine.dense_scores = {
+                    allowed_id: 0.60,
+                    denied_id: 0.99,
+                }
+                _allow_search_sources(app, [allowed_id])
+
+                payload = {"query": "authorized evidence topic", "top_k": 1}
+                if requested_mode == "intersection":
+                    payload["source_ids"] = [denied_id, allowed_id]
+                elif requested_mode == "unauthorized-only":
+                    payload["source_ids"] = [denied_id]
+                elif requested_mode == "empty":
+                    payload["source_ids"] = []
+                response = await client.post("/api/v1/search", headers=headers, json=payload)
+
+        assert response.status_code == 200, response.text
+        result = response.json()
+        if requested_mode in {"unauthorized-only", "empty"}:
+            assert engine.dense_targets == []
+            assert engine.lexical_targets == []
+            assert result["sections"] == []
+            return
+        assert engine.dense_targets == [allowed_id]
+        assert engine.lexical_targets
+        assert set(engine.lexical_targets) == {allowed_id}
+        assert {item["source_id"] for item in result["sections"]} == {allowed_id}
+        assert denied_id not in {item["source_id"] for item in result["sections"]}
+    finally:
+        app.dependency_overrides.pop(get_engine_manager, None)
+        app.dependency_overrides.pop(search_api.get_search_acl_scope, None)
+
+
+@pytest.mark.asyncio
+async def test_global_search_returns_empty_for_empty_authorization_without_retrieval(monkeypatch):
+    from sag_api.api.v1 import search as search_api
+    from sag_api.core.deps import get_engine_manager
+    from sag_api.main import app
+
+    class RetrievalMustNotRun:
+        async def provision(self, *_args, **_kwargs):
+            return None
+
+        async def search_many(self, *_args, **_kwargs):
+            raise AssertionError("empty authorization must stop before dense retrieval")
+
+        async def grep_chunks(self, *_args, **_kwargs):
+            raise AssertionError("empty authorization must stop before lexical retrieval")
+
+    monkeypatch.setattr(
+        search_api,
+        "route_query",
+        lambda query, context=None: {
+            "query": query,
+            "coarse_intent": "KNOWLEDGE",
+            "need_retrieval": True,
+            "suggested_strategy": "vector",
+            "confidence": 0.99,
+            "model": "fake",
+        },
+    )
+    app.dependency_overrides[get_engine_manager] = RetrievalMustNotRun
+    app.dependency_overrides[search_api.get_search_acl_scope] = lambda: search_api.SearchACLScope(
+        frozenset()
+    )
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+                headers = await _register(client)
+                response = await client.post(
+                    "/api/v1/search", headers=headers, json={"query": "empty scope"}
+                )
+        assert response.status_code == 200, response.text
+        assert response.json()["sections"] == []
+    finally:
+        app.dependency_overrides.pop(get_engine_manager, None)
+        app.dependency_overrides.pop(search_api.get_search_acl_scope, None)
+
+
+@pytest.mark.asyncio
+async def test_global_search_without_acl_resolver_fails_closed_before_retrieval(monkeypatch):
+    from sag_api.api.v1 import search as search_api
+    from sag_api.core.deps import get_engine_manager
+    from sag_api.main import app
+
+    class RetrievalMustNotRun:
+        calls = 0
+
+        async def provision(self, *_args, **_kwargs):
+            return None
+
+        async def search_many(self, *_args, **_kwargs):
+            self.calls += 1
+            raise AssertionError("missing ACL scope must stop before retrieval")
+
+        async def grep_chunks(self, *_args, **_kwargs):
+            self.calls += 1
+            raise AssertionError("missing ACL scope must stop before retrieval")
+
+    engine = RetrievalMustNotRun()
+    monkeypatch.setattr(
+        search_api,
+        "route_query",
+        lambda query, context=None: {
+            "query": query,
+            "coarse_intent": "KNOWLEDGE",
+            "need_retrieval": True,
+            "suggested_strategy": "vector",
+            "confidence": 0.99,
+            "model": "fake",
+        },
+    )
+    app.dependency_overrides[get_engine_manager] = lambda: engine
+    app.dependency_overrides[search_api.get_search_acl_scope] = lambda: None
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+                headers = await _register(client)
+                response = await client.post(
+                    "/api/v1/search", headers=headers, json={"query": "no scope"}
+                )
+        assert response.status_code == 503, response.text
+        assert engine.calls == 0
+    finally:
+        app.dependency_overrides.pop(get_engine_manager, None)
+        app.dependency_overrides.pop(search_api.get_search_acl_scope, None)
+
+
+@pytest.mark.asyncio
+async def test_eval_compare_without_acl_resolver_fails_closed_before_retrieval():
+    from sag_api.api.v1 import search as search_api
+    from sag_api.core.deps import get_engine_manager
+    from sag_api.main import app
+
+    class RetrievalMustNotRun:
+        calls = 0
+
+        async def search_many(self, *_args, **_kwargs):
+            self.calls += 1
+            raise AssertionError("eval-compare must stop before retrieval without ACL scope")
+
+        async def grep_chunks(self, *_args, **_kwargs):
+            self.calls += 1
+            raise AssertionError("eval-compare must stop before retrieval without ACL scope")
+
+    engine = RetrievalMustNotRun()
+    app.dependency_overrides[get_engine_manager] = lambda: engine
+    app.dependency_overrides[search_api.get_search_acl_scope] = lambda: None
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+                headers = await _register(client)
+                response = await client.post(
+                    "/api/v1/search/eval-compare",
+                    headers=headers,
+                    json={
+                        "query": "no scope",
+                        "strategies": ["vector", "multi_es_fast"],
+                    },
+                )
+        assert response.status_code == 503, response.text
+        assert engine.calls == 0
+    finally:
+        app.dependency_overrides.pop(get_engine_manager, None)
+        app.dependency_overrides.pop(search_api.get_search_acl_scope, None)
 
 
 @pytest.mark.asyncio
@@ -762,6 +971,7 @@ async def test_eval_compare_returns_two_strategies_and_skips_judge(monkeypatch):
                     json={"name": "eval-compare 测试源"},
                 )
                 assert source.status_code == 201, source.text
+                _allow_search_sources(app, [source.json()["id"]])
 
                 response = await client.post(
                     "/api/v1/search/eval-compare",
@@ -777,6 +987,9 @@ async def test_eval_compare_returns_two_strategies_and_skips_judge(monkeypatch):
     finally:
         app.dependency_overrides.pop(get_engine_manager, None)
         app.dependency_overrides.pop(get_llm, None)
+        from sag_api.api.v1 import search as search_api
+
+        app.dependency_overrides.pop(search_api.get_search_acl_scope, None)
 
     assert response.status_code == 200, response.text
     payload = response.json()

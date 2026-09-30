@@ -182,6 +182,8 @@ _BOILERPLATE = (
     "免责声明",
 )
 _CITATION_RE = re.compile(r"\[(\d+)]")
+_RRF_K = 60
+_SEMANTIC_RELATIVE_RELEVANCE_FLOOR = 0.68
 
 
 def _section_key(section: RetrievedSection) -> tuple[str, str]:
@@ -249,7 +251,7 @@ def rerank_sections(
     limit: int,
     analysis: QueryAnalysis | None = None,
 ) -> RerankResult:
-    """Hybrid rerank with an explicit relevance gate before anything reaches an answer."""
+    """Fuse retriever rank lists without assuming their scores share a scale."""
 
     effective = analysis or analyze_query(
         query,
@@ -262,70 +264,136 @@ def rerank_sections(
         if exact_lexical_keys is None
         else lexical_keys.intersection(exact_lexical_keys)
     )
-    merged: dict[tuple[str, str], tuple[RetrievedSection, int]] = {}
-    for index, section in enumerate([*semantic, *lexical]):
-        key = _section_key(section)
-        if not key[1]:
-            continue
-        previous = merged.get(key)
-        if previous is None:
-            merged[key] = (section, index)
-            continue
-        previous_section, previous_index = previous
-        chosen = section if len(section.content.strip()) > len(previous_section.content.strip()) else previous_section
-        merged[key] = (
-            chosen.model_copy(update={"score": max(float(previous_section.score), float(section.score))}),
-            min(previous_index, index),
+    def unique_rankings(
+        sections: list[RetrievedSection],
+        *,
+        preferred_keys: set[tuple[str, str]] | None = None,
+    ) -> tuple[dict[tuple[str, str], int], dict[tuple[str, str], RetrievedSection]]:
+        ranks: dict[tuple[str, str], int] = {}
+        representatives: dict[tuple[str, str], RetrievedSection] = {}
+        for section in sections:
+            key = _section_key(section)
+            if not key[1]:
+                continue
+            if key not in ranks:
+                ranks[key] = len(ranks)
+                representatives[key] = section
+                continue
+            previous = representatives[key]
+            previous_preference = (
+                len(previous.content.strip()),
+                normalize_lexical_text(previous.heading),
+                normalize_lexical_text(previous.content),
+                previous.heading,
+                previous.content,
+            )
+            current_preference = (
+                len(section.content.strip()),
+                normalize_lexical_text(section.heading),
+                normalize_lexical_text(section.content),
+                section.heading,
+                section.content,
+            )
+            best_score = max(
+                float(previous.score or 0.0),
+                float(section.score or 0.0),
+            )
+            if current_preference > previous_preference:
+                representatives[key] = section.model_copy(
+                    update={"score": best_score}
+                )
+            else:
+                representatives[key] = previous.model_copy(
+                    update={"score": best_score}
+                )
+        preferred_keys = preferred_keys or set()
+        ordered_keys = sorted(
+            ranks,
+            key=lambda key: (key not in preferred_keys, ranks[key], key),
         )
+        ranks = {key: rank for rank, key in enumerate(ordered_keys)}
+        return ranks, representatives
 
-    candidates = list(merged.items())
-    if not candidates:
+    semantic_ranks, semantic_by_key = unique_rankings(semantic)
+    lexical_ranks, lexical_by_key = unique_rankings(lexical, preferred_keys=exact_keys)
+    candidate_keys = set(semantic_ranks) | set(lexical_ranks)
+    if not candidate_keys:
         return RerankResult([], 0, 0, 0, len(lexical))
 
-    raw_scores = [max(0.0, float(item[1][0].score or 0.0)) for item in candidates]
-    top_raw = max(raw_scores, default=0.0)
-    semantic_floor = max(0.35, top_raw * 0.68)
-    denominator = max(1, len(candidates) - 1)
+    merged: dict[tuple[str, str], RetrievedSection] = {}
+    for key in candidate_keys:
+        choices = [
+            candidate
+            for candidate in (semantic_by_key.get(key), lexical_by_key.get(key))
+            if candidate is not None
+        ]
+        merged[key] = max(
+            choices,
+            key=lambda section: (
+                len(section.content.strip()),
+                normalize_lexical_text(section.heading),
+                normalize_lexical_text(section.content),
+                section.heading,
+                section.content,
+            ),
+        )
+
+    top_semantic_score = max(
+        (max(0.0, float(section.score or 0.0)) for section in semantic_by_key.values()),
+        default=0.0,
+    )
     lexical_scores = {
         key: _lexical_relevance(query, section, analysis=effective)
-        for key, (section, _index) in candidates
+        for key, section in merged.items()
     }
-    has_lexical_signal = any(
-        key in lexical_keys or score >= 0.2
-        for key, score in lexical_scores.items()
-    )
-    ranked: list[tuple[float, float, int, RetrievedSection]] = []
+    active_retrievers = int(bool(semantic_ranks)) + int(bool(lexical_ranks))
+    ideal_rrf_score = active_retrievers / (_RRF_K + 1)
+    ranked: list[tuple[float, int, int, int, tuple[str, str], RetrievedSection]] = []
 
-    for position, (key, (section, original_index)) in enumerate(candidates):
-        raw = max(0.0, min(1.0, float(section.score or 0.0)))
+    for key in candidate_keys:
+        section = merged[key]
+        semantic_rank = semantic_ranks.get(key)
+        lexical_rank = lexical_ranks.get(key)
+        raw = max(0.0, float(semantic_by_key[key].score or 0.0)) if key in semantic_by_key else 0.0
+        relative_semantic_score = raw / top_semantic_score if top_semantic_score > 0 else 0.0
         lexical_score = lexical_scores[key]
         exact = key in exact_keys
-        lexical_match = key in lexical_keys
+        lexical_match = lexical_rank is not None
         if _is_boilerplate(section) and not lexical_match and lexical_score < 0.35:
             continue
-        rank_score = 1.0 - position / denominator
-        combined = min(
-            1.0,
-            raw * 0.5 + rank_score * 0.2 + lexical_score * 0.3 + (0.15 if exact else 0.0),
+        reciprocal_rank_score = sum(
+            1.0 / (_RRF_K + rank + 1)
+            for rank in (semantic_rank, lexical_rank)
+            if rank is not None
         )
-        if has_lexical_signal:
-            relevant = lexical_match or lexical_score >= 0.2
-        else:
-            relevant = raw >= semantic_floor
+        fused_score = min(1.0, reciprocal_rank_score / ideal_rrf_score)
+        # Each candidate may pass through either retrieval signal. The relative
+        # semantic gate stays active even when another candidate has a lexical hit.
+        relevant = (
+            lexical_match
+            or lexical_score >= 0.2
+            or relative_semantic_score >= _SEMANTIC_RELATIVE_RELEVANCE_FLOOR
+        )
         if not relevant:
             continue
-        ranked.append((combined, raw, original_index, section))
+        rank_sum = sum(rank for rank in (semantic_rank, lexical_rank) if rank is not None)
+        retriever_coverage = int(semantic_rank is not None) + int(lexical_rank is not None)
+        ranked.append(
+            (fused_score, retriever_coverage, int(exact), rank_sum, key, section)
+        )
 
-    ranked.sort(key=lambda item: (-item[0], -item[1], item[2], _section_key(item[3])))
+    ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3], item[4]))
     selected = [
         section.model_copy(update={"score": round(score, 6), "rank": index})
-        for index, (score, _raw, _original, section) in enumerate(ranked[: max(1, limit)])
+        for index, (score, _coverage, _exact, _rank_sum, _key, section) in enumerate(
+            ranked[: max(1, limit)]
+        )
     ]
     return RerankResult(
         sections=selected,
-        candidate_count=len(candidates),
+        candidate_count=len(candidate_keys),
         relevant_count=len(ranked),
-        filtered_count=len(candidates) - len(ranked),
+        filtered_count=len(candidate_keys) - len(ranked),
         lexical_count=len(lexical),
     )
 
@@ -479,6 +547,9 @@ async def retrieve_relevant_sections(
         "relevant": reranked.relevant_count,
         "filtered_irrelevant": reranked.filtered_count,
         "lexical_candidates": reranked.lexical_count,
+        "semantic_candidates": len(semantic_sections),
+        "fusion_method": "rrf",
+        "fusion_retrievers": int(bool(semantic_sections)) + int(bool(lexical_sections)),
         "chinese_segmentation_used": analysis.chinese_segmentation_used,
         "lexical_term_count": len(analysis.lookup_terms),
         "has_more": reranked.relevant_count > len(reranked.sections),
