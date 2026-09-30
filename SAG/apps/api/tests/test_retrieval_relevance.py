@@ -24,9 +24,9 @@ def test_rerank_prefers_direct_query_evidence_and_filters_unrelated_candidates()
     result = rerank_sections(
         "张杰最近有什么公益动态",
         [
-            section("noise", "平台首页", "这是与体育赛事有关的热门内容。", 0.96),
+            section("noise", "平台首页", "这是与体育赛事有关的热门内容。", 0.45),
             section("answer", "张杰公益行动", "张杰为乡村儿童建设音乐教室。", 0.74),
-            section("other", "其他歌手", "另一位歌手发布了新专辑。", 0.7),
+            section("other", "其他歌手", "另一位歌手发布了新专辑。", 0.4),
         ],
         limit=8,
     )
@@ -120,7 +120,7 @@ def test_semantic_only_relevance_gate_is_invariant_to_score_scale():
     assert [item.chunk_id for item in rescaled.sections] == ["strong", "related"]
 
 
-def test_semantic_only_relevance_uses_best_score_for_duplicate_chunk():
+def test_semantic_dedup_keeps_best_score_and_longest_representative():
     result = rerank_sections(
         "zebraquasar",
         [
@@ -135,6 +135,43 @@ def test_semantic_only_relevance_uses_best_score_for_duplicate_chunk():
     assert next(item for item in result.sections if item.chunk_id == "strong").content == (
         "重复但正文更长、分数更低的语义候选。"
     )
+
+
+def test_semantic_relevance_survives_lexical_signal_from_another_candidate():
+    query = "fiscal outlook zebraquasar"
+    lexical_hit = section(
+        "lexical", "Fiscal outlook", "Fiscal outlook for zebraquasar.", 0.7
+    )
+    result = rerank_sections(
+        query,
+        [
+            section(
+                "dense",
+                "Margins outlook",
+                "Forecasts project contracting margins and falling future sales.",
+                0.95,
+            ),
+            lexical_hit,
+            section("weak", "Appendix", "Unrelated footer material.", 0.2),
+        ],
+        lexical=[lexical_hit],
+        limit=8,
+    )
+
+    assert {item.chunk_id for item in result.sections} == {"dense", "lexical"}
+
+
+def test_rrf_score_is_normalized_rank_score_for_single_retriever_candidates():
+    result = rerank_sections(
+        "needle phrase",
+        [section("semantic-only", "Dense", "Semantic evidence.", 0.95)],
+        lexical=[section("lexical-only", "Lexical", "Lexical evidence.", 0.8)],
+        limit=8,
+    )
+
+    scores = {item.chunk_id: item.score for item in result.sections}
+    assert set(scores) == {"semantic-only", "lexical-only"}
+    assert all(score == pytest.approx(0.5) for score in scores.values())
 
 
 @pytest.mark.asyncio

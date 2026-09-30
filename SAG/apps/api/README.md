@@ -56,4 +56,13 @@ scoped P3 graph/event recall runs only after Source authorization. Universe
 global manifest/rebuild and MCP stdio remain disabled until their data paths can
 prove Project-scoped authorization.
 
+## Retrieval score contract
+
+Search section scores are normalized reciprocal-rank fusion (RRF) rank scores
+in `[0, 1]`; they are not cosine similarities or relevance probabilities.
+When both dense and lexical retrieval return candidates, a top-ranked result
+found by only one retriever can score `0.5`. Dify's `score_threshold` filters
+this normalized RRF score, so configure it for rank-fusion semantics rather
+than as a cosine-similarity cutoff.
+
 也可以在仓库根目录运行 `make api`。开发服务器默认监听全部本机网卡，便于从局域网地址访问 Web；生产环境请通过反向代理与访问控制暴露服务。
