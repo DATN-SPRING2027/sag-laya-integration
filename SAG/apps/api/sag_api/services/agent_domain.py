@@ -394,19 +394,21 @@ async def list_messages_page(
 
 
 def _message_source_ids(message: Message) -> set[str] | None:
-    citations = message.citations or []
-    source_ids = {
-        str(citation["source_id"])
-        for citation in citations
-        if isinstance(citation, dict) and citation.get("source_id")
-    }
-    if any(
-        isinstance(citation, dict) and citation.get("chunk_id") and not citation.get("source_id")
-        for citation in citations
-    ):
+    citations = message.citations if message.citations is not None else []
+    if not isinstance(citations, list):
         return None
+    source_ids: set[str] = set()
+    for citation in citations:
+        if not isinstance(citation, dict):
+            return None
+        if citation.get("source_id"):
+            source_ids.add(str(citation["source_id"]))
+        elif citation.get("kind") != "external" or citation.get("chunk_id") or not citation.get("url"):
+            return None
 
-    steps = getattr(message, "steps", None) or []
+    steps = getattr(message, "steps", None)
+    if steps is None:
+        steps = []
     if not isinstance(steps, list):
         return None
     for step in steps:
@@ -440,7 +442,11 @@ async def filter_messages_for_scope(
     principal: VerifiedPrincipal,
     requested_source_ids: list[str] | None = None,
 ) -> list[Message]:
-    source_ids = set().union(*(_message_source_ids(message) or set() for message in messages))
+    provenance = [
+        (message, _message_source_ids(message) if message.role == MessageRole.ASSISTANT else None)
+        for message in messages
+    ]
+    source_ids = set().union(*(ids for _, ids in provenance if ids))
     authorized = await get_authorized_source_ids(
         session,
         principal=principal,
@@ -449,13 +455,30 @@ async def filter_messages_for_scope(
     if requested_source_ids is not None:
         authorized.intersection_update(requested_source_ids)
     visible: list[Message] = []
-    for message in messages:
+    for message, cited_source_ids in provenance:
         if message.role != MessageRole.ASSISTANT:
             visible.append(message)
             continue
-        cited_source_ids = _message_source_ids(message)
-        if cited_source_ids is not None and cited_source_ids.issubset(authorized):
-            visible.append(message)
+        can_read = cited_source_ids is not None and cited_source_ids.issubset(authorized)
+        # Preserve conversation roles without changing the persisted ORM row.
+        # Frozen prompts can embed earlier revoked answers, even for a currently
+        # authorized answer; omit those snapshots from every assistant history read.
+        visible.append(Message(
+            id=getattr(message, "id", None),
+            thread_id=getattr(message, "thread_id", None),
+            created_at=getattr(message, "created_at", None),
+            role=MessageRole.ASSISTANT,
+            content=(
+                message.content if can_read else
+                "[Answer hidden because its evidence is unavailable in the current source scope.]"
+            ),
+            citations=message.citations if can_read else [],
+            attachments=(getattr(message, "attachments", None) or []) if can_read else [],
+            steps=(getattr(message, "steps", None) or []) if can_read else [],
+            prompt_preview="",
+            status=(getattr(message, "status", None) or MessageStatus.OK) if can_read else MessageStatus.OK,
+            error=getattr(message, "error", None) if can_read else None,
+        ))
     return visible
 
 

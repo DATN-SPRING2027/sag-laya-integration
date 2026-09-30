@@ -110,11 +110,9 @@ does not carry `iss`, `aud`, or `allowed_project_ids`. It is not this contract
 and must not be reused as a SAG principal assertion. In particular, do not share
 the existing symmetric `JWT_SECRET` with SAG.
 
-SAG's current dependency declares PyJWT without the `crypto` extra, although the
-lock includes `cryptography` through an extra path. Before contract freeze,
-declare and verify the asymmetric-verification dependency directly (or jointly
-approve a different asymmetric profile supported by both runtimes). This draft
-does not claim production verification is available yet.
+The pre-ACL baseline declared PyJWT without its `crypto` extra. The runtime ACL
+implementation now declares the asymmetric verification dependencies directly;
+this does not establish production signer/key-management acceptance.
 
 ### JWKS trust and rotation proposal
 
@@ -135,6 +133,11 @@ does not claim production verification is available yet.
   values from amplifying unauthenticated traffic into unbounded JWKS requests.
   If still unknown or refresh fails, deny and perform no retrieval. Never
   accept stale unknown keys or switch to a shared secret.
+  Concurrent refreshes share one in-flight fetch outside the cache lock.
+  Fresh known keys remain usable during an unknown-key refresh; expired cache
+  entries require a successful refresh and are never served as a fallback.
+  The application lifespan reuses and closes the bounded JWKS HTTP client and
+  cancels unfinished refresh work during shutdown.
 - Publish a new public key before signing with it. Retain the previous key for
   at least the maximum assertion lifetime plus clock skew and normal JWKS cache
   age; remove/deny a compromised key through an explicit emergency key deny
@@ -142,9 +145,9 @@ does not claim production verification is available yet.
 - Record key ID and issuer in security-safe logs; never record the assertion,
   signature, private key, or full claims.
 
-The proposed `RS256` choice depends on BE key-management approval. The current
-SAG lock already resolves PyJWT's crypto extra transitively, but a direct
-dependency declaration and production key custody still require review.
+The proposed `RS256` choice depends on BE key-management approval. SAG declares
+`pyjwt[crypto]` and `cryptography` directly; the lockfile pins the resolved crypto
+implementation. Production key custody still requires review.
 
 ## 5. Lifetime and replay proposal
 

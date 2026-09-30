@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,6 +23,7 @@ log = get_logger("security.principal_assertion")
 MAX_ASSERTION_BYTES = 16 * 1024
 MAX_JWKS_BYTES = 256 * 1024
 MAX_JWKS_KEYS = 256
+JWKS_FETCH_TIMEOUT_SECONDS = 3.0
 UNKNOWN_KID_REFRESH_COOLDOWN_SECONDS = 1
 _PRIVATE_RSA_JWK_MEMBERS = frozenset({"d", "p", "q", "dp", "dq", "qi", "oth"})
 _FORBIDDEN_SCOPE_ALIASES = frozenset(
@@ -69,21 +71,19 @@ JwksLoader = Callable[[str], Awaitable[dict[str, Any]]]
 
 
 async def _load_remote_jwks(url: str) -> dict[str, Any]:
+    client = _jwks_client
+    if client is None:
+        raise ServiceUnavailableError("Principal verification key client is not initialized")
     try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(3.0, connect=1.0),
-            follow_redirects=False,
-            trust_env=False,
-        ) as client:
-            async with client.stream("GET", url, headers={"Accept": "application/json"}) as response:
-                response.raise_for_status()
-                body = bytearray()
-                async for chunk in response.aiter_bytes():
-                    body.extend(chunk)
-                    if len(body) > MAX_JWKS_BYTES:
-                        raise ServiceUnavailableError(
-                            "Principal verification key set exceeds the configured size limit"
-                        )
+        async with client.stream("GET", url, headers={"Accept": "application/json"}) as response:
+            response.raise_for_status()
+            body = bytearray()
+            async for chunk in response.aiter_bytes():
+                body.extend(chunk)
+                if len(body) > MAX_JWKS_BYTES:
+                    raise ServiceUnavailableError(
+                        "Principal verification key set exceeds the configured size limit"
+                    )
     except httpx.HTTPError as error:
         raise ServiceUnavailableError("Principal verification keys are unavailable") from error
     try:
@@ -118,7 +118,7 @@ class PrincipalAssertionVerifier:
         self.jwks_url = jwks_url.strip()
         self.max_lifetime_seconds = max_lifetime_seconds
         self.clock_skew_seconds = clock_skew_seconds
-        self.cache_ttl_seconds = cache_ttl_seconds
+        self.cache_ttl_seconds = min(max(cache_ttl_seconds, 1), 60)
         self.max_project_ids = max_project_ids
         self._jwks_loader = jwks_loader
         self._clock = clock
@@ -126,6 +126,7 @@ class PrincipalAssertionVerifier:
         self._cache_expires_at = 0.0
         self._last_unknown_kid_refresh_at = float("-inf")
         self._lock = asyncio.Lock()
+        self._refresh_task: asyncio.Task[dict[str, RSAPublicKey]] | None = None
 
     async def verify(self, token: str) -> VerifiedPrincipal:
         if not token or len(token.encode("utf-8")) > MAX_ASSERTION_BYTES:
@@ -162,6 +163,7 @@ class PrincipalAssertionVerifier:
                 audience=self.audience,
                 options={
                     "require": ["iss", "aud", "sub", "orgId", "allowedProjectIds", "iat", "exp", "jti"],
+                    "strict_aud": True,
                 },
                 leeway=self.clock_skew_seconds,
             )
@@ -176,9 +178,6 @@ class PrincipalAssertionVerifier:
         organization_id = claims.get("orgId")
         project_ids = claims.get("allowedProjectIds")
         token_id = claims.get("jti")
-        audience = claims.get("aud")
-        if audience != self.audience:
-            raise AuthError("Principal assertion audience is invalid")
         if _FORBIDDEN_SCOPE_ALIASES.intersection(claims):
             raise AuthError("Principal assertion contains unsupported scope aliases")
         if (
@@ -234,18 +233,30 @@ class PrincipalAssertionVerifier:
             now = self._clock()
             if not force_refresh and self._keys and now < self._cache_expires_at:
                 return self._keys
-            if (
-                force_refresh
-                and self._keys
-                and now - self._last_unknown_kid_refresh_at < UNKNOWN_KID_REFRESH_COOLDOWN_SECONDS
-            ):
-                return self._keys
-            if force_refresh:
-                # Avoid an attacker-controlled kid causing an upstream JWKS
-                # request on every unauthenticated request.
-                self._last_unknown_kid_refresh_at = now
+            task = self._refresh_task
+            if task is None:
+                if (
+                    force_refresh
+                    and self._keys
+                    and now < self._cache_expires_at
+                    and now - self._last_unknown_kid_refresh_at < UNKNOWN_KID_REFRESH_COOLDOWN_SECONDS
+                ):
+                    return self._keys
+                if force_refresh:
+                    # Limit unknown-kid traffic without serving an expired cache.
+                    self._last_unknown_kid_refresh_at = now
+                task = self._refresh_task = asyncio.create_task(self._refresh_keys())
+                # A disconnected caller must not leave an unobserved task error.
+                task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+        return await asyncio.shield(task)
+
+    async def _refresh_keys(self) -> dict[str, RSAPublicKey]:
+        # Anchor TTL to refresh start, so network time does not extend trust.
+        now = self._clock()
+        try:
             try:
-                document = await self._jwks_loader(self.jwks_url)
+                async with asyncio.timeout(JWKS_FETCH_TIMEOUT_SECONDS):
+                    document = await self._jwks_loader(self.jwks_url)
             except ServiceUnavailableError:
                 raise
             except Exception as error:  # noqa: BLE001 - trust service boundary
@@ -274,13 +285,45 @@ class PrincipalAssertionVerifier:
                             "Principal verification key set contains an invalid RSA key"
                         ) from error
                     keys[kid] = public_key
-            self._keys = keys
-            self._cache_expires_at = now + min(max(self.cache_ttl_seconds, 1), 60)
-            return self._keys
+            async with self._lock:
+                self._keys = keys
+                self._cache_expires_at = now + self.cache_ttl_seconds
+            return keys
+        finally:
+            async with self._lock:
+                self._refresh_task = None
+
+    async def aclose(self) -> None:
+        if task := self._refresh_task:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 _verifier: PrincipalAssertionVerifier | None = None
 _verifier_config: tuple[str | None, str, str | None, int, int, int, int] | None = None
+_jwks_client: httpx.AsyncClient | None = None
+_managed_verifiers: set[PrincipalAssertionVerifier] | None = None
+
+
+@asynccontextmanager
+async def principal_assertion_lifespan() -> AsyncIterator[None]:
+    """Reuse JWKS connections and stop shared refresh tasks before closing them."""
+    global _jwks_client, _verifier, _verifier_config, _managed_verifiers
+    _verifier = _verifier_config = None
+    managed_verifiers: set[PrincipalAssertionVerifier] = set()
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(JWKS_FETCH_TIMEOUT_SECONDS, connect=1.0),
+        follow_redirects=False,
+        trust_env=False,
+    ) as client:
+        _jwks_client = client
+        _managed_verifiers = managed_verifiers
+        try:
+            yield
+        finally:
+            await asyncio.gather(*(verifier.aclose() for verifier in managed_verifiers))
+            _jwks_client = _managed_verifiers = None
+            _verifier = _verifier_config = None
 
 
 def get_principal_assertion_verifier() -> PrincipalAssertionVerifier:
@@ -306,6 +349,8 @@ def get_principal_assertion_verifier() -> PrincipalAssertionVerifier:
             cache_ttl_seconds=ttl,
             max_project_ids=max_projects,
         )
+        if _managed_verifiers is not None:
+            _managed_verifiers.add(_verifier)
     return _verifier
 
 

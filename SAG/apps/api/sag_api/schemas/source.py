@@ -47,4 +47,4 @@ class SourceOut(BaseModel):
 
 
 class SourceCreateOut(SourceOut):
-    mapping_state: Literal["PENDING"]
+    mapping_state: Literal["PENDING"] = "PENDING"

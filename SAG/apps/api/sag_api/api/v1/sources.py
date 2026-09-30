@@ -56,8 +56,9 @@ async def create(
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
 ) -> SourceCreateOut:
+    """Request a Source assignment; reads and uploads require owner confirmation."""
     source = await create_source(session, body, principal=principal, engine_manager=engine_manager)
-    return SourceCreateOut(**SourceOut.model_validate(source).model_dump(), mapping_state="PENDING")
+    return SourceCreateOut.model_validate(source)
 
 
 @router.get("/{source_id}", response_model=SourceOut)

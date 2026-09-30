@@ -78,6 +78,17 @@ async def test_source_create_records_requested_project_as_pending_and_rejects_ou
                 )
                 assert inaccessible.status_code == 404
 
+                documents = await client.get(
+                    f"/api/v1/sources/{created_source_ids[0]}/documents", headers=headers
+                )
+                assert documents.status_code == 404
+                upload = await client.post(
+                    f"/api/v1/sources/{created_source_ids[0]}/documents",
+                    headers=headers,
+                    files={"file": ("pending.txt", b"Pending creator cannot upload", "text/plain")},
+                )
+                assert upload.status_code == 404
+
                 rejected_name = f"{source_name}-out-of-scope"
                 rejected = await client.post(
                     "/api/v1/sources",

@@ -824,7 +824,7 @@ async def test_activity_uses_confirmed_scope_and_client_ids_only_narrow():
 
 
 @pytest.mark.asyncio
-async def test_agent_history_keeps_unscoped_answers_but_filters_unavailable_sources(monkeypatch):
+async def test_agent_history_keeps_unscoped_answers_but_redacts_unavailable_sources(monkeypatch):
     from types import SimpleNamespace
 
     from sag_api.enums import MessageRole
@@ -887,11 +887,18 @@ async def test_agent_history_keeps_unscoped_answers_but_filters_unavailable_sour
         principal=principal,
     )
 
-    assert [message.content for message in visible] == [
+    assert [message.content for message in visible[:3]] == [
         "general answer",
         "external answer",
         "authorized answer",
     ]
+    assert len(visible) == len(messages)
+    assert all(message.role == MessageRole.ASSISTANT for message in visible[3:])
+    assert all(
+        message.content != original.content
+        for message, original in zip(visible[3:], messages[3:], strict=True)
+    )
+    assert all(message.citations == message.steps == [] for message in visible[3:])
 
 
 @pytest.mark.asyncio

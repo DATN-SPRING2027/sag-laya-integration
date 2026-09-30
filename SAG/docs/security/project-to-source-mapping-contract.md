@@ -95,6 +95,11 @@ window. The API's `create_all` path creates this table in dev; it is not claimed
 as a production migration runner. Documents/versions continue to inherit Source
 scope in P1. Future independent document ACL needs a separate approved contract.
 
+The full `source_id` index covers revoked mapping history as well as active
+assignments, supporting Source foreign-key cascade deletion and historical
+mapping lookups. The partial unique index covers only `PENDING`/`CONFIRMED`
+rows and does not replace that index.
+
 Required data invariants, regardless of physical shape:
 
 - `source_id` references a real SAG Source.
@@ -129,6 +134,14 @@ scope. Its response reports `mapping_state: "PENDING"`; only the existing
 owner-approved workflow can confirm it. If the Project is omitted, creation
 may infer the only readable Project, but it must reject an ambiguous multi-
 Project scope rather than pick one.
+
+The `201` creation response is not approval. Frontends must display
+**Chờ phê duyệt Project Mapping**, retain the returned Source ID and defer
+opening the detail/upload view. Pending Sources are absent from the readable
+Source list; reads, document listings and uploads return `404` for all callers,
+including the creator. After owner confirmation, the frontend may refresh the
+authorized list and enable uploads. A pending-mapping status/list API and its UI
+remain separate deliverables; read scope must not grant creator upload access.
 
 ### Normal Source creation and connector ingestion
 

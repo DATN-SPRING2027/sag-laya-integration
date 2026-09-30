@@ -18,6 +18,7 @@ from sag_api.core.db import SessionLocal, dispose_db, init_db
 from sag_api.core.error_taxonomy import ErrorCode, ErrorLayer, ErrorStage
 from sag_api.core.errors import ApiError
 from sag_api.core.logging import RequestContextMiddleware, configure_logging, get_logger
+from sag_api.core.principal_assertion import principal_assertion_lifespan
 from sag_api.runtime import KnowledgeRuntime
 
 log = get_logger("app")
@@ -59,8 +60,9 @@ async def lifespan(app: FastAPI):
     runtime = KnowledgeRuntime(settings, SessionLocal, active_path=Path(settings.data_dir))
 
     try:
-        await runtime.start(app)
-        yield
+        async with principal_assertion_lifespan():
+            await runtime.start(app)
+            yield
     finally:
         failures: list[BaseException] = []
         for cleanup in (

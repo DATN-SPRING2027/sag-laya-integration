@@ -58,6 +58,21 @@ When `project_id` is omitted, the API may use the sole readable Project; callers
 with multiple readable Projects must specify one. Pending Sources remain
 inaccessible until an owner confirms the mapping through the approved workflow.
 
+Frontend integration must treat `201` with `mapping_state: "PENDING"` as a
+request awaiting approval. Show **Chờ phê duyệt Project Mapping** and retain the
+returned Source ID; do not redirect to the upload/detail screen. Pending Sources
+are omitted from `GET /sources`, and their detail, document list and upload
+routes return `404`, including for the creator. A `404` at this stage does not
+mean creation failed. After owner confirmation, refresh the authorized Source
+list before enabling uploads. There is currently no pending-mapping status/list
+API; adding that UI/workflow is a separate frontend deliverable.
+
+Agent history preserves assistant turns whose evidence is no longer authorized
+as placeholders with evidence fields cleared. Historical assistant
+`prompt_preview` is always returned as an empty string because frozen prompts
+can contain earlier revoked evidence. Stored messages remain unchanged; the
+current run's completion event still includes its prompt preview.
+
 Global P4 retrieval uses dense/lexical RRF and emits no graph fields. Source-
 scoped P3 graph/event recall runs only after Source authorization. Universe
 global manifest/rebuild and MCP stdio remain disabled until their data paths can

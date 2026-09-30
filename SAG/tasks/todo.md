@@ -95,6 +95,7 @@ Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL ev
 - [x] Relevance/search strategy regressions: `test_retrieval_relevance.py`, `test_search_strategy.py`, `test_search_stream.py` pass.
 - [x] ACL seam regressions: implicit scope, requested∩authorized, unauthorized/empty request, dense/lexical cùng scope, empty authorization, missing scope fail-closed trên `/search` và `/search/stream`; test dùng fake scope.
 - [x] Không dùng Knowledge Graph/Tree trong global P4 retrieval; không sửa ingestion/index lane hoặc shared contract/config.
+- [ ] Propagate Source provenance qua các lượt assistant phụ thuộc history; kiểm tra revoke khi lượt sau tóm tắt evidence cũ nhưng không có citation/tool riêng. Bộ lọc hiện chỉ xác minh provenance được ghi trên từng message.
 
 **Trạng thái:** P4 retrieval/fusion và ACL runtime code có contract/runtime tests để review. Production ACL rollout acceptance vẫn **BLOCKED** cho tới khi có signer/JWKS thật, mapping/backfill được duyệt và staging leakage/revocation tests đạt. Đây là cổng vận hành ACL; **P1** trong PR notes chỉ Priority 1 runtime ACL, không phải Phase 1 — Upload & Versioned Source. Chi tiết acceptance nằm trong [ACL evidence-path inventory](../docs/security/acl-evidence-path-inventory.md).
 
