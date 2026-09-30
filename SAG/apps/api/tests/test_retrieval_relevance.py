@@ -120,6 +120,23 @@ def test_semantic_only_relevance_gate_is_invariant_to_score_scale():
     assert [item.chunk_id for item in rescaled.sections] == ["strong", "related"]
 
 
+def test_semantic_only_relevance_uses_best_score_for_duplicate_chunk():
+    result = rerank_sections(
+        "zebraquasar",
+        [
+            section("strong", "主题甲", "短的强语义候选。", 0.95),
+            section("strong", "主题甲", "重复但正文更长、分数更低的语义候选。", 0.2),
+            section("related", "主题乙", "主题乙的语义证据。", 0.8),
+        ],
+        limit=8,
+    )
+
+    assert [item.chunk_id for item in result.sections] == ["strong", "related"]
+    assert next(item for item in result.sections if item.chunk_id == "strong").content == (
+        "重复但正文更长、分数更低的语义候选。"
+    )
+
+
 @pytest.mark.asyncio
 async def test_contiguous_and_spaced_chinese_queries_return_same_core_evidence():
     from uuid import uuid4

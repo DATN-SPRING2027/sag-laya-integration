@@ -12,9 +12,11 @@ from sag_api.core.db import get_session
 from sag_api.core.deps import get_engine_manager
 from sag_api.core.errors import (
     ForbiddenError,
+    NotFoundError,
     ServiceUnavailableError,
     ValidationError,
 )
+from sag_api.core.principal_assertion import VerifiedPrincipal, require_principal_assertion
 from sag_api.sag import EngineManager
 from sag_api.schemas.dify import (
     DifyRetrievalRecord,
@@ -22,7 +24,7 @@ from sag_api.schemas.dify import (
     DifyRetrievalResponse,
 )
 from sag_api.services.retrieval_service import retrieve_relevant_sections
-from sag_api.services.source_service import get_source
+from sag_api.services.source_service import get_authorized_source
 
 router = APIRouter(prefix="/dify", tags=["dify"])
 
@@ -51,6 +53,7 @@ def _section_title(source_name: str, heading: str) -> str:
 async def retrieval(
     body: DifyRetrievalRequest,
     _authorized: None = Depends(_require_dify_api_key),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
 ) -> DifyRetrievalResponse:
@@ -69,7 +72,9 @@ async def retrieval(
             "metadata_condition is not supported by the SAG Dify integration"
         )
 
-    source = await get_source(session, knowledge_id)
+    source = await get_authorized_source(session, principal=principal, source_id=knowledge_id)
+    if source is None:
+        raise NotFoundError("信源不存在")
     strategy = settings.dify_search_strategy
     outcome = await retrieve_relevant_sections(
         engine_manager,

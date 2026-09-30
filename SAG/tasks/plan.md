@@ -316,6 +316,10 @@ Checkpoint A xác nhận nhánh đầu đã truy vấn được và citation ho�
 5. Tích hợp generation LLM trong Settings độc lập với Laya; evidence không đủ phải trả lời no-answer/thiếu nguồn, không gửi cả tài liệu vào prompt.
 6. Ghi trace theo stage, requested/effective strategy và fallback; tạo regression query corpus theo taxonomy ở Phụ lục E.
 
+#### P1 ACL runtime rollout gate
+
+`tasks/acl-runtime-implementation-plan.md` và `docs/security/` ghi chi tiết contract, inventory và implementation status. Nhánh runtime đang có verifier RS256/JWKS, Project→Source mapping resolver, fail-closed route guards, RRF fusion và mock/contract tests. Đây **chưa** phải production ACL acceptance: cần issuer/JWKS thật từ BE/Continuum, header propagation an toàn, DB/data-owner phê duyệt DDL/backfill, mapping writer/revoke flow, cùng cross-Project/cross-Organization leakage tests trên mọi evidence path. Giữ PR Draft và P1 chưa hoàn thành cho tới khi có đủ các bằng chứng này.
+
 **Checkpoint A — SEARCH_READY end-to-end:** upload → extract → dedup → index → global hybrid retrieval → context/citation hoạt động; có failure path; có thể tắt/trễ toàn bộ knowledge enrichment mà vẫn hỏi được tài liệu.
 
 ### Phase 5 — Knowledge Units & Graph

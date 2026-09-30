@@ -14,6 +14,7 @@ from sag_api.db.models.octx import (
 )
 from sag_api.db.models.setting import Setting
 from sag_api.db.models.source import Source
+from sag_api.db.models.source_project_mapping import SourceProjectMapping
 from sag_api.db.models.universe import (
     ExplorationSession,
     ExplorationStep,
@@ -38,6 +39,7 @@ __all__ = [
     "OctxTransfer",
     "Setting",
     "Source",
+    "SourceProjectMapping",
     "Thread",
     "User",
     "ExplorationSession",

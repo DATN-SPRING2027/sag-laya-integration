@@ -6,7 +6,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, Response
-from sqlalchemy import func, select, text
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.config import settings
@@ -15,7 +15,8 @@ from sag_api.core.deps import get_current_user, get_current_user_or_connector
 from sag_api.core.errors import ApiError, ConflictError, ForbiddenError
 from sag_api.core.logging import get_logger
 from sag_api.core.model_providers import model_provider_catalog
-from sag_api.db.models import Source, User
+from sag_api.core.principal_assertion import VerifiedPrincipal, require_principal_assertion
+from sag_api.db.models import User
 from sag_api.generation import LLMClient
 from sag_api.mcp.server import MCP_TOOL_DETAILS, MCP_TOOL_NAMES
 from sag_api.sag.engine_manager import EngineManager
@@ -31,6 +32,7 @@ from sag_api.schemas.system import (
     SystemPreferencesUpdate,
 )
 from sag_api.services import dsh_integration_service, settings_service
+from sag_api.services.source_service import list_sources
 
 router = APIRouter(prefix="/system", tags=["system"])
 log = get_logger("system")
@@ -307,10 +309,11 @@ async def get_model_setup_status(
 async def knowledge_mcp_descriptor(
     request: Request,
     _user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """返回将整个 SAG 知识库挂入外部 MCP 宿主的连接信息。"""
-    source_count = await session.scalar(select(func.count(Source.id))) or 0
+    """Return MCP connection details for the verified principal's Source scope."""
+    source_count = len(await list_sources(session, principal=principal))
     base = str(request.base_url).rstrip("/")
     return {
         "name": "SAG 知识库",
@@ -321,17 +324,18 @@ async def knowledge_mcp_descriptor(
         "http": {
             "transport": "streamable-http",
             "url": f"{base}/mcp/",
-            "headers": {"Authorization": "Bearer <SAG_TOKEN>"},
+            "headers": {
+                "Authorization": "Bearer <SAG_TOKEN>",
+                "X-SAG-Principal-Assertion": "<short-lived-continuum-assertion>",
+            },
             "note": (
-                "默认开放全部信源；Dify 等宿主请使用 streamable_http/Streamable HTTP 传输，"
-                "可在 URL 添加 ?source_id=<id> 临时限定单个信源。"
+                "MCP 只加载本次已授权信源；受信任服务端代理必须注入 Continuum 断言。"
+                "source_id 只能进一步收窄该作用域。"
             ),
         },
         "stdio": {
-            "command": "python",
-            "args": ["-m", "sag_api.mcp.server"],
-            "env": {},
-            "note": "默认开放全部信源；设置 SAG_MCP_SOURCE_ID 可限定单个信源。",
+            "available": False,
+            "note": "stdio 已停用，直到每次工具调用都能携带并重新校验当前 BE/Continuum 主体断言。",
         },
     }
 

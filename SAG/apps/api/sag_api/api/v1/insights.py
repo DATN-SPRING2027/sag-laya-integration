@@ -4,14 +4,18 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.db import get_session
-from sag_api.core.deps import get_current_user, get_engine_manager
+from sag_api.core.deps import get_current_user, get_engine_manager, require_path_source_access
 from sag_api.db.models import User
 from sag_api.sag import EngineManager
 from sag_api.schemas.insight import EntityOut, SourceGraphOut
 from sag_api.services.insight_service import get_source_graph, list_entities
 from sag_api.services.source_service import get_source
 
-router = APIRouter(prefix="/sources/{source_id}", tags=["insights"])
+router = APIRouter(
+    prefix="/sources/{source_id}",
+    tags=["insights"],
+    dependencies=[Depends(require_path_source_access)],
+)
 
 
 @router.get("/entities", response_model=list[EntityOut])

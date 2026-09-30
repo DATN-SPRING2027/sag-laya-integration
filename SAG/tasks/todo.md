@@ -64,8 +64,14 @@ Nguồn chuẩn: [Workflow v1.1](../docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1
 
 ## Phase 4 — Retrieval Engine v1
 
-- [ ] Chạy global hybrid search với scope/filter ACL, chưa phụ thuộc tree.
-- [ ] Chọn RRF/DBSF hoặc calibrated fusion; không cộng trực tiếp raw dense/sparse scores khác scale.
+- [ ] Chạy global hybrid search với **production-ready** scope/filter ACL, chưa phụ thuộc tree.
+- [x] Global retrieval dùng RRF rank fusion; không cộng trực tiếp raw dense/sparse scores khác scale.
+- [x] Relevance gate semantic-only bất biến khi retriever score được scale dương; có regression test.
+- [x] Trước dense/lexical candidate generation, giao Project được ký với mapping CONFIRMED Project→Source; client Source IDs chỉ thu hẹp scope.
+- [ ] Deploy BE/Continuum assertion signer/JWKS thật; security owners duyệt issuer/audience/RS256/lifetime/replay/key-rotation contract.
+- [ ] DB/data owners duyệt DDL và backfill mapping; xác nhận Source cũ unmapped tiếp tục bị chặn; chốt mapping writer/revoke authority.
+- [ ] Kiểm tra toàn bộ production evidence paths bằng real-principal cross-Project/cross-Organization leakage tests. Mock/contract tests chưa đạt P1.
+- [ ] Giữ MCP stdio và Universe global manifest/rebuild tắt cho tới khi có graph authorization theo Project.
 - [ ] Collapse exact/near duplicate; kiểm tra MMR giữ evidence đa dạng.
 - [ ] Giới hạn candidate rerank và chỉ rerank khi còn latency budget.
 - [ ] Build context theo coverage/diversity và token budget.

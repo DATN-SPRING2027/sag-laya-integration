@@ -55,6 +55,16 @@ class Settings(BaseSettings):
     allow_registration: bool = True
     # Dify 外部知识库调用的专用服务密钥；未配置时兼容端点拒绝服务。
     dify_api_key: str | None = None
+    # Continuum-signed assertion used only for evidence authorization. Missing
+    # trust configuration keeps evidence APIs fail-closed instead of enabling
+    # a local-user/global-search fallback.
+    principal_assertion_issuer: str | None = None
+    principal_assertion_audience: str = "sag-api"
+    principal_assertion_jwks_url: str | None = None
+    principal_assertion_max_lifetime_seconds: int = Field(default=120, ge=1, le=300)
+    principal_assertion_clock_skew_seconds: int = Field(default=5, ge=0, le=30)
+    principal_assertion_jwks_cache_ttl_seconds: int = Field(default=60, ge=1, le=60)
+    principal_assertion_max_project_ids: int = Field(default=256, ge=1, le=4096)
     # 供桌面端启动时写入本地 DSH 连接文件的公开地址与可选文件位置。
     dsh_public_url: str = "http://127.0.0.1:8000"
     dsh_connection_file: str | None = None
@@ -267,6 +277,43 @@ class Settings(BaseSettings):
             ZoneInfo(normalized)
         except (ZoneInfoNotFoundError, ValueError) as error:
             raise ValueError("timezone 必须是有效的 IANA 时区") from error
+        return normalized
+
+    @field_validator("principal_assertion_issuer")
+    @classmethod
+    def _validate_principal_assertion_issuer(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized or normalized != value or len(normalized) > 512:
+            raise ValueError("principal_assertion_issuer must be a non-empty exact identifier")
+        return normalized
+
+    @field_validator("principal_assertion_audience")
+    @classmethod
+    def _validate_principal_assertion_audience(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized or normalized != value or len(normalized) > 256:
+            raise ValueError("principal_assertion_audience must be a non-empty exact identifier")
+        return normalized
+
+    @field_validator("principal_assertion_jwks_url")
+    @classmethod
+    def _validate_principal_assertion_jwks_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        parsed = urlsplit(normalized)
+        if (
+            normalized != value
+            or parsed.scheme.lower() != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("principal_assertion_jwks_url must be a fixed HTTPS URL without credentials")
         return normalized
 
     @field_validator("dsh_public_url")

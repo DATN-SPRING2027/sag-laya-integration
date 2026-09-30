@@ -415,76 +415,14 @@ async def test_universe_overview_expand_detail_and_reset_contract():
                     source.event_count = 1
                     await session.commit()
 
-                # GET manifest never opens the graph store or materializes real nodes.
+                # Global graph materialization is disabled until builds can be
+                # partitioned by the Project authorization boundary.
                 initial = await client.get("/api/v1/universe/manifest", headers=headers)
-                assert initial.status_code == 200, initial.text
-                assert initial.json()["status"] == "stale"
-                assert initial.json()["version"] is None
-                initial_partition = next(
-                    item
-                    for item in initial.json()["partitions"]
-                    if item["source_id"] == source_id and item["kind"] == "source"
-                )
-                assert initial_partition["event_count"] == 1
+                assert initial.status_code == 503, initial.text
                 assert engine.overview_calls == 0
 
                 rebuilt = await client.post("/api/v1/universe/rebuild", headers=headers)
-                assert rebuilt.status_code == 202, rebuilt.text
-                rebuild_job = rebuilt.json()
-                assert rebuild_job["type"] == "index_universe"
-                assert (await wait_for_job(rebuild_job["id"]))["status"] == "succeeded"
-                manifest_response = await client.get("/api/v1/universe/manifest", headers=headers)
-                assert manifest_response.status_code == 200, manifest_response.text
-                manifest = manifest_response.json()
-                assert manifest["status"] == "ready"
-                counts = manifest["counts"]
-                assert counts["sources"] >= 1
-                assert counts["partitions"] >= counts["sources"]
-                assert counts["events"] >= 1
-                assert counts["entities"] >= 1
-                assert counts["nodes"] == counts["events"] + counts["entities"]
-                assert counts["relations"] >= 1
-                partition = next(
-                    item
-                    for item in manifest["partitions"]
-                    if item["source_id"] == source_id and item["kind"] == "source"
-                )
-                assert partition["event_count"] == 1
-                assert partition["entity_count"] == 1
-                assert partition["relation_count"] == 1
-                assert partition["time_buckets"][0]["count"] == 1
-                assert all(key in partition for key in ("x", "y", "z", "density"))
-
-                # 快照事件数与信源完成数不一致时，即使脏标记遗漏也必须触发重建。
-                async with SessionLocal() as session:
-                    source = await session.get(Source, source_id)
-                    assert source is not None
-                    source.event_count = 2
-                    await session.commit()
-                drifted = await client.get("/api/v1/universe/manifest", headers=headers)
-                assert drifted.status_code == 200
-                assert drifted.json()["status"] == "stale"
-                assert drifted.json()["stale"] is True
-                async with SessionLocal() as session:
-                    source = await session.get(Source, source_id)
-                    assert source is not None
-                    source.event_count = 1
-                    await session.commit()
-
-                second = await client.post("/api/v1/universe/rebuild", headers=headers)
-                assert second.status_code == 202, second.text
-                assert (await wait_for_job(second.json()["id"]))["status"] == "succeeded"
-                second_manifest = await client.get("/api/v1/universe/manifest", headers=headers)
-                second_partition = next(
-                    item
-                    for item in second_manifest.json()["partitions"]
-                    if item["source_id"] == source_id and item["kind"] == "source"
-                )
-                assert (partition["x"], partition["y"], partition["z"]) == (
-                    second_partition["x"],
-                    second_partition["y"],
-                    second_partition["z"],
-                )
+                assert rebuilt.status_code == 503, rebuilt.text
 
                 event_id = f"event-{source_config_id}"
                 entity_id = f"entity-{source_config_id}"
@@ -540,9 +478,7 @@ async def test_universe_overview_expand_detail_and_reset_contract():
                     await session.commit()
                 calls_before = engine.overview_calls
                 fallback = await client.get("/api/v1/universe/manifest", headers=headers)
-                assert fallback.status_code == 200
-                assert fallback.json()["status"] == "stale"
-                assert fallback.json()["version"] is None
+                assert fallback.status_code == 503
                 assert engine.overview_calls == calls_before
     finally:
         app.dependency_overrides.pop(get_engine_manager, None)
