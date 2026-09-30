@@ -30,7 +30,19 @@ async def _register(client: httpx.AsyncClient) -> dict[str, str]:
 
 @pytest.mark.asyncio
 async def test_messages_use_signed_bounded_keyset_pages(monkeypatch):
+    from sag_api.core.principal_assertion import VerifiedPrincipal
     from sag_api.main import app
+
+    principal = VerifiedPrincipal(
+        subject="message-pagination-user",
+        organization_id="pytest-org",
+        allowed_project_ids=frozenset({"pytest-project"}),
+        issuer="https://pytest.invalid",
+        key_id="pytest-key",
+        token_id="message-pagination-assertion",
+        issued_at=1,
+        expires_at=2,
+    )
 
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
@@ -146,6 +158,8 @@ async def test_messages_use_signed_bounded_keyset_pages(monkeypatch):
                     session,
                     thread["id"],
                     exclude_id=f"{10_000 + 104:032x}",
+                    principal=principal,
+                    requested_source_ids=None,
                 )
             assert [item["content"] for item in history] == [
                 f"message-{index:03d}" for index in range(99, 104)

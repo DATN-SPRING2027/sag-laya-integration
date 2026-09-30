@@ -27,6 +27,7 @@ from sag_api.core.deps import (
     get_tool_registry,
 )
 from sag_api.core.errors import ConfigurationError, UpstreamError, ValidationError
+from sag_api.core.principal_assertion import VerifiedPrincipal, require_principal_assertion
 from sag_api.db.models import User
 from sag_api.generation import LLMClient
 from sag_api.sag import EngineManager
@@ -70,6 +71,7 @@ async def chat_completions(
     agent_id: str,
     body: ChatCompletionRequest,
     _user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
     llm: LLMClient = Depends(get_llm),
@@ -98,6 +100,7 @@ async def chat_completions(
             llm=llm,
             tool_registry=tool_registry,
             runtime=agent_runtime,
+            principal=principal,
         )
 
     if body.stream:

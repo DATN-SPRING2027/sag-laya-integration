@@ -5,62 +5,157 @@ from __future__ import annotations
 import os
 import shutil
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.connectors import registry
 from sag_api.core.config import settings
 from sag_api.core.error_taxonomy import ErrorCode
-from sag_api.core.errors import ApiError, NotFoundError, ValidationError
+from sag_api.core.errors import ApiError, ForbiddenError, NotFoundError, ServiceUnavailableError, ValidationError
 from sag_api.core.logging import get_logger
+from sag_api.core.principal_assertion import VerifiedPrincipal
 from sag_api.db.base import new_id
-from sag_api.db.models import AgentBinding, Job, Source
+from sag_api.db.models import AgentBinding, Job, Source, SourceProjectMapping
 from sag_api.enums import CONNECTOR_SOURCE_TYPE, BindingTargetType, JobStatus, JobType, SourceType
 from sag_api.jobs import JobQueue
 from sag_api.sag import EngineManager
 from sag_api.schemas.source import SourceCreate, SourceUpdate
 
 log = get_logger("services.source")
+SOURCE_ID_LOOKUP_BATCH_SIZE = 500
 
 
-async def list_sources(session: AsyncSession) -> list[Source]:
-    rows = await session.execute(select(Source).order_by(Source.created_at.desc()))
-    return list(rows.scalars().all())
+def _authorized_source_statement(principal: VerifiedPrincipal):
+    return (
+        select(Source)
+        .join(SourceProjectMapping, SourceProjectMapping.source_id == Source.id)
+        .where(
+            SourceProjectMapping.state == "CONFIRMED",
+            SourceProjectMapping.organization_id == principal.organization_id,
+            SourceProjectMapping.project_id.in_(principal.allowed_project_ids),
+        )
+    )
+
+
+async def list_sources(session: AsyncSession, *, principal: VerifiedPrincipal) -> list[Source]:
+    if not principal.allowed_project_ids:
+        return []
+    try:
+        rows = await session.execute(
+            _authorized_source_statement(principal).order_by(Source.created_at.desc(), Source.id)
+        )
+    except SQLAlchemyError as error:
+        log.exception("source scope resolution failed operation=list")
+        raise ServiceUnavailableError("Source authorization mapping is unavailable") from error
+    sources = list(rows.scalars().all())
+    log.info("source scope resolved operation=list authorized_source_count=%d", len(sources))
+    return sources
 
 
 async def search_source_candidates(
     session: AsyncSession,
-    source_ids: list[str] | None = None,
+    *,
+    principal: VerifiedPrincipal,
+    requested_source_ids: list[str] | None = None,
 ) -> list[Source]:
-    """Select a bounded retrieval scope without materializing the source table.
-
-    Explicit `source_ids` preserve the user's @ order. An implicit global search
-    uses data density and recency as the cheap partition router until a dedicated
-    source-level semantic index is available.
-    """
+    """Select candidates only from confirmed Source mappings in the principal scope."""
     limit = settings.search_source_candidate_limit
-    if source_ids:
-        ordered_ids = list(dict.fromkeys(source_ids))
+    if not principal.allowed_project_ids:
+        log.info("source scope resolved authorized_project_count=0 effective_source_count=0")
+        return []
+    if requested_source_ids is not None:
+        ordered_ids = list(dict.fromkeys(source_id.strip() for source_id in requested_source_ids if source_id.strip()))
         if len(ordered_ids) > limit:
             raise ValidationError(
                 f"单次最多检索 {limit} 个信息源，请通过 @ 缩小范围",
                 code=ErrorCode.TOO_MANY_SEARCH_SOURCES,
             )
-        rows = await session.execute(select(Source).where(Source.id.in_(ordered_ids)))
+        if not ordered_ids:
+            return []
+        statement = _authorized_source_statement(principal).where(Source.id.in_(ordered_ids))
+        try:
+            rows = await session.execute(statement)
+        except SQLAlchemyError as error:
+            log.exception("source scope resolution failed operation=search requested_count=%d", len(ordered_ids))
+            raise ServiceUnavailableError("Source authorization mapping is unavailable") from error
         by_id = {source.id: source for source in rows.scalars().all()}
-        return [by_id[source_id] for source_id in ordered_ids if source_id in by_id]
-
-    rows = await session.execute(
-        select(Source)
-        .order_by(
+        sources = [by_id[source_id] for source_id in ordered_ids if source_id in by_id]
+    else:
+        statement = _authorized_source_statement(principal).order_by(
             Source.chunk_count.desc(),
             Source.event_count.desc(),
             Source.updated_at.desc(),
             Source.id,
-        )
-        .limit(limit)
+        ).limit(limit)
+        try:
+            rows = await session.execute(statement)
+        except SQLAlchemyError as error:
+            log.exception("source scope resolution failed operation=search requested_count=0")
+            raise ServiceUnavailableError("Source authorization mapping is unavailable") from error
+        sources = list(rows.scalars().all())
+    log.info(
+        "source scope resolved authorized_project_count=%d requested_source_count=%d effective_source_count=%d",
+        len(principal.allowed_project_ids),
+        len(requested_source_ids or []),
+        len(sources),
     )
-    return list(rows.scalars().all())
+    return sources
+
+
+async def get_authorized_source(
+    session: AsyncSession,
+    *,
+    principal: VerifiedPrincipal,
+    source_id: str,
+) -> Source | None:
+    """Resolve a single Source only when its active mapping is inside this principal's scope."""
+    if not principal.allowed_project_ids:
+        log.info("authorization denied reason=empty_project_scope operation=read")
+        return None
+    try:
+        result = await session.execute(
+            _authorized_source_statement(principal).where(Source.id == source_id).limit(1)
+        )
+    except SQLAlchemyError as error:
+        log.exception("source scope resolution failed operation=read")
+        raise ServiceUnavailableError("Source authorization mapping is unavailable") from error
+    source = result.scalar_one_or_none()
+    if source is None:
+        log.info("authorization denied reason=source_mapping_not_visible operation=read")
+    else:
+        log.info("source scope resolved operation=read effective_source_count=1")
+    return source
+
+
+async def get_authorized_source_ids(
+    session: AsyncSession,
+    *,
+    principal: VerifiedPrincipal,
+    requested_source_ids: list[str],
+) -> set[str]:
+    ordered_ids = list(dict.fromkeys(source_id.strip() for source_id in requested_source_ids if source_id.strip()))
+    if not ordered_ids or not principal.allowed_project_ids:
+        return set()
+    authorized: set[str] = set()
+    for start in range(0, len(ordered_ids), SOURCE_ID_LOOKUP_BATCH_SIZE):
+        batch = ordered_ids[start : start + SOURCE_ID_LOOKUP_BATCH_SIZE]
+        try:
+            rows = await session.execute(
+                _authorized_source_statement(principal)
+                .where(Source.id.in_(batch))
+                .with_only_columns(Source.id)
+            )
+        except SQLAlchemyError as error:
+            log.exception("source scope resolution failed operation=validate requested_count=%d", len(ordered_ids))
+            raise ServiceUnavailableError("Source authorization mapping is unavailable") from error
+        authorized.update(rows.scalars().all())
+    log.info(
+        "source scope validated requested_source_count=%d effective_source_count=%d",
+        len(ordered_ids),
+        len(authorized),
+    )
+    return authorized
 
 
 async def get_source(session: AsyncSession, source_id: str) -> Source:
@@ -71,8 +166,26 @@ async def get_source(session: AsyncSession, source_id: str) -> Source:
 
 
 async def create_source(
-    session: AsyncSession, data: SourceCreate, *, engine_manager: EngineManager
+    session: AsyncSession,
+    data: SourceCreate,
+    *,
+    engine_manager: EngineManager,
+    principal: VerifiedPrincipal | None = None,
 ) -> Source:
+    project_id: str | None = None
+    if principal is not None:
+        if not principal.allowed_project_ids:
+            raise ForbiddenError("A readable Project is required to request Source assignment")
+        project_id = data.project_id
+        if project_id is None:
+            if len(principal.allowed_project_ids) != 1:
+                raise ValidationError("project_id is required when the principal can access multiple Projects")
+            project_id = next(iter(principal.allowed_project_ids))
+        if project_id != project_id.strip():
+            raise ValidationError("project_id must not contain leading or trailing whitespace")
+        if project_id not in principal.allowed_project_ids:
+            raise ForbiddenError("The requested Project is outside the principal scope")
+
     connector = registry.get(data.connector_kind)
     connector.validate_config(data.config)
     source_type = CONNECTOR_SOURCE_TYPE.get(data.connector_kind, SourceType.DOCUMENT)
@@ -86,6 +199,17 @@ async def create_source(
         config=data.config or {},
     )
     session.add(source)
+    if principal is not None:
+        await session.flush()
+        session.add(
+            SourceProjectMapping(
+                source_id=source.id,
+                organization_id=principal.organization_id,
+                project_id=project_id,
+                state="PENDING",
+                mapping_version=1,
+            )
+        )
     await session.commit()
     await session.refresh(source)
 
@@ -95,6 +219,7 @@ async def create_source(
         await engine_manager.provision(source.sag_source_config_id, source)
     except ApiError as e:
         log.warning("信源引擎预建失败，回滚信源 %s：%s", source.sag_source_config_id, e.message)
+        await session.execute(delete(SourceProjectMapping).where(SourceProjectMapping.source_id == source.id))
         await session.delete(source)
         await session.commit()
         raise

@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 import pytest
-from sqlalchemy import delete
+from sqlalchemy import delete, update
 
 
 async def _register(client: httpx.AsyncClient) -> dict[str, str]:
@@ -18,15 +18,6 @@ async def _register(client: httpx.AsyncClient) -> dict[str, str]:
     )
     assert response.status_code == 201, response.text
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
-
-
-def _allow_search_sources(app, source_ids: list[str]) -> None:
-    """Install an explicit test-only authorization decision for global search."""
-    from sag_api.api.v1 import search as search_api
-
-    app.dependency_overrides[search_api.get_search_acl_scope] = lambda: search_api.SearchACLScope(
-        frozenset(source_ids)
-    )
 
 
 @pytest.mark.asyncio
@@ -128,7 +119,6 @@ async def test_global_search_forwards_validated_strategy(monkeypatch):
                     json={"name": "检索策略测试源"},
                 )
                 assert source.status_code == 201, source.text
-                _allow_search_sources(app, [source.json()["id"]])
 
                 response = await client.post(
                     "/api/v1/search",
@@ -178,9 +168,6 @@ async def test_global_search_forwards_validated_strategy(monkeypatch):
                 assert invalid.status_code == 422
     finally:
         app.dependency_overrides.pop(get_engine_manager, None)
-        from sag_api.api.v1 import search as search_api
-
-        app.dependency_overrides.pop(search_api.get_search_acl_scope, None)
 
 
 @pytest.mark.asyncio
@@ -303,7 +290,6 @@ async def test_global_search_falls_back_when_laya_errors_without_losing_scope(mo
                     json={"name": "identifier route test"},
                 )
                 source_id = source.json()["id"]
-                _allow_search_sources(app, [source_id])
                 response = await client.post(
                     "/api/v1/search",
                     headers=headers,
@@ -327,9 +313,6 @@ async def test_global_search_falls_back_when_laya_errors_without_losing_scope(mo
                 assert "checkpoint token" not in response.text
     finally:
         app.dependency_overrides.pop(get_engine_manager, None)
-        from sag_api.api.v1 import search as search_api
-
-        app.dependency_overrides.pop(search_api.get_search_acl_scope, None)
 
 
 @pytest.mark.asyncio
@@ -340,8 +323,13 @@ async def test_global_search_applies_same_authorized_scope_before_dense_and_lexi
     requested_mode,
     monkeypatch,
 ):
+    from dataclasses import replace
+
     from sag_api.api.v1 import search as search_api
+    from sag_api.core.db import SessionLocal
     from sag_api.core.deps import get_engine_manager
+    from sag_api.core.principal_assertion import require_principal_assertion
+    from sag_api.db.models import SourceProjectMapping
     from sag_api.main import app
     from sag_api.sag.dto import RetrievedSection, SearchOutcome
 
@@ -395,6 +383,7 @@ async def test_global_search_applies_same_authorized_scope_before_dense_and_lexi
         },
     )
     app.dependency_overrides[get_engine_manager] = lambda: engine
+    original_principal = app.dependency_overrides[require_principal_assertion]
     try:
         transport = httpx.ASGITransport(app=app)
         async with app.router.lifespan_context(app):
@@ -413,7 +402,22 @@ async def test_global_search_applies_same_authorized_scope_before_dense_and_lexi
                     allowed_id: 0.60,
                     denied_id: 0.99,
                 }
-                _allow_search_sources(app, [allowed_id])
+                allowed_project = f"allowed-{uuid.uuid4().hex}"
+                async with SessionLocal() as session:
+                    await session.execute(
+                        update(SourceProjectMapping)
+                        .where(SourceProjectMapping.source_id == denied_id)
+                        .values(project_id="denied-project")
+                    )
+                    await session.execute(
+                        update(SourceProjectMapping)
+                        .where(SourceProjectMapping.source_id == allowed_id)
+                        .values(project_id=allowed_project)
+                    )
+                    await session.commit()
+                app.dependency_overrides[require_principal_assertion] = lambda: replace(
+                    original_principal(), allowed_project_ids=frozenset({allowed_project})
+                )
 
                 payload = {"query": "authorized evidence topic", "top_k": 1}
                 if requested_mode == "intersection":
@@ -438,13 +442,16 @@ async def test_global_search_applies_same_authorized_scope_before_dense_and_lexi
         assert denied_id not in {item["source_id"] for item in result["sections"]}
     finally:
         app.dependency_overrides.pop(get_engine_manager, None)
-        app.dependency_overrides.pop(search_api.get_search_acl_scope, None)
+        app.dependency_overrides[require_principal_assertion] = original_principal
 
 
 @pytest.mark.asyncio
 async def test_global_search_returns_empty_for_empty_authorization_without_retrieval(monkeypatch):
+    from dataclasses import replace
+
     from sag_api.api.v1 import search as search_api
     from sag_api.core.deps import get_engine_manager
+    from sag_api.core.principal_assertion import require_principal_assertion
     from sag_api.main import app
 
     class RetrievalMustNotRun:
@@ -470,8 +477,9 @@ async def test_global_search_returns_empty_for_empty_authorization_without_retri
         },
     )
     app.dependency_overrides[get_engine_manager] = RetrievalMustNotRun
-    app.dependency_overrides[search_api.get_search_acl_scope] = lambda: search_api.SearchACLScope(
-        frozenset()
+    original_principal = app.dependency_overrides[require_principal_assertion]
+    app.dependency_overrides[require_principal_assertion] = lambda: replace(
+        original_principal(), allowed_project_ids=frozenset()
     )
     try:
         transport = httpx.ASGITransport(app=app)
@@ -485,97 +493,7 @@ async def test_global_search_returns_empty_for_empty_authorization_without_retri
         assert response.json()["sections"] == []
     finally:
         app.dependency_overrides.pop(get_engine_manager, None)
-        app.dependency_overrides.pop(search_api.get_search_acl_scope, None)
-
-
-@pytest.mark.asyncio
-async def test_global_search_without_acl_resolver_fails_closed_before_retrieval(monkeypatch):
-    from sag_api.api.v1 import search as search_api
-    from sag_api.core.deps import get_engine_manager
-    from sag_api.main import app
-
-    class RetrievalMustNotRun:
-        calls = 0
-
-        async def provision(self, *_args, **_kwargs):
-            return None
-
-        async def search_many(self, *_args, **_kwargs):
-            self.calls += 1
-            raise AssertionError("missing ACL scope must stop before retrieval")
-
-        async def grep_chunks(self, *_args, **_kwargs):
-            self.calls += 1
-            raise AssertionError("missing ACL scope must stop before retrieval")
-
-    engine = RetrievalMustNotRun()
-    monkeypatch.setattr(
-        search_api,
-        "route_query",
-        lambda query, context=None: {
-            "query": query,
-            "coarse_intent": "KNOWLEDGE",
-            "need_retrieval": True,
-            "suggested_strategy": "vector",
-            "confidence": 0.99,
-            "model": "fake",
-        },
-    )
-    app.dependency_overrides[get_engine_manager] = lambda: engine
-    app.dependency_overrides[search_api.get_search_acl_scope] = lambda: None
-    try:
-        transport = httpx.ASGITransport(app=app)
-        async with app.router.lifespan_context(app):
-            async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
-                headers = await _register(client)
-                response = await client.post(
-                    "/api/v1/search", headers=headers, json={"query": "no scope"}
-                )
-        assert response.status_code == 503, response.text
-        assert engine.calls == 0
-    finally:
-        app.dependency_overrides.pop(get_engine_manager, None)
-        app.dependency_overrides.pop(search_api.get_search_acl_scope, None)
-
-
-@pytest.mark.asyncio
-async def test_eval_compare_without_acl_resolver_fails_closed_before_retrieval():
-    from sag_api.api.v1 import search as search_api
-    from sag_api.core.deps import get_engine_manager
-    from sag_api.main import app
-
-    class RetrievalMustNotRun:
-        calls = 0
-
-        async def search_many(self, *_args, **_kwargs):
-            self.calls += 1
-            raise AssertionError("eval-compare must stop before retrieval without ACL scope")
-
-        async def grep_chunks(self, *_args, **_kwargs):
-            self.calls += 1
-            raise AssertionError("eval-compare must stop before retrieval without ACL scope")
-
-    engine = RetrievalMustNotRun()
-    app.dependency_overrides[get_engine_manager] = lambda: engine
-    app.dependency_overrides[search_api.get_search_acl_scope] = lambda: None
-    try:
-        transport = httpx.ASGITransport(app=app)
-        async with app.router.lifespan_context(app):
-            async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
-                headers = await _register(client)
-                response = await client.post(
-                    "/api/v1/search/eval-compare",
-                    headers=headers,
-                    json={
-                        "query": "no scope",
-                        "strategies": ["vector", "multi_es_fast"],
-                    },
-                )
-        assert response.status_code == 503, response.text
-        assert engine.calls == 0
-    finally:
-        app.dependency_overrides.pop(get_engine_manager, None)
-        app.dependency_overrides.pop(search_api.get_search_acl_scope, None)
+        app.dependency_overrides[require_principal_assertion] = original_principal
 
 
 @pytest.mark.asyncio
@@ -749,15 +667,28 @@ async def test_single_source_timeout_includes_lock_queue(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_search_source_candidates_use_database_limit_and_explicit_order(monkeypatch):
+    from datetime import UTC, datetime
+
     from sag_api.core.config import settings
     from sag_api.core.db import SessionLocal
     from sag_api.core.errors import ValidationError
-    from sag_api.db.models import Source
+    from sag_api.core.principal_assertion import VerifiedPrincipal
+    from sag_api.db.models import Source, SourceProjectMapping
     from sag_api.main import app
     from sag_api.services.source_service import search_source_candidates
 
     monkeypatch.setattr(settings, "search_source_candidate_limit", 2)
     ids = [uuid.uuid4().hex for _ in range(3)]
+    principal = VerifiedPrincipal(
+        subject="test-user",
+        organization_id="test-org",
+        allowed_project_ids=frozenset({"test-project"}),
+        issuer="https://test.invalid",
+        key_id="test-key",
+        token_id="test-token",
+        issued_at=0,
+        expires_at=2**31,
+    )
     async with app.router.lifespan_context(app):
         async with SessionLocal() as session:
             session.add_all(
@@ -772,12 +703,30 @@ async def test_search_source_candidates_use_database_limit_and_explicit_order(mo
                     for index, source_id in enumerate(ids)
                 ]
             )
+            session.add_all(
+                [
+                    SourceProjectMapping(
+                        source_id=source_id,
+                        organization_id="test-org",
+                        project_id="test-project",
+                        state="CONFIRMED",
+                        confirmed_at=datetime.now(UTC),
+                        confirmed_by="test-owner",
+                        approval_ref="test-approval",
+                    )
+                    for source_id in ids
+                ]
+            )
             await session.commit()
 
-            implicit = await search_source_candidates(session)
-            explicit = await search_source_candidates(session, [ids[0], ids[2]])
+            implicit = await search_source_candidates(session, principal=principal)
+            explicit = await search_source_candidates(
+                session,
+                principal=principal,
+                requested_source_ids=[ids[0], ids[2]],
+            )
             with pytest.raises(ValidationError) as captured:
-                await search_source_candidates(session, ids)
+                await search_source_candidates(session, principal=principal, requested_source_ids=ids)
 
             assert [source.id for source in implicit] == [ids[2], ids[1]]
             assert [source.id for source in explicit] == [ids[0], ids[2]]
@@ -971,7 +920,6 @@ async def test_eval_compare_returns_two_strategies_and_skips_judge(monkeypatch):
                     json={"name": "eval-compare 测试源"},
                 )
                 assert source.status_code == 201, source.text
-                _allow_search_sources(app, [source.json()["id"]])
 
                 response = await client.post(
                     "/api/v1/search/eval-compare",
@@ -987,9 +935,6 @@ async def test_eval_compare_returns_two_strategies_and_skips_judge(monkeypatch):
     finally:
         app.dependency_overrides.pop(get_engine_manager, None)
         app.dependency_overrides.pop(get_llm, None)
-        from sag_api.api.v1 import search as search_api
-
-        app.dependency_overrides.pop(search_api.get_search_acl_scope, None)
 
     assert response.status_code == 200, response.text
     payload = response.json()

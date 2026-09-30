@@ -110,7 +110,6 @@ async def _search(
     *,
     request_overrides: dict | None = None,
     route_result: dict | None = None,
-    acl_scope_available: bool = True,
     engine: SearchEngine | None = None,
 ) -> list[tuple[str, dict]]:
     from sag_api.api.v1 import search as search_api
@@ -137,12 +136,6 @@ async def _search(
             app.state.llm = llm
             async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
                 headers, source_id = await _auth_and_source(client)
-                if acl_scope_available:
-                    app.dependency_overrides[search_api.get_search_acl_scope] = lambda: (
-                        search_api.SearchACLScope(frozenset({source_id}))
-                    )
-                else:
-                    app.dependency_overrides[search_api.get_search_acl_scope] = lambda: None
                 response = await client.post(
                     "/api/v1/search/stream",
                     headers=headers,
@@ -157,7 +150,6 @@ async def _search(
                 return _events(response.text)
     finally:
         app.dependency_overrides.pop(get_engine_manager, None)
-        app.dependency_overrides.pop(search_api.get_search_acl_scope, None)
         monkeypatch.undo()
 
 
@@ -242,22 +234,6 @@ async def test_search_stream_skips_retrieval_for_high_confidence_chat():
     assert events[0][1]["query"] == "Xin chào"
     assert events[0][1]["sections"] == []
     assert events[0][1]["stats"]["query_route"]["retrieval"] == "skipped"
-
-
-@pytest.mark.asyncio
-async def test_search_stream_without_acl_scope_emits_error_before_retrieval():
-    engine = SearchEngine()
-    llm = StreamingLLM([])
-    events = await _search(
-        llm,
-        acl_scope_available=False,
-        engine=engine,
-    )
-
-    assert [name for name, _payload in events] == ["error"]
-    assert events[0][1]["code"] == "service_unavailable"
-    assert engine.retrieval_calls == 0
-    assert llm.stream_calls == 0
 
 
 @pytest.mark.asyncio

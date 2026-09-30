@@ -95,8 +95,8 @@ class AskRequest(BaseModel):
     query: str = Field(default="", max_length=4000)
     # 图片附件 id 列表（≤4，经 POST /attachments 上传）
     attachments: list[str] = Field(default_factory=list, max_length=4)
-    # @知识库 范围限定：仅在这些信源内检索（空=默认全部）
-    source_ids: list[str] = Field(default_factory=list, max_length=8)
+    # @知识库范围限定：缺省使用 Principal 允许的 Sources；显式 [] 不检索任何 Source。
+    source_ids: list[str] | None = Field(default=None, max_length=8)
     # 联网能力由用户逐轮授权；默认关闭，开启后才暴露 Agent 配置的外部/MCP 工具。
     web_enabled: bool = False
     # 旧客户端兼容字段：knowledge_only=false 等价于 web_enabled=true。

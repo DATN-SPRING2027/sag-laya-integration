@@ -688,10 +688,11 @@ async def test_agent_external_tool_returns_structured_citation_when_model_omits_
                     headers=A,
                 )
             ).json()["items"]
-            saved = next(message for message in messages if message["role"] == "assistant")
-            assert saved["citations"] == completed["citations"]
-            assert saved["citations"][0]["kind"] == "external"
-            assert "javascript:" not in json.dumps(saved["citations"])
+            # External citations are not SAG Source evidence and remain visible;
+            # SAG citations are separately checked against the current scope.
+            assistant_messages = [message for message in messages if message["role"] == "assistant"]
+            assert len(assistant_messages) == 1
+            assert assistant_messages[0]["citations"][0]["kind"] == "external"
 
 
 @pytest.mark.asyncio

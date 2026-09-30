@@ -30,6 +30,39 @@ uvicorn sag_api.main:app --reload --host 0.0.0.0 --port 8000
 
 文档 UI：http://localhost:8000/docs
 
+## Evidence authorization (ACL rollout)
+
+Search, source/document reads, graph-backed source-scoped operations, agents,
+Dify, MCP HTTP and OCTX evidence paths require a server-verified Continuum
+principal assertion in `X-SAG-Principal-Assertion`. Configure the exact issuer
+and fixed HTTPS JWKS URL with `SAG_PRINCIPAL_ASSERTION_ISSUER` and
+`SAG_PRINCIPAL_ASSERTION_JWKS_URL`; the default audience is `sag-api`. Missing
+configuration or an invalid/missing assertion fails closed. The assertion is a
+server-to-server credential: the trusted BE/BFF must overwrite or strip any
+client-supplied header and must not expose the assertion to browser storage.
+
+SAG maps `allowedProjectIds` and `orgId` from the verified assertion to
+confirmed rows in `source_project_mappings`. New, pending, unmapped, ambiguous,
+or revoked Source mappings are not searchable/readable. `source_ids` can only
+narrow the resulting scope. Use the reviewed DDL and
+`scripts/source_project_acl.py` workflow for the mapping table and
+owner-approved backfill; do not use package metadata or client input to confirm
+a Project mapping. Production trust configuration, key rotation, mapping writer,
+and legacy backfill still require their respective owners' approval; the local
+contract tests are not production ACL acceptance.
+
+`POST /sources` may receive `project_id` as a requested assignment. The API
+checks that it is in the verified principal's readable Project scope and stores
+the mapping as `PENDING`; the response includes `mapping_state: "PENDING"`.
+When `project_id` is omitted, the API may use the sole readable Project; callers
+with multiple readable Projects must specify one. Pending Sources remain
+inaccessible until an owner confirms the mapping through the approved workflow.
+
+Global P4 retrieval uses dense/lexical RRF and emits no graph fields. Source-
+scoped P3 graph/event recall runs only after Source authorization. Universe
+global manifest/rebuild and MCP stdio remain disabled until their data paths can
+prove Project-scoped authorization.
+
 ## Retrieval score contract
 
 Search section scores are normalized reciprocal-rank fusion (RRF) rank scores

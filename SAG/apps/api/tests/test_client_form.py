@@ -29,9 +29,21 @@ async def test_default_agent_activity_and_document_file():
     from sqlalchemy import select
 
     from sag_api.core.db import SessionLocal
+    from sag_api.core.principal_assertion import VerifiedPrincipal
     from sag_api.db.models import Agent
     from sag_api.main import app
     from sag_api.services.agent_domain import resolve_sources
+
+    principal = VerifiedPrincipal(
+        subject="client-form-user",
+        organization_id="pytest-org",
+        allowed_project_ids=frozenset({"pytest-project"}),
+        issuer="https://pytest.invalid",
+        key_id="pytest-key",
+        token_id="client-form-assertion",
+        issued_at=1,
+        expires_at=2,
+    )
 
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
@@ -66,7 +78,7 @@ async def test_default_agent_activity_and_document_file():
             src = (await c.post("/api/v1/sources", headers=A, json={"name": "客户端源"})).json()
             async with SessionLocal() as s:
                 agent = await s.get(Agent, a1["id"])
-                sources = await resolve_sources(s, agent)
+                sources = await resolve_sources(s, agent, principal=principal)
                 assert any(x.id == src["id"] for x in sources)
 
             # 上传一个文档（离线：md 解析入库）

@@ -120,26 +120,20 @@ def test_semantic_only_relevance_gate_is_invariant_to_score_scale():
     assert [item.chunk_id for item in rescaled.sections] == ["strong", "related"]
 
 
-def test_semantic_dedup_keeps_best_score_with_longest_representative():
+def test_semantic_dedup_keeps_best_score_and_longest_representative():
     result = rerank_sections(
         "zebraquasar",
         [
-            section("duplicate", "主题甲", "short high-confidence result", 0.95),
-            section(
-                "duplicate",
-                "主题甲",
-                "longer representative with a lower semantic score",
-                0.45,
-            ),
-            section("related", "主题乙", "related semantic evidence", 0.8),
+            section("strong", "主题甲", "短的强语义候选。", 0.95),
+            section("strong", "主题甲", "重复但正文更长、分数更低的语义候选。", 0.2),
+            section("related", "主题乙", "主题乙的语义证据。", 0.8),
         ],
         limit=8,
     )
 
-    by_chunk = {item.chunk_id: item for item in result.sections}
-    assert set(by_chunk) == {"duplicate", "related"}
-    assert by_chunk["duplicate"].content == (
-        "longer representative with a lower semantic score"
+    assert [item.chunk_id for item in result.sections] == ["strong", "related"]
+    assert next(item for item in result.sections if item.chunk_id == "strong").content == (
+        "重复但正文更长、分数更低的语义候选。"
     )
 
 

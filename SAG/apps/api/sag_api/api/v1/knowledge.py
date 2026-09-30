@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.db import get_session
-from sag_api.core.deps import get_current_user, get_engine_manager
+from sag_api.core.deps import get_current_user, get_engine_manager, require_path_source_access
 from sag_api.core.errors import NotFoundError, ValidationError
 from sag_api.db.models import User
 from sag_api.sag import EngineManager
@@ -20,7 +20,11 @@ from sag_api.schemas.chunk import (
 from sag_api.services.document_service import get_public_document
 from sag_api.services.source_service import get_source
 
-router = APIRouter(prefix="/sources/{source_id}", tags=["knowledge"])
+router = APIRouter(
+    prefix="/sources/{source_id}",
+    tags=["knowledge"],
+    dependencies=[Depends(require_path_source_access)],
+)
 
 
 @router.get("/outline", response_model=OutlineOut)

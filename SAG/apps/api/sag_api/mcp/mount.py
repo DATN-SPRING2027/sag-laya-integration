@@ -1,12 +1,7 @@
-"""把 SAG 知识库 MCP 作为 Streamable-HTTP 端点挂进 FastAPI。
+"""Mount MCP with SAG application authentication and a Continuum scope assertion.
 
-外部宿主（Claude Desktop / Cursor）可挂载：
-
-    http://<host>/mcp/                         # 整个知识库
-    http://<host>/mcp/?source_id=<信源 id>     # 单个信源
-
-请求先校验 SAG JWT 或本地 DSH connector token，再根据可选的 `source_id` 载入一个或全部 Source 并注入 contextvar。
-作用域随请求隔离，外部宿主与进程内 agent 可共用同一 server。
+The optional ``source_id`` only narrows the request. Every request resolves
+confirmed Source mappings before constructing its per-request tool scope.
 """
 
 from __future__ import annotations
@@ -16,13 +11,14 @@ from typing import TYPE_CHECKING
 from urllib.parse import parse_qs
 
 from mcp.server.transport_security import TransportSecuritySettings
-from sqlalchemy import select
 
 from sag_api.core.db import SessionLocal
 from sag_api.core.deps import authenticate_user_token
+from sag_api.core.errors import ApiError
 from sag_api.core.logging import get_logger
-from sag_api.db.models import Source
+from sag_api.core.principal_assertion import get_principal_assertion_verifier
 from sag_api.mcp.server import build_source_mcp, use_scope
+from sag_api.services.source_service import get_authorized_source, list_sources
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -59,8 +55,12 @@ class ScopedKnowledgeMCP:
         self._mcp = mcp_asgi
 
     async def __call__(self, scope, receive, send) -> None:
-        if scope["type"] != "http":
+        if scope["type"] == "lifespan":
             await self._mcp(scope, receive, send)
+            return
+        if scope["type"] != "http":
+            if scope["type"] == "websocket":
+                await send({"type": "websocket.close", "code": 1008})
             return
 
         params = parse_qs((scope.get("query_string") or b"").decode())
@@ -70,16 +70,34 @@ class ScopedKnowledgeMCP:
         if not token:
             await _send_json(send, 401, {"error": "缺少认证令牌"})
             return
+        assertions = [
+            value.decode("latin-1")
+            for name, value in (scope.get("headers") or [])
+            if name == b"x-sag-principal-assertion"
+        ]
+        if len(assertions) != 1 or not assertions[0]:
+            await _send_json(send, 401, {"error": "缺少授权主体断言"})
+            return
+        try:
+            principal = await get_principal_assertion_verifier().verify(assertions[0])
+        except ApiError as error:
+            await _send_json(send, error.status_code, {"error": error.code})
+            return
         async with SessionLocal() as session:
             if await authenticate_user_token(session, token) is None:
                 await _send_json(send, 401, {"error": "令牌无效或已过期"})
                 return
-            statement = select(Source).order_by(Source.created_at, Source.id)
-            if source_id:
-                statement = statement.where(Source.id == source_id)
-            sources = tuple((await session.execute(statement)).scalars().all())
+            try:
+                if source_id:
+                    source = await get_authorized_source(session, principal=principal, source_id=source_id)
+                    sources = (source,) if source is not None else ()
+                else:
+                    sources = tuple(await list_sources(session, principal=principal))
+            except ApiError as error:
+                await _send_json(send, error.status_code, {"error": error.code})
+                return
         if source_id and not sources:
-            await _send_json(send, 404, {"error": "信源不存在"})
+            await _send_json(send, 404, {"error": "信源不存在或不可访问"})
             return
 
         engine_manager = self._parent.state.engine_manager
