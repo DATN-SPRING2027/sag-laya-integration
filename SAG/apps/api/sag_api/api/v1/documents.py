@@ -148,6 +148,7 @@ def _verify_mime_signature(filename: str, file_bytes: bytes) -> None:
             or file_bytes.startswith(b"\x7fELF")
             or file_bytes.startswith(b"\x89PNG\r\n\x1a\n")
             or file_bytes.startswith(b"\xff\xd8\xff")
+            or (b"\x00" in file_bytes[:8192])
         ):
             raise ValidationError(
                 f"Tệp nhị phân hoặc hình ảnh trá hình dưới phần mở rộng văn bản '{ext}' không được phép cho '{filename}'",

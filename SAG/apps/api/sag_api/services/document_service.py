@@ -839,8 +839,12 @@ def _check_upload_file(filename: str, file_bytes: bytes) -> None:
     if allowed:
         ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
         if ext not in allowed:
-            pretty = "、".join(sorted(e.lstrip(".") for e in allowed))
-            raise ValidationError(f"Unsupported file extension. Allowed: {pretty}")
+            pretty = ", ".join(sorted(e.lstrip(".") for e in allowed))
+            raise ValidationError(
+                f"Unsupported file extension. Allowed: {pretty}",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            )
 
 
 def _save_snapshot_file(payload_hash: str, original_filename: str, file_bytes: bytes) -> str:

@@ -739,6 +739,117 @@ async def test_mime_signature_mismatch_rejected(client: httpx.AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_mime_signature_docx_without_zip_rejected(client: httpx.AsyncClient):
+    """Verify that docx files lacking ZIP container signature (PK) are rejected with 422 (TC-VAL-05)."""
+    project_id = "proj_mime_docx_test"
+    auth_header = make_auth_header(user_id="user_mime", allowed_projects=[project_id])
+
+    res = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_mime",
+            "Idempotency-Key": "key_mime_invalid_docx",
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("fake.docx", b"Plain text disguised as docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+    )
+    assert res.status_code == 422
+    assert "ZIP" in res.text or "PK" in res.text
+
+
+@pytest.mark.asyncio
+async def test_mime_signature_text_with_null_byte_rejected(client: httpx.AsyncClient):
+    """Verify that plain text files containing null bytes are rejected as binary pollution with 422 (TC-VAL-07)."""
+    project_id = "proj_mime_null_byte_test"
+    auth_header = make_auth_header(user_id="user_mime", allowed_projects=[project_id])
+
+    res = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_mime",
+            "Idempotency-Key": "key_mime_null_byte",
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("notes.md", b"# Header\nValid text\x00corrupted binary content", "text/markdown")},
+    )
+    assert res.status_code == 422
+    assert "không được phép" in res.text or "nhị phân" in res.text
+
+
+@pytest.mark.asyncio
+async def test_upload_disallowed_extension_rejected(client: httpx.AsyncClient):
+    """Verify that files with extensions outside allowed whitelist are rejected with 422 (TC-VAL-03)."""
+    project_id = "proj_disallowed_ext_test"
+    auth_header = make_auth_header(user_id="user_mime", allowed_projects=[project_id])
+
+    res = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_mime",
+            "Idempotency-Key": "key_disallowed_ext",
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("malicious.sh", b"#!/bin/bash\necho bad\n", "application/x-sh")},
+    )
+    assert res.status_code == 422
+    assert "Unsupported file type" in res.text or "Allowed extensions" in res.text
+
+
+@pytest.mark.asyncio
+async def test_mime_signature_text_with_png_image_rejected(client: httpx.AsyncClient):
+    """Verify that images disguised as plain text (.txt with PNG header) are rejected with 422 (TC-VAL-06)."""
+    project_id = "proj_mime_png_text_test"
+    auth_header = make_auth_header(user_id="user_mime", allowed_projects=[project_id])
+
+    res = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_mime",
+            "Idempotency-Key": "key_mime_png_text",
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("data.txt", b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR", "text/plain")},
+    )
+    assert res.status_code == 422
+    assert "Tệp nhị phân" in res.text or "trá hình" in res.text
+
+
+@pytest.mark.asyncio
+async def test_rejected_upload_leaves_no_disk_or_db_garbage(client: httpx.AsyncClient):
+    """Verify that rejected uploads abort fail-fast without creating Document, Job, Snapshot, or Run records (DoD 2)."""
+    project_id = "proj_zero_garbage_test"
+    auth_header = make_auth_header(user_id="user_zero", allowed_projects=[project_id])
+    idem_key = "key_zero_garbage_check"
+
+    res = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_zero",
+            "Idempotency-Key": idem_key,
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("exploit.exe", b"MZ\x90\x00\x03\x00\x00\x00", "application/x-msdownload")},
+    )
+    assert res.status_code == 422
+
+    async with SessionLocal() as session:
+        run = (
+            await session.execute(
+                select(IngestionRun).where(
+                    IngestionRun.project_id == project_id,
+                    IngestionRun.idempotency_key == idem_key,
+                )
+            )
+        ).scalar_one_or_none()
+        assert run is None, "Rejected upload must not create an IngestionRun record"
+
+
+@pytest.mark.asyncio
 async def test_replay_idempotency_different_logical_source_conflict(client: httpx.AsyncClient):
     """Verify that reusing the same Idempotency-Key with a different logical_source_id raises 409 Conflict (Comment #14)."""
     project_id = "proj_idemp_source_test"
