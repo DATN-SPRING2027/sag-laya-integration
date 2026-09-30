@@ -6,9 +6,10 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.db import get_session
-from sag_api.core.deps import get_current_user, get_engine_manager, get_job_queue
+from sag_api.core.deps import get_current_user, get_engine_manager
+from sag_api.core.errors import NotFoundError, ServiceUnavailableError
+from sag_api.core.principal_assertion import VerifiedPrincipal, require_principal_assertion
 from sag_api.db.models import User
-from sag_api.jobs import JobQueue
 from sag_api.sag import EngineManager
 from sag_api.schemas.job import JobOut
 from sag_api.schemas.universe import (
@@ -19,16 +20,14 @@ from sag_api.schemas.universe import (
     UniverseGraphPatchOut,
     UniverseManifestOut,
     UniverseNodeDetailOut,
-    UniversePartitionOut,
     UniverseTimelineIn,
     UniverseTimelineSliceOut,
 )
+from sag_api.services.source_service import get_authorized_source, get_authorized_source_ids, search_source_candidates
 from sag_api.services.universe_service import (
-    enqueue_universe_rebuild,
     get_exploration,
     list_explorations,
     universe_expand,
-    universe_manifest,
     universe_node_detail,
     universe_timeline,
 )
@@ -36,58 +35,25 @@ from sag_api.services.universe_service import (
 router = APIRouter(prefix="/universe", tags=["universe"])
 
 
-def _partition_out(value) -> UniversePartitionOut:
-    def read(name: str, default=None):
-        if isinstance(value, dict):
-            return value.get(name, default)
-        return getattr(value, name, default)
-
-    return UniversePartitionOut(
-        id=read("id"),
-        source_id=read("source_id"),
-        parent_id=read("parent_id"),
-        kind=read("kind"),
-        key=read("key"),
-        label=read("label"),
-        x=read("x", 0.0),
-        y=read("y", 0.0),
-        z=read("z", 0.0),
-        radius=read("radius", 120.0),
-        node_count=read("node_count", 0),
-        event_count=read("event_count", 0),
-        entity_count=read("entity_count", 0),
-        relation_count=read("relation_count", 0),
-        density=read("density", 0.0),
-        time_buckets=read("time_buckets", []) or [],
-        importance=read("importance", 0.0),
-    )
-
-
 @router.get("/manifest", response_model=UniverseManifestOut)
 async def manifest(
     user: User = Depends(get_current_user),
-    session: AsyncSession = Depends(get_session),
+    _principal: VerifiedPrincipal = Depends(require_principal_assertion),
 ) -> UniverseManifestOut:
-    value = await universe_manifest(session, user.id)
-    return UniverseManifestOut(
-        version=value["version"],
-        status=value["status"],
-        stale=value["stale"],
-        as_of=value.get("as_of"),
-        bounds=value["bounds"],
-        partitions=[_partition_out(item) for item in value["partitions"]],
-        counts=value["counts"],
-        policy=value["policy"],
-    )
+    del user
+    raise ServiceUnavailableError("Universe manifest is disabled until Project-scoped graph builds are available")
 
 
 @router.post("/expand", response_model=UniverseGraphPatchOut)
 async def expand(
     body: UniverseExpandIn,
     user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
 ) -> UniverseGraphPatchOut:
+    if await get_authorized_source(session, principal=principal, source_id=body.source_id) is None:
+        raise NotFoundError("信源不存在")
     value = await universe_expand(
         session,
         engine_manager,
@@ -108,9 +74,12 @@ async def expand(
 async def timeline(
     body: UniverseTimelineIn,
     user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
 ) -> UniverseTimelineSliceOut:
+    if await get_authorized_source(session, principal=principal, source_id=body.source_id) is None:
+        raise NotFoundError("信源不存在")
     value = await universe_timeline(
         session,
         engine_manager,
@@ -130,9 +99,12 @@ async def node_detail(
     node_id: str,
     source_id: str = Query(min_length=1, max_length=64),
     _user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
 ) -> UniverseNodeDetailOut:
+    if await get_authorized_source(session, principal=principal, source_id=source_id) is None:
+        raise NotFoundError("信源不存在")
     value = await universe_node_detail(
         session,
         engine_manager,
@@ -145,24 +117,37 @@ async def node_detail(
 @router.post("/rebuild", response_model=JobOut, status_code=202)
 async def rebuild(
     user: User = Depends(get_current_user),
-    session: AsyncSession = Depends(get_session),
-    job_queue: JobQueue = Depends(get_job_queue),
+    _principal: VerifiedPrincipal = Depends(require_principal_assertion),
 ) -> JobOut:
-    job = await enqueue_universe_rebuild(
-        session,
-        job_queue,
-        user_id=user.id,
-    )
-    return JobOut.model_validate(job)
+    del user
+    raise ServiceUnavailableError("Universe rebuild is disabled until it can build per Project authorization scopes")
 
 
 @router.get("/explorations", response_model=list[ExplorationSessionOut])
 async def explorations(
     limit: int = Query(20, ge=1, le=100),
     user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
 ) -> list[ExplorationSessionOut]:
     rows = await list_explorations(session, user.id, limit=limit)
+    requested_source_ids = list(
+        dict.fromkeys(source_id for item, _count in rows for source_id in (item.source_ids or []))
+    )
+    authorized_source_ids = (
+        await get_authorized_source_ids(
+            session,
+            principal=principal,
+            requested_source_ids=requested_source_ids,
+        )
+        if requested_source_ids
+        else set()
+    )
+    visible: list[tuple[object, int]] = []
+    for item, count in rows:
+        source_ids = set(item.source_ids or [])
+        if not source_ids or source_ids.issubset(authorized_source_ids):
+            visible.append((item, count))
     return [
         ExplorationSessionOut(
             id=item.id,
@@ -172,7 +157,7 @@ async def explorations(
             updated_at=item.updated_at,
             step_count=count,
         )
-        for item, count in rows
+        for item, count in visible
     ]
 
 
@@ -180,9 +165,22 @@ async def explorations(
 async def exploration_detail(
     exploration_id: str,
     user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
 ) -> ExplorationDetailOut:
     item, steps = await get_exploration(session, user.id, exploration_id)
+    source_ids = set(item.source_ids or [])
+    for step in steps:
+        source_ids.update(step.source_ids or [])
+    if not source_ids:
+        raise NotFoundError("探索记录不存在")
+    authorized = await search_source_candidates(
+        session,
+        principal=principal,
+        requested_source_ids=sorted(source_ids),
+    ) if source_ids else []
+    if len(authorized) != len(source_ids):
+        raise NotFoundError("探索记录不存在")
     return ExplorationDetailOut(
         session=ExplorationSessionOut(
             id=item.id,

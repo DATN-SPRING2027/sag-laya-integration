@@ -870,7 +870,7 @@ async def test_status_endpoint_forbidden_for_unauthorized_partition(client: http
 @pytest.mark.asyncio
 async def test_project_source_protected_from_global_sources_routes(client: httpx.AsyncClient):
     """[P1] Verify that auto-provisioned Project Sources are NOT listed in GET /sources
-    and reject un-scoped access via GET /sources/{source_id} or /sources/{source_id}/documents with 403.
+    and hide un-scoped access via GET /sources/{source_id} or /sources/{source_id}/documents with 404.
     """
     project_id = "proj_acl_guard_01"
     auth_header = make_auth_header(user_id="user_acl", allowed_projects=[project_id])
@@ -923,15 +923,14 @@ async def test_project_source_protected_from_global_sources_routes(client: httpx
         f"/api/v1/sources/{source_id}",
         headers={"Authorization": f"Bearer {global_user_token}"},
     )
-    assert res_get_source.status_code == 403
-    assert "Nguồn dữ liệu dự án được bảo vệ" in res_get_source.text or "403" in str(res_get_source.status_code)
+    assert res_get_source.status_code == 404
 
     # User attempts to list documents via un-scoped GET /sources/{source_id}/documents
     res_docs = await client.get(
         f"/api/v1/sources/{source_id}/documents",
         headers={"Authorization": f"Bearer {global_user_token}"},
     )
-    assert res_docs.status_code == 403
+    assert res_docs.status_code == 404
 
 
 @pytest.mark.asyncio

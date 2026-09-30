@@ -19,13 +19,15 @@ from sag_api.branding import DEFAULT_AGENT_AVATAR, DEFAULT_AGENT_NAME
 from sag_api.core.config import settings
 from sag_api.core.error_taxonomy import ErrorCode
 from sag_api.core.errors import ConflictError, NotFoundError, ValidationError
+from sag_api.core.principal_assertion import VerifiedPrincipal
 from sag_api.db.models import Agent, AgentBinding, Message, Source, Thread
 from sag_api.enums import BindingTargetType, MessageRole, MessageStatus
 from sag_api.generation import build_agent_messages, build_prompt_preview
 from sag_api.generation.prompt import estimate_tokens
-from sag_api.services.source_service import search_source_candidates
+from sag_api.services.source_service import get_authorized_source_ids, search_source_candidates
 
 _DEFAULT_TITLES = {"新会话", "New chat"}
+_KNOWLEDGE_TOOL_NAMES = frozenset({"search_context", "get_entity"})
 THREAD_PAGE_DEFAULT = 6
 THREAD_PAGE_MAX = 100
 MESSAGE_PAGE_DEFAULT = 40
@@ -259,21 +261,25 @@ async def resolve_sources(
     session: AsyncSession,
     agent: Agent,
     source_ids: list[str] | None = None,
+    *,
+    principal: VerifiedPrincipal | None = None,
 ) -> list[Source]:
     """解析本轮可见信源。
 
     显式 `source_ids` 来自输入框的 @ 范围，优先于持久绑定；所有入口共用同一
     候选上限，避免默认 Agent 或大量绑定造成无界 fan-out。
     """
-    if source_ids:
-        return await search_source_candidates(session, source_ids)
+    if principal is None:
+        return []
+    if source_ids is not None:
+        return await search_source_candidates(session, principal=principal, requested_source_ids=source_ids)
     if agent.is_default:
-        return await search_source_candidates(session)
+        return await search_source_candidates(session, principal=principal)
     bindings = await list_bindings(session, agent)
     src_ids = [b.target_id for b in bindings if b.target_type == BindingTargetType.SOURCE]
     if not src_ids:
         return []
-    return await search_source_candidates(session, src_ids)
+    return await search_source_candidates(session, principal=principal, requested_source_ids=src_ids)
 
 
 async def resolve_mcp_specs(session: AsyncSession, agent: Agent) -> list[tuple[str, dict]]:
@@ -387,7 +393,103 @@ async def list_messages_page(
     )
 
 
-async def _history(session: AsyncSession, thread_id: str, exclude_id: str) -> list[dict[str, str]]:
+def _message_source_ids(message: Message) -> set[str] | None:
+    citations = message.citations if message.citations is not None else []
+    if not isinstance(citations, list):
+        return None
+    source_ids: set[str] = set()
+    for citation in citations:
+        if not isinstance(citation, dict):
+            return None
+        if citation.get("source_id"):
+            source_ids.add(str(citation["source_id"]))
+        elif citation.get("kind") != "external" or citation.get("chunk_id") or not citation.get("url"):
+            return None
+
+    steps = getattr(message, "steps", None)
+    if steps is None:
+        steps = []
+    if not isinstance(steps, list):
+        return None
+    for step in steps:
+        if not isinstance(step, dict):
+            return None
+        tool_name = step.get("name")
+        details = step.get("details")
+        has_knowledge_scope = isinstance(details, dict) and details.get("scope") == "knowledge"
+        if not (isinstance(tool_name, str) and tool_name in _KNOWLEDGE_TOOL_NAMES) and not has_knowledge_scope:
+            continue
+        if not has_knowledge_scope:
+            return None
+        sources = details.get("sources")
+        if not isinstance(sources, list) or not sources:
+            return None
+        step_source_ids = {
+            str(source["id"])
+            for source in sources
+            if isinstance(source, dict) and source.get("id")
+        }
+        if len(step_source_ids) != len(sources):
+            return None
+        source_ids.update(step_source_ids)
+    return source_ids
+
+
+async def filter_messages_for_scope(
+    session: AsyncSession,
+    messages: list[Message],
+    *,
+    principal: VerifiedPrincipal,
+    requested_source_ids: list[str] | None = None,
+) -> list[Message]:
+    provenance = [
+        (message, _message_source_ids(message) if message.role == MessageRole.ASSISTANT else None)
+        for message in messages
+    ]
+    source_ids = set().union(*(ids for _, ids in provenance if ids))
+    authorized = await get_authorized_source_ids(
+        session,
+        principal=principal,
+        requested_source_ids=sorted(source_ids),
+    ) if source_ids else set()
+    if requested_source_ids is not None:
+        authorized.intersection_update(requested_source_ids)
+    visible: list[Message] = []
+    for message, cited_source_ids in provenance:
+        if message.role != MessageRole.ASSISTANT:
+            visible.append(message)
+            continue
+        can_read = cited_source_ids is not None and cited_source_ids.issubset(authorized)
+        # Preserve conversation roles without changing the persisted ORM row.
+        # Frozen prompts can embed earlier revoked answers, even for a currently
+        # authorized answer; omit those snapshots from every assistant history read.
+        visible.append(Message(
+            id=getattr(message, "id", None),
+            thread_id=getattr(message, "thread_id", None),
+            created_at=getattr(message, "created_at", None),
+            role=MessageRole.ASSISTANT,
+            content=(
+                message.content if can_read else
+                "[Answer hidden because its evidence is unavailable in the current source scope.]"
+            ),
+            citations=message.citations if can_read else [],
+            attachments=(getattr(message, "attachments", None) or []) if can_read else [],
+            steps=(getattr(message, "steps", None) or []) if can_read else [],
+            prompt_preview="",
+            status=(getattr(message, "status", None) or MessageStatus.OK) if can_read else MessageStatus.OK,
+            error=getattr(message, "error", None) if can_read else None,
+        ))
+    return visible
+
+
+async def _history(
+    session: AsyncSession,
+    thread_id: str,
+    exclude_id: str,
+    *,
+    principal: VerifiedPrincipal,
+    requested_source_ids: list[str] | None,
+) -> list[dict[str, str]]:
     rows = await session.execute(
         select(Message)
         .where(
@@ -398,7 +500,12 @@ async def _history(session: AsyncSession, thread_id: str, exclude_id: str) -> li
         .order_by(Message.created_at.desc(), Message.id.desc())
         .limit(settings.history_load_limit)
     )
-    messages = list(reversed(rows.scalars().all()))
+    messages = await filter_messages_for_scope(
+        session,
+        list(reversed(rows.scalars().all())),
+        principal=principal,
+        requested_source_ids=requested_source_ids,
+    )
     return [{"role": m.role.value, "content": m.content} for m in messages]
 
 
@@ -488,7 +595,7 @@ def build_ask_context(
         query=query,
         messages=messages,
         prompt_preview=build_prompt_preview(messages),
-        source_ids=source_ids or None,
+        source_ids=source_ids,
     )
 
 
@@ -500,6 +607,7 @@ async def prepare_ask(
     query: str,
     attachments: list[str] | None = None,
     source_ids: list[str] | None = None,
+    principal: VerifiedPrincipal,
     llm=None,
 ) -> AskPlan:
     """落库用户消息（含图片附件 meta）、解析历史（超上下文阈值时主动压缩），组装计划。"""
@@ -533,7 +641,13 @@ async def prepare_ask(
     await session.commit()
     await session.refresh(user_msg)
 
-    history = await _history(session, thread.id, exclude_id=user_msg.id)
+    history = await _history(
+        session,
+        thread.id,
+        exclude_id=user_msg.id,
+        principal=principal,
+        requested_source_ids=source_ids,
+    )
     # 历史预算 = 上下文窗口的 40%（其余留给工具轮/回答）
     history = await compress_history(history, llm=llm, budget_tokens=int(settings.llm_context_window * 0.4))
     plan = build_ask_context(

@@ -1,7 +1,5 @@
 """Exercise aggregate overview and keyset expansion against the real graph store."""
 
-import asyncio
-import time
 import uuid
 from datetime import datetime, timedelta
 
@@ -190,35 +188,10 @@ async def test_universe_real_store_statistics_and_keyset_cursor():
                 )
                 await session.commit()
 
-            rebuilt = await client.post("/api/v1/universe/rebuild", headers=headers)
-            assert rebuilt.status_code == 202, rebuilt.text
-            deadline = time.monotonic() + 60
-            while True:
-                job_response = await client.get(
-                    f"/api/v1/jobs/{rebuilt.json()['id']}", headers=headers
-                )
-                assert job_response.status_code == 200, job_response.text
-                if job_response.json()["status"] in {"succeeded", "failed"}:
-                    break
-                assert time.monotonic() < deadline, (
-                    f"universe rebuild did not finish within 60 seconds: "
-                    f"{job_response.text}"
-                )
-                await asyncio.sleep(0.05)
-            assert job_response.json()["status"] == "succeeded", job_response.text
-            rebuilt = await client.get("/api/v1/universe/manifest", headers=headers)
-            assert rebuilt.status_code == 200, rebuilt.text
-            partition = next(
-                item
-                for item in rebuilt.json()["partitions"]
-                if item["kind"] == "source" and item["source_id"] == source_id
-            )
-            assert partition["event_count"] == 24
-            assert partition["entity_count"] == 11
-            assert partition["relation_count"] == 34
-            assert sum(bucket["count"] for bucket in partition["time_buckets"]) == 24
-            assert rebuilt.json()["policy"]["timeline_event_page_size"] == 20
-            assert rebuilt.json()["policy"]["event_entity_limit"] == 8
+            global_manifest = await client.get("/api/v1/universe/manifest", headers=headers)
+            assert global_manifest.status_code == 503, global_manifest.text
+            global_rebuild = await client.post("/api/v1/universe/rebuild", headers=headers)
+            assert global_rebuild.status_code == 503, global_rebuild.text
 
             oversized_timeline = await client.post(
                 "/api/v1/universe/timeline",

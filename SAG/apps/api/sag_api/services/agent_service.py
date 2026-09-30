@@ -27,6 +27,7 @@ from sag_agent import (
 from sag_agent import (
     ToolResult as RuntimeToolResult,
 )
+from sag_api.core.principal_assertion import VerifiedPrincipal
 from sag_api.enums import MessageStatus
 from sag_api.generation import LLMClient, build_prompt_preview
 from sag_api.sag import EngineManager, SourceGraphInfo
@@ -525,6 +526,7 @@ async def generate_stream(
     tool_registry: ToolRegistry,
     runtime: AgentRuntime | None = None,
     knowledge_only: bool = False,
+    principal: VerifiedPrincipal | None = None,
 ) -> AsyncIterator[AgentStreamEvent]:
     """Run one request and expose the SDK event contract to the host transport."""
 
@@ -545,7 +547,7 @@ async def generate_stream(
     terminal = False
 
     async with session_factory() as session:
-        sources = await resolve_sources(session, agent, plan.source_ids)
+        sources = await resolve_sources(session, agent, plan.source_ids, principal=principal)
         mcp_specs = [] if knowledge_only else await resolve_mcp_specs(session, agent)
     host_context = HostToolContext(
         engine_manager=engine_manager,

@@ -7,6 +7,7 @@ import pytest
 @pytest.mark.asyncio
 async def test_agents_flow_offline():
     from sag_api.core.db import SessionLocal
+    from sag_api.core.principal_assertion import VerifiedPrincipal
     from sag_api.db.models import Agent
     from sag_api.main import app
     from sag_api.services.agent_domain import resolve_sources
@@ -55,10 +56,25 @@ async def test_agents_flow_offline():
             ).status_code == 409
 
             # 绑定 → 信源解析
+            principal = VerifiedPrincipal(
+                subject="pytest-user",
+                organization_id="pytest-org",
+                allowed_project_ids=frozenset({"pytest-project"}),
+                issuer="https://pytest.invalid",
+                key_id="pytest-key",
+                token_id="pytest-assertion",
+                issued_at=0,
+                expires_at=2**31,
+            )
             async with SessionLocal() as s:
                 agent_obj = await s.get(Agent, aid)
-                resolved = await resolve_sources(s, agent_obj)
-                explicitly_scoped = await resolve_sources(s, agent_obj, [scoped_src["id"]])
+                resolved = await resolve_sources(s, agent_obj, principal=principal)
+                explicitly_scoped = await resolve_sources(
+                    s,
+                    agent_obj,
+                    [scoped_src["id"]],
+                    principal=principal,
+                )
             assert [x.id for x in resolved] == [src["id"]]
             assert [x.id for x in explicitly_scoped] == [scoped_src["id"]]
 

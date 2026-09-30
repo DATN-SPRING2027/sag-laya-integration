@@ -51,6 +51,8 @@ async def _make_agent_with_empty_response(c, headers):
 
 @pytest.mark.asyncio
 async def test_empty_response_injection_and_prompt_preview():
+    from sag_api.core.db import SessionLocal
+    from sag_api.db.models import Message
     from sag_api.main import app
 
     transport = httpx.ASGITransport(app=app)
@@ -92,8 +94,14 @@ async def test_empty_response_injection_and_prompt_preview():
                 "items"
             ]
             saved = next(m for m in msgs if m["content"] == "你好！" and m["role"] == "assistant")
-            assert saved["prompt_preview"] == completed["prompt_preview"]
-            assert saved["content"] not in saved["prompt_preview"]
+            # Historical snapshots can embed revoked turns, so the API omits
+            # them while retaining the original model input in storage for audit.
+            assert saved["prompt_preview"] == ""
+            async with SessionLocal() as session:
+                stored = await session.get(Message, saved["id"])
+                assert stored is not None
+                assert stored.prompt_preview == completed["prompt_preview"]
+                assert stored.content not in stored.prompt_preview
 
 
 @pytest.mark.asyncio

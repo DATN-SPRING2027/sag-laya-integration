@@ -2004,12 +2004,15 @@ async def test_download_ready_transfer_restores_migrated_artifact(
     monkeypatch,
 ):
     """Downloading an old READY transfer must restore its digest-matched package."""
+    from datetime import UTC, datetime
     from pathlib import Path
+    from types import SimpleNamespace
 
     from octx import create_octx, open_octx
 
     from sag_api.api.v1 import octx as octx_api
-    from sag_api.db.models import OctxTransfer
+    from sag_api.core.principal_assertion import VerifiedPrincipal
+    from sag_api.db.models import OctxTransfer, Source, SourceProjectMapping
     from sag_api.enums import OctxTransferDirection, OctxTransferStatus
     from sag_api.octx.storage import OctxStorage
 
@@ -2037,20 +2040,55 @@ async def test_download_ready_transfer_restores_migrated_artifact(
     monkeypatch.setattr(octx_api, "default_octx_storage", lambda: storage)
 
     async with transfer_sessions() as session:
+        source = Source(
+            id="octx-authorized-source",
+            name="authorized source",
+            sag_source_config_id="octx-authorized-config",
+        )
+        principal = VerifiedPrincipal(
+            subject="octx-user",
+            organization_id="octx-org",
+            allowed_project_ids=frozenset({"octx-project"}),
+            issuer="https://continuum.test",
+            key_id="test-key",
+            token_id="test-assertion",
+            issued_at=0,
+            expires_at=2**31,
+        )
         transfer = OctxTransfer(
             id="ready-migrated-transfer",
             direction=OctxTransferDirection.EXPORT,
             status=OctxTransferStatus.READY,
             progress=1.0,
+            target_source_id=source.id,
             artifact_key=key,
             package_digest=digest,
             package_version="1.0.0",
-            checkpoint={"asset_name": "AI 手册"},
+            checkpoint={"asset_name": "AI 手册", "requested_by_user_id": "owner-1"},
         )
+        session.add(source)
+        await session.flush()
+        session.add(
+            SourceProjectMapping(
+                source_id=source.id,
+                organization_id="octx-org",
+                project_id="octx-project",
+                state="CONFIRMED",
+                confirmed_at=datetime.now(UTC),
+                confirmed_by="octx-owner",
+                approval_ref="test-approval",
+            )
+        )
+        await session.flush()
         session.add(transfer)
         await session.commit()
 
-        response = await octx_api.download_artifact(transfer.id, object(), session)
+        response = await octx_api.download_artifact(
+            transfer.id,
+            SimpleNamespace(id="owner-1"),
+            principal,
+            session,
+        )
 
     assert Path(response.path).read_bytes() == package.read_bytes()
     assert response.filename == "AI 手册-OCTX.octx"

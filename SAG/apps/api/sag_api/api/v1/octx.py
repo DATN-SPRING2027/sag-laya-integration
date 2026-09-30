@@ -7,11 +7,12 @@ from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.db import SessionLocal, get_session
-from sag_api.core.deps import get_current_user, get_job_queue
-from sag_api.core.errors import ConflictError, ForbiddenError, NotFoundError
-from sag_api.db.models import OctxRelease, OctxSourceBinding, OctxTransfer, User
+from sag_api.core.deps import get_current_user, get_job_queue, require_path_source_access, require_principal_assertion
+from sag_api.core.errors import ConflictError, NotFoundError
+from sag_api.core.principal_assertion import VerifiedPrincipal
+from sag_api.db.models import OctxAsset, OctxRelease, OctxSourceBinding, OctxTransfer, Source, User
 from sag_api.db.models.octx import transition_transfer
-from sag_api.enums import OctxTransferStatus
+from sag_api.enums import OctxTransferDirection, OctxTransferStatus
 from sag_api.jobs import JobQueue
 from sag_api.schemas.octx import (
     OctxExportCreate,
@@ -31,7 +32,7 @@ from sag_api.services.octx_transfer_service import (
 )
 from sag_api.services.source_operation_service import export_request_admission
 
-router = APIRouter(tags=["octx"])
+router = APIRouter(tags=["octx"], dependencies=[Depends(require_principal_assertion)])
 
 
 async def _transfer(session: AsyncSession, transfer_id: str) -> OctxTransfer:
@@ -39,6 +40,33 @@ async def _transfer(session: AsyncSession, transfer_id: str) -> OctxTransfer:
     if transfer is None:
         raise NotFoundError("OCTX transfer not found")
     return transfer
+
+
+async def _authorize_transfer_source(
+    session: AsyncSession,
+    transfer: OctxTransfer,
+    principal: VerifiedPrincipal,
+) -> None:
+    from sag_api.services.source_service import get_authorized_source
+
+    source_id = transfer.target_source_id
+    if source_id is None and transfer.asset_id:
+        asset = await session.get(OctxAsset, transfer.asset_id)
+        source_id = asset.producer_source_id if asset is not None else None
+    if source_id is not None and await get_authorized_source(
+        session,
+        principal=principal,
+        source_id=source_id,
+    ) is None:
+        raise NotFoundError("OCTX transfer not found")
+    if transfer.direction is OctxTransferDirection.EXPORT and source_id is None:
+        raise NotFoundError("OCTX transfer not found")
+
+
+def _authorize_transfer_owner(transfer: OctxTransfer, user: User) -> None:
+    owner_id = str((transfer.checkpoint or {}).get("requested_by_user_id") or "")
+    if not owner_id or owner_id != user.id:
+        raise NotFoundError("OCTX transfer not found")
 
 
 @router.post(
@@ -71,6 +99,7 @@ async def create_document_export(
     source_id: str,
     document_id: str,
     body: OctxExportCreate,
+    _authorized_source: Source = Depends(require_path_source_access),
     transfer_id: str | None = Header(default=None, alias="X-OCTX-Transfer-ID"),
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
@@ -93,21 +122,25 @@ async def create_document_export(
 async def get_transfer(
     transfer_id: str,
     _user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
 ) -> OctxTransferOut:
-    return OctxTransferOut.from_transfer(await _transfer(session, transfer_id))
+    transfer = await _transfer(session, transfer_id)
+    _authorize_transfer_owner(transfer, _user)
+    await _authorize_transfer_source(session, transfer, principal)
+    return OctxTransferOut.from_transfer(transfer)
 
 
 @router.get("/octx/transfers/{transfer_id}/diagnostics")
 async def get_transfer_diagnostics(
     transfer_id: str,
     user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     transfer = await _transfer(session, transfer_id)
-    owner_id = str((transfer.checkpoint or {}).get("requested_by_user_id") or "")
-    if not owner_id or owner_id != user.id:
-        raise ForbiddenError("OCTX diagnostic bundle is not available for this user")
+    _authorize_transfer_owner(transfer, user)
+    await _authorize_transfer_source(session, transfer, principal)
     return await build_octx_diagnostic_snapshot(session, transfer_id)
 
 
@@ -118,9 +151,22 @@ async def decide_import(
     transfer_id: str,
     body: OctxImportDecisionIn,
     _user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
     job_queue: JobQueue = Depends(get_job_queue),
 ) -> OctxTransferOut:
+    transfer = await _transfer(session, transfer_id)
+    _authorize_transfer_owner(transfer, _user)
+    await _authorize_transfer_source(session, transfer, principal)
+    if body.target_source_id is not None:
+        from sag_api.services.source_service import get_authorized_source
+
+        if await get_authorized_source(
+            session,
+            principal=principal,
+            source_id=body.target_source_id,
+        ) is None:
+            raise NotFoundError("OCTX transfer not found")
     transfer = await submit_import_decision(
         session,
         transfer_id,
@@ -139,9 +185,12 @@ async def decide_import(
 async def download_artifact(
     transfer_id: str,
     _user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
 ):
     transfer = await _transfer(session, transfer_id)
+    _authorize_transfer_owner(transfer, _user)
+    await _authorize_transfer_source(session, transfer, principal)
     if transfer.status is not OctxTransferStatus.READY or not transfer.artifact_key:
         raise ConflictError("OCTX artifact is not ready")
     storage = default_octx_storage()
@@ -170,6 +219,7 @@ async def download_artifact(
 async def create_export(
     source_id: str,
     body: OctxExportCreate,
+    _authorized_source: Source = Depends(require_path_source_access),
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
     job_queue: JobQueue = Depends(get_job_queue),
@@ -192,9 +242,13 @@ async def decide_export(
     transfer_id: str,
     body: OctxExportDecisionIn,
     _user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
     job_queue: JobQueue = Depends(get_job_queue),
 ) -> OctxTransferOut:
+    transfer = await _transfer(session, transfer_id)
+    _authorize_transfer_owner(transfer, _user)
+    await _authorize_transfer_source(session, transfer, principal)
     transfer = await submit_export_decision(
         session,
         transfer_id,
@@ -209,6 +263,7 @@ async def decide_export(
 async def list_releases(
     source_id: str,
     _user: User = Depends(get_current_user),
+    _authorized_source: Source = Depends(require_path_source_access),
     session: AsyncSession = Depends(get_session),
 ) -> list[dict]:
     from sqlalchemy import select
@@ -244,9 +299,12 @@ async def list_releases(
 async def cancel_transfer(
     transfer_id: str,
     _user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
 ) -> OctxTransferOut:
     transfer = await _transfer(session, transfer_id)
+    _authorize_transfer_owner(transfer, _user)
+    await _authorize_transfer_source(session, transfer, principal)
     if transfer.status is OctxTransferStatus.SWITCHING:
         raise ConflictError("OCTX transfer can no longer be cancelled while switching")
     if transfer.status in {
