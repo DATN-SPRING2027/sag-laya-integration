@@ -19,6 +19,7 @@ from sag_api.core.deps import (
 from sag_api.core.error_taxonomy import ErrorCode
 from sag_api.core.errors import ConfigurationError, ConflictError, NotFoundError
 from sag_api.core.logging import get_logger
+from sag_api.core.principal_assertion import VerifiedPrincipal, require_principal_assertion
 from sag_api.db.models import User
 from sag_api.generation import LLMClient
 from sag_api.sag import EngineManager
@@ -227,13 +228,19 @@ async def messages(
     limit: int = Query(default=svc.MESSAGE_PAGE_DEFAULT, ge=1, le=svc.MESSAGE_PAGE_MAX),
     cursor: str | None = Query(default=None, max_length=svc.MESSAGE_CURSOR_MAX_LENGTH),
     _user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
 ):
     agent = await svc.get_agent(session, agent_id)
     thread = await svc.get_thread(session, agent.id, thread_id)
     page = await svc.list_messages_page(session, thread.id, limit=limit, cursor=cursor)
+    visible_messages = await svc.filter_messages_for_scope(
+        session,
+        page.items,
+        principal=principal,
+    )
     return MessagePageOut(
-        items=[MessageOut.model_validate(message) for message in page.items],
+        items=[MessageOut.model_validate(message) for message in visible_messages],
         next_cursor=page.next_cursor,
         has_more=page.has_more,
     )
@@ -341,6 +348,7 @@ async def ask(
     thread_id: str,
     body: AskRequest,
     _user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
     llm: LLMClient = Depends(get_llm),
@@ -358,6 +366,7 @@ async def ask(
         query=body.query,
         attachments=body.attachments,
         source_ids=body.source_ids,
+        principal=principal,
         llm=llm,
     )
     web_enabled = body.effective_web_enabled
@@ -375,6 +384,7 @@ async def ask(
                 tool_registry=tool_registry,
                 runtime=agent_runtime,
                 knowledge_only=not web_enabled,
+                principal=principal,
             ):
                 last = event
                 yield _sse(event.type, event.data)

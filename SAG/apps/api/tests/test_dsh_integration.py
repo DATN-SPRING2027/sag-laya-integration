@@ -55,11 +55,22 @@ async def _connector_api_resource():
     """Create an API source and remove it through the production cleanup path."""
     from sag_api.core.config import settings
     from sag_api.core.db import SessionLocal
+    from sag_api.core.principal_assertion import VerifiedPrincipal, require_principal_assertion
     from sag_api.db.models import User
     from sag_api.main import create_app
     from sag_api.services.source_service import delete_source
 
     app = create_app()
+    app.dependency_overrides[require_principal_assertion] = lambda: VerifiedPrincipal(
+        subject="dsh-test-user",
+        organization_id="pytest-org",
+        allowed_project_ids=frozenset({"pytest-project"}),
+        issuer="https://pytest.invalid",
+        key_id="pytest-key",
+        token_id="dsh-test-assertion",
+        issued_at=1,
+        expires_at=2,
+    )
     email = f"dsh-api-cleanup-{uuid4().hex}@example.test"
     source_ids: list[str] = []
     engine_manager = None
@@ -672,7 +683,6 @@ async def test_local_discovery_mode_rejects_public_docker_port_binding(
 async def test_connector_token_calls_approved_knowledge_apis(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from sag_api.api.v1 import search as search_api
     from sag_api.sag.dto import ChunkInfo
 
     async with _connector_api_resource() as (
@@ -728,11 +738,6 @@ async def test_connector_token_calls_approved_knowledge_apis(
         read = await client.get(
             f"/api/v1/sources/{source_id}/chunks/chunk-for-dsh",
             headers=connector_headers,
-        )
-        monkeypatch.setitem(
-            app.dependency_overrides,
-            search_api.get_search_acl_scope,
-            lambda: search_api.SearchACLScope(frozenset({source_id})),
         )
         searched = await client.post(
             "/api/v1/search",
@@ -898,7 +903,8 @@ async def test_connector_global_search_is_structured_only(
 
     save_calls = 0
 
-    async def fake_prepare(session, _engine_manager, body, _acl_scope=None):
+    async def fake_prepare(session, _engine_manager, body, *, principal):
+        assert principal.subject == "dsh-test-user"
         source = await session.get(Source, body.source_ids[0])
         assert source is not None
         section = RetrievedSection(
@@ -948,11 +954,6 @@ async def test_connector_global_search_is_structured_only(
         _source_ids,
     ):
         app.state.llm = spy_llm
-        monkeypatch.setitem(
-            app.dependency_overrides,
-            search_module.get_search_acl_scope,
-            lambda: search_module.SearchACLScope(frozenset({source_id})),
-        )
         request = {
             "query": "structured search",
             "source_ids": [source_id],

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 import time
 from collections.abc import AsyncIterator
@@ -316,6 +317,14 @@ def rerank_sections(
 
     semantic_ranks, semantic_by_key = unique_rankings(semantic)
     lexical_ranks, lexical_by_key = unique_rankings(lexical, preferred_keys=exact_keys)
+    semantic_scores: dict[tuple[str, str], float] = {}
+    for section in semantic:
+        key = _section_key(section)
+        if not key[1]:
+            continue
+        score = float(section.score or 0.0)
+        if math.isfinite(score):
+            semantic_scores[key] = max(semantic_scores.get(key, 0.0), score, 0.0)
     candidate_keys = set(semantic_ranks) | set(lexical_ranks)
     if not candidate_keys:
         return RerankResult([], 0, 0, 0, len(lexical))
@@ -338,10 +347,7 @@ def rerank_sections(
             ),
         )
 
-    top_semantic_score = max(
-        (max(0.0, float(section.score or 0.0)) for section in semantic_by_key.values()),
-        default=0.0,
-    )
+    top_semantic_score = max(semantic_scores.values(), default=0.0)
     lexical_scores = {
         key: _lexical_relevance(query, section, analysis=effective)
         for key, section in merged.items()
@@ -354,7 +360,7 @@ def rerank_sections(
         section = merged[key]
         semantic_rank = semantic_ranks.get(key)
         lexical_rank = lexical_ranks.get(key)
-        raw = max(0.0, float(semantic_by_key[key].score or 0.0)) if key in semantic_by_key else 0.0
+        raw = semantic_scores.get(key, 0.0)
         relative_semantic_score = raw / top_semantic_score if top_semantic_score > 0 else 0.0
         lexical_score = lexical_scores[key]
         exact = key in exact_keys

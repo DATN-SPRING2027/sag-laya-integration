@@ -25,6 +25,7 @@ from sag_api.db.models.routing_rag import (
 )
 from sag_api.db.models.setting import Setting
 from sag_api.db.models.source import Source
+from sag_api.db.models.source_project_mapping import SourceProjectMapping
 from sag_api.db.models.universe import (
     ExplorationSession,
     ExplorationStep,
@@ -57,6 +58,7 @@ __all__ = [
     "SearchUnit",
     "Setting",
     "Source",
+    "SourceProjectMapping",
     "SourceSnapshot",
     "StageRun",
     "Thread",

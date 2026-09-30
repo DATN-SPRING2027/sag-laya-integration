@@ -242,3 +242,69 @@ async def _isolate_persisted_jobs():
             )
         )
         await session.commit()
+
+
+@pytest.fixture(autouse=True)
+def _install_authorized_project_for_api_tests(monkeypatch):
+    """Legacy API tests use a verified test principal and explicitly mapped Sources.
+
+    Principal verification itself is exercised by test_acl_runtime.py. Tests that
+    verify missing/invalid assertion behavior remove this dependency override.
+    This fixture must never be copied into application/runtime configuration.
+    """
+    from datetime import UTC, datetime
+
+    from sqlalchemy import select
+
+    from sag_api.api.v1 import sources as sources_api
+    from sag_api.core.db import SessionLocal
+    from sag_api.core.principal_assertion import VerifiedPrincipal, require_principal_assertion
+    from sag_api.db.models import SourceProjectMapping
+    from sag_api.services.source_service import create_source as real_create_source
+
+    principal = VerifiedPrincipal(
+        subject="pytest-user",
+        organization_id="pytest-org",
+        allowed_project_ids=frozenset({"pytest-project"}),
+        issuer="https://pytest.invalid",
+        key_id="pytest-key",
+        token_id="pytest-assertion",
+        issued_at=0,
+        expires_at=2**31,
+    )
+    from sag_api.main import app
+
+    old_override = app.dependency_overrides.get(require_principal_assertion)
+    app.dependency_overrides[require_principal_assertion] = lambda: principal
+
+    async def create_mapped_source(*args, **kwargs):
+        source = await real_create_source(*args, **kwargs)
+        async with SessionLocal() as session:
+            mapping = await session.scalar(
+                select(SourceProjectMapping).where(SourceProjectMapping.source_id == source.id)
+            )
+            if mapping is None:
+                mapping = SourceProjectMapping(
+                    source_id=source.id,
+                    organization_id="pytest-org",
+                    project_id="pytest-project",
+                    state="PENDING",
+                )
+                session.add(mapping)
+            mapping.organization_id = "pytest-org"
+            mapping.project_id = "pytest-project"
+            mapping.state = "CONFIRMED"
+            mapping.confirmed_at = datetime.now(UTC)
+            mapping.confirmed_by = "pytest-owner"
+            mapping.approval_ref = "test-fixture"
+            await session.commit()
+        return source
+
+    monkeypatch.setattr(sources_api, "create_source", create_mapped_source)
+    try:
+        yield
+    finally:
+        if old_override is None:
+            app.dependency_overrides.pop(require_principal_assertion, None)
+        else:
+            app.dependency_overrides[require_principal_assertion] = old_override

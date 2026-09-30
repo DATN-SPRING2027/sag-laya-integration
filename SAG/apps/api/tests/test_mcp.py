@@ -392,9 +392,20 @@ def test_registry_overlay_does_not_pollute_global():
 @pytest.mark.asyncio
 async def test_mcp_binding_validation_and_source_descriptor():
     """agent 挂载外部 MCP 的校验 + 信源 MCP 连接描述端点。"""
+    from sag_api.core.principal_assertion import VerifiedPrincipal, require_principal_assertion
     from sag_api.main import create_app
 
     app = create_app()
+    app.dependency_overrides[require_principal_assertion] = lambda: VerifiedPrincipal(
+        subject="pytest-user",
+        organization_id="pytest-org",
+        allowed_project_ids=frozenset({"pytest-project"}),
+        issuer="https://pytest.invalid",
+        key_id="pytest-key",
+        token_id="pytest-assertion",
+        issued_at=0,
+        expires_at=2**31,
+    )
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
@@ -407,7 +418,8 @@ async def test_mcp_binding_validation_and_source_descriptor():
             assert desc.status_code == 200, desc.text
             body = desc.json()
             assert src["id"] in body["http"]["url"]
-            assert body["stdio"]["env"]["SAG_MCP_SOURCE_ID"] == src["id"]
+            assert body["http"]["headers"]["X-SAG-Principal-Assertion"]
+            assert body["stdio"]["available"] is False
             assert set(body["tools"]) == set(MCP_TOOL_NAMES)
             assert body["tool_details"] == list(MCP_TOOL_DETAILS)
 
@@ -418,7 +430,8 @@ async def test_mcp_binding_validation_and_source_descriptor():
             assert global_body["source_count"] >= 1
             assert "source_id" not in global_body["http"]["url"]
             assert global_body["http"]["url"].endswith("/mcp/")
-            assert global_body["stdio"]["env"] == {}
+            assert "X-SAG-Principal-Assertion" in global_body["http"]["headers"]
+            assert global_body["stdio"]["available"] is False
             assert set(global_body["tools"]) == set(MCP_TOOL_NAMES)
             assert global_body["tool_details"] == list(MCP_TOOL_DETAILS)
 
@@ -449,7 +462,7 @@ async def test_mcp_binding_validation_and_source_descriptor():
                 },
                 json=_initialize_request("jwt-test"),
             )
-            assert jwt_initialized.status_code == 200, jwt_initialized.text
+            assert jwt_initialized.status_code == 401, jwt_initialized.text
 
             connection = await c.get("/api/v1/system/dsh-connection")
             connector_headers = {
@@ -465,7 +478,7 @@ async def test_mcp_binding_validation_and_source_descriptor():
                 },
                 json=_initialize_request("connector-source-scope-test", request_id=2),
             )
-            assert connector_initialized.status_code == 200, connector_initialized.text
+            assert connector_initialized.status_code == 401, connector_initialized.text
 
             agent = (await c.post("/api/v1/agents", headers=A, json={"name": "挂载助手"})).json()
             ok = await c.post(

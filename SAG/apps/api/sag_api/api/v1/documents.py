@@ -25,6 +25,7 @@ from sag_api.core.deps import (
     get_engine_manager,
     get_job_queue,
     get_verified_principal,
+    require_path_source_access,
 )
 from sag_api.core.error_taxonomy import ErrorLayer, ErrorStage
 from sag_api.core.errors import ApiError, ConflictError, ForbiddenError, NotFoundError, ValidationError
@@ -61,7 +62,11 @@ from sag_api.services.document_service import (
 from sag_api.services.source_operation_service import source_document_mutation
 from sag_api.services.source_service import get_source
 
-router = APIRouter(prefix="/sources/{source_id}/documents", tags=["documents"])
+router = APIRouter(
+    prefix="/sources/{source_id}/documents",
+    tags=["documents"],
+    dependencies=[Depends(require_path_source_access)],
+)
 project_router = APIRouter(prefix="/projects/{project_id}/documents", tags=["documents"])
 log = get_logger("documents")
 

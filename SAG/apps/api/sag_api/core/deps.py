@@ -17,6 +17,12 @@ from sag_api.core.db import get_session
 from sag_api.core.error_taxonomy import ErrorCode
 from sag_api.core.errors import AuthError
 from sag_api.core.identity import VerifiedPrincipal
+from sag_api.core.principal_assertion import (
+    VerifiedPrincipal as AssertionVerifiedPrincipal,
+)
+from sag_api.core.principal_assertion import (
+    require_principal_assertion,
+)
 from sag_api.core.security import decode_token
 from sag_api.db.models import User
 from sag_api.generation import LLMClient
@@ -202,3 +208,21 @@ async def get_verified_principal(
     )
     request.state.principal = principal
     return principal
+
+
+async def require_path_source_access(
+    request: Request,
+    principal: AssertionVerifiedPrincipal = Depends(require_principal_assertion),
+    session: AsyncSession = Depends(get_session),
+):
+    """Authorize the route's Source before a handler reads metadata or evidence."""
+    from sag_api.core.errors import NotFoundError
+    from sag_api.services.source_service import get_authorized_source
+
+    source_id = request.path_params.get("source_id") or request.query_params.get("source_id")
+    if not source_id:
+        raise NotFoundError("信源不存在")
+    source = await get_authorized_source(session, principal=principal, source_id=source_id)
+    if source is None:
+        raise NotFoundError("信源不存在")
+    return source

@@ -1,8 +1,8 @@
-"""把 SAG 知识库的检索、实体与原文能力暴露为标准 MCP server。
+"""Expose SAG evidence tools through an authorization-scoped MCP request context.
 
-一个 SAG 实例只构造一个 FastMCP server。每次调用可作用于全部信源，也可以通过
-``source_id`` 收窄到单个信源：HTTP 包装层、进程内 Agent 和 stdio 入口都通过
-``MCPScope`` 注入当前可见信源，工具本身不依赖传输方式。
+HTTP scopes are constructed from verified principals and confirmed Source
+mappings. Process-wide stdio is disabled because it cannot refresh that scope
+for every tool call.
 """
 
 from __future__ import annotations
@@ -182,7 +182,7 @@ def build_source_mcp(
     mcp = FastMCP(
         "sag-knowledge",
         instructions=(
-            "SAG 知识库 MCP：默认检索全部信源，也可向工具传 source_id 限定范围。"
+            "SAG 知识库 MCP：检索本次已授权作用域内的信源，也可向工具传 source_id 进一步限定范围。"
             "先用 list_sources/list_documents 了解资料范围，再用 search、grep、outline、"
             "read 和 get_chunk 获取可引用证据。回答请依据 search 返回的编号证据。"
         ),
@@ -505,29 +505,12 @@ def get_source_mcp() -> FastMCP:
 
 
 async def serve_stdio(source_id: str | None = None) -> None:
-    """运行 stdio server；未提供 source_id 时开放全部信源。"""
-    from sqlalchemy import select
-
-    from sag_api.core.config import settings
-    from sag_api.core.db import SessionLocal
-    from sag_api.db.models import Source
-    from sag_api.sag import EngineManager
-
-    engine_manager = EngineManager(settings)
-    async with SessionLocal() as session:
-        statement = select(Source).order_by(Source.created_at, Source.id)
-        if source_id:
-            statement = statement.where(Source.id == source_id)
-        sources = tuple((await session.execute(statement)).scalars().all())
-    if source_id and not sources:
-        raise SystemExit(f"信源不存在：{source_id}")
-
-    mcp = get_source_mcp()
-    try:
-        with use_scope(engine_manager, sources):
-            await mcp.run_stdio_async()
-    finally:
-        await engine_manager.aclose_all()
+    """Disable stdio until each MCP call can carry a current signed principal."""
+    del source_id
+    raise SystemExit(
+        "SAG MCP stdio is disabled: a process-wide Source ID is not an authorization grant; "
+        "use the authenticated HTTP transport with a current Continuum principal assertion."
+    )
 
 
 def _main() -> None:

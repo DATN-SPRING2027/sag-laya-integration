@@ -221,29 +221,42 @@ async def test_octx_diagnostics_require_the_transfer_creator(diagnostic_sessions
     from types import SimpleNamespace
 
     from sag_api.api.v1.octx import get_transfer_diagnostics
-    from sag_api.core.errors import ForbiddenError
+    from sag_api.core.errors import NotFoundError
+    from sag_api.core.principal_assertion import VerifiedPrincipal
     from sag_api.db.models import OctxTransfer
     from sag_api.enums import OctxTransferDirection, OctxTransferStatus
 
     async with diagnostic_sessions() as session:
         transfer = OctxTransfer(
-            direction=OctxTransferDirection.EXPORT,
+            direction=OctxTransferDirection.IMPORT,
             status=OctxTransferStatus.FAILED,
             checkpoint={"requested_by_user_id": "user-1"},
         )
         session.add(transfer)
         await session.commit()
 
+        principal = VerifiedPrincipal(
+            subject="user-1",
+            organization_id="org-1",
+            allowed_project_ids=frozenset(),
+            issuer="https://pytest.invalid",
+            key_id="pytest-key",
+            token_id="octx-diagnostic-assertion",
+            issued_at=1,
+            expires_at=2,
+        )
         snapshot = await get_transfer_diagnostics(
             transfer.id,
-            SimpleNamespace(id="user-1"),
-            session,
+            user=SimpleNamespace(id="user-1"),
+            principal=principal,
+            session=session,
         )
         assert snapshot["transfer"]["id"] == transfer.id
 
-        with pytest.raises(ForbiddenError):
+        with pytest.raises(NotFoundError):
             await get_transfer_diagnostics(
                 transfer.id,
-                SimpleNamespace(id="user-2"),
-                session,
+                user=SimpleNamespace(id="user-2"),
+                principal=principal,
+                session=session,
             )
