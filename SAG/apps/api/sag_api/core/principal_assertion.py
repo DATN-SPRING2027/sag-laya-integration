@@ -273,8 +273,6 @@ class PrincipalAssertionVerifier:
                         raise ServiceUnavailableError(
                             "Principal verification key set contains an invalid RSA key"
                         ) from error
-                    if public_key.key_size < 2048:
-                        raise ServiceUnavailableError("Principal verification key set contains a weak RSA key")
                     keys[kid] = public_key
             self._keys = keys
             self._cache_expires_at = now + min(max(self.cache_ttl_seconds, 1), 60)

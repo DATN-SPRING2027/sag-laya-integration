@@ -201,11 +201,15 @@ async def test_source_scope_id_lookup_batches_large_requests():
 
 @pytest.mark.asyncio
 async def test_verifier_caches_parsed_rsa_key_and_allows_reusing_bearer_assertion(monkeypatch):
+    from sag_api.core.errors import AuthError
     from sag_api.core.principal_assertion import PrincipalAssertionVerifier
 
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     public_jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(private_key.public_key()))
     public_jwk.update({"kid": "review-key", "use": "sig", "alg": "RS256"})
+    weak_private_key = rsa.generate_private_key(public_exponent=65537, key_size=1024)
+    weak_jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(weak_private_key.public_key()))
+    weak_jwk.update({"kid": "weak-review-key", "use": "sig", "alg": "RS256"})
     original_from_jwk = jwt.algorithms.RSAAlgorithm.from_jwk
     parse_calls = 0
 
@@ -217,7 +221,7 @@ async def test_verifier_caches_parsed_rsa_key_and_allows_reusing_bearer_assertio
     monkeypatch.setattr(jwt.algorithms.RSAAlgorithm, "from_jwk", staticmethod(count_key_parses))
 
     async def load_jwks(_url):
-        return {"keys": [public_jwk]}
+        return {"keys": [public_jwk, weak_jwk]}
 
     verifier = PrincipalAssertionVerifier(
         issuer="https://continuum.test",
@@ -226,17 +230,18 @@ async def test_verifier_caches_parsed_rsa_key_and_allows_reusing_bearer_assertio
         jwks_loader=load_jwks,
     )
     now = int(time.time())
+    claims = {
+        "iss": "https://continuum.test",
+        "aud": "sag-api",
+        "sub": "user-1",
+        "orgId": "org-1",
+        "allowedProjectIds": ["project-1"],
+        "iat": now,
+        "exp": now + 60,
+        "jti": "reusable-bearer-assertion",
+    }
     token = jwt.encode(
-        {
-            "iss": "https://continuum.test",
-            "aud": "sag-api",
-            "sub": "user-1",
-            "orgId": "org-1",
-            "allowedProjectIds": ["project-1"],
-            "iat": now,
-            "exp": now + 60,
-            "jti": "reusable-bearer-assertion",
-        },
+        claims,
         private_key,
         algorithm="RS256",
         headers={"kid": "review-key"},
@@ -246,7 +251,17 @@ async def test_verifier_caches_parsed_rsa_key_and_allows_reusing_bearer_assertio
     second = await verifier.verify(token)
 
     assert first == second
-    assert parse_calls == 1
+    assert parse_calls == 2
+
+    weak_token = jwt.encode(
+        claims,
+        private_key,
+        algorithm="RS256",
+        headers={"kid": "weak-review-key"},
+    )
+    with pytest.raises(AuthError, match="too weak"):
+        await verifier.verify(weak_token)
+    assert parse_calls == 2
 
 
 @pytest.mark.asyncio
