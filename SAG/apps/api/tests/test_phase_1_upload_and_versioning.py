@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 import httpx
 import pytest
+import uuid
 from sqlalchemy import select
 
 from sag_api.core.config import settings
@@ -820,10 +821,11 @@ async def test_mime_signature_text_with_png_image_rejected(client: httpx.AsyncCl
 
 @pytest.mark.asyncio
 async def test_rejected_upload_leaves_no_disk_or_db_garbage(client: httpx.AsyncClient):
-    """Verify that rejected uploads abort fail-fast without creating Document, Job, Snapshot, or Run records (DoD 2)."""
+    """Verify that uploads rejected by MIME verification abort fail-fast without creating Document, Job, Snapshot, or Run records (DoD 2)."""
     project_id = "proj_zero_garbage_test"
     auth_header = make_auth_header(user_id="user_zero", allowed_projects=[project_id])
     idem_key = "key_zero_garbage_check"
+    fake_payload = b"MZ\x90\x00\x03\x00\x00\x00_pretending_to_be_pdf"
 
     res = await client.post(
         f"/api/v1/projects/{project_id}/documents/upload",
@@ -833,9 +835,10 @@ async def test_rejected_upload_leaves_no_disk_or_db_garbage(client: httpx.AsyncC
             "Idempotency-Key": idem_key,
             "X-Continuum-Security-Partition": "public",
         },
-        files={"file": ("exploit.exe", b"MZ\x90\x00\x03\x00\x00\x00", "application/x-msdownload")},
+        files={"file": ("fake.pdf", fake_payload, "application/pdf")},
     )
     assert res.status_code == 422
+    assert "thiếu chữ ký PDF" in res.text or "PDF" in res.text
 
     async with SessionLocal() as session:
         run = (
@@ -847,6 +850,68 @@ async def test_rejected_upload_leaves_no_disk_or_db_garbage(client: httpx.AsyncC
             )
         ).scalar_one_or_none()
         assert run is None, "Rejected upload must not create an IngestionRun record"
+
+        doc = (
+            await session.execute(
+                select(Document).where(Document.project_id == project_id)
+            )
+        ).scalar_one_or_none()
+        assert doc is None, "Rejected upload must not create a Document record"
+
+
+@pytest.mark.asyncio
+async def test_mime_signature_text_with_null_byte_after_8kb_rejected(client: httpx.AsyncClient):
+    """Verify that text files with null bytes beyond the first 8KB are rejected by full payload scanning (P2 review fix)."""
+    project_id = "proj_mime_null_deep_test"
+    auth_header = make_auth_header(user_id="user_mime", allowed_projects=[project_id])
+
+    # 10KB valid ASCII text followed by null byte
+    payload = (b"A" * 10000) + b"\x00" + b"trailing binary content"
+    res = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_mime",
+            "Idempotency-Key": "key_mime_null_deep",
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("deep_null.txt", payload, "text/plain")},
+    )
+    assert res.status_code == 422
+    assert "Tệp nhị phân hoặc hình ảnh trá hình" in res.text
+
+
+@pytest.mark.asyncio
+async def test_legacy_source_upload_rejects_invalid_mime_signature(client: httpx.AsyncClient):
+    """Verify that legacy POST /api/v1/sources/{source_id}/documents also enforces MIME signature checks (P1 review fix)."""
+    uid = uuid.uuid4().hex[:8]
+    async with SessionLocal() as session:
+        user = User(
+            id=f"user_leg_{uid}",
+            email=f"leg_{uid}@example.com",
+            password_hash="dummy_password",
+        )
+        source = Source(
+            id=f"src_leg_{uid}",
+            name="Legacy MIME Test Source",
+            sag_source_config_id=f"cfg_{uid}",
+        )
+        session.add_all([user, source])
+        await session.commit()
+        user_id = user.id
+        source_id = source.id
+
+    token = create_access_token(subject=user_id)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Upload text disguised as PDF to legacy route
+    res = await client.post(
+        f"/api/v1/sources/{source_id}/documents",
+        headers=headers,
+        files={"file": ("fake.pdf", b"This is plain text pretending to be PDF", "application/pdf")},
+    )
+    assert res.status_code == 422
+    assert "thiếu chữ ký PDF" in res.text or "PDF" in res.text
 
 
 @pytest.mark.asyncio

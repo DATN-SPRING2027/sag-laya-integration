@@ -11,7 +11,7 @@ Nghiên cứu này đặt trọng tâm hàng đầu vào việc **thấu hiểu 
 ## 1. Thấu Hiểu Dự Án & Bối Cảnh Hệ Thống (Project Context & System Understanding)
 
 ### 1.1. Sứ Mệnh Và Kiến Trúc Tổng Thể Của SAG Knowledge Routing RAG
-Hệ thống SAG (Semantic Aggregation & Generation) là nền tảng cốt lõi của đồ án tốt nghiệp, giải quyết bài toán truy xuất tri thức ngữ nghĩa thông minh và định tuyến câu hỏi dựa trên Cây Tri Thức (Knowledge Routing Tree). Quy trình nghiệp vụ của SAG được chia thành 12 giai đoạn chiến lược (từ Phase 0 đến Phase 11) được quy định chặt chẽ trong [SAG_Knowledge_Routing_RAG_Workflow_v1.1.md](file:///d:/DoAnTotnghiep/sag-laya-integration/SAG/docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1.md) và [tasks/plan.md](file:///d:/DoAnTotnghiep/sag-laya-integration/SAG/tasks/plan.md):
+Hệ thống SAG (Semantic Aggregation & Generation) là nền tảng cốt lõi của đồ án tốt nghiệp, giải quyết bài toán truy xuất tri thức ngữ nghĩa thông minh và định tuyến câu hỏi dựa trên Cây Tri Thức (Knowledge Routing Tree). Quy trình nghiệp vụ của SAG được chia thành 12 giai đoạn chiến lược (từ Phase 0 đến Phase 11) được quy định chặt chẽ trong [SAG_Knowledge_Routing_RAG_Workflow_v1.1.md](../SAG_Knowledge_Routing_RAG_Workflow_v1.1.md) và [tasks/plan.md](../../tasks/plan.md):
 
 * **Phase 0 — Contracts & Foundations:** Thiết lập các hợp đồng dữ liệu nền tảng, định danh ổn định (stable IDs), cơ chế khóa phân tán chống trùng lặp (`Idempotency-Key`), và ranh giới phân vùng bảo mật (`X-Continuum-Security-Partition`).
 * **Phase 1 — Upload & Versioned Source (Phạm Vi Của Task):** Cửa ngõ tiếp nhận tệp, thẩm định quyền và tính hợp lệ của tệp, lưu trữ bất biến (content-addressed snapshot), ghi nhận phiên bản (`DocumentVersion`) và khởi tạo tiến trình (`IngestionRun`).
@@ -66,26 +66,26 @@ Hệ thống SAG (Semantic Aggregation & Generation) là nền tảng cốt lõi
 Để định hướng công việc chính xác và không bị phân tán nguồn lực, ba ranh giới sau được xác lập dứt khoát:
 
 1. **Chuẩn Hóa Điểm Cuối (Endpoint Choice): Cổng Mới Là Trọng Tâm Duy Nhất:**
-   Cổng mới [`POST /api/v1/projects/{project_id}/documents/upload`](file:///d:/DoAnTotnghiep/sag-laya-integration/SAG/apps/api/sag_api/api/v1/documents.py#L453) là điểm cuối chuẩn thức phục vụ kiến trúc Knowledge Routing RAG (Phase 1). Cổng cũ (`/sources/{source_id}/documents`) là di sản single-user cũ, chỉ cần được gắn guard cơ bản chống crash, không đầu tư kiến trúc vào cổng cũ.
+   Cổng mới [`POST /api/v1/projects/{project_id}/documents/upload`](../../apps/api/sag_api/api/v1/documents.py#L453) là điểm cuối chuẩn thức phục vụ kiến trúc Knowledge Routing RAG (Phase 1). Cổng cũ (`/sources/{source_id}/documents`) là di sản single-user cũ, chỉ cần được gắn guard cơ bản chống crash, không đầu tư kiến trúc vào cổng cũ.
 2. **Xử Lý Scanned PDF Bằng MinerU & MarkItDown: Thuộc Về Phase 2A (Hạ Nguồn):**
-   * Hệ thống **đã tích hợp đầy đủ** Microsoft MarkItDown (`markitdown.MarkItDown`) và MinerU (`MinerUClient`) trong module [sag_api/parsing/](file:///d:/DoAnTotnghiep/sag-laya-integration/SAG/apps/api/sag_api/parsing).
+   * Hệ thống **đã tích hợp đầy đủ** Microsoft MarkItDown (`markitdown.MarkItDown`) và MinerU (`MinerUClient`) trong module [sag_api/parsing/](../../apps/api/sag_api/parsing).
    * Cơ chế đã định tuyến rõ: Tệp `.pdf` được ưu tiên xử lý qua **MinerU** để thực hiện bóc tách bố cục tinh tế, trích xuất bảng biểu và OCR scanned PDF; nếu MinerU gặp sự cố sẽ fallback về MarkItDown.
    * **Ranh giới:** Tác vụ OCR nặng này được thực thi ngầm bởi Worker trong **Phase 2A (Canonical Extraction)**. Khâu tiếp nhận (Phase 1) **tuyệt đối không parse tệp PDF trực tiếp trong luồng HTTP upload** để tránh gây nghẽn kết nối và quá thời gian chờ (timeout) của client.
 3. **Ranh Giới Lưu Tệp (File Storage Boundary):**
-   * Hệ thống **đã có sẵn** cơ chế lưu trữ ảnh chụp bất biến theo mã băm SHA-256 ([_save_snapshot_file](file:///d:/DoAnTotnghiep/sag-laya-integration/SAG/apps/api/sag_api/services/document_service.py#L846)) tại thư mục `.data/engine/snapshots/{hash[:2]}/{hash}/{filename}`.
+   * Hệ thống **đã có sẵn** cơ chế lưu trữ ảnh chụp bất biến theo mã băm SHA-256 ([_save_snapshot_file](../../apps/api/sag_api/services/document_service.py#L846)) tại thư mục `.data/engine/snapshots/{hash[:2]}/{hash}/{filename}`.
    * Task này **kế thừa 100% luồng lưu trữ snapshot hiện hữu**, không xây dựng hệ thống lưu trữ mới. Trọng tâm của task là: **Tệp không hợp lệ phải bị từ chối NGAY TRƯỚC KHI lưu tệp (Fail-Fast Memory Abort), không được ghi bất kỳ byte rác nào xuống đĩa hay cơ sở dữ liệu.**
 
 ---
 
 ## 2. Khảo Sát Hiện Trạng: Dự Án Đang Có Gì? (Current Implementation Audit)
 
-Khảo sát mã nguồn thực tế tại [documents.py](file:///d:/DoAnTotnghiep/sag-laya-integration/SAG/apps/api/sag_api/api/v1/documents.py), [document_service.py](file:///d:/DoAnTotnghiep/sag-laya-integration/SAG/apps/api/sag_api/services/document_service.py), và [parsing/service.py](file:///d:/DoAnTotnghiep/sag-laya-integration/SAG/apps/api/sag_api/parsing/service.py) cho thấy dự án đã sở hữu các khối chức năng nền tảng:
+Khảo sát mã nguồn thực tế tại [documents.py](../../apps/api/sag_api/api/v1/documents.py), [document_service.py](../../apps/api/sag_api/services/document_service.py), và [parsing/service.py](../../apps/api/sag_api/parsing/service.py) cho thấy dự án đã sở hữu các khối chức năng nền tảng:
 
-* **Tầng xác thực quyền tại Cổng Dự Án:** [documents.py:L472-L512](file:///d:/DoAnTotnghiep/sag-laya-integration/SAG/apps/api/sag_api/api/v1/documents.py#L472-L512) đã có xác thực JWT Token qua `VerifiedPrincipal`, kiểm tra Project, kiểm tra Security Partition (`X-Continuum-Security-Partition`), kiểm tra chống mạo danh User, và kiểm tra Tenant.
+* **Tầng xác thực quyền tại Cổng Dự Án:** [documents.py:L472-L512](../../apps/api/sag_api/api/v1/documents.py#L472-L512) đã có xác thực JWT Token qua `VerifiedPrincipal`, kiểm tra Project, kiểm tra Security Partition (`X-Continuum-Security-Partition`), kiểm tra chống mạo danh User, và kiểm tra Tenant.
 * **Đọc luồng giới hạn dung lượng:** Hàm `_read_upload_file_bounded` đã đọc theo từng khối 64KB, hủy luồng và ném `ValidationError (422)` nếu tệp rỗng hoặc vượt trần kích thước cấu hình.
 * **Xác thực chữ ký nhị phân sơ bộ:** Hàm `_verify_mime_signature` đã có kiểm tra magic bytes cho `.pdf` (`%PDF-`), OpenXML (`PK\x03\x04`), `.xls` (OLE2), và cấm 4 tiền tố binary (`MZ`, `ELF`, `PNG`, `JPEG`) đối với text.
-* **Danh mục định dạng cấu hình:** [config.py:L86-L102](file:///d:/DoAnTotnghiep/sag-laya-integration/SAG/apps/api/sag_api/core/config.py#L86-L102) quy định rõ danh sách trắng 15 định dạng: `.md`, `.markdown`, `.txt`, `.text`, `.pdf`, `.docx`, `.pptx`, `.xls`, `.xlsx`, `.csv`, `.tsv`, `.html`, `.htm`, `.json`, `.epub`.
-* **Bộ trích xuất hạ nguồn (Phase 2A):** Module [sag_api/parsing/](file:///d:/DoAnTotnghiep/sag-laya-integration/SAG/apps/api/sag_api/parsing) đã tích hợp sẵn **MinerU** cho PDF và **Microsoft MarkItDown** cho các định dạng văn phòng/văn bản.
+* **Danh mục định dạng cấu hình:** [config.py:L86-L102](../../apps/api/sag_api/core/config.py#L86-L102) quy định rõ danh sách trắng 15 định dạng: `.md`, `.markdown`, `.txt`, `.text`, `.pdf`, `.docx`, `.pptx`, `.xls`, `.xlsx`, `.csv`, `.tsv`, `.html`, `.htm`, `.json`, `.epub`.
+* **Bộ trích xuất hạ nguồn (Phase 2A):** Module [sag_api/parsing/](../../apps/api/sag_api/parsing) đã tích hợp sẵn **MinerU** cho PDF và **Microsoft MarkItDown** cho các định dạng văn phòng/văn bản.
 
 ---
 
@@ -97,8 +97,9 @@ Dựa trên tiêu chuẩn tối giản và hiệu quả cao, hệ thống hiện
 +---------------------------------------------------------------------------------------+
 |                              4 KHOẢNG TRỐNG KỸ THUẬT                                  |
 +-------------------------------------------------------------+-------------------------+
-| [G1] Bảng Magic Bytes chưa bao phủ 15 định dạng cấu hình    | ==> Tệp sai định dạng   |
-|      - Thiếu kiểm tra CSV, TSV, JSON, HTML, EPUB            |     lọt vào Ingestion   |
+| [G1] Nhóm định dạng văn bản mở rộng chưa được bảo vệ chặn   | ==> Tệp nhị phân rác    |
+|      - Cần chuẩn hóa kiểm tra text/CSV/TSV/JSON/HTML        |     lọt vào Ingestion   |
+|      - (Lưu ý: EPUB đã được bao phủ trong nhánh ZIP PK..)   |                         |
 +-------------------------------------------------------------+-------------------------+
 | [G2] Thiếu cơ chế quét Null-Byte (\x00) trong tệp văn bản   | ==> Tệp nhị phân trá    |
 |      - Chỉ cấm 4 tiền tố header, dễ lọt mã nhị phân rác     |     hình gây lỗi parser |
@@ -111,10 +112,10 @@ Dựa trên tiêu chuẩn tối giản và hiệu quả cao, hệ thống hiện
 +-------------------------------------------------------------+-------------------------+
 ```
 
-1. **Khoảng Trống 1: Bảng chữ ký nhị phân chưa bao phủ 10 định dạng còn lại:** Hàm `_verify_mime_signature` mới chỉ kiểm tra 5 định dạng (`.pdf`, `.docx`, `.xlsx`, `.pptx`, `.xls`). Các định dạng như `.csv`, `.tsv`, `.json`, `.html`, `.epub` chưa có bộ quy tắc xác thực tính hợp lệ nội dung.
-2. **Khoảng Trống 2: Nguy cơ tệp nhị phân trá hình tệp văn bản:** Các định dạng text (`.txt`, `.csv`, `.json`, `.md`) hiện chỉ dùng danh sách đen 4 chữ ký (`MZ`, `ELF`, `PNG`, `JPEG`). Nếu kẻ tấn công hoặc người dùng nạp tệp nhị phân khác chứa các byte không in được hoặc null-byte (`\x00`), tệp vẫn lọt qua vào đường ống trích xuất.
-3. **Khoảng Trống 3: Phân mảnh tại tầng dịch vụ ([document_service.py:L831](file:///d:/DoAnTotnghiep/sag-laya-integration/SAG/apps/api/sag_api/services/document_service.py#L831)):** Hàm `_check_upload_file` định nghĩa riêng biệt không gọi MIME check, thông báo lỗi dùng dấu phẩy tiếng Trung `"、"`, và chưa gắn nhãn kiến trúc `ErrorLayer.CLIENT`, `ErrorStage.UPLOAD`.
-4. **Khoảng Trống 4: Thiếu kiểm thử tự động cho khâu Ingress:** Trong tệp [test_document_parsing.py](file:///d:/DoAnTotnghiep/sag-laya-integration/SAG/apps/api/tests/test_document_parsing.py), các bài test hiện tại tập trung kiểm thử kết quả trích xuất của MinerU và MarkItDown ở hạ nguồn, chưa có các ca kiểm thử từ chối tệp độc hại/giả mạo định dạng ở cửa ngõ tiếp nhận.
+1. **Khoảng Trống 1: Bảo vệ nhóm định dạng văn bản và dữ liệu mở rộng:** Hàm `_verify_mime_signature` đã bao phủ `.pdf`, `.xls` và nhóm ZIP container (`.docx`, `.pptx`, `.xlsx`, `.epub` đều bắt đầu bằng chữ ký container `PK\x03\x04`). Tuy nhiên, nhóm văn bản (`.txt`, `.md`, `.markdown`, `.text`, `.csv`, `.tsv`, `.json`, `.html`, `.htm`) cần một cơ chế bảo vệ nhất quán để loại trừ tệp nhị phân rác.
+2. **Khoảng Trống 2: Nguy cơ tệp nhị phân trá hình tệp văn bản:** Các định dạng text (`.txt`, `.csv`, `.json`, `.md`) ban đầu chỉ dùng danh sách đen 4 chữ ký (`MZ`, `ELF`, `PNG`, `JPEG`). Nếu tệp nhị phân chứa null-byte (`\x00`) hoặc mã máy khác nạp vào, tệp vẫn lọt qua vào đường ống trích xuất nếu không quét null-byte trên toàn bộ payload (`b"\x00" in file_bytes`).
+3. **Khoảng Trống 3: Phân mảnh tại tầng dịch vụ ([document_service.py:L831](../../apps/api/sag_api/services/document_service.py#L831)):** Hàm `_check_upload_file` định nghĩa riêng biệt không gọi MIME check, thông báo lỗi dùng dấu phẩy tiếng Trung `"、"`, và chưa gắn nhãn kiến trúc `ErrorLayer.CLIENT`, `ErrorStage.UPLOAD`.
+4. **Khoảng Trống 4: Thiếu kiểm thử tự động cho khâu Ingress:** Trong tệp [test_document_parsing.py](../../apps/api/tests/test_document_parsing.py), các bài test hiện tại tập trung kiểm thử kết quả trích xuất của MinerU và MarkItDown ở hạ nguồn, chưa có các ca kiểm thử từ chối tệp độc hại/giả mạo định dạng ở cửa ngõ tiếp nhận.
 
 ---
 
@@ -124,7 +125,7 @@ Dựa trên tiêu chuẩn tối giản và hiệu quả cao, hệ thống hiện
 * *Rung 1 (YAGNI):* Không viết thêm microservice, không thêm bảng DB mới, không thay đổi schema cơ sở dữ liệu.
 * *Rung 2 (Tái sử dụng):* Tái sử dụng `_read_upload_file_bounded`, `_save_snapshot_file`, `error_taxonomy.py`.
 * *Rung 3 (Stdlib):* Dùng hoàn toàn thư viện chuẩn Python (`struct`, `io`, slicing byte). Không cài thêm thư viện liên kết C nặng nề (`libmagic`).
-* *Rung 4 (Diff tối thiểu):* Tập trung tinh chỉnh trực tiếp tại [documents.py](file:///d:/DoAnTotnghiep/sag-laya-integration/SAG/apps/api/sag_api/api/v1/documents.py) và [document_service.py](file:///d:/DoAnTotnghiep/sag-laya-integration/SAG/apps/api/sag_api/services/document_service.py).
+* *Rung 4 (Diff tối thiểu):* Tập trung tinh chỉnh trực tiếp tại [documents.py](../../apps/api/sag_api/api/v1/documents.py) và [document_service.py](../../apps/api/sag_api/services/document_service.py).
 
 ```text
 +---------------------------------------------------------------------------------------+
@@ -145,7 +146,7 @@ Dựa trên tiêu chuẩn tối giản và hiệu quả cao, hệ thống hiện
 |     ├── XLS: file_bytes[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"                   |
 |     └── Text/CSV/JSON/HTML:                                                           |
 |         ├── Không chứa byte nhị phân cấm (MZ, ELF, PNG, JPG, GIF)                     |
-|         └── Quét b"\x00" trong 8KB đầu tiên (Không cho phép null-byte)                |
+|         └── Quét b"\x00" in file_bytes (Không cho phép null-byte trong toàn bộ tệp)   |
 |         │                                                                             |
 |         ▼                                                                             |
 |  ===> HỢP LỆ: Chuyển tiếp sang _save_snapshot_file & tạo IngestionRun                 |
@@ -160,8 +161,8 @@ Dựa trên tiêu chuẩn tối giản và hiệu quả cao, hệ thống hiện
 | **PDF** | `.pdf` | `file_bytes.startswith(b"%PDF-")` | Độ dài tệp tối thiểu $\ge 8$ bytes. |
 | **OpenXML / EPUB** | `.docx`, `.pptx`, `.xlsx`, `.epub` | Bắt đầu bằng chữ ký ZIP container: `b"PK\x03\x04"`, `b"PK\x05\x06"`, hoặc `b"PK\x07\x08"`. | Khước từ ZIP rỗng (dưới 30 bytes). |
 | **Bảng tính cũ** | `.xls` | Bắt đầu bằng OLE2: `b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"`. | Khước từ tệp text đổi đuôi `.xls`. |
-| **Văn bản thuần** | `.txt`, `.md`, `.markdown`, `.text` | Phủ định: Không chứa chữ ký `b"MZ"`, `b"\x7fELF"`, `b"\x89PNG"`, `b"\xff\xd8\xff"`. | Khẳng định: `b"\x00" not in file_bytes[:8192]` và giải mã được qua UTF-8/ASCII. |
-| **Dữ liệu bảng** | `.csv`, `.tsv` | Tương tự văn bản thuần (không chứa chữ ký binary/ảnh). | Quét 8KB đầu không chứa null byte `\x00`. |
+| **Văn bản thuần** | `.txt`, `.md`, `.markdown`, `.text` | Phủ định: Không chứa chữ ký `b"MZ"`, `b"\x7fELF"`, `b"\x89PNG"`, `b"\xff\xd8\xff"`. | Khẳng định: `b"\x00" not in file_bytes` (quét toàn bộ payload). |
+| **Dữ liệu bảng** | `.csv`, `.tsv` | Tương tự văn bản thuần (không chứa chữ ký binary/ảnh). | Quét toàn bộ payload không chứa null byte `\x00`. |
 | **Dữ liệu cấu trúc** | `.json` | Không chứa chữ ký nhị phân; loại bỏ khoảng trắng đầu/cuối. | Ký tự đầu không rỗng là `{` hoặc `[` và kết thúc bằng `}` hoặc `]`. |
 | **Siêu văn bản** | `.html`, `.htm` | Không chứa chữ ký nhị phân; cho phép UTF-8 BOM. | Chứa thẻ đánh dấu (`<html`, `<!doctype`, `<head`, `<body`) trong 2KB đầu. |
 
