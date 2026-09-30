@@ -59,10 +59,31 @@ the branch disposition table records the combined implementation state.
 | Agent asks, OpenAI-compatible chat and history | Principal scope is propagated to Source selection. Assistant history is returned only when all cited SAG Sources and Sources recorded in local knowledge-tool trace metadata remain authorized; ambiguous knowledge-tool provenance is hidden. | Review every agent tool and remote MCP service grant; run cross-Project integration tests. |
 | Jobs | Principal required; source/document jobs resolve their Source mapping before returning job metadata. | Validate owner behavior for source-less internal jobs. |
 
-The branch contains contract/runtime fixtures only. Production Continuum
-issuer/JWKS, signed assertion propagation, approved Project mapping data,
-mapping-writer authority, production migration approval and real revocation/
-leakage evidence are not present. Therefore **P1 remains NOT DONE**.
+The branch contains runtime ACL implementation and local contract/runtime
+fixtures. Production Continuum issuer/JWKS, signed assertion propagation,
+approved Project mapping data, mapping-writer authority, production migration
+approval and real revocation/leakage evidence are not present. Therefore
+production ACL rollout acceptance remains open.
+
+## Operational rollout gates
+
+Track these production acceptance gates in this security inventory, not as
+implementation subtasks in `tasks/todo.md`. They govern rollout of the runtime
+ACL and do not block independent Workflow Phase 2 or Phase 3 engineering.
+
+- Obtain the approved Continuum issuer/audience/JWKS configuration and verify
+  trusted assertion propagation, key rotation and failure behavior.
+- Obtain DB/data-owner approval for the DDL and migration window; confirm
+  Project-to-Source mappings through the owner-approved mapping/backfill and
+  revoke workflow. No production migration or backfill is implied by this PR.
+- Run staging leakage and revocation tests with real principals and data across
+  Project/Organization boundaries and every reachable evidence path.
+- Keep MCP stdio and global Universe manifest/rebuild disabled until their
+  paths enforce Project-scoped graph authorization.
+
+In earlier PR notes, **P1** means the Priority 1 runtime ACL rollout package;
+it does not mean **Workflow Phase 1 — Upload & Versioned Source**. Phase 1
+completion remains tracked against its own checklist and evidence.
 
 ## Required request flow
 

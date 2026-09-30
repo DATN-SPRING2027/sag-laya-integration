@@ -64,14 +64,11 @@ Nguồn chuẩn: [Workflow v1.1](../docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1
 
 ## Phase 4 — Retrieval Engine v1
 
-- [ ] Chạy global hybrid search với **production-ready** scope/filter ACL, chưa phụ thuộc tree.
+- [ ] Chạy global hybrid search với scope/filter ACL, chưa phụ thuộc tree.
 - [x] Global retrieval dùng RRF rank fusion; không cộng trực tiếp raw dense/sparse scores khác scale.
 - [x] Relevance gate semantic-only bất biến khi retriever score được scale dương; có regression test.
 - [x] Trước dense/lexical candidate generation, giao Project được ký với mapping CONFIRMED Project→Source; client Source IDs chỉ thu hẹp scope.
-- [ ] Deploy BE/Continuum assertion signer/JWKS thật; security owners duyệt issuer/audience/RS256/lifetime/replay/key-rotation contract.
-- [ ] DB/data owners duyệt DDL và backfill mapping; xác nhận Source cũ unmapped tiếp tục bị chặn; chốt mapping writer/revoke authority.
-- [ ] Kiểm tra toàn bộ production evidence paths bằng real-principal cross-Project/cross-Organization leakage tests. Mock/contract tests chưa đạt P1.
-- [ ] Giữ MCP stdio và Universe global manifest/rebuild tắt cho tới khi có graph authorization theo Project.
+Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL evidence-path inventory](../docs/security/acl-evidence-path-inventory.md).
 - [ ] Collapse exact/near duplicate; kiểm tra MMR giữ evidence đa dạng.
 - [ ] Giới hạn candidate rerank và chỉ rerank khi còn latency budget.
 - [ ] Build context theo coverage/diversity và token budget.
@@ -82,11 +79,11 @@ Nguồn chuẩn: [Workflow v1.1](../docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1
 
 ### P4 task proposal — Global retrieval, ACL và fusion
 
-- [x] **Quyết định ACL:** BE/Continuum là authority; SAG nhận signed principal assertion đã xác minh và mapping allowed Project→Source. Project→Source là boundary hiện tại; client `source_ids` chỉ narrowing filter. Runtime verifier/mapping chưa có trong repo.
+- [x] **Quyết định ACL:** BE/Continuum là authority; SAG nhận signed principal assertion đã xác minh và mapping allowed Project→Source. Project→Source là boundary hiện tại; client `source_ids` chỉ narrowing filter. Runtime verifier/resolver đã được triển khai; trust cấu hình và mapping production vẫn thuộc acceptance vận hành.
 - [x] Thêm seam `SearchACLScope.authorized_source_ids`; explicit request được giao với scope trước khi truy vấn Source. Không gửi `source_ids` thì chọn candidate chỉ trong tập authorized, vẫn theo candidate limit hiện có.
 - [x] Dense và lexical nhận cùng candidate Source list trước candidate generation/top-k; giữ logical-delete/reprocess prefilter hiện tại.
 - [x] Fail closed khi scope thiếu (`503` trên request/`error` event trên SSE); scope rỗng hoặc request giao rỗng trả 0 evidence và không gọi retriever.
-- [ ] Wire signed assertion verifier, real Project→Source mapping, unmapped-source denial và legacy backfill; đây là blocker runtime/P1, không giải quyết bằng fake resolver.
+- [x] Wire signed assertion verifier, Project→Source mapping resolver và unmapped-source denial; kiểm tra bằng contract/runtime tests. Owner-approved backfill script có sẵn, production approval/run được theo dõi riêng.
 - [x] Fuse semantic + lexical bằng RRF, không cộng raw score khác scale; score đầu ra chuẩn hóa về `[0, 1]` và ghi `fusion_method`/candidate counts.
 - [x] Dedupe candidate theo source/chunk và dùng tie-break xác định; giữ max semantic score, representative nội dung ổn định/dài hơn và ưu tiên exact lexical trước expansion-only match.
 - [x] Chuẩn hóa semantic-only relevance gate theo tỷ lệ so với score cao nhất trong cùng candidate set; test xác nhận scale `0.95/0.8` và `0.00095/0.0008` giữ cùng kết quả.
@@ -95,10 +92,9 @@ Nguồn chuẩn: [Workflow v1.1](../docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1
 - [x] Global `/search` và `/search/stream` bỏ event/graph retrieval trong P4; response giữ graph arrays rỗng. Source-scoped P3 path không đổi.
 - [x] Relevance/search strategy regressions: `test_retrieval_relevance.py`, `test_search_strategy.py`, `test_search_stream.py` pass.
 - [x] ACL seam regressions: implicit scope, requested∩authorized, unauthorized/empty request, dense/lexical cùng scope, empty authorization, missing scope fail-closed trên `/search` và `/search/stream`; test dùng fake scope.
-- [ ] Production ACL leakage/revoke/backfill tests với real assertion và Project→Source mapping; test double không được tính là P1/runtime acceptance.
 - [x] Không dùng Knowledge Graph/Tree trong global P4 retrieval; không sửa ingestion/index lane hoặc shared contract/config.
 
-**Trạng thái:** P4 retrieval/fusion và fail-closed integration seam đã có code/tests để review. ACL runtime/P1 production acceptance vẫn **BLOCKED** cho tới khi real assertion, Project→Source mapping/backfill và staging leakage/revocation tests được nghiệm thu; PR #9 không tự chứng minh P1 hoàn tất.
+**Trạng thái:** P4 retrieval/fusion và ACL runtime code có contract/runtime tests để review. Production ACL rollout acceptance vẫn **BLOCKED** cho tới khi có signer/JWKS thật, mapping/backfill được duyệt và staging leakage/revocation tests đạt. Đây là cổng vận hành ACL; **P1** trong PR notes chỉ Priority 1 runtime ACL, không phải Phase 1 — Upload & Versioned Source. Chi tiết acceptance nằm trong [ACL evidence-path inventory](../docs/security/acl-evidence-path-inventory.md).
 
 ## Checkpoint A — SEARCH_READY end-to-end
 
