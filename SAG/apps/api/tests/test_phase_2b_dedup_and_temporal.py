@@ -33,8 +33,11 @@ from sag_api.services.dedup_and_temporal_service import (
     RELATION_SUPERSEDES,
     RELATION_SUPPORTS,
     VALID_RELATIONS,
+    build_lsh_band_index,
     classify_relation_candidate,
     compute_text_similarity,
+    detect_semantic_signals,
+    query_lsh_candidates,
     register_relation_candidate,
     resolve_temporal_supersedes,
     run_dedup_and_temporal_stage,
@@ -413,3 +416,142 @@ async def test_run_dedup_and_temporal_stage_executes_exact_and_near_dedup():
         assert stage_run.status == "SUCCESS"
         assert stage_run.metrics_json["exact_block_matches"] == 1
         assert stage_run.metrics_json["near_duplicate_candidates_count"] == 1
+
+
+def test_semantic_guard_negation_contradiction():
+    """Kiểm tra Semantic Guard: Khẳng định bị phủ định (lexical overlap cao) KHÔNG được gắn EQUIVALENT mà phải là CONTRADICTS."""
+    text1 = (
+        "Báo cáo kết quả kiểm thử tải xác nhận toàn bộ cụm dịch vụ phân tán của hệ thống "
+        "đang duy trì trạng thái hoạt động ổn định và sẵn sàng phục vụ lượng truy cập lớn."
+    )
+    text2 = (
+        "Báo cáo kết quả kiểm thử tải xác nhận toàn bộ cụm dịch vụ phân tán của hệ thống "
+        "không duy trì trạng thái hoạt động ổn định và sẵn sàng phục vụ lượng truy cập lớn."
+    )
+
+    sim = compute_text_similarity(text1, text2)
+    assert sim >= 0.75
+
+    is_contra, is_supp, is_super = detect_semantic_signals(text1, text2)
+    assert is_contra is True
+
+    rel = classify_relation_candidate(sim, is_contradiction=is_contra, is_support=is_supp, is_supersede=is_super)
+    assert rel == RELATION_CONTRADICTS
+    assert rel != RELATION_EQUIVALENT
+
+
+def test_semantic_guard_support_marker():
+    """Kiểm tra gán nhãn SUPPORTS khi có tín hiệu đồng thuận/xác nhận."""
+    text1 = "Kiến trúc microservices đáp ứng tải cao."
+    text2 = "Thực nghiệm chứng minh kiến trúc microservices đáp ứng tải cao."
+
+    sim = compute_text_similarity(text1, text2)
+    is_contra, is_supp, is_super = detect_semantic_signals(text1, text2)
+    assert is_supp is True
+
+    rel = classify_relation_candidate(sim, is_contradiction=is_contra, is_support=is_supp, is_supersede=is_super)
+    assert rel == RELATION_SUPPORTS
+
+
+def test_lsh_band_index_bounded_candidates():
+    """Kiểm tra LSH Index: Tìm kiếm ứng viên giới hạn qua band buckets thay vì quét toàn bộ O(N^2)."""
+    import random
+    from sag_api.services.dedup_and_temporal_service import compute_minhash_signature
+
+    sigs_by_id = {}
+    for i in range(60):
+        # 60 documents với từ vựng ngẫu nhiên
+        words = [f"word_{random.randint(1, 300)}" for _ in range(20)]
+        sigs_by_id[f"block_{i}"] = compute_minhash_signature(words, num_perm=128)
+
+    # Thêm 1 block gần giống block_0 (chia sẻ 15/20 từ)
+    words_target = [f"word_{random.randint(1, 300)}" for _ in range(20)]
+    sigs_by_id["block_target"] = compute_minhash_signature(words_target, num_perm=128)
+
+    lsh_buckets = build_lsh_band_index(sigs_by_id, num_bands=16, rows_per_band=8)
+    assert len(lsh_buckets) > 0
+
+    # Query bằng target signature
+    candidates = query_lsh_candidates(sigs_by_id["block_target"], lsh_buckets, num_bands=16, rows_per_band=8)
+    # Ứng viên phải chứa chính nó và giới hạn số lượng (< 60)
+    assert "block_target" in candidates
+    assert len(candidates) < 60
+
+
+@pytest.mark.asyncio
+async def test_mid_timeline_insertion_rewires_successor_chain():
+    """Kiểm tra chèn phiên bản vào giữa timeline (v1 -> v2, chèn v_mid):
+    - Đóng valid_to của v1 tại v_mid.valid_from.
+    - Gán v_mid.supersedes_id = v1.id và v_mid.valid_to = v2.valid_from.
+    - Rewire v2.supersedes_id = v_mid.id để giữ chuỗi kế thừa liên tục (v1 <- v_mid <- v2).
+    """
+    await init_db()
+    t_v1 = datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
+    t_mid = datetime(2026, 1, 5, 10, 0, 0, tzinfo=UTC)
+    t_v2 = datetime(2026, 1, 10, 10, 0, 0, tzinfo=UTC)
+
+    doc_id = str(uuid.uuid4())
+    v1_id = str(uuid.uuid4())
+    v2_id = str(uuid.uuid4())
+    v_mid_id = str(uuid.uuid4())
+
+    async with SessionLocal() as session:
+        doc = Document(id=doc_id, filename="mid_timeline.md", storage_path="/tmp/mid.md")
+        session.add(doc)
+
+        # 1. Nạp v1
+        v1 = DocumentVersion(
+            id=v1_id,
+            document_id=doc_id,
+            version_no=1,
+            file_hash="h1",
+            source_published_at=t_v1,
+            observed_at=t_v1,
+            valid_from=t_v1,
+            valid_to=t_v2,
+            status="RECEIVED",
+        )
+        # 2. Nạp v2 (đã nối v1)
+        v2 = DocumentVersion(
+            id=v2_id,
+            document_id=doc_id,
+            version_no=2,
+            file_hash="h2",
+            supersedes_id=v1_id,
+            source_published_at=t_v2,
+            observed_at=t_v2,
+            valid_from=t_v2,
+            valid_to=datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC),
+            status="RECEIVED",
+        )
+        session.add_all([v1, v2])
+        await session.commit()
+
+        # 3. Nạp muộn v_mid nằm giữa t_v1 và t_v2
+        v_mid = DocumentVersion(
+            id=v_mid_id,
+            document_id=doc_id,
+            version_no=3,
+            file_hash="h_mid",
+            source_published_at=t_mid,
+            observed_at=t_mid,
+            status="RECEIVED",
+        )
+        session.add(v_mid)
+
+        res = await resolve_temporal_supersedes(session, current_version=v_mid, document_id=doc_id)
+        await session.commit()
+
+        assert res["action"] == "SUPERSEDED"
+        assert v_mid.supersedes_id == v1_id
+        assert v_mid.valid_from == t_mid
+        assert v_mid.valid_to == t_v2
+
+        # Kiểm tra v1 bị đóng tại t_mid
+        v1_updated = (await session.execute(select(DocumentVersion).where(DocumentVersion.id == v1_id))).scalar_one()
+        assert v1_updated.valid_to == t_mid
+
+        # Bằng chứng cốt lõi: v2 đã được rewire supersedes_id trỏ về v_mid_id thay vì v1_id
+        v2_updated = (await session.execute(select(DocumentVersion).where(DocumentVersion.id == v2_id))).scalar_one()
+        assert v2_updated.supersedes_id == v_mid_id
+

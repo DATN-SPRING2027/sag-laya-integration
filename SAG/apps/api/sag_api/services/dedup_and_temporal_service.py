@@ -85,6 +85,92 @@ def compute_text_similarity(text1: str, text2: str) -> float:
     return estimate_minhash_similarity(sig1, sig2)
 
 
+NEGATION_WORDS = {
+    "not", "no", "never", "none", "neither", "nor", "cannot", "can't", "without",
+    "không", "chẳng", "chưa", "không phải", "đối lập", "ngược lại", "phủ nhận",
+    "contrary", "contradicts", "false", "deprecated", "prohibited", "bị cấm",
+}
+
+SUPPORT_MARKERS = {
+    "đồng thuận", "chứng minh", "xác nhận", "cụ thể", "minh chứng", "phù hợp",
+    "supports", "confirms", "verifies", "proves", "endorses", "consistent with",
+    "furthermore", "moreover", "in addition", "đồng thời",
+}
+
+SUPERSEDE_MARKERS = {
+    "thay thế", "thay bằng", "bãi bỏ", "supersedes", "replaces", "deprecated by",
+}
+
+
+def detect_semantic_signals(text1: str, text2: str) -> tuple[bool, bool, bool]:
+    """Detect contradiction, support, or supersede signals between two texts.
+
+    Returns:
+        (is_contradiction, is_support, is_supersede)
+    """
+    t1_lower = text1.lower()
+    t2_lower = text2.lower()
+    words1 = set(re.findall(r"\w+", t1_lower))
+    words2 = set(re.findall(r"\w+", t2_lower))
+
+    # Detect polarity / negation flip: one text negates a claim present in the other
+    neg1 = words1 & NEGATION_WORDS
+    neg2 = words2 & NEGATION_WORDS
+
+    is_contradiction = False
+    if (neg1 and not neg2) or (neg2 and not neg1):
+        is_contradiction = True
+    elif any(kw in t1_lower or kw in t2_lower for kw in ["contradicts", "trái ngược", "đối lập"]):
+        is_contradiction = True
+
+    is_support = False
+    if any(m in t1_lower or m in t2_lower for m in SUPPORT_MARKERS):
+        is_support = True
+
+    is_supersede = False
+    if any(kw in t1_lower or kw in t2_lower for kw in SUPERSEDE_MARKERS):
+        is_supersede = True
+
+    return is_contradiction, is_support, is_supersede
+
+
+def build_lsh_band_index(
+    signatures_by_id: dict[str, list[int]],
+    *,
+    num_bands: int = 16,
+    rows_per_band: int = 8,
+) -> dict[tuple[int, tuple], list[str]]:
+    """Index MinHash signatures into LSH band hash buckets for sub-quadratic candidate search."""
+    buckets: dict[tuple[int, tuple], list[str]] = {}
+    for item_id, sig in signatures_by_id.items():
+        if len(sig) < num_bands * rows_per_band:
+            continue
+        for b in range(num_bands):
+            band_key = (b, tuple(sig[b * rows_per_band : (b + 1) * rows_per_band]))
+            if band_key not in buckets:
+                buckets[band_key] = []
+            buckets[band_key].append(item_id)
+    return buckets
+
+
+def query_lsh_candidates(
+    query_sig: list[int],
+    lsh_buckets: dict[tuple[int, tuple], list[str]],
+    *,
+    num_bands: int = 16,
+    rows_per_band: int = 8,
+) -> set[str]:
+    """Retrieve candidate IDs sharing at least one LSH band collision with query signature."""
+    candidates = set()
+    if len(query_sig) < num_bands * rows_per_band:
+        return candidates
+    for b in range(num_bands):
+        band_key = (b, tuple(query_sig[b * rows_per_band : (b + 1) * rows_per_band]))
+        if band_key in lsh_buckets:
+            candidates.update(lsh_buckets[band_key])
+    return candidates
+
+
 def get_block_type_threshold(block_type: str) -> float:
     """Return near-dedup similarity threshold by data type according to Phase 2B plan.
 
@@ -207,15 +293,38 @@ async def resolve_temporal_supersedes(
 
     if active_at_start is not None:
         # Normal newer or mid-timeline version: current supersedes active_at_start
+        orig_active_valid_to = active_at_start.valid_to or max_valid_to
         current_version.supersedes_id = active_at_start.id
         current_version.valid_from = cur_start
-        current_version.valid_to = active_at_start.valid_to or max_valid_to
+        current_version.valid_to = orig_active_valid_to
         if v_from:
             active_at_start.valid_from = v_from
         active_at_start.valid_to = cur_start
         session.add(active_at_start)
+
+        # Rewire successor versions that were pointing to active_at_start
+        # (e.g. v1 -> v2, inserting v_mid between their dates leaves v2 pointing to v_mid, maintaining continuous chain)
+        for v in all_prev:
+            if v.id != current_version.id and v.supersedes_id == active_at_start.id:
+                raw_v = (
+                    getattr(v, "source_published_at", None)
+                    or getattr(v, "observed_at", None)
+                    or getattr(v, "valid_from", None)
+                )
+                v_start = raw_v.replace(tzinfo=UTC) if raw_v and raw_v.tzinfo is None else raw_v
+                if v_start and v_start >= cur_start:
+                    v.supersedes_id = current_version.id
+                    session.add(v)
+
         action = "SUPERSEDED"
-        active_id = current_version.id
+        active_v = next(
+            (
+                v for v in all_prev
+                if v.valid_to and (v.valid_to.replace(tzinfo=UTC) if v.valid_to.tzinfo is None else v.valid_to) >= max_valid_to
+            ),
+            current_version,
+        )
+        active_id = active_v.id
     else:
         # Out-of-order older version arriving late, or gap in timeline
         future_vers = []
@@ -321,15 +430,40 @@ async def run_dedup_and_temporal_stage(
     near_dup_candidates: list[dict[str, Any]] = []
     prior_hashes = {b.content_hash for b in prior_blocks if b.content_hash}
 
+    # Precompute MinHash signatures once for all prior blocks and build LSH index
+    prior_sig_by_id: dict[str, list[int]] = {}
+    prior_by_id: dict[str, CanonicalBlock] = {}
+    for pb in prior_blocks:
+        prior_by_id[pb.id] = pb
+        t = re.findall(r"\w+", pb.normalized_text.lower())
+        prior_sig_by_id[pb.id] = compute_minhash_signature(t, num_perm=128)
+
+    lsh_index = build_lsh_band_index(prior_sig_by_id, num_bands=16, rows_per_band=8)
+
     for b in curr_blocks:
         if b.content_hash and b.content_hash in prior_hashes:
             exact_block_matches += 1
         else:
             threshold = get_block_type_threshold(b.block_type)
-            for pb in prior_blocks:
-                sim = compute_text_similarity(b.normalized_text, pb.normalized_text)
+            b_tokens = re.findall(r"\w+", b.normalized_text.lower())
+            b_sig = compute_minhash_signature(b_tokens, num_perm=128)
+
+            # Query bounded candidates using LSH bands
+            candidate_ids = query_lsh_candidates(b_sig, lsh_index, num_bands=16, rows_per_band=8)
+            cand_blocks = [prior_by_id[cid] for cid in candidate_ids if cid in prior_by_id]
+            eval_blocks = cand_blocks if (cand_blocks or len(prior_blocks) > 30) else prior_blocks
+
+            for pb in eval_blocks:
+                pb_sig = prior_sig_by_id.get(pb.id)
+                sim = estimate_minhash_similarity(b_sig, pb_sig) if pb_sig else compute_text_similarity(b.normalized_text, pb.normalized_text)
                 if sim >= threshold:
-                    rel = classify_relation_candidate(sim)
+                    is_contra, is_supp, is_super = detect_semantic_signals(b.normalized_text, pb.normalized_text)
+                    rel = classify_relation_candidate(
+                        sim,
+                        is_contradiction=is_contra,
+                        is_supersede=is_super,
+                        is_support=is_supp,
+                    )
                     near_dup_candidates.append({
                         "source_block_id": b.id,
                         "target_block_id": pb.id,
@@ -341,8 +475,11 @@ async def run_dedup_and_temporal_stage(
                         "similarity": round(sim, 3),
                         "relation": rel,
                         "relation_type": rel,
+                        "is_contradiction": is_contra,
+                        "is_support": is_supp,
+                        "is_supersede": is_super,
                         "auto_merged": False,
-                        "evidence": f"MinHash similarity {sim:.3f} >= {threshold} on {b.block_type}",
+                        "evidence": f"MinHash similarity {sim:.3f} >= {threshold} on {b.block_type} [relation={rel}]",
                     })
                     break  # Found best candidate match for this block
 
