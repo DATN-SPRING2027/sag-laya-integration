@@ -471,12 +471,16 @@ def _adapt_tool(host_tool, host_context: HostToolContext, citations: list[dict])
         if host_tool.meta.name == "search_context":
             host_context.search_context_called = True
             host_context.search_context_no_answer_reason = None
-        host_context.citation_offset = len(citations)
+        host_context.citation_offset = max(host_context.citation_offset, _citation_number_high_water(citations))
         result = await host_tool.invoke(dict(arguments), host_context)
         if host_tool.meta.name == "search_context":
             reason = result.data.get("no_answer_reason")
             host_context.search_context_no_answer_reason = str(reason) if reason else None
         citations.extend(result.citations)
+        host_context.citation_offset = max(
+            host_context.citation_offset,
+            _citation_number_high_water(result.citations),
+        )
         consumed = estimate_tokens(
             json.dumps(
                 {
@@ -488,7 +492,12 @@ def _adapt_tool(host_tool, host_context: HostToolContext, citations: list[dict])
                 separators=(",", ":"),
             )
         )
-        host_context.evidence_token_budget = max(0, host_context.evidence_token_budget - consumed)
+        remaining_budget = host_context.evidence_token_budget
+        if remaining_budget is None:
+            from sag_api.core.config import settings
+
+            remaining_budget = settings.llm_context_window
+        host_context.evidence_token_budget = max(0, remaining_budget - consumed)
         count = int(result.data.get("section_count") or len(result.citations) or 0)
         raw_external_references = result.data.get("external_references")
         external_references = (
@@ -629,6 +638,17 @@ def _adapt_tool(host_tool, host_context: HostToolContext, citations: list[dict])
             execution_mode=ToolExecutionMode.SEQUENTIAL,
         ),
         executor=execute,
+    )
+
+
+def _citation_number_high_water(citations: list[dict]) -> int:
+    return max(
+        (
+            number
+            for citation in citations
+            if isinstance((number := citation.get("n")), int) and not isinstance(number, bool)
+        ),
+        default=0,
     )
 
 
@@ -990,7 +1010,18 @@ async def generate_stream(
                     }
                     terminal = True
 
-                yield _stream_event(event, payload=output_payload)
+                if event.type == EventType.RUN_COMPLETED and requires_grounded_answer:
+                    delta_data = event.to_dict()
+                    delta_data.update(
+                        type=EventType.MESSAGE_DELTA.value,
+                        payload={"role": "assistant", "delta": canonical_answer},
+                    )
+                    yield AgentStreamEvent(type=EventType.MESSAGE_DELTA.value, data=delta_data)
+                    completed_event = _stream_event(event, payload=output_payload)
+                    completed_event.data["sequence"] = event.sequence + 1
+                    yield completed_event
+                else:
+                    yield _stream_event(event, payload=output_payload)
     finally:
         if handle is not None and not terminal and not handle.done:
             handle.cancel()

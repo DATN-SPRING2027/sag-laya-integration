@@ -310,7 +310,13 @@ async def test_search_tool_reuses_direct_event_recall_and_loads_traceable_eviden
     from sag_api.tools import builtin
 
     await init_db()
-    monkeypatch.setattr(builtin, "resolve_traceable_evidence", _resolve_test_locators)
+    resolution_inputs = []
+
+    async def track_resolved_sections(sections, sources):
+        resolution_inputs.append([section.chunk_id for section in sections])
+        return await _resolve_test_locators(sections, sources)
+
+    monkeypatch.setattr(builtin, "resolve_traceable_evidence", track_resolved_sections)
     class SparseEventEngine:
         event_score_calls = 0
         chunk_reads: list[tuple[str, str]] = []
@@ -367,11 +373,12 @@ async def test_search_tool_reuses_direct_event_recall_and_loads_traceable_eviden
     source = SimpleNamespace(id="source-1", name="人类简史", sag_source_config_id="sc-1"[:36])
     result = await SearchContextTool().invoke(
         {"query": "帝国发展", "top_k": 2},
-        ToolContext(engine_manager=engine, sources=[source], evidence_token_budget=10_000),
+        ToolContext(engine_manager=engine, sources=[source]),
     )
 
     assert engine.event_score_calls == 1
     assert engine.chunk_reads == [("sc-1", "event-chunk")]
+    assert resolution_inputs == [["nearby-chunk"], ["event-chunk"]]
     assert result.data["event_candidates"] == 1
     assert result.data["event_count"] == 1
     assert result.citations[0]["chunk_id"] == "event-chunk"
@@ -387,6 +394,32 @@ async def test_search_tool_reuses_direct_event_recall_and_loads_traceable_eviden
     assert result.content.startswith("[1] 事项：帝国运转的信息需求与大脑存储局限")
     assert "摘要：帝国依赖大规模信息处理体系维持扩张与治理。" in result.content
     assert "原文证据：\n维持复杂社会秩序需要存储并处理大量行政信息。" in result.content
+
+
+@pytest.mark.asyncio
+async def test_tool_citation_numbers_stay_monotonic_after_context_prunes_old_citations():
+    class NumberedCitationTool(Tool):
+        meta = ToolMeta(name="numbered", description="Returns one numbered citation.")
+
+        async def invoke(self, _args, ctx):
+            number = ctx.citation_offset + 1
+            citation = {"n": number, "chunk_id": f"chunk-{number}"}
+            return ToolResult(content=f"Evidence [{number}]", citations=[citation])
+
+    citations = []
+    context = ToolContext(engine_manager=SimpleNamespace())
+    adapted = _adapt_tool(NumberedCitationTool(), context, citations)
+    runtime_context = SimpleNamespace(cancellation=SimpleNamespace(raise_if_cancelled=lambda: None))
+
+    first = await adapted.execute({}, runtime_context)
+    assert citations[0]["n"] == 1
+    assert "[1]" in first.content
+
+    citations.clear()  # transform_context can prune citations no longer in the window.
+    second = await adapted.execute({}, runtime_context)
+
+    assert citations[0]["n"] == 2
+    assert "[2]" in second.content
 
 
 def test_visible_sources_mount_builtin_knowledge_tools():

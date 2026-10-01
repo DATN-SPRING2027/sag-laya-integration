@@ -778,6 +778,15 @@ async def stream_synthesize_search_answer(
         raise
     except Exception as error:  # noqa: BLE001
         log.warning("搜索答案流生成失败，回退证据摘要：%s", error)
+        fallback_citations = _citations_used_by_answer(fallback, citations)
+        yield SearchAnswerUpdate(
+            kind="completed",
+            text=fallback,
+            status="no_answer",
+            no_answer_reason="weak_evidence",
+            citations=fallback_citations,
+        )
+        return
 
     validated = _validated_answer("".join(parts), len(pack.sections))
     answer = validated or fallback

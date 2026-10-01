@@ -69,16 +69,14 @@ def _query_anchor_terms(query: str) -> tuple[str, ...]:
     return tuple(normalized)
 
 
-def _sections_cover_query_anchors(query: str, sections: list[RetrievedSection]) -> bool:
-    required_terms = _query_anchor_terms(query)
+def _sections_cover_query_anchors(required_terms: tuple[str, ...], sections: list[RetrievedSection]) -> bool:
     if not required_terms:
         return True
     evidence_text = normalize_lexical_text("\n".join(f"{section.heading}\n{section.content}" for section in sections))
     return all(term in evidence_text for term in required_terms)
 
 
-def _section_contains_query_anchor(query: str, section: RetrievedSection) -> bool:
-    required_terms = _query_anchor_terms(query)
+def _section_contains_query_anchor(required_terms: tuple[str, ...], section: RetrievedSection) -> bool:
     if not required_terms:
         return True
     evidence_text = normalize_lexical_text(f"{section.heading}\n{section.content}")
@@ -90,7 +88,7 @@ def build_tool_evidence_pack(
     *,
     query: str,
     render,
-    context_budget_tokens: int,
+    context_budget_tokens: int | None,
 ) -> ToolEvidencePack:
     """Pack whole traceable tool evidence blocks into the runtime's remaining budget."""
 
@@ -99,11 +97,17 @@ def build_tool_evidence_pack(
     eligible = [section for section in sections if has_traceable_locator(section)]
     if not eligible:
         return ToolEvidencePack([], "（没有可追溯的证据，无法回答。）", "weak", "weak_evidence", 0)
-    if _query_anchor_terms(query):
-        eligible = [section for section in eligible if _section_contains_query_anchor(query, section)]
-        if not eligible or not _sections_cover_query_anchors(query, eligible):
+    required_terms = _query_anchor_terms(query)
+    if required_terms:
+        eligible = [section for section in eligible if _section_contains_query_anchor(required_terms, section)]
+        if not eligible or not _sections_cover_query_anchors(required_terms, eligible):
             return ToolEvidencePack([], "（证据未包含问题中的精确标识，无法回答。）", "weak", "weak_evidence", 0)
 
+    context_budget = (
+        max(0, int(settings.llm_context_window))
+        if context_budget_tokens is None
+        else max(0, int(context_budget_tokens))
+    )
     selected: list[RetrievedSection] = []
     content = ""
     token_estimate = 0
@@ -116,14 +120,14 @@ def build_tool_evidence_pack(
             separators=(",", ":"),
         )
         candidate_tokens = estimate_tokens(rendered_message)
-        if candidate_tokens <= max(0, context_budget_tokens):
+        if candidate_tokens <= context_budget:
             selected = candidate
             content = candidate_content
             token_estimate = candidate_tokens
 
     if not selected:
         return ToolEvidencePack([], "（证据超过剩余上下文预算，无法安全回答。）", "weak", "context_budget", 0)
-    if not _sections_cover_query_anchors(query, selected):
+    if not _sections_cover_query_anchors(required_terms, selected):
         return ToolEvidencePack([], "（预算内证据未覆盖问题中的精确标识，无法回答。）", "weak", "weak_evidence", 0)
     return ToolEvidencePack(selected, content, "sufficient", None, token_estimate)
 
@@ -150,7 +154,6 @@ async def resolve_traceable_evidence(
     from sag_api.enums import DocumentStatus
 
     source_anchor = aliased(CanonicalBlock)
-    source_end = aliased(CanonicalBlock)
     statement = (
         select(
             SearchUnit.id,
@@ -169,11 +172,6 @@ async def resolve_traceable_evidence(
             source_anchor,
             (source_anchor.id == SearchUnit.block_from_id)
             & (source_anchor.document_version_id == SearchUnit.document_version_id),
-        )
-        .join(
-            source_end,
-            (source_end.id == SearchUnit.block_to_id)
-            & (source_end.document_version_id == SearchUnit.document_version_id),
         )
         .where(
             SearchUnit.id.in_(chunk_ids),
@@ -290,9 +288,10 @@ def build_evidence_pack(
     eligible = [section for section in sections if has_traceable_locator(section)]
     if not eligible:
         return EvidencePack([], [], "weak", "weak_evidence", base_tokens, output_reserve, context_window)
-    if _query_anchor_terms(query):
-        eligible = [section for section in eligible if _section_contains_query_anchor(query, section)]
-        if not eligible or not _sections_cover_query_anchors(query, eligible):
+    required_terms = _query_anchor_terms(query)
+    if required_terms:
+        eligible = [section for section in eligible if _section_contains_query_anchor(required_terms, section)]
+        if not eligible or not _sections_cover_query_anchors(required_terms, eligible):
             return EvidencePack([], [], "weak", "weak_evidence", base_tokens, output_reserve, context_window)
 
     selected: list[RetrievedSection] = []
@@ -309,7 +308,7 @@ def build_evidence_pack(
 
     if not selected:
         return EvidencePack([], [], "weak", "context_budget", base_tokens, output_reserve, context_window)
-    if not _sections_cover_query_anchors(query, selected):
+    if not _sections_cover_query_anchors(required_terms, selected):
         return EvidencePack([], [], "weak", "weak_evidence", base_tokens, output_reserve, context_window)
     return EvidencePack(
         selected,

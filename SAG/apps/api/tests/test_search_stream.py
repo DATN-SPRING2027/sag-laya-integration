@@ -289,13 +289,35 @@ async def test_search_stream_replaces_invalid_citations_with_grounded_fallback()
 async def test_search_stream_provider_failure_completes_with_grounded_fallback():
     events = await _search(FailingStreamingLLM([]))
 
-    assert [name for name, _payload in events] == [
-        "result",
-        "summary.delta",
-        "completed",
-    ]
-    assert "未完成的内容" not in events[1][1]["delta"]
-    assert "[1]" in events[-1][1]["summary"]
+    assert [name for name, _payload in events] == ["result", "completed"]
+    completed = events[-1][1]
+    assert "[1]" in completed["summary"]
+    assert completed["answer_status"] == "no_answer"
+    assert completed["no_answer_reason"] == "weak_evidence"
+    assert completed["citations"][0]["chunk_id"]
+    assert completed["citations"][0]["source_id"]
+
+
+@pytest.mark.asyncio
+async def test_search_stream_discards_partial_provider_output_after_failure():
+    class PartialThenFailingLLM:
+        configured = True
+
+        async def stream_complete(self, _messages):
+            yield "未完成的内容 [9]"
+            raise RuntimeError("provider disconnected")
+
+    events = await _search(PartialThenFailingLLM())
+
+    assert [name for name, _payload in events] == ["result", "completed"]
+    completed = events[-1][1]
+    assert "未完成的内容" not in completed["summary"]
+    assert "[9]" not in completed["summary"]
+    assert "[1]" in completed["summary"]
+    assert completed["answer_status"] == "no_answer"
+    assert completed["no_answer_reason"] == "weak_evidence"
+    assert completed["citations"][0]["chunk_id"]
+    assert completed["citations"][0]["source_id"]
 
 
 @pytest.mark.asyncio

@@ -305,6 +305,11 @@ class SearchContextTool(Tool):
             else None
         )
         if graph is not None and graph.events:
+            resolved_keys = {
+                (section.source_config_id or "", section.chunk_id or "")
+                for section in sections
+                if section.source_config_id and section.chunk_id
+            }
             sections = await _prioritize_event_evidence(
                 ctx.engine_manager,
                 sections,
@@ -312,7 +317,26 @@ class SearchContextTool(Tool):
                 sources_by_config,
                 limit=limit,
             )
-            sections = await resolve_traceable_evidence(sections, ctx.sources)
+            new_sections = [
+                section
+                for section in sections
+                if (section.source_config_id or "", section.chunk_id or "") not in resolved_keys
+            ]
+            resolved_new_sections = (
+                await resolve_traceable_evidence(new_sections, ctx.sources)
+                if new_sections
+                else []
+            )
+            resolved_by_key = {
+                (section.source_config_id or "", section.chunk_id or ""): section
+                for section in resolved_new_sections
+            }
+            sections = [
+                section
+                if (section.source_config_id or "", section.chunk_id or "") in resolved_keys
+                else resolved_by_key.get((section.source_config_id or "", section.chunk_id or ""), section)
+                for section in sections
+            ]
             sections = [section for section in sections if has_traceable_locator(section)]
             if not sections:
                 return _no_traceable_search_context(

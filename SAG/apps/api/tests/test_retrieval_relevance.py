@@ -156,6 +156,56 @@ def test_evidence_pack_requires_complete_provenance_and_keeps_whole_items_within
     assert pack.input_tokens + pack.reserved_output_tokens <= pack.context_window_tokens
 
 
+def test_tool_evidence_pack_uses_configured_budget_only_when_budget_is_unspecified(monkeypatch):
+    from sag_api.services import evidence_service
+
+    monkeypatch.setattr(evidence_service.settings, "llm_context_window", 1_000)
+    evidence = traceable_section("budget", "Evidence", "A traceable evidence sentence.", 0.9)
+
+    def render(sections):
+        return "\n".join(item.content for item in sections)
+
+    default_budget = build_tool_evidence_pack(
+        [evidence],
+        query="",
+        render=render,
+        context_budget_tokens=None,
+    )
+    exhausted_budget = build_tool_evidence_pack(
+        [evidence],
+        query="",
+        render=render,
+        context_budget_tokens=0,
+    )
+
+    assert default_budget.status == "sufficient"
+    assert exhausted_budget.status == "weak"
+    assert exhausted_budget.no_answer_reason == "context_budget"
+
+
+def test_evidence_pack_extracts_query_anchor_terms_once(monkeypatch):
+    from sag_api.services import evidence_service
+
+    original = evidence_service._query_anchor_terms
+    calls = 0
+
+    def count_extractions(query):
+        nonlocal calls
+        calls += 1
+        return original(query)
+
+    monkeypatch.setattr(evidence_service, "_query_anchor_terms", count_extractions)
+    pack = build_evidence_pack(
+        "XK-204",
+        [traceable_section("exact", "Release", "Release identifier XK-204 is approved.", 0.9)],
+        context_window_tokens=1_000,
+        reserved_output_tokens=100,
+    )
+
+    assert pack.status == "sufficient"
+    assert calls == 1
+
+
 def test_evidence_pack_distinguishes_empty_from_weak_without_rrf_thresholds():
     empty = build_evidence_pack("missing", [], context_window_tokens=128_000, reserved_output_tokens=20_000)
     weak = build_evidence_pack(

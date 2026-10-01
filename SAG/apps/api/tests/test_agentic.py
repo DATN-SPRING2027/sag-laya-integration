@@ -1,6 +1,7 @@
 """Agentic 基建：默认工具、全局证据编号、历史压缩、token 估算。全离线。"""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -505,3 +506,101 @@ async def test_compress_history_trims_without_llm():
     # 预算内不动
     same = await compress_history(history[:2], llm=None, budget_tokens=10_000)
     assert same == history[:2]
+
+
+@pytest.mark.asyncio
+async def test_grounded_agent_stream_emits_only_the_canonical_answer_delta(monkeypatch):
+    from contextlib import asynccontextmanager
+    from datetime import UTC, datetime
+
+    from sag_agent import AgentEvent, EventType
+    from sag_api.services import agent_service
+    from sag_api.services.evidence_service import no_answer_text
+
+    now = datetime.now(UTC)
+
+    class Handle:
+        done = True
+
+        def __aiter__(self):
+            async def events():
+                yield AgentEvent(EventType.RUN_STARTED, "run-1", 1, now)
+                yield AgentEvent(
+                    EventType.MESSAGE_DELTA,
+                    "run-1",
+                    2,
+                    now,
+                    payload={"role": "assistant", "delta": "Unsupported answer [9]"},
+                )
+                yield AgentEvent(
+                    EventType.MESSAGE_COMPLETED,
+                    "run-1",
+                    3,
+                    now,
+                    payload={"role": "assistant", "message": {"role": "assistant"}},
+                )
+                yield AgentEvent(
+                    EventType.RUN_COMPLETED,
+                    "run-1",
+                    4,
+                    now,
+                    payload={"output": "Unsupported answer [9]"},
+                )
+
+            return events()
+
+    class Runtime:
+        def run(self, *_args, **_kwargs):
+            return Handle()
+
+    class SessionFactory:
+        def __call__(self):
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    @asynccontextmanager
+    async def no_mcp_tools(_specs):
+        yield SimpleNamespace(tools=[], warnings=[])
+
+    async def no_sources(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(agent_service, "_enabled_tool_names", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(agent_service, "resolve_sources", no_sources)
+    monkeypatch.setattr(agent_service, "open_agent_mcp_tools", no_mcp_tools)
+
+    streamed = [
+        event
+        async for event in agent_service.generate_stream(
+            SessionFactory(),
+            plan=SimpleNamespace(
+                citations=[],
+                source_ids=None,
+                messages=[{"role": "user", "content": "What is the fact?"}],
+                query="What is the fact?",
+                user_message_id="user-1",
+            ),
+            agent=SimpleNamespace(name="Test", id="agent-1", persona={}),
+            thread_id=None,
+            engine_manager=SimpleNamespace(),
+            llm=SimpleNamespace(),
+            tool_registry=SimpleNamespace(),
+            runtime=Runtime(),
+            knowledge_only=True,
+        )
+    ]
+
+    deltas = [event for event in streamed if event.type == EventType.MESSAGE_DELTA.value]
+    completed = next(event for event in streamed if event.type == EventType.RUN_COMPLETED.value)
+    canonical_answer = completed.data["payload"]["output"]
+
+    assert len(deltas) == 1
+    assert deltas[0].data["payload"]["delta"] == no_answer_text()
+    assert deltas[0].data["payload"]["delta"] == canonical_answer
+    assert [event.type for event in streamed[-2:]] == [EventType.MESSAGE_DELTA.value, EventType.RUN_COMPLETED.value]
+    assert [event.data["sequence"] for event in streamed[-2:]] == [4, 5]
