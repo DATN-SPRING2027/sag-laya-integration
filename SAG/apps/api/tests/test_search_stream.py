@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 import uuid
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import httpx
@@ -19,8 +20,11 @@ from sag_api.services.retrieval_service import stream_synthesize_search_answer
 
 
 class SearchEngine:
-    def __init__(self):
+    def __init__(self, *, content="骑手技能包括路线规划和异常处理。", score=0.91):
         self.retrieval_calls = 0
+        self.content = content
+        self.score = score
+        self.chunk_id = uuid.uuid4().hex
 
     async def provision(self, *_args):
         return None
@@ -31,10 +35,10 @@ class SearchEngine:
             query=query,
             sections=[
                 RetrievedSection(
-                    chunk_id="chunk-1",
+                    chunk_id=self.chunk_id,
                     heading="骑手技能证据",
-                    content="骑手技能包括路线规划和异常处理。",
-                    score=0.91,
+                    content=self.content,
+                    score=self.score,
                     source_config_id=targets[0][0],
                 )
             ],
@@ -46,6 +50,12 @@ class SearchEngine:
 
     async def search_event_scores(self, *_args, **_kwargs):
         raise AssertionError("P4 global retrieval must not recall graph events")
+
+
+class EmptySearchEngine(SearchEngine):
+    async def search_many(self, _targets, query, *, strategy=None, top_k=None):
+        self.retrieval_calls += 1
+        return SearchOutcome(query=query, sections=[], stats={"strategy": strategy, "top_k": top_k})
 
 
 class StreamingLLM:
@@ -105,12 +115,83 @@ async def _auth_and_source(client: httpx.AsyncClient) -> tuple[dict[str, str], s
     return headers, source.json()["id"]
 
 
+async def _seed_traceable_search_unit(source_id: str, chunk_id: str = "chunk-1") -> None:
+    from sag_api.core.db import SessionLocal
+    from sag_api.db.models import CanonicalBlock, Document, DocumentVersion, SearchUnit, Source
+    from sag_api.enums import DocumentStatus
+
+    async with SessionLocal() as session:
+        source = await session.get(Source, source_id)
+        assert source is not None
+        document_id = uuid.uuid4().hex
+        version_id = uuid.uuid4().hex
+        block_id = uuid.uuid4().hex
+        now = datetime.now(UTC)
+        session.add(
+            Document(
+                id=document_id,
+                source_id=source_id,
+                filename="manual.pdf",
+                content_type="application/pdf",
+                size_bytes=100,
+                storage_path="/tmp/manual.pdf",
+                status=DocumentStatus.READY,
+                is_active=True,
+            )
+        )
+        await session.flush()
+        session.add(
+            DocumentVersion(
+                id=version_id,
+                document_id=document_id,
+                version_no=1,
+                file_hash=uuid.uuid4().hex,
+                status="SEARCH_READY",
+                search_status="SEARCH_READY",
+                search_ready_at=now,
+                metadata_json={},
+            )
+        )
+        await session.flush()
+        session.add(
+            CanonicalBlock(
+                id=block_id,
+                document_version_id=version_id,
+                ordinal=0,
+                block_type="paragraph",
+                page_from=2,
+                page_to=2,
+                section_path="Approval",
+                source_anchor="section:approval",
+                normalized_text="Approved evidence block.",
+                content_hash=uuid.uuid4().hex,
+            )
+        )
+        await session.flush()
+        session.add(
+            SearchUnit(
+                id=chunk_id,
+                document_version_id=version_id,
+                block_from_id=block_id,
+                block_to_id=block_id,
+                security_partition_id="project-1",
+                content_hash=uuid.uuid4().hex,
+                token_count=8,
+                page_from=2,
+                page_to=2,
+                section_path="Approval",
+            )
+        )
+        await session.commit()
+
+
 async def _search(
     llm,
     *,
     request_overrides: dict | None = None,
     route_result: dict | None = None,
     engine: SearchEngine | None = None,
+    traceable: bool = True,
 ) -> list[tuple[str, dict]]:
     from sag_api.api.v1 import search as search_api
     from sag_api.core.deps import get_engine_manager
@@ -136,6 +217,8 @@ async def _search(
             app.state.llm = llm
             async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
                 headers, source_id = await _auth_and_source(client)
+                if traceable:
+                    await _seed_traceable_search_unit(source_id, engine.chunk_id)
                 response = await client.post(
                     "/api/v1/search/stream",
                     headers=headers,
@@ -154,7 +237,7 @@ async def _search(
 
 
 @pytest.mark.asyncio
-async def test_search_stream_emits_true_deltas_then_canonical_response():
+async def test_search_stream_emits_only_canonical_citation_validated_answer():
     llm = StreamingLLM(["骑手", "需要规划能力", " [1]"])
 
     events = await _search(llm)
@@ -162,24 +245,27 @@ async def test_search_stream_emits_true_deltas_then_canonical_response():
     assert [name for name, _payload in events] == [
         "result",
         "summary.delta",
-        "summary.delta",
-        "summary.delta",
         "completed",
     ]
     initial = events[0][1]
     assert initial["summary"] == ""
-    assert initial["sections"][0]["chunk_id"] == "chunk-1"
+    assert initial["sections"][0]["chunk_id"]
     assert initial["events"] == []
     assert initial["entities"] == []
     assert initial["relations"] == []
-    assert [payload["delta"] for name, payload in events if name == "summary.delta"] == [
-        "骑手",
-        "需要规划能力",
-        " [1]",
-    ]
+    assert [payload["delta"] for name, payload in events if name == "summary.delta"] == ["骑手需要规划能力 [1]"]
     completed = events[-1][1]
     assert completed["summary"] == "骑手需要规划能力 [1]"
     assert completed["sections"] == initial["sections"]
+    assert completed["answer_status"] == "answered"
+    citation = completed["citations"][0]
+    assert citation["source_id"]
+    assert citation["document_id"]
+    assert citation["document_version_id"]
+    assert citation["chunk_id"] == initial["sections"][0]["chunk_id"]
+    assert citation["page_from"] == 2
+    assert citation["page_to"] == 2
+    assert citation["anchor"] == "section:approval"
     assert llm.stream_calls == 1
 
 
@@ -192,7 +278,7 @@ async def test_search_stream_replaces_invalid_citations_with_grounded_fallback()
         "summary.delta",
         "completed",
     ]
-    assert events[1][1]["delta"] == "不存在的引用 [9]"
+    assert "[9]" not in events[1][1]["delta"]
     canonical = events[-1][1]["summary"]
     assert "骑手技能包括路线规划和异常处理" in canonical
     assert "[1]" in canonical
@@ -208,7 +294,7 @@ async def test_search_stream_provider_failure_completes_with_grounded_fallback()
         "summary.delta",
         "completed",
     ]
-    assert events[1][1]["delta"] == "未完成的内容"
+    assert "未完成的内容" not in events[1][1]["delta"]
     assert "[1]" in events[-1][1]["summary"]
 
 
@@ -234,6 +320,58 @@ async def test_search_stream_skips_retrieval_for_high_confidence_chat():
     assert events[0][1]["query"] == "Xin chào"
     assert events[0][1]["sections"] == []
     assert events[0][1]["stats"]["query_route"]["retrieval"] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_search_stream_returns_no_answer_for_weak_legacy_evidence_without_calling_llm():
+    llm = StreamingLLM(["must not appear"])
+    events = await _search(llm, traceable=False)
+
+    assert [name for name, _payload in events] == ["result", "completed"]
+    completed = events[-1][1]
+    assert completed["answer_status"] == "no_answer"
+    assert completed["no_answer_reason"] == "weak_evidence"
+    assert completed["citations"] == []
+    assert "足够且可追溯" in completed["summary"]
+    assert llm.stream_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_search_stream_returns_no_answer_for_empty_evidence():
+    llm = StreamingLLM(["must not appear"])
+    events = await _search(llm, engine=EmptySearchEngine())
+
+    assert [name for name, _payload in events] == ["result", "completed"]
+    completed = events[-1][1]
+    assert completed["answer_status"] == "no_answer"
+    assert completed["no_answer_reason"] == "empty_evidence"
+    assert completed["citations"] == []
+    assert llm.stream_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_exact_identifier_survives_rrf_single_retriever_score_and_ambiguous_route():
+    llm = StreamingLLM(["XK-204 is approved [1]"])
+    events = await _search(
+        llm,
+        request_overrides={"query": "XK-204"},
+        engine=SearchEngine(content="Release identifier XK-204 is approved.", score=0.5),
+        route_result={
+            "coarse_intent": "AMBIGUOUS",
+            "is_chitchat": False,
+            "need_retrieval": True,
+            "suggested_strategy": "multi",
+            "confidence": 0.41,
+            "model": "fake",
+            "fallback_used": False,
+            "fallback_reason": "ambiguous_context",
+        },
+    )
+
+    completed = events[-1][1]
+    assert completed["answer_status"] == "answered"
+    assert "XK-204 is approved [1]" in completed["summary"]
+    assert completed["stats"]["query_route"]["retrieval"] == "required"
 
 
 @pytest.mark.asyncio
@@ -282,14 +420,23 @@ async def test_search_answer_stream_propagates_cancellation_and_closes_provider(
             heading="骑手技能",
             content="骑手需要路线规划能力。",
             score=0.9,
+            source_id="engine-source",
+            source_config_id="source-1",
+            document_id="document-1",
+            document_version_id="version-1",
+            page_from=1,
+            page_to=1,
+            anchor="section:rider",
         )
     ]
+    source = SimpleNamespace(id="source-public", name="手册", sag_source_config_id="source-1")
 
     async def consume() -> None:
         async for _update in stream_synthesize_search_answer(
             "骑手技能",
             sections,
             llm=BlockingLLM(),
+            sources=[source],
         ):
             pass
 

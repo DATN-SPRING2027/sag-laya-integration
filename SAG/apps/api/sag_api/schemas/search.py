@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -65,6 +65,24 @@ class SearchSourceHitOut(BaseModel):
     latest_event_time: datetime | None = None
 
 
+class SearchCitationOut(BaseModel):
+    kind: Literal["internal"] = "internal"
+    n: int
+    document_id: str
+    document_version_id: str
+    document_name: str = ""
+    version_no: int | None = None
+    chunk_id: str
+    page_from: int
+    page_to: int
+    anchor: str
+    heading: str = ""
+    snippet: str = ""
+    score: float = 0.0
+    source_id: str
+    source_name: str | None = None
+
+
 class SearchResponse(BaseModel):
     query: str
     sections: list[SectionOut]
@@ -73,6 +91,9 @@ class SearchResponse(BaseModel):
     relations: list[GraphRelationOut] = Field(default_factory=list)
     source_hits: list[SearchSourceHitOut] = Field(default_factory=list)
     summary: str = ""
+    citations: list[SearchCitationOut] = Field(default_factory=list)
+    answer_status: Literal["pending", "answered", "no_answer", "skipped"] = "skipped"
+    no_answer_reason: Literal["empty_evidence", "weak_evidence", "context_budget"] | None = None
     exploration_id: str | None = None
     stats: dict[str, Any]
 

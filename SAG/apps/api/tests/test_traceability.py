@@ -1,6 +1,7 @@
 """引用溯源：chunk 原文端点 + citations 的 sag source_id 语义。"""
 
 import uuid
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -76,3 +77,97 @@ async def test_chunk_endpoint_and_citation_refs():
             assert cites[0]["source_name"] == "手册"
             assert cites[0]["snippet"].endswith("…") and len(cites[0]["snippet"]) <= 722
             assert "summary" not in cites[0]
+
+
+@pytest.mark.asyncio
+async def test_search_unit_locator_resolution_is_exact_and_acl_scoped():
+    from sag_api.core.db import SessionLocal, init_db
+    from sag_api.db.models import CanonicalBlock, Document, DocumentVersion, SearchUnit, Source
+    from sag_api.enums import DocumentStatus
+    from sag_api.sag import RetrievedSection
+    from sag_api.services.evidence_service import has_traceable_locator, resolve_traceable_evidence
+
+    await init_db()
+    async with SessionLocal() as session:
+        source = Source(name="trace source", sag_source_config_id=uuid.uuid4().hex)
+        other_source = Source(name="other source", sag_source_config_id=uuid.uuid4().hex)
+        session.add_all([source, other_source])
+        await session.flush()
+        document_id = uuid.uuid4().hex
+        version_id = uuid.uuid4().hex
+        block_id = uuid.uuid4().hex
+        chunk_id = uuid.uuid4().hex
+        session.add(
+            Document(
+                id=document_id,
+                source_id=source.id,
+                filename="runbook.pdf",
+                content_type="application/pdf",
+                size_bytes=100,
+                storage_path="/tmp/runbook.pdf",
+                status=DocumentStatus.READY,
+                is_active=True,
+            )
+        )
+        await session.flush()
+        session.add(
+            DocumentVersion(
+                id=version_id,
+                document_id=document_id,
+                version_no=3,
+                file_hash=uuid.uuid4().hex,
+                status="SEARCH_READY",
+                search_status="SEARCH_READY",
+                search_ready_at=datetime.now(UTC),
+                metadata_json={},
+            )
+        )
+        await session.flush()
+        session.add(
+            CanonicalBlock(
+                id=block_id,
+                document_version_id=version_id,
+                ordinal=4,
+                block_type="paragraph",
+                page_from=8,
+                page_to=8,
+                section_path="Deploy / Rollback",
+                source_anchor="pdf-page-8-block-4",
+                normalized_text="Use the approved rollback.",
+                content_hash=uuid.uuid4().hex,
+            )
+        )
+        await session.flush()
+        session.add(
+            SearchUnit(
+                id=chunk_id,
+                document_version_id=version_id,
+                block_from_id=block_id,
+                block_to_id=block_id,
+                security_partition_id="project-a",
+                content_hash=uuid.uuid4().hex,
+                token_count=6,
+                page_from=8,
+                page_to=8,
+                section_path="Deploy / Rollback",
+            )
+        )
+        await session.commit()
+        allowed = source
+        denied = other_source
+
+    section = RetrievedSection(
+        chunk_id=chunk_id,
+        heading="Rollback",
+        content="Use the approved rollback.",
+        source_config_id=allowed.sag_source_config_id,
+    )
+    resolved = await resolve_traceable_evidence([section], [allowed])
+    assert has_traceable_locator(resolved[0])
+    assert resolved[0].document_id == document_id
+    assert resolved[0].document_version_id == version_id
+    assert resolved[0].page_from == 8 and resolved[0].page_to == 8
+    assert resolved[0].anchor == "pdf-page-8-block-4"
+
+    denied_result = await resolve_traceable_evidence([section], [denied])
+    assert not has_traceable_locator(denied_result[0])

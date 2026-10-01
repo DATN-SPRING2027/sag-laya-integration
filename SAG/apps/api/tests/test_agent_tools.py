@@ -26,7 +26,30 @@ ECHO_CITATION = {
     "score": 0.9,
     "source_id": "src",
     "source_name": "回声源",
+    "document_id": "doc-echo",
+    "document_version_id": "version-echo",
+    "page_from": 1,
+    "page_to": 1,
+    "anchor": "echo-section",
 }
+
+
+def _test_locator(section):
+    return section.model_copy(
+        update={
+            "document_id": f"doc-{section.chunk_id}",
+            "document_version_id": f"version-{section.chunk_id}",
+            "document_name": "test.pdf",
+            "version_no": 1,
+            "page_from": 1,
+            "page_to": 1,
+            "anchor": f"section-{section.chunk_id}",
+        }
+    )
+
+
+async def _resolve_test_locators(sections, _sources):
+    return [_test_locator(section) for section in sections]
 
 
 class EchoTool(Tool):
@@ -96,7 +119,10 @@ class StubWebSearchTool(Tool):
 
 
 @pytest.mark.asyncio
-async def test_search_tool_prefers_exact_body_window_over_semantic_boilerplate():
+async def test_search_tool_prefers_exact_body_window_over_semantic_boilerplate(monkeypatch):
+    from sag_api.tools import builtin
+
+    monkeypatch.setattr(builtin, "resolve_traceable_evidence", _resolve_test_locators)
     from sag_api.core.db import init_db
 
     await init_db()
@@ -151,13 +177,17 @@ async def test_search_tool_prefers_exact_body_window_over_semantic_boilerplate()
 
     engine = HybridEngine()
     source = SimpleNamespace(id="source-1", name="娱乐新闻", sag_source_config_id="sc-1"[:36])
-    host_context = ToolContext(engine_manager=engine, sources=[source])
+    host_context = ToolContext(engine_manager=engine, sources=[source], evidence_token_budget=10_000)
     result = await SearchContextTool().invoke(
         {"query": "关于林俊杰最新动态 2024 2025", "top_k": 4},
         host_context,
     )
 
     assert result.citations[0]["chunk_id"] == "body"
+    assert result.citations[0]["document_id"] == "doc-body"
+    assert result.citations[0]["document_version_id"] == "version-body"
+    assert result.citations[0]["page_from"] == 1
+    assert result.citations[0]["anchor"] == "section-body"
     assert result.citations[0]["event_refs"][0]["title"] == "林俊杰官宣恋情"
     assert result.citations[0]["event_refs"][0]["content"].startswith("12 月 29 日")
     assert "summary" not in result.citations[0]
@@ -172,7 +202,11 @@ async def test_search_tool_prefers_exact_body_window_over_semantic_boilerplate()
     # of issuing a second graph query while constructing universe artifacts.
     collected_citations: list[dict] = []
     adapter_engine = HybridEngine()
-    adapter_context = ToolContext(engine_manager=adapter_engine, sources=[source])
+    adapter_context = ToolContext(
+        engine_manager=adapter_engine,
+        sources=[source],
+        evidence_token_budget=10_000,
+    )
     adapted = _adapt_tool(SearchContextTool(), adapter_context, collected_citations)
     runtime_result = await adapted.execute(
         {"query": "关于林俊杰最新动态 2024 2025", "top_k": 4},
@@ -213,10 +247,12 @@ async def test_web_search_trace_uses_internet_scope_instead_of_mounted_knowledge
 
 
 @pytest.mark.asyncio
-async def test_search_tool_graph_capacity_covers_every_returned_section():
+async def test_search_tool_graph_capacity_covers_every_returned_section(monkeypatch):
     from sag_api.core.db import init_db
+    from sag_api.tools import builtin
 
     await init_db()
+    monkeypatch.setattr(builtin, "resolve_traceable_evidence", _resolve_test_locators)
     class ManySectionEngine:
         graph_calls = 0
         event_limit = 0
@@ -259,7 +295,7 @@ async def test_search_tool_graph_capacity_covers_every_returned_section():
     source = SimpleNamespace(id="source-1", name="测试资料", sag_source_config_id="sc-1"[:36])
     result = await SearchContextTool().invoke(
         {"query": "共同主题", "top_k": 20},
-        ToolContext(engine_manager=engine, sources=[source]),
+        ToolContext(engine_manager=engine, sources=[source], evidence_token_budget=10_000),
     )
 
     assert len(result.citations) == 20
@@ -269,10 +305,12 @@ async def test_search_tool_graph_capacity_covers_every_returned_section():
 
 
 @pytest.mark.asyncio
-async def test_search_tool_reuses_direct_event_recall_and_loads_traceable_evidence():
+async def test_search_tool_reuses_direct_event_recall_and_loads_traceable_evidence(monkeypatch):
     from sag_api.core.db import init_db
+    from sag_api.tools import builtin
 
     await init_db()
+    monkeypatch.setattr(builtin, "resolve_traceable_evidence", _resolve_test_locators)
     class SparseEventEngine:
         event_score_calls = 0
         chunk_reads: list[tuple[str, str]] = []
@@ -329,7 +367,7 @@ async def test_search_tool_reuses_direct_event_recall_and_loads_traceable_eviden
     source = SimpleNamespace(id="source-1", name="人类简史", sag_source_config_id="sc-1"[:36])
     result = await SearchContextTool().invoke(
         {"query": "帝国发展", "top_k": 2},
-        ToolContext(engine_manager=engine, sources=[source]),
+        ToolContext(engine_manager=engine, sources=[source], evidence_token_budget=10_000),
     )
 
     assert engine.event_score_calls == 1

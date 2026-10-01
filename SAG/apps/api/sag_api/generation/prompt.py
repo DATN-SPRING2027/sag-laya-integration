@@ -344,6 +344,24 @@ def build_citations(
             "source_id": ref.get("id"),
             "source_name": ref.get("name"),
         }
+        if (
+            s.document_id
+            and s.document_version_id
+            and s.page_from is not None
+            and s.page_to is not None
+            and s.anchor
+        ):
+            citation.update(
+                {
+                    "document_id": s.document_id,
+                    "document_version_id": s.document_version_id,
+                    "document_name": s.document_name,
+                    "version_no": s.version_no,
+                    "page_from": s.page_from,
+                    "page_to": s.page_to,
+                    "anchor": s.anchor,
+                }
+            )
         event_key = ((s.source_config_id or "").strip(), (s.chunk_id or "").strip())
         matched_events = event_refs.get(event_key, [])[:3]
         if matched_events:

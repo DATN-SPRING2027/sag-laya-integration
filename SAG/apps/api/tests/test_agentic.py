@@ -1,5 +1,7 @@
 """Agentic 基建：默认工具、全局证据编号、历史压缩、token 估算。全离线。"""
 
+import json
+
 import pytest
 
 from sag_agent import AgentTool, ToolResult, ToolSpec
@@ -11,6 +13,7 @@ from sag_api.services.agent_service import (
     _build_external_citations,
     _enabled_tool_names,
     _finalize_answer_citations,
+    _fit_agent_context,
     _initial_tool_choice,
 )
 from sag_api.tools.base import ToolContext
@@ -55,6 +58,49 @@ def test_estimate_tokens_cjk_aware():
     assert estimate_tokens("你好世界") == 4  # CJK 每字 1
     assert estimate_tokens("abcdefgh") == 2  # ASCII 每 4 字符 1
     assert estimate_tokens("") == 0
+
+
+def test_agent_context_budget_counts_prompt_schemas_reserves_and_keeps_tool_turns_atomic():
+    messages = [
+        {"role": "system", "content": "SAG system instructions."},
+        {"role": "user", "content": "old history " * 400},
+        {"role": "user", "content": "Find XK-204."},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "search_context", "arguments": "{\"query\":\"XK-204\"}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "name": "search_context",
+            "tool_call_id": "call-1",
+            "content": "[1] XK-204 approved. Locator: version=v1 page=2 anchor=approval.",
+        },
+    ]
+    schemas = [{"name": "search_context", "parameters": {"query": "string"}}]
+    window = 500
+    output_reserve = 80
+
+    fitted, evidence_budget = _fit_agent_context(
+        messages,
+        schemas,
+        context_window_tokens=window,
+        reserved_output_tokens=output_reserve,
+    )
+
+    fitted_tokens = estimate_tokens(json.dumps({"messages": fitted, "tools": schemas}, separators=(",", ":")))
+    assert fitted[0]["role"] == "system"
+    assert any(message.get("content") == "Find XK-204." for message in fitted)
+    assert not any("old history" in str(message.get("content")) for message in fitted)
+    assert any(message.get("tool_call_id") == "call-1" for message in fitted)
+    assert any(message.get("role") == "assistant" and message.get("tool_calls") for message in fitted)
+    assert fitted_tokens + evidence_budget + output_reserve * 2 <= window
 
 
 def test_agent_prompt_uses_static_timezone_rule_and_time_tool_guidance():
@@ -214,6 +260,15 @@ def test_initial_tool_policy_anchors_time_and_preserves_clarification():
     )
     assert (
         _initial_tool_choice(
+            "你好",
+            tools,
+            knowledge_only=False,
+            scoped=True,
+        )
+        == "none"
+    )
+    assert (
+        _initial_tool_choice(
             "推荐一下",
             tools,
             knowledge_only=True,
@@ -306,10 +361,23 @@ def test_high_confidence_social_intents_disable_tools(query):
 
 
 def test_answer_citations_are_canonical_and_traceable():
+    def citation(n, *, chunk_id, source_id, heading):
+        return {
+            "n": n,
+            "chunk_id": chunk_id,
+            "source_id": source_id,
+            "heading": heading,
+            "document_id": f"doc-{n}",
+            "document_version_id": f"version-{n}",
+            "page_from": 1,
+            "page_to": 1,
+            "anchor": f"section-{n}",
+        }
+
     citations = [
-        {"n": 1, "chunk_id": "chunk-1", "source_id": "source-1", "heading": "一"},
-        {"n": 2, "chunk_id": None, "source_id": "source-1", "heading": "不可打开"},
-        {"n": 3, "chunk_id": "chunk-3", "source_id": "source-3", "heading": "三"},
+        citation(1, chunk_id="chunk-1", source_id="source-1", heading="一"),
+        citation(2, chunk_id=None, source_id="source-1", heading="不可打开"),
+        citation(3, chunk_id="chunk-3", source_id="source-3", heading="三"),
     ]
 
     answer, used = _finalize_answer_citations("结论 [1]，虚构 [9]，坏引用 [2]。", citations)
@@ -376,7 +444,27 @@ def test_external_citations_are_safe_deduplicated_bounded_and_mapping_aware():
 
 
 @pytest.mark.asyncio
-async def test_search_tool_uses_global_citation_offset():
+async def test_search_tool_uses_global_citation_offset(monkeypatch):
+    from sag_api.core.db import init_db
+    from sag_api.tools import builtin
+
+    await init_db()
+
+    async def resolve_test_locators(sections, _sources):
+        return [
+            section.model_copy(
+                update={
+                    "document_id": "doc-c1",
+                    "document_version_id": "version-c1",
+                    "page_from": 1,
+                    "page_to": 1,
+                    "anchor": "section-c1",
+                }
+            )
+            for section in sections
+        ]
+
+    monkeypatch.setattr(builtin, "resolve_traceable_evidence", resolve_test_locators)
     class _EM:
         async def search_many(self, targets, query, strategy=None, top_k=None):
             return SearchOutcome(
@@ -397,7 +485,12 @@ async def test_search_tool_uses_global_citation_offset():
         id = "sid"
         name = "源"
 
-    ctx = ToolContext(engine_manager=_EM(), sources=[_Src()], citation_offset=3)
+    ctx = ToolContext(
+        engine_manager=_EM(),
+        sources=[_Src()],
+        citation_offset=3,
+        evidence_token_budget=10_000,
+    )
     result = await SearchContextTool().invoke({"query": "q"}, ctx)
     assert "[4]" in result.content  # 编号从 offset+1 开始
     assert result.citations[0]["n"] == 4

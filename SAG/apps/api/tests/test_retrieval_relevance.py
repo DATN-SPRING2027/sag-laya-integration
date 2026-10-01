@@ -1,8 +1,11 @@
 """Retrieval answers may only see evidence that survives query-aware reranking."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from sag_api.sag import RetrievedSection
+from sag_api.services.evidence_service import build_evidence_pack, build_tool_evidence_pack
 from sag_api.services.retrieval_service import (
     fallback_search_answer,
     rerank_sections,
@@ -17,6 +20,20 @@ def section(chunk_id: str, heading: str, content: str, score: float) -> Retrieve
         content=content,
         score=score,
         source_config_id="source-1",
+    )
+
+
+def traceable_section(chunk_id: str, heading: str, content: str, score: float) -> RetrievedSection:
+    return section(chunk_id, heading, content, score).model_copy(
+        update={
+            "document_id": "document-1",
+            "document_version_id": "version-1",
+            "document_name": "Manual.pdf",
+            "version_no": 1,
+            "page_from": 2,
+            "page_to": 2,
+            "anchor": "section:approval",
+        }
     )
 
 
@@ -100,6 +117,80 @@ def test_rank_fusion_deduplicates_candidates_by_source_and_chunk():
     assert len({item.chunk_id for item in result.sections}) == 3
     shared = next(item for item in result.sections if item.chunk_id == "shared")
     assert shared.content == "bản trùng dài nhất trong lexical result"
+
+
+def test_evidence_pack_requires_complete_provenance_and_keeps_whole_items_within_budget():
+    traceable = section("short", "Exact identifier", "XK-204 is approved.", 0.5).model_copy(
+        update={
+            "document_id": "doc-1",
+            "document_version_id": "version-1",
+            "page_from": 2,
+            "page_to": 2,
+            "anchor": "section:approval",
+        }
+    )
+    too_large = section("long", "Large evidence", "L" * 3000, 0.9).model_copy(
+        update={
+            "document_id": "doc-2",
+            "document_version_id": "version-2",
+            "page_from": 3,
+            "page_to": 3,
+            "anchor": "section:large",
+        }
+    )
+    untraceable = section("legacy", "Legacy evidence", "Must never reach the answer prompt.", 1.0)
+
+    pack = build_evidence_pack(
+        "XK-204",
+        [too_large, untraceable, traceable],
+        context_window_tokens=300,
+        reserved_output_tokens=40,
+    )
+
+    assert pack.status == "sufficient"
+    assert [item.chunk_id for item in pack.sections] == ["short"]
+    assert "XK-204 is approved." in pack.messages[-1]["content"]
+    assert "不受信任的数据" in pack.messages[0]["content"]
+    assert "Must never reach" not in pack.messages[-1]["content"]
+    assert "L" * 100 not in pack.messages[-1]["content"]
+    assert pack.input_tokens + pack.reserved_output_tokens <= pack.context_window_tokens
+
+
+def test_evidence_pack_distinguishes_empty_from_weak_without_rrf_thresholds():
+    empty = build_evidence_pack("missing", [], context_window_tokens=128_000, reserved_output_tokens=20_000)
+    weak = build_evidence_pack(
+        "missing",
+        [section("legacy", "Legacy", "retrieved but no verified locator", 1.0)],
+        context_window_tokens=128_000,
+        reserved_output_tokens=20_000,
+    )
+
+    assert (empty.status, empty.no_answer_reason) == ("empty", "empty_evidence")
+    assert (weak.status, weak.no_answer_reason) == ("weak", "weak_evidence")
+
+
+def test_exact_identifier_requires_literal_evidence_match():
+    unrelated = traceable_section("unrelated", "Release", "The release is approved.", 0.99)
+
+    pack = build_evidence_pack(
+        "XK-204",
+        [unrelated],
+        context_window_tokens=128_000,
+        reserved_output_tokens=20_000,
+    )
+
+    assert pack.status == "weak"
+    assert pack.no_answer_reason == "weak_evidence"
+    assert pack.sections == []
+
+    tool_pack = build_tool_evidence_pack(
+        [unrelated],
+        query="XK-204",
+        render=lambda sections: "\n".join(section.content for section in sections),
+        context_budget_tokens=10_000,
+    )
+    assert tool_pack.status == "weak"
+    assert tool_pack.sections == []
 
 
 def test_semantic_only_relevance_gate_is_invariant_to_score_scale():
@@ -558,16 +649,19 @@ async def test_invalid_llm_citation_falls_back_to_selected_evidence():
         async def complete(self, _messages):
             return "模型引用了不存在的证据 [9]"
 
-    selected = [section("one", "相关证据", "实际入选的事实。", 0.9)]
-    answer = await synthesize_search_answer(
+    selected = [traceable_section("one", "相关证据", "实际入选的事实。", 0.9)]
+    result = await synthesize_search_answer(
         "问题",
         selected,
         llm=InvalidCitationLLM(),
+        sources=[SimpleNamespace(id="public-source", name="手册", sag_source_config_id="source-1")],
     )
 
-    assert "实际入选的事实" in answer
-    assert "[1]" in answer
-    assert "[9]" not in answer
+    assert result.status == "answered"
+    assert "实际入选的事实" in result.text
+    assert "[1]" in result.text
+    assert "[9]" not in result.text
+    assert result.citations[0]["document_version_id"] == "version-1"
 
 
 @pytest.mark.asyncio
