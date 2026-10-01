@@ -20,6 +20,13 @@ Task P4 này tích hợp global hybrid retrieval vào query flow sau P3, enforce
 không phụ thuộc raw score khác scale. Không triển khai evidence context,
 citation, no-answer flow, Knowledge Graph hoặc Knowledge Routing Tree.
 
+> **Cập nhật trạng thái sau PR #12 (2026-10-01):** các ghi chú ACL bên dưới
+> phản ánh trạng thái trước runtime ACL integration và không còn là blocker code
+> hiện tại. `search_source_candidates()` nay nhận verified principal, chỉ lấy
+> Source có mapping `CONFIRMED` trong organization/project scope; PR này kế thừa
+> contract đó và không sửa ACL, global retrieval hay fusion. Chưa suy ra từ việc
+> merge rằng môi trường staging/production đã được cấu hình hoặc nghiệm thu.
+
 ### Hiện trạng đã xác nhận
 
 - P3 đã route vào global `/search`, `/search/stream` và source-scoped search.
@@ -201,6 +208,397 @@ phải bằng chứng user được phép xem.
 | ACL filter sau candidate cap | Evidence được phép bị starvation bởi evidence cấm | Filter trước retrieval/top-k nếu backend hỗ trợ; test prefilter |
 | Filter failure fallback unfiltered | ACL leakage nghiêm trọng | Fail closed hoặc trả empty/error an toàn |
 | Thay đổi shared contract/migration ngoài phạm vi | Xung đột lane và PR | Tách decision/database deliverable, không tự ý sửa |
+
+## Follow-up implementation plan — [SAG][P4] Evidence context, citation và no-answer
+
+**Trạng thái:** implementation trên task branch sau `main`/PR #12. Baseline-flow
+notes bên dưới ghi trạng thái trước code; implementation status và kiểm chứng
+được ghi ngay sau phần plan. Mục tiêu là đóng gói evidence sau ACL-filtered P3/P4
+retrieval, trả citation truy nguyên được và abstain an toàn khi evidence
+rỗng/yếu. Không đổi candidate generation, ACL resolver, RRF/fusion hoặc
+ingestion/index lane.
+
+### Baseline flow before implementation
+
+1. `/search` và `/search/stream` gọi `_build_query_route()`. Chỉ `CHAT` confidence
+   cao mới skip retrieval. `AMBIGUOUS`, `KNOWLEDGE`, `COMMAND`, CHAT confidence
+   thấp và lỗi Laya đều tiếp tục retrieval (lỗi Laya dùng strategy `multi`).
+2. Global search lấy Source qua `search_source_candidates(principal, requested_ids)`;
+   helper chỉ trả mapping Project→Source ở trạng thái `CONFIRMED` trong scope
+   của signed principal. Source-scoped search gọi `get_authorized_source()` trước
+   retrieval. Dense và lexical nhận cùng scope Source.
+3. `retrieve_relevant_sections()` gọi engine `search_many()` cùng lexical
+   `grep_chunks()`, lọc logical-delete/reprocess derivatives, rồi rerank bằng
+   RRF và relevance gate hiện có. Global API còn có defense-in-depth filter theo
+   `source_config_id` đã được authorize. P4 follow-up bắt đầu **sau** các bước đó.
+4. Search summary hiện gọi `_search_answer_messages()`: prompt gồm system rule,
+   query và các section đánh số; nội dung evidence bị cắt theo tổng **12,000 ký
+   tự**, có thể cắt giữa section. Không có explicit no-answer status; không có
+   section thì fallback hiện là chuỗi rỗng.
+5. Agent gọi `search_context`. Tool lấy retrieval sections, dựng `_format_sections`
+   và `build_citations`, rồi `_adapt_tool()` đưa `result.content` vào runtime tool
+   response. Citation number được tăng offset xuyên các lần gọi. Agent chỉ
+   compress lịch sử ban đầu; các lượt tool/evidence về sau do `AgentRuntime`
+   ghép vào request.
+
+### Implemented flow
+
+1. Source/global search resolve versioned locator sau retrieval bằng exact
+   `SearchUnit.id == chunk_id`, exact Source được cấp bởi authorization flow,
+   active/READY Document, SEARCH_READY version và start/end CanonicalBlock cùng
+   version. Locator miss không được đoán từ engine SourceChunk hoặc tên file.
+2. Search answer và Agent `search_context` chỉ render section có document/version,
+   chunk, page range, anchor và body. Whole items được pack sau ACL/relevance;
+   Search API không gọi answer LLM khi pack rỗng/yếu. Agent tool trả kết quả
+   fail-closed, sau đó runtime có thể gọi một lượt cuối nhưng terminal gate chặn
+   output nếu không có citation claim hợp lệ.
+3. Global/source search validator chỉ nhận citation number thuộc exact pack đã
+   gửi model; citation response mang SAG Source ID cùng document/version/chunk/
+   page/anchor. SSE buffer provider output tới validation rồi emit canonical text.
+4. Agent runtime transform hook tính lại toàn bộ messages + tool schemas mỗi
+   model turn, dành hai `llm_max_tokens` reserves (answer turn và evidence/next
+   turn), rồi đưa phần còn lại vào `search_context`. Assistant deltas được giữ
+   lại khi P4 local grounding được yêu cầu hoặc `search_context` đã chạy; các
+   high-confidence direct/chat turns giữ nguyên câu trả lời và streaming contract.
+5. Exact phrase/identifier/path terms từ QueryAnalysis phải xuất hiện nguyên văn
+   theo lexical normalization trong packed evidence; đây là deterministic exact
+   match gate, không phải semantic answerability score.
+
+### Existing contracts
+
+#### Retrieval result hiện có
+
+`RetrievedSection` trong `sag/dto.py` là contract nội bộ được tạo từ section của
+engine trong `SearchOutcome.from_result()`. Các giá trị cuối cùng sau rerank:
+
+| Field cần cho evidence | Giá trị có ngay trong kết quả hiện tại | Nguồn thực tế / giới hạn |
+|---|---|---|
+| `document_id` | Không có | Không có trong `RetrievedSection` hoặc section mapping trong `from_section()`. Có thể tìm Document qua `Document.sag_source_id` nếu join đúng engine document-source ID và giới hạn `Document.source_id` trong Source đã authorize; không được tra cứu chỉ bằng client `source_ids`. |
+| `document_version_id` | Không có | `DocumentVersion` liên kết tới `Document`, nhưng chunk kết quả không chứa version key và code retrieval không nối tới `SearchUnit`. Không được gán “latest version” theo phỏng đoán. |
+| `chunk_id` | Có, có thể nullable | `RetrievedSection.from_section()` lấy `section.chunk_id` hoặc `section.id`; lexical path lấy `SourceChunk.id` trong relational DB của zleap. Đây là locator hiện dùng trong UI/tool, không đồng nghĩa với `SearchUnit.id`. |
+| `page` | Không có | DTO và kết quả engine không mang page. `SearchUnit.page_from/page_to` được khai báo trong model nhưng code retrieval hiện không đọc/populate nó. |
+| `anchor` | Không có | DTO/engine result không mang anchor. `CanonicalBlock.source_anchor` có trong model nhưng không được nối từ section truy vấn hiện tại. |
+| `source_id` | Có nhưng nghĩa đổi theo boundary | Nội bộ `RetrievedSection.source_id` đến từ engine section; lexical path lấy `SourceChunk.source_id` (engine document/source ID), dùng cùng `Document.sag_source_id` trong logical-delete barrier. Đây không phải luôn là SAG Source ID. Search API chuyển sang SAG `Source.id`; citations trong `build_citations()` cũng resolve SAG ID qua `source_config_id` trong map của các Source đã authorize. |
+| `content` | Có | Dense result dùng `section.content`; lexical path dùng `SourceChunk` text để dựng `snippet`, rồi snippet trở thành `content`. Khi duplicate, reranker chọn representative có nội dung dài hơn theo quy tắc deterministic. |
+| `score` | Có nhưng semantics đổi | Engine score được giữ trong candidate DTO; final selected section ghi đè bằng normalized RRF score `[0,1]`. Công thức dùng rank lists (`k=60`), chia ideal score theo số retriever hoạt động. Không phải cosine similarity, xác suất relevance hay answerability. Raw score không còn trong final result. |
+| `rank` | Có, zero-based ở output sau rerank | `from_section()` đọc engine `rank`/`metadata.rank`; lexical path tạo rank theo thứ tự grep. `rerank_sections()` cuối cùng ghi đè `rank` bằng vị trí sau sort, bắt đầu từ 0. |
+| ACL metadata | Không có trên từng row | Không có `project_id`, organization, mapping state hay allowed-scope claim trong `RetrievedSection`. ACL được áp từ verified principal → confirmed Source mapping trước candidate generation; `source_config_id` nối result về Source đã authorize. Engine `source_id` chỉ giúp logical-delete/reprocess filtering, không phải ACL token. |
+
+Schema/model hiện có `DocumentVersion`, `CanonicalBlock` và `SearchUnit` cùng
+DDL đặc tả, nhưng truy vấn production code ở `EngineManager.search_many()`/
+`grep_chunks()` hiện lấy chunk từ zleap `SourceChunk`/engine search. Không thấy
+đường join ổn định từ chunk trả về sang `SearchUnit`/canonical block; model fields
+đơn thuần không chứng minh dữ liệu đã được populate hay gắn với chunk đang trả.
+`Document.sag_source_id` giúp định vị document hiện tại cho logical-delete, nhưng
+không cung cấp version/page/anchor của đúng indexed chunk.
+
+#### Citation provenance hiện tại, end-to-end
+
+| Stage | Search API | Agent |
+|---|---|---|
+| Retrieval → evidence | `SearchOutcome.sections: list[RetrievedSection]`, sau ACL filter | Cùng retriever với authorized `host_context.sources` |
+| Evidence → context | `_search_answer_messages()` tạo `[1] heading + content`; cắt theo character limit | `_format_sections()` tạo `[n] heading + content` hoặc event synopsis và nguyên văn; chưa có bounded evidence pack |
+| ID → LLM | Số `[n]` trong prompt; `evidence_count` là số block | Citation offsets toàn cục của tool calls; tool text và `result.citations` sinh song song từ sections |
+| LLM → validator | `_validated_answer()` chỉ yêu cầu có ít nhất một `[n]`, và mọi `n` nằm trong `1..section_count` | `_finalize_answer_citations()` bỏ số không có citation object mang `chunk_id` + SAG `source_id`; syntax/provenance cơ bản, không đối chiếu evidence ID của final context pack |
+| Final → source locator | Summary inline; `SearchResponse` không có citation objects | Citation object có `source_id/name`, `chunk_id`, heading/snippet/score và có thể event refs |
+
+Thiếu trong cả đường dẫn: evidence ID bền vững; `document_id`,
+`document_version_id`, page, anchor; citation registry gắn với **đúng phần đã
+được render vào prompt**. Search validator chỉ kiểm tra cú pháp/range, và vẫn có
+thể chấp nhận ID của block bị cắt một phần. Agent validator xác nhận citation
+object có source/chunk nhưng chưa chứng minh nó nằm nguyên vẹn trong actual tool
+context. Cả hai không kiểm tra entailment giữa từng câu trả lời và đoạn trích.
+Search SSE và agent stream hiện phát raw model deltas trước final validation;
+invalid citation có thể xuất hiện tạm thời dù bị sửa trong terminal payload.
+
+**ACL-safe provenance rule:** chỉ enrich từ result đã nằm trong authorized
+Source scope. Nếu tra metadata, truy vấn phải ràng buộc `Document.source_id` với
+IDs lấy từ verified `Source` set, khớp `source_config_id`, khớp engine document
+source ID và loại Document không active/deleting. Không tin `source_id` gửi từ
+client, không query toàn cục rồi mới lọc citation, không suy diễn locator từ
+filename hay text similarity. Nếu không có mapping exact thì locator thiếu và
+evidence không được đánh dấu traceable.
+
+### Evidence model
+
+Implementation thêm `EvidencePack`/`ToolEvidencePack` phía service và các
+optional locator fields trên `RetrievedSection`; DTO fields chỉ là transport,
+không trở thành authorization source:
+
+- Numeric `[n]` là ID theo từng pack/context và giữ tương thích UI/API; chưa có
+  persistent/stable `evidence_id` riêng.
+- Pack giữ section body, heading, `source_config_id`, final RRF `rank/score` và
+  engine `chunk_id`; API citation gắn public SAG `source_id/name`. Hiện chưa có
+  `content_hash` trên `RetrievedSection`/citation contract.
+- Locator `document_id`, `document_version_id`, page range và anchor chỉ được set
+  từ exact DB join đã xác minh. Incomplete locator không được pack; không suy
+  `latest version` hoặc giá trị thiếu.
+- ACL scope không được phát ra như citation metadata. Authorization provenance
+  nội bộ giữ lại reference tới Source object đã authorize để validator xác minh.
+- Chỉ pack items được phép và đầy đủ mới được đưa vào LLM context. Citation IDs
+  được cấp **sau** chọn evidence cuối cùng; mọi final citation resolve từ đúng
+  registry đó. Fallback cũng chỉ render pack, không quay lại candidate list.
+
+### Token budget algorithm
+
+#### Hiện trạng đã xác minh
+
+- Không có model tokenizer trong search answer path. `generation/prompt.py`
+  `estimate_tokens()` dùng heuristic CJK characters ≈ 1 token và ký tự còn lại
+  ≈ 1/4 token (round up); đây là estimator xấp xỉ, không phải provider tokenizer.
+- `settings.llm_context_window` lấy mặc định từ provider registry
+  (`model_providers.py`: OpenAI-compatible 128,000; Anthropic 1,000,000; Gemini
+  1,048,576), nhưng có thể cấu hình qua `SAG_*`/Settings API. Đây là provider
+  default/configured value, không lookup giới hạn model cụ thể của gateway.
+- `settings.llm_max_tokens` mặc định 20,000, có thể cấu hình và được truyền thành
+  `max_tokens` trong `LLMClient`; code hiện không trừ nó khỏi context window.
+- Search answer chỉ giới hạn evidence ở 12,000 ký tự; không tính system prompt,
+  query, role/message framing hoặc output reserve; có thể cắt ngang block.
+- Agent history dùng `int(llm_context_window * 0.4)` với cùng estimator, nhưng
+  chỉ giới hạn lịch sử ban đầu. System prompt, current query, tool definitions,
+  các lượt tool result và output reserve chưa có một phép tính tổng tại SAG layer.
+
+#### Thuật toán đã triển khai
+
+Không thay 12,000 chars bằng một hằng số token. Với từng lần gọi model:
+
+1. Dùng `llm_context_window` và `llm_max_tokens` đang hiệu lực; cap reserve ở
+   context window để cấu hình không hợp lệ tạo pack rỗng/no-answer.
+2. Render fixed system instructions, current query, conversation/history hiện có,
+   tool schema/framing (nếu runtime cung cấp), và evidence theo format cuối cùng.
+   Tính `base_input_estimate = estimate_tokens(render(base messages))`, không chỉ
+   đếm content của chunks.
+3. Tính evidence capacity động từ
+   `context_window - reserved_output_tokens - base_input_estimate`. Tính token
+   trên từng block đã render đầy đủ, gồm heading, citation ID và separator.
+4. Thêm từng evidence item theo thứ tự retrieval hiện có khi toàn block còn vừa;
+   bỏ item quá lớn và tiếp tục thử item nhỏ hơn, không cắt block. Citation number
+   được render theo đúng thứ tự packed; ranking/fusion không đổi.
+5. Search path packer ước tính toàn bộ rendered messages trước call. Agent
+   `transform_context` re-estimate actual runtime messages + tool schemas từng
+   turn; remaining evidence budget đã trừ hai output reserves. Packer không ghi
+   thống kê token ra response; tests kiểm tra không vượt estimator budget.
+
+`estimate_tokens()` chỉ là estimator; nó không bảo đảm provider token count.
+Agent hook có actual runtime messages tại transform boundary và có thể loại bỏ
+history/evidence units; nếu system prompt + current query + tool schemas tự vượt
+budget thì runtime fail-closed. Hard guarantee theo tokenizer/context window
+chính xác của từng provider/model vẫn là gap.
+
+### Citation provenance algorithm
+
+1. Lấy candidate sections đã qua authorization + logical-delete + existing
+   relevance/fusion. Enrich source/document locator trong scope Source đã được
+   resolve; không thay thứ tự hay eligibility retriever.
+2. Chỉ nhận chunk/document match exact theo engine `source_config_id` + engine
+   document-source ID + `chunk_id`. Xác minh document còn searchable/active và
+   `Document.source_id` thuộc Source set đã authorized.
+3. Resolve version/page/anchor qua exact versioned index lineage nếu có. Không
+   dùng `latest DocumentVersion` hoặc text-hash similarity làm bằng chứng mapping.
+   Nếu locator bắt buộc chưa resolve đầy đủ, đánh dấu missing; theo policy an
+   toàn hiện đề xuất loại khỏi answerable pack và trả `no_answer`.
+4. Token-pack các EvidenceItems hoàn chỉnh. Numeric citation number được render
+   theo đúng thứ tự pack; danh sách packed sections là registry cụ thể của lượt
+   answer (Agent đọc citation IDs từ tool messages còn lại sau context fitting).
+5. Search validator kiểm tra cú pháp/range trên chính packed sections; Agent
+   finalizer yêu cầu citation object có locator và lọc số theo evidence ID thực
+   sự còn trong rendered `search_context` message. Số không có trong pack bị
+   loại; factual claim không có mapping citation thì Search fallback dùng trích
+   đoạn có citation, còn local-only Agent trả no-answer.
+6. Citation output mang `document_id`, `document_version_id`, `chunk_id`, page
+   range/anchor, SAG `source_id/name` và excerpt. Agent còn đánh dấu `claim_level`;
+   Search API chỉ trả citations được dùng theo numeric references. Không có hash
+   hoặc entailment proof; Agent run-level source fallback không được dùng để
+   vượt qua local-evidence no-answer gate.
+
+### Empty/Weak/Sufficient algorithm
+
+Score semantics hiện tại không cung cấp answerability: RRF `[0,1]` phản ánh rank
+agreement/position; relevance gate có lexical feature heuristic và semantic
+relative ratio `0.68`, không phải xác suất, confidence hoặc claim support. Không
+được đặt một RRF cutoff mới để phân loại.
+
+- **EMPTY:** sau ACL, logical-delete filtering và existing relevance gate không
+  còn section nào. Search API không gọi answer LLM; trả no-answer có cấu trúc,
+  rỗng citation. Agent SearchContext trả tool result không có evidence/citation;
+  runtime hiện vẫn có thể chạy lượt cuối để hoàn thành tool loop, nhưng giữ kín
+  deltas và canonical output sẽ bị thay bằng no-answer.
+- **WEAK (có thể phát hiện bằng contract hiện tại):** candidates có nhưng không
+  có item vừa context budget nguyên vẹn; provenance/ACL exact join thiếu; locator
+  bắt buộc chưa đủ; hoặc query features có exact identifier/path nhưng không có
+  packed content nào khớp qua lexical normalization. Search API không gọi answer
+  LLM; Agent không phát raw answer delta và terminal gate trả no-answer.
+- **SUFFICIENT (operational pack eligibility, không calibrated confidence):** có
+  ít nhất một evidence item đầy đủ, được phép, traceable, được render nguyên vẹn
+  trong budget và vượt existing relevance gate; với exact identifier query còn
+  phải hiện diện chính identifier trong evidence. Chỉ khi đó mới gọi LLM với
+  prompt grounded/citation-constrained. Không dùng score để tuyên bố chắc chắn
+  nội dung evidence entail câu trả lời.
+
+**GAP còn lại:** code không có calibrated answerability, claim coverage hay
+entailment validator. Với câu hỏi factual tự nhiên, “có section relevant + locator
+đầy đủ” vẫn không chứng minh section trả lời đủ câu hỏi. Policy trong scope có thể
+chặn EMPTY và WEAK theo điều kiện cấu trúc trên, nhưng không thể chứng nhận semantic
+WEAK ở mọi truy vấn. Safest rollout là abstain khi không đạt structural pack
+eligibility, chỉ cho phép answer generation với citation cho từng factual claim,
+và ghi rõ đây chưa phải bảo đảm entailment. Đo/calibrate answerability là follow-up
+riêng; không đặt ngưỡng RRF tạm thời.
+
+### Ambiguous query behavior
+
+P3 contract không đổi: `_build_query_route()` tiếp tục gửi `AMBIGUOUS` qua
+retrieval; chỉ high-confidence `CHAT` skip. Agent initial tool choice và prompt
+hiện có thể yêu cầu hoặc chọn clarification theo intent/tool contract; P4 không
+thêm rule “ambiguous ⇒ hỏi lại”. Sau routing hiện có, P4 chỉ pack evidence và
+đánh giá EMPTY/WEAK/SUFFICIENT. Nếu ambiguous query có evidence đủ structural
+eligibility thì dùng evidence đó; nếu rỗng/yếu thì no-answer theo evidence policy,
+không tự sinh câu trả lời và cũng không tự biến thành clarification.
+
+### API/stream changes
+
+- Giữ request, query route, source scope và `sections` retrieval response tương
+  thích. Additive response fields: `answer_status`, `citations` có
+  locator provenance, và `no_answer_reason`/evidence diagnostics không nhạy cảm.
+- Search summary/fallback chỉ sử dụng final EvidencePack. Empty/Weak trả thông
+  báo no-answer rõ nghĩa thay vì `summary=""` hoặc excerpt bất kỳ; Search API
+  bỏ answer LLM call, Agent giữ raw output kín và thay final answer bằng
+  no-answer nếu evidence/citation không đạt gate.
+- SSE giữ tên event `result`, `summary.delta`, `completed`, `error`, nhưng không
+  phát raw LLM text/citation trước validator. Buffer đến khi citation IDs được
+  xác thực; sau đó có thể emit canonical answer và completed. Đây là thay đổi
+  latency/streaming semantics so với true provider deltas hiện tại; cần regression
+  cho consumers.
+- Agent final citation validator dùng registry EvidencePack thực tế của các tool
+  results. Để đảm bảo empty/weak không leak qua runtime delta, buffer assistant
+  answer deltas trong knowledge-only, scoped, hoặc các run có thể dùng
+  `search_context` đến final validation/no-answer. External web citations giữ
+  loại/validator riêng và không được coi là SAG document citation.
+- Không thay routing trace, ACL fields, result ranking hoặc graph/source-scoped
+  event behavior.
+
+### Test matrix
+
+| Case | Setup/expectation |
+|---|---|
+| Greeting / high-confidence CHAT | Routing giữ nguyên; retrieval/answer LLM không bị gọi; không có fabricated citation; no-answer không thay greeting contract của Agent. |
+| Factual question, evidence rõ | Chỉ section trong authorized scope được pack; block nguyên vẹn và nằm trong budget; answer dùng facts trong evidence; final citation map về locator fixture đầy đủ. |
+| Exact identifier | Exact lexical result ưu tiên như hiện tại; identifier phải có nguyên văn trong pack; score `0.5` hay RRF position không làm mất match; cite đúng chunk/version/page/anchor. |
+| Ambiguous | Assert query_route/coarse intent và strategy không đổi; evidence đủ thì grounded answer; evidence rỗng/yếu thì no-answer, không ép clarification. |
+| No evidence | Zero post-ACL relevant sections; explicit no-answer, `citations=[]`, Search API không gọi answer LLM, Agent không phát raw delta/claim. |
+| Weak structural evidence | Missing locator, unauthorized/mismatched source, exact ID vắng, hoặc không item nào vừa budget; Search API không gọi answer LLM, Agent trả no-answer và không lộ raw answer delta. |
+| Token budget | Tính tổng system + conversation/query + tool framing + evidence bằng estimator; output reserve lấy `llm_max_tokens`; không vượt `llm_context_window`; item không bị cắt ngang. Kiểm tra nhiều provider settings và prompt lớn. |
+| Citation syntax/provenance | Valid ID trong final pack được giữ; malformed/out-of-range/invented ID, item bị bỏ/không render, source ngoài authorized set hoặc thiếu locator bị loại/answer abstains. |
+| Stream | Không thấy speculative invalid text trước validation; status/citations nhất quán giữa result và completed; cancellation/provider failure vẫn đóng stream an toàn. |
+| Existing regressions | `tests/test_search_stream.py`, `tests/test_retrieval_relevance.py`, `tests/test_agentic.py`; bổ sung tool path (`test_agent_tools.py`) nếu thay đổi `SearchContextTool`. |
+
+### File-by-file changes
+
+**Implemented in this task branch:**
+
+- `SAG/apps/api/sag_api/services/evidence_service.py` — exact ACL-scoped locator
+  resolver, whole-item token packers, exact identifier guard and no-answer text.
+- `SAG/apps/api/sag_api/services/retrieval_service.py` — answer orchestration,
+  canonical citation validation and buffered search generation; candidate
+  generation, ACL filters, candidate limits và RRF không đổi.
+- `SAG/apps/api/sag_api/api/v1/search.py` — dùng pack ở source/global search và
+  stream; trả no-answer/citations sau final validation.
+- `SAG/apps/api/sag_api/schemas/search.py` — additive `answer_status`, citation
+  locator schema và no-answer reason; giữ field score documentation semantics.
+- `SAG/apps/api/sag_api/tools/builtin.py` — exact resolve, locator filter,
+  context-budgeted `search_context` và citations chỉ từ items trả runtime.
+- `SAG/apps/api/sag_api/services/agent_service.py` — actual-message/tool-schema
+  fitting each runtime turn, remaining evidence budget, citation visibility gate,
+  no-answer for ungrounded local evidence, and protected answer deltas.
+- `SAG/apps/api/sag_api/sag/dto.py` — optional locator transport fields; legacy
+  hits remain incomplete unless the exact resolver fills them.
+- `SAG/apps/api/sag_api/generation/prompt.py` — locator fields on citation
+  objects; existing `estimate_tokens()` is reused.
+- `SAG/apps/api/sag_api/tools/base.py` — per-run context budget and local-search
+  gate state.
+- No changes to `generation/llm.py`, `sag/engine_manager.py`, schema migrations,
+  or ingestion/index lane.
+- Tests: `SAG/apps/api/tests/test_search_stream.py`,
+  `test_retrieval_relevance.py`, `test_agentic.py`, `test_agent_tools.py` and
+  `test_traceability.py` cover the API, tool and DB resolver seams.
+- `SAG/tasks/todo.md` — actual implementation status, verified checks and open
+  corpus/answerability gaps.
+
+### Out-of-scope
+
+- Thay đổi global retrieval, ACL/principal resolver, Project→Source mapping,
+  dense/lexical candidate generation, RRF/fusion, score contract hoặc P3 routing.
+- Sửa ingestion, canonicalization, chunk generation, embedding/vector index,
+  populate `CanonicalBlock`/`SearchUnit`, reindex/backfill hay schema migration.
+- Tự gán version bằng latest row, trang/anchor từ suy đoán, hoặc ghép chunk với
+  canonical content bằng fuzzy/text similarity.
+- Thay đổi Graph/Tree routing, agent clarification policy, external web search,
+  hoặc citation rules của web sources.
+- Frontend UX/FE streaming changes ngoài additive API event compatibility; nếu
+  client dựa vào raw token deltas, cần task/owner thống nhất riêng.
+
+### Remaining gaps
+
+1. **Hard locator gap — rollout blocker:** resolver exact đã có, nhưng legacy
+   zleap `SourceChunk.id` không được chứng minh bằng `SearchUnit.id` của
+   versioned index. Locator test dùng fixture cùng exact IDs; corpus thực tế cần
+   xác nhận `SearchUnit` đã được populate và IDs khớp. Với kết quả legacy không
+   khớp, search trả no-answer thay vì câu trả lời không citation. Owner ingestion/
+   index (phan tai) cần thống nhất mapping/reindex deliverable riêng; task này
+   không sửa lane đó.
+2. **Answerability gap:** không có calibrated signal/claim coverage/entailment.
+   RRF/relevance gate không thể lấp gap này. Tác vụ này chỉ có thể định nghĩa
+   operational structural eligibility và abstain ở case yếu phát hiện được.
+3. **Tokenizer/model window gap:** `estimate_tokens()` là heuristic; provider
+   registry chứa provider default chứ không exact model-specific limit. Runtime
+   messages/tool schemas được fit mỗi turn nhưng provider token usage có thể cao
+   hơn estimator; hard guarantee cần tokenizer/model metadata chính xác.
+4. **Agent stream latency:** buffering tới final validation tăng
+   time-to-first-answer; consumer phải nghiệm thu single canonical delta thay vì
+   provider's speculative token deltas. Cancellation/provider failure tests cover
+   stream close, nhưng không đo latency thực tế.
+
+**Database/config/security impact thực tế:** không đổi schema/migration/ACL hoặc
+LLM settings mặc định. Packer đọc các config hiện hữu. Metadata lookup chỉ dùng
+Source set đã authorize và exact versioned IDs; lookup miss fail closed. Nếu
+muốn persist exact chunk→version/page mapping thì đó là deliverable DB/index
+riêng, ngoài task này. Retrieved document text được đánh dấu là dữ liệu không
+đáng tin cậy trong Search và Agent instructions; không thể thay thế entailment
+validation.
+
+### Acceptance checklist
+
+- [x] Retrieval-result table và source-of-truth fields được giữ trong review notes;
+      không nhầm engine `source_id` với SAG Source ID hoặc RRF với confidence.
+- [x] Context chỉ chứa whole EvidenceItems thuộc ACL scope và nằm trong budget
+      estimate từ actual messages, configured context window và output reserve.
+- [x] Citation IDs chỉ resolve tới item được render; citation locator có
+      document/version/chunk/page/anchor đã verify, không có metadata suy đoán.
+- [x] EMPTY và structural WEAK không lộ raw stream deltas;
+      trả no-answer rõ ràng với citation list rỗng.
+- [x] Factual/exact-ID Checkpoint A có positive test với fixture lineage đầy đủ;
+      exact identifier không bị RRF score scale/position làm mất.
+- [x] Ambiguous query giữ routing contract hiện có; P4 chỉ thay evidence outcome.
+- [x] Checkpoint A regression đủ greeting, factual, exact identifier, ambiguous, no evidence;
+      stream và Agent citations được kiểm tra riêng.
+- [x] `tasks/todo.md` ghi rõ hard locator gap, answerability gap và validation
+      chưa chạy/không đạt; không đánh dấu hoàn thành chỉ vì unit suite xanh.
+- [ ] Trước review/merge, xác nhận corpus production có exact
+      version/page/anchor mapping hoặc owner chấp thuận rõ partial citation
+      contract; nếu chưa thì merge readiness bị chặn.
+
+### Implementation verification — 2026-10-01
+
+- Final focused regression command: `test_retrieval_relevance.py`,
+  `test_search_stream.py`, `test_traceability.py`, `test_agent_tools.py` và
+  `test_agentic.py`: **69 passed, 1 deselected** after all code changes.
+  Deselect là `test_initial_tool_policy_anchors_time_and_preserves_clarification`;
+  an unfiltered run failed there because `_initial_tool_choice("最近 ChatGPT 有哪些更新？")`
+  returns `"none"` instead of `get_time`. That routing logic/test is unchanged by
+  this task.
+- Ruff trên mọi Python file đổi: **passed**. `git diff --check`: **passed**.
+- Runner dùng sibling checkout's populated `.venv` với `PYTHONPATH` trỏ về
+  current task checkout; local task `.venv` thiếu binary `link.exe` để build
+  dependency `litellm`, nên full environment install/build chưa xác minh.
 
 ## Luồng mục tiêu
 

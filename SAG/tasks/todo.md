@@ -97,7 +97,20 @@ Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL ev
 - [x] Không dùng Knowledge Graph/Tree trong global P4 retrieval; không sửa ingestion/index lane hoặc shared contract/config.
 - [ ] Propagate Source provenance qua các lượt assistant phụ thuộc history; kiểm tra revoke khi lượt sau tóm tắt evidence cũ nhưng không có citation/tool riêng. Bộ lọc hiện chỉ xác minh provenance được ghi trên từng message.
 
-**Trạng thái:** P4 retrieval/fusion và ACL runtime code có contract/runtime tests để review. Production ACL rollout acceptance vẫn **BLOCKED** cho tới khi có signer/JWKS thật, mapping/backfill được duyệt và staging leakage/revocation tests đạt. Đây là cổng vận hành ACL; **P1** trong PR notes chỉ Priority 1 runtime ACL, không phải Phase 1 — Upload & Versioned Source. Chi tiết acceptance nằm trong [ACL evidence-path inventory](../docs/security/acl-evidence-path-inventory.md).
+### P4 evidence context / citation / no-answer — implementation status (2026-10-01)
+
+- [x] Ghi chính xác retrieval-result fields và actual source/semantics trong [implementation plan](plan.md#existing-contracts).
+- [x] Resolver gắn locator bằng exact SearchUnit/chunk ID, authorized SAG Source scope, active/READY Document, SEARCH_READY version và CanonicalBlock start/end cùng version; missing locator fail closed.
+- [x] Search API và Agent chỉ pack whole traceable evidence nằm trong token estimate budget; reserve dùng `llm_max_tokens`, window dùng `llm_context_window`, Agent tính actual runtime messages/tool schemas mỗi turn.
+- [x] Citation output có SAG source/document/version/chunk/page/anchor; validator chỉ giữ IDs của evidence đã render và được phép.
+- [x] Search stream buffer raw model text tới citation validation; Agent ẩn answer deltas khi local grounding bắt buộc hoặc `search_context` đã chạy, còn direct/chat turns giữ contract; terminal gate loại output local không có provenance claim.
+- [x] Regression có greeting, factual positive fixture, exact identifier, ambiguous giữ routing contract, empty evidence, missing locator, provenance ACL boundary, Agent citation/context fitting.
+- [ ] Xác nhận với owner ingestion/index (phan tai) rằng corpus thật populate `SearchUnit` và chunk IDs khớp; legacy `SourceChunk` không map được thì sẽ no-answer cho tới khi có deliverable mapping/reindex được thống nhất.
+- [ ] Calibrate answerability/claim coverage/entailment riêng; RRF và relevance score không phải confidence, nên hiện tại chỉ phát hiện structural weak và exact-anchor miss.
+- [ ] Chạy end-to-end upload → extraction → index → retrieval → answer trên corpus có locator thật, cùng provider/model tokenizer/context-window verification.
+- [ ] Consumer nghiệm thu stream single canonical delta/time-to-first-answer và kiểm tra full API suite; hiện có một agent routing baseline failure được ghi ở kiểm chứng của plan.
+
+**Trạng thái:** P4 retrieval/fusion/ACL runtime code có contract/runtime tests để review; task evidence pack có code và focused regressions, nhưng còn các gap được đánh dấu ở trên. Production ACL rollout acceptance vẫn **BLOCKED** cho tới khi có signer/JWKS thật, mapping/backfill được duyệt và staging leakage/revocation tests đạt. Đây là cổng vận hành ACL; **P1** trong PR notes chỉ Priority 1 runtime ACL, không phải Phase 1 — Upload & Versioned Source. Chi tiết acceptance nằm trong [ACL evidence-path inventory](../docs/security/acl-evidence-path-inventory.md).
 
 ## Checkpoint A — SEARCH_READY end-to-end
 
