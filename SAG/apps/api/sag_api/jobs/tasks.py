@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -385,37 +386,79 @@ async def _process_document_unlocked(
                 if ing_run:
                     doc_ver = await session.get(DocumentVersion, ing_run.document_version_id)
                     if doc_ver:
-                        md_path = str(prepared.path) if prepared else target_storage_path
-                        if os.path.exists(md_path):
-                            with open(md_path, "r", encoding="utf-8", errors="replace") as f:
-                                doc_content = f.read()
-                            # 2A: Parse & Persist Canonical Blocks
-                            from sag_api.services.canonical_service import parse_and_persist_document_content
-                            await parse_and_persist_document_content(
-                                session, doc_ver.id, doc_content, run_id=run_id
+                        # [P2 Fix]: Safe prepared document resolution on resume to prevent raw binary UTF-8 decoding
+                        if prepared is None:
+                            prepared = await prepare_document(
+                                target_storage_path,
+                                settings,
+                                state=(job.payload or {}).get("document_parser"),
+                                on_state=on_parser_state,
+                                should_pause=should_pause,
                             )
-                            # 2B: Dedup & Temporal Lineage
-                            from sag_api.services.dedup_and_temporal_service import run_dedup_and_temporal_stage
-                            await run_dedup_and_temporal_stage(
-                                session,
-                                document_version=doc_ver,
-                                document_id=document.id,
-                                project_id=ing_run.project_id,
-                                run_id=run_id,
-                            )
-                            # 2C: Search Units Chunking & Indexing
-                            from sag_api.services.search_index_service import run_search_indexing_stage
-                            sec_partition = (doc_ver.metadata_json or {}).get("security_partition_id") or "public"
+
+                        if prepared is None or not prepared.path or not os.path.exists(prepared.path):
+                            raise RuntimeError(f"Prepared markdown path missing for document {document.id}")
+
+                        with open(prepared.path, "r", encoding="utf-8", errors="replace") as f:
+                            doc_content = f.read()
+
+                        # 2A: Parse & Persist Canonical Blocks
+                        from sag_api.services.canonical_service import parse_and_persist_document_content
+                        await parse_and_persist_document_content(
+                            session, doc_ver.id, doc_content, run_id=run_id
+                        )
+
+                        # 2B: Dedup & Temporal Lineage
+                        from sag_api.services.dedup_and_temporal_service import run_dedup_and_temporal_stage
+                        await run_dedup_and_temporal_stage(
+                            session,
+                            document_version=doc_ver,
+                            document_id=document.id,
+                            project_id=ing_run.project_id,
+                            run_id=run_id,
+                        )
+
+                        # [P1 Fix]: Fail-closed on missing security_partition_id
+                        sec_partition = (doc_ver.metadata_json or {}).get("security_partition_id")
+                        if not sec_partition or not str(sec_partition).strip():
+                            raise ValueError(f"Missing security_partition_id for document_version {doc_ver.id} (fail-closed)")
+
+                        # [P1 Fix]: Worker passes real Qdrant client and Embedder to search index stage
+                        embedder = None
+                        try:
+                            embedder = await engine_manager.get_sag_embedding(source.sag_source_config_id, source)
+                        except Exception as emb_exc:
+                            log.warning("Could not get sag embedding client: %s", emb_exc)
+
+                        from sag_api.services.search_index_service import run_search_indexing_stage
+                        qdrant_url = getattr(settings, "sag_qdrant_url", "http://localhost:6333").rstrip("/")
+                        async with httpx.AsyncClient(base_url=qdrant_url, timeout=30.0) as qdrant_client:
                             await run_search_indexing_stage(
                                 session,
                                 project_id=ing_run.project_id,
                                 document_version=doc_ver,
                                 security_partition_id=sec_partition,
+                                qdrant_client=qdrant_client,
+                                embedder=embedder,
                                 run_id=run_id,
                             )
-                            await session.commit()
+                        await session.commit()
             except Exception as pipe_err:
-                log.warning("Phase 2 pipeline execution warning run_id=%s: %s", run_id, pipe_err)
+                log.error("Phase 2 pipeline execution failed run_id=%s: %s", run_id, pipe_err)
+                ing_run = await session.get(IngestionRun, run_id) if run_id else None
+                if ing_run:
+                    ing_run.status = "FAILED"
+                    ing_run.error_layer = ErrorLayer.API.value
+                    ing_run.error_stage = ErrorStage.EXTRACT.value
+                    ing_run.error_message = str(pipe_err)
+                    session.add(ing_run)
+                    await session.commit()
+                # Fail the document and preserve error layer and stage
+                raise ApiError(
+                    str(pipe_err),
+                    layer=ErrorLayer.API,
+                    stage=ErrorStage.EXTRACT,
+                ) from pipe_err
 
         outcome = await engine_manager.process_document(
             source.sag_source_config_id,

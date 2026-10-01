@@ -42,8 +42,9 @@ VALID_RELATIONS = {
 
 def compute_text_similarity(text1: str, text2: str) -> float:
     """Compute lexical Jaccard similarity using word tokens (stdlib)."""
-    t1 = set(text1.strip().lower().split())
-    t2 = set(text2.strip().lower().split())
+    import re
+    t1 = set(re.findall(r"\w+", text1.lower()))
+    t2 = set(re.findall(r"\w+", text2.lower()))
     if not t1 or not t2:
         return 0.0
     return len(t1 & t2) / len(t1 | t2)
@@ -185,17 +186,85 @@ async def run_dedup_and_temporal_stage(
     project_id: str,
     run_id: str | None = None,
 ) -> dict[str, Any]:
-    """Execute Phase 2B stage with StageRun audit trail."""
+    """Execute Phase 2B stage: Exact Dedup, Near Dedup, and Temporal Supersedes with audit."""
     start_time = datetime.now(UTC)
 
+    # 1. Exact Version Dedup Check (by file_hash)
+    exact_dup_stmt = (
+        select(DocumentVersion)
+        .where(
+            DocumentVersion.document_id == document_id,
+            DocumentVersion.id != document_version.id,
+            DocumentVersion.file_hash == document_version.file_hash,
+        )
+        .order_by(desc(DocumentVersion.created_at))
+    )
+    exact_dup_version = (await session.execute(exact_dup_stmt)).scalars().first()
+    is_exact_dup_version = exact_dup_version is not None
+
+    # 2. Block-Level Exact & Near Dedup Check
+    curr_blocks = (
+        await session.execute(
+            select(CanonicalBlock)
+            .where(CanonicalBlock.document_version_id == document_version.id)
+            .order_by(CanonicalBlock.ordinal)
+        )
+    ).scalars().all()
+
+    prior_blocks = (
+        await session.execute(
+            select(CanonicalBlock)
+            .join(DocumentVersion, CanonicalBlock.document_version_id == DocumentVersion.id)
+            .where(
+                DocumentVersion.document_id == document_id,
+                DocumentVersion.id != document_version.id,
+            )
+        )
+    ).scalars().all()
+
+    exact_block_matches = 0
+    near_dup_candidates: list[dict[str, Any]] = []
+    prior_hashes = {b.content_hash for b in prior_blocks if b.content_hash}
+
+    for b in curr_blocks:
+        if b.content_hash and b.content_hash in prior_hashes:
+            exact_block_matches += 1
+        else:
+            # Near-dedup: check lexical Jaccard similarity against prior blocks
+            for pb in prior_blocks:
+                sim = compute_text_similarity(b.normalized_text, pb.normalized_text)
+                if sim >= 0.85:
+                    rel = classify_relation_candidate(sim)
+                    near_dup_candidates.append({
+                        "source_block_id": b.id,
+                        "target_block_id": pb.id,
+                        "similarity": round(sim, 3),
+                        "relation": rel,
+                        "auto_merged": False,
+                    })
+                    break  # Found best match for this block
+
+    # 3. Temporal Resolution (Multi-timestamp lineage & out-of-order protection)
     temporal_result = await resolve_temporal_supersedes(
         session,
         current_version=document_version,
         document_id=document_id,
     )
 
+    # 4. Update DocumentVersion metadata with Dedup audit
+    meta = dict(document_version.metadata_json or {})
+    meta.update({
+        "is_exact_duplicate": is_exact_dup_version,
+        "exact_duplicate_of": exact_dup_version.id if exact_dup_version else None,
+        "exact_block_matches": exact_block_matches,
+        "near_duplicate_candidates_count": len(near_dup_candidates),
+    })
+    document_version.metadata_json = meta
+    session.add(document_version)
+
     duration_ms = (datetime.now(UTC) - start_time).total_seconds() * 1000.0
 
+    # 5. Record StageRun
     if run_id:
         stage_run = StageRun(
             id=str(uuid.uuid4()),
@@ -204,10 +273,21 @@ async def run_dedup_and_temporal_stage(
             status="SUCCESS",
             duration_ms=duration_ms,
             metrics_json={
+                "exact_duplicate_found": is_exact_dup_version,
+                "exact_duplicate_of": exact_dup_version.id if exact_dup_version else None,
+                "exact_block_matches": exact_block_matches,
+                "near_duplicate_candidates_count": len(near_dup_candidates),
                 "temporal_action": temporal_result["action"],
                 "active_version_id": temporal_result["active_version_id"],
             },
         )
         session.add(stage_run)
 
-    return temporal_result
+    return {
+        "exact_duplicate_found": is_exact_dup_version,
+        "exact_duplicate_of": exact_dup_version.id if exact_dup_version else None,
+        "exact_block_matches": exact_block_matches,
+        "near_duplicate_candidates": near_dup_candidates,
+        "temporal_action": temporal_result["action"],
+        **temporal_result,
+    }

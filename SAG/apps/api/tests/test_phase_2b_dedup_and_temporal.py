@@ -282,3 +282,134 @@ async def test_out_of_order_ingestion_protection():
         # Bản mới hơn (v_new) vẫn giữ nguyên hiệu lực đến vĩnh cửu
         v_new_check = (await session.execute(select(DocumentVersion).where(DocumentVersion.id == v_new_id))).scalar_one()
         assert v_new_check.valid_to == datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_run_dedup_and_temporal_stage_executes_exact_and_near_dedup():
+    """Kiểm tra run_dedup_and_temporal_stage thực thi cả exact dedup và near dedup Jaccard."""
+    await init_db()
+    project_id = f"proj_dedup_{uuid.uuid4().hex[:8]}"
+    run_id = str(uuid.uuid4())
+
+    async with SessionLocal() as session:
+        doc_id = await _create_test_hierarchy(session)
+
+        # Version 1: chứa block 1 và block 2
+        v1_id = str(uuid.uuid4())
+        v1 = DocumentVersion(
+            id=v1_id,
+            document_id=doc_id,
+            version_no=1,
+            file_hash="hash_content_v1",
+            observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+            status="RECEIVED",
+        )
+        session.add(v1)
+        await session.commit()
+
+        b1 = CanonicalBlock(
+            id=str(uuid.uuid4()),
+            document_version_id=v1_id,
+            ordinal=0,
+            block_type="paragraph",
+            page_from=1,
+            page_to=1,
+            section_path="Intro",
+            normalized_text="Kiến trúc hệ thống microservices với Docker và Kubernetes.",
+            content_hash="hash_block_1",
+        )
+        b2 = CanonicalBlock(
+            id=str(uuid.uuid4()),
+            document_version_id=v1_id,
+            ordinal=1,
+            block_type="paragraph",
+            page_from=1,
+            page_to=1,
+            section_path="Intro",
+            normalized_text="Cơ sở dữ liệu PostgreSQL và Qdrant vector database được cấu hình tối ưu.",
+            content_hash="hash_block_2",
+        )
+        session.add_all([b1, b2])
+        await session.commit()
+
+        # Version 2: nạp lại: 1 block exact match, 1 block near duplicate (sửa 1 từ)
+        v2_id = str(uuid.uuid4())
+        v2 = DocumentVersion(
+            id=v2_id,
+            document_id=doc_id,
+            version_no=2,
+            file_hash="hash_content_v2",
+            observed_at=datetime(2026, 1, 2, tzinfo=UTC),
+            status="RECEIVED",
+        )
+        session.add(v2)
+        await session.commit()
+
+        # Block v2_1: exact match với b1
+        v2_b1 = CanonicalBlock(
+            id=str(uuid.uuid4()),
+            document_version_id=v2_id,
+            ordinal=0,
+            block_type="paragraph",
+            page_from=1,
+            page_to=1,
+            section_path="Intro",
+            normalized_text="Kiến trúc hệ thống microservices với Docker và Kubernetes.",
+            content_hash="hash_block_1",  # exact hash match
+        )
+        # Block v2_2: near duplicate với b2 (Jaccard > 0.85)
+        v2_b2 = CanonicalBlock(
+            id=str(uuid.uuid4()),
+            document_version_id=v2_id,
+            ordinal=1,
+            block_type="paragraph",
+            page_from=1,
+            page_to=1,
+            section_path="Intro",
+            normalized_text="Cơ sở dữ liệu PostgreSQL và Qdrant vector database được cấu hình tối ưu nhất.",
+            content_hash="hash_block_2_modified",
+        )
+        session.add_all([v2_b1, v2_b2])
+
+        ing_run = IngestionRun(
+            id=run_id,
+            tenant_id="tenant_default",
+            project_id=project_id,
+            document_version_id=v2_id,
+            idempotency_key="key_dedup_test",
+            payload_hash="hash_content_v2",
+            status="RUNNING",
+        )
+        session.add(ing_run)
+        await session.commit()
+
+        # Chạy Stage 2B
+        res = await run_dedup_and_temporal_stage(
+            session,
+            document_version=v2,
+            document_id=doc_id,
+            project_id=project_id,
+            run_id=run_id,
+        )
+        await session.commit()
+
+        assert res["exact_block_matches"] == 1
+        assert len(res["near_duplicate_candidates"]) == 1
+        assert res["near_duplicate_candidates"][0]["relation"] == RELATION_EQUIVALENT
+        assert res["near_duplicate_candidates"][0]["auto_merged"] is False
+        assert res["temporal_action"] == "SUPERSEDED"
+
+        # Kiểm tra metadata_json của v2 được ghi nhận
+        v2_updated = (await session.execute(select(DocumentVersion).where(DocumentVersion.id == v2_id))).scalar_one()
+        assert v2_updated.metadata_json["exact_block_matches"] == 1
+        assert v2_updated.metadata_json["near_duplicate_candidates_count"] == 1
+
+        # Kiểm tra StageRun
+        stage_run = (
+            await session.execute(
+                select(StageRun).where(StageRun.run_id == run_id, StageRun.stage == "DEDUP_TEMPORAL")
+            )
+        ).scalar_one()
+        assert stage_run.status == "SUCCESS"
+        assert stage_run.metrics_json["exact_block_matches"] == 1
+        assert stage_run.metrics_json["near_duplicate_candidates_count"] == 1

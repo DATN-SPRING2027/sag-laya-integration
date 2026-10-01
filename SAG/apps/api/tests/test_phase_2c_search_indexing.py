@@ -148,9 +148,14 @@ def test_pre_provisioned_tree_routing_fields_in_payload():
     assert "tree_version_b" in payload and payload["tree_version_b"] is None
 
 
+class MockEmbedder:
+    async def batch_generate(self, texts: list[str]) -> list[list[float]]:
+        return [[0.2, 0.4, 0.6] for _ in texts]
+
+
 @pytest.mark.asyncio
 async def test_search_indexing_stage_and_manifest_verification():
-    """Kiểm tra toàn bộ luồng stage INDEX_SEARCH và đối soát số lượng (manifest verification)."""
+    """Kiểm tra toàn bộ luồng stage INDEX_SEARCH với real embedding và đối soát số lượng (manifest verification)."""
     await init_db()
     project_id = f"proj_{uuid.uuid4().hex[:8]}"
     doc_id = str(uuid.uuid4())
@@ -222,13 +227,15 @@ async def test_search_indexing_stage_and_manifest_verification():
         session.add(ingestion_run)
         await session.commit()
 
-        # Thực thi stage
+        # Thực thi stage với mock_client và real MockEmbedder
+        mock_embedder = MockEmbedder()
         units = await run_search_indexing_stage(
             session,
             project_id=project_id,
             document_version=ver,
             security_partition_id="part_internal",
             qdrant_client=mock_client,
+            embedder=mock_embedder,
             run_id=run_id,
         )
         await session.commit()
@@ -247,11 +254,85 @@ async def test_search_indexing_stage_and_manifest_verification():
         assert stage_run.metrics_json["manifest_verified"] is True
         assert stage_run.metrics_json["qdrant_indexed_count"] == len(units)
 
-        # Xác minh mock Qdrant nhận đúng collection_name
-        assert any(f"/collections/search_units_{project_id}/points" in r.url.path for r in requests_log)
+        # Xác minh mock Qdrant nhận đúng collection_name và vector embedding thật
+        points_requests = [r for r in requests_log if f"/collections/search_units_{project_id}/points" in r.url.path]
+        assert len(points_requests) >= 1
+        body = json.loads(points_requests[0].content)
+        assert "points" in body
+        assert body["points"][0]["vector"]["content_vector"] == [0.2, 0.4, 0.6]
 
         # Xác minh DocumentVersion đạt SEARCH_READY
         ver_updated = (await session.execute(select(DocumentVersion).where(DocumentVersion.id == ver_id))).scalar_one()
         assert ver_updated.search_status == "READY"
         assert ver_updated.search_ready_at is not None
+
+
+@pytest.mark.asyncio
+async def test_search_readiness_fails_without_qdrant_client():
+    """Kiểm tra nếu không có qdrant_client thì không bao giờ được đánh dấu READY (fail-closed)."""
+    await init_db()
+    project_id = f"proj_{uuid.uuid4().hex[:8]}"
+    doc_id = str(uuid.uuid4())
+    ver_id = str(uuid.uuid4())
+    run_id = str(uuid.uuid4())
+
+    async with SessionLocal() as session:
+        doc = Document(id=doc_id, source_id=None, filename="fail_ready.md", storage_path="/tmp/f.md")
+        session.add(doc)
+        await session.commit()
+
+        ver = DocumentVersion(
+            id=ver_id,
+            document_id=doc_id,
+            version_no=1,
+            file_hash="hash_f",
+            valid_from=datetime.now(UTC),
+            valid_to=datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC),
+        )
+        session.add(ver)
+        await session.commit()
+
+        b1 = CanonicalBlock(
+            id=str(uuid.uuid4()),
+            document_version_id=ver_id,
+            ordinal=0,
+            block_type="paragraph",
+            page_from=1,
+            page_to=1,
+            section_path="Intro",
+            normalized_text="Nội dung cần index nhưng không có Qdrant client.",
+            content_hash="hf1",
+        )
+        session.add(b1)
+
+        ingestion_run = IngestionRun(
+            id=run_id,
+            tenant_id="tenant_default",
+            project_id=project_id,
+            document_version_id=ver_id,
+            idempotency_key="key_fail_qdrant",
+            payload_hash="hash_f",
+            status="RUNNING",
+        )
+        session.add(ingestion_run)
+        await session.commit()
+
+        # Không truyền qdrant_client -> Bắt buộc ném lỗi và search_status là INDEX_FAILED
+        with pytest.raises(RuntimeError) as exc_info:
+            await run_search_indexing_stage(
+                session,
+                project_id=project_id,
+                document_version=ver,
+                security_partition_id="part_internal",
+                qdrant_client=None,
+                run_id=run_id,
+            )
+
+        assert "Search indexing failed" in str(exc_info.value)
+        await session.commit()
+
+        # Xác minh DocumentVersion KHÔNG được READY
+        ver_updated = (await session.execute(select(DocumentVersion).where(DocumentVersion.id == ver_id))).scalar_one()
+        assert ver_updated.search_status == "INDEX_FAILED"
+        assert ver_updated.search_ready_at is None
 

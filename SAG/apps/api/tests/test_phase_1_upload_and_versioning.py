@@ -584,12 +584,22 @@ async def test_query_document_version_status_success_and_not_found(client: httpx
 # ============================================================================
 
 @pytest.mark.asyncio
-async def test_worker_transitions_ingestion_run_and_document_version(client: httpx.AsyncClient):
+async def test_worker_transitions_ingestion_run_and_document_version(client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch):
     """Verify that JobType.PROCESS_DOCUMENT linked with run_id transitions IngestionRun
     from QUEUED to RUNNING and on completion updates status to SUCCEEDED and DocumentVersion to READY.
     """
     project_id = "proj_worker_01"
     auth_header = make_auth_header(user_id="user_worker_test", allowed_projects=[project_id])
+
+    # Mock Qdrant handler for search indexing stage in worker
+    def mock_qdrant_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"result": {"operation_id": 1, "status": "completed"}})
+
+    mock_qdrant_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(mock_qdrant_handler),
+        base_url="http://localhost:6333",
+    )
+    monkeypatch.setattr("httpx.AsyncClient", lambda *args, **kwargs: mock_qdrant_client)
 
     res = await client.post(
         f"/api/v1/projects/{project_id}/documents/upload",
@@ -628,6 +638,12 @@ async def test_worker_transitions_ingestion_run_and_document_version(client: htt
         class MockEngineManager:
             async def process_document(self, *args, **kwargs):
                 return MockOutcome()
+
+            async def get_sag_embedding(self, *args, **kwargs):
+                class MockEmbedder:
+                    async def batch_generate(self, texts: list[str]) -> list[list[float]]:
+                        return [[0.1, 0.2, 0.3] for _ in texts]
+                return MockEmbedder()
 
         # Verify that project upload automatically maps and populates doc.source_id (Comment #9)
         assert doc.source_id is not None
@@ -1120,13 +1136,23 @@ async def test_project_source_protected_from_global_sources_routes(client: httpx
 
 
 @pytest.mark.asyncio
-async def test_job_reads_correct_immutable_snapshot_version(client: httpx.AsyncClient):
+async def test_job_reads_correct_immutable_snapshot_version(client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch):
     """[P1] Verify that Job payload carries immutable storage_path and worker processes
     the snapshot of the specific version, even if Document.storage_path is updated by subsequent version.
     """
     project_id = "proj_snapshot_immut_01"
     auth_header = make_auth_header(user_id="user_snap", allowed_projects=[project_id])
     logical_doc = "concurrent/spec.txt"
+
+    # Mock Qdrant handler for search indexing stage in worker
+    def mock_qdrant_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"result": {"operation_id": 1, "status": "completed"}})
+
+    mock_qdrant_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(mock_qdrant_handler),
+        base_url="http://localhost:6333",
+    )
+    monkeypatch.setattr("httpx.AsyncClient", lambda *args, **kwargs: mock_qdrant_client)
 
     # 1. Upload Version 1
     res1 = await client.post(
@@ -1191,6 +1217,12 @@ async def test_job_reads_correct_immutable_snapshot_version(client: httpx.AsyncC
             async def process_document(self, *args, **kwargs):
                 recorded_paths.append(kwargs.get("original_path"))
                 return MockOutcome()
+
+            async def get_sag_embedding(self, *args, **kwargs):
+                class MockEmbedder:
+                    async def batch_generate(self, texts: list[str]) -> list[list[float]]:
+                        return [[0.1, 0.2, 0.3] for _ in texts]
+                return MockEmbedder()
 
         from sag_api.jobs.tasks import process_document
         await process_document(session, job1, engine_manager=MockEngine())
