@@ -896,7 +896,17 @@ async def test_legacy_source_upload_rejects_invalid_mime_signature(client: httpx
             name="Legacy MIME Test Source",
             sag_source_config_id=f"cfg_{uid}",
         )
-        session.add_all([user, source])
+        from sag_api.db.models.source_project_mapping import SourceProjectMapping
+        mapping = SourceProjectMapping(
+            source_id=source.id,
+            organization_id="pytest-org",
+            project_id="pytest-project",
+            state="CONFIRMED",
+            confirmed_at=datetime.now(UTC),
+            confirmed_by="pytest-owner",
+            approval_ref="test-fixture",
+        )
+        session.add_all([user, source, mapping])
         await session.commit()
         user_id = user.id
         source_id = source.id

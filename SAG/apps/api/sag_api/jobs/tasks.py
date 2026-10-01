@@ -377,6 +377,46 @@ async def _process_document_unlocked(
                     prepared.cached,
                     _redact_parser_reason(prepared.fallback_error),
                 )
+
+        # Phase 2 Pipeline: Canonical Extraction -> Dedup & Temporal -> Search Units
+        if run_id:
+            try:
+                ing_run = await session.get(IngestionRun, run_id)
+                if ing_run:
+                    doc_ver = await session.get(DocumentVersion, ing_run.document_version_id)
+                    if doc_ver:
+                        md_path = str(prepared.path) if prepared else target_storage_path
+                        if os.path.exists(md_path):
+                            with open(md_path, "r", encoding="utf-8", errors="replace") as f:
+                                doc_content = f.read()
+                            # 2A: Parse & Persist Canonical Blocks
+                            from sag_api.services.canonical_service import parse_and_persist_document_content
+                            await parse_and_persist_document_content(
+                                session, doc_ver.id, doc_content, run_id=run_id
+                            )
+                            # 2B: Dedup & Temporal Lineage
+                            from sag_api.services.dedup_and_temporal_service import run_dedup_and_temporal_stage
+                            await run_dedup_and_temporal_stage(
+                                session,
+                                document_version=doc_ver,
+                                document_id=document.id,
+                                project_id=ing_run.project_id,
+                                run_id=run_id,
+                            )
+                            # 2C: Search Units Chunking & Indexing
+                            from sag_api.services.search_index_service import run_search_indexing_stage
+                            sec_partition = (doc_ver.metadata_json or {}).get("security_partition_id") or "public"
+                            await run_search_indexing_stage(
+                                session,
+                                project_id=ing_run.project_id,
+                                document_version=doc_ver,
+                                security_partition_id=sec_partition,
+                                run_id=run_id,
+                            )
+                            await session.commit()
+            except Exception as pipe_err:
+                log.warning("Phase 2 pipeline execution warning run_id=%s: %s", run_id, pipe_err)
+
         outcome = await engine_manager.process_document(
             source.sag_source_config_id,
             str(prepared.path) if prepared is not None else None,
