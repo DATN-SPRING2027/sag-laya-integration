@@ -438,3 +438,31 @@ Nhằm đảm bảo kế hoạch khớp 100% với phân công nhiệm vụ th�
 +-------------------------------------------------------------------------------------------------------+
 ```
 
+---
+
+## 8. Bổ Sung & Đóng Khớp Đợt Review Mới Nhất PR #14 (PR #14 Re-Review Closure)
+
+Bản cập nhật này giải quyết toàn bộ 6 phát hiện trọng yếu từ lượt review mới nhất của Reviewer (`KeyT9999`) trên PR #14:
+
+1. **[P1] Thứ tự dọn dẹp retry & Qdrant points cleanup (`sag_api/services/canonical_service.py` & `search_index_service.py`):**
+   - Đảo ngược thứ tự xóa: Xóa `SearchUnit` trước khi xóa `CanonicalBlock` trên DB để tránh lỗi khóa ngoại FK.
+   - Thêm bước xóa points cũ trên Qdrant qua API `POST /collections/{collection}/points/delete` có filter `document_version_id` trước khi nạp lại.
+   - Sinh `SearchUnit.id` tất định qua UUIDv5 `UUIDv5("sag:unit:{doc_ver_id}:{ordinal}")` và `point_id` qua `UUIDv5("sag:qdrant:{collection}:{unit_id}")`.
+2. **[P1] Qdrant API Key Header (`sag_api/jobs/tasks.py`):**
+   - Truyền `api-key` header từ cấu hình `settings.sag_qdrant_api_key` vào `httpx.AsyncClient`.
+3. **[P1] Manifest Gatekeeper đối soát Qdrant points count (`sag_api/services/search_index_service.py`):**
+   - Không chỉ đếm PostgreSQL `search_units`, mà còn gọi trực tiếp `POST /collections/{collection}/points/count` với filter `document_version_id`.
+   - Đối chiếu số lượng chính xác 100% giữa PostgreSQL và Qdrant trước khi gắn trạng thái `SEARCH_READY`.
+4. **[P1] Near-Dedup MinHash/LSH, separate thresholds & Evidence Recording (`sag_api/services/dedup_and_temporal_service.py`):**
+   - Áp dụng MinHash 128 hash permutations cho n-gram shingles.
+   - Phân tách ngưỡng: 0.85 cho văn bản thông thường, 0.95 cho code và bảng dữ liệu.
+   - Phân loại quan hệ ngữ nghĩa 5 nhãn (`EQUIVALENT`, `SUPPORTS`, `CONTRADICTS`, `SUPERSEDES`, `RELATED`) và cấm tự động merge (`auto_merged = False`).
+   - Ghi nhận chi tiết evidence mapping vào `document_version.metadata_json` và `StageRun.metrics_json`.
+5. **[P1] Dual Representation (Dense + BM25 Sparse), Payload Indexes & Rebuild Service (`sag_api/services/search_index_service.py` & `rebuild_service.py`):**
+   - Khởi tạo 8 payload indexes (`tenant_id`, `project_id`, `security_partition_id`, `document_version_id`, `valid_from`, `valid_to`, `primary_node_a`, `primary_node_b`).
+   - Dual vector: `content_vector` (dense) + `bm25_sparse` (lexical sparse term frequency).
+   - Module `rebuild_service.py` hỗ trợ tái tạo toàn bộ vector collection từ nguồn chân lý duy nhất PostgreSQL.
+6. **[P2] Bảo vệ Bi-Temporal không chồng lấn khi nạp lệch thứ tự (`sag_api/services/dedup_and_temporal_service.py`):**
+   - Tìm kiếm predecessor còn active qua khoảng thời gian thực tế `valid_from <= cur_start < valid_to` thay vì chỉ sắp xếp số phiên bản `version_no`.
+   - Chuẩn hóa UTC an toàn cho mọi timestamp và khép kín khoảng thời gian, loại bỏ hoàn toàn hiện tượng chồng lấn hiệu lực.
+

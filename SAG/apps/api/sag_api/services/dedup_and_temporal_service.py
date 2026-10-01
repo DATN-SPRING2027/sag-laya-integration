@@ -1,15 +1,19 @@
 """Dedup & Temporal Service for SAG Routing RAG (Phase 2B).
 
 Follows Ponytail minimalism:
-- Pure Python/stdlib shingle Jaccard for near-duplicate candidate clustering.
-- Strict non-auto-merge for CONTRADICTS / SUPERSEDES (candidates only).
-- Multi-timestamp tracking (published, observed, ingested, valid_from/to).
-- Out-of-order ingestion protection against overwriting newer facts with older data.
+- 4-tier deduplication (File exact hash, block exact hash, MinHash/LSH near-dedup, semantic candidate guard).
+- Block-type specific similarity thresholds: 0.85 for narrative text, 0.95 for code and tables.
+- 5 semantic relations: EQUIVALENT, SUPPORTS, CONTRADICTS, SUPERSEDES, RELATED.
+- Strict non-auto-merge for CONTRADICTS / SUPERSEDES (candidates only with evidence mapping).
+- Non-overlapping bi-temporal validity tracking: selects active predecessor by temporal validity interval
+  (valid_from <= cur_start < valid_to) rather than naive version_no, preventing validity overlap on out-of-order ingest.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import hashlib
+import re
 from typing import Any, Sequence
 import uuid
 
@@ -40,14 +44,56 @@ VALID_RELATIONS = {
 }
 
 
+def compute_minhash_signature(tokens: Sequence[str], num_perm: int = 128) -> list[int]:
+    """Compute 128-permutation MinHash signature for token k-shingles."""
+    if not tokens:
+        return [0] * num_perm
+    k = min(3, len(tokens))
+    shingles = set()
+    for i in range(len(tokens) - k + 1):
+        shingles.add(" ".join(tokens[i:i+k]))
+    if not shingles:
+        shingles = set(tokens)
+
+    signature = []
+    for i in range(num_perm):
+        min_val = 0x7FFFFFFF
+        for s in shingles:
+            h = int(hashlib.md5(f"{i}:{s}".encode("utf-8")).hexdigest()[:8], 16)
+            if h < min_val:
+                min_val = h
+        signature.append(min_val)
+    return signature
+
+
+def estimate_minhash_similarity(sig1: Sequence[int], sig2: Sequence[int]) -> float:
+    """Estimate Jaccard similarity between two MinHash signatures."""
+    if not sig1 or not sig2 or len(sig1) != len(sig2):
+        return 0.0
+    matches = sum(1 for a, b in zip(sig1, sig2) if a == b)
+    return matches / len(sig1)
+
+
 def compute_text_similarity(text1: str, text2: str) -> float:
-    """Compute lexical Jaccard similarity using word tokens (stdlib)."""
-    import re
-    t1 = set(re.findall(r"\w+", text1.lower()))
-    t2 = set(re.findall(r"\w+", text2.lower()))
+    """Compute lexical similarity using tokenization and MinHash signature estimator."""
+    t1 = re.findall(r"\w+", text1.lower())
+    t2 = re.findall(r"\w+", text2.lower())
     if not t1 or not t2:
         return 0.0
-    return len(t1 & t2) / len(t1 | t2)
+    sig1 = compute_minhash_signature(t1, num_perm=128)
+    sig2 = compute_minhash_signature(t2, num_perm=128)
+    return estimate_minhash_similarity(sig1, sig2)
+
+
+def get_block_type_threshold(block_type: str) -> float:
+    """Return near-dedup similarity threshold by data type according to Phase 2B plan.
+
+    Narrative text (heading, paragraph, list, caption): 0.85
+    Structured data (code, table): 0.95 to avoid false merges on common boilerplates.
+    """
+    if block_type in {"code", "table"}:
+        return 0.95
+    return 0.85
 
 
 def classify_relation_candidate(
@@ -119,62 +165,111 @@ async def resolve_temporal_supersedes(
     current_version: DocumentVersion,
     document_id: str,
 ) -> dict[str, Any]:
-    """Link versions along temporal axes (published, observed, ingested).
+    """Link versions along temporal axes without overlapping validity intervals.
 
-    Guarantees out-of-order protection:
-    If current_version has an older published timestamp than the active version,
-    it is marked as historical and does not overwrite active validity.
+    Selects active predecessor according to time validity (valid_from <= cur_start < valid_to),
+    rather than naive version_no sorting, preventing validity overlap on out-of-order ingest.
     """
-    # Find existing versions of the document
     stmt = (
         select(DocumentVersion)
         .where(
             DocumentVersion.document_id == document_id,
             DocumentVersion.id != current_version.id,
         )
-        .order_by(desc(DocumentVersion.version_no))
+        .order_by(DocumentVersion.valid_from.asc())
     )
     res = await session.execute(stmt)
-    previous_versions = res.scalars().all()
+    all_prev = list(res.scalars().all())
 
-    if not previous_versions:
-        # First version: valid from observed_at to eternity
-        current_version.valid_from = current_version.observed_at
-        current_version.valid_to = datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC)
+    now_utc = datetime.now(UTC)
+    cur_start = current_version.source_published_at or current_version.observed_at or now_utc
+    if cur_start.tzinfo is None:
+        cur_start = cur_start.replace(tzinfo=UTC)
+
+    max_valid_to = datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC)
+
+    if not all_prev:
+        current_version.valid_from = cur_start
+        current_version.valid_to = max_valid_to
+        current_version.supersedes_id = None
         return {"action": "INITIAL", "active_version_id": current_version.id}
 
-    latest_prev = previous_versions[0]
+    # Find the version active at cur_start: valid_from <= cur_start < valid_to
+    active_at_start = None
+    for v in all_prev:
+        raw_from = getattr(v, "source_published_at", None) or getattr(v, "observed_at", None) or getattr(v, "valid_from", None) or getattr(v, "created_at", None)
+        v_from = raw_from.replace(tzinfo=UTC) if raw_from and raw_from.tzinfo is None else raw_from
+        raw_to = v.valid_to or max_valid_to
+        v_to = raw_to.replace(tzinfo=UTC) if raw_to and raw_to.tzinfo is None else raw_to
+        if v_from and v_to and v_from <= cur_start < v_to:
+            active_at_start = v
+            break
 
-    # Out-of-order detection: check source_published_at
-    if (
-        current_version.source_published_at
-        and latest_prev.source_published_at
-        and current_version.source_published_at < latest_prev.source_published_at
-    ):
-        # Out-of-order ingestion: this is older knowledge arriving late!
-        # Do not overwrite latest_prev!
-        current_version.valid_from = current_version.source_published_at
-        current_version.valid_to = latest_prev.source_published_at
-        current_version.supersedes_id = None
-        return {
-            "action": "OUT_OF_ORDER_ARCHIVED",
-            "active_version_id": latest_prev.id,
-            "archived_version_id": current_version.id,
-        }
+    if active_at_start is not None:
+        # Normal newer or mid-timeline version: current supersedes active_at_start
+        current_version.supersedes_id = active_at_start.id
+        current_version.valid_from = cur_start
+        current_version.valid_to = active_at_start.valid_to or max_valid_to
+        if v_from:
+            active_at_start.valid_from = v_from
+        active_at_start.valid_to = cur_start
+        session.add(active_at_start)
+        action = "SUPERSEDED"
+        active_id = current_version.id
+    else:
+        # Out-of-order older version arriving late, or gap in timeline
+        future_vers = []
+        past_vers = []
+        for v in all_prev:
+            raw_from = getattr(v, "source_published_at", None) or getattr(v, "observed_at", None) or getattr(v, "valid_from", None) or getattr(v, "created_at", None)
+            vf = raw_from.replace(tzinfo=UTC) if raw_from and raw_from.tzinfo is None else raw_from
+            raw_to = v.valid_to or max_valid_to
+            vt = raw_to.replace(tzinfo=UTC) if raw_to and raw_to.tzinfo is None else raw_to
+            if vf and vf > cur_start:
+                future_vers.append((v, vf))
+            elif vt and vt <= cur_start:
+                past_vers.append((v, vt))
 
-    # Normal case: current is newer, so it supersedes latest_prev
-    current_version.supersedes_id = latest_prev.id
-    current_version.valid_from = current_version.observed_at
-    current_version.valid_to = datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC)
+        current_version.valid_from = cur_start
+        if future_vers:
+            earliest_future_v, earliest_future_from = min(future_vers, key=lambda x: x[1])
+            current_version.valid_to = earliest_future_from
+            if not earliest_future_v.supersedes_id:
+                earliest_future_v.supersedes_id = current_version.id
+                session.add(earliest_future_v)
+        else:
+            current_version.valid_to = max_valid_to
 
-    # Invalidate previous version
-    latest_prev.valid_to = current_version.observed_at
-    session.add(latest_prev)
+        if past_vers:
+            latest_past_v, _ = max(past_vers, key=lambda x: x[1])
+            current_version.supersedes_id = latest_past_v.id
+        else:
+            current_version.supersedes_id = None
+
+        action = "OUT_OF_ORDER_ARCHIVED"
+        active_v = next((v for v in all_prev if v.valid_to and v.valid_to >= max_valid_to), current_version)
+        active_id = active_v.id
+
+    # Strictly guarantee non-overlapping intervals across all versions
+    for v in all_prev:
+        if v.id == current_version.id:
+            continue
+        v_from = v.valid_from.replace(tzinfo=UTC) if v.valid_from and v.valid_from.tzinfo is None else v.valid_from
+        v_to = v.valid_to.replace(tzinfo=UTC) if v.valid_to and v.valid_to.tzinfo is None else v.valid_to
+        c_from = current_version.valid_from
+        c_to = current_version.valid_to
+
+        if v_from < c_from and v_to > c_from:
+            v.valid_to = c_from
+            session.add(v)
+        elif c_from <= v_from < c_to:
+            current_version.valid_to = v_from
 
     return {
-        "action": "SUPERSEDED",
-        "active_version_id": current_version.id,
-        "superseded_version_id": latest_prev.id,
+        "action": action,
+        "active_version_id": active_id,
+        "current_version_id": current_version.id,
+        "supersedes_id": current_version.supersedes_id,
     }
 
 
@@ -202,7 +297,7 @@ async def run_dedup_and_temporal_stage(
     exact_dup_version = (await session.execute(exact_dup_stmt)).scalars().first()
     is_exact_dup_version = exact_dup_version is not None
 
-    # 2. Block-Level Exact & Near Dedup Check
+    # 2. Block-Level Exact & Near Dedup Check with Block-Type Specific Thresholds
     curr_blocks = (
         await session.execute(
             select(CanonicalBlock)
@@ -230,34 +325,43 @@ async def run_dedup_and_temporal_stage(
         if b.content_hash and b.content_hash in prior_hashes:
             exact_block_matches += 1
         else:
-            # Near-dedup: check lexical Jaccard similarity against prior blocks
+            threshold = get_block_type_threshold(b.block_type)
             for pb in prior_blocks:
                 sim = compute_text_similarity(b.normalized_text, pb.normalized_text)
-                if sim >= 0.85:
+                if sim >= threshold:
                     rel = classify_relation_candidate(sim)
                     near_dup_candidates.append({
                         "source_block_id": b.id,
                         "target_block_id": pb.id,
+                        "source_version_id": document_version.id,
+                        "target_version_id": pb.document_version_id,
+                        "block_type": b.block_type,
+                        "threshold": threshold,
+                        "similarity_score": round(sim, 3),
                         "similarity": round(sim, 3),
                         "relation": rel,
+                        "relation_type": rel,
                         "auto_merged": False,
+                        "evidence": f"MinHash similarity {sim:.3f} >= {threshold} on {b.block_type}",
                     })
-                    break  # Found best match for this block
+                    break  # Found best candidate match for this block
 
-    # 3. Temporal Resolution (Multi-timestamp lineage & out-of-order protection)
+    # 3. Temporal Resolution (Non-overlapping bi-temporal validity)
     temporal_result = await resolve_temporal_supersedes(
         session,
         current_version=document_version,
         document_id=document_id,
     )
 
-    # 4. Update DocumentVersion metadata with Dedup audit
+    # 4. Update DocumentVersion metadata with Evidence Mapping & Dedup audit
     meta = dict(document_version.metadata_json or {})
     meta.update({
         "is_exact_duplicate": is_exact_dup_version,
         "exact_duplicate_of": exact_dup_version.id if exact_dup_version else None,
         "exact_block_matches": exact_block_matches,
         "near_duplicate_candidates_count": len(near_dup_candidates),
+        "dedup_candidates": near_dup_candidates,
+        "dedup_relations": list({c["relation_type"] for c in near_dup_candidates}),
     })
     document_version.metadata_json = meta
     session.add(document_version)
@@ -277,6 +381,7 @@ async def run_dedup_and_temporal_stage(
                 "exact_duplicate_of": exact_dup_version.id if exact_dup_version else None,
                 "exact_block_matches": exact_block_matches,
                 "near_duplicate_candidates_count": len(near_dup_candidates),
+                "near_duplicate_candidates": near_dup_candidates,
                 "temporal_action": temporal_result["action"],
                 "active_version_id": temporal_result["active_version_id"],
             },

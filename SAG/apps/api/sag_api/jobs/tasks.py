@@ -432,7 +432,10 @@ async def _process_document_unlocked(
 
                         from sag_api.services.search_index_service import run_search_indexing_stage
                         qdrant_url = getattr(settings, "sag_qdrant_url", "http://localhost:6333").rstrip("/")
-                        async with httpx.AsyncClient(base_url=qdrant_url, timeout=30.0) as qdrant_client:
+                        qdrant_headers = {}
+                        if getattr(settings, "sag_qdrant_api_key", None):
+                            qdrant_headers["api-key"] = settings.sag_qdrant_api_key
+                        async with httpx.AsyncClient(base_url=qdrant_url, headers=qdrant_headers, timeout=30.0) as qdrant_client:
                             await run_search_indexing_stage(
                                 session,
                                 project_id=ing_run.project_id,

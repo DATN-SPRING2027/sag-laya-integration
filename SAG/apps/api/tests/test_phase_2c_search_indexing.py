@@ -255,7 +255,10 @@ async def test_search_indexing_stage_and_manifest_verification():
         assert stage_run.metrics_json["qdrant_indexed_count"] == len(units)
 
         # Xác minh mock Qdrant nhận đúng collection_name và vector embedding thật
-        points_requests = [r for r in requests_log if f"/collections/search_units_{project_id}/points" in r.url.path]
+        points_requests = [
+            r for r in requests_log
+            if f"/collections/search_units_{project_id}/points" in r.url.path and r.method == "PUT"
+        ]
         assert len(points_requests) >= 1
         body = json.loads(points_requests[0].content)
         assert "points" in body

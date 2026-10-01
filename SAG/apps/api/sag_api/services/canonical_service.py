@@ -42,6 +42,11 @@ async def persist_canonical_blocks(
     start_time = time.monotonic()
 
     # 1. Dọn dẹp bản ghi cũ của version này nếu đây là lần retry (Idempotent cleanup)
+    # Xóa SearchUnit trước vì SearchUnit có FK trỏ tới CanonicalBlock không cascade
+    from sag_api.db.models.routing_rag import SearchUnit
+    await session.execute(
+        delete(SearchUnit).where(SearchUnit.document_version_id == document_version_id)
+    )
     await session.execute(
         delete(CanonicalBlock).where(CanonicalBlock.document_version_id == document_version_id)
     )

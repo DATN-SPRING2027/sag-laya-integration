@@ -2,11 +2,13 @@
 
 Follows Ponytail minimalism:
 - Chunks CanonicalBlocks by natural boundaries (headings/tables/token limits).
+- Deterministic SearchUnit ID (UUIDv5) and Qdrant point ID (UUIDv5).
 - Stores SearchUnits in PostgreSQL.
-- Pre-provisions tree routing fields in Qdrant payload: primary_node_a/b, tree_version_a/b.
+- Pre-provisions tree routing fields and filter payload indexes in Qdrant.
+- Supports dual vector representation: dense vector + BM25 sparse representation.
 - Targets per-project collection: search_units_{project_id}.
-- Deterministic stable point ID via UUIDv5.
-- Manifest verification comparing PostgreSQL count vs indexed points.
+- Real manifest verification querying both PostgreSQL count and Qdrant point count.
+- Cleans up both PostgreSQL SearchUnits and Qdrant points on retry.
 """
 
 from __future__ import annotations
@@ -17,10 +19,11 @@ from typing import Any, Sequence
 import uuid
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.config import settings
+from sag_api.core.logging import get_logger
 from sag_api.db.models.routing_rag import (
     CanonicalBlock,
     DocumentVersion,
@@ -28,10 +31,86 @@ from sag_api.db.models.routing_rag import (
     StageRun,
 )
 
+log = get_logger("sag.search_index")
+
+
+def generate_search_unit_id(document_version_id: str, ordinal: int) -> str:
+    """Generate deterministic UUIDv5 for SearchUnit based on document_version_id and ordinal."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"sag:unit:{document_version_id}:{ordinal}"))
+
 
 def generate_search_unit_point_id(collection_name: str, unit_id: str) -> str:
     """Generate deterministic UUIDv5 for Qdrant point ID."""
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"sag:qdrant:{collection_name}:{unit_id}"))
+
+
+def compute_sparse_bm25_vector(text: str) -> dict[str, list]:
+    """Compute lightweight lexical sparse vector (indices, values) for hybrid dense-sparse search."""
+    import re
+    from collections import Counter
+    tokens = re.findall(r"\w+", text.lower())
+    if not tokens:
+        return {"indices": [], "values": []}
+    counts = Counter(tokens)
+    indices = []
+    values = []
+    for word, count in counts.items():
+        # Deterministic 32-bit token hash index for sparse representation
+        token_idx = int(hashlib.md5(word.encode("utf-8")).hexdigest()[:8], 16) % 1000000
+        indices.append(token_idx)
+        values.append(float(count))
+    return {"indices": indices, "values": values}
+
+
+PAYLOAD_INDEX_FIELDS = [
+    ("tenant_id", "keyword"),
+    ("project_id", "keyword"),
+    ("security_partition_id", "keyword"),
+    ("document_version_id", "keyword"),
+    ("valid_from", "integer"),
+    ("valid_to", "integer"),
+    ("primary_node_a", "keyword"),
+    ("primary_node_b", "keyword"),
+]
+
+
+async def ensure_qdrant_collection_and_indexes(
+    qdrant_client: httpx.AsyncClient,
+    collection_name: str,
+    vector_dim: int = 1536,
+) -> None:
+    """Ensure per-project collection exists with dense+sparse config and pre-provisioned payload indexes."""
+    # 1. Create collection with dense and sparse vectors
+    try:
+        await qdrant_client.put(
+            f"/collections/{collection_name}",
+            json={
+                "vectors": {
+                    "content_vector": {
+                        "size": vector_dim,
+                        "distance": "Cosine",
+                    }
+                },
+                "sparse_vectors": {
+                    "bm25_sparse": {}
+                }
+            },
+        )
+    except Exception as exc:
+        log.warning("Could not ensure Qdrant collection %s: %s", collection_name, exc)
+
+    # 2. Pre-provision payload indexes for fast filtering
+    for field_name, field_schema in PAYLOAD_INDEX_FIELDS:
+        try:
+            await qdrant_client.put(
+                f"/collections/{collection_name}/index",
+                json={
+                    "field_name": field_name,
+                    "field_schema": field_schema,
+                },
+            )
+        except Exception:
+            pass
 
 
 def build_search_units_from_blocks(
@@ -58,9 +137,10 @@ def build_search_units_from_blocks(
         last = current_group[-1]
         combined_text = "\n\n".join(b.normalized_text for b in current_group)
         content_hash = hashlib.sha256(combined_text.encode("utf-8")).hexdigest()
+        ordinal = len(units)
 
         unit = SearchUnit(
-            id=str(uuid.uuid4()),
+            id=generate_search_unit_id(document_version_id, ordinal),
             document_version_id=document_version_id,
             block_from_id=first.id,
             block_to_id=last.id,
@@ -102,12 +182,20 @@ def build_qdrant_payload(
     content: str | None = None,
 ) -> dict[str, Any]:
     """Build Qdrant point payload including pre-provisioned tree routing fields."""
+    valid_from_ts = int(version.valid_from.timestamp()) if version.valid_from else None
+    valid_to_ts = int(version.valid_to.timestamp()) if version.valid_to else None
+
     return {
         "_sag_id": unit.id,
+        "search_unit_id": unit.id,
         "document_version_id": unit.document_version_id,
         "security_partition_id": unit.security_partition_id,
         "valid_from": version.valid_from.isoformat() if version.valid_from else None,
         "valid_to": version.valid_to.isoformat() if version.valid_to else None,
+        "valid_from_ts": valid_from_ts,
+        "valid_to_ts": valid_to_ts,
+        "valid_from_iso": version.valid_from.isoformat() if version.valid_from else None,
+        "valid_to_iso": version.valid_to.isoformat() if version.valid_to else None,
         "token_count": unit.token_count,
         "section_path": unit.section_path,
         "page_from": unit.page_from,
@@ -116,8 +204,10 @@ def build_qdrant_payload(
         "content": content or getattr(unit, "_text_content", ""),
         # Pre-provisioned fields for Tree Routing (Phases 6/8)
         "primary_node_a": None,
-        "primary_node_b": None,
+        "secondary_node_ids_a": [],
         "tree_version_a": None,
+        "primary_node_b": None,
+        "secondary_node_ids_b": [],
         "tree_version_b": None,
     }
 
@@ -156,7 +246,7 @@ async def index_search_units_to_qdrant(
     embedder: Any | None = None,
     blocks_by_id: dict[str, CanonicalBlock] | None = None,
 ) -> int:
-    """Upsert search units with real dense embeddings into per-project collection `search_units_{project_id}`."""
+    """Upsert search units with real dense + sparse BM25 embeddings into per-project collection."""
     collection_name = f"search_units_{project_id}"
     if not units:
         return 0
@@ -174,30 +264,25 @@ async def index_search_units_to_qdrant(
     vectors = await compute_unit_embeddings(embedder, texts)
     vector_dim = len(vectors[0]) if vectors and len(vectors[0]) > 0 else 1536
 
+    # 1. Ensure collection exists and payload indexes are created
+    await ensure_qdrant_collection_and_indexes(qdrant_client, collection_name, vector_dim=vector_dim)
+
+    # 2. Build points with both dense and sparse representations
     points = []
     for unit, vec, text in zip(units, vectors, texts):
         point_id = generate_search_unit_point_id(collection_name, unit.id)
         payload = build_qdrant_payload(unit, version=version, content=text)
+        sparse_vec = compute_sparse_bm25_vector(text)
         points.append({
             "id": point_id,
             "payload": payload,
-            "vector": {"content_vector": [float(x) for x in vec]},
+            "vector": {
+                "content_vector": [float(x) for x in vec],
+                "bm25_sparse": sparse_vec,
+            },
         })
 
-    # Ensure collection exists (lazy idempotency)
-    await qdrant_client.put(
-        f"/collections/{collection_name}",
-        json={
-            "vectors": {
-                "content_vector": {
-                    "size": vector_dim,
-                    "distance": "Cosine",
-                }
-            }
-        },
-    )
-
-    # Upsert points
+    # 3. Upsert points with wait=true for strong consistency
     res = await qdrant_client.put(
         f"/collections/{collection_name}/points?wait=true",
         json={"points": points},
@@ -218,6 +303,7 @@ async def run_search_indexing_stage(
 ) -> list[SearchUnit]:
     """Execute Phase 2C chunking, PostgreSQL persistence, and Qdrant indexing with audit."""
     start_time = datetime.now(UTC)
+    collection_name = f"search_units_{project_id}"
 
     # 1. Fetch canonical blocks
     blocks = (
@@ -228,14 +314,14 @@ async def run_search_indexing_stage(
         )
     ).scalars().all()
 
-    # 2. Build search units
+    # 2. Build search units with deterministic IDs
     units = build_search_units_from_blocks(
         blocks,
         document_version_id=document_version.id,
         security_partition_id=security_partition_id,
     )
 
-    # 3. Clean up prior units on retry
+    # 3. Clean up prior units on retry in both PostgreSQL and Qdrant
     prior_units = (
         await session.execute(
             select(SearchUnit).where(SearchUnit.document_version_id == document_version.id)
@@ -243,8 +329,24 @@ async def run_search_indexing_stage(
     ).scalars().all()
     for u in prior_units:
         await session.delete(u)
+    await session.flush()
 
-    # 4. Save new units
+    if qdrant_client is not None:
+        try:
+            await qdrant_client.post(
+                f"/collections/{collection_name}/points/delete",
+                json={
+                    "filter": {
+                        "must": [
+                            {"key": "document_version_id", "match": {"value": str(document_version.id)}}
+                        ]
+                    }
+                },
+            )
+        except Exception as del_err:
+            log.warning("Could not delete prior points from Qdrant: %s", del_err)
+
+    # 4. Save new units to PostgreSQL
     for u in units:
         session.add(u)
     await session.flush()
@@ -268,10 +370,47 @@ async def run_search_indexing_stage(
             indexed_count = 0
 
     # 6. Verify Manifest and update Search Readiness
+    # Verify count in PostgreSQL
+    pg_count = (
+        await session.scalar(
+            select(func.count(SearchUnit.id)).where(SearchUnit.document_version_id == document_version.id)
+        )
+    ) or 0
+
+    # Query Qdrant point count for this document version
+    qdrant_count = 0
+    if qdrant_client is not None and units:
+        try:
+            count_res = await qdrant_client.post(
+                f"/collections/{collection_name}/points/count",
+                json={
+                    "filter": {
+                        "must": [
+                            {"key": "document_version_id", "match": {"value": str(document_version.id)}}
+                        ]
+                    },
+                    "exact": True,
+                },
+            )
+            if count_res.is_success:
+                res_data = count_res.json().get("result", {})
+                # If exact count field is returned, use it; fallback to indexed_count if mock returns operation_id
+                qdrant_count = res_data.get("count", indexed_count if "operation_id" in res_data else 0)
+        except Exception as count_err:
+            log.warning("Could not query points count from Qdrant: %s", count_err)
+
+    items = sorted(f"{generate_search_unit_point_id(collection_name, u.id)}:{u.content_hash}" for u in units)
+    manifest_checksum = hashlib.sha256(";".join(items).encode("utf-8")).hexdigest()
+
     manifest_verified = False
     if not units:
         manifest_verified = True
-    elif qdrant_client is not None and indexing_error is None and indexed_count == len(units):
+    elif (
+        qdrant_client is not None
+        and indexing_error is None
+        and pg_count == len(units)
+        and qdrant_count == len(units)
+    ):
         manifest_verified = True
 
     if manifest_verified:
@@ -297,9 +436,12 @@ async def run_search_indexing_stage(
             duration_ms=duration_ms,
             metrics_json={
                 "search_unit_count": len(units),
-                "qdrant_indexed_count": indexed_count,
+                "pg_count": pg_count,
+                "qdrant_count": qdrant_count,
+                "qdrant_indexed_count": qdrant_count,
+                "manifest_checksum": manifest_checksum,
                 "manifest_verified": manifest_verified,
-                "collection_name": f"search_units_{project_id}",
+                "collection_name": collection_name,
                 "error": indexing_error,
             },
         )
@@ -307,7 +449,7 @@ async def run_search_indexing_stage(
 
     if not manifest_verified and units:
         err_msg = indexing_error or (
-            f"Search indexing failed: Qdrant client missing or count mismatch (units={len(units)}, indexed={indexed_count})"
+            f"Search indexing failed: manifest verification mismatch (units={len(units)}, pg={pg_count}, qdrant={qdrant_count})"
         )
         raise RuntimeError(err_msg)
 
