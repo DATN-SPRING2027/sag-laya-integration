@@ -35,6 +35,8 @@ from sag_api.db.models.routing_rag import (
 )
 from sag_api.enums import DocumentStatus, JobStatus, JobType
 from sag_api.jobs.tasks import _process_document_unlocked
+from sag_api.core.security import create_access_token
+from sag_api.main import app
 from sag_api.services.document_service import get_document_version_status
 from sag_api.services.rebuild_service import rebuild_search_index_for_project
 from sag_api.services.search_index_service import (
@@ -318,6 +320,10 @@ async def test_checkpoint_a_e2e_upload_to_manifest_verified(tmp_path):
         assert payload["security_partition_id"] == "sec_alpha"
         assert payload["block_from_id"] is not None
         assert payload["block_to_id"] is not None
+        assert payload.get("source_anchor") is not None and len(payload["source_anchor"].strip()) > 0
+        assert payload.get("page_from", 0) >= 1
+        assert payload.get("page_to", 0) >= payload.get("page_from", 1)
+        assert "section_path" in payload and len(payload["section_path"]) > 0
         assert "valid_from_ts" in payload and payload["valid_from_ts"] is not None
         assert "bm25_sparse" in points[0]["vector"]
 
@@ -508,6 +514,16 @@ async def test_checkpoint_a_indexing_failure_fails_closed(tmp_path):
         doc_db = (await check_session.execute(select(Document).where(Document.id == doc_id))).scalar_one()
         assert doc_db.status == DocumentStatus.FAILED
 
+        # Kiểm tra StageRun không bị mất sau khi rollback
+        stage_run = (
+            await check_session.execute(
+                select(StageRun).where(StageRun.run_id == run_id).where(StageRun.stage == "INDEX_SEARCH")
+            )
+        ).scalar_one_or_none()
+        assert stage_run is not None
+        assert stage_run.status == "FAILED"
+        assert stage_run.error_message is not None
+
 
 # ==============================================================================
 # Gate 6: Manifest Checksum Mismatch Fails Closed
@@ -696,7 +712,9 @@ async def test_checkpoint_a_zero_secret_leakage():
     """Kịch bản 9: Không rò rỉ secret trong error_message, log và database."""
     raw_leak = (
         "Failed to request https://admin_user:super_secret_password_123@qdrant.internal:6333/points"
-        "?api-key=secret_query_key_xyz&token=secret_query_token_abc "
+        "?api-key=secret_query_key_xyz&token=secret_query_token_abc"
+        "&api_key=secret_snake_key&password=secret_password_val"
+        "&access_token=secret_access_tok&client_secret=secret_client_sec "
         "using Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.sensitive_payload.signature "
         "and OpenAI key sk-proj-1234567890abcdef1234567890"
     )
@@ -706,6 +724,10 @@ async def test_checkpoint_a_zero_secret_leakage():
     assert "admin_user" not in cleaned
     assert "secret_query_key_xyz" not in cleaned
     assert "secret_query_token_abc" not in cleaned
+    assert "secret_snake_key" not in cleaned
+    assert "secret_password_val" not in cleaned
+    assert "secret_access_tok" not in cleaned
+    assert "secret_client_sec" not in cleaned
     assert "sk-proj-1234567890abcdef1234567890" not in cleaned
     assert "sensitive_payload" not in cleaned
 
@@ -818,3 +840,119 @@ async def test_checkpoint_a_disaster_recovery_rebuild(tmp_path):
     restored_points = q_mock.points[col_name]
     assert len(restored_points) == len(initial_points)
     assert set(restored_points.keys()) == set(initial_points.keys())
+
+
+# ==============================================================================
+# Gate 11: Extraction Failure After Indexing Does Not Downgrade SEARCH_READY (Finding 1)
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_checkpoint_a_extraction_failure_after_indexing_does_not_downgrade_search_ready(tmp_path):
+    """Lỗi tại engine_manager.process_document (LLM extraction) sau khi Phase 2C đã commit không được hạ SEARCH_READY."""
+    await init_db()
+    project_id = f"proj_{uuid.uuid4().hex[:8]}"
+    source_id = f"src_{uuid.uuid4().hex[:8]}"
+    doc_id = str(uuid.uuid4())
+    ver_id = str(uuid.uuid4())
+    run_id = str(uuid.uuid4())
+    job_id = f"job_{uuid.uuid4().hex[:8]}"
+
+    md_file = tmp_path / "post_idx_fail.md"
+    md_file.write_text("# Tài liệu\n\nNội dung hoàn tất index nhưng fail extraction sau.", encoding="utf-8")
+
+    q_mock = MockQdrantStorage(vector_dim=3)
+
+    class FailingExtractionEngine(FakeIngestionEngine):
+        async def process_document(self, *args, **kwargs):
+            raise RuntimeError("LLM service unavailable / quota exhausted")
+
+    with patch("sag_api.jobs.tasks.httpx.AsyncClient", lambda **kw: q_mock.make_client()):
+        async with SessionLocal() as session:
+            await seed_ingestion_pipeline(
+                session,
+                source_id=source_id,
+                doc_id=doc_id,
+                ver_id=ver_id,
+                run_id=run_id,
+                job_id=job_id,
+                project_id=project_id,
+                file_path=md_file,
+                security_partition_id="sec_post",
+            )
+            job = await session.get(Job, job_id)
+            with pytest.raises(Exception):
+                await _process_document_unlocked(session, job, engine_manager=FailingExtractionEngine(vector_dim=3))
+
+    async with SessionLocal() as check_session:
+        # Document bị FAILED do legacy extraction thất bại
+        doc_db = (await check_session.execute(select(Document).where(Document.id == doc_id))).scalar_one()
+        assert doc_db.status == DocumentStatus.FAILED
+
+        # Tuy nhiên DocumentVersion vẫn giữ nguyên SEARCH_READY và search_ready_at vì Qdrant manifest đã verified
+        ver_db = (await check_session.execute(select(DocumentVersion).where(DocumentVersion.id == ver_id))).scalar_one()
+        assert ver_db.search_status == "SEARCH_READY"
+        assert ver_db.search_ready_at is not None
+        assert ver_db.knowledge_status == "FAILED"
+
+
+# ==============================================================================
+# Gate 12: True E2E Upload API to Manifest Verified (Finding 5)
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_checkpoint_a_e2e_real_upload_api_to_manifest_verified():
+    """Luồng E2E hoàn chỉnh từ HTTP Upload API thực tế đến worker xử lý và verify Qdrant manifest."""
+    await init_db()
+    project_id = f"proj_real_{uuid.uuid4().hex[:8]}"
+    token = create_access_token(
+        subject="user_tester",
+        extra={"tenant_id": "tenant_real", "allowed_projects": [project_id], "allowed_partitions": ["sec_real"]},
+    )
+    auth_header = {"Authorization": f"Bearer {token}"}
+
+    md_content = b"# Architecture Overview\n\nThis is a complete end-to-end integration test from upload API to verified Qdrant manifest."
+    transport = httpx.ASGITransport(app=app)
+
+    async with _RealAsyncClient(transport=transport, base_url="http://test") as client:
+        res = await client.post(
+            f"/api/v1/projects/{project_id}/documents/upload",
+            headers={
+                **auth_header,
+                "X-Continuum-User-Id": "user_tester",
+                "Idempotency-Key": f"idemp_{uuid.uuid4().hex[:12]}",
+                "X-Continuum-Security-Partition": "sec_real",
+            },
+            files={"file": ("architecture.md", md_content, "text/markdown")},
+        )
+        assert res.status_code == 201, res.text
+        upload_data = res.json()
+        doc_id = upload_data["document_id"]
+        ver_id = upload_data["version_id"]
+
+    q_mock = MockQdrantStorage(vector_dim=3)
+
+    with patch("sag_api.jobs.tasks.httpx.AsyncClient", lambda **kw: q_mock.make_client()):
+        async with SessionLocal() as session:
+            job = (await session.execute(select(Job).where(Job.document_id == doc_id))).scalars().first()
+            assert job is not None
+            await _process_document_unlocked(session, job, engine_manager=FakeIngestionEngine(vector_dim=3))
+
+    async with SessionLocal() as check_session:
+        doc_db = (await check_session.execute(select(Document).where(Document.id == doc_id))).scalar_one()
+        assert doc_db.status == DocumentStatus.READY
+
+        ver_db = (await check_session.execute(select(DocumentVersion).where(DocumentVersion.id == ver_id))).scalar_one()
+        assert ver_db.status == "SEARCH_READY"
+        assert ver_db.search_status == "SEARCH_READY"
+        assert ver_db.search_ready_at is not None
+
+        col_name = f"search_units_{project_id}"
+        assert col_name in q_mock.points
+        points = list(q_mock.points[col_name].values())
+        assert len(points) >= 1
+        payload = points[0]["payload"]
+        assert payload["project_id"] == project_id
+        assert payload["document_id"] == doc_id
+        assert payload["document_version_id"] == ver_id
+        assert payload.get("source_anchor") is not None
+        assert payload.get("page_from", 0) >= 1
+        assert payload.get("page_to", 0) >= payload.get("page_from", 1)
+

@@ -502,6 +502,23 @@ async def _process_document_unlocked(
                     ing_run.error_message = pipe_err_str
                     session.add(ing_run)
 
+                    from sag_api.db.models import StageRun
+                    stage_name = "INDEX_SEARCH" if current_pipeline_stage == "INDEX" else (
+                        "CANONICAL_EXTRACTION" if current_pipeline_stage == "PARSE" else (
+                            "DEDUP_TEMPORAL" if current_pipeline_stage == "DEDUP" else "INGEST"
+                        )
+                    )
+                    failed_stage_run = StageRun(
+                        id=str(uuid.uuid4()),
+                        run_id=run_id,
+                        stage=stage_name,
+                        status="FAILED",
+                        error_message=pipe_err_str,
+                        duration_ms=0.0,
+                        metrics_json={"error": pipe_err_str},
+                    )
+                    session.add(failed_stage_run)
+
                     doc_ver = await session.get(DocumentVersion, ing_run.document_version_id)
                     if doc_ver:
                         doc_ver.search_status = "INDEX_FAILED"
@@ -593,10 +610,16 @@ async def _process_document_unlocked(
                 ingestion_run.error_message = public_message
                 ver = await session.get(DocumentVersion, ingestion_run.document_version_id)
                 if ver:
-                    ver.status = "FAILED"
-                    if ver.search_status != "INDEX_FAILED":
-                        ver.search_status = "FAILED"
-                    ver.search_ready_at = None
+                    # Nếu Phase 2C đã hoàn tất và SEARCH_READY, lỗi extraction/LLM hoặc enrichment
+                    # phía sau không được phép hạ cấp hoặc xóa trạng thái tìm kiếm
+                    if ver.search_status == "SEARCH_READY":
+                        ver.knowledge_status = "FAILED"
+                    else:
+                        ver.status = "FAILED"
+                        if ver.search_status != "INDEX_FAILED":
+                            ver.search_status = "FAILED"
+                        ver.search_ready_at = None
+                    session.add(ver)
         await session.commit()
         raise
 

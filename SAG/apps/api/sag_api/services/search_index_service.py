@@ -407,7 +407,9 @@ async def index_search_units_to_qdrant(
     for unit, vec, text in zip(units, vectors, texts):
         point_id = generate_search_unit_point_id(collection_name, unit.id)
         b_start = blocks_by_id.get(unit.block_from_id) if blocks_by_id else None
-        s_anchor = b_start.source_anchor if b_start else None
+        s_anchor = (b_start.source_anchor if b_start and b_start.source_anchor else None) or f"block-{unit.block_from_id[:8]}"
+        if b_start and not b_start.source_anchor:
+            b_start.source_anchor = s_anchor
         payload = build_qdrant_payload(
             unit,
             version=version,
