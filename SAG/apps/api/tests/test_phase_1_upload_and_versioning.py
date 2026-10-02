@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 import httpx
 import pytest
+import uuid
 from sqlalchemy import select
 
 from sag_api.core.config import settings
@@ -583,12 +584,36 @@ async def test_query_document_version_status_success_and_not_found(client: httpx
 # ============================================================================
 
 @pytest.mark.asyncio
-async def test_worker_transitions_ingestion_run_and_document_version(client: httpx.AsyncClient):
+async def test_worker_transitions_ingestion_run_and_document_version(client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch):
     """Verify that JobType.PROCESS_DOCUMENT linked with run_id transitions IngestionRun
     from QUEUED to RUNNING and on completion updates status to SUCCEEDED and DocumentVersion to READY.
     """
     project_id = "proj_worker_01"
     auth_header = make_auth_header(user_id="user_worker_test", allowed_projects=[project_id])
+
+    # Mock Qdrant handler for search indexing stage in worker
+    stored_points: list[dict[str, Any]] = []
+
+    def mock_qdrant_handler(request: httpx.Request) -> httpx.Response:
+        url_path = request.url.path
+        if url_path.endswith("/points/count"):
+            return httpx.Response(200, json={"result": {"count": len(stored_points)}})
+        if url_path.endswith("/points/scroll"):
+            return httpx.Response(200, json={"result": {"points": stored_points, "next_page_offset": None}})
+        if request.method == "PUT" and "/points" in url_path:
+            import json
+            body = json.loads(request.content.decode("utf-8"))
+            stored_points.extend(body.get("points", []))
+            return httpx.Response(200, json={"result": {"operation_id": 1, "status": "completed"}})
+        if request.method == "GET":
+            return httpx.Response(200, json={"result": {"config": {"params": {"vectors": {"content_vector": {"size": 3}}}}}})
+        return httpx.Response(200, json={"result": {"operation_id": 1, "status": "completed"}})
+
+    mock_qdrant_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(mock_qdrant_handler),
+        base_url="http://localhost:6333",
+    )
+    monkeypatch.setattr("httpx.AsyncClient", lambda *args, **kwargs: mock_qdrant_client)
 
     res = await client.post(
         f"/api/v1/projects/{project_id}/documents/upload",
@@ -627,6 +652,12 @@ async def test_worker_transitions_ingestion_run_and_document_version(client: htt
         class MockEngineManager:
             async def process_document(self, *args, **kwargs):
                 return MockOutcome()
+
+            async def get_sag_embedding(self, *args, **kwargs):
+                class MockEmbedder:
+                    async def batch_generate(self, texts: list[str]) -> list[list[float]]:
+                        return [[0.1, 0.2, 0.3] for _ in texts]
+                return MockEmbedder()
 
         # Verify that project upload automatically maps and populates doc.source_id (Comment #9)
         assert doc.source_id is not None
@@ -732,6 +763,191 @@ async def test_mime_signature_mismatch_rejected(client: httpx.AsyncClient):
             "Idempotency-Key": "key_mime_invalid_pdf",
             "X-Continuum-Security-Partition": "public",
         },
+        files={"file": ("fake.pdf", b"This is plain text pretending to be PDF", "application/pdf")},
+    )
+    assert res.status_code == 422
+    assert "thiếu chữ ký PDF" in res.text or "PDF" in res.text
+
+
+@pytest.mark.asyncio
+async def test_mime_signature_docx_without_zip_rejected(client: httpx.AsyncClient):
+    """Verify that docx files lacking ZIP container signature (PK) are rejected with 422 (TC-VAL-05)."""
+    project_id = "proj_mime_docx_test"
+    auth_header = make_auth_header(user_id="user_mime", allowed_projects=[project_id])
+
+    res = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_mime",
+            "Idempotency-Key": "key_mime_invalid_docx",
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("fake.docx", b"Plain text disguised as docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+    )
+    assert res.status_code == 422
+    assert "ZIP" in res.text or "PK" in res.text
+
+
+@pytest.mark.asyncio
+async def test_mime_signature_text_with_null_byte_rejected(client: httpx.AsyncClient):
+    """Verify that plain text files containing null bytes are rejected as binary pollution with 422 (TC-VAL-07)."""
+    project_id = "proj_mime_null_byte_test"
+    auth_header = make_auth_header(user_id="user_mime", allowed_projects=[project_id])
+
+    res = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_mime",
+            "Idempotency-Key": "key_mime_null_byte",
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("notes.md", b"# Header\nValid text\x00corrupted binary content", "text/markdown")},
+    )
+    assert res.status_code == 422
+    assert "không được phép" in res.text or "nhị phân" in res.text
+
+
+@pytest.mark.asyncio
+async def test_upload_disallowed_extension_rejected(client: httpx.AsyncClient):
+    """Verify that files with extensions outside allowed whitelist are rejected with 422 (TC-VAL-03)."""
+    project_id = "proj_disallowed_ext_test"
+    auth_header = make_auth_header(user_id="user_mime", allowed_projects=[project_id])
+
+    res = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_mime",
+            "Idempotency-Key": "key_disallowed_ext",
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("malicious.sh", b"#!/bin/bash\necho bad\n", "application/x-sh")},
+    )
+    assert res.status_code == 422
+    assert "Unsupported file type" in res.text or "Allowed extensions" in res.text
+
+
+@pytest.mark.asyncio
+async def test_mime_signature_text_with_png_image_rejected(client: httpx.AsyncClient):
+    """Verify that images disguised as plain text (.txt with PNG header) are rejected with 422 (TC-VAL-06)."""
+    project_id = "proj_mime_png_text_test"
+    auth_header = make_auth_header(user_id="user_mime", allowed_projects=[project_id])
+
+    res = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_mime",
+            "Idempotency-Key": "key_mime_png_text",
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("data.txt", b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR", "text/plain")},
+    )
+    assert res.status_code == 422
+    assert "Tệp nhị phân" in res.text or "trá hình" in res.text
+
+
+@pytest.mark.asyncio
+async def test_rejected_upload_leaves_no_disk_or_db_garbage(client: httpx.AsyncClient):
+    """Verify that uploads rejected by MIME verification abort fail-fast without creating Document, Job, Snapshot, or Run records (DoD 2)."""
+    project_id = "proj_zero_garbage_test"
+    auth_header = make_auth_header(user_id="user_zero", allowed_projects=[project_id])
+    idem_key = "key_zero_garbage_check"
+    fake_payload = b"MZ\x90\x00\x03\x00\x00\x00_pretending_to_be_pdf"
+
+    res = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_zero",
+            "Idempotency-Key": idem_key,
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("fake.pdf", fake_payload, "application/pdf")},
+    )
+    assert res.status_code == 422
+    assert "thiếu chữ ký PDF" in res.text or "PDF" in res.text
+
+    async with SessionLocal() as session:
+        run = (
+            await session.execute(
+                select(IngestionRun).where(
+                    IngestionRun.project_id == project_id,
+                    IngestionRun.idempotency_key == idem_key,
+                )
+            )
+        ).scalar_one_or_none()
+        assert run is None, "Rejected upload must not create an IngestionRun record"
+
+        doc = (
+            await session.execute(
+                select(Document).where(Document.project_id == project_id)
+            )
+        ).scalar_one_or_none()
+        assert doc is None, "Rejected upload must not create a Document record"
+
+
+@pytest.mark.asyncio
+async def test_mime_signature_text_with_null_byte_after_8kb_rejected(client: httpx.AsyncClient):
+    """Verify that text files with null bytes beyond the first 8KB are rejected by full payload scanning (P2 review fix)."""
+    project_id = "proj_mime_null_deep_test"
+    auth_header = make_auth_header(user_id="user_mime", allowed_projects=[project_id])
+
+    # 10KB valid ASCII text followed by null byte
+    payload = (b"A" * 10000) + b"\x00" + b"trailing binary content"
+    res = await client.post(
+        f"/api/v1/projects/{project_id}/documents/upload",
+        headers={
+            **auth_header,
+            "X-Continuum-User-Id": "user_mime",
+            "Idempotency-Key": "key_mime_null_deep",
+            "X-Continuum-Security-Partition": "public",
+        },
+        files={"file": ("deep_null.txt", payload, "text/plain")},
+    )
+    assert res.status_code == 422
+    assert "Tệp nhị phân hoặc hình ảnh trá hình" in res.text
+
+
+@pytest.mark.asyncio
+async def test_legacy_source_upload_rejects_invalid_mime_signature(client: httpx.AsyncClient):
+    """Verify that legacy POST /api/v1/sources/{source_id}/documents also enforces MIME signature checks (P1 review fix)."""
+    uid = uuid.uuid4().hex[:8]
+    async with SessionLocal() as session:
+        user = User(
+            id=f"user_leg_{uid}",
+            email=f"leg_{uid}@example.com",
+            password_hash="dummy_password",
+        )
+        source = Source(
+            id=f"src_leg_{uid}",
+            name="Legacy MIME Test Source",
+            sag_source_config_id=f"cfg_{uid}",
+        )
+        from sag_api.db.models.source_project_mapping import SourceProjectMapping
+        mapping = SourceProjectMapping(
+            source_id=source.id,
+            organization_id="pytest-org",
+            project_id="pytest-project",
+            state="CONFIRMED",
+            confirmed_at=datetime.now(UTC),
+            confirmed_by="pytest-owner",
+            approval_ref="test-fixture",
+        )
+        session.add_all([user, source, mapping])
+        await session.commit()
+        user_id = user.id
+        source_id = source.id
+
+    token = create_access_token(subject=user_id)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Upload text disguised as PDF to legacy route
+    res = await client.post(
+        f"/api/v1/sources/{source_id}/documents",
+        headers=headers,
         files={"file": ("fake.pdf", b"This is plain text pretending to be PDF", "application/pdf")},
     )
     assert res.status_code == 422
@@ -934,13 +1150,37 @@ async def test_project_source_protected_from_global_sources_routes(client: httpx
 
 
 @pytest.mark.asyncio
-async def test_job_reads_correct_immutable_snapshot_version(client: httpx.AsyncClient):
+async def test_job_reads_correct_immutable_snapshot_version(client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch):
     """[P1] Verify that Job payload carries immutable storage_path and worker processes
     the snapshot of the specific version, even if Document.storage_path is updated by subsequent version.
     """
     project_id = "proj_snapshot_immut_01"
     auth_header = make_auth_header(user_id="user_snap", allowed_projects=[project_id])
     logical_doc = "concurrent/spec.txt"
+
+    # Mock Qdrant handler for search indexing stage in worker
+    stored_points: list[dict[str, Any]] = []
+
+    def mock_qdrant_handler(request: httpx.Request) -> httpx.Response:
+        url_path = request.url.path
+        if url_path.endswith("/points/count"):
+            return httpx.Response(200, json={"result": {"count": len(stored_points)}})
+        if url_path.endswith("/points/scroll"):
+            return httpx.Response(200, json={"result": {"points": stored_points, "next_page_offset": None}})
+        if request.method == "PUT" and "/points" in url_path:
+            import json
+            body = json.loads(request.content.decode("utf-8"))
+            stored_points.extend(body.get("points", []))
+            return httpx.Response(200, json={"result": {"operation_id": 1, "status": "completed"}})
+        if request.method == "GET":
+            return httpx.Response(200, json={"result": {"config": {"params": {"vectors": {"content_vector": {"size": 3}}}}}})
+        return httpx.Response(200, json={"result": {"operation_id": 1, "status": "completed"}})
+
+    mock_qdrant_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(mock_qdrant_handler),
+        base_url="http://localhost:6333",
+    )
+    monkeypatch.setattr("httpx.AsyncClient", lambda *args, **kwargs: mock_qdrant_client)
 
     # 1. Upload Version 1
     res1 = await client.post(
@@ -1005,6 +1245,12 @@ async def test_job_reads_correct_immutable_snapshot_version(client: httpx.AsyncC
             async def process_document(self, *args, **kwargs):
                 recorded_paths.append(kwargs.get("original_path"))
                 return MockOutcome()
+
+            async def get_sag_embedding(self, *args, **kwargs):
+                class MockEmbedder:
+                    async def batch_generate(self, texts: list[str]) -> list[list[float]]:
+                        return [[0.1, 0.2, 0.3] for _ in texts]
+                return MockEmbedder()
 
         from sag_api.jobs.tasks import process_document
         await process_document(session, job1, engine_manager=MockEngine())

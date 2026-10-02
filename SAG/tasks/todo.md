@@ -19,34 +19,37 @@ Nguồn chuẩn: [Workflow v1.1](../docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1
 - [x] Kiểm tra bốn trường hợp cùng hash/cùng identity, cùng hash/khác nguồn, hash mới/cùng identity, hash mới/nguồn mới.
 - [x] Đảm bảo frontend retry dùng idempotency key, không tạo workflow trùng.
 - [x] Ghi stage/status/error cho worker; xác nhận status API và UI phản ánh tiến trình/lỗi/retry.
-- [x] Evidence: [test_phase_1_upload_and_versioning.py](../apps/api/tests/test_phase_1_upload_and_versioning.py) (8/8 passed).
+- [x] Evidence: [test_phase_1_upload_and_versioning.py](../apps/api/tests/test_phase_1_upload_and_versioning.py) (34/34 passed).
 
 ## Phase 2A — Canonical Extraction
 
-- [ ] Xác nhận danh sách định dạng thực sự hỗ trợ và parser/fixtures cho từng định dạng.
-- [ ] Lưu canonical block type, ordinal, page range, section path, anchor và document version.
-- [ ] Kiểm tra normalization giữ bảng/code/punctuation/identifier và dấu vết boilerplate.
-- [ ] Xác nhận LLM không được dùng để sửa text mặc định.
-- [ ] Kiểm tra extraction output versioned/temp, retry và lỗi stage.
+- [x] Xác nhận danh sách định dạng thực sự hỗ trợ và parser/fixtures cho từng định dạng.
+- [x] Lưu canonical block type, ordinal, page range, section path, anchor và document version.
+- [x] Kiểm tra normalization giữ bảng/code/punctuation/identifier và dấu vết boilerplate.
+- [x] Xác nhận LLM không được dùng để sửa text mặc định.
+- [x] Kiểm tra extraction output versioned/temp, retry và lỗi stage.
+- [x] Evidence: [test_phase_2a_canonical_extraction.py](../apps/api/tests/test_phase_2a_canonical_extraction.py) (8/8 passed).
 
 ## Phase 2B — Dedup & Temporal
 
-- [ ] Kiểm tra file exact hash và block exact hash; reuse content vẫn giữ mọi provenance/evidence.
-- [ ] Kiểm tra near-duplicate tạo candidate cluster, có ngưỡng phù hợp loại dữ liệu.
-- [ ] Kiểm tra semantic similarity chỉ tạo candidate, không tự merge CONTRADICTS/SUPERSEDES.
-- [ ] Kiểm tra EQUIVALENT, SUPPORTS, CONTRADICTS, SUPERSEDES, RELATED và evidence mapping.
-- [ ] Kiểm tra published/observed/ingested time, validity, supersedes lineage và truy vấn lịch sử.
-- [ ] Xác nhận reprocess deterministic, retry an toàn và không mất lịch sử.
+- [x] Kiểm tra file exact hash và block exact hash; reuse content vẫn giữ mọi provenance/evidence.
+- [x] Kiểm tra near-duplicate tạo candidate cluster, có ngưỡng phù hợp loại dữ liệu.
+- [x] Kiểm tra semantic similarity chỉ tạo candidate, không tự merge CONTRADICTS/SUPERSEDES.
+- [x] Kiểm tra EQUIVALENT, SUPPORTS, CONTRADICTS, SUPERSEDES, RELATED và evidence mapping.
+- [x] Kiểm tra published/observed/ingested time, validity, supersedes lineage và truy vấn lịch sử.
+- [x] Xác nhận reprocess deterministic, retry an toàn và không mất lịch sử.
+- [x] Evidence: [test_phase_2b_dedup_and_temporal.py](../apps/api/tests/test_phase_2b_dedup_and_temporal.py) (5/5 passed).
 
 ## Phase 2C — Search Index
 
-- [ ] Xác nhận Search Unit boundary theo heading/paragraph/table trước token window.
-- [ ] Giữ document/version, canonical block range, hash, page, section và security partition.
-- [ ] Tạo dense+sparse representation theo provider/model đã xác nhận; giữ riêng Search Unit và Knowledge Unit.
-- [ ] Tạo Qdrant payload indexes cho filter fields trước ingestion.
-- [ ] Upsert bằng stable point ID; kiểm tra reprocess không tạo point/vector trùng hoặc evidence cũ.
-- [ ] Lưu/verify index manifest; chỉ bật search readiness sau index nhất quán.
-- [ ] Xác nhận Qdrant có thể rebuild từ PostgreSQL/source artifacts.
+- [x] Xác nhận Search Unit boundary theo heading/paragraph/table trước token window.
+- [x] Giữ document/version, canonical block range, hash, page, section và security partition.
+- [x] Tạo dense+sparse representation theo provider/model đã xác nhận; giữ riêng Search Unit và Knowledge Unit.
+- [x] Tạo Qdrant payload indexes cho filter fields trước ingestion.
+- [x] Upsert bằng stable point ID; kiểm tra reprocess không tạo point/vector trùng hoặc evidence cũ.
+- [x] Lưu/verify index manifest; chỉ bật search readiness sau index nhất quán.
+- [x] Xác nhận Qdrant có thể rebuild từ PostgreSQL/source artifacts.
+- [x] Evidence: [test_phase_2c_search_indexing.py](../apps/api/tests/test_phase_2c_search_indexing.py) (4/4 passed).
 
 ## Phase 3 — Laya & Query Analyzer
 
