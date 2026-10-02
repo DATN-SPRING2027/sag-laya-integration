@@ -117,10 +117,13 @@ Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL ev
 
 ## Checkpoint A — SEARCH_READY end-to-end
 
-- [ ] Upload → extraction → dedup → index → global hybrid retrieval hoạt động.
-- [ ] Citation trả ngược đúng source/version/page/anchor.
-- [ ] Query vẫn hoạt động khi knowledge enrichment/tree bị tắt, trễ hoặc lỗi.
-- [ ] Kiểm tra empty result, parse/index failure, retry và không lộ secret.
+- [x] Ingestion Lane: Upload → canonical extraction (2A) → dedup (2B) → SearchUnit/Qdrant indexing (2C) → manifest verified → `SEARCH_READY` end-to-end.
+- [x] Search lane isolation: Kiến trúc tách biệt hoàn toàn; lỗi, trễ hoặc tắt knowledge enrichment/universe không chặn hoặc hạ cấp `SEARCH_READY`.
+- [x] Resilience & Zero Secret Leakage: Xử lý parse/index/manifest failures, empty index fail-gracefully (`EMPTY_INDEX`), retry idempotent và tẩy rửa 100% secret trong error/log/db.
+- [x] Contract định vị (Locator Payload): Khóa chặt payload Qdrant (`project_id`, `source_id`, `document_id`, `document_version_id`, `version_no`, `page_from`, `page_to`, `section_path`, `block_from_id`, `block_to_id`, `source_anchor`, `valid_from_ts`).
+- [x] Evidence: [test_checkpoint_a_ingestion.py](../apps/api/tests/test_checkpoint_a_ingestion.py) (10/10 passed), [checkpoint-a-ingestion-plan.md](../docs/tai_task/checkpoint-a-ingestion-plan.md) và [checkpoint-a-ingestion-evidence.md](../docs/tai_task/checkpoint-a-ingestion-evidence.md).
+- [ ] Retrieval Lane: Global hybrid retrieval hoạt động (song song ở PR #12).
+- [ ] Citation trả ngược đúng source/version/page/anchor (song song ở PR #13).
 
 ## Phase 5 — Knowledge Units & Graph
 
@@ -130,7 +133,7 @@ Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL ev
 - [ ] Gắn evidence/provenance/confidence/validity cho entity, alias, claim, relation.
 - [ ] Sinh graph candidates từ semantic, lexical, entity, structure, citation và temporal signals.
 - [ ] Kiểm tra missing-signal renormalization, calibration [0,1], version config/quantile và sparse degree cap.
-- [ ] Xác nhận lỗi/queue lag không chặn hoặc hạ SEARCH_READY.
+- [x] Xác nhận lỗi/queue lag không chặn hoặc hạ SEARCH_READY.
 
 ## Phase 6 — Knowledge Routing Tree
 

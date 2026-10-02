@@ -1282,11 +1282,12 @@ async def get_document_version_status(
             stage_progress[s.stage] = StageProgressItem(
                 status=s.status, duration_ms=s.duration_ms
             )
-        if latest_run.error_code:
+        if latest_run.error_code or latest_run.error_message:
+            code = latest_run.error_code or f"{latest_run.error_layer or 'API'}_{latest_run.error_stage or 'INGEST'}_FAILED"
             err_info = {
-                "layer": latest_run.error_layer,
-                "stage": latest_run.error_stage,
-                "code": latest_run.error_code,
+                "layer": latest_run.error_layer or "API",
+                "stage": latest_run.error_stage or "INGEST",
+                "code": code,
                 "message": latest_run.error_message,
             }
 

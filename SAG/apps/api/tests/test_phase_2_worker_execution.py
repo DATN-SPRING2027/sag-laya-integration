@@ -334,7 +334,7 @@ async def test_prepared_none_resolution_does_not_decode_binary_as_utf8(tmp_path,
     # Xác minh Search readiness và canonical blocks được nạp thành công từ parsed markdown
     async with SessionLocal() as check_session:
         ver_updated = (await check_session.execute(select(DocumentVersion).where(DocumentVersion.id == ver_id))).scalar_one()
-        assert ver_updated.search_status in ("READY", "SEARCH_READY")
+        assert ver_updated.search_status == "SEARCH_READY"
         assert ver_updated.search_ready_at is not None
 
 

@@ -23,6 +23,7 @@ from sag_api.core.db import SessionLocal
 from sag_api.core.error_taxonomy import ErrorLayer, ErrorStage
 from sag_api.core.errors import ApiError, NotFoundError
 from sag_api.core.logging import get_logger
+from sag_api.core.sanitizer import sanitize_error_message
 from sag_api.db.models import Document, Job, Source
 from sag_api.db.models.routing_rag import DocumentVersion, IngestionRun, StageRun
 from sag_api.enums import DocumentStatus, JobStatus, JobType
@@ -463,7 +464,8 @@ async def _process_document_unlocked(
             except (JobPaused, JobYielded, ParsePaused):
                 await _pause_or_yield()
             except Exception as pipe_err:
-                log.error("Phase 2 pipeline execution failed run_id=%s: %s", run_id, pipe_err)
+                pipe_err_str = sanitize_error_message(pipe_err)
+                log.error("Phase 2 pipeline execution failed run_id=%s: %s", run_id, pipe_err_str)
                 await session.rollback()
 
                 # Determine accurate error layer & stage
@@ -487,23 +489,29 @@ async def _process_document_unlocked(
                     if pipe_err.stage:
                         err_stage = pipe_err.stage
 
+                err_layer_val = err_layer.value if hasattr(err_layer, "value") else str(err_layer)
+                err_stage_val = err_stage.value if hasattr(err_stage, "value") else str(err_stage)
+                err_code = "EMPTY_INDEX" if "EMPTY_INDEX" in str(pipe_err) else f"{err_layer_val}_{err_stage_val}_FAILED"
+
                 ing_run = await session.get(IngestionRun, run_id) if run_id else None
                 if ing_run:
                     ing_run.status = "FAILED"
-                    ing_run.error_layer = err_layer.value if hasattr(err_layer, "value") else str(err_layer)
-                    ing_run.error_stage = err_stage.value if hasattr(err_stage, "value") else str(err_stage)
-                    ing_run.error_message = str(pipe_err)
+                    ing_run.error_layer = err_layer_val
+                    ing_run.error_stage = err_stage_val
+                    ing_run.error_code = err_code
+                    ing_run.error_message = pipe_err_str
                     session.add(ing_run)
 
                     doc_ver = await session.get(DocumentVersion, ing_run.document_version_id)
                     if doc_ver:
                         doc_ver.search_status = "INDEX_FAILED"
+                        doc_ver.search_ready_at = None
                         session.add(doc_ver)
                     await session.commit()
 
                 # Fail the document and preserve error layer and stage
                 raise ApiError(
-                    str(pipe_err),
+                    pipe_err_str,
                     layer=err_layer,
                     stage=err_stage,
                 ) from pipe_err
@@ -534,7 +542,8 @@ async def _process_document_unlocked(
             await _yield_after_document_transition_lost(session, document)
         layer, stage = _classify_document_failure(e, document.status)
         expected_status = document.status
-        message = getattr(e, "message", None) or str(e)
+        raw_message = getattr(e, "message", None) or str(e)
+        message = sanitize_error_message(raw_message)
         public_message = message
         parser_failure_values: dict[str, str | None] = {}
         parser_state = (job.payload or {}).get("document_parser")
@@ -579,10 +588,15 @@ async def _process_document_unlocked(
                 ingestion_run.status = "FAILED"
                 ingestion_run.error_layer = layer.value
                 ingestion_run.error_stage = stage.value
+                if not ingestion_run.error_code:
+                    ingestion_run.error_code = "EMPTY_INDEX" if "EMPTY_INDEX" in raw_message else f"{layer.value}_{stage.value}_FAILED"
                 ingestion_run.error_message = public_message
                 ver = await session.get(DocumentVersion, ingestion_run.document_version_id)
                 if ver:
                     ver.status = "FAILED"
+                    if ver.search_status != "INDEX_FAILED":
+                        ver.search_status = "FAILED"
+                    ver.search_ready_at = None
         await session.commit()
         raise
 
@@ -636,14 +650,16 @@ async def _process_document_unlocked(
             ingestion_run.completed_at = datetime.now(UTC)
             ver = await session.get(DocumentVersion, ingestion_run.document_version_id)
             if ver:
-                # Xác minh chỉ số tìm kiếm (chunks) đã thực sự được nạp hợp lệ trước khi đánh dấu SEARCH_READY (Comment #11)
-                if outcome.chunk_count > 0:
+                # Xác minh chỉ số tìm kiếm từ Phase 2 hoặc legacy engine
+                if ver.search_status == "SEARCH_READY" or outcome.chunk_count > 0:
                     ver.status = "SEARCH_READY"
                     ver.search_status = "SEARCH_READY"
-                    ver.search_ready_at = datetime.now(UTC)
+                    if not ver.search_ready_at:
+                        ver.search_ready_at = datetime.now(UTC)
                 else:
                     ver.status = "FAILED"
                     ver.search_status = "FAILED"
+                    ver.search_ready_at = None
                 # knowledge_status duy trì độc lập theo hợp đồng Phase 0 (chỉ chuyển khi tree/graph hoàn tất)
                 if ver.knowledge_status != "KNOWLEDGE_READY":
                     ver.knowledge_status = "NOT_STARTED"
@@ -658,14 +674,22 @@ async def _process_document_unlocked(
         outcome.token_usage,
     )
     if job_queue is not None:
-        from sag_api.services.universe_service import schedule_universe_refresh
+        try:
+            from sag_api.services.universe_service import schedule_universe_refresh
 
-        await schedule_universe_refresh(
-            session,
-            job_queue,
-            source_id=source.id,
-            reason="document_processed",
-        )
+            await schedule_universe_refresh(
+                session,
+                job_queue,
+                source_id=source.id,
+                reason="document_processed",
+            )
+        except Exception as uni_err:
+            log.warning(
+                "Secondary queue universe refresh failed or delayed doc=%s source=%s: %s",
+                document.id,
+                source.id,
+                sanitize_error_message(uni_err),
+            )
 
 
 async def delete_document_task(
