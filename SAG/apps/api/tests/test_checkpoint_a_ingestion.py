@@ -7,6 +7,7 @@ empty index handling, zero secret leakage, idempotent retries, and disaster reco
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 import hashlib
 import json
@@ -418,6 +419,57 @@ async def test_checkpoint_a_enrichment_disabled_or_lag_does_not_block_search(tmp
         assert ver_db.search_status == "SEARCH_READY"
         assert ver_db.knowledge_status == "NOT_STARTED"
 
+    # Trường hợp 2: Enrichment queue bị delayed / lag -> SEARCH_READY đã commit và sẵn sàng từ trước
+    project_id_lag = f"proj_lag_{uuid.uuid4().hex[:8]}"
+    source_id_lag = f"src_lag_{uuid.uuid4().hex[:8]}"
+    doc_id_lag = str(uuid.uuid4())
+    ver_id_lag = str(uuid.uuid4())
+    run_id_lag = str(uuid.uuid4())
+    job_id_lag = f"job_lag_{uuid.uuid4().hex[:8]}"
+
+    md_file_lag = tmp_path / "lag_search.md"
+    md_file_lag.write_text("# Lag Search\n\nKiểm tra enrichment bị lag không ảnh hưởng search readiness.", encoding="utf-8")
+
+    lag_event = asyncio.Event()
+    readiness_verified_during_lag = False
+
+    async def _mock_delayed_schedule(*args, **kwargs):
+        nonlocal readiness_verified_during_lag
+        # Đọc từ session hoàn toàn độc lập trong lúc enrichment scheduler đang bị block
+        async with SessionLocal() as indep_session:
+            v_check = (await indep_session.execute(select(DocumentVersion).where(DocumentVersion.id == ver_id_lag))).scalar_one()
+            assert v_check.search_status == "SEARCH_READY"
+            assert v_check.search_ready_at is not None
+            readiness_verified_during_lag = True
+        await lag_event.wait()
+
+    with patch("sag_api.jobs.tasks.httpx.AsyncClient", lambda **kw: q_mock.make_client()), \
+         patch("sag_api.services.universe_service.schedule_universe_refresh", side_effect=_mock_delayed_schedule):
+        async with SessionLocal() as session:
+            await seed_ingestion_pipeline(
+                session,
+                source_id=source_id_lag,
+                doc_id=doc_id_lag,
+                ver_id=ver_id_lag,
+                run_id=run_id_lag,
+                job_id=job_id_lag,
+                project_id=project_id_lag,
+                file_path=md_file_lag,
+                security_partition_id="sec_lag",
+            )
+            job_lag = await session.get(Job, job_id_lag)
+            worker_task = asyncio.create_task(
+                _process_document_unlocked(session, job_lag, engine_manager=FakeIngestionEngine(vector_dim=3), job_queue=SimpleNamespace())
+            )
+            for _ in range(50):
+                if readiness_verified_during_lag:
+                    break
+                await asyncio.sleep(0.05)
+
+            assert readiness_verified_during_lag is True
+            lag_event.set()
+            await worker_task
+
 
 # ==============================================================================
 # Gate 4: Parse Failure Fails Closed
@@ -741,10 +793,23 @@ async def test_checkpoint_a_zero_secret_leakage(caplog: pytest.LogCaptureFixture
     assert "Bearer [REDACTED]" in cleaned
     assert "https://[REDACTED]@qdrant.internal:6333" in cleaned
 
+    # Kiểm tra scrub credentials trên các URI DSN (PostgreSQL, Redis)
+    dsn_leak = (
+        "Database error: postgresql+asyncpg://admin_user:super_secret_db_pass@db.internal:5432/rag "
+        "and cache error: redis://default:super_secret_redis_pass@redis.internal:6379/0"
+    )
+    cleaned_dsn = sanitize_error_message(dsn_leak)
+    assert "super_secret_db_pass" not in cleaned_dsn
+    assert "super_secret_redis_pass" not in cleaned_dsn
+    assert "postgresql+asyncpg://[REDACTED]@db.internal:5432/rag" in cleaned_dsn
+    assert "redis://[REDACTED]@redis.internal:6379/0" in cleaned_dsn
+
     # Kiểm tra log sink trực tiếp với logger
     test_logger = logging.getLogger("sag_api.test_sanitizer")
-    test_logger.warning("Sanitized sink test: %s", sanitize_error_message(raw_leak))
+    test_logger.warning("Sanitized sink test: %s | %s", sanitize_error_message(raw_leak), cleaned_dsn)
     assert "super_secret_password_123" not in caplog.text
+    assert "super_secret_db_pass" not in caplog.text
+    assert "super_secret_redis_pass" not in caplog.text
     assert "secret_refresh_tok" not in caplog.text
     assert "secret_id_tok" not in caplog.text
     assert "sk-proj-1234567890abcdef1234567890" not in caplog.text
@@ -1114,5 +1179,188 @@ async def test_checkpoint_a_whitespace_source_anchor_fallback_and_locator_resolu
         assert len(resolved) == 1
         assert has_traceable_locator(resolved[0])
         assert resolved[0].anchor == expected_fallback_anchor
+
+
+# ==============================================================================
+# Gate 14: Re-index Demotes Readiness Before Deleting Points
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_checkpoint_a_reindex_demotes_readiness_before_deleting_points():
+    """Khẳng định khi reindex tài liệu đang SEARCH_READY:
+    - Trạng thái lập tức hạ xuống INDEXING trước khi xóa các điểm cũ.
+    - Nếu có lỗi xảy ra trong quá trình xóa/index, trạng thái không bị kẹt ở SEARCH_READY.
+    """
+    await init_db()
+    project_id = f"proj_reidx_{uuid.uuid4().hex[:8]}"
+    doc_id = str(uuid.uuid4())
+    ver_id = str(uuid.uuid4())
+    run_id = str(uuid.uuid4())
+    block_id = str(uuid.uuid4())
+
+    async with SessionLocal() as session:
+        doc = Document(id=doc_id, filename="reindex.md", storage_path="/tmp/reindex.md", project_id=project_id, tenant_id="tenant_default", status=DocumentStatus.READY)
+        ver = DocumentVersion(
+            id=ver_id,
+            document_id=doc_id,
+            version_no=1,
+            file_hash="hash_reidx",
+            valid_from=datetime.now(UTC),
+            status="SEARCH_READY",
+            search_status="SEARCH_READY",
+            search_ready_at=datetime.now(UTC),
+            metadata_json={"security_partition_id": "sec_reidx"},
+        )
+        block = CanonicalBlock(
+            id=block_id,
+            document_version_id=ver_id,
+            ordinal=0,
+            block_type="paragraph",
+            page_from=1,
+            page_to=1,
+            section_path="Section",
+            normalized_text="Existing block",
+            content_hash="h1",
+        )
+        unit = SearchUnit(
+            id=str(uuid.uuid4()),
+            document_version_id=ver_id,
+            block_from_id=block_id,
+            block_to_id=block_id,
+            security_partition_id="sec_reidx",
+            content_hash="h1",
+            page_from=1,
+            page_to=1,
+            token_count=10,
+            section_path="Section",
+        )
+        session.add(doc)
+        await session.commit()
+        session.add(ver)
+        await session.commit()
+        session.add(block)
+        await session.commit()
+        session.add(unit)
+        await session.commit()
+
+        # Giả lập client Qdrant bị lỗi khi xóa điểm cũ
+        class FailingDeleteQdrantClient:
+            async def post(self, url, **kwargs):
+                if "/points/delete" in url:
+                    return httpx.Response(500, text="Internal Qdrant Error on Delete")
+                return httpx.Response(200, json={"result": {}})
+
+        with pytest.raises(RuntimeError):
+            await run_search_indexing_stage(
+                session,
+                project_id=project_id,
+                document_version=ver,
+                security_partition_id="sec_reidx",
+                qdrant_client=FailingDeleteQdrantClient(),
+                embedder=FakeIngestionEngine(vector_dim=3),
+                run_id=run_id,
+            )
+
+    async with SessionLocal() as check_session:
+        ver_db = (await check_session.execute(select(DocumentVersion).where(DocumentVersion.id == ver_id))).scalar_one()
+        # Trạng thái bắt buộc không còn SEARCH_READY, không có search_ready_at
+        assert ver_db.search_status == "INDEX_FAILED"
+        assert ver_db.search_ready_at is None
+
+
+# ==============================================================================
+# Gate 15: Legacy Chunk Count Does Not Promote SEARCH_READY
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_checkpoint_a_chunk_count_without_manifest_does_not_promote_search_ready():
+    """Khẳng định nếu Phase 2C thất bại manifest, dù legacy engine trả về chunk_count > 0,
+    worker tuyệt đối không được ghi đè hoặc thăng hạng search_status thành SEARCH_READY.
+    """
+    await init_db()
+    project_id = f"proj_chunk_{uuid.uuid4().hex[:8]}"
+    source_id = f"src_chunk_{uuid.uuid4().hex[:8]}"
+    doc_id = str(uuid.uuid4())
+    ver_id = str(uuid.uuid4())
+    run_id = str(uuid.uuid4())
+    job_id = f"job_chunk_{uuid.uuid4().hex[:8]}"
+
+    q_mock = MockQdrantStorage(vector_dim=3)
+
+    class IngestionEngineWithChunksAndFailStage(FakeIngestionEngine):
+        async def process_document(self, *args, **kwargs):
+            # Giả lập trả về outcome có chunk_count > 0
+            return SimpleNamespace(chunk_count=15, event_count=2, token_usage=100, paused=False, source_id="src_dummy")
+
+    # Giả lập Qdrant client trả về lỗi khi index Phase 2C
+    class FailingQdrantIndexingClient:
+        async def post(self, url, **kwargs):
+            if "/points" in url:
+                return httpx.Response(500, text="Qdrant node disk full")
+            return httpx.Response(200, json={"result": {}})
+
+        async def put(self, url, **kwargs):
+            return httpx.Response(200, json={"result": True})
+
+        async def get(self, url, **kwargs):
+            return httpx.Response(200, json={"result": {"config": {"params": {"vectors": {"content_vector": {"size": 3}}}}}})
+
+    with patch("sag_api.jobs.tasks.httpx.AsyncClient", lambda **kw: FailingQdrantIndexingClient()):
+        async with SessionLocal() as session:
+            await seed_ingestion_pipeline(
+                session,
+                source_id=source_id,
+                doc_id=doc_id,
+                ver_id=ver_id,
+                run_id=run_id,
+                job_id=job_id,
+                project_id=project_id,
+                file_path=Path("dummy.md"),
+                security_partition_id="sec_chk",
+            )
+            job = await session.get(Job, job_id)
+            with pytest.raises(Exception):
+                await _process_document_unlocked(session, job, engine_manager=IngestionEngineWithChunksAndFailStage(vector_dim=3))
+
+    async with SessionLocal() as check_session:
+        ver_db = (await check_session.execute(select(DocumentVersion).where(DocumentVersion.id == ver_id))).scalar_one()
+        # Không được phép là SEARCH_READY
+        assert ver_db.search_status == "INDEX_FAILED"
+        assert ver_db.search_ready_at is None
+        assert ver_db.status == "FAILED"
+
+
+# ==============================================================================
+# Gate 16: Legacy READY Alias Rejected Without Manifest
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_checkpoint_a_legacy_ready_alias_rejected_without_manifest():
+    """Khẳng định bản ghi legacy có search_status='READY' nhưng chưa qua manifest
+    (search_ready_at is None) bị từ chối search_ready=False tại status API.
+    """
+    await init_db()
+    project_id = f"proj_leg_{uuid.uuid4().hex[:8]}"
+    doc_id = str(uuid.uuid4())
+    ver_id = str(uuid.uuid4())
+
+    async with SessionLocal() as session:
+        doc = Document(id=doc_id, filename="legacy.md", storage_path="/tmp/legacy.md", project_id=project_id, tenant_id="tenant_default")
+        ver = DocumentVersion(
+            id=ver_id,
+            document_id=doc_id,
+            version_no=1,
+            file_hash="hash_leg",
+            valid_from=datetime.now(UTC),
+            status="READY",
+            search_status="READY",  # Legacy alias chưa verified
+            search_ready_at=None,
+            metadata_json={"security_partition_id": "sec_leg"},
+        )
+        session.add(doc)
+        await session.commit()
+        session.add(ver)
+        await session.commit()
+
+        status_res = await get_document_version_status(session, project_id=project_id, document_id=doc_id, version_no=1)
+        assert status_res.search_ready is False
+
 
 

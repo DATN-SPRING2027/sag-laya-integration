@@ -581,6 +581,13 @@ async def run_search_indexing_stage(
     )
 
     # 3. Clean up prior units on retry in both PostgreSQL and Qdrant
+    # Demote readiness immediately before deleting old points to prevent false-ready state during reindexing
+    if document_version.search_status == "SEARCH_READY":
+        document_version.search_status = "INDEXING"
+        document_version.search_ready_at = None
+        session.add(document_version)
+        await session.flush()
+
     prior_units = (
         await session.execute(
             select(SearchUnit).where(SearchUnit.document_version_id == document_version.id)

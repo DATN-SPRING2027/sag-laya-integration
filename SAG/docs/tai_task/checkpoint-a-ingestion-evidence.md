@@ -97,21 +97,24 @@ configfile: pyproject.toml
 plugins: anyio-4.15.1, langsmith-0.8.5, asyncio-1.4.0
 asyncio: mode=Mode.AUTO
 
-apps/api/tests/test_checkpoint_a_ingestion.py::test_checkpoint_a_e2e_upload_to_manifest_verified PASSED [  7%]
-apps/api/tests/test_checkpoint_a_ingestion.py::test_checkpoint_a_universe_refresh_failure_does_not_downgrade_search_ready PASSED [ 15%]
-apps/api/tests/test_checkpoint_a_enrichment_disabled_or_lag_does_not_block_search PASSED [ 23%]
-apps/api/tests/test_checkpoint_a_parse_failure_fails_closed PASSED [ 30%]
-apps/api/tests/test_checkpoint_a_indexing_failure_fails_closed PASSED [ 38%]
-apps/api/tests/test_checkpoint_a_manifest_checksum_mismatch_fails_closed PASSED [ 46%]
-apps/api/tests/test_checkpoint_a_empty_index_fails_gracefully PASSED [ 53%]
-apps/api/tests/test_checkpoint_a_idempotent_retry_and_reprocess PASSED [ 61%]
-apps/api/tests/test_checkpoint_a_zero_secret_leakage PASSED [ 69%]
-apps/api/tests/test_checkpoint_a_disaster_recovery_rebuild PASSED [ 76%]
-apps/api/tests/test_checkpoint_a_extraction_failure_after_indexing_does_not_downgrade_search_ready PASSED [ 84%]
-apps/api/tests/test_checkpoint_a_e2e_real_upload_api_to_manifest_verified PASSED [ 92%]
-apps/api/tests/test_checkpoint_a_whitespace_source_anchor_fallback_and_locator_resolution PASSED [100%]
+apps/api/tests/test_checkpoint_a_ingestion.py::test_checkpoint_a_e2e_upload_to_manifest_verified PASSED [  6%]
+apps/api/tests/test_checkpoint_a_ingestion.py::test_checkpoint_a_universe_refresh_failure_does_not_downgrade_search_ready PASSED [ 12%]
+apps/api/tests/test_checkpoint_a_enrichment_disabled_or_lag_does_not_block_search PASSED [ 18%]
+apps/api/tests/test_checkpoint_a_parse_failure_fails_closed PASSED [ 25%]
+apps/api/tests/test_checkpoint_a_indexing_failure_fails_closed PASSED [ 31%]
+apps/api/tests/test_checkpoint_a_manifest_checksum_mismatch_fails_closed PASSED [ 37%]
+apps/api/tests/test_checkpoint_a_empty_index_fails_gracefully PASSED [ 43%]
+apps/api/tests/test_checkpoint_a_idempotent_retry_and_reprocess PASSED [ 50%]
+apps/api/tests/test_checkpoint_a_zero_secret_leakage PASSED [ 56%]
+apps/api/tests/test_checkpoint_a_disaster_recovery_rebuild PASSED [ 62%]
+apps/api/tests/test_checkpoint_a_extraction_failure_after_indexing_does_not_downgrade_search_ready PASSED [ 68%]
+apps/api/tests/test_checkpoint_a_e2e_real_upload_api_to_manifest_verified PASSED [ 75%]
+apps/api/tests/test_checkpoint_a_whitespace_source_anchor_fallback_and_locator_resolution PASSED [ 81%]
+apps/api/tests/test_checkpoint_a_reindex_demotes_readiness_before_deleting_points PASSED [ 87%]
+apps/api/tests/test_checkpoint_a_chunk_count_without_manifest_does_not_promote_search_ready PASSED [ 93%]
+apps/api/tests/test_checkpoint_a_legacy_ready_alias_rejected_without_manifest PASSED [100%]
 
-======================== 13 passed, 1 warning in 2.74s ========================
+======================== 16 passed, 1 warning in 3.42s ========================
 ```
 
 Suite bổ trợ liên quan:
@@ -119,4 +122,4 @@ Suite bổ trợ liên quan:
 - `apps/api/tests/test_phase_2c_search_indexing.py`: 17/17 passed
 - `apps/api/tests/test_traceability.py`: 2/2 passed
 - `apps/api/tests/test_phase_1_upload_and_versioning.py`: 34/34 passed
-- **Tổng cộng: 72/72 passed (100%)**
+- **Tổng cộng: 75/75 passed (100%)**

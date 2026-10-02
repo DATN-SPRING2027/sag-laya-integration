@@ -1297,7 +1297,7 @@ async def get_document_version_status(
         status=doc_ver.status,
         search_status=doc_ver.search_status,
         knowledge_status=doc_ver.knowledge_status,
-        search_ready=(doc_ver.search_status in ("SEARCH_READY", "READY")),
+        search_ready=(doc_ver.search_status == "SEARCH_READY" and doc_ver.search_ready_at is not None),
         knowledge_ready=(doc_ver.knowledge_status in ("KNOWLEDGE_READY", "READY")),
         current_stage=current_stage,
         stage_progress=stage_progress,

@@ -685,15 +685,15 @@ async def _process_document_unlocked(
             ingestion_run.completed_at = datetime.now(UTC)
             ver = await session.get(DocumentVersion, ingestion_run.document_version_id)
             if ver:
-                # Xác minh chỉ số tìm kiếm từ Phase 2 hoặc legacy engine
-                if ver.search_status == "SEARCH_READY" or outcome.chunk_count > 0:
+                # Chỉ công nhận SEARCH_READY khi Phase 2C đã xác minh manifest nhất quán, tuyệt đối không dùng chunk_count
+                if ver.search_status == "SEARCH_READY":
                     ver.status = "SEARCH_READY"
-                    ver.search_status = "SEARCH_READY"
                     if not ver.search_ready_at:
                         ver.search_ready_at = datetime.now(UTC)
                 else:
                     ver.status = "FAILED"
-                    ver.search_status = "FAILED"
+                    if ver.search_status != "INDEX_FAILED":
+                        ver.search_status = "FAILED"
                     ver.search_ready_at = None
                 # knowledge_status duy trì độc lập theo hợp đồng Phase 0 (chỉ chuyển khi tree/graph hoàn tất)
                 if ver.knowledge_status != "KNOWLEDGE_READY":
