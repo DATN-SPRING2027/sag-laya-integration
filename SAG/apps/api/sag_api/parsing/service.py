@@ -671,3 +671,21 @@ def _write_markdown(path: str, markdown: str) -> None:
         except OSError:
             pass
         raise
+
+
+def extract_canonical_blocks_from_markdown(
+    markdown_text: str,
+    *,
+    version_id: str,
+    page_from: int = 1,
+    page_to: int = 1,
+):
+    """Bridge parser markdown output directly to structured canonical blocks (Jira Task 3)."""
+    from sag_api.parsing.canonical import extract_canonical_blocks
+    return extract_canonical_blocks(
+        markdown_text,
+        version_id=version_id,
+        page_from=page_from,
+        page_to=page_to,
+    )
+
