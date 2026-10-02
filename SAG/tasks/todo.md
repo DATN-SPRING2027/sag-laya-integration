@@ -117,13 +117,29 @@ Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL ev
 
 ## Checkpoint A — SEARCH_READY end-to-end
 
-- [x] Ingestion Lane: Upload → canonical extraction (2A) → dedup (2B) → SearchUnit/Qdrant indexing (2C) → manifest verified → `SEARCH_READY` end-to-end.
-- [x] Search lane isolation: Kiến trúc tách biệt hoàn toàn; lỗi, trễ hoặc tắt knowledge enrichment/universe không chặn hoặc hạ cấp `SEARCH_READY`.
-- [x] Resilience & Zero Secret Leakage: Xử lý parse/index/manifest failures, empty index fail-gracefully (`EMPTY_INDEX`), retry idempotent và tẩy rửa 100% secret trong error/log/db.
-- [x] Contract định vị (Locator Payload): Khóa chặt payload Qdrant (`project_id`, `source_id`, `document_id`, `document_version_id`, `version_no`, `page_from`, `page_to`, `section_path`, `block_from_id`, `block_to_id`, `source_anchor`, `valid_from_ts`).
-- [x] Evidence: [test_checkpoint_a_ingestion.py](../apps/api/tests/test_checkpoint_a_ingestion.py) (10/10 passed), [checkpoint-a-ingestion-plan.md](../docs/tai_task/checkpoint-a-ingestion-plan.md) và [checkpoint-a-ingestion-evidence.md](../docs/tai_task/checkpoint-a-ingestion-evidence.md).
-- [ ] Retrieval Lane: Global hybrid retrieval hoạt động (song song ở PR #12).
-- [ ] Citation trả ngược đúng source/version/page/anchor (song song ở PR #13).
+### Ingestion / index lane (PR #16)
+
+- [x] Upload → canonical extraction (2A) → dedup (2B) → SearchUnit/Qdrant indexing (2C) → manifest verified → `SEARCH_READY` end-to-end.
+- [x] Search lane isolation: lỗi, trễ hoặc tắt knowledge enrichment/universe không chặn hoặc hạ cấp `SEARCH_READY`.
+- [x] Resilience & Zero Secret Leakage: parse/index/manifest failure, empty index fail-gracefully (`EMPTY_INDEX`), retry idempotent và sanitizer cho error/log/DB.
+- [x] Locator payload: `project_id`, `source_id`, `document_id`, `document_version_id`, `version_no`, `page_from`, `page_to`, `section_path`, `block_from_id`, `block_to_id`, `source_anchor`, `valid_from_ts`.
+- [x] Evidence: [test_checkpoint_a_ingestion.py](../apps/api/tests/test_checkpoint_a_ingestion.py), [checkpoint-a-ingestion-plan.md](../docs/tai_task/checkpoint-a-ingestion-plan.md) và [checkpoint-a-ingestion-evidence.md](../docs/tai_task/checkpoint-a-ingestion-evidence.md). Xem evidence report để biết từng case và kết quả; PR head hiện tại đã bổ sung regression cho các review finding.
+
+### Retrieval / context / citation lane
+
+- [x] Global `/search` và `/search/stream` đọc Phase 2C SearchUnit theo Project; không gọi Knowledge Tree/event retrieval.
+- [x] Candidate Sources bị giới hạn bởi CONFIRMED mapping và signed org/Project scope; Qdrant dense/sparse áp filter project/tenant/partition/version trước top-k; `source_ids` chỉ thu hẹp.
+- [x] Xác minh current attempt/manifest, SEARCH_READY và version validity; retry/unready/deleting/reprocessing không dùng stale point.
+- [x] Dense + sparse dùng RRF rank fusion; query nhiều scope được rank-interleave ổn định, không cộng raw score hay dùng RRF làm confidence.
+- [x] `search_context` dùng cùng reader, token pack và citation numbering; enrichment/event/graph không thuộc read path.
+- [x] Citation giữ source/document/version/SearchUnit/block range/page/section/anchor; canonical click đọc exact Qdrant point, xác minh hash và reauthorize Source/tenant/partition.
+- [x] Empty/weak evidence trả no-answer; exact ID cần anchor coverage; index error/retry có bound và response không lộ exception/secret.
+- [ ] Upload thật → worker Phase 2C → producer manifest → `/search`, `/search/stream`, `search_context` trên Qdrant thật; hiện có fixture vertical cho reader, chưa phải staging/provider E2E.
+- [ ] Owner DATN-33/BE/security xác nhận principal tenant/partition, Project Source mapping, readiness/retry và embedding-model identity contract; assertion cũ thiếu tenant/partition sẽ fail closed.
+- [ ] Staging với principal/data thật xác nhận leakage, revoke, enrichment off/lag/failure và navigation FE tới split SearchUnit.
+- [ ] Calibrate answerability/entailment và exact split-unit offset; structural/exact-anchor gate chưa phải semantic confidence.
+
+**Implementation status (2026-10-02):** reader/context/citation code và regressions đã làm trên task branch; PR review follow-up sửa readiness contract (`search_status=READY/SEARCH_READY`), reuse pooled Qdrant client, candidate grouping thừa và HTTP exception chaining. Relevant checks đạt **161 passed, 4 warnings**; Ruff và `git diff --check` pass. Xem [evidence và limitations](../docs/Thang_Task/%5BSAG%5D%5BCheckpoint%20A%5D/researchtask.md). Không đánh dấu Checkpoint A toàn hệ thống hoàn tất: upload-to-real-index/provider/staging và owner contract vẫn mở.
 
 ## Phase 5 — Knowledge Units & Graph
 
