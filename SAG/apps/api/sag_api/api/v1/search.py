@@ -33,6 +33,7 @@ from sag_api.schemas.search import (
     EvalJudgeOut,
     EvalStrategyResultOut,
     GlobalSearchRequest,
+    SearchCitationOut,
     SearchEventOut,
     SearchRequest,
     SearchResponse,
@@ -44,6 +45,7 @@ from sag_api.services.laya_router import CHAT_HIGH_CONFIDENCE, route_query
 from sag_api.services.query_analysis import analyze_query
 from sag_api.services.retrieval_service import (
     EventScoreMap,
+    SearchAnswer,
     recall_event_scores,
     retrieve_relevant_sections,
     stream_synthesize_search_answer,
@@ -290,6 +292,7 @@ class _PreparedGlobalSearch:
     sources: list[Source]
     outcome: SearchOutcome
     response: SearchResponse
+    answer_skipped: bool = False
 
 
 async def _prepare_global_search(
@@ -314,7 +317,8 @@ async def _prepare_global_search(
         return _PreparedGlobalSearch(
             sources=[],
             outcome=outcome,
-            response=SearchResponse(query=body.query, sections=[], stats=stats),
+            response=SearchResponse(query=body.query, sections=[], stats=stats, answer_status="skipped"),
+            answer_skipped=True,
         )
 
     sources = await search_source_candidates(
@@ -333,7 +337,7 @@ async def _prepare_global_search(
         return _PreparedGlobalSearch(
             sources=[],
             outcome=outcome,
-            response=SearchResponse(query=body.query, sections=[], stats=stats),
+            response=SearchResponse(query=body.query, sections=[], stats=stats, answer_status="pending"),
         )
 
     refs = {source.sag_source_config_id: source for source in sources}
@@ -384,6 +388,7 @@ async def _prepare_global_search(
             query=body.query,
             sections=section_outputs,
             stats=stats,
+            answer_status="pending",
         ),
     )
 
@@ -393,7 +398,7 @@ async def _complete_global_search(
     user: User,
     body: GlobalSearchRequest,
     prepared: _PreparedGlobalSearch,
-    summary: str,
+    answer: SearchAnswer,
 ) -> SearchResponse:
     exploration_id = None
     if body.save_exploration and prepared.sources:
@@ -416,7 +421,7 @@ async def _complete_global_search(
             user_id=user.id,
             query=prepared.outcome.query,
             source_ids=[source.id for source in prepared.sources],
-            summary=summary,
+            summary=answer.text,
             events=[item.model_dump(mode="json") for item in response.events],
             entities=[item.model_dump(mode="json") for item in response.entities],
             relations=[item.model_dump(mode="json") for item in response.relations],
@@ -424,7 +429,17 @@ async def _complete_global_search(
         )
         exploration_id = exploration.id
 
-    return prepared.response.model_copy(update={"summary": summary, "exploration_id": exploration_id})
+    if prepared.answer_skipped:
+        return prepared.response.model_copy(update={"summary": "", "answer_status": "skipped"})
+    return prepared.response.model_copy(
+        update={
+            "summary": answer.text,
+            "citations": [SearchCitationOut.model_validate(citation) for citation in answer.citations],
+            "answer_status": answer.status,
+            "no_answer_reason": answer.no_answer_reason,
+            "exploration_id": exploration_id,
+        }
+    )
 
 
 def _sse(event: str, payload: dict) -> dict[str, str]:
@@ -494,6 +509,11 @@ async def search(
         refs,
         event_scores=event_scores,
     )
+    answer = (
+        await synthesize_search_answer(body.query, outcome.sections, llm=llm, sources=[source])
+        if route_plan.need_retrieval
+        else SearchAnswer("", [], "skipped")
+    )
     # 对外 source_id = sag 信源 id（可路由 / 取原文），不泄漏引擎内部 id
     return SearchResponse(
         query=body.query,
@@ -502,11 +522,10 @@ async def search(
         ],
         **graph_fields,
         source_hits=_source_hits(graph_fields["events"]),
-        summary=await synthesize_search_answer(
-            body.query,
-            outcome.sections,
-            llm=llm,
-        ),
+        summary=answer.text,
+        citations=answer.citations,
+        answer_status=answer.status,
+        no_answer_reason=answer.no_answer_reason,
         stats={
             **outcome.stats,
             "event_hits": len(graph_fields["events"]),
@@ -529,19 +548,24 @@ async def global_search(
     prepared = await _prepare_global_search(session, engine_manager, body, principal=principal)
     if request.state.auth_kind == "connector":
         return prepared.response.model_copy(
-            update={"summary": "", "exploration_id": None},
+            update={"summary": "", "exploration_id": None, "answer_status": "skipped"},
         )
-    summary = await synthesize_search_answer(
-        prepared.outcome.query,
-        prepared.outcome.sections,
-        llm=llm,
+    answer = (
+        await synthesize_search_answer(
+            prepared.outcome.query,
+            prepared.outcome.sections,
+            llm=llm,
+            sources=prepared.sources,
+        )
+        if not prepared.answer_skipped
+        else SearchAnswer("", [], "skipped")
     )
     return await _complete_global_search(
         session,
         _user,
         body,
         prepared,
-        summary,
+        answer,
     )
 
 
@@ -563,23 +587,32 @@ async def global_search_stream(
             # the browser starts a newer search or disconnects.
             prepared = await _prepare_global_search(session, engine_manager, body, principal=principal)
             yield _sse("result", prepared.response.model_dump(mode="json"))
-            summary = ""
-            async for update in stream_synthesize_search_answer(
-                prepared.outcome.query,
-                prepared.outcome.sections,
-                llm=llm,
-            ):
-                if update.kind == "delta":
-                    yield _sse("summary.delta", {"delta": update.text})
-                else:
-                    summary = update.text
+            if prepared.answer_skipped:
+                answer = SearchAnswer("", [], "skipped")
+            else:
+                answer = SearchAnswer("", [], "no_answer", "empty_evidence")
+                async for update in stream_synthesize_search_answer(
+                    prepared.outcome.query,
+                    prepared.outcome.sections,
+                    llm=llm,
+                    sources=prepared.sources,
+                ):
+                    if update.kind == "delta":
+                        yield _sse("summary.delta", {"delta": update.text})
+                    else:
+                        answer = SearchAnswer(
+                            update.text,
+                            update.citations or [],
+                            update.status,
+                            update.no_answer_reason,
+                        )
 
             completed = await _complete_global_search(
                 session,
                 user,
                 body,
                 prepared,
-                summary,
+                answer,
             )
             yield _sse("completed", completed.model_dump(mode="json"))
         except asyncio.CancelledError:

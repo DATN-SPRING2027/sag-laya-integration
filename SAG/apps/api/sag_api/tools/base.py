@@ -44,8 +44,12 @@ class ToolContext:
     sources: list[Source] = field(default_factory=list)
     persona: dict[str, Any] = field(default_factory=dict)
     agent: Agent | None = None
-    # 全局证据编号偏移：循环在每次派发前设置，保证 [n] 跨轮递增不重号
+    # High-water mark for citation numbering; survives context-window pruning.
     citation_offset: int = 0
+    # Recomputed by the agent host's per-turn context budget guard.
+    evidence_token_budget: int | None = None
+    search_context_called: bool = False
+    search_context_no_answer_reason: str | None = None
 
 
 @dataclass

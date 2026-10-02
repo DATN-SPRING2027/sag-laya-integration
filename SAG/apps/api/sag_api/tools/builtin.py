@@ -20,11 +20,24 @@ from sag_api.connectors.web import extract_web_markdown, extract_web_title
 from sag_api.core.config import settings
 from sag_api.core.logging import get_logger
 from sag_api.generation import build_citations
-from sag_api.sag import RetrievedSection
-from sag_api.services.retrieval_service import recall_event_scores, retrieve_relevant_sections
+from sag_api.sag import RetrievedSection, SearchOutcome
+from sag_api.services.evidence_service import (
+    build_tool_evidence_pack,
+    has_traceable_locator,
+    resolve_traceable_evidence,
+)
+from sag_api.services.retrieval_service import (
+    recall_event_scores,
+    retrieve_relevant_sections,
+)
 from sag_api.tools.base import Tool, ToolContext, ToolMeta, ToolResult
 
 log = get_logger("tools.web_search")
+
+
+def _section_locator_key(section: RetrievedSection) -> tuple[str, str]:
+    return section.source_config_id or "", section.chunk_id or ""
+
 
 _WEB_SEARCH_HOSTS = frozenset({"api.302.ai", "api.302ai.cn"})
 _WEB_SEARCH_PROVIDER = "tavily"
@@ -80,6 +93,12 @@ def _format_sections(sections: list, offset: int = 0, events: list | None = None
     event_refs = _events_by_section(events)
     blocks = []
     for i, s in enumerate(sections, start=1 + offset):
+        locator = (
+            f"Locator: document={getattr(s, 'document_id', '')}; "
+            f"version={getattr(s, 'document_version_id', '')}; chunk={getattr(s, 'chunk_id', '')}; "
+            f"page={getattr(s, 'page_from', '')}-{getattr(s, 'page_to', '')}; "
+            f"anchor={getattr(s, 'anchor', '')}"
+        )
         key = (
             str(getattr(s, "source_config_id", "") or "").strip(),
             str(getattr(s, "chunk_id", "") or "").strip(),
@@ -89,7 +108,7 @@ def _format_sections(sections: list, offset: int = 0, events: list | None = None
             event = related_events[0]
             title = " ".join(str(getattr(event, "title", "") or "").split())
             summary = " ".join(str(getattr(event, "summary", "") or "").split())
-            lines = [f"[{i}] 事项：{title or '未命名事项'}"]
+            lines = [f"[{i}] 事项：{title or '未命名事项'}", locator]
             if summary:
                 lines.append(f"摘要：{summary}")
             content = getattr(s, "content", "")
@@ -98,7 +117,7 @@ def _format_sections(sections: list, offset: int = 0, events: list | None = None
             blocks.append("\n".join(lines))
             continue
         heading = getattr(s, "heading", None) or "片段"
-        blocks.append(f"[{i}] {heading}\n{getattr(s, 'content', '')}")
+        blocks.append(f"[{i}] {heading}\n{locator}\n{getattr(s, 'content', '')}")
     return "\n\n".join(blocks)
 
 
@@ -195,6 +214,31 @@ async def _prioritize_event_evidence(
     return selected
 
 
+def _no_traceable_search_context(
+    outcome: SearchOutcome,
+    event_scores: dict[tuple[str, str], float],
+    *,
+    no_answer_reason: str,
+    event_count: int,
+) -> ToolResult:
+    evidence_status = "empty" if no_answer_reason == "empty_evidence" else "weak"
+    return ToolResult(
+        content="（没有足够且可追溯的资料，无法回答。）",
+        citations=[],
+        data={
+            "sections": [],
+            "section_count": 0,
+            "evidence_status": evidence_status,
+            "no_answer_reason": no_answer_reason,
+            "lexical_count": int(outcome.stats.get("lexical_candidates") or 0),
+            "filtered_count": int(outcome.stats.get("filtered_irrelevant") or 0),
+            "candidate_count": int(outcome.stats.get("candidates") or len(outcome.sections)),
+            "event_count": event_count,
+            "event_candidates": len(event_scores),
+        },
+    )
+
+
 class SearchContextTool(Tool):
     meta = ToolMeta(
         name="search_context",
@@ -241,7 +285,15 @@ class SearchContextTool(Tool):
                 limit=limit,
             ),
         )
-        sections = outcome.sections
+        resolved_sections = await resolve_traceable_evidence(outcome.sections, ctx.sources)
+        sections = [section for section in resolved_sections if has_traceable_locator(section)]
+        if not sections:
+            return _no_traceable_search_context(
+                outcome,
+                event_scores,
+                no_answer_reason="weak_evidence" if outcome.sections else "empty_evidence",
+                event_count=0,
+            )
         graph_for_sections = getattr(ctx.engine_manager, "graph_for_sections", None)
         graph = (
             await graph_for_sections(
@@ -258,6 +310,11 @@ class SearchContextTool(Tool):
             else None
         )
         if graph is not None and graph.events:
+            resolved_keys = {
+                _section_locator_key(section)
+                for section in sections
+                if section.source_config_id and section.chunk_id
+            }
             sections = await _prioritize_event_evidence(
                 ctx.engine_manager,
                 sections,
@@ -265,20 +322,75 @@ class SearchContextTool(Tool):
                 sources_by_config,
                 limit=limit,
             )
+            new_sections = [
+                section
+                for section in sections
+                if _section_locator_key(section) not in resolved_keys
+            ]
+            resolved_new_sections = (
+                await resolve_traceable_evidence(new_sections, ctx.sources)
+                if new_sections
+                else []
+            )
+            resolved_by_key = {
+                _section_locator_key(section): section
+                for section in resolved_new_sections
+            }
+            sections = [
+                section
+                if _section_locator_key(section) in resolved_keys
+                else resolved_by_key.get(_section_locator_key(section), section)
+                for section in sections
+            ]
+            sections = [section for section in sections if has_traceable_locator(section)]
+            if not sections:
+                return _no_traceable_search_context(
+                    outcome,
+                    event_scores,
+                    no_answer_reason="weak_evidence",
+                    event_count=len(graph.events),
+                )
         offset = max(0, ctx.citation_offset)
-        citations = build_citations(sections, source_refs, list(graph.events) if graph is not None else None)
+        graph_events = list(graph.events) if graph is not None else None
+
+        def render(candidate_sections: list[RetrievedSection]) -> str:
+            return _format_sections(candidate_sections, offset, graph_events)
+
+        packed = build_tool_evidence_pack(
+            sections,
+            query=query,
+            render=render,
+            context_budget_tokens=ctx.evidence_token_budget,
+        )
+        if packed.status != "sufficient":
+            return ToolResult(
+                content=packed.content,
+                citations=[],
+                data={
+                    "sections": [],
+                    "section_count": 0,
+                    "evidence_status": packed.status,
+                    "no_answer_reason": packed.no_answer_reason,
+                    "context_tokens": packed.token_estimate,
+                    "lexical_count": int(outcome.stats.get("lexical_candidates") or 0),
+                    "filtered_count": int(outcome.stats.get("filtered_irrelevant") or 0),
+                    "candidate_count": int(outcome.stats.get("candidates") or len(sections)),
+                    "event_count": len(graph.events) if graph is not None else 0,
+                    "event_candidates": len(event_scores),
+                },
+            )
+        sections = packed.sections
+        citations = build_citations(sections, source_refs, graph_events)
         for c in citations:
             c["n"] = c["n"] + offset
         return ToolResult(
-            content=_format_sections(
-                sections,
-                offset,
-                list(graph.events) if graph is not None else None,
-            ),
+            content=packed.content,
             citations=citations,
             data={
                 "sections": sections,
                 "section_count": len(sections),
+                "evidence_status": packed.status,
+                "context_tokens": packed.token_estimate,
                 "lexical_count": int(outcome.stats.get("lexical_candidates") or 0),
                 "filtered_count": int(outcome.stats.get("filtered_irrelevant") or 0),
                 "candidate_count": int(outcome.stats.get("candidates") or len(sections)),

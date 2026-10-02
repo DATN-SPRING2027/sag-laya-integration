@@ -18,6 +18,15 @@ class RetrievedSection(BaseModel):
     rank: int = 0
     source_id: str | None = None
     source_config_id: str | None = None
+    # Filled only by the API's exact, ACL-scoped SearchUnit lineage resolver.
+    # Legacy engine hits do not carry these fields and remain non-citable.
+    document_id: str | None = None
+    document_version_id: str | None = None
+    document_name: str | None = None
+    version_no: int | None = None
+    page_from: int | None = None
+    page_to: int | None = None
+    anchor: str | None = None
 
     @classmethod
     def from_section(cls, s: Any) -> RetrievedSection:

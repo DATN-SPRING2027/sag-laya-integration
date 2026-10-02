@@ -1,5 +1,8 @@
 """Agentic 基建：默认工具、全局证据编号、历史压缩、token 估算。全离线。"""
 
+import json
+from types import SimpleNamespace
+
 import pytest
 
 from sag_agent import AgentTool, ToolResult, ToolSpec
@@ -11,6 +14,7 @@ from sag_api.services.agent_service import (
     _build_external_citations,
     _enabled_tool_names,
     _finalize_answer_citations,
+    _fit_agent_context,
     _initial_tool_choice,
 )
 from sag_api.tools.base import ToolContext
@@ -55,6 +59,49 @@ def test_estimate_tokens_cjk_aware():
     assert estimate_tokens("你好世界") == 4  # CJK 每字 1
     assert estimate_tokens("abcdefgh") == 2  # ASCII 每 4 字符 1
     assert estimate_tokens("") == 0
+
+
+def test_agent_context_budget_counts_prompt_schemas_reserves_and_keeps_tool_turns_atomic():
+    messages = [
+        {"role": "system", "content": "SAG system instructions."},
+        {"role": "user", "content": "old history " * 400},
+        {"role": "user", "content": "Find XK-204."},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "search_context", "arguments": "{\"query\":\"XK-204\"}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "name": "search_context",
+            "tool_call_id": "call-1",
+            "content": "[1] XK-204 approved. Locator: version=v1 page=2 anchor=approval.",
+        },
+    ]
+    schemas = [{"name": "search_context", "parameters": {"query": "string"}}]
+    window = 500
+    output_reserve = 80
+
+    fitted, evidence_budget = _fit_agent_context(
+        messages,
+        schemas,
+        context_window_tokens=window,
+        reserved_output_tokens=output_reserve,
+    )
+
+    fitted_tokens = estimate_tokens(json.dumps({"messages": fitted, "tools": schemas}, separators=(",", ":")))
+    assert fitted[0]["role"] == "system"
+    assert any(message.get("content") == "Find XK-204." for message in fitted)
+    assert not any("old history" in str(message.get("content")) for message in fitted)
+    assert any(message.get("tool_call_id") == "call-1" for message in fitted)
+    assert any(message.get("role") == "assistant" and message.get("tool_calls") for message in fitted)
+    assert fitted_tokens + evidence_budget + output_reserve * 2 <= window
 
 
 def test_agent_prompt_uses_static_timezone_rule_and_time_tool_guidance():
@@ -214,6 +261,15 @@ def test_initial_tool_policy_anchors_time_and_preserves_clarification():
     )
     assert (
         _initial_tool_choice(
+            "你好",
+            tools,
+            knowledge_only=False,
+            scoped=True,
+        )
+        == "none"
+    )
+    assert (
+        _initial_tool_choice(
             "推荐一下",
             tools,
             knowledge_only=True,
@@ -306,10 +362,23 @@ def test_high_confidence_social_intents_disable_tools(query):
 
 
 def test_answer_citations_are_canonical_and_traceable():
+    def citation(n, *, chunk_id, source_id, heading):
+        return {
+            "n": n,
+            "chunk_id": chunk_id,
+            "source_id": source_id,
+            "heading": heading,
+            "document_id": f"doc-{n}",
+            "document_version_id": f"version-{n}",
+            "page_from": 1,
+            "page_to": 1,
+            "anchor": f"section-{n}",
+        }
+
     citations = [
-        {"n": 1, "chunk_id": "chunk-1", "source_id": "source-1", "heading": "一"},
-        {"n": 2, "chunk_id": None, "source_id": "source-1", "heading": "不可打开"},
-        {"n": 3, "chunk_id": "chunk-3", "source_id": "source-3", "heading": "三"},
+        citation(1, chunk_id="chunk-1", source_id="source-1", heading="一"),
+        citation(2, chunk_id=None, source_id="source-1", heading="不可打开"),
+        citation(3, chunk_id="chunk-3", source_id="source-3", heading="三"),
     ]
 
     answer, used = _finalize_answer_citations("结论 [1]，虚构 [9]，坏引用 [2]。", citations)
@@ -376,7 +445,27 @@ def test_external_citations_are_safe_deduplicated_bounded_and_mapping_aware():
 
 
 @pytest.mark.asyncio
-async def test_search_tool_uses_global_citation_offset():
+async def test_search_tool_uses_global_citation_offset(monkeypatch):
+    from sag_api.core.db import init_db
+    from sag_api.tools import builtin
+
+    await init_db()
+
+    async def resolve_test_locators(sections, _sources):
+        return [
+            section.model_copy(
+                update={
+                    "document_id": "doc-c1",
+                    "document_version_id": "version-c1",
+                    "page_from": 1,
+                    "page_to": 1,
+                    "anchor": "section-c1",
+                }
+            )
+            for section in sections
+        ]
+
+    monkeypatch.setattr(builtin, "resolve_traceable_evidence", resolve_test_locators)
     class _EM:
         async def search_many(self, targets, query, strategy=None, top_k=None):
             return SearchOutcome(
@@ -397,7 +486,12 @@ async def test_search_tool_uses_global_citation_offset():
         id = "sid"
         name = "源"
 
-    ctx = ToolContext(engine_manager=_EM(), sources=[_Src()], citation_offset=3)
+    ctx = ToolContext(
+        engine_manager=_EM(),
+        sources=[_Src()],
+        citation_offset=3,
+        evidence_token_budget=10_000,
+    )
     result = await SearchContextTool().invoke({"query": "q"}, ctx)
     assert "[4]" in result.content  # 编号从 offset+1 开始
     assert result.citations[0]["n"] == 4
@@ -412,3 +506,107 @@ async def test_compress_history_trims_without_llm():
     # 预算内不动
     same = await compress_history(history[:2], llm=None, budget_tokens=10_000)
     assert same == history[:2]
+
+
+@pytest.mark.asyncio
+async def test_grounded_agent_stream_emits_only_the_canonical_answer_delta(monkeypatch):
+    from contextlib import asynccontextmanager
+    from datetime import UTC, datetime
+
+    from sag_agent import AgentEvent, EventType
+    from sag_api.services import agent_service
+    from sag_api.services.evidence_service import no_answer_text
+
+    now = datetime.now(UTC)
+
+    class Handle:
+        done = True
+
+        def __aiter__(self):
+            async def events():
+                yield AgentEvent(EventType.RUN_STARTED, "run-1", 1, now)
+                yield AgentEvent(
+                    EventType.MESSAGE_DELTA,
+                    "run-1",
+                    2,
+                    now,
+                    payload={"role": "assistant", "delta": "Unsupported answer [9]"},
+                )
+                yield AgentEvent(
+                    EventType.MESSAGE_COMPLETED,
+                    "run-1",
+                    3,
+                    now,
+                    payload={"role": "assistant", "message": {"role": "assistant"}},
+                )
+                yield AgentEvent(
+                    EventType.RUN_COMPLETED,
+                    "run-1",
+                    4,
+                    now,
+                    payload={"output": "Unsupported answer [9]"},
+                )
+
+            return events()
+
+    class Runtime:
+        def run(self, *_args, **_kwargs):
+            return Handle()
+
+    class SessionFactory:
+        def __call__(self):
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    @asynccontextmanager
+    async def no_mcp_tools(_specs):
+        yield SimpleNamespace(tools=[], warnings=[])
+
+    async def no_sources(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(agent_service, "_enabled_tool_names", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(agent_service, "resolve_sources", no_sources)
+    monkeypatch.setattr(agent_service, "open_agent_mcp_tools", no_mcp_tools)
+
+    streamed = [
+        event
+        async for event in agent_service.generate_stream(
+            SessionFactory(),
+            plan=SimpleNamespace(
+                citations=[],
+                source_ids=None,
+                messages=[{"role": "user", "content": "What is the fact?"}],
+                query="What is the fact?",
+                user_message_id="user-1",
+            ),
+            agent=SimpleNamespace(name="Test", id="agent-1", persona={}),
+            thread_id=None,
+            engine_manager=SimpleNamespace(),
+            llm=SimpleNamespace(),
+            tool_registry=SimpleNamespace(),
+            runtime=Runtime(),
+            knowledge_only=True,
+        )
+    ]
+
+    deltas = [event for event in streamed if event.type == EventType.MESSAGE_DELTA.value]
+    completed = next(event for event in streamed if event.type == EventType.RUN_COMPLETED.value)
+    canonical_answer = completed.data["payload"]["output"]
+
+    assert len(deltas) == 1
+    assert deltas[0].data == {
+        "type": EventType.MESSAGE_DELTA.value,
+        "run_id": "run-1",
+        "sequence": 4,
+        "payload": {"role": "assistant", "delta": no_answer_text()},
+    }
+    assert deltas[0].data["payload"]["delta"] == no_answer_text()
+    assert deltas[0].data["payload"]["delta"] == canonical_answer
+    assert [event.type for event in streamed[-2:]] == [EventType.MESSAGE_DELTA.value, EventType.RUN_COMPLETED.value]
+    assert [event.data["sequence"] for event in streamed[-2:]] == [4, 5]

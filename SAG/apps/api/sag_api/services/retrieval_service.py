@@ -8,11 +8,17 @@ import re
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol
+from typing import Any, Literal
 
 from sag_api.core.config import settings
 from sag_api.core.logging import get_logger
 from sag_api.sag import RetrievedSection, SearchOutcome
+from sag_api.services.evidence_service import (
+    SearchSource,
+    build_evidence_pack,
+    no_answer_text,
+    resolve_traceable_evidence,
+)
 from sag_api.services.query_analysis import (
     QueryAnalysis,
     analyze_query,
@@ -20,12 +26,6 @@ from sag_api.services.query_analysis import (
 )
 
 log = get_logger("retrieval")
-
-
-class SearchSource(Protocol):
-    id: str
-    name: str
-    sag_source_config_id: str
 
 
 EventScoreMap = dict[tuple[str, str], float]
@@ -665,44 +665,39 @@ def _validated_answer(answer: str, section_count: int) -> str | None:
     return text
 
 
+def _citations_used_by_answer(answer: str, citations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    numbers = {int(value) for value in _CITATION_RE.findall(answer)}
+    return [citation for citation in citations if citation.get("n") in numbers]
+
+
+def _build_search_citations(
+    sections: list[RetrievedSection],
+    sources: list[SearchSource],
+) -> list[dict[str, Any]]:
+    from sag_api.generation import build_citations
+
+    refs = {
+        source.sag_source_config_id: {"id": source.id, "name": source.name}
+        for source in sources
+    }
+    return build_citations(sections, refs)
+
+
 @dataclass(frozen=True, slots=True)
 class SearchAnswerUpdate:
     kind: Literal["delta", "completed"]
     text: str
+    status: Literal["answered", "no_answer"] = "answered"
+    no_answer_reason: str | None = None
+    citations: list[dict[str, Any]] | None = None
 
 
-def _search_answer_messages(
-    query: str,
-    sections: list[RetrievedSection],
-) -> tuple[list[dict[str, str]], int]:
-    evidence_blocks: list[str] = []
-    used = 0
-    for index, section in enumerate(sections, 1):
-        block = f"[{index}] {section.heading or '相关资料'}\n{section.content.strip()}"
-        remaining = 12000 - used
-        if remaining <= 0:
-            break
-        block = block[:remaining]
-        evidence_blocks.append(block)
-        used += len(block)
-    return (
-        [
-            {
-                "role": "system",
-                "content": (
-                    "你是检索结果回答器。只回答用户提出的具体问题，不要概括候选集合。"
-                    "只能使用给定证据；忽略与问题无关的内容。每个事实性结论必须标注"
-                    "对应的 [编号]，编号只能来自证据。证据不足时明确说明不足，不得补充"
-                    "常识或猜测。回答简洁、直接。"
-                ),
-            },
-            {
-                "role": "user",
-                "content": (f"问题：{query}\n\n已通过相关性重排的证据：\n" + "\n\n".join(evidence_blocks)),
-            },
-        ],
-        len(evidence_blocks),
-    )
+@dataclass(frozen=True, slots=True)
+class SearchAnswer:
+    text: str
+    citations: list[dict[str, Any]]
+    status: Literal["answered", "no_answer", "skipped"]
+    no_answer_reason: str | None = None
 
 
 async def synthesize_search_answer(
@@ -710,20 +705,30 @@ async def synthesize_search_answer(
     sections: list[RetrievedSection],
     *,
     llm: Any | None,
-) -> str:
+    sources: list[SearchSource] | None = None,
+) -> SearchAnswer:
     """Answer the actual question from selected evidence; never summarize the raw candidate pool."""
 
-    fallback = fallback_search_answer(query, sections)
-    if not sections or llm is None or not getattr(llm, "configured", False):
-        return fallback
+    verified_sections = await resolve_traceable_evidence(sections, sources or []) if sources is not None else sections
+    pack = build_evidence_pack(query, verified_sections)
+    if pack.status != "sufficient":
+        return SearchAnswer(no_answer_text(), [], "no_answer", pack.no_answer_reason)
 
-    messages, evidence_count = _search_answer_messages(query, sections)
+    citations = _build_search_citations(pack.sections, sources or [])
+    if len(citations) != len(pack.sections) or any(not citation.get("source_id") for citation in citations):
+        return SearchAnswer(no_answer_text(), [], "no_answer", "weak_evidence")
+    fallback = fallback_search_answer(query, pack.sections)
+    if llm is None or not getattr(llm, "configured", False):
+        return SearchAnswer(fallback, _citations_used_by_answer(fallback, citations), "answered")
+
     try:
-        answer = await llm.complete(messages)
+        answer = await llm.complete(pack.messages)
     except Exception as error:  # noqa: BLE001
         log.warning("搜索答案生成失败，回退证据摘要：%s", error)
-        return fallback
-    return _validated_answer(answer, evidence_count) or fallback
+        return SearchAnswer(fallback, _citations_used_by_answer(fallback, citations), "answered")
+    validated = _validated_answer(answer, len(pack.sections))
+    canonical = validated or fallback
+    return SearchAnswer(canonical, _citations_used_by_answer(canonical, citations), "answered")
 
 
 async def stream_synthesize_search_answer(
@@ -731,28 +736,60 @@ async def stream_synthesize_search_answer(
     sections: list[RetrievedSection],
     *,
     llm: Any | None,
+    sources: list[SearchSource] | None = None,
 ) -> AsyncIterator[SearchAnswerUpdate]:
-    """Yield true provider deltas followed by one citation-validated answer."""
+    """Buffer provider output; only publish a canonical, provenance-backed answer."""
 
-    fallback = fallback_search_answer(query, sections)
-    if not sections or llm is None or not getattr(llm, "configured", False):
-        yield SearchAnswerUpdate(kind="completed", text=fallback)
+    verified_sections = await resolve_traceable_evidence(sections, sources or []) if sources is not None else sections
+    pack = build_evidence_pack(query, verified_sections)
+    if pack.status != "sufficient":
+        yield SearchAnswerUpdate(
+            kind="completed",
+            text=no_answer_text(),
+            status="no_answer",
+            no_answer_reason=pack.no_answer_reason,
+            citations=[],
+        )
         return
 
-    messages, evidence_count = _search_answer_messages(query, sections)
+    citations = _build_search_citations(pack.sections, sources or [])
+    if len(citations) != len(pack.sections) or any(not citation.get("source_id") for citation in citations):
+        yield SearchAnswerUpdate(
+            kind="completed",
+            text=no_answer_text(),
+            status="no_answer",
+            no_answer_reason="weak_evidence",
+            citations=[],
+        )
+        return
+    fallback = fallback_search_answer(query, pack.sections)
+    if llm is None or not getattr(llm, "configured", False):
+        used_citations = _citations_used_by_answer(fallback, citations)
+        yield SearchAnswerUpdate(kind="delta", text=fallback)
+        yield SearchAnswerUpdate(kind="completed", text=fallback, citations=used_citations)
+        return
+
     parts: list[str] = []
     try:
-        async for delta in llm.stream_complete(messages):
-            if not delta:
-                continue
-            parts.append(delta)
-            yield SearchAnswerUpdate(kind="delta", text=delta)
+        async for delta in llm.stream_complete(pack.messages):
+            if delta:
+                parts.append(delta)
     except asyncio.CancelledError:
         raise
     except Exception as error:  # noqa: BLE001
         log.warning("搜索答案流生成失败，回退证据摘要：%s", error)
-        yield SearchAnswerUpdate(kind="completed", text=fallback)
+        fallback_citations = _citations_used_by_answer(fallback, citations)
+        yield SearchAnswerUpdate(
+            kind="completed",
+            text=fallback,
+            citations=fallback_citations,
+        )
         return
 
-    answer = _validated_answer("".join(parts), evidence_count) or fallback
-    yield SearchAnswerUpdate(kind="completed", text=answer)
+    validated = _validated_answer("".join(parts), len(pack.sections))
+    answer = validated or fallback
+    used_citations = _citations_used_by_answer(answer, citations)
+    # Provider deltas remain private until citation syntax is checked against
+    # this exact pack. Only the canonical text is sent as a single delta.
+    yield SearchAnswerUpdate(kind="delta", text=answer)
+    yield SearchAnswerUpdate(kind="completed", text=answer, citations=used_citations)
