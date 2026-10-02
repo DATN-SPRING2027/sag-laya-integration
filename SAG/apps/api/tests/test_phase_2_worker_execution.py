@@ -204,13 +204,13 @@ async def test_phase_2_exception_propagates_and_marks_document_failed(tmp_path):
     async with SessionLocal() as check_session:
         doc_updated = (await check_session.execute(select(Document).where(Document.id == doc_id))).scalar_one()
         assert doc_updated.status == DocumentStatus.FAILED
-        assert doc_updated.error_layer == ErrorLayer.API.value
-        assert doc_updated.error_stage == ErrorStage.EXTRACT.value
+        assert doc_updated.error_layer == ErrorLayer.STORE.value
+        assert doc_updated.error_stage == ErrorStage.PERSIST.value
 
         run_updated = (await check_session.execute(select(IngestionRun).where(IngestionRun.id == run_id))).scalar_one()
         assert run_updated.status == "FAILED"
-        assert run_updated.error_layer == ErrorLayer.API.value
-        assert run_updated.error_stage == ErrorStage.EXTRACT.value
+        assert run_updated.error_layer == ErrorLayer.STORE.value
+        assert run_updated.error_stage == ErrorStage.PERSIST.value
 
 
 @pytest.mark.asyncio
@@ -247,7 +247,21 @@ async def test_prepared_none_resolution_does_not_decode_binary_as_utf8(tmp_path,
     monkeypatch.setattr("sag_api.jobs.tasks.prepare_document", mock_prepare_document)
 
     # Mock Qdrant handler
+    stored_points: list[dict[str, Any]] = []
+
     def mock_qdrant_handler(request: httpx.Request) -> httpx.Response:
+        url_path = request.url.path
+        if url_path.endswith("/points/count"):
+            return httpx.Response(200, json={"result": {"count": len(stored_points)}})
+        if url_path.endswith("/points/scroll"):
+            return httpx.Response(200, json={"result": {"points": stored_points, "next_page_offset": None}})
+        if request.method == "PUT" and "/points" in url_path:
+            import json
+            body = json.loads(request.content.decode("utf-8"))
+            stored_points.extend(body.get("points", []))
+            return httpx.Response(200, json={"result": {"operation_id": 1, "status": "completed"}})
+        if request.method == "GET":
+            return httpx.Response(200, json={"result": {"config": {"params": {"vectors": {"content_vector": {"size": 3}}}}}})
         return httpx.Response(200, json={"result": {"operation_id": 1, "status": "completed"}})
 
     mock_client = httpx.AsyncClient(
@@ -322,3 +336,204 @@ async def test_prepared_none_resolution_does_not_decode_binary_as_utf8(tmp_path,
         ver_updated = (await check_session.execute(select(DocumentVersion).where(DocumentVersion.id == ver_id))).scalar_one()
         assert ver_updated.search_status in ("READY", "SEARCH_READY")
         assert ver_updated.search_ready_at is not None
+
+
+@pytest.mark.asyncio
+async def test_reprocess_document_task_creates_new_ingestion_run():
+    """Kiểm tra reprocess document tạo IngestionRun mới và gán run_id vào process_job.payload (#7)."""
+    await init_db()
+    from sag_api.jobs.tasks import _reprocess_document_task_unlocked
+
+    doc_id = str(uuid.uuid4())
+    ver_id = str(uuid.uuid4())
+    source_id = f"src_{uuid.uuid4().hex[:8]}"
+    reprocess_job_id = f"job_rep_{uuid.uuid4().hex[:8]}"
+
+    async with SessionLocal() as session:
+        source = Source(id=source_id, name="Reprocess Source", sag_source_config_id="cfg_rep")
+        session.add(source)
+        await session.commit()
+
+        doc = Document(
+            id=doc_id,
+            source_id=source_id,
+            tenant_id="tenant_rep",
+            project_id="proj_rep",
+            filename="reprocess.md",
+            storage_path="/tmp/rep.md",
+            status=DocumentStatus.READY,
+        )
+        session.add(doc)
+
+        ver = DocumentVersion(
+            id=ver_id,
+            document_id=doc_id,
+            version_no=1,
+            file_hash="hash_reprocess_123",
+            valid_from=datetime.now(UTC),
+            valid_to=datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC),
+            metadata_json={"security_partition_id": "sec_rep"},
+        )
+        session.add(ver)
+
+        job = Job(
+            id=reprocess_job_id,
+            type=JobType.REPROCESS_DOCUMENT,
+            source_id=source_id,
+            document_id=doc_id,
+            status=JobStatus.RUNNING,
+            payload={},
+        )
+        session.add(job)
+        await session.commit()
+
+        class DummyEngine:
+            async def delete_document_data(self, *args, **kwargs):
+                pass
+
+        await _reprocess_document_task_unlocked(session, job, engine_manager=DummyEngine())
+
+    async with SessionLocal() as check_session:
+        # Kiểm tra Job process mới được tạo
+        process_job = (
+            await check_session.execute(
+                select(Job).where(Job.type == JobType.PROCESS_DOCUMENT, Job.document_id == doc_id)
+            )
+        ).scalar_one_or_none()
+        assert process_job is not None
+        assert "run_id" in process_job.payload
+        new_run_id = process_job.payload["run_id"]
+
+        # Kiểm tra IngestionRun tương ứng được tạo
+        run = await check_session.get(IngestionRun, new_run_id)
+        assert run is not None
+        assert run.project_id == "proj_rep"
+        assert run.tenant_id == "tenant_rep"
+        assert run.document_version_id == ver_id
+        assert run.status == "QUEUED"
+
+
+@pytest.mark.asyncio
+async def test_delete_document_task_deletes_all_versions_qdrant_points(monkeypatch):
+    """Kiểm tra delete document thu thập tất cả DocumentVersion IDs và gọi xóa Qdrant points (#8)."""
+    await init_db()
+    from sag_api.jobs.tasks import _delete_document_task_unlocked
+
+    doc_id = str(uuid.uuid4())
+    ver_1_id = str(uuid.uuid4())
+    ver_2_id = str(uuid.uuid4())
+    source_id = f"src_{uuid.uuid4().hex[:8]}"
+    delete_job_id = f"job_del_{uuid.uuid4().hex[:8]}"
+
+    deleted_versions: list[str] = []
+    deleted_project: str | None = None
+
+    async def mock_delete_document_points_from_qdrant(client, project_id, document_version_ids):
+        nonlocal deleted_versions, deleted_project
+        deleted_project = project_id
+        deleted_versions.extend(document_version_ids)
+
+    monkeypatch.setattr(
+        "sag_api.services.search_index_service.delete_document_points_from_qdrant",
+        mock_delete_document_points_from_qdrant,
+    )
+
+    async with SessionLocal() as session:
+        source = Source(id=source_id, name="Delete Source", sag_source_config_id="cfg_del")
+        session.add(source)
+        await session.commit()
+
+        doc = Document(
+            id=doc_id,
+            source_id=source_id,
+            tenant_id="tenant_del",
+            project_id="proj_del",
+            filename="delete.md",
+            storage_path="/tmp/del.md",
+            status=DocumentStatus.READY,
+        )
+        session.add(doc)
+
+        ver1 = DocumentVersion(
+            id=ver_1_id,
+            document_id=doc_id,
+            version_no=1,
+            file_hash="hash_1",
+            status="SEARCH_READY",
+        )
+        ver2 = DocumentVersion(
+            id=ver_2_id,
+            document_id=doc_id,
+            version_no=2,
+            file_hash="hash_2",
+            status="SEARCH_READY",
+        )
+        session.add_all([ver1, ver2])
+
+        job = Job(
+            id=delete_job_id,
+            type=JobType.DELETE_DOCUMENT,
+            source_id=source_id,
+            document_id=doc_id,
+            status=JobStatus.RUNNING,
+            payload={},
+        )
+        session.add(job)
+        await session.commit()
+
+        class DummyEngine:
+            async def delete_document_data(self, *args, **kwargs):
+                pass
+
+        await _delete_document_task_unlocked(session, job, engine_manager=DummyEngine())
+
+    assert deleted_project == "proj_del"
+    assert set(deleted_versions) == {ver_1_id, ver_2_id}
+
+
+@pytest.mark.asyncio
+async def test_prepare_document_parse_paused_handled_safely(tmp_path, monkeypatch):
+    """Kiểm tra khi prepare_document ném ParsePaused, worker xử lý pause/yield an toàn (#16)."""
+    await init_db()
+    from sag_api.jobs.control import JobPaused, JobYielded
+    from sag_api.parsing import ParsePaused
+
+    doc_id = str(uuid.uuid4())
+    source_id = f"src_{uuid.uuid4().hex[:8]}"
+    job_id = f"job_pause_{uuid.uuid4().hex[:8]}"
+
+    md_file = tmp_path / "pause.md"
+    md_file.write_text("# Test Pause\n\nNội dung chờ parse.", encoding="utf-8")
+
+    async def mock_prepare_document_raises_paused(*args, **kwargs):
+        raise ParsePaused()
+
+    monkeypatch.setattr("sag_api.jobs.tasks.prepare_document", mock_prepare_document_raises_paused)
+
+    async with SessionLocal() as session:
+        source = Source(id=source_id, name="Pause Source", sag_source_config_id="cfg_pause")
+        session.add(source)
+        await session.commit()
+
+        doc = Document(
+            id=doc_id,
+            source_id=source_id,
+            filename="pause.md",
+            storage_path=str(md_file),
+            status=DocumentStatus.LOADING,
+        )
+        session.add(doc)
+
+        job = Job(
+            id=job_id,
+            type=JobType.PROCESS_DOCUMENT,
+            source_id=source_id,
+            document_id=doc_id,
+            status=JobStatus.RUNNING,
+            payload={"storage_path": str(md_file)},
+        )
+        session.add(job)
+        await session.commit()
+
+        with pytest.raises((JobPaused, JobYielded)):
+            await _process_document_unlocked(session, job, engine_manager=FakeEngineManager())

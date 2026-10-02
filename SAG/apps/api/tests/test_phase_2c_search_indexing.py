@@ -168,9 +168,22 @@ async def test_search_indexing_stage_and_manifest_verification():
     run_id = str(uuid.uuid4())
 
     requests_log: list[httpx.Request] = []
+    stored_points: list[dict[str, Any]] = []
 
     def mock_qdrant_handler(request: httpx.Request) -> httpx.Response:
         requests_log.append(request)
+        url_path = request.url.path
+        if url_path.endswith("/points/count"):
+            return httpx.Response(200, json={"result": {"count": len(stored_points)}})
+        if url_path.endswith("/points/scroll"):
+            return httpx.Response(200, json={"result": {"points": stored_points, "next_page_offset": None}})
+        if request.method == "PUT" and "/points" in url_path:
+            import json
+            body = json.loads(request.content.decode("utf-8"))
+            stored_points.extend(body.get("points", []))
+            return httpx.Response(200, json={"result": {"operation_id": 1, "status": "completed"}})
+        if request.method == "GET":
+            return httpx.Response(200, json={"result": {"config": {"params": {"vectors": {"content_vector": {"size": 3}}}}}})
         return httpx.Response(200, json={"result": {"operation_id": 1, "status": "completed"}})
 
     mock_client = httpx.AsyncClient(
@@ -600,4 +613,379 @@ async def test_rebuild_service_unmapped_partition_fails_closed():
 
         ver_updated = (await session.execute(select(DocumentVersion).where(DocumentVersion.id == ver_id))).scalar_one()
         assert ver_updated.search_status == "INDEX_FAILED"
+
+
+@pytest.mark.asyncio
+async def test_manifest_fails_closed_when_checksum_mismatch_or_scroll_error():
+    """Kiểm tra manifest gate fail-closed (#1): Nếu scroll lỗi hoặc checksum không khớp, fail closed."""
+    await init_db()
+    project_id = f"proj_fc_{uuid.uuid4().hex[:8]}"
+    doc_id = str(uuid.uuid4())
+    ver_id = str(uuid.uuid4())
+
+    async with SessionLocal() as session:
+        doc = Document(id=doc_id, project_id=project_id, filename="fc.md", storage_path="/tmp/fc.md")
+        ver = DocumentVersion(
+            id=ver_id,
+            document_id=doc_id,
+            version_no=1,
+            file_hash="h_fc",
+            valid_from=datetime.now(UTC),
+            valid_to=datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC),
+        )
+        session.add_all([doc, ver])
+        await session.commit()
+
+        b = CanonicalBlock(
+            id=str(uuid.uuid4()),
+            document_version_id=ver_id,
+            ordinal=0,
+            block_type="paragraph",
+            page_from=1,
+            page_to=1,
+            section_path="Main",
+            normalized_text="Nội dung kiểm tra fail-closed khi scroll lỗi.",
+            content_hash="h_block_fc",
+        )
+        session.add(b)
+        await session.commit()
+
+        # Mock handler nơi scroll API trả về lỗi 500
+        def broken_scroll_handler(request: httpx.Request) -> httpx.Response:
+            url_path = request.url.path
+            if url_path.endswith("/points/count"):
+                return httpx.Response(200, json={"result": {"count": 1}})
+            if url_path.endswith("/points/scroll"):
+                return httpx.Response(500, json={"error": "Scroll internal error"})
+            return httpx.Response(200, json={"result": {"operation_id": 1, "status": "completed"}})
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(broken_scroll_handler),
+            base_url="http://localhost:6333",
+        ) as broken_client:
+            with pytest.raises(RuntimeError) as exc_info:
+                await run_search_indexing_stage(
+                    session,
+                    project_id=project_id,
+                    document_version=ver,
+                    security_partition_id="part_1",
+                    qdrant_client=broken_client,
+                    embedder=lambda t: [0.1, 0.2, 0.3],
+                )
+
+            assert "manifest verification mismatch" in str(exc_info.value)
+
+        await session.refresh(ver)
+        assert ver.search_status == "INDEX_FAILED"
+        assert ver.search_ready_at is None
+
+
+def test_oversized_canonical_block_chunked_within_token_limit():
+    """Kiểm tra oversized block (#14): Block 1200 từ được tách thành các units <= 512 tokens."""
+    ver_id = str(uuid.uuid4())
+    words = [f"token_{i}" for i in range(1200)]
+    long_text = " ".join(words)
+
+    long_block = CanonicalBlock(
+        id=str(uuid.uuid4()),
+        document_version_id=ver_id,
+        ordinal=0,
+        block_type="paragraph",
+        page_from=3,
+        page_to=4,
+        section_path="DeepSection > Sub",
+        normalized_text=long_text,
+        content_hash="hash_long",
+    )
+
+    units = build_search_units_from_blocks(
+        [long_block],
+        document_version_id=ver_id,
+        security_partition_id="sec_p1",
+        max_tokens_per_unit=512,
+    )
+
+    assert len(units) == 3
+    assert units[0].token_count == 512
+    assert units[1].token_count == 512
+    assert units[2].token_count == 176
+    for u in units:
+        assert u.token_count <= 512
+        assert u.block_from_id == long_block.id
+        assert u.block_to_id == long_block.id
+        assert u.section_path == "DeepSection > Sub"
+        assert u.page_from == 3
+        assert u.page_to == 4
+
+
+@pytest.mark.asyncio
+async def test_rebuild_service_with_custom_dim_and_conflicting_project():
+    """Kiểm tra rebuild với embedder 1024-dim (#9) và phát hiện conflict IngestionRun project_id (#2)."""
+    await init_db()
+    proj_a = f"proj_a_{uuid.uuid4().hex[:8]}"
+    proj_b = f"proj_b_{uuid.uuid4().hex[:8]}"
+    doc_id = str(uuid.uuid4())
+    ver_id = str(uuid.uuid4())
+
+    async with SessionLocal() as session:
+        # Document thuộc proj_a
+        doc = Document(id=doc_id, project_id=proj_a, tenant_id="t_cust", filename="conf.md", storage_path="/tmp/c.md")
+        ver = DocumentVersion(
+            id=ver_id,
+            document_id=doc_id,
+            version_no=1,
+            file_hash="hc",
+            valid_from=datetime.now(UTC),
+            valid_to=datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC),
+            metadata_json={"security_partition_id": "sec_part_a"},
+        )
+        session.add_all([doc, ver])
+        await session.commit()
+
+        b = CanonicalBlock(
+            id=str(uuid.uuid4()),
+            document_version_id=ver_id,
+            ordinal=0,
+            block_type="paragraph",
+            page_from=1,
+            page_to=1,
+            section_path="Root",
+            normalized_text="Valid text",
+            content_hash="hb",
+        )
+        su = SearchUnit(
+            id=str(uuid.uuid4()),
+            document_version_id=ver_id,
+            security_partition_id="sec_part_a",
+            block_from_id=b.id,
+            block_to_id=b.id,
+            page_from=1,
+            page_to=1,
+            section_path="Root",
+            token_count=2,
+            content_hash="hb",
+        )
+        # Giả lập IngestionRun có project_id = proj_b (xung đột dữ liệu với doc.project_id = proj_a)
+        ir_conflict = IngestionRun(
+            id=str(uuid.uuid4()),
+            tenant_id="t_cust",
+            project_id=proj_b,  # Conflict!
+            document_version_id=ver_id,
+            idempotency_key="key_conflict",
+            payload_hash="hc",
+            status="QUEUED",
+        )
+        session.add_all([b, su, ir_conflict])
+        await session.commit()
+
+        stored: list[dict[str, Any]] = []
+
+        def mock_qdrant(req: httpx.Request) -> httpx.Response:
+            url = req.url.path
+            if url.endswith("/points/count"):
+                return httpx.Response(200, json={"result": {"count": len(stored)}})
+            if url.endswith("/points/scroll"):
+                return httpx.Response(200, json={"result": {"points": stored, "next_page_offset": None}})
+            if req.method == "PUT" and "/points" in url:
+                import json
+                body = json.loads(req.content.decode("utf-8"))
+                stored.extend(body.get("points", []))
+                return httpx.Response(200, json={"result": {"operation_id": 1, "status": "completed"}})
+            return httpx.Response(200, json={"result": True})
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_qdrant),
+            base_url="http://localhost:6333",
+        ) as client:
+            # Rebuild project_a phải phát hiện IngestionRun có project_id proj_b và fail closed
+            with pytest.raises(ValueError) as exc_info:
+                await rebuild_search_index_for_project(
+                    session,
+                    project_id=proj_a,
+                    qdrant_client=client,
+                    embedder=lambda t: [0.1] * 1024,
+                )
+
+            assert "conflicting IngestionRun project_id" in str(exc_info.value)
+            assert "rebuild failed closed" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_tenant_id_isolation_in_payload():
+    """Kiểm tra tenant_id (#6) được truyền đúng từ Document/IngestionRun vào Qdrant payload."""
+    await init_db()
+    project_id = f"proj_ten_{uuid.uuid4().hex[:8]}"
+    doc_id = str(uuid.uuid4())
+    ver_id = str(uuid.uuid4())
+
+    async with SessionLocal() as session:
+        doc = Document(id=doc_id, project_id=project_id, tenant_id="tenant_enterprise_xyz", filename="t.md", storage_path="/tmp/t.md")
+        ver = DocumentVersion(
+            id=ver_id,
+            document_id=doc_id,
+            version_no=1,
+            file_hash="ht",
+            valid_from=datetime.now(UTC),
+            valid_to=datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC),
+        )
+        session.add_all([doc, ver])
+        await session.commit()
+
+        b = CanonicalBlock(
+            id=str(uuid.uuid4()),
+            document_version_id=ver_id,
+            ordinal=0,
+            block_type="paragraph",
+            page_from=1,
+            page_to=1,
+            section_path="Root",
+            normalized_text="Multi-tenant test content",
+            content_hash="h_tenant_b",
+        )
+        session.add(b)
+        await session.commit()
+
+        stored_points: list[dict[str, Any]] = []
+
+        def mock_qdrant(req: httpx.Request) -> httpx.Response:
+            url = req.url.path
+            if url.endswith("/points/count"):
+                return httpx.Response(200, json={"result": {"count": len(stored_points)}})
+            if url.endswith("/points/scroll"):
+                return httpx.Response(200, json={"result": {"points": stored_points, "next_page_offset": None}})
+            if req.method == "PUT" and "/points" in url:
+                import json
+                body = json.loads(req.content.decode("utf-8"))
+                stored_points.extend(body.get("points", []))
+                return httpx.Response(200, json={"result": {"operation_id": 1, "status": "completed"}})
+            return httpx.Response(200, json={"result": True})
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_qdrant),
+            base_url="http://localhost:6333",
+        ) as client:
+            await run_search_indexing_stage(
+                session,
+                project_id=project_id,
+                document_version=ver,
+                security_partition_id="part_custom",
+                qdrant_client=client,
+                embedder=lambda t: [0.1, 0.2, 0.3],
+            )
+
+        assert len(stored_points) == 1
+        assert stored_points[0]["payload"]["tenant_id"] == "tenant_enterprise_xyz"
+
+
+@pytest.mark.asyncio
+async def test_delete_document_points_and_reconcile_orphans():
+    """Kiểm tra helper xóa points theo versions và dọn dẹp orphan points trong Qdrant (#8)."""
+    await init_db()
+    project_id = f"proj_clean_{uuid.uuid4().hex[:8]}"
+
+    qdrant_state: list[dict[str, Any]] = [
+        {"id": "pt_1", "payload": {"search_unit_id": "su_1", "document_version_id": "v1"}},
+        {"id": "pt_2", "payload": {"search_unit_id": "su_2", "document_version_id": "v1"}},
+        {"id": "pt_orphan", "payload": {"search_unit_id": "su_nonexistent", "document_version_id": "v_deleted"}},
+    ]
+
+    def mock_qdrant(req: httpx.Request) -> httpx.Response:
+        url = req.url.path
+        if url.endswith("/points/scroll"):
+            return httpx.Response(200, json={"result": {"points": qdrant_state, "next_page_offset": None}})
+        if url.endswith("/points/delete"):
+            import json
+            body = json.loads(req.content.decode("utf-8"))
+            if "points" in body:
+                to_delete = set(body["points"])
+                qdrant_state[:] = [p for p in qdrant_state if p["id"] not in to_delete]
+            elif "filter" in body:
+                qdrant_state.clear()
+            return httpx.Response(200, json={"result": {"operation_id": 1, "status": "completed"}})
+        return httpx.Response(200, json={"result": True})
+
+    async with SessionLocal() as session:
+        # Trong PostgreSQL chỉ có su_1 và su_2
+        doc_id = str(uuid.uuid4())
+        doc = Document(id=doc_id, project_id=project_id, filename="d.md", storage_path="/tmp/d.md")
+        ver = DocumentVersion(
+            id="v1",
+            document_id=doc_id,
+            version_no=1,
+            file_hash="h1",
+            valid_from=datetime.now(UTC),
+            valid_to=datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC),
+        )
+        session.add_all([doc, ver])
+        await session.commit()
+
+        cb1 = CanonicalBlock(
+            id="b1",
+            document_version_id="v1",
+            ordinal=0,
+            block_type="paragraph",
+            page_from=1,
+            page_to=1,
+            section_path="Root",
+            normalized_text="Block 1",
+            content_hash="h1",
+        )
+        cb2 = CanonicalBlock(
+            id="b2",
+            document_version_id="v1",
+            ordinal=1,
+            block_type="paragraph",
+            page_from=1,
+            page_to=1,
+            section_path="Root",
+            normalized_text="Block 2",
+            content_hash="h2",
+        )
+        session.add_all([cb1, cb2])
+        await session.commit()
+
+        su1 = SearchUnit(
+            id="su_1",
+            document_version_id="v1",
+            security_partition_id="part_1",
+            block_from_id="b1",
+            block_to_id="b1",
+            page_from=1,
+            page_to=1,
+            section_path="Root",
+            token_count=1,
+            content_hash="h1",
+        )
+        su2 = SearchUnit(
+            id="su_2",
+            document_version_id="v1",
+            security_partition_id="part_1",
+            block_from_id="b2",
+            block_to_id="b2",
+            page_from=1,
+            page_to=1,
+            section_path="Root",
+            token_count=1,
+            content_hash="h2",
+        )
+        session.add_all([su1, su2])
+        await session.commit()
+
+        from sag_api.services.search_index_service import (
+            delete_document_points_from_qdrant,
+            reconcile_orphan_search_units,
+        )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(mock_qdrant), base_url="http://localhost:6333") as client:
+            # 1. Dọn dẹp orphan points
+            rec_result = await reconcile_orphan_search_units(session, client, project_id=project_id)
+            assert rec_result["orphans_deleted"] == 1
+            assert len(qdrant_state) == 2
+            assert all(p["id"] != "pt_orphan" for p in qdrant_state)
+
+            # 2. Xóa points của document version v1
+            del_count = await delete_document_points_from_qdrant(client, project_id=project_id, document_version_ids=["v1"])
+            assert del_count == 1
+            assert len(qdrant_state) == 0
+
 

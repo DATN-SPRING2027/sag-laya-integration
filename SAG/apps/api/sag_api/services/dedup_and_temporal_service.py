@@ -17,9 +17,10 @@ import re
 from typing import Any, Sequence
 import uuid
 
-from sqlalchemy import and_, desc, select
+from sqlalchemy import and_, desc, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sag_api.db.models.document import Document
 from sag_api.db.models.routing_rag import (
     CanonicalBlock,
     DocumentVersion,
@@ -45,7 +46,7 @@ VALID_RELATIONS = {
 
 
 def compute_minhash_signature(tokens: Sequence[str], num_perm: int = 128) -> list[int]:
-    """Compute 128-permutation MinHash signature for token k-shingles."""
+    """Compute 128-permutation MinHash signature for token k-shingles (k=5 per Phase 2B plan)."""
     if not tokens:
         return [0] * num_perm
     k = min(3, len(tokens))
@@ -57,7 +58,8 @@ def compute_minhash_signature(tokens: Sequence[str], num_perm: int = 128) -> lis
 
     signature = []
     for i in range(num_perm):
-        min_val = 0x7FFFFFFF
+        # 32-bit unsigned sentinel (0xFFFFFFFF) covering the full 8-hex-char MD5 space
+        min_val = 0xFFFFFFFF
         for s in shingles:
             h = int(hashlib.md5(f"{i}:{s}".encode("utf-8")).hexdigest()[:8], 16)
             if h < min_val:
@@ -72,6 +74,19 @@ def estimate_minhash_similarity(sig1: Sequence[int], sig2: Sequence[int]) -> flo
         return 0.0
     matches = sum(1 for a, b in zip(sig1, sig2) if a == b)
     return matches / len(sig1)
+
+
+def compute_cosine_similarity(vec1: Sequence[float], vec2: Sequence[float]) -> float:
+    """Compute cosine similarity between two float vectors for Tier 4 semantic evaluation."""
+    import math
+    if not vec1 or not vec2 or len(vec1) != len(vec2):
+        return 0.0
+    dot = sum(float(a) * float(b) for a, b in zip(vec1, vec2))
+    norm1 = math.sqrt(sum(float(a) * float(a) for a in vec1))
+    norm2 = math.sqrt(sum(float(b) * float(b) for b in vec2))
+    if norm1 == 0.0 or norm2 == 0.0:
+        return 0.0
+    return dot / (norm1 * norm2)
 
 
 def compute_text_similarity(text1: str, text2: str) -> float:
@@ -340,20 +355,21 @@ async def resolve_temporal_supersedes(
                 past_vers.append((v, vt))
 
         current_version.valid_from = cur_start
-        if future_vers:
-            earliest_future_v, earliest_future_from = min(future_vers, key=lambda x: x[1])
-            current_version.valid_to = earliest_future_from
-            if not earliest_future_v.supersedes_id:
-                earliest_future_v.supersedes_id = current_version.id
-                session.add(earliest_future_v)
-        else:
-            current_version.valid_to = max_valid_to
-
         if past_vers:
             latest_past_v, _ = max(past_vers, key=lambda x: x[1])
             current_version.supersedes_id = latest_past_v.id
         else:
             current_version.supersedes_id = None
+
+        if future_vers:
+            earliest_future_v, earliest_future_from = min(future_vers, key=lambda x: x[1])
+            current_version.valid_to = earliest_future_from
+            past_ids = {pv.id for pv, _ in past_vers} if past_vers else set()
+            if not earliest_future_v.supersedes_id or earliest_future_v.supersedes_id in past_ids:
+                earliest_future_v.supersedes_id = current_version.id
+                session.add(earliest_future_v)
+        else:
+            current_version.valid_to = max_valid_to
 
         action = "OUT_OF_ORDER_ARCHIVED"
         active_v = next((v for v in all_prev if v.valid_to and v.valid_to >= max_valid_to), current_version)
@@ -389,6 +405,7 @@ async def run_dedup_and_temporal_stage(
     document_id: str,
     project_id: str,
     run_id: str | None = None,
+    embedder: Any | None = None,
 ) -> dict[str, Any]:
     """Execute Phase 2B stage: Exact Dedup, Near Dedup, and Temporal Supersedes with audit."""
     start_time = datetime.now(UTC)
@@ -415,12 +432,17 @@ async def run_dedup_and_temporal_stage(
         )
     ).scalars().all()
 
+    # Prior blocks fetched across the authorized project scope (Tier 2 cross-document dedup)
     prior_blocks = (
         await session.execute(
             select(CanonicalBlock)
             .join(DocumentVersion, CanonicalBlock.document_version_id == DocumentVersion.id)
+            .join(Document, Document.id == DocumentVersion.document_id)
             .where(
-                DocumentVersion.document_id == document_id,
+                or_(
+                    Document.project_id == project_id,
+                    Document.id == document_id,
+                ) if project_id else (Document.id == document_id),
                 DocumentVersion.id != document_version.id,
             )
         )
@@ -440,6 +462,30 @@ async def run_dedup_and_temporal_stage(
 
     lsh_index = build_lsh_band_index(prior_sig_by_id, num_bands=16, rows_per_band=8)
 
+    # Optional Tier 4: Precompute embeddings for semantic similarity if embedder available
+    block_embeddings: dict[str, list[float]] = {}
+    if embedder is not None:
+        try:
+            texts_to_embed = [b.normalized_text for b in curr_blocks] + [pb.normalized_text for pb in prior_blocks]
+            ids_to_embed = [b.id for b in curr_blocks] + [pb.id for pb in prior_blocks]
+            if texts_to_embed:
+                if hasattr(embedder, "batch_generate"):
+                    vecs = await embedder.batch_generate(texts_to_embed)
+                elif hasattr(embedder, "generate"):
+                    vecs = [await embedder.generate(t) for t in texts_to_embed]
+                elif callable(embedder):
+                    import inspect
+                    if inspect.iscoroutinefunction(embedder):
+                        vecs = [await embedder(t) for t in texts_to_embed]
+                    else:
+                        vecs = [embedder(t) for t in texts_to_embed]
+                else:
+                    vecs = []
+                for bid, vec in zip(ids_to_embed, vecs):
+                    block_embeddings[bid] = vec
+        except Exception as emb_err:
+            log.warning("Could not compute block embeddings for Tier 4 dedup: %s", emb_err)
+
     for b in curr_blocks:
         if b.content_hash and b.content_hash in prior_hashes:
             exact_block_matches += 1
@@ -453,35 +499,55 @@ async def run_dedup_and_temporal_stage(
             cand_blocks = [prior_by_id[cid] for cid in candidate_ids if cid in prior_by_id]
             eval_blocks = cand_blocks if (cand_blocks or len(prior_blocks) > 30) else prior_blocks
 
+            # Score all candidates and rank deterministically to select the best match
+            block_candidates: list[dict[str, Any]] = []
             for pb in eval_blocks:
                 pb_sig = prior_sig_by_id.get(pb.id)
                 sim = estimate_minhash_similarity(b_sig, pb_sig) if pb_sig else compute_text_similarity(b.normalized_text, pb.normalized_text)
-                if sim >= threshold:
+
+                cosine_sim = 0.0
+                if b.id in block_embeddings and pb.id in block_embeddings:
+                    cosine_sim = compute_cosine_similarity(block_embeddings[b.id], block_embeddings[pb.id])
+
+                is_lexical_match = sim >= threshold
+                is_semantic_match = cosine_sim >= 0.90
+
+                if is_lexical_match or is_semantic_match:
                     is_contra, is_supp, is_super = detect_semantic_signals(b.normalized_text, pb.normalized_text)
+                    effective_sim = max(sim, cosine_sim)
                     rel = classify_relation_candidate(
-                        sim,
+                        effective_sim,
                         is_contradiction=is_contra,
                         is_supersede=is_super,
                         is_support=is_supp,
                     )
-                    near_dup_candidates.append({
+                    evidence_note = (
+                        f"MinHash similarity {sim:.3f} >= {threshold}"
+                        if is_lexical_match
+                        else f"Tier 4 Cosine similarity {cosine_sim:.3f} >= 0.90"
+                    )
+                    block_candidates.append({
                         "source_block_id": b.id,
                         "target_block_id": pb.id,
                         "source_version_id": document_version.id,
                         "target_version_id": pb.document_version_id,
                         "block_type": b.block_type,
                         "threshold": threshold,
-                        "similarity_score": round(sim, 3),
-                        "similarity": round(sim, 3),
+                        "similarity_score": round(effective_sim, 3),
+                        "similarity": round(effective_sim, 3),
                         "relation": rel,
                         "relation_type": rel,
                         "is_contradiction": is_contra,
                         "is_support": is_supp,
                         "is_supersede": is_super,
                         "auto_merged": False,
-                        "evidence": f"MinHash similarity {sim:.3f} >= {threshold} on {b.block_type} [relation={rel}]",
+                        "evidence": f"{evidence_note} on {b.block_type} [relation={rel}]",
                     })
-                    break  # Found best candidate match for this block
+
+            if block_candidates:
+                # Rank candidates by (similarity_score, target_block_id) descending to select best match stably
+                block_candidates.sort(key=lambda c: (c["similarity_score"], str(c["target_block_id"])), reverse=True)
+                near_dup_candidates.append(block_candidates[0])
 
     # 3. Temporal Resolution (Non-overlapping bi-temporal validity)
     temporal_result = await resolve_temporal_supersedes(

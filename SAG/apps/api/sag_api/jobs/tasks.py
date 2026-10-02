@@ -381,6 +381,7 @@ async def _process_document_unlocked(
 
         # Phase 2 Pipeline: Canonical Extraction -> Dedup & Temporal -> Search Units
         if run_id:
+            current_pipeline_stage = "PARSE"
             try:
                 ing_run = await session.get(IngestionRun, run_id)
                 if ing_run:
@@ -388,13 +389,16 @@ async def _process_document_unlocked(
                     if doc_ver:
                         # [P2 Fix]: Safe prepared document resolution on resume to prevent raw binary UTF-8 decoding
                         if prepared is None:
-                            prepared = await prepare_document(
-                                target_storage_path,
-                                settings,
-                                state=(job.payload or {}).get("document_parser"),
-                                on_state=on_parser_state,
-                                should_pause=should_pause,
-                            )
+                            try:
+                                prepared = await prepare_document(
+                                    target_storage_path,
+                                    settings,
+                                    state=(job.payload or {}).get("document_parser"),
+                                    on_state=on_parser_state,
+                                    should_pause=should_pause,
+                                )
+                            except ParsePaused:
+                                await _pause_or_yield()
 
                         if prepared is None or not prepared.path or not os.path.exists(prepared.path):
                             raise RuntimeError(f"Prepared markdown path missing for document {document.id}")
@@ -403,12 +407,14 @@ async def _process_document_unlocked(
                             doc_content = f.read()
 
                         # 2A: Parse & Persist Canonical Blocks
+                        current_pipeline_stage = "PARSE"
                         from sag_api.services.canonical_service import parse_and_persist_document_content
                         await parse_and_persist_document_content(
                             session, doc_ver.id, doc_content, run_id=run_id
                         )
 
                         # 2B: Dedup & Temporal Lineage
+                        current_pipeline_stage = "DEDUP"
                         from sag_api.services.dedup_and_temporal_service import run_dedup_and_temporal_stage
                         await run_dedup_and_temporal_stage(
                             session,
@@ -424,12 +430,14 @@ async def _process_document_unlocked(
                             raise ValueError(f"Missing security_partition_id for document_version {doc_ver.id} (fail-closed)")
 
                         # [P1 Fix]: Worker passes real Qdrant client and Embedder to search index stage
+                        current_pipeline_stage = "EMBED"
                         embedder = None
                         try:
                             embedder = await engine_manager.get_sag_embedding(source.sag_source_config_id, source)
                         except Exception as emb_exc:
                             log.warning("Could not get sag embedding client: %s", emb_exc)
 
+                        current_pipeline_stage = "INDEX"
                         from sag_api.services.search_index_service import run_search_indexing_stage
                         qdrant_url = getattr(settings, "sag_qdrant_url", "http://localhost:6333").rstrip("/")
                         qdrant_headers = {}
@@ -441,26 +449,58 @@ async def _process_document_unlocked(
                                 project_id=ing_run.project_id,
                                 document_version=doc_ver,
                                 security_partition_id=sec_partition,
+                                tenant_id=ing_run.tenant_id,
                                 qdrant_client=qdrant_client,
                                 embedder=embedder,
                                 run_id=run_id,
                             )
                         await session.commit()
+            except (JobPaused, JobYielded, ParsePaused):
+                await _pause_or_yield()
             except Exception as pipe_err:
                 log.error("Phase 2 pipeline execution failed run_id=%s: %s", run_id, pipe_err)
+                await session.rollback()
+
+                # Determine accurate error layer & stage
+                err_layer = ErrorLayer.API
+                if current_pipeline_stage == "PARSE":
+                    err_stage = ErrorStage.PARSE
+                elif current_pipeline_stage == "DEDUP":
+                    err_stage = ErrorStage.EXTRACT
+                elif current_pipeline_stage == "EMBED":
+                    err_stage = ErrorStage.EMBED
+                    err_layer = ErrorLayer.ENGINE
+                elif current_pipeline_stage == "INDEX":
+                    err_stage = ErrorStage.PERSIST
+                    err_layer = ErrorLayer.STORE
+                else:
+                    err_stage = ErrorStage.EXTRACT
+
+                if isinstance(pipe_err, ApiError):
+                    if pipe_err.layer:
+                        err_layer = pipe_err.layer
+                    if pipe_err.stage:
+                        err_stage = pipe_err.stage
+
                 ing_run = await session.get(IngestionRun, run_id) if run_id else None
                 if ing_run:
                     ing_run.status = "FAILED"
-                    ing_run.error_layer = ErrorLayer.API.value
-                    ing_run.error_stage = ErrorStage.EXTRACT.value
+                    ing_run.error_layer = err_layer.value if hasattr(err_layer, "value") else str(err_layer)
+                    ing_run.error_stage = err_stage.value if hasattr(err_stage, "value") else str(err_stage)
                     ing_run.error_message = str(pipe_err)
                     session.add(ing_run)
+
+                    doc_ver = await session.get(DocumentVersion, ing_run.document_version_id)
+                    if doc_ver:
+                        doc_ver.search_status = "INDEX_FAILED"
+                        session.add(doc_ver)
                     await session.commit()
+
                 # Fail the document and preserve error layer and stage
                 raise ApiError(
                     str(pipe_err),
-                    layer=ErrorLayer.API,
-                    stage=ErrorStage.EXTRACT,
+                    layer=err_layer,
+                    stage=err_stage,
                 ) from pipe_err
 
         outcome = await engine_manager.process_document(
@@ -481,6 +521,10 @@ async def _process_document_unlocked(
         raise
     except Exception as e:  # noqa: BLE001 - Ghi nhận vào tài liệu trước khi ném tiếp cho worker
         await session.refresh(document)
+        try:
+            await session.refresh(job)
+        except Exception:
+            pass
         if document.status in _CONTROL_TRANSITION_STATES or document.status == DocumentStatus.PAUSED:
             await _yield_after_document_transition_lost(session, document)
         layer, stage = _classify_document_failure(e, document.status)
@@ -656,6 +700,32 @@ async def _delete_document_task_unlocked(
             derived_source_id,
             source=source,
         )
+
+    # Phase 2 Cleanup: Delete Qdrant points for all document versions belonging to this document
+    from sqlalchemy import select
+    from sag_api.db.models.routing_rag import DocumentVersion
+    version_ids = (
+        await session.execute(
+            select(DocumentVersion.id).where(DocumentVersion.document_id == document.id)
+        )
+    ).scalars().all()
+    if version_ids and document.project_id:
+        qdrant_url = getattr(settings, "sag_qdrant_url", "http://localhost:6333").rstrip("/")
+        qdrant_headers = {}
+        if getattr(settings, "sag_qdrant_api_key", None):
+            qdrant_headers["api-key"] = settings.sag_qdrant_api_key
+        try:
+            async with httpx.AsyncClient(base_url=qdrant_url, headers=qdrant_headers, timeout=30.0) as qdrant_client:
+                from sag_api.services.search_index_service import delete_document_points_from_qdrant
+                await delete_document_points_from_qdrant(
+                    qdrant_client,
+                    project_id=document.project_id,
+                    document_version_ids=version_ids,
+                )
+        except Exception as qdel_err:
+            log.error("Failed to delete Qdrant points on document deletion %s: %s", document.id, qdel_err)
+            raise RuntimeError(f"Qdrant cleanup failed during document deletion: {qdel_err}") from qdel_err
+
     path = document.storage_path
     job.payload = {**(job.payload or {}), "target_document_id": document.id}
     job.document_id = None
@@ -748,6 +818,47 @@ async def _reprocess_document_task_unlocked(
         )
         session.add(process_job)
         await session.flush()
+
+    # Create an IngestionRun for Phase 2 processing on reprocess
+    from sqlalchemy import select
+    from sag_api.db.models.routing_rag import DocumentVersion, IngestionRun
+    latest_ver = (
+        await session.execute(
+            select(DocumentVersion)
+            .where(DocumentVersion.document_id == document.id)
+            .order_by(DocumentVersion.version_no.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+    new_run_id = None
+    if latest_ver and document.project_id:
+        new_run_id = str(uuid.uuid4())
+        tenant_id = document.tenant_id or "tenant_default"
+        idempotency_key = f"reprocess:{document.id}:{latest_ver.version_no}:{new_run_id[:8]}"
+        payload_hash = latest_ver.file_hash or "reprocess"
+        ing_run = IngestionRun(
+            id=new_run_id,
+            tenant_id=tenant_id,
+            project_id=document.project_id,
+            document_version_id=latest_ver.id,
+            idempotency_key=idempotency_key,
+            payload_hash=payload_hash,
+            current_stage="RECEIVE",
+            status="QUEUED",
+            attempt_count=1,
+            max_attempts=3,
+        )
+        session.add(ing_run)
+        await session.flush()
+
+    process_job_payload = {
+        **(process_job.payload or {}),
+    }
+    if new_run_id:
+        process_job_payload["run_id"] = new_run_id
+    process_job.payload = process_job_payload
+
     job.payload = {
         **payload,
         "cleanup_completed": True,

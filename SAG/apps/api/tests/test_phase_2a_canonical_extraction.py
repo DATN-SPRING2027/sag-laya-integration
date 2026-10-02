@@ -316,3 +316,74 @@ async def test_idempotent_retry_overwrites_old_blocks_without_duplicates():
         assert len(count_2) == 3
         assert count_2[0].normalized_text == "Bản 2 Đã Sửa"
 
+
+@pytest.mark.asyncio
+async def test_canonical_page_markers_advance_page_numbers():
+    """Kiểm tra nhận diện marker ngắt trang (<!-- PAGE N -->, \f, --- page break ---) và gán đúng page_from/page_to (#15)."""
+    await init_db()
+    source_id = str(uuid.uuid4())
+    doc_id = str(uuid.uuid4())
+    ver_id = str(uuid.uuid4())
+
+    async with SessionLocal() as session:
+        source = Source(
+            id=source_id,
+            name="Test Source",
+            sag_source_config_id=f"cfg_{source_id[:8]}",
+        )
+        session.add(source)
+        await session.commit()
+
+        doc = Document(
+            id=doc_id,
+            source_id=source_id,
+            filename="pages.md",
+            status="LOADING",
+            storage_path="/tmp/pages.md",
+        )
+        session.add(doc)
+        ver = DocumentVersion(id=ver_id, document_id=doc_id, version_no=1, file_hash="hash_pages", status="RECEIVED")
+        session.add(ver)
+        await session.commit()
+
+        content = (
+            "<!-- PAGE 1 -->\n"
+            "# Trang 1 Heading\n\n"
+            "Nội dung ở trang 1.\n\n"
+            "<!-- PAGE 2 -->\n"
+            "# Trang 2 Heading\n\n"
+            "Nội dung ở trang 2.\n\n"
+            "\x0c"
+            "Nội dung sau form feed ở trang 3.\n\n"
+            "--- page break ---\n"
+            "Nội dung sau markdown page break ở trang 4."
+        )
+
+        blocks = await parse_and_persist_document_content(session, ver_id, content)
+        await session.commit()
+
+        assert len(blocks) >= 6
+        # Khối 1: Trang 1
+        assert blocks[0].page_from == 1
+        assert blocks[0].page_to == 1
+        assert "Trang 1" in blocks[0].normalized_text
+
+        # Khối 2: Nội dung trang 1
+        assert blocks[1].page_from == 1
+        assert blocks[1].page_to == 1
+
+        # Khối 3: Trang 2
+        assert blocks[2].page_from == 2
+        assert blocks[2].page_to == 2
+        assert "Trang 2" in blocks[2].normalized_text
+
+        # Khối sau form feed: Trang 3
+        ff_block = next(b for b in blocks if "form feed" in b.normalized_text)
+        assert ff_block.page_from == 3
+        assert ff_block.page_to == 3
+
+        # Khối sau page break: Trang 4
+        pb_block = next(b for b in blocks if "markdown page break" in b.normalized_text)
+        assert pb_block.page_from == 4
+        assert pb_block.page_to == 4
+

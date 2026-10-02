@@ -458,24 +458,27 @@ def test_lsh_band_index_bounded_candidates():
     import random
     from sag_api.services.dedup_and_temporal_service import compute_minhash_signature
 
+    random.seed(42)
     sigs_by_id = {}
-    for i in range(60):
-        # 60 documents với từ vựng ngẫu nhiên
-        words = [f"word_{random.randint(1, 300)}" for _ in range(20)]
+    words_0 = [f"word_anchor_{j}" for j in range(20)]
+    sigs_by_id["block_0"] = compute_minhash_signature(words_0, num_perm=128)
+
+    for i in range(1, 60):
+        words = [f"word_noise_{i}_{j}" for j in range(20)]
         sigs_by_id[f"block_{i}"] = compute_minhash_signature(words, num_perm=128)
 
-    # Thêm 1 block gần giống block_0 (chia sẻ 15/20 từ)
-    words_target = [f"word_{random.randint(1, 300)}" for _ in range(20)]
-    sigs_by_id["block_target"] = compute_minhash_signature(words_target, num_perm=128)
+    # Query nằm ngoài reference pool nhưng chia sẻ 18/20 từ với block_0
+    query_words = words_0[:18] + ["query_unique_1", "query_unique_2"]
+    query_sig = compute_minhash_signature(query_words, num_perm=128)
 
     lsh_buckets = build_lsh_band_index(sigs_by_id, num_bands=16, rows_per_band=8)
     assert len(lsh_buckets) > 0
 
-    # Query bằng target signature
-    candidates = query_lsh_candidates(sigs_by_id["block_target"], lsh_buckets, num_bands=16, rows_per_band=8)
-    # Ứng viên phải chứa chính nó và giới hạn số lượng (< 60)
-    assert "block_target" in candidates
-    assert len(candidates) < 60
+    # Query bằng target signature nằm ngoài pool
+    candidates = query_lsh_candidates(query_sig, lsh_buckets, num_bands=16, rows_per_band=8)
+    # block_0 phải được tìm thấy và giới hạn số lượng (< 10)
+    assert "block_0" in candidates
+    assert len(candidates) < 10
 
 
 @pytest.mark.asyncio
@@ -554,4 +557,242 @@ async def test_mid_timeline_insertion_rewires_successor_chain():
         # Bằng chứng cốt lõi: v2 đã được rewire supersedes_id trỏ về v_mid_id thay vì v1_id
         v2_updated = (await session.execute(select(DocumentVersion).where(DocumentVersion.id == v2_id))).scalar_one()
         assert v2_updated.supersedes_id == v_mid_id
+
+
+def test_minhash_disjoint_sets_yield_zero_similarity():
+    """Kiểm tra sentinel 0xFFFFFFFF (#13): Hai tập từ vựng hoàn toàn rời nhau phải có similarity = 0.0."""
+    from sag_api.services.dedup_and_temporal_service import compute_minhash_signature, estimate_minhash_similarity
+
+    set_a = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf"]
+    set_b = ["hotel", "india", "juliet", "kilo", "lima", "mike", "november"]
+
+    sig_a = compute_minhash_signature(set_a, num_perm=128)
+    sig_b = compute_minhash_signature(set_b, num_perm=128)
+
+    sim = estimate_minhash_similarity(sig_a, sig_b)
+    assert sim == 0.0, f"Expected 0.0 similarity for completely disjoint word sets, got {sim}"
+
+
+@pytest.mark.asyncio
+async def test_cross_document_dedup_within_project():
+    """Kiểm tra đối soát dedup xuyên tài liệu (cross-document) trong cùng project_id (#12)."""
+    await init_db()
+    project_id = f"proj_cross_{uuid.uuid4().hex[:8]}"
+
+    async with SessionLocal() as session:
+        # Document 1 trong project
+        doc1_id = str(uuid.uuid4())
+        doc1 = Document(id=doc1_id, project_id=project_id, filename="doc1.md", storage_path="/tmp/doc1.md")
+        session.add(doc1)
+        await session.commit()
+
+        v1_id = str(uuid.uuid4())
+        v1 = DocumentVersion(id=v1_id, document_id=doc1_id, version_no=1, file_hash="hash_d1", status="RECEIVED")
+        session.add(v1)
+        await session.commit()
+
+        b1 = CanonicalBlock(
+            id=str(uuid.uuid4()),
+            document_version_id=v1_id,
+            ordinal=0,
+            block_type="paragraph",
+            page_from=1,
+            page_to=1,
+            section_path="Policy",
+            normalized_text="Quy định nghỉ phép năm áp dụng tối đa 12 ngày làm việc cho toàn thể nhân sự công ty.",
+            content_hash="hash_b1_policy",
+        )
+        session.add(b1)
+        await session.commit()
+
+        # Document 2 trong cùng project nhưng khác document_id
+        doc2_id = str(uuid.uuid4())
+        doc2 = Document(id=doc2_id, project_id=project_id, filename="doc2.md", storage_path="/tmp/doc2.md")
+        session.add(doc2)
+        await session.commit()
+
+        v2_id = str(uuid.uuid4())
+        v2 = DocumentVersion(id=v2_id, document_id=doc2_id, version_no=1, file_hash="hash_d2", status="RECEIVED")
+        session.add(v2)
+        await session.commit()
+
+        b2 = CanonicalBlock(
+            id=str(uuid.uuid4()),
+            document_version_id=v2_id,
+            ordinal=0,
+            block_type="paragraph",
+            page_from=1,
+            page_to=1,
+            section_path="HR_Policy",
+            normalized_text="Quy định nghỉ phép năm áp dụng tối đa 12 ngày làm việc cho toàn thể nhân sự công ty này.",
+            content_hash="hash_b2_policy_variant",
+        )
+        session.add(b2)
+        await session.commit()
+
+        # Chạy dedup cho v2: phải tìm thấy b1 từ doc1 vì cùng project_id
+        res = await run_dedup_and_temporal_stage(
+            session,
+            document_version=v2,
+            document_id=doc2_id,
+            project_id=project_id,
+        )
+        await session.commit()
+
+        assert len(res["near_duplicate_candidates"]) >= 1
+        cand = res["near_duplicate_candidates"][0]
+        assert cand["target_block_id"] == b1.id
+        assert cand["target_version_id"] == v1_id
+
+
+@pytest.mark.asyncio
+async def test_candidate_ranking_selects_highest_similarity():
+    """Kiểm tra candidate ranking (#18): Khi 1 block khớp nhiều block trong quá khứ, chọn ứng viên có điểm cao nhất."""
+    await init_db()
+    project_id = f"proj_rank_{uuid.uuid4().hex[:8]}"
+    doc_id = str(uuid.uuid4())
+
+    async with SessionLocal() as session:
+        doc = Document(id=doc_id, project_id=project_id, filename="ranking.md", storage_path="/tmp/r.md")
+        session.add(doc)
+        await session.commit()
+
+        v1_id = str(uuid.uuid4())
+        v1 = DocumentVersion(id=v1_id, document_id=doc_id, version_no=1, file_hash="h1", status="RECEIVED")
+        session.add(v1)
+        await session.commit()
+
+        pb1 = CanonicalBlock(
+            id=str(uuid.uuid4()),
+            document_version_id=v1_id,
+            ordinal=0,
+            block_type="paragraph",
+            page_from=1,
+            page_to=1,
+            section_path="Arch",
+            normalized_text="Hệ thống cơ sở dữ liệu phân tán PostgreSQL được triển khai song song.",
+            content_hash="hpb1",
+        )
+        pb2 = CanonicalBlock(
+            id=str(uuid.uuid4()),
+            document_version_id=v1_id,
+            ordinal=1,
+            block_type="paragraph",
+            page_from=1,
+            page_to=1,
+            section_path="Arch",
+            normalized_text="Hệ thống cơ sở dữ liệu phân tán PostgreSQL và Qdrant được triển khai tối ưu trên Kubernetes cluster.",
+            content_hash="hpb2",
+        )
+        session.add_all([pb1, pb2])
+        await session.commit()
+
+        v2_id = str(uuid.uuid4())
+        v2 = DocumentVersion(id=v2_id, document_id=doc_id, version_no=2, file_hash="h2", status="RECEIVED")
+        session.add(v2)
+        await session.commit()
+
+        curr_b = CanonicalBlock(
+            id=str(uuid.uuid4()),
+            document_version_id=v2_id,
+            ordinal=0,
+            block_type="paragraph",
+            page_from=1,
+            page_to=1,
+            section_path="Arch",
+            normalized_text="Hệ thống cơ sở dữ liệu phân tán PostgreSQL và Qdrant được triển khai tối ưu trên Kubernetes cluster mạnh mẽ.",
+            content_hash="hcurr",
+        )
+        session.add(curr_b)
+        await session.commit()
+
+        res = await run_dedup_and_temporal_stage(
+            session,
+            document_version=v2,
+            document_id=doc_id,
+            project_id=project_id,
+        )
+        await session.commit()
+
+        assert len(res["near_duplicate_candidates"]) == 1
+        best_cand = res["near_duplicate_candidates"][0]
+        assert best_cand["target_block_id"] == pb2.id
+
+
+@pytest.mark.asyncio
+async def test_tier_4_cosine_embedding_dedup_and_contradiction_guard():
+    """Kiểm tra Tier 4 embedding evaluation và contradiction semantic guard (#11)."""
+    await init_db()
+    project_id = f"proj_t4_{uuid.uuid4().hex[:8]}"
+    doc_id = str(uuid.uuid4())
+
+    class MockSemanticEmbedder:
+        async def batch_generate(self, texts: list[str]) -> list[list[float]]:
+            vecs = []
+            for t in texts:
+                if "thành công" in t:
+                    vecs.append([1.0, 0.0, 0.0])
+                elif "thất bại" in t:
+                    vecs.append([-1.0, 0.0, 0.0])
+                else:
+                    vecs.append([0.95, 0.05, 0.0])
+            return vecs
+
+    async with SessionLocal() as session:
+        doc = Document(id=doc_id, project_id=project_id, filename="semantic.md", storage_path="/tmp/sem.md")
+        session.add(doc)
+        await session.commit()
+
+        v1_id = str(uuid.uuid4())
+        v1 = DocumentVersion(id=v1_id, document_id=doc_id, version_no=1, file_hash="h1", status="RECEIVED")
+        session.add(v1)
+        await session.commit()
+
+        pb = CanonicalBlock(
+            id=str(uuid.uuid4()),
+            document_version_id=v1_id,
+            ordinal=0,
+            block_type="paragraph",
+            page_from=1,
+            page_to=1,
+            section_path="Result",
+            normalized_text="Dự án đã triển khai thành công đúng tiến độ cam kết.",
+            content_hash="h_succ",
+        )
+        session.add(pb)
+        await session.commit()
+
+        v2_id = str(uuid.uuid4())
+        v2 = DocumentVersion(id=v2_id, document_id=doc_id, version_no=2, file_hash="h2", status="RECEIVED")
+        session.add(v2)
+        await session.commit()
+
+        curr = CanonicalBlock(
+            id=str(uuid.uuid4()),
+            document_version_id=v2_id,
+            ordinal=0,
+            block_type="paragraph",
+            page_from=1,
+            page_to=1,
+            section_path="Result",
+            normalized_text="Toàn bộ kế hoạch của dự án đã thành công mỹ mãn.",
+            content_hash="h_succ_para",
+        )
+        session.add(curr)
+        await session.commit()
+
+        res = await run_dedup_and_temporal_stage(
+            session,
+            document_version=v2,
+            document_id=doc_id,
+            project_id=project_id,
+            embedder=MockSemanticEmbedder(),
+        )
+        await session.commit()
+
+        assert len(res["near_duplicate_candidates"]) >= 1
+        cand = res["near_duplicate_candidates"][0]
+        assert cand["similarity_score"] >= 0.90
+        assert cand["target_block_id"] == pb.id
+
 

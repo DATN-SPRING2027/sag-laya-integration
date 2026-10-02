@@ -592,7 +592,21 @@ async def test_worker_transitions_ingestion_run_and_document_version(client: htt
     auth_header = make_auth_header(user_id="user_worker_test", allowed_projects=[project_id])
 
     # Mock Qdrant handler for search indexing stage in worker
+    stored_points: list[dict[str, Any]] = []
+
     def mock_qdrant_handler(request: httpx.Request) -> httpx.Response:
+        url_path = request.url.path
+        if url_path.endswith("/points/count"):
+            return httpx.Response(200, json={"result": {"count": len(stored_points)}})
+        if url_path.endswith("/points/scroll"):
+            return httpx.Response(200, json={"result": {"points": stored_points, "next_page_offset": None}})
+        if request.method == "PUT" and "/points" in url_path:
+            import json
+            body = json.loads(request.content.decode("utf-8"))
+            stored_points.extend(body.get("points", []))
+            return httpx.Response(200, json={"result": {"operation_id": 1, "status": "completed"}})
+        if request.method == "GET":
+            return httpx.Response(200, json={"result": {"config": {"params": {"vectors": {"content_vector": {"size": 3}}}}}})
         return httpx.Response(200, json={"result": {"operation_id": 1, "status": "completed"}})
 
     mock_qdrant_client = httpx.AsyncClient(
@@ -1145,7 +1159,21 @@ async def test_job_reads_correct_immutable_snapshot_version(client: httpx.AsyncC
     logical_doc = "concurrent/spec.txt"
 
     # Mock Qdrant handler for search indexing stage in worker
+    stored_points: list[dict[str, Any]] = []
+
     def mock_qdrant_handler(request: httpx.Request) -> httpx.Response:
+        url_path = request.url.path
+        if url_path.endswith("/points/count"):
+            return httpx.Response(200, json={"result": {"count": len(stored_points)}})
+        if url_path.endswith("/points/scroll"):
+            return httpx.Response(200, json={"result": {"points": stored_points, "next_page_offset": None}})
+        if request.method == "PUT" and "/points" in url_path:
+            import json
+            body = json.loads(request.content.decode("utf-8"))
+            stored_points.extend(body.get("points", []))
+            return httpx.Response(200, json={"result": {"operation_id": 1, "status": "completed"}})
+        if request.method == "GET":
+            return httpx.Response(200, json={"result": {"config": {"params": {"vectors": {"content_vector": {"size": 3}}}}}})
         return httpx.Response(200, json={"result": {"operation_id": 1, "status": "completed"}})
 
     mock_qdrant_client = httpx.AsyncClient(

@@ -92,6 +92,12 @@ def generate_canonical_block_id(version_id: str, ordinal: int, content_hash: str
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"sag:block:{version_id}:{ordinal}:{content_hash}"))
 
 
+_PAGE_MARKER_RE = re.compile(
+    r"^(?:<!--\s*(?:PAGE|page)\s+(\d+)\s*-->|<!--\s*(?:PAGE_BREAK|page\s*break)\s*-->|[\x0c\f]|---\s*(?:page\s*break|PAGE\s*BREAK)\s*---)$",
+    re.IGNORECASE,
+)
+
+
 def extract_canonical_blocks(
     content: str,
     *,
@@ -102,14 +108,18 @@ def extract_canonical_blocks(
     """Phân tích văn bản (Markdown hoặc plain text) thành danh sách các CanonicalBlock có cấu trúc.
     
     Thuần deterministic, không gọi LLM, bảo toàn bảng biểu, khối mã lệnh và định danh.
+    Nhận diện page markers (ví dụ: <!-- PAGE N -->, form feed \f) để bảo toàn trang nguồn.
     """
     if not content or not content.strip():
         return []
 
-    lines = content.splitlines()
+    # Tiền xử lý form feed (\x0c, \f) trước splitlines vì str.splitlines() tự động tách và nuốt ký tự này
+    normalized_content = content.replace("\x0c", "\n<!-- PAGE_BREAK -->\n").replace("\f", "\n<!-- PAGE_BREAK -->\n")
+    lines = normalized_content.splitlines()
     blocks: list[ExtractedBlock] = []
     current_section_stack: list[tuple[int, str]] = []  # [(level, heading_text)]
     ordinal = 0
+    current_page = page_from
 
     idx = 0
     total_lines = len(lines)
@@ -120,6 +130,17 @@ def extract_canonical_blocks(
 
         # Bỏ qua dòng trống giữa các khối
         if not stripped:
+            idx += 1
+            continue
+
+        # Nhận diện dấu ngắt trang / page marker
+        page_marker_match = _PAGE_MARKER_RE.match(stripped)
+        if page_marker_match:
+            explicit_page = page_marker_match.group(1)
+            if explicit_page:
+                current_page = int(explicit_page)
+            else:
+                current_page += 1
             idx += 1
             continue
 
@@ -146,8 +167,8 @@ def extract_canonical_blocks(
                     block_type="code",
                     normalized_text=normalized_code,
                     content_hash=chash,
-                    page_from=page_from,
-                    page_to=page_to,
+                    page_from=current_page,
+                    page_to=current_page,
                     section_path=section_path,
                     source_anchor=f"block-{ordinal}",
                 )
@@ -175,8 +196,8 @@ def extract_canonical_blocks(
                     block_type="heading",
                     normalized_text=heading_title,
                     content_hash=chash,
-                    page_from=page_from,
-                    page_to=page_to,
+                    page_from=current_page,
+                    page_to=current_page,
                     section_path=section_path,
                     source_anchor=f"h{level}-{ordinal}",
                     metadata={"heading_level": level},
@@ -205,8 +226,8 @@ def extract_canonical_blocks(
                     block_type="table",
                     normalized_text=normalized_table,
                     content_hash=chash,
-                    page_from=page_from,
-                    page_to=page_to,
+                    page_from=current_page,
+                    page_to=current_page,
                     section_path=section_path,
                     source_anchor=f"tbl-{ordinal}",
                 )
@@ -221,7 +242,7 @@ def extract_canonical_blocks(
             while idx < total_lines:
                 curr = lines[idx]
                 curr_stripped = curr.strip()
-                if not curr_stripped:
+                if not curr_stripped or _PAGE_MARKER_RE.match(curr_stripped):
                     break
                 if _LIST_ITEM_RE.match(curr_stripped) or curr.startswith(("  ", "\t")):
                     list_lines.append(curr)
@@ -240,8 +261,8 @@ def extract_canonical_blocks(
                     block_type="list",
                     normalized_text=normalized_list,
                     content_hash=chash,
-                    page_from=page_from,
-                    page_to=page_to,
+                    page_from=current_page,
+                    page_to=current_page,
                     section_path=section_path,
                     source_anchor=f"list-{ordinal}",
                 )
@@ -255,9 +276,10 @@ def extract_canonical_blocks(
         while idx < total_lines:
             curr = lines[idx]
             curr_stripped = curr.strip()
-            # Dừng paragraph khi gặp dòng trống, heading, code block, hoặc table
+            # Dừng paragraph khi gặp dòng trống, page break, heading, code block, hoặc table
             if (
                 not curr_stripped
+                or _PAGE_MARKER_RE.match(curr_stripped)
                 or curr_stripped.startswith("```")
                 or _HEADING_RE.match(curr_stripped)
                 or _TABLE_ROW_RE.match(curr)
@@ -279,8 +301,8 @@ def extract_canonical_blocks(
                 block_type="paragraph",
                 normalized_text=normalized_para,
                 content_hash=chash,
-                page_from=page_from,
-                page_to=page_to,
+                page_from=current_page,
+                page_to=current_page,
                 section_path=section_path,
                 source_anchor=f"p-{ordinal}",
                 is_boilerplate=is_bp,
@@ -290,3 +312,4 @@ def extract_canonical_blocks(
         ordinal += 1
 
     return blocks
+

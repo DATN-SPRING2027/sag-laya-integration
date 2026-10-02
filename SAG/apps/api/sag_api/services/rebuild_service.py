@@ -39,11 +39,19 @@ async def rebuild_search_index_for_version(
     if not security_partition_id:
         raise ValueError(f"DocumentVersion {document_version_id} has no security_partition_id; fail closed")
 
+    doc = await session.get(Document, doc_ver.document_id)
+    if doc and doc.project_id and doc.project_id != project_id:
+        raise ValueError(
+            f"DocumentVersion {document_version_id} belongs to project {doc.project_id}, not {project_id}; fail closed"
+        )
+    tenant_id = doc.tenant_id if doc and doc.tenant_id else "tenant_default"
+
     units = await run_search_indexing_stage(
         session,
         project_id=project_id,
         document_version=doc_ver,
         security_partition_id=security_partition_id,
+        tenant_id=tenant_id,
         qdrant_client=qdrant_client,
         embedder=embedder,
     )
@@ -59,25 +67,18 @@ async def rebuild_search_index_for_project(
 ) -> dict[str, Any]:
     """Rebuild all Qdrant vector points for an entire project from PostgreSQL.
 
-    Guarantees strict tenant/project isolation: only versions associated with project_id
-    via Document or IngestionRun mapping are re-indexed into search_units_{project_id}.
-    Fails closed if any version lacks a confirmed security_partition_id.
+    Guarantees strict tenant/project isolation: Document.project_id is the authoritative
+    source of truth. Fails closed if any version has a conflicting IngestionRun project_id
+    or lacks a confirmed security_partition_id.
     """
     collection_name = f"search_units_{project_id}"
-    await ensure_qdrant_collection_and_indexes(qdrant_client, collection_name=collection_name)
 
-    # Strictly scope query to DocumentVersions belonging to requested project_id
+    # Strictly scope query to DocumentVersions belonging to requested project_id via Document
     stmt = (
         select(DocumentVersion)
         .join(SearchUnit, SearchUnit.document_version_id == DocumentVersion.id)
-        .outerjoin(Document, Document.id == DocumentVersion.document_id)
-        .outerjoin(IngestionRun, IngestionRun.document_version_id == DocumentVersion.id)
-        .where(
-            or_(
-                Document.project_id == project_id,
-                IngestionRun.project_id == project_id,
-            )
-        )
+        .join(Document, Document.id == DocumentVersion.document_id)
+        .where(Document.project_id == project_id)
         .distinct()
     )
     versions = (await session.execute(stmt)).scalars().all()
@@ -85,6 +86,29 @@ async def rebuild_search_index_for_project(
     rebuilt_versions = 0
     total_units = 0
     for ver in versions:
+        # Cross-project conflict check: IngestionRun project_id must not conflict with requested project_id
+        conflicting_run = (
+            await session.execute(
+                select(IngestionRun.project_id)
+                .where(IngestionRun.document_version_id == ver.id)
+                .where(IngestionRun.project_id != project_id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if conflicting_run:
+            log.error(
+                "Rebuild cross-project conflict: DocumentVersion %s belongs to project %s but has IngestionRun with project %s",
+                ver.id,
+                project_id,
+                conflicting_run,
+            )
+            ver.search_status = "INDEX_FAILED"
+            session.add(ver)
+            await session.commit()
+            raise ValueError(
+                f"DocumentVersion {ver.id} has conflicting IngestionRun project_id {conflicting_run} vs expected {project_id}; rebuild failed closed"
+            )
+
         # Determine security partition strictly; fail closed if unmapped
         sec_partition = (ver.metadata_json or {}).get("security_partition_id")
         if not sec_partition:
@@ -109,11 +133,15 @@ async def rebuild_search_index_for_project(
                 f"DocumentVersion {ver.id} has unmapped security_partition_id; rebuild failed closed"
             )
 
+        doc = await session.get(Document, ver.document_id)
+        tenant_id = doc.tenant_id if doc and doc.tenant_id else "tenant_default"
+
         units = await run_search_indexing_stage(
             session,
             project_id=project_id,
             document_version=ver,
             security_partition_id=sec_partition,
+            tenant_id=tenant_id,
             qdrant_client=qdrant_client,
             embedder=embedder,
         )
