@@ -22,8 +22,9 @@
 | **Tính lũy đẳng khi Retry & Reprocess** | Sử dụng UUIDv5 tất định cho Qdrant Point ID; reprocess xóa điểm cũ theo `document_version_id` và nạp lại chính xác mà không nhân bản SearchUnit. | `test_checkpoint_a_idempotent_retry_and_reprocess` | **PASSED** |
 | **Lọc và che giấu bí mật (Zero Secret Leakage)** | Module `sag_api.core.sanitizer` tẩy rửa toàn bộ Bearer token, `sk-...`, `ak-...`, basic auth URL, và query parameters nhạy cảm (`api_key`, `password`, `token`, `access_token`, `client_secret`) trong error message / log / DB. | `test_checkpoint_a_zero_secret_leakage` | **PASSED** |
 | **Khôi phục thảm họa (Disaster Recovery - SSOT)** | PostgreSQL là nguồn chân lý duy nhất (SSOT); hàm `rebuild_search_index_for_project` phục hồi nguyên trạng Qdrant vector index và verify manifest thành công khi xóa trắng Qdrant. | `test_checkpoint_a_disaster_recovery_rebuild` | **PASSED** |
-| **Lỗi Extraction sau khi Index không hạ `SEARCH_READY`** | Đảm bảo khi Phase 2C đã xác minh `SEARCH_READY`, lỗi từ legacy extraction hoặc LLM enrichment phía sau không được phép hạ cấp `search_status` hoặc xóa `search_ready_at`. | `test_checkpoint_a_extraction_failure_after_indexing_does_not_downgrade_search_ready` | **PASSED** |
+| **Lỗi Extraction sau khi Index không hạ `SEARCH_READY`** | Đảm bảo khi Phase 2C đã xác minh `SEARCH_READY`, lỗi từ legacy extraction hoặc LLM enrichment phía sau không được phép hạ cấp `search_status` hoặc xóa `search_ready_at`, đồng thời giữ `Document.status = READY` để evidence service resolve locator chính xác. | `test_checkpoint_a_extraction_failure_after_indexing_does_not_downgrade_search_ready` | **PASSED** |
 | **Kiểm thử E2E từ Upload API đến Manifest** | Chạy toàn bộ chu trình thực tế từ HTTP multipart upload API (`POST /api/v1/projects/{project_id}/documents/upload`) đến worker xử lý và xác minh Qdrant manifest. | `test_checkpoint_a_e2e_real_upload_api_to_manifest_verified` | **PASSED** |
+| **Xử lý Whitespace Anchor Fallback & Locator** | Khi `source_anchor` chỉ chứa khoảng trắng (`"   "`), tự động fallback sang `block-<id[:8]>`, cập nhật DB và verify resolve thành công qua `resolve_traceable_evidence`. | `test_checkpoint_a_whitespace_source_anchor_fallback_and_locator_resolution` | **PASSED** |
 
 ---
 
@@ -69,9 +70,18 @@ Các trường payload được đánh index lọc (`PAYLOAD_INDEX_FIELDS`):
 
 ### 3. Phản Hồi & Khắc Phục Các Finding Trong Code Review PR #16
 
-- **Finding 1 [P1 - Isolation]:** Đã cập nhật outer exception handler trong `tasks.py` để bảo tồn `ver.search_status == "SEARCH_READY"` và `ver.search_ready_at` khi `engine_manager.process_document()` gặp lỗi; bổ sung `test_checkpoint_a_extraction_failure_after_indexing_does_not_downgrade_search_ready`.
-- **Finding 2 [P1 - Sanitizer]:** Mở rộng regex trong `sanitizer.py` nhận diện cả snake_case và kebab-case (`api_key`, `access_token`, `client_secret`, `password`, `secret`), dọn dẹp `_URL` thừa; mở rộng assertion trong `test_checkpoint_a_zero_secret_leakage`.
-- **Finding 3 [P2 - Locator Anchor]:** Cung cấp fallback tất định `s_anchor = (b_start.source_anchor if b_start and b_start.source_anchor else None) or f"block-{unit.block_from_id[:8]}"`, cập nhật ngược vào `b_start.source_anchor`; bổ sung assertion kiểm tra `source_anchor`, `page_from/to`, `section_path` trong payload.
+- **Finding 1 [P1 - Isolation & Evidence Eligibility]:** 
+  - Đã cập nhật outer exception handler trong `tasks.py` để bảo tồn `ver.search_status == "SEARCH_READY"` và `ver.search_ready_at` khi `engine_manager.process_document()` gặp lỗi.
+  - Đồng thời thiết lập `doc.status = DocumentStatus.READY` nếu `is_search_ready` là `True` để thoả mãn điều kiện lọc `Document.status == READY` tại `evidence_service.py:180`, tránh việc kết quả tìm kiếm bị loại bỏ khỏi evidence pack.
+  - Cập nhật test case `test_checkpoint_a_extraction_failure_after_indexing_does_not_downgrade_search_ready` xác thực `resolve_traceable_evidence` resolve locator thành công.
+- **Finding 2 [P1 - Sanitizer & Log Sinks]:** 
+  - Mở rộng regex trong `sanitizer.py` nhận diện snake_case và kebab-case (`api_key`, `access_token`, `client_secret`, `password`, `secret`, `refresh_token`, `id_token`), dọn dẹp `_URL` thừa.
+  - Tẩy rửa toàn bộ các log sink trực tiếp (`emb_exc`, `del_err`, `count_err`, `scroll_res.text`, `scroll_err`) bằng `sanitize_error_message`.
+  - Mở rộng assertion trong `test_checkpoint_a_zero_secret_leakage` dùng `caplog` kiểm chứng không rò rỉ secret trong log.
+- **Finding 3 [P2 - Locator Anchor & Whitespace Fallback]:** 
+  - Cung cấp fallback tất định `s_anchor = (raw_anchor.strip() if raw_anchor and raw_anchor.strip() else f"block-{unit.block_from_id[:8]}")`. Xử lý trường hợp anchor chỉ chứa khoảng trắng `"   "`.
+  - Đồng bộ fallback anchor ngược lại vào `CanonicalBlock.source_anchor` và flush vào database.
+  - Thêm test case `test_checkpoint_a_whitespace_source_anchor_fallback_and_locator_resolution`.
 - **Finding 4 [P2 - Observability]:** Thêm logic ghi nhận `StageRun(stage="INDEX_SEARCH", status="FAILED", ...)` trong khối xử lý lỗi của worker sau khi rollback; bổ sung assertion kiểm tra `StageRun` tồn tại trong DB sau lỗi.
 - **Finding 5 [P2 - E2E Test]:** Bổ sung test case `test_checkpoint_a_e2e_real_upload_api_to_manifest_verified` kiểm chứng luồng liên thông từ HTTP Upload API đến manifest verified.
 
@@ -87,20 +97,21 @@ configfile: pyproject.toml
 plugins: anyio-4.15.1, langsmith-0.8.5, asyncio-1.4.0
 asyncio: mode=Mode.AUTO
 
-apps/api/tests/test_checkpoint_a_ingestion.py::test_checkpoint_a_e2e_upload_to_manifest_verified PASSED [  8%]
-apps/api/tests/test_checkpoint_a_ingestion.py::test_checkpoint_a_universe_refresh_failure_does_not_downgrade_search_ready PASSED [ 16%]
-apps/api/tests/test_checkpoint_a_enrichment_disabled_or_lag_does_not_block_search PASSED [ 25%]
-apps/api/tests/test_checkpoint_a_parse_failure_fails_closed PASSED [ 33%]
-apps/api/tests/test_checkpoint_a_indexing_failure_fails_closed PASSED [ 41%]
-apps/api/tests/test_checkpoint_a_manifest_checksum_mismatch_fails_closed PASSED [ 50%]
-apps/api/tests/test_checkpoint_a_empty_index_fails_gracefully PASSED [ 58%]
-apps/api/tests/test_checkpoint_a_idempotent_retry_and_reprocess PASSED [ 66%]
-apps/api/tests/test_checkpoint_a_zero_secret_leakage PASSED [ 75%]
-apps/api/tests/test_checkpoint_a_disaster_recovery_rebuild PASSED [ 83%]
-apps/api/tests/test_checkpoint_a_extraction_failure_after_indexing_does_not_downgrade_search_ready PASSED [ 91%]
-apps/api/tests/test_checkpoint_a_e2e_real_upload_api_to_manifest_verified PASSED [100%]
+apps/api/tests/test_checkpoint_a_ingestion.py::test_checkpoint_a_e2e_upload_to_manifest_verified PASSED [  7%]
+apps/api/tests/test_checkpoint_a_ingestion.py::test_checkpoint_a_universe_refresh_failure_does_not_downgrade_search_ready PASSED [ 15%]
+apps/api/tests/test_checkpoint_a_enrichment_disabled_or_lag_does_not_block_search PASSED [ 23%]
+apps/api/tests/test_checkpoint_a_parse_failure_fails_closed PASSED [ 30%]
+apps/api/tests/test_checkpoint_a_indexing_failure_fails_closed PASSED [ 38%]
+apps/api/tests/test_checkpoint_a_manifest_checksum_mismatch_fails_closed PASSED [ 46%]
+apps/api/tests/test_checkpoint_a_empty_index_fails_gracefully PASSED [ 53%]
+apps/api/tests/test_checkpoint_a_idempotent_retry_and_reprocess PASSED [ 61%]
+apps/api/tests/test_checkpoint_a_zero_secret_leakage PASSED [ 69%]
+apps/api/tests/test_checkpoint_a_disaster_recovery_rebuild PASSED [ 76%]
+apps/api/tests/test_checkpoint_a_extraction_failure_after_indexing_does_not_downgrade_search_ready PASSED [ 84%]
+apps/api/tests/test_checkpoint_a_e2e_real_upload_api_to_manifest_verified PASSED [ 92%]
+apps/api/tests/test_checkpoint_a_whitespace_source_anchor_fallback_and_locator_resolution PASSED [100%]
 
-======================== 12 passed, 1 warning in 3.34s ========================
+======================== 13 passed, 1 warning in 2.74s ========================
 ```
 
 Suite bổ trợ liên quan:
@@ -108,4 +119,4 @@ Suite bổ trợ liên quan:
 - `apps/api/tests/test_phase_2c_search_indexing.py`: 17/17 passed
 - `apps/api/tests/test_traceability.py`: 2/2 passed
 - `apps/api/tests/test_phase_1_upload_and_versioning.py`: 34/34 passed
-- **Tổng cộng: 71/71 passed**
+- **Tổng cộng: 72/72 passed (100%)**

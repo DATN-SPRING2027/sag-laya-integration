@@ -142,7 +142,7 @@ async def ensure_qdrant_collection_and_indexes(
     except Exception as check_exc:
         if isinstance(check_exc, ValueError):
             raise
-        log.debug("Collection check skipped or non-fatal: %s", check_exc)
+        log.debug("Collection check skipped or non-fatal: %s", sanitize_error_message(check_exc))
 
     # 1. Create collection with dense and sparse vectors
     try:
@@ -171,7 +171,7 @@ async def ensure_qdrant_collection_and_indexes(
     except Exception as exc:
         if isinstance(exc, (RuntimeError, ValueError)):
             raise
-        log.warning("Could not ensure Qdrant collection %s: %s", collection_name, exc)
+        log.warning("Could not ensure Qdrant collection %s: %s", collection_name, sanitize_error_message(exc))
 
     # 2. Pre-provision payload indexes for fast filtering; fail stage if index creation fails
     for field_name, field_schema in PAYLOAD_INDEX_FIELDS:
@@ -407,8 +407,9 @@ async def index_search_units_to_qdrant(
     for unit, vec, text in zip(units, vectors, texts):
         point_id = generate_search_unit_point_id(collection_name, unit.id)
         b_start = blocks_by_id.get(unit.block_from_id) if blocks_by_id else None
-        s_anchor = (b_start.source_anchor if b_start and b_start.source_anchor else None) or f"block-{unit.block_from_id[:8]}"
-        if b_start and not b_start.source_anchor:
+        raw_anchor = b_start.source_anchor if b_start and b_start.source_anchor else None
+        s_anchor = raw_anchor.strip() if raw_anchor and raw_anchor.strip() else f"block-{unit.block_from_id[:8]}"
+        if b_start and (not b_start.source_anchor or not b_start.source_anchor.strip()):
             b_start.source_anchor = s_anchor
         payload = build_qdrant_payload(
             unit,
@@ -606,7 +607,7 @@ async def run_search_indexing_stage(
                     f"Qdrant point cleanup failed before indexing: HTTP {del_res.status_code} - {del_res.text}"
                 )
         except Exception as del_err:
-            log.error("Could not delete prior points from Qdrant: %s", del_err)
+            log.error("Could not delete prior points from Qdrant: %s", sanitize_error_message(del_err))
             document_version.search_status = "INDEX_FAILED"
             session.add(document_version)
             await session.commit()
@@ -638,6 +639,10 @@ async def run_search_indexing_stage(
             indexing_error = str(exc)
             indexed_count = 0
 
+    for b in blocks:
+        session.add(b)
+    await session.flush()
+
     # 6. Verify Manifest and update Search Readiness
     # Verify count in PostgreSQL
     pg_count = (
@@ -666,7 +671,7 @@ async def run_search_indexing_stage(
                 if "count" in res_data:
                     qdrant_count = int(res_data["count"])
         except Exception as count_err:
-            log.warning("Could not query points count from Qdrant: %s", count_err)
+            log.warning("Could not query points count from Qdrant: %s", sanitize_error_message(count_err))
 
     items = sorted(f"{generate_search_unit_point_id(collection_name, u.id)}:{u.content_hash}" for u in units)
     manifest_checksum = hashlib.sha256(";".join(items).encode("utf-8")).hexdigest()
@@ -696,7 +701,7 @@ async def run_search_indexing_stage(
                     json=scroll_body,
                 )
                 if not scroll_res.is_success:
-                    log.warning("Qdrant scroll returned status %d: %s", scroll_res.status_code, scroll_res.text)
+                    log.warning("Qdrant scroll returned status %d: %s", scroll_res.status_code, sanitize_error_message(scroll_res.text))
                     all_q_points = None
                     break
 
@@ -713,7 +718,7 @@ async def run_search_indexing_stage(
                 )
                 qdrant_checksum = hashlib.sha256(";".join(q_items).encode("utf-8")).hexdigest()
         except Exception as scroll_err:
-            log.warning("Could not read back points from Qdrant for checksum: %s", scroll_err)
+            log.warning("Could not read back points from Qdrant for checksum: %s", sanitize_error_message(scroll_err))
             qdrant_checksum = None
 
     manifest_verified = False

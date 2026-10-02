@@ -441,7 +441,7 @@ async def _process_document_unlocked(
                         try:
                             embedder = await engine_manager.get_sag_embedding(source.sag_source_config_id, source)
                         except Exception as emb_exc:
-                            log.warning("Could not get sag embedding client: %s", emb_exc)
+                            log.warning("Could not get sag embedding client: %s", sanitize_error_message(emb_exc))
 
                         current_pipeline_stage = "INDEX"
                         from sag_api.services.search_index_service import run_search_indexing_stage
@@ -575,6 +575,17 @@ async def _process_document_unlocked(
             parser_failure_values = _parser_state_values(parser_state)
             parser_failure_values["parser_status"] = "failed"
             parser_failure_values["fallback_reason"] = _redact_parser_reason(message)
+        # Kiểm tra xem tài liệu đã đạt SEARCH_READY trước đó hay chưa (Phase 2C đã commit)
+        is_search_ready = False
+        if run_id:
+            ing_run_chk = await session.get(IngestionRun, run_id)
+            if ing_run_chk:
+                ver_chk = await session.get(DocumentVersion, ing_run_chk.document_version_id)
+                if ver_chk and ver_chk.search_status == "SEARCH_READY":
+                    is_search_ready = True
+
+        doc_target_status = DocumentStatus.READY if is_search_ready else DocumentStatus.FAILED
+
         failed = await session.execute(
             update(Document)
             .where(
@@ -582,7 +593,7 @@ async def _process_document_unlocked(
                 Document.status == expected_status,
             )
             .values(
-                status=DocumentStatus.FAILED,
+                status=doc_target_status,
                 error=public_message,
                 error_layer=layer.value,
                 error_stage=stage.value,
@@ -612,7 +623,8 @@ async def _process_document_unlocked(
                 if ver:
                     # Nếu Phase 2C đã hoàn tất và SEARCH_READY, lỗi extraction/LLM hoặc enrichment
                     # phía sau không được phép hạ cấp hoặc xóa trạng thái tìm kiếm
-                    if ver.search_status == "SEARCH_READY":
+                    if is_search_ready:
+                        ver.status = "SEARCH_READY"
                         ver.knowledge_status = "FAILED"
                     else:
                         ver.status = "FAILED"

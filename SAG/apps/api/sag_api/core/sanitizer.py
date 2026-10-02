@@ -12,7 +12,7 @@ import re
 _BEARER_TOKEN = re.compile(r"(?i)bearer\s+\S+")
 _API_KEY = re.compile(r"(?i)\b(?:sk|ak)-[a-z0-9._-]{6,}\b")
 _SECRET_QUERY_KEYS = re.compile(
-    r"(?i)([?&](?:token|key|signature|credential|authorization|auth|api[-_]?key|access[-_]?token|client[-_]?secret|password|secret|x-amz-[^=]+)=)[^&#\s]+"
+    r"(?i)([?&](?:token|key|signature|credential|authorization|auth|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|client[-_]?secret|password|secret|x-amz-[^=]+)=)[^&#\s]+"
 )
 _URL_CREDENTIALS = re.compile(r"(?i)(https?://)([^:\s/]+:[^@\s/]+@)")
 

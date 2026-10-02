@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import hashlib
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -25,6 +26,7 @@ from sag_api.core.db import SessionLocal, init_db
 from sag_api.core.error_taxonomy import ErrorLayer, ErrorStage
 from sag_api.core.errors import ApiError
 from sag_api.core.sanitizer import sanitize_error_message
+from sag_api.core.security import create_access_token
 from sag_api.db.models import Document, Job, Source
 from sag_api.db.models.routing_rag import (
     CanonicalBlock,
@@ -35,9 +37,10 @@ from sag_api.db.models.routing_rag import (
 )
 from sag_api.enums import DocumentStatus, JobStatus, JobType
 from sag_api.jobs.tasks import _process_document_unlocked
-from sag_api.core.security import create_access_token
 from sag_api.main import app
+from sag_api.sag import RetrievedSection
 from sag_api.services.document_service import get_document_version_status
+from sag_api.services.evidence_service import has_traceable_locator, resolve_traceable_evidence
 from sag_api.services.rebuild_service import rebuild_search_index_for_project
 from sag_api.services.search_index_service import (
     build_search_units_from_blocks,
@@ -708,13 +711,14 @@ async def test_checkpoint_a_idempotent_retry_and_reprocess(tmp_path):
 # Gate 9: Zero Secret Leakage in DB and Logs
 # ==============================================================================
 @pytest.mark.asyncio
-async def test_checkpoint_a_zero_secret_leakage():
+async def test_checkpoint_a_zero_secret_leakage(caplog: pytest.LogCaptureFixture):
     """Kịch bản 9: Không rò rỉ secret trong error_message, log và database."""
     raw_leak = (
         "Failed to request https://admin_user:super_secret_password_123@qdrant.internal:6333/points"
         "?api-key=secret_query_key_xyz&token=secret_query_token_abc"
         "&api_key=secret_snake_key&password=secret_password_val"
-        "&access_token=secret_access_tok&client_secret=secret_client_sec "
+        "&access_token=secret_access_tok&client_secret=secret_client_sec"
+        "&refresh_token=secret_refresh_tok&id_token=secret_id_tok "
         "using Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.sensitive_payload.signature "
         "and OpenAI key sk-proj-1234567890abcdef1234567890"
     )
@@ -728,12 +732,23 @@ async def test_checkpoint_a_zero_secret_leakage():
     assert "secret_password_val" not in cleaned
     assert "secret_access_tok" not in cleaned
     assert "secret_client_sec" not in cleaned
+    assert "secret_refresh_tok" not in cleaned
+    assert "secret_id_tok" not in cleaned
     assert "sk-proj-1234567890abcdef1234567890" not in cleaned
     assert "sensitive_payload" not in cleaned
 
     assert "[REDACTED]" in cleaned
     assert "Bearer [REDACTED]" in cleaned
     assert "https://[REDACTED]@qdrant.internal:6333" in cleaned
+
+    # Kiểm tra log sink trực tiếp với logger
+    test_logger = logging.getLogger("sag_api.test_sanitizer")
+    test_logger.warning("Sanitized sink test: %s", sanitize_error_message(raw_leak))
+    assert "super_secret_password_123" not in caplog.text
+    assert "secret_refresh_tok" not in caplog.text
+    assert "secret_id_tok" not in caplog.text
+    assert "sk-proj-1234567890abcdef1234567890" not in caplog.text
+    assert "[REDACTED]" in caplog.text
 
     await init_db()
     project_id = f"proj_{uuid.uuid4().hex[:8]}"
@@ -774,8 +789,16 @@ async def test_checkpoint_a_zero_secret_leakage():
 
         sr = (await session.execute(select(StageRun).where(StageRun.run_id == run_id))).scalar_one()
         assert "super_secret_password_123" not in sr.error_message
+        assert "secret_refresh_tok" not in sr.error_message
+        assert "secret_id_tok" not in sr.error_message
         assert "sk-proj-1234567890abcdef1234567890" not in sr.error_message
         assert "[REDACTED]" in sr.error_message
+
+        # Khẳng định log sink của search_index_service cũng không chứa secret trong caplog
+        assert "super_secret_password_123" not in caplog.text
+        assert "secret_refresh_tok" not in caplog.text
+        assert "secret_id_tok" not in caplog.text
+        assert "sk-proj-1234567890abcdef1234567890" not in caplog.text
 
 
 # ==============================================================================
@@ -883,15 +906,34 @@ async def test_checkpoint_a_extraction_failure_after_indexing_does_not_downgrade
                 await _process_document_unlocked(session, job, engine_manager=FailingExtractionEngine(vector_dim=3))
 
     async with SessionLocal() as check_session:
-        # Document bị FAILED do legacy extraction thất bại
+        # Document vẫn giữ READY để không làm mất tính khả truy/truy xuất evidence của version SEARCH_READY
         doc_db = (await check_session.execute(select(Document).where(Document.id == doc_id))).scalar_one()
-        assert doc_db.status == DocumentStatus.FAILED
+        assert doc_db.status == DocumentStatus.READY
 
         # Tuy nhiên DocumentVersion vẫn giữ nguyên SEARCH_READY và search_ready_at vì Qdrant manifest đã verified
         ver_db = (await check_session.execute(select(DocumentVersion).where(DocumentVersion.id == ver_id))).scalar_one()
         assert ver_db.search_status == "SEARCH_READY"
         assert ver_db.search_ready_at is not None
         assert ver_db.knowledge_status == "FAILED"
+
+        # Khẳng định evidence locator thực sự resolve thành công qua resolve_traceable_evidence
+        src_db = (await check_session.execute(select(Source).where(Source.id == source_id))).scalar_one()
+        unit_db = (await check_session.execute(select(SearchUnit).where(SearchUnit.document_version_id == ver_id))).scalars().first()
+        assert unit_db is not None
+
+        section = RetrievedSection(
+            chunk_id=unit_db.id,
+            heading="Section",
+            content="Search ready content",
+            source_config_id=src_db.sag_source_config_id,
+        )
+        resolved = await resolve_traceable_evidence([section], [src_db])
+        assert len(resolved) == 1
+        assert has_traceable_locator(resolved[0])
+        assert resolved[0].document_id == doc_id
+        assert resolved[0].document_version_id == ver_id
+        assert resolved[0].version_no == 1
+        assert resolved[0].anchor is not None and resolved[0].anchor.strip() != ""
 
 
 # ==============================================================================
@@ -955,4 +997,122 @@ async def test_checkpoint_a_e2e_real_upload_api_to_manifest_verified():
         assert payload.get("source_anchor") is not None
         assert payload.get("page_from", 0) >= 1
         assert payload.get("page_to", 0) >= payload.get("page_from", 1)
+
+
+# ==============================================================================
+# Gate 13: Whitespace Source Anchor Fallback and Locator Resolution (Finding 3)
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_checkpoint_a_whitespace_source_anchor_fallback_and_locator_resolution():
+    """Kiểm tra anchor chỉ chứa khoảng trắng ('   ') tự động fallback sang block-<id[:8]>
+    và resolve thành công trong evidence_service mà không bị loại bỏ.
+    """
+    await init_db()
+    project_id = f"proj_ws_{uuid.uuid4().hex[:8]}"
+    source_id = f"src_ws_{uuid.uuid4().hex[:8]}"
+    doc_id = str(uuid.uuid4())
+    ver_id = str(uuid.uuid4())
+    run_id = str(uuid.uuid4())
+    block_id = str(uuid.uuid4())
+
+    q_mock = MockQdrantStorage(vector_dim=3)
+
+    async with SessionLocal() as session:
+        src = Source(
+            id=source_id,
+            name="Source WS",
+            sag_source_config_id=f"cfg_{project_id}",
+        )
+        session.add(src)
+        await session.commit()
+
+        doc = Document(
+            id=doc_id,
+            filename="ws_anchor.md",
+            storage_path="/tmp/ws_anchor.md",
+            project_id=project_id,
+            tenant_id="tenant_default",
+            source_id=source_id,
+            status=DocumentStatus.READY,
+            is_active=True,
+        )
+        session.add(doc)
+        await session.commit()
+
+        ver = DocumentVersion(
+            id=ver_id,
+            document_id=doc_id,
+            version_no=1,
+            file_hash="hash_ws",
+            valid_from=datetime.now(UTC),
+            metadata_json={"security_partition_id": "sec_ws"},
+        )
+        session.add(ver)
+        await session.commit()
+
+        block = CanonicalBlock(
+            id=block_id,
+            document_version_id=ver_id,
+            ordinal=0,
+            block_type="paragraph",
+            page_from=1,
+            page_to=1,
+            section_path="Section WS",
+            source_anchor="   ",  # Chỉ chứa khoảng trắng
+            normalized_text="Content with whitespace anchor.",
+            content_hash="hash_blk_ws",
+        )
+        run = IngestionRun(
+            id=run_id,
+            tenant_id="tenant_default",
+            project_id=project_id,
+            document_version_id=ver_id,
+            idempotency_key=f"ws_{run_id}",
+            payload_hash="hash_run_ws",
+            status="RUNNING",
+        )
+        session.add_all([block, run])
+        await session.commit()
+
+        client = q_mock.make_client()
+        embedder = (await FakeIngestionEngine(vector_dim=3).get_sag_embedding("dummy_cfg"))
+
+        await run_search_indexing_stage(
+            session,
+            project_id=project_id,
+            document_version=ver,
+            security_partition_id="sec_ws",
+            qdrant_client=client,
+            embedder=embedder,
+            run_id=run_id,
+        )
+        await session.commit()
+
+    col_name = f"search_units_{project_id}"
+    points = list(q_mock.points[col_name].values())
+    assert len(points) == 1
+    expected_fallback_anchor = f"block-{block_id[:8]}"
+    assert points[0]["payload"]["source_anchor"] == expected_fallback_anchor
+    assert points[0]["payload"]["source_anchor"].strip() != ""
+
+    async with SessionLocal() as check_session:
+        # DB block source_anchor cũng được chuẩn hóa thành fallback
+        b_db = (await check_session.execute(select(CanonicalBlock).where(CanonicalBlock.id == block_id))).scalar_one()
+        assert b_db.source_anchor == expected_fallback_anchor
+
+        u_db = (await check_session.execute(select(SearchUnit).where(SearchUnit.document_version_id == ver_id))).scalar_one()
+
+        # Evidence resolution thành công và có traceable locator
+        src_db = (await check_session.execute(select(Source).where(Source.id == source_id))).scalar_one()
+        section = RetrievedSection(
+            chunk_id=u_db.id,
+            heading="Section WS",
+            content="Content with whitespace anchor.",
+            source_config_id=src_db.sag_source_config_id,
+        )
+        resolved = await resolve_traceable_evidence([section], [src_db])
+        assert len(resolved) == 1
+        assert has_traceable_locator(resolved[0])
+        assert resolved[0].anchor == expected_fallback_anchor
+
 
