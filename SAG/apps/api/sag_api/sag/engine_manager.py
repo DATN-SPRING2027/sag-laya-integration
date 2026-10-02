@@ -23,6 +23,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
+import httpx
 from zleap.sag import DataEngine
 from zleap.sag.pipeline import SearchOptions, SearchRequest, SearchScope
 
@@ -254,6 +255,9 @@ class EngineManager:
     def __init__(self, settings: Settings):
         self._settings = settings
         self._slots: dict[str, _Slot] = {}
+        self._search_unit_qdrant_client: httpx.AsyncClient | None = None
+        self._search_unit_qdrant_client_config: tuple[str, str | None, float] | None = None
+        self._search_unit_qdrant_client_lock = asyncio.Lock()
         self._create_lock = asyncio.Lock()
         # SQLite permits one writer at a time.  Keep local document mutations
         # serialized across source slots; server databases retain full concurrency.
@@ -265,6 +269,39 @@ class EngineManager:
         # 一次性 monkey-patch zleap 检索链,把每 step 的 `_timings` 送回 SearchOutcome.stats
         # 0.8.2 检索模块已重写,probe 内部 ImportError 时静默跳过(REQ-7 待 zleap 内置耗时统计)。
         _install_timings_probe()
+
+    async def get_search_unit_qdrant_client(self) -> httpx.AsyncClient:
+        """Return a runtime-managed HTTP client for canonical SearchUnit queries."""
+        url = self._settings.sag_qdrant_url.rstrip("/")
+        api_key = self._settings.sag_qdrant_api_key
+        timeout = max(1.0, float(self._settings.search_source_timeout))
+        client_config = (url, api_key, timeout)
+        async with self._search_unit_qdrant_client_lock:
+            if self._search_unit_qdrant_client_config != client_config:
+                await self._close_search_unit_qdrant_client_locked()
+            if self._search_unit_qdrant_client is None:
+                from sag_api.sag.search_unit_store import SearchIndexUnavailable
+
+                headers = {"api-key": api_key} if api_key else {}
+                try:
+                    self._search_unit_qdrant_client = httpx.AsyncClient(
+                        base_url=url,
+                        headers=headers,
+                        timeout=timeout,
+                    )
+                except httpx.InvalidURL:
+                    raise SearchIndexUnavailable(
+                        "Search index request configuration is invalid"
+                    ) from None
+                self._search_unit_qdrant_client_config = client_config
+            return self._search_unit_qdrant_client
+
+    async def _close_search_unit_qdrant_client_locked(self) -> None:
+        client = self._search_unit_qdrant_client
+        self._search_unit_qdrant_client = None
+        self._search_unit_qdrant_client_config = None
+        if client is not None:
+            await client.aclose()
 
     async def _relational_session_factory(
         self, source_config_id: str, source: Source | None = None
@@ -3228,3 +3265,8 @@ class EngineManager:
                             await slot.engine.aclose()
                     except Exception as e:  # noqa: BLE001
                         log.warning("关闭引擎失败 %s: %s", scid, e)
+        async with self._search_unit_qdrant_client_lock:
+            try:
+                await self._close_search_unit_qdrant_client_locked()
+            except Exception as error:  # noqa: BLE001 - do not log client configuration
+                log.warning("canonical Qdrant client close failed error_type=%s", type(error).__name__)

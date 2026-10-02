@@ -30,6 +30,8 @@ def _token(private_key, **overrides):
         "sub": "user-1",
         "orgId": "org-1",
         "allowedProjectIds": ["project-1"],
+        "tenantId": "tenant-1",
+        "allowedPartitionIds": ["partition-1"],
         "iat": now,
         "exp": now + 60,
         "jti": "assertion-1",
@@ -57,6 +59,8 @@ async def test_verifier_accepts_only_configured_signed_project_scope():
     assert principal.subject == "user-1"
     assert principal.organization_id == "org-1"
     assert principal.allowed_project_ids == frozenset({"project-1"})
+    assert principal.tenant_id == "tenant-1"
+    assert principal.allowed_partition_ids == frozenset({"partition-1"})
 
 
 @pytest.mark.asyncio
@@ -88,7 +92,10 @@ async def test_principal_dependency_rejects_duplicate_assertion_headers():
         {"orgId": ""},
         {"allowedProjectIds": "project-1"},
         {"allowedProjectIds": ["project-1", "project-1"]},
-        {"tenantId": "other-org"},
+        {"tenant_id": "other-org"},
+        {"tenantId": ""},
+        {"allowedPartitionIds": "partition-1"},
+        {"allowedPartitionIds": ["partition-1", "partition-1"]},
         {"organization_id": "other-org"},
         {"source_ids": ["source-1"]},
         {"allowed_project_ids": ["other-project"]},
@@ -483,6 +490,74 @@ async def test_empty_project_scope_and_mapping_failures_never_fall_back_to_globa
 
 
 @pytest.mark.asyncio
+async def test_canonical_search_may_include_only_confirmed_project_sources():
+    from sag_api.core.db import SessionLocal, init_db
+    from sag_api.core.principal_assertion import VerifiedPrincipal
+
+    await init_db()
+    authorized_id, pending_id = "checkpoint-project-source", "checkpoint-pending-project-source"
+    principal = VerifiedPrincipal(
+        subject="user-1",
+        organization_id="org-1",
+        allowed_project_ids=frozenset({"project-1"}),
+        issuer="https://continuum.test",
+        key_id="test-key",
+        token_id="project-source-scope",
+        issued_at=1,
+        expires_at=2,
+    )
+    async with SessionLocal() as session:
+        session.add_all(
+            [
+                Source(
+                    id=authorized_id,
+                    name="authorized Project Source",
+                    sag_source_config_id="checkpoint-config-confirmed",
+                    config={"is_project_source": True},
+                ),
+                Source(
+                    id=pending_id,
+                    name="pending Project Source",
+                    sag_source_config_id="checkpoint-config-pending",
+                    config={"is_project_source": True},
+                ),
+            ]
+        )
+        session.add_all(
+            [
+                SourceProjectMapping(
+                    source_id=authorized_id,
+                    organization_id="org-1",
+                    project_id="project-1",
+                    state="CONFIRMED",
+                    confirmed_at=datetime.now(UTC),
+                    confirmed_by="owner",
+                    approval_ref="checkpoint-a-test",
+                ),
+                SourceProjectMapping(
+                    source_id=pending_id,
+                    organization_id="org-1",
+                    project_id="project-1",
+                    state="PENDING",
+                ),
+            ]
+        )
+        await session.commit()
+        try:
+            assert await search_source_candidates(session, principal=principal) == []
+            canonical_sources = await search_source_candidates(
+                session,
+                principal=principal,
+                include_project_sources=True,
+            )
+            assert [source.id for source in canonical_sources] == [authorized_id]
+        finally:
+            await session.delete(await session.get(Source, authorized_id))
+            await session.delete(await session.get(Source, pending_id))
+            await session.commit()
+
+
+@pytest.mark.asyncio
 async def test_global_search_and_stream_reject_missing_assertion_before_retrieval():
     from sag_api.core.deps import get_engine_manager
     from sag_api.core.principal_assertion import require_principal_assertion
@@ -521,25 +596,37 @@ async def test_global_search_and_stream_reject_missing_assertion_before_retrieva
 
 
 @pytest.mark.asyncio
-async def test_global_scope_is_applied_before_dense_lexical_candidate_generation(monkeypatch):
+async def test_global_scope_is_applied_before_search_unit_candidate_generation(monkeypatch):
     from sag_api.api.v1 import search as search_api
     from sag_api.core.db import SessionLocal, init_db
     from sag_api.core.deps import get_engine_manager
     from sag_api.main import app
     from sag_api.sag.dto import SearchOutcome
+    from sag_api.services import search_unit_retrieval_service
 
     await init_db()
     authorized_id, foreign_id = "acl-route-authorized", "acl-route-foreign"
-    candidates: list[list[str]] = []
+    retrieval_scope: list[dict] = []
 
     class RecordingEngine:
-        async def search_many(self, targets, _query, **_kwargs):
-            candidates.append([("dense", source_config_id) for source_config_id, _source in targets])
-            return SearchOutcome(query="scoped", sections=[])
+        pass
 
-        async def grep_chunks(self, source_config_id, _pattern, **_kwargs):
-            candidates.append([("lexical", source_config_id)])
-            return []
+    async def record_search_unit_scope(_engine, sources, query, *, principal, top_k=None):
+        retrieval_scope.append(
+            {
+                "source_ids": [source.id for source in sources],
+                "query": query,
+                "project_ids": principal.allowed_project_ids,
+                "top_k": top_k,
+            }
+        )
+        return SearchOutcome(query=query, sections=[])
+
+    monkeypatch.setattr(
+        search_unit_retrieval_service,
+        "retrieve_search_unit_sections",
+        record_search_unit_scope,
+    )
 
     monkeypatch.setattr(
         search_api,
@@ -603,9 +690,13 @@ async def test_global_scope_is_applied_before_dense_lexical_candidate_generation
                     json={"query": "scoped", "source_ids": [foreign_id, authorized_id]},
                 )
         assert response.status_code == 200, response.text
-        assert candidates == [
-            [("dense", "acl-cfg-allowed")],
-            [("lexical", "acl-cfg-allowed")],
+        assert retrieval_scope == [
+            {
+                "source_ids": [authorized_id],
+                "query": "scoped",
+                "project_ids": frozenset({"pytest-project"}),
+                "top_k": None,
+            }
         ]
     finally:
         app.dependency_overrides.pop(get_engine_manager, None)
@@ -917,8 +1008,14 @@ async def test_explicit_empty_agent_source_filter_never_expands_to_all_sources(m
         source_ids=[],
     )
 
-    async def source_candidates(_session, *, principal, requested_source_ids=None):
-        calls.append(requested_source_ids)
+    async def source_candidates(
+        _session,
+        *,
+        principal,
+        requested_source_ids=None,
+        include_project_sources=False,
+    ):
+        calls.append((requested_source_ids, include_project_sources))
         return ["authorized-source"] if requested_source_ids is None else []
 
     monkeypatch.setattr(agent_domain, "search_source_candidates", source_candidates)
@@ -931,4 +1028,4 @@ async def test_explicit_empty_agent_source_filter_never_expands_to_all_sources(m
 
     assert plan.source_ids == []
     assert sources == []
-    assert calls == [[]]
+    assert calls == [([], False)]

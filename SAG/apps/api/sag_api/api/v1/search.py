@@ -325,6 +325,7 @@ async def _prepare_global_search(
         session,
         principal=principal,
         requested_source_ids=body.source_ids,
+        include_project_sources=True,
     )
     # Retrieval and answer generation can be long-running. End the read-only
     # transaction as soon as source identity has been materialized so an SSE
@@ -341,11 +342,13 @@ async def _prepare_global_search(
         )
 
     refs = {source.sag_source_config_id: source for source in sources}
-    outcome = await retrieve_relevant_sections(
+    from sag_api.services.search_unit_retrieval_service import retrieve_search_unit_sections
+
+    outcome = await retrieve_search_unit_sections(
         engine_manager,
         sources,
         body.query,
-        strategy=route_plan.strategy,
+        principal=principal,
         top_k=body.top_k,
     )
     permitted_config_ids = set(refs)

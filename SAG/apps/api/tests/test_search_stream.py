@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import uuid
@@ -115,7 +116,12 @@ async def _auth_and_source(client: httpx.AsyncClient) -> tuple[dict[str, str], s
     return headers, source.json()["id"]
 
 
-async def _seed_traceable_search_unit(source_id: str, chunk_id: str = "chunk-1") -> None:
+async def _seed_traceable_search_unit(
+    source_id: str,
+    *,
+    chunk_id: str = "chunk-1",
+    content: str = "Approved evidence block.",
+) -> dict[str, str]:
     from sag_api.core.db import SessionLocal
     from sag_api.db.models import CanonicalBlock, Document, DocumentVersion, SearchUnit, Source
     from sag_api.enums import DocumentStatus
@@ -131,6 +137,8 @@ async def _seed_traceable_search_unit(source_id: str, chunk_id: str = "chunk-1")
             Document(
                 id=document_id,
                 source_id=source_id,
+                tenant_id="tenant_continuum_default",
+                project_id="pytest-project",
                 filename="manual.pdf",
                 content_type="application/pdf",
                 size_bytes=100,
@@ -149,7 +157,7 @@ async def _seed_traceable_search_unit(source_id: str, chunk_id: str = "chunk-1")
                 status="SEARCH_READY",
                 search_status="SEARCH_READY",
                 search_ready_at=now,
-                metadata_json={},
+                metadata_json={"security_partition_id": "project-1"},
             )
         )
         await session.flush()
@@ -163,7 +171,7 @@ async def _seed_traceable_search_unit(source_id: str, chunk_id: str = "chunk-1")
                 page_to=2,
                 section_path="Approval",
                 source_anchor="section:approval",
-                normalized_text="Approved evidence block.",
+                normalized_text=content,
                 content_hash=uuid.uuid4().hex,
             )
         )
@@ -175,7 +183,7 @@ async def _seed_traceable_search_unit(source_id: str, chunk_id: str = "chunk-1")
                 block_from_id=block_id,
                 block_to_id=block_id,
                 security_partition_id="project-1",
-                content_hash=uuid.uuid4().hex,
+                content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
                 token_count=8,
                 page_from=2,
                 page_to=2,
@@ -183,6 +191,12 @@ async def _seed_traceable_search_unit(source_id: str, chunk_id: str = "chunk-1")
             )
         )
         await session.commit()
+        return {
+            "document_id": document_id,
+            "document_version_id": version_id,
+            "block_id": block_id,
+            "anchor": "section:approval",
+        }
 
 
 async def _search(
@@ -210,6 +224,56 @@ async def _search(
     }
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(search_api, "route_query", lambda query, context=None: {**route_result, "query": query})
+    from sag_api.services import search_unit_retrieval_service
+
+    async def retrieve_canonical(_engine, sources, query, *, principal, top_k=None):
+        if isinstance(engine, EmptySearchEngine):
+            return SearchOutcome(query=query, sections=[], stats={"canonical_index": True})
+        source = sources[0]
+        content = engine.content
+        if not traceable:
+            return SearchOutcome(
+                query=query,
+                sections=[
+                    RetrievedSection(
+                        chunk_id=engine.chunk_id,
+                        content=content,
+                        source_id=source.id,
+                        source_config_id=source.sag_source_config_id,
+                    )
+                ],
+                stats={"canonical_index": True},
+            )
+        locator = seeded_locator
+        return SearchOutcome(
+            query=query,
+            sections=[
+                RetrievedSection(
+                    chunk_id=engine.chunk_id,
+                    search_unit_id=engine.chunk_id,
+                    block_from_id=locator["block_id"],
+                    block_to_id=locator["block_id"],
+                    heading="骑手技能证据",
+                    content=content,
+                    score=0.5,
+                    rank=0,
+                    source_id=source.id,
+                    source_config_id=source.sag_source_config_id,
+                    content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                    canonical_evidence_verified=True,
+                    document_id=locator["document_id"],
+                    document_version_id=locator["document_version_id"],
+                    document_name="manual.pdf",
+                    version_no=1,
+                    page_from=2,
+                    page_to=2,
+                    anchor=locator["anchor"],
+                )
+            ],
+            stats={"canonical_index": True, "fusion_method": "rrf"},
+        )
+
+    monkeypatch.setattr(search_unit_retrieval_service, "retrieve_search_unit_sections", retrieve_canonical)
     app.dependency_overrides[get_engine_manager] = lambda: engine
     try:
         transport = httpx.ASGITransport(app=app)
@@ -217,8 +281,11 @@ async def _search(
             app.state.llm = llm
             async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
                 headers, source_id = await _auth_and_source(client)
-                if traceable:
-                    await _seed_traceable_search_unit(source_id, engine.chunk_id)
+                seeded_locator = (
+                    await _seed_traceable_search_unit(source_id, chunk_id=engine.chunk_id, content=engine.content)
+                    if traceable
+                    else {}
+                )
                 response = await client.post(
                     "/api/v1/search/stream",
                     headers=headers,
@@ -439,16 +506,21 @@ async def test_search_answer_stream_propagates_cancellation_and_closes_provider(
     sections = [
         RetrievedSection(
             chunk_id="chunk-1",
+            search_unit_id="chunk-1",
+            block_from_id="block-1",
+            block_to_id="block-1",
             heading="骑手技能",
             content="骑手需要路线规划能力。",
             score=0.9,
-            source_id="engine-source",
+            source_id="source-public",
             source_config_id="source-1",
             document_id="document-1",
             document_version_id="version-1",
             page_from=1,
             page_to=1,
             anchor="section:rider",
+            content_hash=hashlib.sha256("骑手需要路线规划能力。".encode()).hexdigest(),
+            canonical_evidence_verified=True,
         )
     ]
     source = SimpleNamespace(id="source-public", name="手册", sag_source_config_id="source-1")
