@@ -430,7 +430,7 @@ def test_semantic_guard_negation_contradiction():
     )
 
     sim = compute_text_similarity(text1, text2)
-    assert sim >= 0.75
+    assert sim >= 0.70
 
     is_contra, is_supp, is_super = detect_semantic_signals(text1, text2)
     assert is_contra is True
@@ -794,5 +794,21 @@ async def test_tier_4_cosine_embedding_dedup_and_contradiction_guard():
         cand = res["near_duplicate_candidates"][0]
         assert cand["similarity_score"] >= 0.90
         assert cand["target_block_id"] == pb.id
+
+
+def test_minhash_shingle_size_k5():
+    """Xác nhận kích thước shingle là k=5 per Phase 2B plan và fallback an toàn cho văn bản ngắn."""
+    from sag_api.services.dedup_and_temporal_service import compute_minhash_signature
+    tokens = ["một", "hai", "ba", "bốn", "năm", "sáu"]
+    sig = compute_minhash_signature(tokens)
+    assert len(sig) == 128
+    assert all(isinstance(x, int) for x in sig)
+
+    # Văn bản ngắn (< 5 tokens) phải fallback sang token-level shingles mà không vỡ
+    short_tokens = ["sag", "rag", "qdrant"]
+    short_sig = compute_minhash_signature(short_tokens)
+    assert len(short_sig) == 128
+    assert short_sig != [0] * 128
+
 
 

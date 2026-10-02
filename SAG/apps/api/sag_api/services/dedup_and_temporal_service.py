@@ -49,7 +49,7 @@ def compute_minhash_signature(tokens: Sequence[str], num_perm: int = 128) -> lis
     """Compute 128-permutation MinHash signature for token k-shingles (k=5 per Phase 2B plan)."""
     if not tokens:
         return [0] * num_perm
-    k = min(3, len(tokens))
+    k = min(5, len(tokens))
     shingles = set()
     for i in range(len(tokens) - k + 1):
         shingles.add(" ".join(tokens[i:i+k]))
@@ -497,7 +497,8 @@ async def run_dedup_and_temporal_stage(
             # Query bounded candidates using LSH bands
             candidate_ids = query_lsh_candidates(b_sig, lsh_index, num_bands=16, rows_per_band=8)
             cand_blocks = [prior_by_id[cid] for cid in candidate_ids if cid in prior_by_id]
-            eval_blocks = cand_blocks if (cand_blocks or len(prior_blocks) > 30) else prior_blocks
+            # Fall back to prior_blocks if LSH finds no lexical collisions, enabling Tier 4 semantic cosine check
+            eval_blocks = cand_blocks if cand_blocks else prior_blocks
 
             # Score all candidates and rank deterministically to select the best match
             block_candidates: list[dict[str, Any]] = []

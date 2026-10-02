@@ -40,11 +40,11 @@ async def rebuild_search_index_for_version(
         raise ValueError(f"DocumentVersion {document_version_id} has no security_partition_id; fail closed")
 
     doc = await session.get(Document, doc_ver.document_id)
-    if doc and doc.project_id and doc.project_id != project_id:
+    if not doc or not doc.project_id or doc.project_id != project_id:
         raise ValueError(
-            f"DocumentVersion {document_version_id} belongs to project {doc.project_id}, not {project_id}; fail closed"
+            f"DocumentVersion {document_version_id} must have confirmed project_id matching {project_id}; fail closed"
         )
-    tenant_id = doc.tenant_id if doc and doc.tenant_id else "tenant_default"
+    tenant_id = doc.tenant_id if doc.tenant_id else "tenant_default"
 
     units = await run_search_indexing_stage(
         session,

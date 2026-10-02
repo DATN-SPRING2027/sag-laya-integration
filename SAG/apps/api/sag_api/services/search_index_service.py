@@ -74,8 +74,7 @@ def compute_sparse_bm25_vector(
 
     doc_len = len(tokens)
     counts = Counter(tokens)
-    indices = []
-    values = []
+    sparse_map: dict[int, float] = {}
 
     for word, tf in counts.items():
         # Compute Robertson-Spärck Jones IDF
@@ -96,10 +95,14 @@ def compute_sparse_bm25_vector(
 
         # Deterministic 32-bit token hash index for Qdrant sparse vector
         token_idx = int(hashlib.md5(word.encode("utf-8")).hexdigest()[:8], 16) % 1000000
-        indices.append(token_idx)
-        values.append(round(bm25_weight, 4))
+        # Deduplicate indices and preserve highest weight on hash collision for Qdrant uniqueness
+        sparse_map[token_idx] = max(sparse_map.get(token_idx, 0.0), round(bm25_weight, 4))
 
-    return {"indices": indices, "values": values}
+    sorted_indices = sorted(sparse_map.keys())
+    return {
+        "indices": sorted_indices,
+        "values": [sparse_map[idx] for idx in sorted_indices],
+    }
 
 
 PAYLOAD_INDEX_FIELDS = [
@@ -690,7 +693,8 @@ async def run_search_indexing_stage(
             # Empty units must confirm Qdrant has 0 points left; stale points cause INDEX_FAILED
             manifest_verified = (qdrant_count == 0)
         else:
-            manifest_verified = True
+            # Fail closed: cannot verify 0 points in Qdrant without client
+            manifest_verified = False
     elif (
         qdrant_client is not None
         and indexing_error is None

@@ -384,9 +384,14 @@ async def _process_document_unlocked(
             current_pipeline_stage = "PARSE"
             try:
                 ing_run = await session.get(IngestionRun, run_id)
-                if ing_run:
-                    doc_ver = await session.get(DocumentVersion, ing_run.document_version_id)
-                    if doc_ver:
+                if not ing_run:
+                    raise RuntimeError(f"IngestionRun {run_id} not found for Phase 2 processing (fail-closed)")
+                doc_ver = await session.get(DocumentVersion, ing_run.document_version_id)
+                if not doc_ver:
+                    raise RuntimeError(
+                        f"DocumentVersion {ing_run.document_version_id} not found for IngestionRun {run_id} (fail-closed)"
+                    )
+                if True:
                         # [P2 Fix]: Safe prepared document resolution on resume to prevent raw binary UTF-8 decoding
                         if prepared is None:
                             try:
@@ -832,6 +837,9 @@ async def _reprocess_document_task_unlocked(
     ).scalar_one_or_none()
 
     new_run_id = None
+    process_job_payload = {
+        **(process_job.payload or {}),
+    }
     if latest_ver and document.project_id:
         new_run_id = str(uuid.uuid4())
         tenant_id = document.tenant_id or "tenant_default"
@@ -851,12 +859,16 @@ async def _reprocess_document_task_unlocked(
         )
         session.add(ing_run)
         await session.flush()
-
-    process_job_payload = {
-        **(process_job.payload or {}),
-    }
-    if new_run_id:
         process_job_payload["run_id"] = new_run_id
+    else:
+        process_job_payload["phase2_skipped"] = True
+        process_job_payload["phase2_skip_reason"] = "MISSING_PROJECT_OR_VERSION"
+        log.warning(
+            "Reprocess document %s lacks project_id (%s) or DocumentVersion (%s); Phase 2 skipped with legacy fallback",
+            document.id,
+            document.project_id,
+            bool(latest_ver),
+        )
     process_job.payload = process_job_payload
 
     job.payload = {

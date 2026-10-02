@@ -989,3 +989,115 @@ async def test_delete_document_points_and_reconcile_orphans():
             assert len(qdrant_state) == 0
 
 
+def test_sparse_bm25_indices_strictly_unique_and_sorted():
+    """Kiểm tra indices của sparse vector luôn duy nhất và sắp xếp tăng dần kể cả khi có collision."""
+    from sag_api.services.search_index_service import compute_sparse_bm25_vector
+    text = "Hệ thống SAG phân tích dữ liệu phân tán với cơ chế phục hồi thảm họa dữ liệu tự động."
+    res = compute_sparse_bm25_vector(text)
+    indices = res["indices"]
+    values = res["values"]
+    assert len(indices) == len(set(indices)), "Sparse indices must be strictly unique for Qdrant compatibility"
+    assert indices == sorted(indices), "Sparse indices must be sorted ascending"
+    assert len(indices) == len(values)
+
+
+@pytest.mark.asyncio
+async def test_rebuild_service_missing_or_mismatched_project_fails_closed():
+    """Kiểm tra Document không có project_id hoặc project_id lệch bị fail-closed."""
+    from sag_api.services.rebuild_service import rebuild_search_index_for_version
+    await init_db()
+    async with SessionLocal() as session:
+        # 1. Document không có project_id
+        doc_no_proj = Document(
+            id=f"doc_no_p_{uuid.uuid4().hex[:8]}",
+            source_id=None,
+            filename="test1.md",
+            storage_path="/tmp/test.md",
+            project_id=None,
+        )
+        ver_no_proj = DocumentVersion(
+            id=f"ver_no_p_{uuid.uuid4().hex[:8]}",
+            document_id=doc_no_proj.id,
+            version_no=1,
+            file_hash="hash_no_p",
+            search_status="PENDING",
+        )
+        session.add_all([doc_no_proj, ver_no_proj])
+        await session.commit()
+
+        with pytest.raises(ValueError, match="must have confirmed project_id matching"):
+            await rebuild_search_index_for_version(
+                session,
+                document_version_id=ver_no_proj.id,
+                project_id="proj_target",
+                security_partition_id="part_sec",
+                qdrant_client=None,
+                embedder=None,
+            )
+
+        # 2. Document có project_id lệch với caller
+        doc_mismatch = Document(
+            id=f"doc_mismatch_{uuid.uuid4().hex[:8]}",
+            source_id=None,
+            filename="test2.md",
+            storage_path="/tmp/test2.md",
+            project_id="proj_other",
+        )
+        ver_mismatch = DocumentVersion(
+            id=f"ver_mismatch_{uuid.uuid4().hex[:8]}",
+            document_id=doc_mismatch.id,
+            version_no=1,
+            file_hash="hash_mismatch",
+            search_status="PENDING",
+        )
+        session.add_all([doc_mismatch, ver_mismatch])
+        await session.commit()
+
+        with pytest.raises(ValueError, match="must have confirmed project_id matching"):
+            await rebuild_search_index_for_version(
+                session,
+                document_version_id=ver_mismatch.id,
+                project_id="proj_target",
+                security_partition_id="part_sec",
+                qdrant_client=None,
+                embedder=None,
+            )
+
+
+@pytest.mark.asyncio
+async def test_empty_units_without_qdrant_client_fails_closed():
+    """Kiểm tra khi units rỗng và không có Qdrant client, stage phải fail closed (INDEX_FAILED)."""
+    await init_db()
+    async with SessionLocal() as session:
+        doc = Document(
+            id=f"doc_empty_{uuid.uuid4().hex[:8]}",
+            source_id=None,
+            filename="test_empty.md",
+            storage_path="/tmp/test_empty.md",
+            project_id="proj_empty",
+        )
+        ver = DocumentVersion(
+            id=f"ver_empty_{uuid.uuid4().hex[:8]}",
+            document_id=doc.id,
+            version_no=1,
+            file_hash="hash_empty",
+            search_status="PENDING",
+        )
+        session.add_all([doc, ver])
+        await session.commit()
+
+        # Gọi run_search_indexing_stage với qdrant_client=None và không có blocks/units
+        with pytest.raises(RuntimeError, match="manifest verification mismatch"):
+            await run_search_indexing_stage(
+                session,
+                project_id="proj_empty",
+                document_version=ver,
+                security_partition_id="part_sec",
+                qdrant_client=None,
+                embedder=None,
+            )
+        await session.refresh(ver)
+        assert ver.search_status == "INDEX_FAILED"
+
+
+
