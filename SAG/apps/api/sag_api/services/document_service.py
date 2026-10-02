@@ -1282,11 +1282,12 @@ async def get_document_version_status(
             stage_progress[s.stage] = StageProgressItem(
                 status=s.status, duration_ms=s.duration_ms
             )
-        if latest_run.error_code:
+        if latest_run.error_code or latest_run.error_message:
+            code = latest_run.error_code or f"{latest_run.error_layer or 'API'}_{latest_run.error_stage or 'INGEST'}_FAILED"
             err_info = {
-                "layer": latest_run.error_layer,
-                "stage": latest_run.error_stage,
-                "code": latest_run.error_code,
+                "layer": latest_run.error_layer or "API",
+                "stage": latest_run.error_stage or "INGEST",
+                "code": code,
                 "message": latest_run.error_message,
             }
 
@@ -1296,7 +1297,7 @@ async def get_document_version_status(
         status=doc_ver.status,
         search_status=doc_ver.search_status,
         knowledge_status=doc_ver.knowledge_status,
-        search_ready=(doc_ver.search_status in ("SEARCH_READY", "READY")),
+        search_ready=(doc_ver.search_status == "SEARCH_READY" and doc_ver.search_ready_at is not None),
         knowledge_ready=(doc_ver.knowledge_status in ("KNOWLEDGE_READY", "READY")),
         current_stage=current_stage,
         stage_progress=stage_progress,

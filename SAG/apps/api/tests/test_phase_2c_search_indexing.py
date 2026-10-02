@@ -284,7 +284,7 @@ async def test_search_indexing_stage_and_manifest_verification():
 
         # Xác minh DocumentVersion đạt SEARCH_READY
         ver_updated = (await session.execute(select(DocumentVersion).where(DocumentVersion.id == ver_id))).scalar_one()
-        assert ver_updated.search_status == "READY"
+        assert ver_updated.search_status == "SEARCH_READY"
         assert ver_updated.search_ready_at is not None
 
 

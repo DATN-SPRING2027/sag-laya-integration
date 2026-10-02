@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.config import settings
 from sag_api.core.logging import get_logger
+from sag_api.core.sanitizer import sanitize_error_message
 from sag_api.db.models.routing_rag import (
     CanonicalBlock,
     DocumentVersion,
@@ -110,6 +111,8 @@ PAYLOAD_INDEX_FIELDS = [
     ("project_id", "keyword"),
     ("security_partition_id", "keyword"),
     ("document_version_id", "keyword"),
+    ("source_id", "keyword"),
+    ("document_id", "keyword"),
     ("valid_from_ts", "integer"),
     ("valid_to_ts", "integer"),
     ("primary_node_a", "keyword"),
@@ -139,7 +142,7 @@ async def ensure_qdrant_collection_and_indexes(
     except Exception as check_exc:
         if isinstance(check_exc, ValueError):
             raise
-        log.debug("Collection check skipped or non-fatal: %s", check_exc)
+        log.debug("Collection check skipped or non-fatal: %s", sanitize_error_message(check_exc))
 
     # 1. Create collection with dense and sparse vectors
     try:
@@ -168,7 +171,7 @@ async def ensure_qdrant_collection_and_indexes(
     except Exception as exc:
         if isinstance(exc, (RuntimeError, ValueError)):
             raise
-        log.warning("Could not ensure Qdrant collection %s: %s", collection_name, exc)
+        log.warning("Could not ensure Qdrant collection %s: %s", collection_name, sanitize_error_message(exc))
 
     # 2. Pre-provision payload indexes for fast filtering; fail stage if index creation fails
     for field_name, field_schema in PAYLOAD_INDEX_FIELDS:
@@ -282,8 +285,14 @@ def build_qdrant_payload(
     project_id: str = "",
     tenant_id: str = "tenant_default",
     content: str | None = None,
+    source_id: str | None = None,
+    document_id: str | None = None,
+    version_no: int | None = None,
+    block_from_id: str | None = None,
+    block_to_id: str | None = None,
+    source_anchor: str | None = None,
 ) -> dict[str, Any]:
-    """Build Qdrant point payload including pre-provisioned tree routing fields."""
+    """Build Qdrant point payload including pre-provisioned tree routing fields and retrieval locators."""
     valid_from_ts = int(version.valid_from.timestamp()) if version.valid_from else None
     valid_to_ts = int(version.valid_to.timestamp()) if version.valid_to else None
 
@@ -292,8 +301,14 @@ def build_qdrant_payload(
         "search_unit_id": unit.id,
         "tenant_id": tenant_id,
         "project_id": project_id,
+        "source_id": source_id,
+        "document_id": document_id or getattr(version, "document_id", None),
         "document_version_id": unit.document_version_id,
+        "version_no": version_no if version_no is not None else getattr(version, "version_no", 1),
         "security_partition_id": unit.security_partition_id,
+        "block_from_id": block_from_id or getattr(unit, "block_from_id", None),
+        "block_to_id": block_to_id or getattr(unit, "block_to_id", None),
+        "source_anchor": source_anchor,
         "valid_from": version.valid_from.isoformat() if version.valid_from else None,
         "valid_to": version.valid_to.isoformat() if version.valid_to else None,
         "valid_from_ts": valid_from_ts,
@@ -350,6 +365,8 @@ async def index_search_units_to_qdrant(
     tenant_id: str = "tenant_default",
     embedder: Any | None = None,
     blocks_by_id: dict[str, CanonicalBlock] | None = None,
+    source_id: str | None = None,
+    document_id: str | None = None,
 ) -> int:
     """Upsert search units with real dense + sparse BM25 embeddings into per-project collection."""
     collection_name = f"search_units_{project_id}"
@@ -389,12 +406,23 @@ async def index_search_units_to_qdrant(
     points = []
     for unit, vec, text in zip(units, vectors, texts):
         point_id = generate_search_unit_point_id(collection_name, unit.id)
+        b_start = blocks_by_id.get(unit.block_from_id) if blocks_by_id else None
+        raw_anchor = b_start.source_anchor if b_start and b_start.source_anchor else None
+        s_anchor = raw_anchor.strip() if raw_anchor and raw_anchor.strip() else f"block-{unit.block_from_id[:8]}"
+        if b_start and (not b_start.source_anchor or not b_start.source_anchor.strip()):
+            b_start.source_anchor = s_anchor
         payload = build_qdrant_payload(
             unit,
             version=version,
             project_id=project_id,
             tenant_id=tenant_id,
             content=text,
+            source_id=source_id,
+            document_id=document_id or getattr(version, "document_id", None),
+            version_no=getattr(version, "version_no", 1),
+            block_from_id=unit.block_from_id,
+            block_to_id=unit.block_to_id,
+            source_anchor=s_anchor,
         )
         sparse_vec = compute_sparse_bm25_vector(
             text,
@@ -522,11 +550,11 @@ async def run_search_indexing_stage(
     start_time = datetime.now(UTC)
     collection_name = f"search_units_{project_id}"
 
-    # Resolve authoritative tenant_id from Document or IngestionRun if not provided
+    # Resolve authoritative tenant_id and doc from Document or IngestionRun
+    from sag_api.db.models.document import Document
+    from sag_api.db.models.routing_rag import IngestionRun
+    doc = await session.get(Document, document_version.document_id)
     if not tenant_id:
-        from sag_api.db.models.document import Document
-        from sag_api.db.models.routing_rag import IngestionRun
-        doc = await session.get(Document, document_version.document_id)
         if doc and doc.tenant_id:
             tenant_id = doc.tenant_id
         elif run_id:
@@ -553,6 +581,13 @@ async def run_search_indexing_stage(
     )
 
     # 3. Clean up prior units on retry in both PostgreSQL and Qdrant
+    # Demote readiness immediately before deleting old points to prevent false-ready state during reindexing
+    if document_version.search_status == "SEARCH_READY":
+        document_version.search_status = "INDEXING"
+        document_version.search_ready_at = None
+        session.add(document_version)
+        await session.flush()
+
     prior_units = (
         await session.execute(
             select(SearchUnit).where(SearchUnit.document_version_id == document_version.id)
@@ -579,7 +614,7 @@ async def run_search_indexing_stage(
                     f"Qdrant point cleanup failed before indexing: HTTP {del_res.status_code} - {del_res.text}"
                 )
         except Exception as del_err:
-            log.error("Could not delete prior points from Qdrant: %s", del_err)
+            log.error("Could not delete prior points from Qdrant: %s", sanitize_error_message(del_err))
             document_version.search_status = "INDEX_FAILED"
             session.add(document_version)
             await session.commit()
@@ -604,10 +639,16 @@ async def run_search_indexing_stage(
                 tenant_id=tenant_id,
                 embedder=embedder,
                 blocks_by_id=blocks_by_id,
+                source_id=doc.source_id if doc else None,
+                document_id=document_version.document_id,
             )
         except Exception as exc:
             indexing_error = str(exc)
             indexed_count = 0
+
+    for b in blocks:
+        session.add(b)
+    await session.flush()
 
     # 6. Verify Manifest and update Search Readiness
     # Verify count in PostgreSQL
@@ -637,7 +678,7 @@ async def run_search_indexing_stage(
                 if "count" in res_data:
                     qdrant_count = int(res_data["count"])
         except Exception as count_err:
-            log.warning("Could not query points count from Qdrant: %s", count_err)
+            log.warning("Could not query points count from Qdrant: %s", sanitize_error_message(count_err))
 
     items = sorted(f"{generate_search_unit_point_id(collection_name, u.id)}:{u.content_hash}" for u in units)
     manifest_checksum = hashlib.sha256(";".join(items).encode("utf-8")).hexdigest()
@@ -667,7 +708,7 @@ async def run_search_indexing_stage(
                     json=scroll_body,
                 )
                 if not scroll_res.is_success:
-                    log.warning("Qdrant scroll returned status %d: %s", scroll_res.status_code, scroll_res.text)
+                    log.warning("Qdrant scroll returned status %d: %s", scroll_res.status_code, sanitize_error_message(scroll_res.text))
                     all_q_points = None
                     break
 
@@ -684,7 +725,7 @@ async def run_search_indexing_stage(
                 )
                 qdrant_checksum = hashlib.sha256(";".join(q_items).encode("utf-8")).hexdigest()
         except Exception as scroll_err:
-            log.warning("Could not read back points from Qdrant for checksum: %s", scroll_err)
+            log.warning("Could not read back points from Qdrant for checksum: %s", sanitize_error_message(scroll_err))
             qdrant_checksum = None
 
     manifest_verified = False
@@ -705,8 +746,8 @@ async def run_search_indexing_stage(
         # Strict fail-closed manifest verification: checksum must match
         manifest_verified = (qdrant_checksum == manifest_checksum)
 
-    if manifest_verified:
-        document_version.search_status = "READY"
+    if manifest_verified and units:
+        document_version.search_status = "SEARCH_READY"
         document_version.search_ready_at = datetime.now(UTC)
     else:
         document_version.search_status = "INDEX_FAILED"
@@ -718,14 +759,19 @@ async def run_search_indexing_stage(
 
     # 7. Record StageRun with Manifest verification
     if run_id:
+        is_success = manifest_verified and bool(units)
+        err_text: str | None = None
+        if not units:
+            err_text = "EMPTY_INDEX: Document has no text content to index"
+        elif not manifest_verified:
+            err_text = sanitize_error_message(indexing_error) if indexing_error else "Qdrant client missing or manifest count/checksum mismatch"
+
         stage_run = StageRun(
             id=str(uuid.uuid4()),
             run_id=run_id,
             stage="INDEX_SEARCH",
-            status="SUCCESS" if manifest_verified else "FAILED",
-            error_message=indexing_error if not manifest_verified and indexing_error else (
-                "Qdrant client missing or manifest count/checksum mismatch" if not manifest_verified else None
-            ),
+            status="SUCCESS" if is_success else "FAILED",
+            error_message=err_text,
             duration_ms=duration_ms,
             metrics_json={
                 "search_unit_count": len(units),
@@ -736,7 +782,7 @@ async def run_search_indexing_stage(
                 "qdrant_checksum": qdrant_checksum,
                 "manifest_verified": manifest_verified,
                 "collection_name": collection_name,
-                "error": indexing_error,
+                "error": sanitize_error_message(indexing_error) if indexing_error else (err_text if not is_success else None),
             },
         )
         session.add(stage_run)
@@ -746,5 +792,8 @@ async def run_search_indexing_stage(
             f"Search indexing failed: manifest verification mismatch (units={len(units)}, pg={pg_count}, qdrant={qdrant_count}, qdrant_checksum={qdrant_checksum})"
         )
         raise RuntimeError(err_msg)
+
+    if not units:
+        raise RuntimeError("EMPTY_INDEX: Document has no text content to index")
 
     return units
