@@ -292,8 +292,8 @@ async def test_search_stream_provider_failure_completes_with_grounded_fallback()
     assert [name for name, _payload in events] == ["result", "completed"]
     completed = events[-1][1]
     assert "[1]" in completed["summary"]
-    assert completed["answer_status"] == "no_answer"
-    assert completed["no_answer_reason"] == "weak_evidence"
+    assert completed["answer_status"] == "answered"
+    assert completed["no_answer_reason"] is None
     assert completed["citations"][0]["chunk_id"]
     assert completed["citations"][0]["source_id"]
 
@@ -314,8 +314,8 @@ async def test_search_stream_discards_partial_provider_output_after_failure():
     assert "未完成的内容" not in completed["summary"]
     assert "[9]" not in completed["summary"]
     assert "[1]" in completed["summary"]
-    assert completed["answer_status"] == "no_answer"
-    assert completed["no_answer_reason"] == "weak_evidence"
+    assert completed["answer_status"] == "answered"
+    assert completed["no_answer_reason"] is None
     assert completed["citations"][0]["chunk_id"]
     assert completed["citations"][0]["source_id"]
 

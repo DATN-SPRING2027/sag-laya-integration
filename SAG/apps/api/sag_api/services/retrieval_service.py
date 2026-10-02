@@ -782,8 +782,6 @@ async def stream_synthesize_search_answer(
         yield SearchAnswerUpdate(
             kind="completed",
             text=fallback,
-            status="no_answer",
-            no_answer_reason="weak_evidence",
             citations=fallback_citations,
         )
         return

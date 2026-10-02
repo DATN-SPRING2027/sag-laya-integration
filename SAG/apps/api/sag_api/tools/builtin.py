@@ -34,6 +34,11 @@ from sag_api.tools.base import Tool, ToolContext, ToolMeta, ToolResult
 
 log = get_logger("tools.web_search")
 
+
+def _section_locator_key(section: RetrievedSection) -> tuple[str, str]:
+    return section.source_config_id or "", section.chunk_id or ""
+
+
 _WEB_SEARCH_HOSTS = frozenset({"api.302.ai", "api.302ai.cn"})
 _WEB_SEARCH_PROVIDER = "tavily"
 _WEB_RESULT_CONTENT_LIMIT = 1_200
@@ -306,7 +311,7 @@ class SearchContextTool(Tool):
         )
         if graph is not None and graph.events:
             resolved_keys = {
-                (section.source_config_id or "", section.chunk_id or "")
+                _section_locator_key(section)
                 for section in sections
                 if section.source_config_id and section.chunk_id
             }
@@ -320,7 +325,7 @@ class SearchContextTool(Tool):
             new_sections = [
                 section
                 for section in sections
-                if (section.source_config_id or "", section.chunk_id or "") not in resolved_keys
+                if _section_locator_key(section) not in resolved_keys
             ]
             resolved_new_sections = (
                 await resolve_traceable_evidence(new_sections, ctx.sources)
@@ -328,13 +333,13 @@ class SearchContextTool(Tool):
                 else []
             )
             resolved_by_key = {
-                (section.source_config_id or "", section.chunk_id or ""): section
+                _section_locator_key(section): section
                 for section in resolved_new_sections
             }
             sections = [
                 section
-                if (section.source_config_id or "", section.chunk_id or "") in resolved_keys
-                else resolved_by_key.get((section.source_config_id or "", section.chunk_id or ""), section)
+                if _section_locator_key(section) in resolved_keys
+                else resolved_by_key.get(_section_locator_key(section), section)
                 for section in sections
             ]
             sections = [section for section in sections if has_traceable_locator(section)]

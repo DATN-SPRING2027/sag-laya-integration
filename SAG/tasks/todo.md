@@ -105,7 +105,7 @@ Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL ev
 - [x] Citation output có SAG source/document/version/chunk/page/anchor; validator chỉ giữ IDs của evidence đã render và được phép.
 - [x] Search stream buffer raw model text tới citation validation; Agent ẩn answer deltas khi local grounding bắt buộc hoặc `search_context` đã chạy, còn direct/chat turns giữ contract; terminal gate loại output local không có provenance claim.
 - [x] Regression có greeting, factual positive fixture, exact identifier, ambiguous giữ routing contract, empty evidence, missing locator, provenance ACL boundary, Agent citation/context fitting.
-- [ ] Xác nhận với owner ingestion/index (phan tai) rằng corpus thật populate `SearchUnit` và chunk IDs khớp; legacy `SourceChunk` không map được thì sẽ no-answer cho tới khi có deliverable mapping/reindex được thống nhất.
+- [ ] Chờ PR #14 (Phase 2 Canonical/Search Index) merge, rồi cùng owner ingestion/index (phan tai) xác nhận corpus thật populate `SearchUnit`, chunk IDs khớp và locator truy xuất được trước khi đưa PR #13 ra khỏi Draft; legacy `SourceChunk` không map được thì sẽ no-answer cho tới khi có deliverable mapping/reindex được thống nhất.
 - [ ] Calibrate answerability/claim coverage/entailment riêng; RRF và relevance score không phải confidence, nên hiện tại chỉ phát hiện structural weak và exact-anchor miss.
 - [ ] Chạy end-to-end upload → extraction → index → retrieval → answer trên corpus có locator thật, cùng provider/model tokenizer/context-window verification.
 - [ ] Consumer nghiệm thu stream single canonical delta/time-to-first-answer và kiểm tra full API suite; hiện có một agent routing baseline failure được ghi ở kiểm chứng của plan.

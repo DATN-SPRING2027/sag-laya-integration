@@ -600,6 +600,12 @@ async def test_grounded_agent_stream_emits_only_the_canonical_answer_delta(monke
     canonical_answer = completed.data["payload"]["output"]
 
     assert len(deltas) == 1
+    assert deltas[0].data == {
+        "type": EventType.MESSAGE_DELTA.value,
+        "run_id": "run-1",
+        "sequence": 4,
+        "payload": {"role": "assistant", "delta": no_answer_text()},
+    }
     assert deltas[0].data["payload"]["delta"] == no_answer_text()
     assert deltas[0].data["payload"]["delta"] == canonical_answer
     assert [event.type for event in streamed[-2:]] == [EventType.MESSAGE_DELTA.value, EventType.RUN_COMPLETED.value]

@@ -925,17 +925,7 @@ async def generate_stream(
                     answer_status = "answered"
                     no_answer_reason = None
                     has_internal_claim = any(citation.get("claim_level") == "claim" for citation in internal_citations)
-                    external_start = (
-                        max(
-                            (
-                                citation["n"]
-                                for citation in internal_citations
-                                if isinstance(citation.get("n"), int) and not isinstance(citation.get("n"), bool)
-                            ),
-                            default=0,
-                        )
-                        + 1
-                    )
+                    external_start = _citation_number_high_water(internal_citations) + 1
                     external_citations = _build_external_citations(
                         str(payload.get("output") or ""),
                         external_references,
@@ -1011,11 +1001,12 @@ async def generate_stream(
                     terminal = True
 
                 if event.type == EventType.RUN_COMPLETED and requires_grounded_answer:
-                    delta_data = event.to_dict()
-                    delta_data.update(
-                        type=EventType.MESSAGE_DELTA.value,
-                        payload={"role": "assistant", "delta": canonical_answer},
-                    )
+                    delta_data = {
+                        "type": EventType.MESSAGE_DELTA.value,
+                        "run_id": event.run_id,
+                        "sequence": event.sequence,
+                        "payload": {"role": "assistant", "delta": canonical_answer},
+                    }
                     yield AgentStreamEvent(type=EventType.MESSAGE_DELTA.value, data=delta_data)
                     completed_event = _stream_event(event, payload=output_payload)
                     completed_event.data["sequence"] = event.sequence + 1
