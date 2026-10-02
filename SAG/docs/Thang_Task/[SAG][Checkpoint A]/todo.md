@@ -53,15 +53,15 @@ P0 không cấm làm adapter/DTO/test scaffolding song song, nhưng các policy 
 - [x] Citation provenance và exact click service+route; wrong project/unready fail closed. FE navigation/render và staging revoke còn mở.
 - [x] Greeting/factual/exact/ambiguous/no evidence; `search_context` test fail nếu đụng enrichment graph.
 - [x] Transient retry, exhausted/malformed response, sanitized errors có regression; real missing collection/provider deployment smoke còn mở.
-- [x] Bộ suites retrieval/store/traceability, stream/agent, ACL/strategy và Phase 2C indexing/worker chạy lại sau review (**158 passed, 4 warnings**); xem lệnh và shim limitation trong `researchtask.md`.
+- [x] Bộ suites retrieval/store/traceability, stream/agent, ACL/strategy và Phase 2C indexing/worker chạy lại sau review (**161 passed, 4 warnings**); xem lệnh và shim limitation trong `researchtask.md`.
 
 ## P4 — Handoff
 
-- [x] Hoàn thành một lượt code review toàn diff; sửa lỗi exception DB/index thô có thể lọt vào tool trace; regression xác nhận sanitization và bộ suites chạy lại.
+- [x] Hoàn thành code review và follow-up review PR #15; sửa readiness `DocumentVersion`, Qdrant client pooling, channel candidate grouping và exception chaining; regression xác nhận.
 - [x] Cập nhật nguồn chuẩn `SAG/tasks/plan.md` và `todo.md` với trạng thái implementation cùng các gate còn mở.
 - [x] Điền final results vào researchtask.md: branch/commit state, checks, finding/fix, remaining gaps, DB/config/security impact và rollback.
 - [ ] Giữ gap tokenizer/answerability/anchor offset/model/producer/external smoke còn mở nếu chưa giải quyết.
-- [ ] Commit đúng task branch sau review; không tự push. PR base main; đưa Thang exact push command theo workflow.
+- [x] Commit trên task branch và mở PR #15 vào main; follow-up review fix sẽ tiếp tục trên cùng PR.
 
 ## Definition of done
 

@@ -183,15 +183,16 @@ Tests sẵn có: `tests/test_phase_2c_search_indexing.py`, `test_phase_2_worker_
 | File / module | Thay đổi thực tế | Trạng thái |
 |---|---|---|
 | `sag/search_unit_store.py` (mới) | Read-only Qdrant dense/sparse/exact-point adapter, bounded retry/error sanitization | Đã implement; không sửa producer. |
-| `services/search_unit_retrieval_service.py` (mới) | Authorized readiness/scope, batch hydration, hash/range validation, recheck lifecycle và orchestration | Đã implement; producer/owner gates vẫn mở. |
+| `services/search_unit_retrieval_service.py` (mới) | Authorized readiness/scope, chấp nhận `search_status=READY/SEARCH_READY`, batch hydration, hash/range validation, recheck lifecycle và orchestration | Đã implement; producer/owner gates vẫn mở. |
 | `services/retrieval_service.py` | Không đổi legacy/global fusion module; canonical reader tái sử dụng semantics liên quan | Giữ ngoài diff để không thay retrieval/fusion chung. |
 | `services/source_service.py`, `services/agent_domain.py` | Canonical Project Source candidate selection chỉ khi mapping CONFIRMED | Đã implement theo ACL runtime; không auto-map. |
-| `services/evidence_service.py` | Provenance cho unit/range, hash validation, token pack và citations visible-context | Đã implement; tokenizer/answerability limitations còn mở. |
+| `services/evidence_service.py` | Provenance cho unit/range, chấp nhận trạng thái search `READY/SEARCH_READY`, hash validation, token pack và citations visible-context | Đã implement; tokenizer/answerability limitations còn mở. |
 | `sag/dto.py`, `schemas/search.py`, `generation/prompt.py` | Additive unit/range/section fields, prompt citation locator | Đã implement. |
 | `api/v1/search.py`, `api/v1/sources.py` | Shared canonical reader cho search/stream và exact-unit click resolver | Đã implement; real provider/staging smoke còn mở. |
 | `tools/builtin.py`, `services/agent_service.py`, `tools/base.py` | `search_context` dùng reader chung, không gọi event/graph; giữ context fit/citation flow | Đã implement. |
 | `core/principal_assertion.py` | Signed tenant/partition claims được validate; canonical retrieval fail closed khi thiếu | Đã implement; claim issuer/authority chưa được owner xác nhận. |
-| Tests mục 10 | Store/retrieval/ACL/traceability/stream/agent/index-worker regressions | Đã chạy focused suite: 158 passed, 4 warnings; fixture/mock không phải vertical provider E2E. |
+| `sag/engine_manager.py` | Quản lý pooled Qdrant HTTP client cho canonical search/citation; đóng client khi runtime đóng hoặc cấu hình đổi | Đã implement theo review comment; có regression reuse/reconfigure/close. |
+| Tests mục 10 | Store/retrieval/ACL/traceability/stream/agent/index-worker regressions | Đã chạy focused suite: 161 passed, 4 warnings; fixture/mock không phải vertical provider E2E. |
 | `SAG/tasks/plan.md`, `SAG/tasks/todo.md` | Cập nhật trạng thái code và tách rõ gate còn mở | Đã cập nhật; không đánh dấu toàn Checkpoint A hoàn tất. |
 | Folder task này | Research, todo và kết quả review/validation | Đã cập nhật cho task hiện tại. |
 
@@ -211,7 +212,7 @@ Không thêm abstractions/cache/provider framework ngoài nhu cầu reader chung
 
 ### GAP cần owner xác nhận trước nghiệm thu
 
-1. READY vs SEARCH_READY và Document.status READY hiện còn gắn legacy enrichment; readiness phải độc lập knowledge lane.
+1. Retrieval/citation/evidence chấp nhận `search_status=READY` hoặc `SEARCH_READY` và không dựa vào `DocumentVersion.status`; owner vẫn cần xác nhận current-attempt/manifest và zero-unit readiness contract độc lập enrichment.
 2. Mapping upload Project Source và selector project Source.
 3. Hai principal contract: org/tenant/partition authority chưa thống nhất.
 4. Current verified ingestion attempt, stale readiness khi retry, current/historical version policy.

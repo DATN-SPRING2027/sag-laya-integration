@@ -134,15 +134,15 @@ class SearchUnitQdrantStore:
         for attempt in range(self._max_retries + 1):
             try:
                 response = await self._client.request(method, path, **kwargs)
-            except httpx.InvalidURL as error:
-                raise SearchIndexUnavailable("Search index request configuration is invalid") from error
-            except (httpx.TimeoutException, httpx.NetworkError) as error:
+            except httpx.InvalidURL:
+                raise SearchIndexUnavailable("Search index request configuration is invalid") from None
+            except (httpx.TimeoutException, httpx.NetworkError):
                 if attempt < self._max_retries:
                     await asyncio.sleep(0.05 * (attempt + 1))
                     continue
-                raise SearchIndexUnavailable("Search index is temporarily unavailable") from error
-            except httpx.RequestError as error:
-                raise SearchIndexUnavailable("Search index request failed") from error
+                raise SearchIndexUnavailable("Search index is temporarily unavailable") from None
+            except httpx.RequestError:
+                raise SearchIndexUnavailable("Search index request failed") from None
             if response.status_code in _TRANSIENT_STATUS_CODES and attempt < self._max_retries:
                 await asyncio.sleep(0.05 * (attempt + 1))
                 continue

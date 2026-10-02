@@ -16,7 +16,8 @@ from sag_api.services import search_unit_retrieval_service as retrieval
 
 
 @pytest.mark.asyncio
-async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_citation(monkeypatch):
+@pytest.mark.parametrize("search_status", ["READY", "SEARCH_READY"])
+async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_citation(search_status):
     from sag_api.core.db import SessionLocal, init_db
     from sag_api.db.models import (
         CanonicalBlock,
@@ -90,8 +91,10 @@ async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_cit
                 document_id=document_id,
                 version_no=1,
                 file_hash=hashlib.sha256(b"upload").hexdigest(),
-                status="SEARCH_READY",
-                    search_status="SEARCH_READY",
+                # The producer's verified index state is independent from the
+                # document-version lifecycle status, which remains RECEIVED.
+                status="RECEIVED",
+                search_status=search_status,
                 search_ready_at=now,
                 metadata_json={"security_partition_id": partition_id},
             )
@@ -223,17 +226,10 @@ async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_cit
             },
         )
 
-    real_async_client = httpx.AsyncClient
-
-    def mock_async_client(*, base_url, headers=None, timeout=None):
-        return real_async_client(
-            transport=httpx.MockTransport(qdrant_reply),
-            base_url=base_url,
-            headers=headers,
-            timeout=timeout,
-        )
-
-    monkeypatch.setattr(retrieval.httpx, "AsyncClient", mock_async_client)
+    qdrant_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(qdrant_reply),
+        base_url="http://qdrant-test",
+    )
 
     class Embedder:
         async def generate(self, _query: str):
@@ -243,8 +239,13 @@ async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_cit
         async def get_sag_embedding(self, *_args):
             return Embedder()
 
+        async def get_search_unit_qdrant_client(self):
+            return qdrant_client
+
+    search_engines = SearchEngines()
+
     outcome = await retrieval.retrieve_search_unit_sections(
-        SearchEngines(),
+        search_engines,
         [source],
         "XK-204",
         principal=principal,
@@ -257,6 +258,8 @@ async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_cit
     ]
     assert outcome.stats["canonical_index"] is True
     assert outcome.stats["fusion_method"] == "rrf"
+    assert outcome.stats["semantic_candidates"] == 1
+    assert outcome.stats["lexical_candidates"] == 1
     assert len(outcome.sections) == 1
     evidence = outcome.sections[0]
     assert evidence.canonical_evidence_verified is True
@@ -282,6 +285,7 @@ async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_cit
             source=source,
             principal=principal,
             search_unit_id=unit_id,
+            engine_manager=search_engines,
         )
         with pytest.raises(NotFoundError):
             await retrieval.get_search_unit_citation(
@@ -289,6 +293,7 @@ async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_cit
                 source=source,
                 principal=replace(principal, allowed_project_ids=frozenset({"other-project"})),
                 search_unit_id=unit_id,
+                engine_manager=search_engines,
             )
 
     from sag_api.api.v1.sources import get_chunk
@@ -301,7 +306,7 @@ async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_cit
             source=source,
             principal=principal,
             session=session,
-            engine_manager=object(),
+            engine_manager=search_engines,
         )
 
     assert clicked["content"] == content
@@ -317,11 +322,11 @@ async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_cit
 
     async with SessionLocal() as session:
         version = await session.get(DocumentVersion, version_id)
-        version.status = "FAILED"
+        version.search_status = "INDEX_FAILED"
         await session.commit()
 
     unavailable = await retrieval.retrieve_search_unit_sections(
-        SearchEngines(),
+        search_engines,
         [source],
         "XK-204",
         principal=principal,
@@ -336,7 +341,10 @@ async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_cit
                 source=source,
                 principal=principal,
                 search_unit_id=unit_id,
+                engine_manager=search_engines,
             )
+
+    await qdrant_client.aclose()
 
 
 @pytest.mark.asyncio
@@ -408,6 +416,7 @@ async def test_citation_database_errors_are_sanitized():
             source=source,
             principal=principal,
             search_unit_id="unit-safe",
+            engine_manager=object(),
         )
 
     assert "secret-password" not in str(error.value)
@@ -486,17 +495,10 @@ async def test_candidate_hydration_database_errors_are_sanitized(monkeypatch):
             },
         )
 
-    real_async_client = httpx.AsyncClient
-
-    def mock_async_client(*, base_url, headers=None, timeout=None):
-        return real_async_client(
-            transport=httpx.MockTransport(qdrant_reply),
-            base_url=base_url,
-            headers=headers,
-            timeout=timeout,
-        )
-
-    monkeypatch.setattr(retrieval.httpx, "AsyncClient", mock_async_client)
+    qdrant_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(qdrant_reply),
+        base_url="http://qdrant-test",
+    )
 
     class Embedder:
         async def generate(self, _query: str):
@@ -505,6 +507,9 @@ async def test_candidate_hydration_database_errors_are_sanitized(monkeypatch):
     class SearchEngines:
         async def get_sag_embedding(self, *_args):
             return Embedder()
+
+        async def get_search_unit_qdrant_client(self):
+            return qdrant_client
 
     with pytest.raises(ServiceUnavailableError) as error:
         await retrieval.retrieve_search_unit_sections(
@@ -517,3 +522,4 @@ async def test_candidate_hydration_database_errors_are_sanitized(monkeypatch):
 
     assert "secret-password" not in str(error.value)
     assert "db.internal" not in str(error.value)
+    await qdrant_client.aclose()

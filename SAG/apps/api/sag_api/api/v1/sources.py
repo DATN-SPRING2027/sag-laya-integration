@@ -129,6 +129,7 @@ async def get_chunk(
         source=source,
         principal=principal,
         search_unit_id=chunk_id,
+        engine_manager=engine_manager,
     )
     if canonical is not None:
         return canonical

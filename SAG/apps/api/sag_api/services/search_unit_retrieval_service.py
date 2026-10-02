@@ -163,8 +163,7 @@ async def _load_current_ready_versions_checked(
                 Document.is_active.is_(True),
                 Document.status.notin_([DocumentStatus.DELETING, DocumentStatus.DELETE_FAILED]),
                 Document.id.notin_(hidden_document_ids) if hidden_document_ids else True,
-                DocumentVersion.status == "SEARCH_READY",
-                DocumentVersion.search_status == "SEARCH_READY",
+                DocumentVersion.search_status.in_(("READY", "SEARCH_READY")),
                 DocumentVersion.valid_from <= current_time,
                 DocumentVersion.search_ready_at.is_not(None),
                 DocumentVersion.valid_to > current_time,
@@ -403,27 +402,22 @@ async def retrieve_search_unit_sections(
             stats={"canonical_index": True, "ready_versions": 0, **retrieval_stats},
         )
 
-    headers = {"api-key": settings.sag_qdrant_api_key} if settings.sag_qdrant_api_key else {}
     try:
-        async with httpx.AsyncClient(
-            base_url=settings.sag_qdrant_url.rstrip("/"),
-            headers=headers,
-            timeout=max(1.0, settings.search_source_timeout),
-        ) as client:
-            store = SearchUnitQdrantStore(client)
-            semaphore = asyncio.Semaphore(max(1, settings.search_source_concurrency))
+        client = await engine_manager.get_search_unit_qdrant_client()
+        store = SearchUnitQdrantStore(client)
+        semaphore = asyncio.Semaphore(max(1, settings.search_source_concurrency))
 
-            async def bounded(group: _SearchGroup):
-                async with semaphore:
-                    return await _query_group(
-                        group,
-                        query=query,
-                        limit=candidate_limit,
-                        engine_manager=engine_manager,
-                        store=store,
-                    )
+        async def bounded(group: _SearchGroup):
+            async with semaphore:
+                return await _query_group(
+                    group,
+                    query=query,
+                    limit=candidate_limit,
+                    engine_manager=engine_manager,
+                    store=store,
+                )
 
-            channel_results = await asyncio.gather(*(bounded(group) for group in groups))
+        channel_results = await asyncio.gather(*(bounded(group) for group in groups))
     except asyncio.CancelledError:
         raise
     except SearchIndexUnavailable as error:
@@ -536,9 +530,14 @@ async def retrieve_search_unit_sections(
         )
 
     sections_by_key: dict[tuple[str, str, str, str, str], RetrievedSection] = {}
-    for channel, project_id, source_id, tenant_id, partition_id, unit_id in hits:
+    ranked_by_channel_and_scope: dict[
+        tuple[str, tuple[str, str, str, str]], list[RetrievedSection]
+    ] = defaultdict(list)
+    semantic_candidate_count = 0
+    lexical_candidate_count = 0
+    for channel, project_id, source_id, tenant_id, partition_id, unit_id in sorted(hits):
         hit_key = (channel, project_id, source_id, tenant_id, partition_id, unit_id)
-        _group, hit, score, rank = hits[hit_key]
+        group, hit, score, rank = hits[hit_key]
         resolved = unit_by_id.get(unit_id)
         if resolved is None:
             continue
@@ -562,68 +561,66 @@ async def retrieve_search_unit_sections(
 
         if hit.point_id != generate_search_unit_point_id(f"search_units_{project_id}", unit.id):
             continue
-        scope_source = _group.source
-        section = RetrievedSection(
-            chunk_id=unit.id,
-            search_unit_id=unit.id,
-            block_from_id=unit.block_from_id,
-            block_to_id=unit.block_to_id,
-            section_path=unit.section_path,
-            heading=unit.section_path or locator["document_name"],
-            content=content,
-            score=score,
-            rank=rank,
-            source_id=scope_source.id,
-            source_config_id=scope_source.sag_source_config_id,
-            content_hash=unit.content_hash,
-            canonical_evidence_verified=True,
-            **{
-                name: value
-                for name, value in locator.items()
-                if name
-                not in {
-                    "source_id",
-                    "source_name",
-                    "project_id",
-                    "tenant_id",
-                    "security_partition_id",
-                    "search_unit_id",
-                    "content_hash",
-                    "block_from_id",
-                    "block_to_id",
-                    "section_path",
-                }
-            },
-        )
-        sections_by_key[(project_id, source_id, tenant_id, partition_id, unit_id)] = section
-
-    semantic_sections: list[RetrievedSection] = []
-    lexical_sections: list[RetrievedSection] = []
-    for channel, project_id, source_id, tenant_id, partition_id, unit_id in sorted(hits):
-        group, _hit, score, rank = hits[(channel, project_id, source_id, tenant_id, partition_id, unit_id)]
-        section = sections_by_key.get((project_id, source_id, tenant_id, partition_id, unit_id))
+        section_key = (project_id, source_id, tenant_id, partition_id, unit_id)
+        scope_key = (project_id, source_id, tenant_id, partition_id)
+        section = sections_by_key.get(section_key)
         if section is None:
-            continue
-        ranked_section = section.model_copy(update={"score": score, "rank": rank})
-        (semantic_sections if channel == "dense" else lexical_sections).append(ranked_section)
+            scope_source = group.source
+            section = RetrievedSection(
+                chunk_id=unit.id,
+                search_unit_id=unit.id,
+                block_from_id=unit.block_from_id,
+                block_to_id=unit.block_to_id,
+                section_path=unit.section_path,
+                heading=unit.section_path or locator["document_name"],
+                content=content,
+                score=0.0,
+                rank=0,
+                source_id=scope_source.id,
+                source_config_id=scope_source.sag_source_config_id,
+                content_hash=unit.content_hash,
+                canonical_evidence_verified=True,
+                **{
+                    name: value
+                    for name, value in locator.items()
+                    if name
+                    not in {
+                        "source_id",
+                        "source_name",
+                        "project_id",
+                        "tenant_id",
+                        "security_partition_id",
+                        "search_unit_id",
+                        "content_hash",
+                        "block_from_id",
+                        "block_to_id",
+                        "section_path",
+                    }
+                },
+            )
+            sections_by_key[section_key] = section
+        ranked_by_channel_and_scope[(channel, scope_key)].append(
+            section.model_copy(update={"score": score, "rank": rank})
+        )
+        if channel == "dense":
+            semantic_candidate_count += 1
+        else:
+            lexical_candidate_count += 1
 
-    def ranked_scope_lists(channel: str) -> list[list[RetrievedSection]]:
-        lists: list[list[RetrievedSection]] = []
-        for group in groups:
-            scope_sections: list[RetrievedSection] = []
-            for hit_key, (_hit_group, _hit, score, rank) in hits.items():
-                hit_channel, project_id, source_id, tenant_id, partition_id, unit_id = hit_key
-                scope_key = (project_id, source_id, tenant_id, partition_id)
-                if hit_channel != channel or scope_key != group.scope_key:
-                    continue
-                section = sections_by_key.get((*scope_key, unit_id))
-                if section is not None:
-                    scope_sections.append(section.model_copy(update={"score": score, "rank": rank}))
-            lists.append(sorted(scope_sections, key=lambda section: (section.rank, section.chunk_id or "")))
-        return lists
-
-    semantic_lists = ranked_scope_lists("dense")
-    lexical_lists = ranked_scope_lists("sparse")
+    semantic_lists = [
+        sorted(
+            ranked_by_channel_and_scope.get(("dense", group.scope_key), []),
+            key=lambda section: (section.rank, section.chunk_id or ""),
+        )
+        for group in groups
+    ]
+    lexical_lists = [
+        sorted(
+            ranked_by_channel_and_scope.get(("sparse", group.scope_key), []),
+            key=lambda section: (section.rank, section.chunk_id or ""),
+        )
+        for group in groups
+    ]
     semantic = _fair_rank_merge(semantic_lists)
     lexical = _fair_rank_merge(lexical_lists)
     fused = rerank_sections(query, semantic, lexical=lexical, limit=requested_limit)
@@ -634,8 +631,8 @@ async def retrieve_search_unit_sections(
             "canonical_index": True,
             "ready_versions": len(ready_versions),
             **retrieval_stats,
-            "semantic_candidates": len(semantic_sections),
-            "lexical_candidates": len(lexical_sections),
+            "semantic_candidates": semantic_candidate_count,
+            "lexical_candidates": lexical_candidate_count,
             "candidates": fused.candidate_count,
             "relevant": fused.relevant_count,
             "filtered_irrelevant": fused.filtered_count,
@@ -651,6 +648,7 @@ async def get_search_unit_citation(
     source: SearchableSource,
     principal: VerifiedPrincipal,
     search_unit_id: str,
+    engine_manager: Any,
 ) -> dict[str, Any] | None:
     try:
         return await _get_search_unit_citation_checked(
@@ -658,6 +656,7 @@ async def get_search_unit_citation(
             source=source,
             principal=principal,
             search_unit_id=search_unit_id,
+            engine_manager=engine_manager,
         )
     except SQLAlchemyError as error:
         log.warning("canonical citation authorization unavailable error_type=%s", type(error).__name__)
@@ -670,6 +669,7 @@ async def _get_search_unit_citation_checked(
     source: SearchableSource,
     principal: VerifiedPrincipal,
     search_unit_id: str,
+    engine_manager: Any,
 ) -> dict[str, Any] | None:
     """Read an exact canonical citation target, rechecking ACL and index provenance.
 
@@ -719,8 +719,7 @@ async def _get_search_unit_citation_checked(
                 SourceProjectMapping.state == "CONFIRMED",
                 Document.is_active.is_(True),
                 Document.status.notin_([DocumentStatus.DELETING, DocumentStatus.DELETE_FAILED]),
-                DocumentVersion.status == "SEARCH_READY",
-                DocumentVersion.search_status == "SEARCH_READY",
+                DocumentVersion.search_status.in_(("READY", "SEARCH_READY")),
                 DocumentVersion.search_ready_at.is_not(None),
                 SearchUnit.security_partition_id.in_(principal.allowed_partition_ids),
                 SearchUnit.security_partition_id == partition_expression,
@@ -775,17 +774,12 @@ async def _get_search_unit_citation_checked(
         raise NotFoundError("原文分块不存在")
 
     collection = f"search_units_{project_id}"
-    headers = {"api-key": settings.sag_qdrant_api_key} if settings.sag_qdrant_api_key else {}
     try:
-        async with httpx.AsyncClient(
-            base_url=settings.sag_qdrant_url.rstrip("/"),
-            headers=headers,
-            timeout=max(1.0, settings.search_source_timeout),
-        ) as client:
-            point = await SearchUnitQdrantStore(client).get_point(
-                collection,
-                _point_id(collection, unit.id),
-            )
+        client = await engine_manager.get_search_unit_qdrant_client()
+        point = await SearchUnitQdrantStore(client).get_point(
+            collection,
+            _point_id(collection, unit.id),
+        )
     except SearchIndexUnavailable as error:
         log.warning("canonical citation index unavailable error_type=%s", type(error).__name__)
         raise ServiceUnavailableError("Canonical citation index is unavailable") from error

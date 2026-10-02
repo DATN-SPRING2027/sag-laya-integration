@@ -10,16 +10,18 @@
 
 - 2026-10-02: hoàn thành nghiên cứu baseline main `6035130`, ghi current flow/contracts/fields/algorithms/tests/gaps.
 - Branch: `feat/Thang-checkpoint-a-search-ready-be-api` trong checkout `sag-laya-main-sync`.
-- 2026-10-02: implementation và một lượt code review đã hoàn thành trên task branch.
-- Không có commit, push hoặc PR trong lượt này.
+- 2026-10-02: implementation, code review và follow-up review comments đã xử lý trên task branch.
+- PR #15 được tạo từ commit `0e6258e`; follow-up review fixes trên task branch, chưa có trên remote PR.
 - Chưa có xác nhận contract DATN-33/security hoặc kết quả staging; các phần đó vẫn là gate ngoài lane code.
 
 ## Implementation evidence — cập nhật sau khi thực hiện
 
-- Commit(s): chưa tạo; working tree còn các thay đổi implementation trên task branch.
+- Commit(s): implementation ở `0e6258e`; follow-up review fix local, chưa push.
 - Phạm vi files: API global search/stream, SearchUnit Qdrant reader, canonical evidence/citation/context, principal tenant/partition claims, agent `search_context`, tests và cập nhật plan/todo/task research. Không sửa ingestion/index producer hoặc frontend.
 - Review finding đã sửa: lỗi SQLAlchemy ở scope lookup, candidate hydration và citation click có thể thoát thành exception thô vào tool trace. Canonical reader/citation đổi sang thông báo 503 đã làm sạch, log chỉ ghi exception type; Qdrant URL/request lỗi cũng được sanitize. Regression mô phỏng connection string có secret xác nhận không lộ.
-- Checks: bộ suites retrieval/store/traceability, stream/agent, ACL/strategy và Phase 2C indexing/worker: **158 passed, 4 warnings**. Ruff trên 23 file Python: **All checks passed**. `git diff --check`: passed.
+- PR review follow-up: bỏ điều kiện sai `DocumentVersion.status == SEARCH_READY`; dùng `search_status in (READY, SEARCH_READY)` cùng `search_ready_at` trong retrieval, citation click và evidence resolver. Thêm Qdrant HTTP client pool theo vòng đời `EngineManager`; giữ base section tách biệt channel score/rank và gom candidates trong một pass; HTTP request exceptions dùng `from None`.
+- Regression bổ sung mô phỏng producer thật (`status=RECEIVED`, `search_status=READY/SEARCH_READY`), citation/evidence và client reuse/close; kiểm tra exception không giữ secret cause.
+- Checks sau review: bộ suites retrieval/store/traceability, stream/agent, ACL/strategy và Phase 2C indexing/worker: **161 passed, 4 warnings**. Ruff trên các Python files sửa: **All checks passed**. `git diff --check`: passed.
 - Lệnh test đầy đủ:
 
   ```powershell

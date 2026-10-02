@@ -129,7 +129,7 @@ Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL ev
 - [ ] Staging với principal/data thật xác nhận leakage, revoke, enrichment off/lag/failure và navigation FE tới split SearchUnit.
 - [ ] Calibrate answerability/entailment và exact split-unit offset; hiện structural/exact-anchor gate không phải semantic confidence.
 
-**Implementation status (2026-10-02):** reader/context/citation code và mock/DB regressions đã làm trên task branch; một lượt code review đã sửa exception DB/index thô có thể lọt vào tool trace. Relevant checks đạt **158 passed, 4 warnings**; Ruff và `git diff --check` pass. Xem [evidence và limitations](../docs/Thang_Task/%5BSAG%5D%5BCheckpoint%20A%5D/researchtask.md). Không đánh dấu Checkpoint A toàn hệ thống hoàn tất: upload-to-real-index/provider/staging và owner contract vẫn mở.
+**Implementation status (2026-10-02):** reader/context/citation code và regressions đã làm trên task branch; PR review follow-up sửa readiness contract (`search_status=READY/SEARCH_READY`), reuse pooled Qdrant client, candidate grouping thừa và HTTP exception chaining. Relevant checks đạt **161 passed, 4 warnings**; Ruff và `git diff --check` pass. Xem [evidence và limitations](../docs/Thang_Task/%5BSAG%5D%5BCheckpoint%20A%5D/researchtask.md). Không đánh dấu Checkpoint A toàn hệ thống hoàn tất: upload-to-real-index/provider/staging và owner contract vẫn mở.
 
 ## Phase 5 — Knowledge Units & Graph
 

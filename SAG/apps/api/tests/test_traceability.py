@@ -117,8 +117,8 @@ async def test_search_unit_locator_resolution_is_exact_and_acl_scoped():
                 document_id=document_id,
                 version_no=3,
                 file_hash=uuid.uuid4().hex,
-                status="SEARCH_READY",
-                search_status="SEARCH_READY",
+                status="RECEIVED",
+                search_status="READY",
                 search_ready_at=datetime.now(UTC),
                 metadata_json={},
             )

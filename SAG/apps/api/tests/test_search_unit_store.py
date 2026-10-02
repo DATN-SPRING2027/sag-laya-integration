@@ -200,4 +200,77 @@ async def test_invalid_index_request_is_sanitized():
         )
 
     assert "secret-value" not in str(error.value)
-    assert "qdrant.internal" not in str(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__suppress_context__ is True
+
+
+@pytest.mark.asyncio
+async def test_request_error_does_not_keep_secret_exception_cause():
+    class RequestFailureClient:
+        async def request(self, *_args, **_kwargs):
+            raise httpx.RequestError("https://user:secret-value@qdrant.internal/private")
+
+    store = SearchUnitQdrantStore(RequestFailureClient())
+    with pytest.raises(SearchIndexUnavailable, match="Search index request failed") as error:
+        await store.search(
+            "search_units_project-a",
+            vector_name="content_vector",
+            query=[0.1],
+            search_filter=build_search_filter(
+                project_id="project-a",
+                tenant_id="tenant-a",
+                partition_id="partition-a",
+                document_version_ids=["version-a"],
+            ),
+            limit=1,
+        )
+
+    assert "secret-value" not in str(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__suppress_context__ is True
+
+
+@pytest.mark.asyncio
+async def test_search_unit_client_is_pooled_and_closed_by_engine_manager(monkeypatch):
+    from sag_api.core.config import settings
+    from sag_api.sag import engine_manager as engine_manager_module
+
+    created = []
+
+    class ManagedClient:
+        def __init__(self, **options):
+            self.options = options
+            self.closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    def make_client(**options):
+        client = ManagedClient(**options)
+        created.append(client)
+        return client
+
+    monkeypatch.setattr(engine_manager_module.httpx, "AsyncClient", make_client)
+    manager_settings = settings.model_copy(
+        update={
+            "sag_qdrant_url": "http://qdrant-test",
+            "sag_qdrant_api_key": "test-key",
+            "search_source_timeout": 7.0,
+        }
+    )
+    manager = engine_manager_module.EngineManager(manager_settings)
+
+    first = await manager.get_search_unit_qdrant_client()
+    second = await manager.get_search_unit_qdrant_client()
+
+    assert first is second
+    assert len(created) == 1
+    assert first.options["headers"] == {"api-key": "test-key"}
+
+    manager_settings.sag_qdrant_url = "http://qdrant-reconfigured"
+    third = await manager.get_search_unit_qdrant_client()
+    assert third is not first
+    assert first.closed is True
+
+    await manager.aclose_all()
+    assert third.closed is True

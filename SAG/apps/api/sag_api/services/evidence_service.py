@@ -212,7 +212,7 @@ async def resolve_traceable_evidence(
             Document.source_id.in_(set(source_by_id)),
             Document.is_active.is_(True),
             Document.status == DocumentStatus.READY,
-            DocumentVersion.search_status == "SEARCH_READY",
+            DocumentVersion.search_status.in_(("READY", "SEARCH_READY")),
             DocumentVersion.search_ready_at.is_not(None),
         )
     )
