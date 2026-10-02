@@ -263,6 +263,7 @@ async def resolve_sources(
     source_ids: list[str] | None = None,
     *,
     principal: VerifiedPrincipal | None = None,
+    include_project_sources: bool = False,
 ) -> list[Source]:
     """解析本轮可见信源。
 
@@ -272,14 +273,28 @@ async def resolve_sources(
     if principal is None:
         return []
     if source_ids is not None:
-        return await search_source_candidates(session, principal=principal, requested_source_ids=source_ids)
+        return await search_source_candidates(
+            session,
+            principal=principal,
+            requested_source_ids=source_ids,
+            include_project_sources=include_project_sources,
+        )
     if agent.is_default:
-        return await search_source_candidates(session, principal=principal)
+        return await search_source_candidates(
+            session,
+            principal=principal,
+            include_project_sources=include_project_sources,
+        )
     bindings = await list_bindings(session, agent)
     src_ids = [b.target_id for b in bindings if b.target_type == BindingTargetType.SOURCE]
     if not src_ids:
         return []
-    return await search_source_candidates(session, principal=principal, requested_source_ids=src_ids)
+    return await search_source_candidates(
+        session,
+        principal=principal,
+        requested_source_ids=src_ids,
+        include_project_sources=include_project_sources,
+    )
 
 
 async def resolve_mcp_specs(session: AsyncSession, agent: Agent) -> list[tuple[str, dict]]:

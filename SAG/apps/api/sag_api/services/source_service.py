@@ -68,6 +68,7 @@ async def search_source_candidates(
     *,
     principal: VerifiedPrincipal,
     requested_source_ids: list[str] | None = None,
+    include_project_sources: bool = False,
 ) -> list[Source]:
     """Select candidates only from confirmed Source mappings in the principal scope."""
     limit = settings.search_source_candidate_limit
@@ -93,7 +94,7 @@ async def search_source_candidates(
         sources = [
             by_id[source_id]
             for source_id in ordered_ids
-            if source_id in by_id and not _is_project_source(by_id[source_id])
+            if source_id in by_id and (include_project_sources or not _is_project_source(by_id[source_id]))
         ]
     else:
         statement = _authorized_source_statement(principal).order_by(
@@ -107,7 +108,11 @@ async def search_source_candidates(
         except SQLAlchemyError as error:
             log.exception("source scope resolution failed operation=search requested_count=0")
             raise ServiceUnavailableError("Source authorization mapping is unavailable") from error
-        sources = [source for source in rows.scalars().all() if not _is_project_source(source)]
+        sources = [
+            source
+            for source in rows.scalars().all()
+            if include_project_sources or not _is_project_source(source)
+        ]
     log.info(
         "source scope resolved authorized_project_count=%d requested_source_count=%d effective_source_count=%d",
         len(principal.allowed_project_ids),
@@ -183,7 +188,8 @@ async def get_source(
         raise NotFoundError("信源不存在")
     if not allow_project_source and isinstance(source.config, dict) and source.config.get("is_project_source"):
         raise ForbiddenError(
-            "Nguồn dữ liệu dự án được bảo vệ và không thể truy cập qua route không có scope. Hãy sử dụng API /projects/{project_id}/documents."
+            "Nguồn dữ liệu dự án được bảo vệ và không thể truy cập qua route không có scope. "
+            "Hãy sử dụng API /projects/{project_id}/documents."
         )
     return source
 

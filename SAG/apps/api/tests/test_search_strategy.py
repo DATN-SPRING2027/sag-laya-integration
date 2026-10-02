@@ -52,44 +52,45 @@ async def test_query_route_offloads_laya_prediction_from_event_loop(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_global_search_forwards_validated_strategy(monkeypatch):
+async def test_global_search_records_strategy_and_queries_canonical_index(monkeypatch):
     from sag_api.api.v1 import search as search_api
     from sag_api.core.deps import get_engine_manager
     from sag_api.main import app
-    from sag_api.sag.dto import RetrievedSection, SearchOutcome
+    from sag_api.sag.dto import SearchOutcome
+    from sag_api.services import search_unit_retrieval_service
 
     class RecordingEngine:
-        strategy: str | None = None
-        top_k: int | None = None
-        query: str | None = None
-
-        async def provision(self, *_args):
+        async def provision(self, *_args, **_kwargs):
             return None
 
-        async def search_many(self, targets, query, *, strategy=None, top_k=None):
-            self.strategy = strategy
-            self.top_k = top_k
-            self.query = query
-            source_config_id = targets[0][0]
-            return SearchOutcome(
-                query=query,
-                sections=[
-                    RetrievedSection(
-                        chunk_id="chunk-1",
-                        heading="原始分块标题",
-                        content="原始分块正文",
-                        score=0.82,
-                        source_config_id=source_config_id,
-                    )
-                ],
-                stats={"strategy": strategy},
-            )
+    retrieval_calls = []
 
-        async def search_event_scores(self, *_args, **_kwargs):
-            raise AssertionError("P4 global retrieval must not recall graph events")
+    async def canonical_retrieval(engine, sources, query, *, principal, top_k=None):
+        retrieval_calls.append(
+            {
+                "engine": engine,
+                "source_ids": [source.id for source in sources],
+                "query": query,
+                "principal": principal,
+                "top_k": top_k,
+            }
+        )
+        return SearchOutcome(
+            query=query,
+            sections=[],
+            stats={
+                "canonical_index": True,
+                "requested_top_k": top_k,
+                "candidate_top_k": 21,
+                "fusion_method": "rrf",
+            },
+        )
 
-        async def graph_for_sections(self, *_args, **_kwargs):
-            raise AssertionError("P4 global retrieval must not project graph fields")
+    monkeypatch.setattr(
+        search_unit_retrieval_service,
+        "retrieve_search_unit_sections",
+        canonical_retrieval,
+    )
 
     engine = RecordingEngine()
     monkeypatch.setattr(
@@ -131,27 +132,26 @@ async def test_global_search_forwards_validated_strategy(monkeypatch):
                     },
                 )
                 assert response.status_code == 200, response.text
-                assert engine.strategy == "multi"
-                assert engine.query == "策略测试"
-                # 对外仍返回 7 条；内部有界扩大候选池，之后统一重排与过滤。
-                assert engine.top_k == 21
-                assert response.json()["stats"]["strategy"] == "multi"
                 result = response.json()
                 assert result["stats"]["requested_top_k"] == 7
                 assert result["stats"]["candidate_top_k"] == 21
                 assert result["stats"]["fusion_method"] == "rrf"
-                assert result["stats"]["fusion_retrievers"] == 1
                 assert "event_candidates" not in result["stats"]
                 assert "event_hits" not in result["stats"]
                 assert result["stats"]["query_route"]["query_original"] == "策略测试"
                 assert result["stats"]["query_route"]["requested_strategy"] == "multi"
                 assert result["stats"]["query_route"]["effective_strategy"] == "multi"
                 assert result["stats"]["query_route"]["fallback_used"] is False
-                assert "[1]" in result["summary"]
                 assert result["events"] == []
                 assert result["entities"] == []
                 assert result["relations"] == []
                 assert result["source_hits"] == []
+                assert retrieval_calls[0]["engine"] is engine
+                assert retrieval_calls[0]["source_ids"] == [source.json()["id"]]
+                assert retrieval_calls[0]["query"] == "策略测试"
+                assert retrieval_calls[0]["principal"].allowed_project_ids
+                assert retrieval_calls[0]["top_k"] == 7
+                assert result["answer_status"] == "no_answer"
 
                 deprecated = await client.post(
                     "/api/v1/search",
@@ -239,39 +239,24 @@ async def test_global_search_falls_back_when_laya_errors_without_losing_scope(mo
     from sag_api.api.v1 import search as search_api
     from sag_api.core.deps import get_engine_manager
     from sag_api.main import app
-    from sag_api.sag.dto import RetrievedSection, SearchOutcome, SourceGraphInfo
+    from sag_api.sag.dto import SearchOutcome
+    from sag_api.services import search_unit_retrieval_service
 
     class RetrievalEngine:
-        query: str | None = None
-
         async def provision(self, *_args, **_kwargs):
             return None
 
-        async def search_many(self, targets, query, *, strategy=None, top_k=None):
-            self.query = query
-            return SearchOutcome(
-                query=query,
-                sections=[
-                    RetrievedSection(
-                        chunk_id="identifier-chunk",
-                        heading="Error code",
-                        content="ERR_TIMEOUT is retriable.",
-                        score=0.9,
-                        source_config_id=targets[0][0],
-                    )
-                ],
-                stats={
-                    "requested_strategy": strategy,
-                    "effective_strategy": "vector",
-                    "fallback_used": True,
-                },
-            )
+    retrieval_calls = []
 
-        async def search_event_scores(self, *_args, **_kwargs):
-            return {}
+    async def canonical_retrieval(engine, sources, query, *, principal, top_k=None):
+        retrieval_calls.append((engine, [source.id for source in sources], query, principal, top_k))
+        return SearchOutcome(query=query, sections=[], stats={"canonical_index": True})
 
-        async def graph_for_sections(self, *_args, **_kwargs):
-            return SourceGraphInfo()
+    monkeypatch.setattr(
+        search_unit_retrieval_service,
+        "retrieve_search_unit_sections",
+        canonical_retrieval,
+    )
 
     def broken_laya(_query, _context=None):
         raise RuntimeError("checkpoint token must stay internal")
@@ -302,7 +287,6 @@ async def test_global_search_falls_back_when_laya_errors_without_losing_scope(mo
                 assert response.status_code == 200, response.text
                 payload = response.json()
                 assert payload["query"] == "ERR_TIMEOUT"
-                assert engine.query == "ERR_TIMEOUT"
                 trace = payload["stats"]["query_route"]
                 assert trace["coarse_intent"] == "AMBIGUOUS"
                 assert trace["retrieval"] == "fallback"
@@ -311,6 +295,9 @@ async def test_global_search_falls_back_when_laya_errors_without_losing_scope(mo
                 assert trace["scope_source_ids"] == [source_id]
                 assert "ERR_TIMEOUT" in trace["query_analysis"]["features"]["identifier_terms"]
                 assert "checkpoint token" not in response.text
+                assert retrieval_calls[0][0] is engine
+                assert retrieval_calls[0][1] == [source_id]
+                assert retrieval_calls[0][2] == "ERR_TIMEOUT"
     finally:
         app.dependency_overrides.pop(get_engine_manager, None)
 
@@ -319,7 +306,7 @@ async def test_global_search_falls_back_when_laya_errors_without_losing_scope(mo
 @pytest.mark.parametrize(
     "requested_mode", ["omitted", "intersection", "unauthorized-only", "empty"]
 )
-async def test_global_search_applies_same_authorized_scope_before_dense_and_lexical(
+async def test_global_search_applies_same_authorized_scope_before_search_unit_query(
     requested_mode,
     monkeypatch,
 ):
@@ -331,45 +318,27 @@ async def test_global_search_applies_same_authorized_scope_before_dense_and_lexi
     from sag_api.core.principal_assertion import require_principal_assertion
     from sag_api.db.models import SourceProjectMapping
     from sag_api.main import app
-    from sag_api.sag.dto import RetrievedSection, SearchOutcome
+    from sag_api.sag.dto import SearchOutcome
+    from sag_api.services import search_unit_retrieval_service
 
     class ScopeRecordingEngine:
-        def __init__(self):
-            self.dense_targets: list[str] = []
-            self.lexical_targets: list[str] = []
-            self.dense_scores: dict[str, float] = {}
-
         async def provision(self, *_args, **_kwargs):
             return None
 
-        async def search_many(self, targets, query, *, strategy=None, top_k=None):
-            self.dense_targets = [source.id for _config_id, source in targets]
-            candidates = [
-                RetrievedSection(
-                    chunk_id=f"dense-{source.id}",
-                    heading="authorized evidence",
-                    content="authorized evidence supports the requested topic",
-                    score=self.dense_scores[source.id],
-                    source_config_id=config_id,
-                )
-                for config_id, source in targets
-            ]
-            candidates.sort(key=lambda section: -section.score)
-            return SearchOutcome(query=query, sections=candidates[:top_k], stats={})
-
-        async def grep_chunks(self, source_config_id, term, *, source=None, limit=None, **_kwargs):
-            del term, limit
-            self.lexical_targets.append(source.id)
-            return [
-                {
-                    "chunk_id": f"lexical-{source_config_id}",
-                    "heading": "authorized evidence",
-                    "snippet": "authorized evidence supports the requested topic",
-                    "source_id": f"document-{source_config_id}",
-                }
-            ]
-
     engine = ScopeRecordingEngine()
+    retrieval_scopes = []
+
+    async def record_search_unit_scope(_engine, sources, query, *, principal, top_k=None):
+        retrieval_scopes.append(
+            ([source.id for source in sources], query, principal.allowed_project_ids, top_k)
+        )
+        return SearchOutcome(query=query, sections=[], stats={"canonical_index": True})
+
+    monkeypatch.setattr(
+        search_unit_retrieval_service,
+        "retrieve_search_unit_sections",
+        record_search_unit_scope,
+    )
     monkeypatch.setattr(
         search_api,
         "route_query",
@@ -398,10 +367,6 @@ async def test_global_search_applies_same_authorized_scope_before_dense_and_lexi
                 assert allowed.status_code == denied.status_code == 201
                 allowed_id = allowed.json()["id"]
                 denied_id = denied.json()["id"]
-                engine.dense_scores = {
-                    allowed_id: 0.60,
-                    denied_id: 0.99,
-                }
                 allowed_project = f"allowed-{uuid.uuid4().hex}"
                 async with SessionLocal() as session:
                     await session.execute(
@@ -431,15 +396,13 @@ async def test_global_search_applies_same_authorized_scope_before_dense_and_lexi
         assert response.status_code == 200, response.text
         result = response.json()
         if requested_mode in {"unauthorized-only", "empty"}:
-            assert engine.dense_targets == []
-            assert engine.lexical_targets == []
+            assert retrieval_scopes == []
             assert result["sections"] == []
             return
-        assert engine.dense_targets == [allowed_id]
-        assert engine.lexical_targets
-        assert set(engine.lexical_targets) == {allowed_id}
-        assert {item["source_id"] for item in result["sections"]} == {allowed_id}
-        assert denied_id not in {item["source_id"] for item in result["sections"]}
+        assert retrieval_scopes == [
+            ([allowed_id], "authorized evidence topic", frozenset({allowed_project}), 1)
+        ]
+        assert result["sections"] == []
     finally:
         app.dependency_overrides.pop(get_engine_manager, None)
         app.dependency_overrides[require_principal_assertion] = original_principal

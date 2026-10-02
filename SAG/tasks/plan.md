@@ -730,6 +730,8 @@ Checkpoint A xác nhận nhánh đầu đã truy vấn được và citation ho�
 
 **Checkpoint A — SEARCH_READY end-to-end:** upload → extract → dedup → index → global hybrid retrieval → context/citation hoạt động; có failure path; có thể tắt/trễ toàn bộ knowledge enrichment mà vẫn hỏi được tài liệu.
 
+**Implementation status — 2026-10-02:** Task branch `feat/Thang-checkpoint-a-search-ready-be-api` wires global Search, stream, and `search_context` to ACL-scoped, verified Phase 2C SearchUnits; accepts producer `search_status=READY/SEARCH_READY` independently of `DocumentVersion.status`; packs/cites only traceable evidence; and fails closed for empty/weak/unready evidence. PR review follow-up added a pooled Qdrant HTTP client, reduced duplicate channel materialization, and suppressed raw HTTP exception chaining. Relevant checks: **161 passed, 4 warnings**; Ruff and `git diff --check` pass. This is not the full Checkpoint A gate: actual upload → producer-written index → API against real Qdrant, trusted tenant/partition and Project Source owner contracts, model-identity compatibility, and staging leakage/revocation evidence remain open. See the [Checkpoint A research task record](../docs/Thang_Task/%5BSAG%5D%5BCheckpoint%20A%5D/researchtask.md) for commands, review fixes, and exact gaps.
+
 ### Phase 5 — Knowledge Units & Graph
 
 **Phụ thuộc:** Checkpoint A; dữ liệu canonical/versioned từ Phase 2A–2C.

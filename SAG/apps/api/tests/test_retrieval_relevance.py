@@ -1,5 +1,6 @@
 """Retrieval answers may only see evidence that survives query-aware reranking."""
 
+import hashlib
 from types import SimpleNamespace
 
 import pytest
@@ -98,6 +99,57 @@ def test_rank_fusion_is_independent_of_retriever_score_scales():
     assert [item.chunk_id for item in baseline.sections] == ["a", "b", "c"]
     assert [item.chunk_id for item in rescaled.sections] == ["a", "b", "c"]
     assert all(0.0 <= item.score <= 1.0 for item in rescaled.sections)
+
+
+def test_cross_project_merge_interleaves_each_authorized_scope_before_second_rank():
+    from sag_api.services.search_unit_retrieval_service import _fair_rank_merge
+
+    project_a = [
+        section("a1", "A1", "project A first result", 0.9),
+        section("a2", "A2", "project A second result", 0.8),
+    ]
+    project_b = [
+        section("b1", "B1", "project B first result", 0.99),
+        section("b2", "B2", "project B second result", 0.7),
+    ]
+
+    merged = _fair_rank_merge([project_a, project_b])
+
+    assert [item.chunk_id for item in merged] == ["a1", "b1", "a2", "b2"]
+
+
+def test_index_manifest_from_before_retry_start_is_not_current():
+    from datetime import UTC, datetime, timedelta
+    from types import SimpleNamespace
+
+    from sag_api.services.search_unit_retrieval_service import _stage_belongs_to_current_attempt
+
+    retry_started = datetime(2026, 1, 1, tzinfo=UTC)
+    previous_manifest = SimpleNamespace(created_at=retry_started - timedelta(seconds=1))
+    current_manifest = SimpleNamespace(created_at=retry_started + timedelta(seconds=1))
+    assert not _stage_belongs_to_current_attempt(retry_started, previous_manifest)
+    assert _stage_belongs_to_current_attempt(retry_started, current_manifest)
+    assert not _stage_belongs_to_current_attempt(None, current_manifest)
+
+
+def test_search_ready_manifest_rejects_coerced_counts_and_malformed_checksums():
+    from sag_api.services.search_unit_retrieval_service import _verified_manifest
+
+    checksum = hashlib.sha256(b"verified-manifest").hexdigest()
+    manifest = {
+        "manifest_verified": True,
+        "collection_name": "search_units_project-1",
+        "search_unit_count": 2,
+        "pg_count": 2,
+        "qdrant_count": 2,
+        "qdrant_indexed_count": 2,
+        "manifest_checksum": checksum,
+        "qdrant_checksum": checksum,
+    }
+    assert _verified_manifest(manifest, project_id="project-1")
+    assert not _verified_manifest({**manifest, "pg_count": True}, project_id="project-1")
+    assert not _verified_manifest({**manifest, "qdrant_count": "2"}, project_id="project-1")
+    assert not _verified_manifest({**manifest, "manifest_checksum": "trusted"}, project_id="project-1")
 
 
 def test_rank_fusion_deduplicates_candidates_by_source_and_chunk():
@@ -699,7 +751,19 @@ async def test_invalid_llm_citation_falls_back_to_selected_evidence():
         async def complete(self, _messages):
             return "模型引用了不存在的证据 [9]"
 
-    selected = [traceable_section("one", "相关证据", "实际入选的事实。", 0.9)]
+    content = "实际入选的事实。"
+    selected = [
+        traceable_section("one", "相关证据", content, 0.9).model_copy(
+            update={
+                "search_unit_id": "one",
+                "block_from_id": "block-one",
+                "block_to_id": "block-one",
+                "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                "canonical_evidence_verified": True,
+                "source_id": "public-source",
+            }
+        )
+    ]
     result = await synthesize_search_answer(
         "问题",
         selected,

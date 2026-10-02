@@ -1,5 +1,6 @@
 """引用溯源：chunk 原文端点 + citations 的 sag source_id 语义。"""
 
+import hashlib
 import uuid
 from datetime import UTC, datetime
 
@@ -116,8 +117,8 @@ async def test_search_unit_locator_resolution_is_exact_and_acl_scoped():
                 document_id=document_id,
                 version_no=3,
                 file_hash=uuid.uuid4().hex,
-                status="SEARCH_READY",
-                search_status="SEARCH_READY",
+                status="RECEIVED",
+                search_status="READY",
                 search_ready_at=datetime.now(UTC),
                 metadata_json={},
             )
@@ -134,7 +135,7 @@ async def test_search_unit_locator_resolution_is_exact_and_acl_scoped():
                 section_path="Deploy / Rollback",
                 source_anchor="pdf-page-8-block-4",
                 normalized_text="Use the approved rollback.",
-                content_hash=uuid.uuid4().hex,
+                    content_hash=hashlib.sha256(b"Use the approved rollback.").hexdigest(),
             )
         )
         await session.flush()
@@ -145,7 +146,7 @@ async def test_search_unit_locator_resolution_is_exact_and_acl_scoped():
                 block_from_id=block_id,
                 block_to_id=block_id,
                 security_partition_id="project-a",
-                content_hash=uuid.uuid4().hex,
+                content_hash=hashlib.sha256(b"Use the approved rollback.").hexdigest(),
                 token_count=6,
                 page_from=8,
                 page_to=8,
@@ -171,3 +172,13 @@ async def test_search_unit_locator_resolution_is_exact_and_acl_scoped():
 
     denied_result = await resolve_traceable_evidence([section], [denied])
     assert not has_traceable_locator(denied_result[0])
+
+    mismatched_duplicate = section.model_copy(
+        update={"content": "Forged content with a colliding SearchUnit ID."}
+    )
+    duplicate_result = await resolve_traceable_evidence(
+        [mismatched_duplicate, section],
+        [allowed],
+    )
+    assert not has_traceable_locator(duplicate_result[0])
+    assert has_traceable_locator(duplicate_result[1])

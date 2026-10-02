@@ -1,5 +1,6 @@
 """Agentic 基建：默认工具、全局证据编号、历史压缩、token 估算。全离线。"""
 
+import hashlib
 import json
 from types import SimpleNamespace
 
@@ -446,40 +447,40 @@ def test_external_citations_are_safe_deduplicated_bounded_and_mapping_aware():
 
 @pytest.mark.asyncio
 async def test_search_tool_uses_global_citation_offset(monkeypatch):
-    from sag_api.core.db import init_db
-    from sag_api.tools import builtin
+    from sag_api.services import search_unit_retrieval_service
+    async def retrieve_canonical(_engine, sources, query, *, principal, top_k=None):
+        assert principal.tenant_id == "tenant-c1"
+        source = sources[0]
+        return SearchOutcome(
+            query=query,
+            sections=[
+                RetrievedSection(
+                    heading="标题",
+                    content="内容",
+                    chunk_id="c1",
+                    search_unit_id="c1",
+                    source_id=source.id,
+                    source_config_id=source.sag_source_config_id,
+                    score=0.9,
+                    canonical_evidence_verified=True,
+                    content_hash=hashlib.sha256("内容".encode()).hexdigest(),
+                    document_id="doc-c1",
+                    document_version_id="version-c1",
+                    page_from=1,
+                    page_to=1,
+                    anchor="section-c1",
+                    block_from_id="block-a",
+                    block_to_id="block-a",
+                    section_path="章节一",
+                )
+            ],
+        )
 
-    await init_db()
+    monkeypatch.setattr(search_unit_retrieval_service, "retrieve_search_unit_sections", retrieve_canonical)
 
-    async def resolve_test_locators(sections, _sources):
-        return [
-            section.model_copy(
-                update={
-                    "document_id": "doc-c1",
-                    "document_version_id": "version-c1",
-                    "page_from": 1,
-                    "page_to": 1,
-                    "anchor": "section-c1",
-                }
-            )
-            for section in sections
-        ]
-
-    monkeypatch.setattr(builtin, "resolve_traceable_evidence", resolve_test_locators)
     class _EM:
-        async def search_many(self, targets, query, strategy=None, top_k=None):
-            return SearchOutcome(
-                query=query,
-                sections=[
-                    RetrievedSection(
-                        heading="标题",
-                        content="内容",
-                        chunk_id="c1",
-                        source_config_id="scid",
-                        score=0.9,
-                    )
-                ],
-            )
+        async def graph_for_sections(self, *_args, **_kwargs):
+            raise AssertionError("search_context must not depend on knowledge enrichment")
 
     class _Src:
         sag_source_config_id = "scid"
@@ -489,12 +490,18 @@ async def test_search_tool_uses_global_citation_offset(monkeypatch):
     ctx = ToolContext(
         engine_manager=_EM(),
         sources=[_Src()],
+        principal=SimpleNamespace(tenant_id="tenant-c1", allowed_partition_ids=frozenset({"p-c1"})),
         citation_offset=3,
         evidence_token_budget=10_000,
     )
     result = await SearchContextTool().invoke({"query": "q"}, ctx)
     assert "[4]" in result.content  # 编号从 offset+1 开始
     assert result.citations[0]["n"] == 4
+    assert result.citations[0]["document_version_id"] == "version-c1"
+    assert result.citations[0]["block_from_id"] == "block-a"
+    assert result.citations[0]["section_path"] == "章节一"
+    assert result.data["evidence_status"] == "sufficient"
+    assert "_graph" in result.data
 
 
 @pytest.mark.asyncio

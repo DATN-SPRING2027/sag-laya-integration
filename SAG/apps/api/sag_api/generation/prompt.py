@@ -360,6 +360,10 @@ def build_citations(
                     "page_from": s.page_from,
                     "page_to": s.page_to,
                     "anchor": s.anchor,
+                    "search_unit_id": s.search_unit_id or s.chunk_id,
+                    "block_from_id": s.block_from_id,
+                    "block_to_id": s.block_to_id,
+                    "section_path": s.section_path,
                 }
             )
         event_key = ((s.source_config_id or "").strip(), (s.chunk_id or "").strip())
