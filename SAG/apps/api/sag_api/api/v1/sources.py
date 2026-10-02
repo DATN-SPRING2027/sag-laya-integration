@@ -116,11 +116,22 @@ async def get_chunk(
     chunk_id: str,
     _user: User = Depends(get_current_user_or_connector),
     source: Source = Depends(require_path_source_access),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
 ) -> dict:
     """引用溯源：读取某分块的完整原文。"""
     from sag_api.core.errors import NotFoundError
+    from sag_api.services.search_unit_retrieval_service import get_search_unit_citation
+
+    canonical = await get_search_unit_citation(
+        session,
+        source=source,
+        principal=principal,
+        search_unit_id=chunk_id,
+    )
+    if canonical is not None:
+        return canonical
 
     chunk = await engine_manager.get_chunk(source.sag_source_config_id, chunk_id, source=source)
     if chunk is None:

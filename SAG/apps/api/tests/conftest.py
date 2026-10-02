@@ -186,8 +186,8 @@ class _InMemoryVectorStore:
 # in-memory implementation. Real Qdrant coverage belongs in an integration job.
 if "zleap.sag.core.adapters.models" not in sys.modules:
     # Inject fallback models into sys.modules so qdrant_store can import them
-    import types as _types
     import dataclasses as _dc_inject
+    import types as _types
     _models_mod = _types.ModuleType("zleap.sag.core.adapters.models")
     _models_mod.BulkResult = BulkResult  # type: ignore[attr-defined]
     _models_mod.Filter = Filter  # type: ignore[attr-defined]
@@ -271,6 +271,8 @@ def _install_authorized_project_for_api_tests(monkeypatch):
         token_id="pytest-assertion",
         issued_at=0,
         expires_at=2**31,
+        tenant_id="tenant_continuum_default",
+        allowed_partition_ids=frozenset({"*"}),
     )
     from sag_api.main import app
 

@@ -692,11 +692,18 @@ async def generate_stream(
     terminal = False
 
     async with session_factory() as session:
-        sources = await resolve_sources(session, agent, plan.source_ids, principal=principal)
+        sources = await resolve_sources(
+            session,
+            agent,
+            plan.source_ids,
+            principal=principal,
+            include_project_sources=True,
+        )
         mcp_specs = [] if knowledge_only else await resolve_mcp_specs(session, agent)
     host_context = HostToolContext(
         engine_manager=engine_manager,
         sources=sources,
+        principal=principal,
         persona=agent.persona or {},
         agent=agent,
     )

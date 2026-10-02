@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from sag_api.core.principal_assertion import VerifiedPrincipal
     from sag_api.db.models import Agent, Source
     from sag_api.sag import EngineManager
 
@@ -42,6 +43,7 @@ class ToolContext:
 
     engine_manager: EngineManager
     sources: list[Source] = field(default_factory=list)
+    principal: VerifiedPrincipal | None = None
     persona: dict[str, Any] = field(default_factory=dict)
     agent: Agent | None = None
     # High-water mark for citation numbering; survives context-window pruning.

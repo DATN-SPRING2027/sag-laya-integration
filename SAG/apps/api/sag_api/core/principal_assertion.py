@@ -31,7 +31,6 @@ _FORBIDDEN_SCOPE_ALIASES = frozenset(
         "organizationId",
         "organization_id",
         "org_id",
-        "tenantId",
         "tenant_id",
         "projectId",
         "project_id",
@@ -51,6 +50,9 @@ _FORBIDDEN_SCOPE_ALIASES = frozenset(
         "document_id",
         "documentIds",
         "document_ids",
+        "allowed_partition_ids",
+        "securityPartitionIds",
+        "security_partition_ids",
     }
 )
 
@@ -65,6 +67,8 @@ class VerifiedPrincipal:
     token_id: str
     issued_at: int
     expires_at: int
+    tenant_id: str = ""
+    allowed_partition_ids: frozenset[str] = frozenset()
 
 
 JwksLoader = Callable[[str], Awaitable[dict[str, Any]]]
@@ -177,6 +181,8 @@ class PrincipalAssertionVerifier:
         subject = claims.get("sub")
         organization_id = claims.get("orgId")
         project_ids = claims.get("allowedProjectIds")
+        tenant_id = claims.get("tenantId", "")
+        partition_ids = claims.get("allowedPartitionIds", [])
         token_id = claims.get("jti")
         if _FORBIDDEN_SCOPE_ALIASES.intersection(claims):
             raise AuthError("Principal assertion contains unsupported scope aliases")
@@ -193,6 +199,10 @@ class PrincipalAssertionVerifier:
             raise AuthError("Principal assertion lifetime is invalid")
         if not self._valid_identifier(subject) or not self._valid_identifier(organization_id):
             raise AuthError("Principal assertion identity is invalid")
+        if "tenantId" in claims and (
+            not self._valid_identifier(tenant_id) or len(tenant_id) > 64
+        ):
+            raise AuthError("Principal assertion Tenant scope is invalid")
         if (
             not isinstance(project_ids, list)
             or len(project_ids) > self.max_project_ids
@@ -200,6 +210,13 @@ class PrincipalAssertionVerifier:
             or len(set(project_ids)) != len(project_ids)
         ):
             raise AuthError("Principal assertion Project scope is invalid")
+        if (
+            not isinstance(partition_ids, list)
+            or len(partition_ids) > self.max_project_ids
+            or any(not self._valid_identifier(partition_id) for partition_id in partition_ids)
+            or len(set(partition_ids)) != len(partition_ids)
+        ):
+            raise AuthError("Principal assertion partition scope is invalid")
         if not self._valid_identifier(token_id):
             raise AuthError("Principal assertion token identifier is invalid")
 
@@ -212,6 +229,8 @@ class PrincipalAssertionVerifier:
             token_id=token_id,
             issued_at=issued_at,
             expires_at=expires_at,
+            tenant_id=tenant_id,
+            allowed_partition_ids=frozenset(partition_ids),
         )
         log.info(
             "principal assertion verified issuer=%s kid=%s allowed_project_count=%d",

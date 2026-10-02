@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
@@ -145,9 +146,41 @@ async def resolve_traceable_evidence(
     if not sections:
         return []
     source_by_id = {source.id: source for source in sources if source.id and source.sag_source_config_id}
-    chunk_ids = {section.chunk_id for section in sections if section.chunk_id}
+    source_by_config = {source.sag_source_config_id: source for source in source_by_id.values()}
+    verified_canonical: dict[tuple[str, str], RetrievedSection] = {}
+    invalid_canonical: set[tuple[str, str]] = set()
+    legacy_sections: list[RetrievedSection] = []
+    for section in sections:
+        source = source_by_config.get(section.source_config_id or "")
+        key = (section.source_config_id or "", section.chunk_id or "")
+        canonical_is_valid = (
+            section.canonical_evidence_verified
+            and section.search_unit_id == section.chunk_id
+            and section.source_id == getattr(source, "id", None)
+            and section.content_hash is not None
+            and hashlib.sha256(section.content.encode("utf-8")).hexdigest() == section.content_hash
+            and bool(section.document_id)
+            and bool(section.document_version_id)
+            and bool(section.block_from_id)
+            and bool(section.block_to_id)
+            and section.page_from is not None
+            and section.page_to is not None
+            and bool(section.anchor and section.anchor.strip())
+        )
+        if section.canonical_evidence_verified and canonical_is_valid:
+            verified_canonical[key] = section
+        elif section.canonical_evidence_verified:
+            invalid_canonical.add(key)
+        else:
+            legacy_sections.append(section.model_copy(update={"canonical_evidence_verified": False}))
+
+    chunk_ids = {section.chunk_id for section in legacy_sections if section.chunk_id}
     if not source_by_id or not chunk_ids:
-        return list(sections)
+        return [
+            verified_canonical.get((section.source_config_id or "", section.chunk_id or ""), section)
+            for section in sections
+            if (section.source_config_id or "", section.chunk_id or "") not in invalid_canonical
+        ]
 
     from sag_api.core.db import SessionLocal
     from sag_api.db.models import CanonicalBlock, Document, DocumentVersion, SearchUnit
@@ -160,6 +193,7 @@ async def resolve_traceable_evidence(
             SearchUnit.document_version_id,
             SearchUnit.page_from,
             SearchUnit.page_to,
+            SearchUnit.content_hash,
             Document.id,
             Document.filename,
             Document.source_id,
@@ -198,6 +232,7 @@ async def resolve_traceable_evidence(
         version_id,
         page_from,
         page_to,
+        content_hash,
         document_id,
         document_name,
         source_id,
@@ -221,13 +256,34 @@ async def resolve_traceable_evidence(
             "page_from": int(page_from),
             "page_to": int(page_to),
             "anchor": str(anchor).strip(),
+            "content_hash": str(content_hash),
         }
 
     resolved = []
-    for section in sections:
+    for section in legacy_sections:
         locator = by_key.get((section.source_config_id or "", section.chunk_id or ""))
-        resolved.append(section.model_copy(update=locator) if locator else section)
-    return resolved
+        content_matches_unit = bool(
+            locator
+            and hashlib.sha256(section.content.encode("utf-8")).hexdigest() == locator["content_hash"]
+        )
+        resolved.append(
+            section.model_copy(update=locator)
+            if content_matches_unit
+            else section.model_copy(update={"document_id": None, "document_version_id": None, "anchor": None})
+        )
+    resolved_legacy = iter(resolved)
+    traceable_sections: list[RetrievedSection] = []
+    for section in sections:
+        key = (section.source_config_id or "", section.chunk_id or "")
+        if key in invalid_canonical:
+            continue
+        canonical = verified_canonical.get(key)
+        if canonical is not None:
+            traceable_sections.append(canonical)
+        elif not section.canonical_evidence_verified:
+            # Preserve per-item hash validation even when legacy IDs collide.
+            traceable_sections.append(next(resolved_legacy))
+    return traceable_sections
 
 
 def _search_prompt_messages(query: str, sections: list[RetrievedSection]) -> list[dict[str, str]]:
@@ -235,7 +291,9 @@ def _search_prompt_messages(query: str, sections: list[RetrievedSection]) -> lis
         (
             f"[{index}] {section.heading or '相关资料'}\n"
             f"locator: document={section.document_id}; version={section.document_version_id}; "
-            f"chunk={section.chunk_id}; page={section.page_from}-{section.page_to}; anchor={section.anchor}\n"
+            f"search_unit={section.search_unit_id or section.chunk_id}; "
+            f"blocks={section.block_from_id}-{section.block_to_id}; "
+            f"page={section.page_from}-{section.page_to}; section={section.section_path}; anchor={section.anchor}\n"
             f"{section.content.strip()}"
         )
         for index, section in enumerate(sections, 1)

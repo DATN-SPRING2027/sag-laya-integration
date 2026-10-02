@@ -20,23 +20,14 @@ from sag_api.connectors.web import extract_web_markdown, extract_web_title
 from sag_api.core.config import settings
 from sag_api.core.logging import get_logger
 from sag_api.generation import build_citations
-from sag_api.sag import RetrievedSection, SearchOutcome
+from sag_api.sag import RetrievedSection, SourceGraphInfo
 from sag_api.services.evidence_service import (
     build_tool_evidence_pack,
     has_traceable_locator,
-    resolve_traceable_evidence,
-)
-from sag_api.services.retrieval_service import (
-    recall_event_scores,
-    retrieve_relevant_sections,
 )
 from sag_api.tools.base import Tool, ToolContext, ToolMeta, ToolResult
 
 log = get_logger("tools.web_search")
-
-
-def _section_locator_key(section: RetrievedSection) -> tuple[str, str]:
-    return section.source_config_id or "", section.chunk_id or ""
 
 
 _WEB_SEARCH_HOSTS = frozenset({"api.302.ai", "api.302ai.cn"})
@@ -48,7 +39,6 @@ _WEB_PAGE_TEXT_LIMIT = 12_000
 _WEB_PAGE_MAX_REDIRECTS = 3
 _WEB_PAGE_CONTENT_TYPES = ("text/html", "text/plain", "application/xhtml+xml")
 _WEB_PAGE_PORTS = frozenset({80, 443, 8080, 8443})
-_DEFAULT_KNOWLEDGE_SEARCH_STRATEGY = "vector"
 _RECENT_QUERY_MARKERS = (
     "今天",
     "今日",
@@ -95,8 +85,11 @@ def _format_sections(sections: list, offset: int = 0, events: list | None = None
     for i, s in enumerate(sections, start=1 + offset):
         locator = (
             f"Locator: document={getattr(s, 'document_id', '')}; "
-            f"version={getattr(s, 'document_version_id', '')}; chunk={getattr(s, 'chunk_id', '')}; "
+            f"version={getattr(s, 'document_version_id', '')}; "
+            f"search_unit={getattr(s, 'search_unit_id', '') or getattr(s, 'chunk_id', '')}; "
+            f"blocks={getattr(s, 'block_from_id', '')}-{getattr(s, 'block_to_id', '')}; "
             f"page={getattr(s, 'page_from', '')}-{getattr(s, 'page_to', '')}; "
+            f"section={getattr(s, 'section_path', '')}; "
             f"anchor={getattr(s, 'anchor', '')}"
         )
         key = (
@@ -119,124 +112,6 @@ def _format_sections(sections: list, offset: int = 0, events: list | None = None
         heading = getattr(s, "heading", None) or "片段"
         blocks.append(f"[{i}] {heading}\n{locator}\n{getattr(s, 'content', '')}")
     return "\n\n".join(blocks)
-
-
-async def _prioritize_event_evidence(
-    engine_manager: Any,
-    sections: list[RetrievedSection],
-    events: list,
-    sources_by_config: dict[str, Any],
-    *,
-    limit: int,
-) -> list[RetrievedSection]:
-    """Put event-backed evidence first, then retain chunk-only fallbacks."""
-
-    existing = {
-        ((section.source_config_id or "").strip(), (section.chunk_id or "").strip()): section
-        for section in sections
-        if section.source_config_id and section.chunk_id
-    }
-    event_scores: dict[tuple[str, str], float] = {}
-    ordered_keys: list[tuple[str, str]] = []
-    for event in events:
-        key = (
-            str(getattr(event, "source_config_id", "") or "").strip(),
-            str(getattr(event, "chunk_id", "") or "").strip(),
-        )
-        if not all(key):
-            continue
-        try:
-            score = float(getattr(event, "score", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            score = 0.0
-        event_scores[key] = max(event_scores.get(key, 0.0), score)
-        if key not in ordered_keys:
-            ordered_keys.append(key)
-        if len(ordered_keys) >= limit:
-            break
-
-    get_chunk = getattr(engine_manager, "get_chunk", None)
-    missing_keys = [key for key in ordered_keys if key not in existing]
-
-    async def load(key: tuple[str, str]) -> tuple[tuple[str, str], RetrievedSection | None]:
-        if not callable(get_chunk):
-            return key, None
-        source_config_id, chunk_id = key
-        try:
-            chunk = await get_chunk(
-                source_config_id,
-                chunk_id,
-                source=sources_by_config.get(source_config_id),
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:  # noqa: BLE001
-            log.warning("读取事项原文块失败 %s/%s：%s", source_config_id, chunk_id, error)
-            return key, None
-        if chunk is None:
-            return key, None
-        return key, RetrievedSection(
-            chunk_id=chunk.chunk_id,
-            heading=chunk.heading,
-            content=chunk.content,
-            score=event_scores.get(key, 0.0),
-            rank=chunk.rank,
-            source_config_id=source_config_id,
-        )
-
-    if missing_keys:
-        for key, section in await asyncio.gather(*(load(key) for key in missing_keys)):
-            if section is not None:
-                existing[key] = section
-
-    selected: list[RetrievedSection] = []
-    selected_keys: set[tuple[str, str]] = set()
-    for key in ordered_keys:
-        section = existing.get(key)
-        if section is None:
-            continue
-        selected.append(section.model_copy(update={"score": max(section.score, event_scores.get(key, 0.0))}))
-        selected_keys.add(key)
-        if len(selected) >= limit:
-            return selected
-
-    for section in sections:
-        key = (
-            (section.source_config_id or "").strip(),
-            (section.chunk_id or "").strip(),
-        )
-        if key in selected_keys:
-            continue
-        selected.append(section)
-        selected_keys.add(key)
-        if len(selected) >= limit:
-            break
-    return selected
-
-
-def _no_traceable_search_context(
-    outcome: SearchOutcome,
-    event_scores: dict[tuple[str, str], float],
-    *,
-    no_answer_reason: str,
-    event_count: int,
-) -> ToolResult:
-    evidence_status = "empty" if no_answer_reason == "empty_evidence" else "weak"
-    return ToolResult(
-        content="（没有足够且可追溯的资料，无法回答。）",
-        citations=[],
-        data={
-            "sections": [],
-            "section_count": 0,
-            "evidence_status": evidence_status,
-            "no_answer_reason": no_answer_reason,
-            "lexical_count": int(outcome.stats.get("lexical_candidates") or 0),
-            "filtered_count": int(outcome.stats.get("filtered_irrelevant") or 0),
-            "candidate_count": int(outcome.stats.get("candidates") or len(outcome.sections)),
-            "event_count": event_count,
-            "event_candidates": len(event_scores),
-        },
-    )
 
 
 class SearchContextTool(Tool):
@@ -267,94 +142,42 @@ class SearchContextTool(Tool):
         top_k = args.get("top_k") or persona.get("top_k")
         limit = max(1, min(int(top_k or 8), 50))
         source_refs = {s.sag_source_config_id: {"id": s.id, "name": s.name} for s in ctx.sources}
-        sources_by_config = {source.sag_source_config_id: source for source in ctx.sources}
-        outcome, event_scores = await asyncio.gather(
-            retrieve_relevant_sections(
-                ctx.engine_manager,
-                ctx.sources,
-                query,
-                # 问答工具有独立的 30 秒执行预算。默认采用与搜索页“快速”
-                # 一致的批量向量召回，并叠加并行词法与事项召回；人格可显式覆盖。
-                strategy=persona.get("search_strategy") or _DEFAULT_KNOWLEDGE_SEARCH_STRATEGY,
-                top_k=limit,
-            ),
-            recall_event_scores(
-                ctx.engine_manager,
-                query,
-                sources_by_config,
-                limit=limit,
-            ),
-        )
-        resolved_sections = await resolve_traceable_evidence(outcome.sections, ctx.sources)
-        sections = [section for section in resolved_sections if has_traceable_locator(section)]
-        if not sections:
-            return _no_traceable_search_context(
-                outcome,
-                event_scores,
-                no_answer_reason="weak_evidence" if outcome.sections else "empty_evidence",
-                event_count=0,
-            )
-        graph_for_sections = getattr(ctx.engine_manager, "graph_for_sections", None)
-        graph = (
-            await graph_for_sections(
-                sections,
-                sources_by_config,
-                # graph_for_sections allocates the first event of each chunk
-                # before a second pass. Cover every returned section while
-                # retaining the existing minimum activation capacity.
-                event_limit=max(12, len(sections), len(event_scores)),
-                entity_limit=36,
-                event_scores=event_scores,
-            )
-            if (sections or event_scores) and callable(graph_for_sections)
-            else None
-        )
-        if graph is not None and graph.events:
-            resolved_keys = {
-                _section_locator_key(section)
-                for section in sections
-                if section.source_config_id and section.chunk_id
-            }
-            sections = await _prioritize_event_evidence(
-                ctx.engine_manager,
-                sections,
-                list(graph.events),
-                sources_by_config,
-                limit=limit,
-            )
-            new_sections = [
-                section
-                for section in sections
-                if _section_locator_key(section) not in resolved_keys
-            ]
-            resolved_new_sections = (
-                await resolve_traceable_evidence(new_sections, ctx.sources)
-                if new_sections
-                else []
-            )
-            resolved_by_key = {
-                _section_locator_key(section): section
-                for section in resolved_new_sections
-            }
-            sections = [
-                section
-                if _section_locator_key(section) in resolved_keys
-                else resolved_by_key.get(_section_locator_key(section), section)
-                for section in sections
-            ]
-            sections = [section for section in sections if has_traceable_locator(section)]
-            if not sections:
-                return _no_traceable_search_context(
-                    outcome,
-                    event_scores,
-                    no_answer_reason="weak_evidence",
-                    event_count=len(graph.events),
-                )
-        offset = max(0, ctx.citation_offset)
-        graph_events = list(graph.events) if graph is not None else None
+        from sag_api.services.search_unit_retrieval_service import retrieve_search_unit_sections
 
+        outcome = await retrieve_search_unit_sections(
+            ctx.engine_manager,
+            ctx.sources,
+            query,
+            principal=ctx.principal,
+            top_k=limit,
+        )
+        sections = [
+            section
+            for section in outcome.sections
+            if section.canonical_evidence_verified and has_traceable_locator(section)
+        ]
+        if not sections:
+            evidence_status = "empty" if not outcome.sections else "weak"
+            no_answer_reason = "empty_evidence" if evidence_status == "empty" else "weak_evidence"
+            return ToolResult(
+                content="（没有足够且可追溯的资料，无法回答。）",
+                citations=[],
+                data={
+                    "sections": [],
+                    "section_count": 0,
+                    "evidence_status": evidence_status,
+                    "no_answer_reason": no_answer_reason,
+                    "lexical_count": int(outcome.stats.get("lexical_candidates") or 0),
+                    "filtered_count": int(outcome.stats.get("filtered_irrelevant") or 0),
+                    "candidate_count": int(outcome.stats.get("candidates") or len(outcome.sections)),
+                    "event_count": 0,
+                    "event_candidates": 0,
+                    "_graph": SourceGraphInfo(),
+                },
+            )
+        offset = max(0, ctx.citation_offset)
         def render(candidate_sections: list[RetrievedSection]) -> str:
-            return _format_sections(candidate_sections, offset, graph_events)
+            return _format_sections(candidate_sections, offset)
 
         packed = build_tool_evidence_pack(
             sections,
@@ -375,12 +198,13 @@ class SearchContextTool(Tool):
                     "lexical_count": int(outcome.stats.get("lexical_candidates") or 0),
                     "filtered_count": int(outcome.stats.get("filtered_irrelevant") or 0),
                     "candidate_count": int(outcome.stats.get("candidates") or len(sections)),
-                    "event_count": len(graph.events) if graph is not None else 0,
-                    "event_candidates": len(event_scores),
+                    "event_count": 0,
+                    "event_candidates": 0,
+                    "_graph": SourceGraphInfo(),
                 },
             )
         sections = packed.sections
-        citations = build_citations(sections, source_refs, graph_events)
+        citations = build_citations(sections, source_refs)
         for c in citations:
             c["n"] = c["n"] + offset
         return ToolResult(
@@ -394,9 +218,11 @@ class SearchContextTool(Tool):
                 "lexical_count": int(outcome.stats.get("lexical_candidates") or 0),
                 "filtered_count": int(outcome.stats.get("filtered_irrelevant") or 0),
                 "candidate_count": int(outcome.stats.get("candidates") or len(sections)),
-                "event_count": len(graph.events) if graph is not None else 0,
-                "event_candidates": len(event_scores),
-                "_graph": graph,
+                "event_count": 0,
+                "event_candidates": 0,
+                # Prevent the agent host from making a graph/enrichment call for
+                # evidence that is already complete and citation-safe.
+                "_graph": SourceGraphInfo(),
             },
         )
 

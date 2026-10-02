@@ -18,6 +18,12 @@ class RetrievedSection(BaseModel):
     rank: int = 0
     source_id: str | None = None
     source_config_id: str | None = None
+    search_unit_id: str | None = None
+    block_from_id: str | None = None
+    block_to_id: str | None = None
+    section_path: str | None = None
+    content_hash: str | None = None
+    canonical_evidence_verified: bool = False
     # Filled only by the API's exact, ACL-scoped SearchUnit lineage resolver.
     # Legacy engine hits do not carry these fields and remain non-citable.
     document_id: str | None = None
@@ -45,6 +51,12 @@ class RetrievedSection(BaseModel):
             rank=int(s.get("rank") or metadata.get("rank") or 0),
             source_id=s.get("source_id"),
             source_config_id=s.get("source_config_id") or s.get("data_source_id"),
+            search_unit_id=s.get("search_unit_id"),
+            block_from_id=s.get("block_from_id"),
+            block_to_id=s.get("block_to_id"),
+            section_path=s.get("section_path"),
+            content_hash=s.get("content_hash"),
+            canonical_evidence_verified=bool(s.get("canonical_evidence_verified")),
         )
 
 

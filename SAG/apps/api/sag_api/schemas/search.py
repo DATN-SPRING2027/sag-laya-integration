@@ -27,6 +27,17 @@ class GlobalSearchRequest(BaseModel):
 
 class SectionOut(BaseModel):
     chunk_id: str | None
+    search_unit_id: str | None = None
+    block_from_id: str | None = None
+    block_to_id: str | None = None
+    section_path: str | None = None
+    document_id: str | None = None
+    document_version_id: str | None = None
+    document_name: str | None = None
+    version_no: int | None = None
+    page_from: int | None = None
+    page_to: int | None = None
+    anchor: str | None = None
     heading: str
     content: str
     score: float = Field(
@@ -73,6 +84,10 @@ class SearchCitationOut(BaseModel):
     document_name: str = ""
     version_no: int | None = None
     chunk_id: str
+    search_unit_id: str | None = None
+    block_from_id: str | None = None
+    block_to_id: str | None = None
+    section_path: str | None = None
     page_from: int
     page_to: int
     anchor: str

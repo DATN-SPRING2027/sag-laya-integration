@@ -117,10 +117,19 @@ Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL ev
 
 ## Checkpoint A — SEARCH_READY end-to-end
 
-- [ ] Upload → extraction → dedup → index → global hybrid retrieval hoạt động.
-- [ ] Citation trả ngược đúng source/version/page/anchor.
-- [ ] Query vẫn hoạt động khi knowledge enrichment/tree bị tắt, trễ hoặc lỗi.
-- [ ] Kiểm tra empty result, parse/index failure, retry và không lộ secret.
+- [x] Global `/search` và `/search/stream` đọc Phase 2C SearchUnit từ collection theo Project; không gọi Knowledge Tree/event retrieval.
+- [x] Candidate Sources bị giới hạn bởi CONFIRMED mapping + signed org/Project scope; Qdrant dense/sparse đều nhận project/tenant/partition/version filter trước top-k; `source_ids` chỉ thu hẹp.
+- [x] Verified current attempt/manifest, SEARCH_READY status và version validity được kiểm tra; retry/unready/deleting/reprocessing không dùng stale point.
+- [x] Dense + sparse dùng rank fusion RRF hiện có; query nhiều scope được rank-interleave ổn định, không cộng raw score hay dùng RRF làm confidence.
+- [x] `search_context` dùng cùng reader, token pack và citation numbering; enrichment/event/graph không tham gia đường đọc.
+- [x] Citation giữ source/document/version/SearchUnit/block range/page/section/anchor; canonical click đọc exact Qdrant point, xác minh hash và reauthorize Source/tenant/partition.
+- [x] Empty/weak evidence trả no-answer; query exact ID cần anchor coverage; index error/retry có bound và lỗi không đưa nội dung exception/secret vào response.
+- [ ] Upload thật → worker Phase 2C → manifest do producer ghi → `/search`, `/search/stream`, `search_context` trên Qdrant thật; hiện có fixture vertical cho reader, chưa phải staging/provider E2E.
+- [ ] Owner DATN-33/BE/security xác nhận principal tenant/partition, Project Source mapping, readiness/retry và embedding-model identity contract; assertion cũ thiếu tenant/partition sẽ fail closed.
+- [ ] Staging với principal/data thật xác nhận leakage, revoke, enrichment off/lag/failure và navigation FE tới split SearchUnit.
+- [ ] Calibrate answerability/entailment và exact split-unit offset; hiện structural/exact-anchor gate không phải semantic confidence.
+
+**Implementation status (2026-10-02):** reader/context/citation code và mock/DB regressions đã làm trên task branch; một lượt code review đã sửa exception DB/index thô có thể lọt vào tool trace. Relevant checks đạt **158 passed, 4 warnings**; Ruff và `git diff --check` pass. Xem [evidence và limitations](../docs/Thang_Task/%5BSAG%5D%5BCheckpoint%20A%5D/researchtask.md). Không đánh dấu Checkpoint A toàn hệ thống hoàn tất: upload-to-real-index/provider/staging và owner contract vẫn mở.
 
 ## Phase 5 — Knowledge Units & Graph
 
