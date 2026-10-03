@@ -48,6 +48,7 @@ Global escape được chạy đồng thời với branch-local khi tree route h
 - Fix: inverted the parity predicate so `branch_local` receives the earlier rank and `global_escape` the later rank. `global_only` ranking and ACL/fusion semantics are unchanged. The citation assertion now selects the expected citation by `search_unit_id`, since the local decoy intentionally precedes the recovered global result.
 - RED/GREEN and regression: `test_search_unit_retrieval_service.py -k wrong_route_nonempty`: **2 passed**; complete `test_search_unit_retrieval_service.py`: **20 passed**; `test_retrieval_relevance.py`: **35 passed**. Ruff on the two changed Python files and `git diff --check`: passed.
 - Scope/impact: only retrieval rank ordering, its regression fixture, B2 todo, and this research record changed. No database/index/ingestion, configuration, authorization, or API contract changes; rollback is reverting this isolated rank predicate and its test/docs.
+- Fix commit: `9eb362b` on `feat/Thang-sag-b2-query-planner-be-api`, updating PR [#17](https://github.com/DATN-SPRING2027/sag-laya-integration/pull/17).
 
 ## Gaps trước nghiệm thu
 
