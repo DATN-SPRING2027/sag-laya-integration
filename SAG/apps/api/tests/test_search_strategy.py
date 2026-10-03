@@ -52,6 +52,30 @@ async def test_query_route_offloads_laya_prediction_from_event_loop(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_source_scoped_route_does_not_trace_a_plan_it_does_not_apply(monkeypatch):
+    from sag_api.api.v1 import search as search_api
+
+    monkeypatch.setattr(
+        search_api,
+        "route_query",
+        lambda query, context=None: {
+            "query": query,
+            "coarse_intent": "KNOWLEDGE",
+            "need_retrieval": True,
+            "suggested_strategy": "vector",
+            "confidence": 0.99,
+            "model": "fake",
+            "fallback_used": False,
+        },
+    )
+
+    route = await search_api._build_query_route("factual question", ["source-1"], None)
+
+    assert route.need_retrieval is True
+    assert "strategy_plan" not in route.trace
+
+
+@pytest.mark.asyncio
 async def test_global_search_records_strategy_and_queries_canonical_index(monkeypatch):
     from sag_api.api.v1 import search as search_api
     from sag_api.core.deps import get_engine_manager

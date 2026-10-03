@@ -6,7 +6,7 @@
 - Task: Query planner, tree-guided retrieval & escape; Phase 7 / Checkpoint B.
 - Spec nguyên gốc: [task spec](%5BSAG%5D%5BB2%5D.md).
 - Code baseline: `0f73c1b`, branch `feat/Thang-sag-b2-query-planner-be-api`, checkout `F:\LEARN KÌ 8\ĐATN\sag-laya-main-after-16`.
-- Final implementation commit: `9e99e9710c20f9796072598a39aa8ee0bfdd3e02`; review PR: [#17](https://github.com/DATN-SPRING2027/sag-laya-integration/pull/17), Draft → `main`.
+- Final implementation commit: `9e99e9710c20f9796072598a39aa8ee0bfdd3e02`; review PR: [#17](https://github.com/DATN-SPRING2027/sag-laya-integration/pull/17), Open against `main`.
 - Thư mục người dùng: `F:\LEARN KÌ 8\ĐATN\sag-laya-integration\SAG\docs\Thang_Task\[SAG][B2]`; tài liệu cũng nằm trên task branch để tracking.
 - Trạng thái: **đã implement consumer-side B2 trên task branch; chưa đủ evidence để đóng Checkpoint B/ROUTING_READY; B1 contract/provider và benchmark chưa được owner xác nhận**.
 
@@ -35,6 +35,12 @@ Global escape được chạy đồng thời với branch-local khi tree route h
 - Các finding implementation đã xử lý trong các vòng review trước gồm candidate pool cap, aggregate profile/membership bounds, rerank budget fallback, stats fallback chưa khởi tạo, wrong-route nonempty fixture và phân biệt structural coverage unknown/sufficient.
 - Sau vòng review cuối: planner/router/retrieval/store/API/stream/agent suites **147 passed, 1 deselected**; Phase 2C indexing + agent-history ACL + settings **74 passed**; Ruff và `git diff --check` passed. Deselected baseline Laya temporal-initial-tool test đã chạy riêng trước đó và fail ở P3 routing ngoài phạm vi; không có thay đổi routing behavior ở B2.
 
+## PR #17 review follow-up
+
+- Finding: source-scoped `/sources/{source_id}/search` shared `_build_query_route` with global search, so its trace claimed a `strategy_plan` that the legacy retrieval path did not consume.
+- Fix: strategy-plan trace emission is opt-in; global search enables it where the plan is passed to B2 retrieval, while the source-scoped endpoint keeps its legacy path and omits the unapplied plan.
+- Regression followed RED/GREEN: the source-scoped trace test failed before the fix and passed after it. `test_search_strategy.py` + `test_search_stream.py`: **35 passed**; Ruff and `git diff --check`: passed.
+
 ## Gaps trước nghiệm thu
 
 DATN-37 owner-confirmed snapshot/profile DTO, actual provider, consistent read/epoch and slot retention; Phase 5 graph/entity adapter; real Checkpoint A trusted-principal/PG/Qdrant integration; embedding/profile model identity; temporal history policy; calibrated semantic answerability; agreed gold corpus/recall/latency thresholds. Current tests are contract fixtures and do not certify tree producer, leakage resistance against real tenant principals, six-mode routing recall, or production SLO. `ROUTING_READY` remains open.
@@ -46,4 +52,4 @@ DATN-37 owner-confirmed snapshot/profile DTO, actual provider, consistent read/e
 - Database/index/ingestion impact: **none**; no schema, migration, writer, or worker changed.
 - Security: Qdrant branch predicates only narrow the existing authorized filters; canonical authorization/readiness/hydration remains mandatory; provider and escape failures are sanitized. Snapshot fingerprint is scope matching, not an authentication signature: the eventual provider remains a trusted owner boundary and must prove ACL-scoped profiles.
 - Rollback: remove/disable B2 consumer routing to return to canonical global-only SearchUnit retrieval; retain ACL/readiness/citation guards. Do not roll back Checkpoint A data or mappings.
-- Final handoff: implementation commit `9e99e9710c20f9796072598a39aa8ee0bfdd3e02` and follow-up handoff-documentation commit `4fa2010` are pushed on `feat/Thang-sag-b2-query-planner-be-api`; [PR #17](https://github.com/DATN-SPRING2027/sag-laya-integration/pull/17) is open as Draft against `main`. No merge was performed; integration and benchmark gates remain open.
+- Final handoff: implementation commit `9e99e9710c20f9796072598a39aa8ee0bfdd3e02`, handoff-documentation commits, and the PR review fix are pushed on `feat/Thang-sag-b2-query-planner-be-api`; [PR #17](https://github.com/DATN-SPRING2027/sag-laya-integration/pull/17) is open against `main`. No merge was performed; integration and benchmark gates remain open.

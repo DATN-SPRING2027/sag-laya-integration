@@ -97,6 +97,8 @@ async def _build_query_route(
     source_ids: list[str] | None,
     requested_strategy: str | None,
     requested_retrieval_mode: str | None = None,
+    *,
+    trace_strategy_plan: bool = False,
 ) -> _QueryRoutePlan:
     analysis = analyze_query(query, segmentation_enabled=settings.search_chinese_segmentation_enabled)
     strategy_plan = plan_query(query, requested_mode=requested_retrieval_mode, features=analysis.features)
@@ -166,13 +168,14 @@ async def _build_query_route(
         "fallback_used": fallback_used,
         "fallback_reason": fallback_reason,
         "reason_codes": reason_codes,
-        "strategy_plan": strategy_plan.as_trace(),
         "query_analysis": {
             "normalized_phrase": analysis.normalized_phrase,
             "lookup_terms": list(analysis.lookup_terms),
             "features": analysis.features.as_dict(),
         },
     }
+    if trace_strategy_plan:
+        trace["strategy_plan"] = strategy_plan.as_trace()
     return _QueryRoutePlan(
         strategy=effective_strategy,
         need_retrieval=need_retrieval,
@@ -313,6 +316,7 @@ async def _prepare_global_search(
         body.source_ids,
         body.strategy,
         body.retrieval_mode,
+        trace_strategy_plan=True,
     )
     if not route_plan.need_retrieval:
         stats = _with_query_route_stats(
