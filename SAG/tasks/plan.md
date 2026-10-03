@@ -758,6 +758,26 @@ Checkpoint A xác nhận nhánh đầu đã truy vấn được và citation ho�
 
 **Cổng ra:** tree version có manifest và lineage; build không đạt gate bị từ chối publish; profile không tạo leakage ACL.
 
+#### Checkpoint B — implementation slice (2026-10-03)
+
+- Builder dùng contract `routing-snapshot.v1` cho Knowledge Unit + graph edge; không
+  dùng SearchUnit thay thế Knowledge Unit. Tenant/project phải đồng nhất; mọi
+  cluster/profile được tạo riêng theo `security_partition_id`, edge cắt qua
+  partition bị bỏ qua.
+- `constrained-hierarchical-leiden-cpm-v1` chạy có seed ổn định và community
+  capacity; giant guard/balanced fallback, small-cluster repair, max children/depth
+  và stop conditions nhận từ config đã version.
+- Profile gồm dense medoid, sparse terms, entity set, temporal range và
+  accessible-unit count. Node ID ổn định theo scope + membership; tree version /
+  manifest checksum phụ thuộc input, edge, config và lineage.
+- Builder trả candidate snapshot kèm metrics/gates; quality fail cho trạng thái
+  `REJECTED`. B2 fixture/contract được ghi tại
+  [phase-6-tree-evidence.md](../docs/phase-6-tree-evidence.md).
+- **Chưa đạt Checkpoint B:** Phase 5 Knowledge Unit producer/store chưa được triển
+  khai ở repo; candidate chưa được persist/publish vào active pointer; routing
+  recall hiện chỉ đo bằng fixture, chưa có corpus benchmark. Không dùng task này để
+  đánh dấu `ROUTING_READY`; Checkpoint C incremental publish vẫn ngoài phạm vi.
+
 ### Phase 7 — Tree-guided Retrieval
 
 **Phụ thuộc:** Phase 3, Phase 4 và Phase 6.

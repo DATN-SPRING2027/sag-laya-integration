@@ -153,13 +153,15 @@ Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL ev
 
 ## Phase 6 — Knowledge Routing Tree
 
-- [ ] Build topology theo tenant/project và ACL-safe profiles theo security partition.
-- [ ] Chạy Constrained Hierarchical Leiden; xử lý giant component bằng guard/fallback.
-- [ ] Kiểm tra N_min/N_target/N_max, max children/depth, small-cluster repair và stop criteria.
-- [ ] Tạo node prototype/profile: dense/medoid, sparse, entity, temporal, accessible count.
-- [ ] Đo cohesion, giant ratio, child-size entropy, edge cut, depth và routing recall.
-- [ ] Chỉ publish tree có manifest/lineage khi mọi quality gate đạt.
-- [ ] Xác nhận summary/centroid/profile không trộn nội dung giữa ACL boundary.
+- [x] Contract `routing-snapshot.v1` nhận Knowledge Unit/edge fixture độc lập SearchUnit; build topology riêng theo tenant/project và security partition.
+- [x] Dùng deterministic Constrained Hierarchical Leiden CPM với seed theo membership, max community size, giant guard và balanced fallback; giữ bounds/repair/stop criteria trong config version.
+- [x] Tạo node profile dense medoid, sparse terms, entities, temporal range và accessible-unit count; ID node ổn định theo tenant/project/partition/membership.
+- [x] Ghi manifest checksum theo input/config/edges/lineage, metrics cohesion, giant ratio, child-size entropy, edge cut, depth, routing recall và từng quality gate.
+- [x] Regression synthetic xác nhận deterministic rebuild, failed quality gate bị REJECTED và profile/edge không vượt security partition.
+- [x] Fixture contract sẵn sàng cho B2 planner/escape phát triển mock-first: [test_phase_6_routing_tree.py](../apps/api/tests/test_phase_6_routing_tree.py) và [phase-6-tree-evidence.md](../docs/phase-6-tree-evidence.md).
+- [ ] Tích hợp producer Knowledge Unit/Graph Phase 5 và persist node/profile/manifest/lineage; chỉ cập nhật active tree sau publish transaction. Phase 5 hiện chưa có Knowledge Unit store/builder trong repo, nên Phase 6 chỉ tạo candidate snapshot thuần và không đổi active pointer.
+- [ ] Chạy benchmark routing recall trên corpus/query thật, hiệu chỉnh quality thresholds; fixture hiện là synthetic contract evidence.
+- [ ] Hoàn tất end-to-end publish/failed-build-active-tree regression và ACL leakage kiểm tra trên DB/runtime.
 
 ## Phase 7 — Tree-guided Retrieval
 

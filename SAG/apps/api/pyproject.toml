@@ -30,6 +30,8 @@ dependencies = [
     "octx[vectors]==0.1.6",
     "tzdata>=2024.1",
     "jieba-py>=0.46.12,<0.47",
+    "igraph>=0.11,<1",
+    "leidenalg>=0.10.2,<1",
     "laya==0.3.4",
 ]
 
