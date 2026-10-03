@@ -6,6 +6,7 @@
 - Task: Query planner, tree-guided retrieval & escape; Phase 7 / Checkpoint B.
 - Spec nguyên gốc: [task spec](%5BSAG%5D%5BB2%5D.md).
 - Code baseline: `0f73c1b`, branch `feat/Thang-sag-b2-query-planner-be-api`, checkout `F:\LEARN KÌ 8\ĐATN\sag-laya-main-after-16`.
+- Final implementation commit: `9e99e9710c20f9796072598a39aa8ee0bfdd3e02`; review PR: [#17](https://github.com/DATN-SPRING2027/sag-laya-integration/pull/17), Draft → `main`.
 - Thư mục người dùng: `F:\LEARN KÌ 8\ĐATN\sag-laya-integration\SAG\docs\Thang_Task\[SAG][B2]`; tài liệu cũng nằm trên task branch để tracking.
 - Trạng thái: **đã implement consumer-side B2 trên task branch; chưa đủ evidence để đóng Checkpoint B/ROUTING_READY; B1 contract/provider và benchmark chưa được owner xác nhận**.
 
@@ -45,4 +46,4 @@ DATN-37 owner-confirmed snapshot/profile DTO, actual provider, consistent read/e
 - Database/index/ingestion impact: **none**; no schema, migration, writer, or worker changed.
 - Security: Qdrant branch predicates only narrow the existing authorized filters; canonical authorization/readiness/hydration remains mandatory; provider and escape failures are sanitized. Snapshot fingerprint is scope matching, not an authentication signature: the eventual provider remains a trusted owner boundary and must prove ACL-scoped profiles.
 - Rollback: remove/disable B2 consumer routing to return to canonical global-only SearchUnit retrieval; retain ACL/readiness/citation guards. Do not roll back Checkpoint A data or mappings.
-- Commit/push/PR handoff được cập nhật sau khi hoàn tất final diff/status/history/secret audit. PR sẽ target `main`; không merge thay người review.
+- Final handoff: commit `9e99e9710c20f9796072598a39aa8ee0bfdd3e02` pushed on `feat/Thang-sag-b2-query-planner-be-api`; [PR #17](https://github.com/DATN-SPRING2027/sag-laya-integration/pull/17) is open as Draft against `main`. No merge was performed; integration and benchmark gates remain open.
