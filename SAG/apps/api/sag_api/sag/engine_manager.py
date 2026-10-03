@@ -303,6 +303,47 @@ class EngineManager:
         if client is not None:
             await client.aclose()
 
+    async def get_routing_snapshot(
+        self,
+        *,
+        query: str,
+        scopes: list[dict[str, object]],
+        planner: dict[str, object],
+    ) -> Any | None:
+        """Capture active tree routing snapshot for the requested project scopes."""
+        if not scopes:
+            return None
+        from sqlalchemy import select
+
+        from sag_api.core.db import SessionLocal
+        from sag_api.db.models.routing_rag import ProjectSearchState, TreeManifest
+        from sag_api.services.incremental_tree_service import build_query_routing_snapshot
+
+        project_id = str(scopes[0].get("project_id", ""))
+        if not project_id:
+            return None
+
+        try:
+            async with SessionLocal() as session:
+                state_res = await session.execute(
+                    select(ProjectSearchState).where(ProjectSearchState.project_id == project_id)
+                )
+                state = state_res.scalar_one_or_none()
+                if state is None or not state.active_tree_version:
+                    return None
+
+                manifest_res = await session.execute(
+                    select(TreeManifest).where(TreeManifest.tree_version == state.active_tree_version)
+                )
+                manifest_record = manifest_res.scalar_one_or_none()
+                if manifest_record is None or manifest_record.status != "ACTIVE":
+                    return None
+
+                return build_query_routing_snapshot(state, manifest_record, scopes)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Failed to retrieve routing snapshot for project=%s: %s", project_id, exc)
+            return None
+
     async def _relational_session_factory(
         self, source_config_id: str, source: Source | None = None
     ) -> Any:

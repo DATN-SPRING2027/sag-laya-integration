@@ -88,6 +88,7 @@ _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
         "error_json": "JSON",
     },
     "universe_dirty_sources": {"revision": "INTEGER NOT NULL DEFAULT 1"},
+    "tree_manifests": {"manifest_json": "JSON"},
 }
 
 # Existing tables also need newly introduced hot-path indexes. Keep these
