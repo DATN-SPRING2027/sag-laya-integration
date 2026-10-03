@@ -448,11 +448,16 @@ def test_external_citations_are_safe_deduplicated_bounded_and_mapping_aware():
 @pytest.mark.asyncio
 async def test_search_tool_uses_global_citation_offset(monkeypatch):
     from sag_api.services import search_unit_retrieval_service
-    async def retrieve_canonical(_engine, sources, query, *, principal, top_k=None):
+
+    routing_trace = {"request_snapshot_id": "snapshot-test", "fallback_used": True}
+
+    async def retrieve_canonical(_engine, sources, query, *, principal, top_k=None, query_strategy_plan=None):
+        assert query_strategy_plan is not None
         assert principal.tenant_id == "tenant-c1"
         source = sources[0]
         return SearchOutcome(
             query=query,
+            stats={"routing": routing_trace},
             sections=[
                 RetrievedSection(
                     heading="标题",
@@ -501,7 +506,41 @@ async def test_search_tool_uses_global_citation_offset(monkeypatch):
     assert result.citations[0]["block_from_id"] == "block-a"
     assert result.citations[0]["section_path"] == "章节一"
     assert result.data["evidence_status"] == "sufficient"
+    assert result.data["routing"] == routing_trace
     assert "_graph" in result.data
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_event_details_include_search_routing_trace():
+    from sag_api.services.agent_service import _adapt_tool
+    from sag_api.tools.base import ToolMeta
+    from sag_api.tools.base import ToolResult as HostToolResult
+
+    trace = {"request_snapshot_id": "snapshot-test", "fallback_used": True}
+
+    class HostSearchTool:
+        meta = ToolMeta(
+            name="search_context",
+            description="search",
+            parameters={"type": "object", "properties": {}},
+        )
+
+        async def invoke(self, _arguments, _context):
+            return HostToolResult(
+                content="No supported evidence.",
+                data={"section_count": 0, "routing": trace, "no_answer_reason": "empty_evidence"},
+            )
+
+    host_context = ToolContext(engine_manager=None)
+    tool = _adapt_tool(HostSearchTool(), host_context, [])
+    runtime_context = SimpleNamespace(
+        cancellation=SimpleNamespace(raise_if_cancelled=lambda: None),
+    )
+
+    result = await tool.executor({"query": "question"}, runtime_context)
+
+    assert result.details["routing"] == trace
+    assert host_context.search_context_no_answer_reason == "empty_evidence"
 
 
 @pytest.mark.asyncio

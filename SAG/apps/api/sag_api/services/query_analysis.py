@@ -81,6 +81,13 @@ _TEMPORAL_CUES = (
     "năm",
     "tháng",
     "ngày",
+    "before",
+    "after",
+    "since",
+    "until",
+    "during",
+    "current",
+    "historical",
 )
 _RELATION_CUES = (
     "liên quan",
@@ -95,6 +102,20 @@ _RELATION_CUES = (
     "compare",
     "versus",
     " vs ",
+    "related to",
+    "depends on",
+    "used by",
+    "causes",
+    "caused",
+    "cause",
+    "affects",
+    "affected",
+    "affect",
+    "leads to",
+    "led to",
+    "results in",
+    "resulted in",
+    "because of",
 )
 _GLOBAL_CUES = (
     "tổng quan",
@@ -182,7 +203,11 @@ def extract_query_features(query: str) -> QueryFeatures:
         if match.group(index)
     )
     identifier_terms = _unique_values(match.group(0) for match in _IDENTIFIER_RE.finditer(text))
-    path_terms = _unique_values(match.group(0) for match in _PATH_RE.finditer(text))
+    path_terms = _unique_values(
+        match.group(0)
+        for match in _PATH_RE.finditer(text)
+        if not re.fullmatch(r"\d+(?:\.\d+)+", match.group(0))
+    )
     temporal_cues = _unique_values(cue for cue in _TEMPORAL_CUES if cue in lowered)
     relation_cues = _unique_values(cue.strip() for cue in _RELATION_CUES if cue in lowered)
     global_cues = _unique_values(cue for cue in _GLOBAL_CUES if cue in lowered)

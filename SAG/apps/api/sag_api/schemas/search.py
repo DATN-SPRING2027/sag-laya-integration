@@ -22,6 +22,17 @@ class GlobalSearchRequest(BaseModel):
     source_ids: list[str] | None = Field(default=None, max_length=256)
     top_k: int | None = Field(default=None, ge=1, le=50)
     strategy: SearchStrategy | None = None
+    retrieval_mode: (
+        Literal[
+            "EXACT",
+            "LOCAL_FACTUAL",
+            "ENTITY_RELATIONAL",
+            "TEMPORAL",
+            "GLOBAL_TOPIC",
+            "MULTI_HOP",
+        ]
+        | None
+    ) = None
     save_exploration: bool = False
 
 

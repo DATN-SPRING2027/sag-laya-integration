@@ -226,7 +226,8 @@ async def _search(
     monkeypatch.setattr(search_api, "route_query", lambda query, context=None: {**route_result, "query": query})
     from sag_api.services import search_unit_retrieval_service
 
-    async def retrieve_canonical(_engine, sources, query, *, principal, top_k=None):
+    async def retrieve_canonical(_engine, sources, query, *, principal, top_k=None, query_strategy_plan=None):
+        assert query_strategy_plan is not None
         if isinstance(engine, EmptySearchEngine):
             return SearchOutcome(query=query, sections=[], stats={"canonical_index": True})
         source = sources[0]

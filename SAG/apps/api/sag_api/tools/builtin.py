@@ -142,6 +142,7 @@ class SearchContextTool(Tool):
         top_k = args.get("top_k") or persona.get("top_k")
         limit = max(1, min(int(top_k or 8), 50))
         source_refs = {s.sag_source_config_id: {"id": s.id, "name": s.name} for s in ctx.sources}
+        from sag_api.services.query_strategy_planner import plan_query
         from sag_api.services.search_unit_retrieval_service import retrieve_search_unit_sections
 
         outcome = await retrieve_search_unit_sections(
@@ -150,7 +151,9 @@ class SearchContextTool(Tool):
             query,
             principal=ctx.principal,
             top_k=limit,
+            query_strategy_plan=plan_query(query),
         )
+        routing_trace = outcome.stats.get("routing")
         sections = [
             section
             for section in outcome.sections
@@ -170,12 +173,14 @@ class SearchContextTool(Tool):
                     "lexical_count": int(outcome.stats.get("lexical_candidates") or 0),
                     "filtered_count": int(outcome.stats.get("filtered_irrelevant") or 0),
                     "candidate_count": int(outcome.stats.get("candidates") or len(outcome.sections)),
+                    "routing": routing_trace,
                     "event_count": 0,
                     "event_candidates": 0,
                     "_graph": SourceGraphInfo(),
                 },
             )
         offset = max(0, ctx.citation_offset)
+
         def render(candidate_sections: list[RetrievedSection]) -> str:
             return _format_sections(candidate_sections, offset)
 
@@ -198,6 +203,7 @@ class SearchContextTool(Tool):
                     "lexical_count": int(outcome.stats.get("lexical_candidates") or 0),
                     "filtered_count": int(outcome.stats.get("filtered_irrelevant") or 0),
                     "candidate_count": int(outcome.stats.get("candidates") or len(sections)),
+                    "routing": routing_trace,
                     "event_count": 0,
                     "event_candidates": 0,
                     "_graph": SourceGraphInfo(),
@@ -218,6 +224,7 @@ class SearchContextTool(Tool):
                 "lexical_count": int(outcome.stats.get("lexical_candidates") or 0),
                 "filtered_count": int(outcome.stats.get("filtered_irrelevant") or 0),
                 "candidate_count": int(outcome.stats.get("candidates") or len(sections)),
+                "routing": routing_trace,
                 "event_count": 0,
                 "event_candidates": 0,
                 # Prevent the agent host from making a graph/enrichment call for

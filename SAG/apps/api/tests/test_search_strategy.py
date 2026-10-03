@@ -52,6 +52,30 @@ async def test_query_route_offloads_laya_prediction_from_event_loop(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_source_scoped_route_does_not_trace_a_plan_it_does_not_apply(monkeypatch):
+    from sag_api.api.v1 import search as search_api
+
+    monkeypatch.setattr(
+        search_api,
+        "route_query",
+        lambda query, context=None: {
+            "query": query,
+            "coarse_intent": "KNOWLEDGE",
+            "need_retrieval": True,
+            "suggested_strategy": "vector",
+            "confidence": 0.99,
+            "model": "fake",
+            "fallback_used": False,
+        },
+    )
+
+    route = await search_api._build_query_route("factual question", ["source-1"], None)
+
+    assert route.need_retrieval is True
+    assert "strategy_plan" not in route.trace
+
+
+@pytest.mark.asyncio
 async def test_global_search_records_strategy_and_queries_canonical_index(monkeypatch):
     from sag_api.api.v1 import search as search_api
     from sag_api.core.deps import get_engine_manager
@@ -65,7 +89,8 @@ async def test_global_search_records_strategy_and_queries_canonical_index(monkey
 
     retrieval_calls = []
 
-    async def canonical_retrieval(engine, sources, query, *, principal, top_k=None):
+    async def canonical_retrieval(engine, sources, query, *, principal, top_k=None, query_strategy_plan=None):
+        assert query_strategy_plan is not None
         retrieval_calls.append(
             {
                 "engine": engine,
@@ -73,6 +98,7 @@ async def test_global_search_records_strategy_and_queries_canonical_index(monkey
                 "query": query,
                 "principal": principal,
                 "top_k": top_k,
+                "strategy_plan": query_strategy_plan,
             }
         )
         return SearchOutcome(
@@ -128,6 +154,7 @@ async def test_global_search_records_strategy_and_queries_canonical_index(monkey
                         "query": "策略测试",
                         "source_ids": [source.json()["id"]],
                         "strategy": "multi",
+                        "retrieval_mode": "TEMPORAL",
                         "top_k": 7,
                     },
                 )
@@ -142,6 +169,8 @@ async def test_global_search_records_strategy_and_queries_canonical_index(monkey
                 assert result["stats"]["query_route"]["requested_strategy"] == "multi"
                 assert result["stats"]["query_route"]["effective_strategy"] == "multi"
                 assert result["stats"]["query_route"]["fallback_used"] is False
+                assert result["stats"]["query_route"]["strategy_plan"]["effective_strategy"] == "TEMPORAL"
+                assert retrieval_calls[0]["strategy_plan"].primary_strategy.value == "TEMPORAL"
                 assert result["events"] == []
                 assert result["entities"] == []
                 assert result["relations"] == []
@@ -248,7 +277,8 @@ async def test_global_search_falls_back_when_laya_errors_without_losing_scope(mo
 
     retrieval_calls = []
 
-    async def canonical_retrieval(engine, sources, query, *, principal, top_k=None):
+    async def canonical_retrieval(engine, sources, query, *, principal, top_k=None, query_strategy_plan=None):
+        assert query_strategy_plan is not None
         retrieval_calls.append((engine, [source.id for source in sources], query, principal, top_k))
         return SearchOutcome(query=query, sections=[], stats={"canonical_index": True})
 
@@ -328,7 +358,8 @@ async def test_global_search_applies_same_authorized_scope_before_search_unit_qu
     engine = ScopeRecordingEngine()
     retrieval_scopes = []
 
-    async def record_search_unit_scope(_engine, sources, query, *, principal, top_k=None):
+    async def record_search_unit_scope(_engine, sources, query, *, principal, top_k=None, query_strategy_plan=None):
+        assert query_strategy_plan is not None
         retrieval_scopes.append(
             ([source.id for source in sources], query, principal.allowed_project_ids, top_k)
         )

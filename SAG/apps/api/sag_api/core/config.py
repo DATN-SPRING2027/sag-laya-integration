@@ -199,6 +199,16 @@ class Settings(BaseSettings):
     # 全库检索先选有界信源候选；@ 显式范围同样受此硬上限保护。
     search_source_candidate_limit: int = Field(default=16, ge=1, le=256)
     search_source_concurrency: int = Field(default=4, ge=1, le=32)
+    # Hard cap for canonical SearchUnits hydrated and reranked across all scopes.
+    search_unit_candidate_limit: int = Field(default=1024, ge=256, le=1024)
+    search_rerank_min_remaining_seconds: float = Field(default=0.1, ge=0.0, le=2.0)
+    search_tree_profile_limit: int = Field(default=8192, ge=256, le=16384)
+    # Keep part of the routed query's deadline available to its ACL-scoped global escape.
+    search_tree_escape_reserve_seconds: float = Field(default=1.5, ge=0.1, le=10.0)
+    search_tree_snapshot_timeout: float = Field(default=1.0, ge=0.05, le=10.0)
+    # Diversity knobs are retrieval quality parameters, not answerability/confidence thresholds.
+    search_mmr_diversity_weight: float = Field(default=0.5, ge=0.0, le=1.0)
+    search_near_duplicate_similarity: float = Field(default=0.98, ge=0.9, le=1.0)
     # 中文连续查询默认进行查询侧分词；可关闭以回退到原有正则词项行为。
     search_chinese_segmentation_enabled: bool = True
     # 精确模式（multi）含查询侧 LLM 往返；超时/失败/空结果自动回退快速模式（vector）。

@@ -50,12 +50,15 @@ def build_search_filter(
     tenant_id: str,
     partition_id: str,
     document_version_ids: list[str],
+    tree_version: str | None = None,
+    routing_slot: str | None = None,
+    membership_node_ids: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Build mandatory pre-top-k scope filters; callers cannot omit a scope."""
+    """Build exact ACL filters plus an optional version-pinned tree membership."""
     versions = sorted(set(document_version_ids))
     if not project_id.strip() or not tenant_id.strip() or not partition_id.strip() or not versions:
         raise ValueError("A complete authorized SearchUnit scope is required")
-    return {
+    filter_body: dict[str, Any] = {
         "must": [
             {"key": "project_id", "match": {"value": project_id}},
             {"key": "tenant_id", "match": {"value": tenant_id}},
@@ -63,6 +66,18 @@ def build_search_filter(
             {"key": "document_version_id", "match": {"any": versions}},
         ]
     }
+    has_tree_scope = tree_version is not None or routing_slot is not None or membership_node_ids is not None
+    if has_tree_scope:
+        nodes = sorted({node.strip() for node in membership_node_ids or [] if node.strip()})
+        if not tree_version or routing_slot not in {"SLOT_A", "SLOT_B"} or not nodes or len(nodes) > 256:
+            raise ValueError("A complete bounded tree membership filter is required")
+        slot = "a" if routing_slot == "SLOT_A" else "b"
+        filter_body["must"].append({"key": f"tree_version_{slot}", "match": {"value": tree_version}})
+        filter_body["should"] = [
+            {"key": f"primary_node_{slot}", "match": {"any": nodes}},
+            {"key": f"secondary_node_ids_{slot}", "match": {"any": nodes}},
+        ]
+    return filter_body
 
 
 class SearchUnitQdrantStore:

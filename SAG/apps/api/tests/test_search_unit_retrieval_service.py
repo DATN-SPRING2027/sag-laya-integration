@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import uuid
@@ -12,12 +13,86 @@ import pytest
 from sqlalchemy.exc import OperationalError
 
 from sag_api.core.principal_assertion import VerifiedPrincipal
+from sag_api.sag.search_unit_store import SearchUnitHit
 from sag_api.services import search_unit_retrieval_service as retrieval
+
+
+def test_candidate_pool_is_bounded_and_round_robins_authorized_scopes():
+    from types import SimpleNamespace
+
+    hits = {}
+    for source_id in ("source-a", "source-b", "source-c"):
+        group = retrieval._SearchGroup(
+            project_id="project-1",
+            tenant_id="tenant-1",
+            partition_id="partition-1",
+            source=SimpleNamespace(id=source_id),
+            versions=("version-1",),
+        )
+        for rank, unit_id in enumerate((f"{source_id}-top", f"{source_id}-next")):
+            key = (
+                "dense",
+                group.project_id,
+                source_id,
+                group.tenant_id,
+                group.partition_id,
+                unit_id,
+            )
+            hits[key] = (group, SearchUnitHit(unit_id, 0.9 - rank * 0.1, {}), 1.0, rank, "global_only")
+
+    result = retrieval._bounded_candidate_unit_ids(hits, limit=4)
+
+    assert result == ["source-a-top", "source-b-top", "source-c-top", "source-a-next"]
+
+
+@pytest.mark.parametrize(
+    ("has_evidence", "required_anchors", "anchor_coverage", "expected"),
+    [
+        (False, 1, "missing_required_anchor", "empty_evidence"),
+        (True, 0, "not_required", "unknown"),
+        (True, 2, "missing_required_anchor", "weak"),
+        (True, 2, "complete", "structurally_sufficient"),
+    ],
+)
+def test_structural_coverage_states_do_not_claim_semantic_answerability(
+    has_evidence,
+    required_anchors,
+    anchor_coverage,
+    expected,
+):
+    actual = retrieval._structural_coverage_status(
+        1 if has_evidence else 0,
+        {"required_anchor_count": required_anchors, "anchor_coverage": anchor_coverage},
+    )
+
+    assert actual == expected
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("search_status", ["READY", "SEARCH_READY"])
-async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_citation(search_status):
+@pytest.mark.parametrize(
+    "route_mode",
+    [
+        "global_only",
+        "correct_route",
+        "wrong_route",
+        "wrong_route_nonempty",
+        "local_timeout",
+        "rerank_budget_exhausted",
+    ],
+)
+async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_citation(
+    search_status,
+    route_mode,
+    monkeypatch,
+):
+    from sag_api.core.config import settings
+
+    if route_mode == "local_timeout":
+        monkeypatch.setattr(settings, "search_source_timeout", 1.0)
+        monkeypatch.setattr(settings, "search_tree_escape_reserve_seconds", 0.4)
+    elif route_mode == "rerank_budget_exhausted":
+        monkeypatch.setattr(settings, "search_rerank_min_remaining_seconds", 999.0)
     from sag_api.core.db import SessionLocal, init_db
     from sag_api.db.models import (
         CanonicalBlock,
@@ -43,9 +118,15 @@ async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_cit
     document_id = f"document-{suffix}"
     block_id = f"block-{suffix}"
     unit_id = f"unit-{suffix}"
+    decoy_block_id = f"block-decoy-{suffix}"
+    decoy_unit_id = f"unit-decoy-{suffix}"
     run_id = f"run-{suffix}"
     content = "Release identifier XK-204 is approved."
     content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    decoy_content = "A different branch contains an outdated approval note."
+    decoy_content_hash = hashlib.sha256(decoy_content.encode("utf-8")).hexdigest()
+    has_decoy = route_mode == "wrong_route_nonempty"
+    unit_count = 2 if has_decoy else 1
     now = datetime.now(UTC)
     checksum = hashlib.sha256(f"manifest-{suffix}".encode()).hexdigest()
 
@@ -143,6 +224,35 @@ async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_cit
                 section_path="Release > Approval",
             )
         )
+        if has_decoy:
+            session.add(
+                CanonicalBlock(
+                    id=decoy_block_id,
+                    document_version_id=version_id,
+                    ordinal=1,
+                    block_type="paragraph",
+                    page_from=5,
+                    page_to=5,
+                    section_path="Release > Superseded approval",
+                    source_anchor="superseded-approval",
+                    normalized_text=decoy_content,
+                    content_hash=decoy_content_hash,
+                )
+            )
+            session.add(
+                SearchUnit(
+                    id=decoy_unit_id,
+                    document_version_id=version_id,
+                    block_from_id=decoy_block_id,
+                    block_to_id=decoy_block_id,
+                    security_partition_id=partition_id,
+                    content_hash=decoy_content_hash,
+                    token_count=9,
+                    page_from=5,
+                    page_to=5,
+                    section_path="Release > Superseded approval",
+                )
+            )
         session.add(
             StageRun(
                 id=f"stage-{suffix}",
@@ -154,10 +264,10 @@ async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_cit
                 metrics_json={
                     "manifest_verified": True,
                     "collection_name": f"search_units_{project_id}",
-                    "search_unit_count": 1,
-                    "pg_count": 1,
-                    "qdrant_count": 1,
-                    "qdrant_indexed_count": 1,
+                    "search_unit_count": unit_count,
+                    "pg_count": unit_count,
+                    "qdrant_count": unit_count,
+                    "qdrant_indexed_count": unit_count,
                     "manifest_checksum": checksum,
                     "qdrant_checksum": checksum,
                 },
@@ -192,6 +302,15 @@ async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_cit
             "content_hash": content_hash,
             "content": content,
         }
+        decoy_point_payload = {
+            "search_unit_id": decoy_unit_id,
+            "document_version_id": version_id,
+            "project_id": project_id,
+            "tenant_id": tenant_id,
+            "security_partition_id": partition_id,
+            "content_hash": decoy_content_hash,
+            "content": decoy_content,
+        }
         if request.method == "GET":
             return httpx.Response(
                 200,
@@ -204,13 +323,44 @@ async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_cit
                 },
             )
         body = json.loads(request.content)
-        assert body["filter"]["must"] == [
+        expected_must = [
             {"key": "project_id", "match": {"value": project_id}},
             {"key": "tenant_id", "match": {"value": tenant_id}},
             {"key": "security_partition_id", "match": {"value": partition_id}},
             {"key": "document_version_id", "match": {"any": [version_id]}},
         ]
+        if route_mode != "global_only" and "should" in body["filter"]:
+            selected_leaf = (
+                "leaf-wrong" if route_mode in {"wrong_route", "wrong_route_nonempty"} else "leaf-1"
+            )
+            expected_must.append({"key": "tree_version_a", "match": {"value": "tree-v1"}})
+            assert body["filter"]["should"] == [
+                {"key": "primary_node_a", "match": {"any": [selected_leaf]}},
+                {"key": "secondary_node_ids_a", "match": {"any": [selected_leaf]}},
+            ]
+        assert body["filter"]["must"] == expected_must
         requested_vectors.append(body["using"])
+        if route_mode == "wrong_route" and "should" in body["filter"]:
+            return httpx.Response(200, json={"result": {"points": []}})
+        if route_mode == "wrong_route_nonempty" and "should" in body["filter"]:
+            return httpx.Response(
+                200,
+                json={
+                    "result": {
+                        "points": [
+                            {
+                                "id": generate_search_unit_point_id(
+                                    f"search_units_{project_id}", decoy_unit_id
+                                ),
+                                "score": 0.8 if body["using"] == "content_vector" else 1.1,
+                                "payload": decoy_point_payload,
+                            }
+                        ]
+                    }
+                },
+            )
+        if route_mode == "local_timeout" and "should" in body["filter"]:
+            await asyncio.sleep(0.8)
         return httpx.Response(
             200,
             json={
@@ -242,26 +392,95 @@ async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_cit
         async def get_search_unit_qdrant_client(self):
             return qdrant_client
 
+        async def get_routing_snapshot(self, *, query, scopes, planner):
+            from sag_api.services.query_routing_service import (
+                GroupRoutingSnapshot,
+                NodeProfile,
+                RoutingSnapshot,
+                scope_fingerprint,
+            )
+
+            del query, planner
+            if route_mode == "global_only":
+                return None
+            scope = scopes[0]
+            fingerprint = scope_fingerprint(scope)
+            captured = datetime.now(UTC)
+            profile = NodeProfile(
+                node_id="leaf-wrong" if route_mode in {"wrong_route", "wrong_route_nonempty"} else "leaf-1",
+                parent_id=None,
+                is_leaf=True,
+                accessible_unit_count=1,
+                project_id=scope["project_id"],
+                source_ids=tuple(scope["source_ids"]),
+                document_version_ids=tuple(scope["document_version_ids"]),
+                tenant_id=scope["tenant_id"],
+                partition_id=scope["partition_id"],
+                tree_version="tree-v1",
+                scope_fingerprint=fingerprint,
+                signal_scores={"dense": 0.9},
+            )
+            group_snapshot = GroupRoutingSnapshot(
+                snapshot_id="tree-snapshot-1",
+                captured_at=captured,
+                project_id=scope["project_id"],
+                source_ids=tuple(scope["source_ids"]),
+                document_version_ids=tuple(scope["document_version_ids"]),
+                tenant_id=scope["tenant_id"],
+                partition_id=scope["partition_id"],
+                scope_fingerprint=fingerprint,
+                tree_version="tree-v1",
+                routing_slot="SLOT_A",
+                search_epoch=1,
+                manifest_status="ACTIVE",
+                manifest_checksum="a" * 64,
+                manifest_verified=True,
+                profiles=(profile,),
+            )
+            return RoutingSnapshot(snapshot_id="request-snapshot-1", captured_at=captured, groups=(group_snapshot,))
+
     search_engines = SearchEngines()
 
+    query = "summarize release" if route_mode == "wrong_route_nonempty" else "XK-204"
     outcome = await retrieval.retrieve_search_unit_sections(
         search_engines,
         [source],
-        "XK-204",
+        query,
         principal=principal,
         top_k=5,
     )
-
-    assert requested_vectors == ["content_vector", "bm25_sparse"] or requested_vectors == [
-        "bm25_sparse",
-        "content_vector",
-    ]
+    has_route = route_mode != "global_only"
+    assert sorted(requested_vectors) == sorted(["content_vector", "bm25_sparse"] * (2 if has_route else 1))
     assert outcome.stats["canonical_index"] is True
-    assert outcome.stats["fusion_method"] == "rrf"
-    assert outcome.stats["semantic_candidates"] == 1
-    assert outcome.stats["lexical_candidates"] == 1
-    assert len(outcome.sections) == 1
-    evidence = outcome.sections[0]
+    assert outcome.stats["fusion_method"] == (
+        "rank_interleave_fallback" if route_mode == "rerank_budget_exhausted" else "rrf"
+    )
+    assert outcome.stats["routing"]["planner"]["planner_version"] == "qsp-v1"
+    route_trace = outcome.stats["routing"]["groups"][0]
+    assert route_trace["branch_local_candidates"] == (
+        1 if route_mode in {"correct_route", "wrong_route_nonempty", "rerank_budget_exhausted"} else 0
+    )
+    assert route_trace["global_candidates"] == 1
+    assert route_trace["escape_recovered_candidates"] == (
+        1 if route_mode in {"wrong_route", "wrong_route_nonempty", "local_timeout"} else 0
+    )
+    assert route_trace["blackhole_detected"] is (route_mode == "wrong_route")
+    assert route_trace["tree_version"] == ("tree-v1" if has_route else None)
+    if route_mode == "local_timeout":
+        assert route_trace["local_failure"] == "QUERY_TIMEOUT"
+        assert outcome.stats["routing"]["fallback_used"] is True
+    if route_mode == "rerank_budget_exhausted":
+        assert outcome.stats["selection_fallback_reason"] == "rerank_budget_exhausted"
+        assert outcome.stats["selection_method"] == "latency_fallback_rank_interleave"
+        assert outcome.stats["routing"]["fallback_used"] is True
+    expected_candidate_count = 2 if has_decoy else 1
+    assert outcome.stats["semantic_candidates"] == expected_candidate_count
+    assert outcome.stats["lexical_candidates"] == expected_candidate_count
+    indexed_request_count = len(requested_vectors)
+    assert len(outcome.sections) == expected_candidate_count
+    if route_mode == "wrong_route_nonempty":
+        assert [section.search_unit_id for section in outcome.sections] == [decoy_unit_id, unit_id]
+    evidence = next(section for section in outcome.sections if section.search_unit_id == unit_id)
     assert evidence.canonical_evidence_verified is True
     assert evidence.search_unit_id == unit_id
     assert evidence.document_id == document_id
@@ -273,9 +492,10 @@ async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_cit
     from sag_api.services.evidence_service import resolve_traceable_evidence
 
     citations = await resolve_traceable_evidence(outcome.sections, [source])
-    assert citations[0].document_version_id == version_id
-    assert citations[0].block_from_id == block_id
-    assert citations[0].anchor == "release-approval"
+    citation = next(item for item in citations if item.search_unit_id == unit_id)
+    assert citation.document_version_id == version_id
+    assert citation.block_from_id == block_id
+    assert citation.anchor == "release-approval"
 
     from sag_api.core.errors import NotFoundError
 
@@ -333,7 +553,7 @@ async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_cit
         top_k=5,
     )
     assert unavailable.sections == []
-    assert len(requested_vectors) == 2  # an unready version never reaches Qdrant
+    assert len(requested_vectors) == indexed_request_count  # an unready version never reaches Qdrant
     async with SessionLocal() as session:
         with pytest.raises(NotFoundError):
             await retrieval.get_search_unit_citation(
