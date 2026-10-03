@@ -296,6 +296,25 @@ class EngineManager:
                 self._search_unit_qdrant_client_config = client_config
             return self._search_unit_qdrant_client
 
+    async def get_routing_snapshot(
+        self,
+        *,
+        query: str,
+        scopes: list[dict[str, object]],
+        planner: dict[str, object],
+    ) -> Any:
+        """Capture durable tree/search/ACL pins for one complete request."""
+        del planner  # The immutable tree snapshot is independent of strategy planning.
+        from sag_api.services.tree_query_snapshot_service import acquire_tree_query_snapshot
+
+        return await acquire_tree_query_snapshot(query=query, scopes=scopes)
+
+    async def release_routing_snapshot(self, snapshot_id: str) -> None:
+        """Release request leases after the Qdrant reads using their pinned slot finish."""
+        from sag_api.services.tree_query_snapshot_service import release_tree_query_snapshot
+
+        await release_tree_query_snapshot(snapshot_id)
+
     async def _close_search_unit_qdrant_client_locked(self) -> None:
         client = self._search_unit_qdrant_client
         self._search_unit_qdrant_client = None

@@ -88,6 +88,8 @@ _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
         "error_json": "JSON",
     },
     "universe_dirty_sources": {"revision": "INTEGER NOT NULL DEFAULT 1"},
+    "tree_manifests": {"manifest_json": "JSON NOT NULL DEFAULT '{}'"},
+    "tree_routing_profiles": {"document_version_id": "VARCHAR(128) NOT NULL DEFAULT ''"},
 }
 
 # Existing tables also need newly introduced hot-path indexes. Keep these
@@ -98,6 +100,10 @@ _INDEX_UPGRADES = (
     "CREATE INDEX IF NOT EXISTS ix_documents_source_sag_source ON documents (source_id, sag_source_id)",
     "CREATE INDEX IF NOT EXISTS ix_documents_source_active_created ON documents (source_id, is_active, created_at)",
     "CREATE INDEX IF NOT EXISTS ix_documents_tenant_project_logical ON documents (tenant_id, project_id, logical_source_id)",
+    (
+        "CREATE INDEX IF NOT EXISTS idx_tree_routing_profiles_version_scope "
+        "ON tree_routing_profiles (project_id, tree_version, source_id, document_version_id, partition_id)"
+    ),
 )
 
 
@@ -121,8 +127,16 @@ async def _ensure_columns() -> None:
 
 
 async def _ensure_indexes() -> None:
+    from sqlalchemy import inspect as sa_inspect
+
     async with engine.begin() as conn:
         for ddl in _INDEX_UPGRADES:
+            if "tree_routing_profiles" in ddl:
+                table_exists = await conn.run_sync(
+                    lambda sync_conn: sa_inspect(sync_conn).has_table("tree_routing_profiles")
+                )
+                if not table_exists:
+                    continue
             await conn.exec_driver_sql(ddl)
 
 

@@ -386,6 +386,9 @@ async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_cit
             return [0.25, 0.75]
 
     class SearchEngines:
+        def __init__(self):
+            self.released_snapshots: list[str] = []
+
         async def get_sag_embedding(self, *_args):
             return Embedder()
 
@@ -439,6 +442,9 @@ async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_cit
             )
             return RoutingSnapshot(snapshot_id="request-snapshot-1", captured_at=captured, groups=(group_snapshot,))
 
+        async def release_routing_snapshot(self, snapshot_id: str):
+            self.released_snapshots.append(snapshot_id)
+
     search_engines = SearchEngines()
 
     query = "summarize release" if route_mode == "wrong_route_nonempty" else "XK-204"
@@ -450,6 +456,7 @@ async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_cit
         top_k=5,
     )
     has_route = route_mode != "global_only"
+    assert search_engines.released_snapshots == (["request-snapshot-1"] if has_route else [])
     assert sorted(requested_vectors) == sorted(["content_vector", "bm25_sparse"] * (2 if has_route else 1))
     assert outcome.stats["canonical_index"] is True
     assert outcome.stats["fusion_method"] == (
