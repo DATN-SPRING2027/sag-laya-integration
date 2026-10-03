@@ -40,7 +40,12 @@ from sag_api.sag.search_unit_store import (
     build_search_filter,
     build_sparse_query_vector,
 )
-from sag_api.services.query_routing_service import RouteDecision, capture_routing_decisions
+from sag_api.services.query_routing_service import (
+    RouteDecision,
+    capture_routing_decisions,
+    routing_scope_for_group,
+    scope_fingerprint,
+)
 from sag_api.services.query_strategy_planner import QueryStrategyPlan, plan_query, promote_multi_hop
 
 log = get_logger("search_units")
@@ -315,14 +320,20 @@ async def _query_group(
     route: RouteDecision | None = None,
 ) -> tuple[_SearchGroup, list[SearchUnitHit], list[SearchUnitHit]]:
     collection = f"search_units_{group.project_id}"
+    use_tree_route = bool(
+        route
+        and route.routed
+        and route.acl_scope_fingerprint
+        == scope_fingerprint(routing_scope_for_group(group))
+    )
     search_filter = build_search_filter(
         project_id=group.project_id,
         tenant_id=group.tenant_id,
         partition_id=group.partition_id,
         document_version_ids=list(group.versions),
-        tree_version=route.tree_version if route and route.routed else None,
-        routing_slot=route.routing_slot if route and route.routed else None,
-        membership_node_ids=list(route.membership_node_ids) if route and route.routed else None,
+        tree_version=route.tree_version if use_tree_route and route else None,
+        routing_slot=route.routing_slot if use_tree_route and route else None,
+        membership_node_ids=list(route.membership_node_ids) if use_tree_route and route else None,
     )
     try:
         vector = [float(value) for value in query_vector]
@@ -497,6 +508,7 @@ def _routing_trace(
                 "partition_id": group.partition_id,
                 "snapshot_id": route.snapshot_id if route else None,
                 "request_snapshot_id": route.request_snapshot_id if route else None,
+                "acl_scope_fingerprint": route.acl_scope_fingerprint if route else None,
                 "tree_version": route.tree_version if route else None,
                 "routing_slot": route.routing_slot if route else None,
                 "search_epoch": route.search_epoch if route else None,
@@ -640,6 +652,20 @@ async def retrieve_search_unit_sections(
             async def bounded(group: _SearchGroup):
                 async with semaphore:
                     route = decisions.get(group.scope_key)
+                    if (
+                        route is not None
+                        and route.routed
+                        and route.acl_scope_fingerprint
+                        != scope_fingerprint(routing_scope_for_group(group))
+                    ):
+                        route = route.model_copy(
+                            update={
+                                "selected_nodes": (),
+                                "membership_node_ids": (),
+                                "fallback_reason": "acl_scope_snapshot_mismatch",
+                                "reason_code": "ROUTING_ACL_SCOPE_MISMATCH",
+                            }
+                        )
                     vector = await _query_vector(engine_manager, group, query)
                     if route is None or not route.routed:
                         result = await _query_group(
@@ -735,6 +761,22 @@ async def retrieve_search_unit_sections(
     except httpx.HTTPError as error:
         log.warning("canonical search client unavailable error_type=%s", type(error).__name__)
         raise ServiceUnavailableError("Canonical search index is unavailable") from error
+    finally:
+        request_snapshot_ids = {
+            route.request_snapshot_id
+            for route in decisions.values()
+            if route.request_snapshot_id
+        }
+        release = getattr(engine_manager, "release_routing_snapshot", None)
+        if callable(release):
+            for request_snapshot_id in request_snapshot_ids:
+                try:
+                    await release(request_snapshot_id)
+                except Exception as error:  # noqa: BLE001 - lease expiry remains the recovery path
+                    log.warning(
+                        "could not release request tree snapshot error_type=%s",
+                        type(error).__name__,
+                    )
 
     hits: dict[
         tuple[str, str, str, str, str, str],

@@ -193,6 +193,8 @@ Implementation slice B2 đã có fixture test (xem `SAG/docs/Thang_Task/[SAG][B2
 - [ ] Query trong lúc publish đọc một snapshot nhất quán.
 - [ ] Inject/kiểm tra lỗi build và publish; active tree cũ vẫn phục vụ và rollback được.
 
+**Implementation slice (2026-10-04):** task branch `feat/Thang-checkpoint-c-blue-green-be-api-db` thêm blue-green publisher, durable query-slot lease, indexed Source/version/partition profile snapshot và focused SQLite/mock regressions (35 tests liên quan pass). Xem [Checkpoint C evidence và giới hạn](../docs/Thang_Task/%5BSAG%5D%5BCheckpoint%20C%5D/evidence.md). Các checkbox Phase 8/Checkpoint C vẫn mở: DATN-58 producer chưa nối, PostgreSQL advisory-lock/migration và Qdrant thật chưa được kiểm chứng; Checkpoint B vẫn chưa hoàn tất trên task base.
+
 ## Checkpoint C — INCREMENTAL_READY
 
 - [ ] Ingest bình thường không đòi full tree rebuild.
