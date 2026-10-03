@@ -163,16 +163,18 @@ Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL ev
 
 ## Phase 7 — Tree-guided Retrieval
 
-- [ ] Planner map deterministic features sang primary strategy + modifiers; ghi planner version/reason codes.
-- [ ] Regression EXACT, LOCAL_FACTUAL, ENTITY_RELATIONAL, TEMPORAL, GLOBAL_TOPIC, MULTI_HOP; xác nhận MULTI_HOP là escalation có căn cứ.
+- [x] Implement planner `qsp-v1`: deterministic primary strategy/modifiers, explicit mode override và reason codes; regression fixtures cover sáu mode.
+- [ ] So sánh sáu mode với global-only trên gold corpus và ngưỡng benchmark đã thống nhất; xác nhận routing recall/latency.
 - [ ] Chụp một snapshot tree/search/ACL cho mỗi query.
-- [ ] Prune node inaccessible trước beam; dùng ACL-safe profiles và exact ACL filter ở Qdrant.
-- [ ] Kiểm tra beam/entropy/margin; giữ broad route khi tín hiệu không quyết định.
-- [ ] Chạy branch-local retrieval và global escape theo budget; local rỗng/coverage thấp phải thử escape.
-- [ ] Kiểm tra fusion → dedup → MMR → coverage → bounded graph expansion → rerank → context.
-- [ ] Kiểm tra latency exhaustion có thể bỏ graph expansion/rerank mà vẫn trả fallback phù hợp.
-- [ ] Trace đủ selected nodes/version, requested/effective strategy, reason codes và fallback/blackhole.
+- [x] Consumer prune profile sai scope/không accessible trước beam; tree filter chỉ được AND thêm vào Project/tenant/partition/version ACL. Provider B1 thật chưa nối.
+- [x] Beam route deterministic; entropy/margin giữ broad route khi tín hiệu chưa quyết định.
+- [x] Fixture kiểm tra branch-local + authorized global escape cho wrong route và local timeout; real B1 tree output còn chờ.
+- [x] Giữ RRF→canonical verification→dedup/MMR→coverage; giới hạn candidate hydration/rerank toàn truy vấn. Graph adapter chưa có nên skip an toàn và trace rõ.
+- [x] Snapshot/local/escape budget exhaustion có global/rank-interleave fallback phù hợp; chưa benchmark latency trên hạ tầng thật.
+- [x] Trace planner/snapshot/nodes/version/reason/escape/coverage/blackhole và selection fallback.
 - [ ] Kiểm tra ACL leakage và routing blackhole bằng principal có quyền khác nhau.
+
+Implementation slice B2 đã có fixture test (xem `SAG/docs/Thang_Task/[SAG][B2]/todo.md`); các mục cần DATN-37/Phase 5, principal thật, gold corpus và benchmark vẫn mở. Không đánh dấu `ROUTING_READY` khi chưa có integration evidence.
 
 ## Checkpoint B — ROUTING_READY
 

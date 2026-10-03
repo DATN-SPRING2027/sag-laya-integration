@@ -45,6 +45,41 @@ def test_search_filter_requires_all_acl_dimensions_and_versions():
     ]
 
 
+def test_tree_filter_adds_slot_and_membership_without_replacing_acl():
+    actual = build_search_filter(
+        project_id="project-a",
+        tenant_id="tenant-a",
+        partition_id="partition-a",
+        document_version_ids=["v1"],
+        tree_version="tree-12",
+        routing_slot="SLOT_B",
+        membership_node_ids=["leaf-2", "leaf-1", "leaf-2"],
+    )
+
+    assert actual["must"] == [
+        {"key": "project_id", "match": {"value": "project-a"}},
+        {"key": "tenant_id", "match": {"value": "tenant-a"}},
+        {"key": "security_partition_id", "match": {"value": "partition-a"}},
+        {"key": "document_version_id", "match": {"any": ["v1"]}},
+        {"key": "tree_version_b", "match": {"value": "tree-12"}},
+    ]
+    assert actual["should"] == [
+        {"key": "primary_node_b", "match": {"any": ["leaf-1", "leaf-2"]}},
+        {"key": "secondary_node_ids_b", "match": {"any": ["leaf-1", "leaf-2"]}},
+    ]
+
+
+def test_incomplete_tree_filter_fails_closed():
+    with pytest.raises(ValueError):
+        build_search_filter(
+            project_id="project-a",
+            tenant_id="tenant-a",
+            partition_id="partition-a",
+            document_version_ids=["v1"],
+            tree_version="tree-12",
+        )
+
+
 @pytest.mark.parametrize(
     "scope",
     [

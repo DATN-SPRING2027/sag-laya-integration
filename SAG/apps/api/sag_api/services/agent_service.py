@@ -529,6 +529,9 @@ def _adapt_tool(host_tool, host_context: HostToolContext, citations: list[dict])
             for citation in result.citations[:6]
         ]
         details: dict[str, Any] = {"count": count}
+        routing_trace = result.data.get("routing")
+        if host_tool.meta.name == "search_context" and isinstance(routing_trace, Mapping):
+            details["routing"] = dict(routing_trace)
         if host_tool.meta.name in _KNOWLEDGE_TOOLS:
             details["scope"] = "knowledge"
             details["sources"] = [

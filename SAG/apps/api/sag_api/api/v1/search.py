@@ -43,6 +43,7 @@ from sag_api.schemas.search import (
 from sag_api.services.eval.llm_judge import judge_pairwise
 from sag_api.services.laya_router import CHAT_HIGH_CONFIDENCE, route_query
 from sag_api.services.query_analysis import analyze_query
+from sag_api.services.query_strategy_planner import QueryStrategyPlan, plan_query
 from sag_api.services.retrieval_service import (
     EventScoreMap,
     SearchAnswer,
@@ -69,6 +70,7 @@ class _QueryRoutePlan:
     strategy: str
     need_retrieval: bool
     trace: dict[str, Any]
+    strategy_plan: QueryStrategyPlan
 
 
 def _query_feature_reason_codes(features: Any) -> list[str]:
@@ -94,8 +96,10 @@ async def _build_query_route(
     query: str,
     source_ids: list[str] | None,
     requested_strategy: str | None,
+    requested_retrieval_mode: str | None = None,
 ) -> _QueryRoutePlan:
     analysis = analyze_query(query, segmentation_enabled=settings.search_chinese_segmentation_enabled)
+    strategy_plan = plan_query(query, requested_mode=requested_retrieval_mode, features=analysis.features)
     route_error = False
     try:
         laya = await asyncio.to_thread(route_query, query)
@@ -162,6 +166,7 @@ async def _build_query_route(
         "fallback_used": fallback_used,
         "fallback_reason": fallback_reason,
         "reason_codes": reason_codes,
+        "strategy_plan": strategy_plan.as_trace(),
         "query_analysis": {
             "normalized_phrase": analysis.normalized_phrase,
             "lookup_terms": list(analysis.lookup_terms),
@@ -172,6 +177,7 @@ async def _build_query_route(
         strategy=effective_strategy,
         need_retrieval=need_retrieval,
         trace=trace,
+        strategy_plan=strategy_plan,
     )
 
 
@@ -302,7 +308,12 @@ async def _prepare_global_search(
     *,
     principal: VerifiedPrincipal,
 ) -> _PreparedGlobalSearch:
-    route_plan = await _build_query_route(body.query, body.source_ids, body.strategy)
+    route_plan = await _build_query_route(
+        body.query,
+        body.source_ids,
+        body.strategy,
+        body.retrieval_mode,
+    )
     if not route_plan.need_retrieval:
         stats = _with_query_route_stats(
             {
@@ -350,6 +361,7 @@ async def _prepare_global_search(
         body.query,
         principal=principal,
         top_k=body.top_k,
+        query_strategy_plan=route_plan.strategy_plan,
     )
     permitted_config_ids = set(refs)
     permitted_sections = [

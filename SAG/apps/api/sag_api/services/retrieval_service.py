@@ -22,6 +22,7 @@ from sag_api.services.evidence_service import (
 from sag_api.services.query_analysis import (
     QueryAnalysis,
     analyze_query,
+    extract_query_features,
     normalize_lexical_text,
 )
 
@@ -402,6 +403,164 @@ def rerank_sections(
         filtered_count=len(candidate_keys) - len(ranked),
         lexical_count=len(lexical),
     )
+
+
+def _content_shingles(section: RetrievedSection) -> frozenset[str]:
+    normalized = normalize_lexical_text(f"{section.heading}\n{section.content}")
+    if len(normalized) > 4096:
+        # Keep the similarity signature bounded while sampling the whole evidence;
+        # prefix-only truncation can collapse sections with different conclusions.
+        window_size = 1024
+        last_start = len(normalized) - window_size
+        starts = (0, last_start // 3, (last_start * 2) // 3, last_start)
+        normalized = "\n".join(
+            normalized[start : start + window_size]
+            for start in dict.fromkeys(starts)
+        )
+    if len(normalized) < 3:
+        return frozenset({normalized}) if normalized else frozenset()
+    return frozenset(normalized[index : index + 3] for index in range(len(normalized) - 2))
+
+
+def _jaccard(left: frozenset[str], right: frozenset[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def select_diverse_sections(
+    query: str,
+    candidates: list[RetrievedSection],
+    *,
+    limit: int,
+    diversity_weight: float | None = None,
+    near_duplicate_similarity: float | None = None,
+) -> tuple[list[RetrievedSection], dict[str, Any]]:
+    """Collapse near-identical text and apply deterministic MMR without dropping query anchors."""
+    if limit <= 0 or not candidates:
+        return [], {"candidate_count": len(candidates), "deduplicated_count": 0, "anchor_coverage": {}}
+
+    diversity = (
+        settings.search_mmr_diversity_weight
+        if diversity_weight is None
+        else float(diversity_weight)
+    )
+    duplicate_threshold = (
+        settings.search_near_duplicate_similarity
+        if near_duplicate_similarity is None
+        else float(near_duplicate_similarity)
+    )
+    if not math.isfinite(diversity) or not 0.0 <= diversity <= 1.0:
+        raise ValueError("MMR diversity weight must be between zero and one")
+    if not math.isfinite(duplicate_threshold) or not 0.9 <= duplicate_threshold <= 1.0:
+        raise ValueError("Near-duplicate similarity must be between 0.9 and one")
+
+    features = extract_query_features(query)
+    required = tuple(
+        dict.fromkeys(
+            value
+            for term in (*features.exact_terms, *features.identifier_terms, *features.path_terms)
+            if (value := normalize_lexical_text(term))
+        )
+    )
+
+    def anchor_coverage(section: RetrievedSection) -> frozenset[str]:
+        text = normalize_lexical_text(f"{section.heading}\n{section.content}")
+        return frozenset(term for term in required if term in text)
+
+    def representative_key(section: RetrievedSection) -> tuple[Any, ...]:
+        return (
+            len(anchor_coverage(section)),
+            float(section.score or 0.0),
+            -int(section.rank or 0),
+            section.source_id or "",
+            section.document_version_id or "",
+            section.chunk_id or "",
+        )
+
+    ordered = sorted(
+        candidates,
+        key=lambda section: (
+            -float(section.score or 0.0),
+            int(section.rank or 0),
+            section.source_id or "",
+            section.chunk_id or "",
+        ),
+    )
+    unique: list[RetrievedSection] = []
+    unique_shingles: list[frozenset[str]] = []
+    unique_coverage: list[frozenset[str]] = []
+    for section in ordered:
+        shingles = _content_shingles(section)
+        coverage = anchor_coverage(section)
+        duplicate_index = next(
+            (
+                index
+                for index, previous in enumerate(unique_shingles)
+                if coverage == unique_coverage[index]
+                and _jaccard(shingles, previous) >= duplicate_threshold
+            ),
+            None,
+        )
+        if duplicate_index is None:
+            unique.append(section)
+            unique_shingles.append(shingles)
+            unique_coverage.append(coverage)
+        elif representative_key(section) > representative_key(unique[duplicate_index]):
+            unique[duplicate_index] = section
+            unique_shingles[duplicate_index] = shingles
+
+    selected_indices: list[int] = []
+    selected_anchors: set[str] = set()
+    for anchor in required:
+        if anchor in selected_anchors or len(selected_indices) >= limit:
+            continue
+        best = next(
+            (
+                index
+                for index, coverage in enumerate(unique_coverage)
+                if anchor in coverage and index not in selected_indices
+            ),
+            None,
+        )
+        if best is not None:
+            selected_indices.append(best)
+            selected_anchors.update(unique_coverage[best])
+
+    while len(selected_indices) < min(limit, len(unique)):
+        remaining = [index for index in range(len(unique)) if index not in selected_indices]
+        best = max(
+            remaining,
+            key=lambda index: (
+                (1.0 - diversity) * max(0.0, min(1.0, float(unique[index].score or 0.0)))
+                - diversity
+                * max(
+                    (_jaccard(unique_shingles[index], unique_shingles[chosen]) for chosen in selected_indices),
+                    default=0.0,
+                ),
+                -int(unique[index].rank or 0),
+                -index,
+            ),
+        )
+        selected_indices.append(best)
+
+    selected = [unique[index].model_copy(update={"rank": rank}) for rank, index in enumerate(selected_indices)]
+    covered = set().union(*(anchor_coverage(section) for section in selected)) if selected else set()
+    return selected, {
+        "candidate_count": len(candidates),
+        "deduplicated_count": len(candidates) - len(unique),
+        "diversity_weight": diversity,
+        "near_duplicate_similarity": duplicate_threshold,
+        "required_anchor_count": len(required),
+        "covered_anchor_count": len(covered),
+        "anchor_coverage": (
+            "not_required"
+            if not required
+            else "complete"
+            if set(required) <= covered
+            else "missing_required_anchor"
+        ),
+    }
 
 
 async def _lexical_sections(

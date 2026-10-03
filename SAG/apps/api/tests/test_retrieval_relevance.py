@@ -10,6 +10,7 @@ from sag_api.services.evidence_service import build_evidence_pack, build_tool_ev
 from sag_api.services.retrieval_service import (
     fallback_search_answer,
     rerank_sections,
+    select_diverse_sections,
     synthesize_search_answer,
 )
 
@@ -169,6 +170,92 @@ def test_rank_fusion_deduplicates_candidates_by_source_and_chunk():
     assert len({item.chunk_id for item in result.sections}) == 3
     shared = next(item for item in result.sections if item.chunk_id == "shared")
     assert shared.content == "bản trùng dài nhất trong lexical result"
+
+
+def test_mmr_collapses_near_duplicates_and_preserves_all_query_identifiers():
+    repeated = "DATN-37 was approved after review. " + ("The owner recorded the decision in the release notes. " * 8)
+    sections = [
+        RetrievedSection(chunk_id="a1", heading="Approval", content=repeated, score=0.8, rank=0),
+        RetrievedSection(
+            chunk_id="a2",
+            heading="Approval",
+            content=repeated[:-2] + "! ",
+            score=0.9,
+            rank=1,
+        ),
+        RetrievedSection(
+            chunk_id="b", heading="Error", content="ERR-504 was recorded in the incident report.", score=0.4, rank=2
+        ),
+        RetrievedSection(
+            chunk_id="c", heading="Overview", content="A separate unrelated architecture overview.", score=0.99, rank=3
+        ),
+    ]
+
+    selected, trace = select_diverse_sections(
+        'Where are "DATN-37" and "ERR-504" recorded?',
+        sections,
+        limit=2,
+        near_duplicate_similarity=0.95,
+    )
+
+    assert len(selected) == 2
+    assert {item.chunk_id for item in selected} == {"a2", "b"}
+    assert trace["deduplicated_count"] == 1
+    assert trace["anchor_coverage"] == "complete"
+
+
+def test_mmr_marks_structural_anchor_coverage_not_applicable_without_required_anchors():
+    _, trace = select_diverse_sections(
+        "How does deployment work?",
+        [RetrievedSection(chunk_id="a", content="Deployment uses a verified process.", score=0.8)],
+        limit=1,
+    )
+
+    assert trace["required_anchor_count"] == 0
+    assert trace["anchor_coverage"] == "not_required"
+
+
+def test_mmr_is_deterministic_and_prefers_independent_evidence():
+    sections = [
+        RetrievedSection(
+            chunk_id="a", heading="Same", content="Deployment uses a blue green rollout design.", score=0.9, rank=0
+        ),
+        RetrievedSection(
+            chunk_id="b", heading="Similar", content="Deployment uses a blue green rollout process.", score=0.88, rank=1
+        ),
+        RetrievedSection(
+            chunk_id="c",
+            heading="Different",
+            content="Rollback restores the previous verified manifest.",
+            score=0.6,
+            rank=2,
+        ),
+    ]
+
+    first, _ = select_diverse_sections("How does deployment work?", sections, limit=2)
+    second, _ = select_diverse_sections("How does deployment work?", sections, limit=2)
+
+    assert [item.chunk_id for item in first] == [item.chunk_id for item in second]
+    assert "c" in {item.chunk_id for item in first}
+
+
+def test_mmr_similarity_samples_long_evidence_beyond_the_shared_prefix():
+    shared_prefix = "The document repeats the same background text. " * 120
+    first = shared_prefix + ("The decision authorizes release A. " * 20)
+    second = shared_prefix + ("The decision rejects release B. " * 20)
+
+    selected, trace = select_diverse_sections(
+        "Summarize the decision",
+        [
+            RetrievedSection(chunk_id="release-a", heading="Decision", content=first, score=0.9, rank=0),
+            RetrievedSection(chunk_id="release-b", heading="Decision", content=second, score=0.8, rank=1),
+        ],
+        limit=2,
+        near_duplicate_similarity=0.98,
+    )
+
+    assert {item.chunk_id for item in selected} == {"release-a", "release-b"}
+    assert trace["deduplicated_count"] == 0
 
 
 def test_evidence_pack_requires_complete_provenance_and_keeps_whole_items_within_budget():
