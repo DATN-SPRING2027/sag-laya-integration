@@ -46,7 +46,7 @@ P0 cho phép planner/fixture/consumer global-fallback làm song song bằng prop
 - [x] Bounded candidate unit IDs (hard cap 1,024) trước canonical hydration/rerank; branch-local/global escape hợp nhất trước final top-k.
 - [x] Escape reserve từ đầu; authorization DB, provider, embedding, query paths và hydration dùng monotonic request deadline.
 - [x] Fixture wrong accessible route (có local hit nhưng bỏ sót unit) và local timeout; global escape phục hồi unit trong authorized scope. Inaccessible profile được prune trước beam; delta/real-tree E2E còn thiếu.
-- [x] Một vote mỗi unit/channel khi local+escape trùng; giữ RRF semantics và cross-scope rank interleave.
+- [x] Một vote mỗi unit/channel khi local+escape trùng; giữ RRF semantics và cross-scope rank interleave; candidate branch-local đứng trước global-escape khi đồng hạng (PR #17 regression).
 - [x] Canonical exact dedup giữ locator; near-duplicate content dedup có ngưỡng config và regression. Distinct-version/fact benchmark vẫn mở.
 - [x] MMR deterministic và bảo toàn quoted/exact/identifier/path anchors; time/entity facet calibration chưa có entity extractor/gold benchmark.
 - [x] EMPTY/WEAK/structurally-sufficient/UNKNOWN structural anchor states are distinct; semantic answerability remains `unknown` and no RRF confidence threshold is used. Entity/time facet calibration still lacks extraction/benchmark support.

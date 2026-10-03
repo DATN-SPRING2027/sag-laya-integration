@@ -976,7 +976,7 @@ async def retrieve_search_unit_sections(
                 },
             )
             sections_by_key[section_key] = section
-        interleaved_rank = rank if origin == "global_only" else rank * 2 + int(origin == "branch_local")
+        interleaved_rank = rank if origin == "global_only" else rank * 2 + int(origin != "branch_local")
         ranked_by_channel_and_scope[(channel, scope_key)].append(
             section.model_copy(update={"score": score, "rank": interleaved_rank})
         )

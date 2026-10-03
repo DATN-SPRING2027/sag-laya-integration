@@ -41,6 +41,14 @@ Global escape được chạy đồng thời với branch-local khi tree route h
 - Fix: strategy-plan trace emission is opt-in; global search enables it where the plan is passed to B2 retrieval, while the source-scoped endpoint keeps its legacy path and omits the unapplied plan.
 - Regression followed RED/GREEN: the source-scoped trace test failed before the fix and passed after it. `test_search_strategy.py` + `test_search_stream.py`: **35 passed**; Ruff and `git diff --check`: passed.
 
+### Rank precedence review finding
+
+- New reviewer finding ([discussion](https://github.com/DATN-SPRING2027/sag-laya-integration/pull/17#discussion_r4172120626)): `retrieve_search_unit_sections` interleaves equal-ranked `branch_local` and `global_escape` candidates with a parity bit, but the bit currently assigns the earlier even rank to escape candidates. This contradicts the intended route preference; duplicates already preserve `branch_local` origin when choosing between equivalent hits.
+- Reproduction: the `wrong_route_nonempty` fixture now uses a non-exact query so exact-anchor preservation cannot mask the merge ordering. The regression asserts equal-rank local evidence precedes the global-escape result. It failed on the current implementation for both READY and SEARCH_READY parameterizations before the service fix.
+- Fix: inverted the parity predicate so `branch_local` receives the earlier rank and `global_escape` the later rank. `global_only` ranking and ACL/fusion semantics are unchanged. The citation assertion now selects the expected citation by `search_unit_id`, since the local decoy intentionally precedes the recovered global result.
+- RED/GREEN and regression: `test_search_unit_retrieval_service.py -k wrong_route_nonempty`: **2 passed**; complete `test_search_unit_retrieval_service.py`: **20 passed**; `test_retrieval_relevance.py`: **35 passed**. Ruff on the two changed Python files and `git diff --check`: passed.
+- Scope/impact: only retrieval rank ordering, its regression fixture, B2 todo, and this research record changed. No database/index/ingestion, configuration, authorization, or API contract changes; rollback is reverting this isolated rank predicate and its test/docs.
+
 ## Gaps trước nghiệm thu
 
 DATN-37 owner-confirmed snapshot/profile DTO, actual provider, consistent read/epoch and slot retention; Phase 5 graph/entity adapter; real Checkpoint A trusted-principal/PG/Qdrant integration; embedding/profile model identity; temporal history policy; calibrated semantic answerability; agreed gold corpus/recall/latency thresholds. Current tests are contract fixtures and do not certify tree producer, leakage resistance against real tenant principals, six-mode routing recall, or production SLO. `ROUTING_READY` remains open.

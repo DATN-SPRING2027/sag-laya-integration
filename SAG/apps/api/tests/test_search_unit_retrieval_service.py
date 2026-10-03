@@ -441,10 +441,11 @@ async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_cit
 
     search_engines = SearchEngines()
 
+    query = "summarize release" if route_mode == "wrong_route_nonempty" else "XK-204"
     outcome = await retrieval.retrieve_search_unit_sections(
         search_engines,
         [source],
-        "XK-204",
+        query,
         principal=principal,
         top_k=5,
     )
@@ -477,6 +478,8 @@ async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_cit
     assert outcome.stats["lexical_candidates"] == expected_candidate_count
     indexed_request_count = len(requested_vectors)
     assert len(outcome.sections) == expected_candidate_count
+    if route_mode == "wrong_route_nonempty":
+        assert [section.search_unit_id for section in outcome.sections] == [decoy_unit_id, unit_id]
     evidence = next(section for section in outcome.sections if section.search_unit_id == unit_id)
     assert evidence.canonical_evidence_verified is True
     assert evidence.search_unit_id == unit_id
@@ -489,9 +492,10 @@ async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_cit
     from sag_api.services.evidence_service import resolve_traceable_evidence
 
     citations = await resolve_traceable_evidence(outcome.sections, [source])
-    assert citations[0].document_version_id == version_id
-    assert citations[0].block_from_id == block_id
-    assert citations[0].anchor == "release-approval"
+    citation = next(item for item in citations if item.search_unit_id == unit_id)
+    assert citation.document_version_id == version_id
+    assert citation.block_from_id == block_id
+    assert citation.anchor == "release-approval"
 
     from sag_api.core.errors import NotFoundError
 
