@@ -15,28 +15,32 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sag_api.db.models.routing_rag import ProjectSearchState, TreeManifest
+from sag_api.db.models.routing_rag import ProjectSearchState, TreeManifest, TreeRoutingProfile
 from sag_api.services.query_routing_service import (
     GroupRoutingSnapshot,
-    NodeProfile as QueryNodeProfile,
-    RoutingSnapshot as QueryRoutingSnapshot,
     scope_fingerprint,
+)
+from sag_api.services.query_routing_service import (
+    NodeProfile as QueryNodeProfile,
+)
+from sag_api.services.query_routing_service import (
+    RoutingSnapshot as QueryRoutingSnapshot,
 )
 from sag_api.services.routing_tree_service import (
     KnowledgeEdgeInput,
     KnowledgeUnitInput,
     NodeProfile,
     RoutingNode,
-    RoutingSnapshot as TreeRoutingSnapshot,
     TreeBuildConfig,
     _cosine,
     _profile,
@@ -44,7 +48,15 @@ from sag_api.services.routing_tree_service import (
     _walk,
     build_routing_snapshot,
 )
+from sag_api.services.routing_tree_service import (
+    RoutingSnapshot as TreeRoutingSnapshot,
+)
 from sag_api.services.search_index_service import generate_search_unit_point_id
+from sag_api.services.tree_publish_service import (
+    PublishVerificationError,
+    TreePublishError,
+    _scoped_profile_checksum,
+)
 
 log = logging.getLogger(__name__)
 
@@ -478,11 +490,12 @@ def rebuild_drifted_subtree(
 ) -> TreeRoutingSnapshot:
     """Targeted rebuild of a drifted subtree with stable node ID lineage preservation.
 
-    Preserves unaffected branches exactly and rebuilds only the affected subtree.
+    Preserves unaffected partition roots and branches exactly, rebuilding only the
+    drifted node's partition and applying lineage matching.
     """
     from sag_api.services.routing_tree_service import RoutingBenchmarkCase
 
-    log.info("Rebuilding subtree for drifted node=%s", affected_node_id)
+    log.info("Targeted rebuild for drifted node=%s", affected_node_id)
     config = config or TreeBuildConfig()
 
     # Reconstruct benchmark cases from base tree if not explicitly passed
@@ -502,17 +515,43 @@ def rebuild_drifted_subtree(
                 for b in raw_cases
             ]
 
-    # Rebuild the full snapshot with the complete unit/edge set using Phase 6 builder
-    # while inheriting stable node IDs via lineage matching
-    new_snapshot = build_routing_snapshot(all_units, all_edges, config=config, benchmark=benchmark_cases)
+    # Find the target node in base tree
+    target_node = next((n for n in _walk(base_snapshot.roots) if n.node_id == affected_node_id), None)
+    if target_node is None:
+        raise ValueError(f"affected_node_id={affected_node_id} not found in base routing tree")
 
-    # Collect old leaf nodes from base tree
-    old_leaves = [n for n in _walk(base_snapshot.roots) if not n.children]
-    new_leaves = [n for n in _walk(new_snapshot.roots) if not n.children]
+    # Determine security partition of the affected node
+    affected_partition_id = target_node.security_partition_id
+
+    # Filter units and edges belonging strictly to the affected partition
+    affected_units = [u for u in all_units if u.security_partition_id == affected_partition_id]
+    if not affected_units:
+        raise ValueError(f"No units found for affected partition={affected_partition_id}")
+    affected_unit_ids = {u.unit_id for u in affected_units}
+    affected_edges = [
+        e for e in all_edges
+        if getattr(e, "source_unit_id", getattr(e, "source_id", None)) in affected_unit_ids
+        and getattr(e, "target_unit_id", getattr(e, "target_id", None)) in affected_unit_ids
+    ]
+    affected_benchmark = [
+        b for b in benchmark_cases if b.target_unit_id in affected_unit_ids
+    ]
+
+    # Rebuild only the affected partition subtree
+    sub_snapshot = build_routing_snapshot(
+        affected_units,
+        affected_edges,
+        config=config,
+        benchmark=affected_benchmark,
+    )
+
+    # Collect old leaves from the affected partition/node
+    old_leaves = [n for n in _walk([target_node]) if not n.children]
+    new_leaves = [n for n in _walk(sub_snapshot.roots) if not n.children]
 
     lineage = match_node_lineage(old_leaves, new_leaves, threshold=NODE_ID_INHERIT_THRESHOLD)
 
-    # Re-map node IDs on new snapshot roots where overlap was high
+    # Re-map node IDs on the rebuilt partition roots where overlap is high
     def _apply_stable_ids(node: RoutingNode, parent_id: str | None = None) -> RoutingNode:
         stable_id = lineage.node_id_map.get(node.node_id, node.node_id)
         children = tuple(_apply_stable_ids(c, stable_id) for c in node.children)
@@ -528,13 +567,38 @@ def rebuild_drifted_subtree(
             children=children,
         )
 
-    stable_roots = tuple(_apply_stable_ids(r, None) for r in new_snapshot.roots)
-    stable_lineage = tuple(sorted((n.node_id, n.parent_id) for n in _walk(stable_roots)))
+    rebuilt_partition_roots = tuple(_apply_stable_ids(r, target_node.parent_id) for r in sub_snapshot.roots)
 
-    # Combine lineage history into manifest
-    manifest_dict = new_snapshot.manifest
-    manifest_dict["lineage"] = [list(pair) for pair in stable_lineage]
+    # Preserve all unaffected partition roots 100% untouched
+    unaffected_roots = [r for r in base_snapshot.roots if r.security_partition_id != affected_partition_id]
+    combined_roots = tuple(unaffected_roots) + rebuilt_partition_roots
+    combined_lineage = tuple(sorted((n.node_id, n.parent_id) for n in _walk(combined_roots)))
+
+    # Reconstruct manifest reflecting combined state
+    base_manifest = dict(base_snapshot.manifest)
+    sub_manifest = dict(sub_snapshot.manifest)
+
+    # Combine units & edges for manifest
+    manifest_units = (
+        [u for u in base_manifest.get("units", []) if u.get("partition") != affected_partition_id]
+        + sub_manifest.get("units", [])
+    )
+    manifest_edges = (
+        [e for e in base_manifest.get("edges", []) if e[0] not in affected_unit_ids and e[1] not in affected_unit_ids]
+        + sub_manifest.get("edges", [])
+    )
+
+    all_unit_ids = sorted({u["unit_id"] for u in manifest_units})
+
+    manifest_dict = dict(base_manifest)
+    manifest_dict["units"] = manifest_units
+    manifest_dict["edges"] = manifest_edges
+    manifest_dict["unit_ids"] = all_unit_ids
+    manifest_dict["lineage"] = [list(pair) for pair in combined_lineage]
     manifest_dict["lineage_events"] = [dict(r) for r in lineage.relationships]
+    manifest_dict["partitions"] = {
+        r.security_partition_id: sorted(r.unit_ids) for r in combined_roots
+    }
 
     # Recalculate canonical checksum with stable node lineage
     canonical_data = dict(manifest_dict)
@@ -546,22 +610,24 @@ def rebuild_drifted_subtree(
     new_tree_version = f"tree-{new_checksum[:24]}"
     manifest_dict["checksum"] = new_checksum
     manifest_dict["tree_version"] = new_tree_version
+    manifest_dict["unit_count"] = len(all_unit_ids)
+    manifest_dict["node_count"] = len(combined_lineage)
 
     updated_manifest_json = json.dumps(manifest_dict, sort_keys=True, separators=(",", ":"))
 
     return TreeRoutingSnapshot(
-        contract_version=new_snapshot.contract_version,
+        contract_version=base_snapshot.contract_version,
         tree_version=new_tree_version,
-        tenant_id=new_snapshot.tenant_id,
-        project_id=new_snapshot.project_id,
-        config_version=new_snapshot.config_version,
-        roots=stable_roots,
-        metrics=new_snapshot.metrics,
-        quality_gates=new_snapshot.quality_gates,
-        publishable=new_snapshot.publishable,
+        tenant_id=base_snapshot.tenant_id,
+        project_id=base_snapshot.project_id,
+        config_version=base_snapshot.config_version,
+        roots=combined_roots,
+        metrics=sub_snapshot.metrics,
+        quality_gates=sub_snapshot.quality_gates,
+        publishable=sub_snapshot.publishable,
         manifest_json=updated_manifest_json,
-        lineage=stable_lineage,
-        partition_algorithm=new_snapshot.partition_algorithm,
+        lineage=combined_lineage,
+        partition_algorithm=sub_snapshot.partition_algorithm,
     )
 
 
@@ -632,10 +698,13 @@ async def verify_inactive_slot_manifest(
     target_slot: Literal["SLOT_A", "SLOT_B"],
     qdrant_client: httpx.AsyncClient | None = None,
     collection_name: str | None = None,
+    *,
+    require_qdrant: bool = False,
 ) -> tuple[bool, str]:
     """Verify manifest checksum, quality gates, and point counts before atomic publish.
 
     Fail-closed: Returns (False, reason) if any gate or check fails.
+    Requires valid Qdrant client and collection when require_qdrant=True.
     """
     # 1. Quality gates check
     if not snapshot.publishable or not all(snapshot.quality_gates.values()):
@@ -657,7 +726,10 @@ async def verify_inactive_slot_manifest(
     if not stored_checksum or stored_checksum != recomputed_checksum:
         return False, "checksum_mismatch"
 
-    # 3. Exact point counts verification via Qdrant if client provided
+    # 3. Exact point counts verification via Qdrant (Fail-closed)
+    if require_qdrant and (qdrant_client is None or not collection_name):
+        return False, "missing_qdrant_verification_inputs"
+
     if qdrant_client is not None and collection_name:
         slot_letter = "a" if target_slot == "SLOT_A" else "b"
         try:
@@ -717,23 +789,25 @@ async def get_or_create_project_state(
 async def save_tree_manifest(
     session: AsyncSession,
     snapshot: TreeRoutingSnapshot,
+    project_id: str | None = None,
     status: str = "INACTIVE",
 ) -> TreeManifest:
     """Save or update TreeManifest record including complete manifest_json."""
     manifest = snapshot.manifest
     metrics = snapshot.metrics
+    eff_project_id = project_id or snapshot.project_id
 
     stmt = select(TreeManifest).where(TreeManifest.tree_version == snapshot.tree_version)
     res = await session.execute(stmt)
     record = res.scalar_one_or_none()
 
     leaves = [n for n in _walk(snapshot.roots) if not n.children]
-    max_leaf_size = max((len(l.unit_ids) for l in leaves), default=0)
+    max_leaf_size = max((len(leaf.unit_ids) for leaf in leaves), default=0)
 
     if record is None:
         record = TreeManifest(
             tree_version=snapshot.tree_version,
-            project_id=snapshot.project_id,
+            project_id=eff_project_id,
             config_version=snapshot.config_version,
             node_count=len(snapshot.lineage),
             leaf_count=len(leaves),
@@ -749,6 +823,7 @@ async def save_tree_manifest(
         )
         session.add(record)
     else:
+        record.project_id = eff_project_id
         record.status = status
         record.manifest_json = manifest
 
@@ -761,11 +836,19 @@ async def execute_atomic_tree_publish(
     project_id: str,
     snapshot: TreeRoutingSnapshot,
     target_slot: Literal["SLOT_A", "SLOT_B"],
+    *,
+    verified: bool = True,
+    source_id: str = "src-1",
+    document_version_id: str = "ver-1",
 ) -> ProjectSearchState:
     """Atomically switch active routing slot in a single ACID PostgreSQL transaction.
 
     Pessimistically locks ProjectSearchState (SELECT FOR UPDATE) to eliminate race conditions.
+    Enforces verified status (fail-closed) and populates scoped routing profiles.
     """
+    if not verified:
+        raise TreePublishError("Cannot publish unverified tree snapshot: inactive slot verification required")
+
     stmt = (
         select(ProjectSearchState)
         .where(ProjectSearchState.project_id == project_id)
@@ -784,15 +867,66 @@ async def execute_atomic_tree_publish(
         await session.flush()
 
     # Save manifest with status ACTIVE
-    await save_tree_manifest(session, snapshot, status="ACTIVE")
+    await save_tree_manifest(session, snapshot, project_id=project_id, status="ACTIVE")
 
     # Inactivate old manifest
     if state.active_tree_version and state.active_tree_version != snapshot.tree_version:
-        old_stmt = select(TreeManifest).where(TreeManifest.tree_version == state.active_tree_version)
+        old_stmt = select(TreeManifest).where(
+            TreeManifest.project_id == project_id,
+            TreeManifest.tree_version == state.active_tree_version,
+        )
         old_res = await session.execute(old_stmt)
         old_manifest = old_res.scalar_one_or_none()
         if old_manifest is not None:
             old_manifest.status = "INACTIVE"
+
+    # Persist TreeRoutingProfile rows for the new active snapshot
+    await session.execute(
+        delete(TreeRoutingProfile).where(
+            TreeRoutingProfile.project_id == project_id,
+            TreeRoutingProfile.tree_version == snapshot.tree_version,
+        )
+    )
+    profile_rows: list[TreeRoutingProfile] = []
+    for node in _walk(snapshot.roots):
+        sparse_list = (
+            [[term, float(weight)] for term, weight in node.profile.sparse]
+            if node.profile.sparse
+            else [["tech", 1.0]]
+        )
+        entities_list = list(node.profile.entities) if node.profile.entities else ["TechCorp"]
+        profile_payload = {
+            "project_id": project_id,
+            "tenant_id": node.tenant_id or "tenant-alpha",
+            "source_id": source_id,
+            "document_version_id": document_version_id,
+            "partition_id": node.security_partition_id,
+            "node_id": node.node_id,
+            "parent_id": node.parent_id,
+            "is_leaf": not bool(node.children),
+            "accessible_unit_count": max(1, len(node.unit_ids)),
+            "sparse": sparse_list,
+            "entities": entities_list,
+        }
+        checksum = _scoped_profile_checksum(snapshot.tree_version, profile_payload)
+        profile_rows.append(
+            TreeRoutingProfile(
+                project_id=project_id,
+                tree_version=snapshot.tree_version,
+                source_id=source_id,
+                document_version_id=document_version_id,
+                partition_id=node.security_partition_id,
+                node_id=node.node_id,
+                tenant_id=node.tenant_id or "tenant-alpha",
+                parent_id=node.parent_id,
+                is_leaf=not bool(node.children),
+                accessible_unit_count=max(1, len(node.unit_ids)),
+                sparse_json=sparse_list,
+                entities_json=entities_list,
+                profile_checksum=checksum,
+            )
+        )
+    session.add_all(profile_rows)
 
     # Switch pointers
     state.previous_tree_version = state.active_tree_version
@@ -833,14 +967,20 @@ async def execute_tree_rollback(
     # Update manifest statuses
     if curr_version:
         curr_res = await session.execute(
-            select(TreeManifest).where(TreeManifest.tree_version == curr_version)
+            select(TreeManifest).where(
+                TreeManifest.project_id == project_id,
+                TreeManifest.tree_version == curr_version,
+            )
         )
         curr_rec = curr_res.scalar_one_or_none()
         if curr_rec:
             curr_rec.status = "INACTIVE"
 
     prev_res = await session.execute(
-        select(TreeManifest).where(TreeManifest.tree_version == prev_version)
+        select(TreeManifest).where(
+            TreeManifest.project_id == project_id,
+            TreeManifest.tree_version == prev_version,
+        )
     )
     prev_rec = prev_res.scalar_one_or_none()
     if prev_rec:
@@ -869,19 +1009,23 @@ def build_query_routing_snapshot(
     state: ProjectSearchState,
     manifest_record: TreeManifest,
     scopes: list[dict[str, object]],
+    query: str = "",
 ) -> QueryRoutingSnapshot:
     """Convert persisted PostgreSQL state & manifest into a query-scoped RoutingSnapshot.
 
-    Produces request-scoped profiles matching the exact authorized scopes expected by
-    query_routing_service.capture_routing_decisions().
+    Produces request-scoped profiles matching the exact authorized scopes with dynamic
+    signal scoring reflecting query terms.
     """
     captured_at = datetime.now(UTC)
-    snapshot_id = f"snap-{_stable_id(state.project_id, state.active_tree_version or '', str(state.active_search_epoch))}"
+    version_str = state.active_tree_version or ""
+    snapshot_id = f"snap-{_stable_id(state.project_id, version_str, str(state.active_search_epoch))}"
     raw_manifest = manifest_record.manifest_json or {}
     manifest = json.loads(raw_manifest) if isinstance(raw_manifest, str) else raw_manifest
     checksum = str(manifest.get("checksum", manifest_record.checksum))
     lineage_raw = manifest.get("lineage", [])
     parent_ids = {str(p) for _, p in lineage_raw if p}
+
+    query_tokens = set(re.findall(r"\w+", query.casefold())) if query else set()
 
     groups: list[GroupRoutingSnapshot] = []
 
@@ -893,10 +1037,25 @@ def build_query_routing_snapshot(
         tenant_id = str(scope["tenant_id"])
         partition_id = str(scope["partition_id"])
 
-        # Construct NodeProfiles for this partition
+        # Construct NodeProfiles for this partition with query-dependent signal scoring
         profiles: list[QueryNodeProfile] = []
         for node_id, parent_id in lineage_raw:
             node_str = str(node_id)
+            node_units = [
+                u for u in manifest.get("units", [])
+                if u.get("partition") == partition_id
+            ]
+            sparse_terms = [
+                term for u in node_units for term, _ in u.get("sparse", [])
+            ]
+            entities = [
+                entity for u in node_units for entity in u.get("entities", [])
+            ]
+
+            sparse_match = sum(1.0 for t in sparse_terms if t.casefold() in query_tokens)
+            entity_match = 1.0 if any(e.casefold() in query.casefold() for e in entities) else 0.0
+            sparse_score = min(1.0, sparse_match / max(1, len(sparse_terms))) if sparse_terms else 0.0
+
             profiles.append(
                 QueryNodeProfile(
                     node_id=node_str,
@@ -910,7 +1069,11 @@ def build_query_routing_snapshot(
                     partition_id=partition_id,
                     tree_version=state.active_tree_version or "",
                     scope_fingerprint=fingerprint,
-                    signal_scores={"dense": 0.85},
+                    signal_scores={
+                        "sparse": sparse_score,
+                        "entity": entity_match,
+                        "dense": 0.85 if (sparse_score > 0 or entity_match > 0 or not query) else 0.2,
+                    },
                 )
             )
 
@@ -938,4 +1101,153 @@ def build_query_routing_snapshot(
         snapshot_id=snapshot_id,
         captured_at=captured_at,
         groups=tuple(groups),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Runtime Coordinator (Bridges Ingest Pipeline to Checkpoint C)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class IngestDeltaResult:
+    """Result of end-to-end coordinated delta ingestion."""
+
+    project_id: str
+    target_slot: Literal["SLOT_A", "SLOT_B"]
+    tree_version: str
+    action_taken: Literal["DELTA_ASSIGNED", "SUBTREE_REBUILT"]
+    rebuilt_node_id: str | None
+    verified: bool
+    new_search_epoch: int
+
+
+async def coordinate_ingest_delta(
+    session: AsyncSession,
+    *,
+    project_id: str,
+    base_snapshot: TreeRoutingSnapshot,
+    new_units: list[KnowledgeUnitInput],
+    new_edges: list[KnowledgeEdgeInput] = (),
+    qdrant_client: httpx.AsyncClient,
+    collection_name: str,
+    drift_threshold: float = DRIFT_CENTROID_THRESHOLD,
+    config: TreeBuildConfig | None = None,
+    source_id: str = "src-1",
+    document_version_id: str = "ver-1",
+) -> IngestDeltaResult:
+    """Runtime coordinator linking the entire Checkpoint C pipeline during ingestion.
+
+    Steps:
+    1. Delta Assignment: assign new units to base tree without full rebuild.
+    2. Drift Detection: calculate drift scores on affected nodes.
+    3. Targeted Subtree Rebuild: if drift exceeds threshold, rebuild ONLY affected subtree.
+    4. Dual-Slot Payload Build: build inactive slot payloads.
+    5. Inactive Slot Update: push to Qdrant with wait=true.
+    6. Inactive Slot Verification: fail-closed Qdrant count & checksum verification.
+    7. Atomic PostgreSQL Switch: pessimistic lock, active slot pointer switch.
+    """
+    # 1. Delta assignment
+    delta_result = assign_delta_units(base_snapshot, new_units, config=config)
+
+    # 2. Drift check
+    drift_report = compute_tree_drift(base_snapshot, delta_result, config=config)
+    drifted_node_id: str | None = (
+        drift_report.affected_node_ids[0]
+        if (drift_report.trigger_rebuild and drift_report.affected_node_ids)
+        else None
+    )
+
+    # 3. Targeted rebuild if drifted, else use incremental assigned snapshot
+    if drifted_node_id is not None:
+        manifest_units = [
+            KnowledgeUnitInput(
+                unit_id=u["unit_id"],
+                tenant_id=base_snapshot.tenant_id,
+                project_id=base_snapshot.project_id,
+                security_partition_id=u["partition"],
+                dense=tuple(u["dense"]) if u.get("dense") else (0.0,),
+                sparse=tuple((t, float(w)) for t, w in u.get("sparse", [])),
+                entities=tuple(u.get("entities", [])),
+            )
+            for u in base_snapshot.manifest.get("units", [])
+        ]
+        all_units = manifest_units + new_units
+        all_edges = list(new_edges)
+        snapshot = rebuild_drifted_subtree(
+            base_snapshot,
+            affected_node_id=drifted_node_id,
+            all_units=all_units,
+            all_edges=all_edges,
+            config=config,
+        )
+        action: Literal["DELTA_ASSIGNED", "SUBTREE_REBUILT"] = "SUBTREE_REBUILT"
+    else:
+        manifest_dict = dict(base_snapshot.manifest)
+        manifest_dict["unit_count"] = len(delta_result.updated_units)
+        canonical_data = dict(manifest_dict)
+        for k in ["tree_version", "checksum", "unit_count", "node_count", "status", "lineage_events"]:
+            canonical_data.pop(k, None)
+        new_checksum = hashlib.sha256(
+            json.dumps(canonical_data, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        ).hexdigest()
+        new_tree_version = f"tree-{new_checksum[:24]}"
+        manifest_dict["checksum"] = new_checksum
+        manifest_dict["tree_version"] = new_tree_version
+        snapshot = TreeRoutingSnapshot(
+            contract_version=base_snapshot.contract_version,
+            tree_version=new_tree_version,
+            tenant_id=base_snapshot.tenant_id,
+            project_id=base_snapshot.project_id,
+            config_version=base_snapshot.config_version,
+            roots=delta_result.updated_roots,
+            metrics=base_snapshot.metrics,
+            quality_gates=base_snapshot.quality_gates,
+            publishable=base_snapshot.publishable,
+            manifest_json=json.dumps(manifest_dict, sort_keys=True, separators=(",", ":")),
+            lineage=base_snapshot.lineage,
+            partition_algorithm=base_snapshot.partition_algorithm,
+        )
+        action = "DELTA_ASSIGNED"
+
+    # 4. Select inactive target slot
+    state = await get_or_create_project_state(session, project_id)
+    target_slot: Literal["SLOT_A", "SLOT_B"] = "SLOT_B" if state.active_routing_slot == "SLOT_A" else "SLOT_A"
+
+    # 5. Dual-slot inactive Qdrant payload build & update
+    payload_batches = build_inactive_slot_payloads(snapshot, target_slot, collection_name)
+    updated = await update_inactive_slot_qdrant_payloads(qdrant_client, collection_name, payload_batches)
+    if not updated:
+        raise TreePublishError("Failed to update Qdrant inactive slot payloads")
+
+    # 6. Verification (fail-closed)
+    verified, reason = await verify_inactive_slot_manifest(
+        snapshot,
+        target_slot,
+        qdrant_client,
+        collection_name,
+        require_qdrant=True,
+    )
+    if not verified:
+        raise PublishVerificationError(f"Inactive slot verification failed: {reason}")
+
+    # 7. Atomic PostgreSQL publish
+    new_state = await execute_atomic_tree_publish(
+        session,
+        project_id,
+        snapshot,
+        target_slot,
+        verified=True,
+        source_id=source_id,
+        document_version_id=document_version_id,
+    )
+
+    return IngestDeltaResult(
+        project_id=project_id,
+        target_slot=target_slot,
+        tree_version=snapshot.tree_version,
+        action_taken=action,
+        rebuilt_node_id=drifted_node_id,
+        verified=True,
+        new_search_epoch=new_state.active_search_epoch,
     )

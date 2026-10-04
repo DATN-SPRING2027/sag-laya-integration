@@ -73,7 +73,8 @@ async def get_session() -> AsyncIterator[AsyncSession]:
 
 
 # Incremental columns for existing tables (lightweight dev migrations; production uses Alembic).
-# create_all only creates new tables and does not alter existing tables, so we idempotently ADD COLUMN for evolving fields.
+# create_all only creates new tables and does not alter existing tables, so we idempotently
+# ADD COLUMN for evolving fields.
 _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
     "agents": {"is_default": "BOOLEAN NOT NULL DEFAULT FALSE"},
     "documents": {
@@ -115,7 +116,10 @@ _INDEX_UPGRADES = (
     "CREATE INDEX IF NOT EXISTS ix_messages_thread_created_id ON messages (thread_id, created_at, id)",
     "CREATE INDEX IF NOT EXISTS ix_documents_source_sag_source ON documents (source_id, sag_source_id)",
     "CREATE INDEX IF NOT EXISTS ix_documents_source_active_created ON documents (source_id, is_active, created_at)",
-    "CREATE INDEX IF NOT EXISTS ix_documents_tenant_project_logical ON documents (tenant_id, project_id, logical_source_id)",
+    (
+        "CREATE INDEX IF NOT EXISTS ix_documents_tenant_project_logical "
+        "ON documents (tenant_id, project_id, logical_source_id)"
+    ),
     (
         "CREATE INDEX IF NOT EXISTS idx_tree_routing_profiles_version_scope "
         "ON tree_routing_profiles (project_id, tree_version, source_id, document_version_id, partition_id)"

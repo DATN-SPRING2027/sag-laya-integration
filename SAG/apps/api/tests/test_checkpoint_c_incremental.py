@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
-from typing import Any
 
 import httpx
 import pytest
@@ -26,37 +25,33 @@ from sag_api.core.db import SessionLocal, init_db
 from sag_api.db.models.routing_rag import ProjectSearchState, TreeManifest
 from sag_api.sag.engine_manager import EngineManager
 from sag_api.services.incremental_tree_service import (
-    DRIFT_CENTROID_THRESHOLD,
     T_HIGH,
-    T_LOW,
-    UnitAssignment,
     assign_delta_units,
     build_inactive_slot_payloads,
     build_query_routing_snapshot,
     compute_tree_drift,
+    coordinate_ingest_delta,
     execute_atomic_tree_publish,
     execute_tree_rollback,
     get_or_create_project_state,
-    match_node_lineage,
     rebuild_drifted_subtree,
-    save_tree_manifest,
     update_inactive_slot_qdrant_payloads,
     verify_inactive_slot_manifest,
 )
 from sag_api.services.query_routing_service import (
-    RouteDecision,
-    capture_routing_decisions,
     route_snapshot,
-    scope_fingerprint,
 )
 from sag_api.services.routing_tree_service import (
     KnowledgeEdgeInput,
     KnowledgeUnitInput,
     RoutingBenchmarkCase,
-    RoutingSnapshot as TreeRoutingSnapshot,
     TreeBuildConfig,
     build_routing_snapshot,
 )
+from sag_api.services.routing_tree_service import (
+    RoutingSnapshot as TreeRoutingSnapshot,
+)
+from sag_api.services.tree_publish_service import TreePublishError
 
 
 def _base_units() -> list[KnowledgeUnitInput]:
@@ -254,9 +249,12 @@ def test_targeted_subtree_rebuild_and_stable_node_lineage():
     all_units = units + [additional_unit]
     all_edges = edges + [KnowledgeEdgeInput("ku-0", "ku-add-1", 0.9)]
 
+    tech_root = next(r for r in base_snapshot.roots if r.security_partition_id == "part-tech")
+    hr_root_before = next(r for r in base_snapshot.roots if r.security_partition_id == "part-hr")
+
     rebuilt_snapshot = rebuild_drifted_subtree(
         base_snapshot,
-        affected_node_id=base_snapshot.roots[0].node_id,
+        affected_node_id=tech_root.node_id,
         all_units=all_units,
         all_edges=all_edges,
         config=config,
@@ -264,6 +262,12 @@ def test_targeted_subtree_rebuild_and_stable_node_lineage():
 
     assert rebuilt_snapshot.publishable
     assert rebuilt_snapshot.tree_version != base_snapshot.tree_version
+
+    # Verify that unaffected partition (part-hr) remains 100% untouched
+    hr_root_after = next(r for r in rebuilt_snapshot.roots if r.security_partition_id == "part-hr")
+    assert hr_root_before == hr_root_after
+    assert hr_root_before.node_id == hr_root_after.node_id
+    assert hr_root_before.unit_ids == hr_root_after.unit_ids
 
     # Check that stable node ID was preserved via lineage mapping
     old_ids = {n.node_id for n in base_snapshot.roots}
@@ -664,3 +668,245 @@ async def test_hierarchical_multi_depth_tree_routing_snapshot_integration():
     assert decision.routed
     assert decision.fallback_reason is None
     assert len(decision.membership_node_ids) > 0
+
+
+# ---------------------------------------------------------------------------
+# TEST-C10: Fail-Closed Verification & Unverified Publish Rejection (Point 1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fail_closed_qdrant_verification_and_unverified_publish_rejected():
+    """Verify fail-closed invariant: Qdrant verification is required and unverified publish is rejected."""
+    units = _base_units()
+    edges = _base_edges()
+    snapshot = build_routing_snapshot(units, edges, benchmark=_base_benchmark())
+
+    # 1. Verification with require_qdrant=True fails if client/collection missing
+    valid, reason = await verify_inactive_slot_manifest(
+        snapshot, target_slot="SLOT_B", require_qdrant=True
+    )
+    assert not valid
+    assert reason == "missing_qdrant_verification_inputs"
+
+    # 2. execute_atomic_tree_publish() strictly rejects unverified publish
+    async with SessionLocal() as session:
+        with pytest.raises(TreePublishError, match="Cannot publish unverified tree snapshot"):
+            await execute_atomic_tree_publish(
+                session, "proj-fail-closed", snapshot, "SLOT_A", verified=False
+            )
+
+
+# ---------------------------------------------------------------------------
+# TEST-C11: Runtime Ingestion Pipeline Coordinator (Point 2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_coordinate_ingest_delta_runtime_pipeline():
+    """Verify runtime ingestion coordinator links delta, drift check, Qdrant update, verification, and publish."""
+    units = _base_units()
+    edges = _base_edges()
+    base_snapshot = build_routing_snapshot(units, edges, benchmark=_base_benchmark())
+    project_id = "proj-runtime-delta"
+    collection = "search_units_runtime_test"
+
+    # Initial publish of base tree
+    async with SessionLocal() as session:
+        await execute_atomic_tree_publish(session, project_id, base_snapshot, "SLOT_A")
+
+    # Ingest a delta unit into tech cluster
+    delta_unit = KnowledgeUnitInput(
+        unit_id="ku-delta-runtime-1",
+        tenant_id="tenant-alpha",
+        project_id=project_id,
+        security_partition_id="part-tech",
+        dense=(1.0, 0.0, 0.5),
+        sparse=(("tech", 2.0), ("runtime", 1.5)),
+        entities=("TechCorp", "RuntimeService"),
+    )
+
+    # Mock Qdrant responding to payload update and point count
+    def qdrant_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/points/payload"):
+            return httpx.Response(200, json={"result": {"status": "completed"}})
+        if request.url.path.endswith("/points/count"):
+            return httpx.Response(200, json={"result": {"count": 9}})
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(qdrant_handler), base_url="http://mock-qdrant:6333"
+    )
+
+    async with SessionLocal() as session:
+        result = await coordinate_ingest_delta(
+            session,
+            project_id=project_id,
+            base_snapshot=base_snapshot,
+            new_units=[delta_unit],
+            qdrant_client=client,
+            collection_name=collection,
+        )
+
+    await client.aclose()
+
+    assert result.project_id == project_id
+    assert result.target_slot == "SLOT_B"  # Switched from initial SLOT_A to SLOT_B!
+    assert result.verified is True
+    assert result.action_taken in {"DELTA_ASSIGNED", "SUBTREE_REBUILT"}
+    assert result.new_search_epoch == 3
+
+    # Verify PostgreSQL state was atomically updated
+    async with SessionLocal() as session:
+        state = await get_or_create_project_state(session, project_id)
+        assert state.active_routing_slot == "SLOT_B"
+        assert state.active_tree_version == result.tree_version
+        assert state.active_search_epoch == 3
+
+
+# ---------------------------------------------------------------------------
+# TEST-C12: Query-Dependent Signal Scores & Branch Routing (Point 4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_query_dependent_routing_signal_scores():
+    """Verify that query routing dynamically computes signal scores reflecting query tokens."""
+    units = _base_units()
+    edges = _base_edges()
+    snapshot = build_routing_snapshot(units, edges, benchmark=_base_benchmark())
+    project_id = "proj-c12-query-signals"
+
+    async with SessionLocal() as session:
+        await execute_atomic_tree_publish(session, project_id, snapshot, "SLOT_A")
+
+    settings = Settings()
+    engine_manager = EngineManager(settings)
+
+    tech_scope = [{
+        "project_id": project_id,
+        "source_ids": ["src-1"],
+        "document_version_ids": ["ver-1"],
+        "tenant_id": "tenant-alpha",
+        "partition_id": "part-tech",
+    }]
+    hr_scope = [{
+        "project_id": project_id,
+        "source_ids": ["src-1"],
+        "document_version_ids": ["ver-1"],
+        "tenant_id": "tenant-alpha",
+        "partition_id": "part-hr",
+    }]
+
+    # Query targeting Tech
+    tech_snap = await engine_manager.get_routing_snapshot(
+        query="Tìm kiếm thông tin tech công nghệ",
+        scopes=tech_scope,
+        planner={"strategy": "EXACT"},
+    )
+    assert tech_snap is not None
+    tech_group = tech_snap.groups[0]
+    tech_decision = route_snapshot(tech_group)
+    assert tech_decision.routed
+    assert len(tech_decision.membership_node_ids) > 0
+
+    # Verify tech node has non-zero sparse score for query 'tech'
+    tech_profile = next(p for p in tech_group.profiles if p.partition_id == "part-tech")
+    assert tech_profile.signal_scores.get("sparse", 0.0) > 0.0
+
+    # Query targeting HR
+    hr_snap = await engine_manager.get_routing_snapshot(
+        query="Tìm kiếm nhân sự hr tuyển dụng",
+        scopes=hr_scope,
+        planner={"strategy": "EXACT"},
+    )
+    assert hr_snap is not None
+    hr_group = hr_snap.groups[0]
+    hr_decision = route_snapshot(hr_group)
+    assert hr_decision.routed
+    assert len(hr_decision.membership_node_ids) > 0
+
+    hr_profile = next(p for p in hr_group.profiles if p.partition_id == "part-hr")
+    assert hr_profile.signal_scores.get("sparse", 0.0) > 0.0
+
+
+# ---------------------------------------------------------------------------
+# TEST-C13: Multi-Project Scope Isolation (Point 5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_multi_project_routing_snapshots_isolation():
+    """Verify that multi-project requests capture isolated snapshots per project."""
+    units_a = _base_units()
+    edges_a = _base_edges()
+    snapshot_a = build_routing_snapshot(units_a, edges_a, benchmark=_base_benchmark())
+
+    # Create distinct units for project B
+    units_b = [
+        KnowledgeUnitInput(
+            unit_id=f"ku-b-{i}",
+            tenant_id="tenant-beta",
+            project_id="proj-multi-b",
+            security_partition_id="part-finance",
+            dense=(0.5, 0.5, float(i) * 0.1),
+            sparse=(("finance", 2.0), ("audit", 1.0)),
+            entities=("FinanceCorp", "AuditUnit"),
+            valid_from=datetime(2026, 1, 1, tzinfo=UTC),
+            valid_to=datetime(2026, 12, 31, tzinfo=UTC),
+        )
+        for i in range(4)
+    ]
+    edges_b = [KnowledgeEdgeInput(f"ku-b-{i}", f"ku-b-{i + 1}", 0.75) for i in range(3)]
+    snapshot_b = build_routing_snapshot(units_b, edges_b)
+
+    proj_a = "proj-multi-a"
+    proj_b = "proj-multi-b"
+
+    async with SessionLocal() as session:
+        await execute_atomic_tree_publish(session, proj_a, snapshot_a, "SLOT_A")
+        await execute_atomic_tree_publish(session, proj_b, snapshot_b, "SLOT_B")
+
+    settings = Settings()
+    engine_manager = EngineManager(settings)
+
+    multi_scopes = [
+        {
+            "project_id": proj_a,
+            "source_ids": ["src-1"],
+            "document_version_ids": ["ver-1"],
+            "tenant_id": "tenant-alpha",
+            "partition_id": "part-tech",
+        },
+        {
+            "project_id": proj_b,
+            "source_ids": ["src-1"],
+            "document_version_ids": ["ver-1"],
+            "tenant_id": "tenant-beta",
+            "partition_id": "part-finance",
+        },
+    ]
+
+    captured = await engine_manager.get_routing_snapshot(
+        query="Kiểm toán tài chính và công nghệ tech",
+        scopes=multi_scopes,
+        planner={"strategy": "EXACT"},
+    )
+
+    assert captured is not None
+    assert len(captured.groups) == 2
+
+    # Group 1 belongs to proj_a in SLOT_A
+    group_a = next(g for g in captured.groups if g.project_id == proj_a)
+    assert group_a.routing_slot == "SLOT_A"
+    assert group_a.tree_version == snapshot_a.tree_version
+    assert group_a.tenant_id == "tenant-alpha"
+    assert group_a.partition_id == "part-tech"
+
+    # Group 2 belongs to proj_b in SLOT_B
+    group_b = next(g for g in captured.groups if g.project_id == proj_b)
+    assert group_b.routing_slot == "SLOT_B"
+    assert group_b.tree_version == snapshot_b.tree_version
+    assert group_b.tenant_id == "tenant-beta"
+    assert group_b.partition_id == "part-finance"
+
