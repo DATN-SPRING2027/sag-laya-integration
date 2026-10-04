@@ -18,9 +18,10 @@ from urllib.parse import quote
 import httpx
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sag_api.core.db import SessionLocal, engine
+from sag_api.core.db import SessionLocal, engine, publish_lock_engine
 from sag_api.db.models.document import Document
 from sag_api.db.models.routing_rag import (
     DocumentVersion,
@@ -793,6 +794,7 @@ async def _verify_stored_source_profiles(
             )
             .order_by(
                 TreeRoutingProfile.source_id,
+                TreeRoutingProfile.document_version_id,
                 TreeRoutingProfile.partition_id,
                 TreeRoutingProfile.node_id,
             )
@@ -851,7 +853,17 @@ async def _project_publish_lock(project_id: str) -> AsyncIterator[None]:
         return
 
     key = _advisory_lock_key(project_id)
-    async with engine.connect() as connection:
+    # The session lock must span Qdrant I/O to serialize slot writers. A
+    # dedicated bounded pool keeps these long-lived connections away from API
+    # request sessions; losing the PostgreSQL session releases the lock.
+    connection = publish_lock_engine.connect()
+    try:
+        await connection.start()
+    except SQLAlchemyTimeoutError as error:
+        await connection.close()
+        raise TreePublishInProgress("The bounded PostgreSQL publish-lock pool is busy") from error
+
+    try:
         async with connection.begin():
             acquired = await connection.scalar(text("SELECT pg_try_advisory_lock(:key)"), {"key": key})
         if not acquired:
@@ -864,6 +876,9 @@ async def _project_publish_lock(project_id: str) -> AsyncIterator[None]:
                     await connection.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": key})
             except SQLAlchemyError:
                 log.exception("Could not release PostgreSQL tree publish lock")
+                await connection.invalidate()
+    finally:
+        await connection.close()
 
 
 async def _stage_candidate(
@@ -1058,9 +1073,6 @@ async def publish_tree_candidate(
             )
             await _verify_staged_candidate(candidate)
             await _verify_qdrant_slot(candidate, target_slot, qdrant_client)
-            # The pre-publish reads above verify the exact stored JSON and all gates;
-            # check it once more in the switch transaction to close the PG race.
-            await _verify_staged_candidate(candidate)
         except (PublishVerificationError, httpx.HTTPError, SQLAlchemyError) as error:
             await _mark_rejected(candidate)
             if isinstance(error, PublishVerificationError):

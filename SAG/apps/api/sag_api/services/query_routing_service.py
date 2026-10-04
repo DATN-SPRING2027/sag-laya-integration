@@ -101,7 +101,7 @@ class GroupRoutingSnapshot(BaseModel):
     manifest_status: str
     manifest_checksum: str
     manifest_verified: bool
-    profiles: tuple[NodeProfile, ...] = Field(max_length=1_024)
+    profiles: tuple[NodeProfile, ...] = Field(max_length=settings.search_tree_profile_limit)
 
 
 class RoutingSnapshot(BaseModel):

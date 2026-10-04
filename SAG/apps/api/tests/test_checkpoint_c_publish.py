@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from hashlib import sha256
 from uuid import uuid4
 
@@ -37,6 +38,7 @@ from sag_api.services.tree_publish_service import (
     TreePublishError,
     TreeSlotInUse,
     _scoped_profile_checksum,
+    _verify_stored_source_profiles,
     build_inactive_slot_payloads,
     prepare_tree_candidate,
     publish_tree_candidate,
@@ -244,6 +246,135 @@ async def test_candidate_manifest_checksum_covers_persisted_routing_profiles():
     assert sum(len(batch["points"]) for batch in payload_batches) == candidate.expected_point_count
     assert all("tree_version_b" in batch["payload"] for batch in payload_batches)
     assert candidate.expected_partition_counts == {"partition-public": 4, "partition-private": 4}
+
+
+@pytest.mark.asyncio
+async def test_stored_profile_verification_orders_document_versions_before_nodes():
+    await init_db()
+    snapshot = _snapshot(f"project-{uuid4().hex}")
+    candidate = prepare_tree_candidate(snapshot, _assignments(snapshot))
+    manifest = candidate.manifest
+    profiles = manifest["source_routing_profiles"]
+    source_id = profiles[0]["source_id"]
+    source_profiles = [profile for profile in profiles if profile["source_id"] == source_id]
+    template = source_profiles[0]
+    expected_profiles = [profile for profile in profiles if profile["source_id"] != source_id]
+    inserted_profiles = []
+    for version_id in ("version-z", "version-a"):
+        for node_id in ("node-2", "node-1"):
+            profile = {
+                **template,
+                "document_version_id": version_id,
+                "node_id": node_id,
+            }
+            expected_profiles.append(profile)
+            inserted_profiles.append(profile)
+    manifest["source_routing_profiles"] = sorted(
+        expected_profiles,
+        key=lambda profile: (
+            profile["source_id"],
+            profile["document_version_id"],
+            profile["partition_id"],
+            profile["node_id"],
+        ),
+    )
+    candidate = replace(candidate, manifest_json=json.dumps(manifest))
+
+    async with SessionLocal() as session:
+        for profile in [item for item in profiles if item["source_id"] != source_id] + inserted_profiles:
+            session.add(
+                TreeRoutingProfile(
+                    project_id=profile["project_id"],
+                    tree_version=candidate.tree_version,
+                    source_id=profile["source_id"],
+                    document_version_id=profile["document_version_id"],
+                    partition_id=profile["partition_id"],
+                    node_id=profile["node_id"],
+                    tenant_id=profile["tenant_id"],
+                    parent_id=profile["parent_id"],
+                    is_leaf=profile["is_leaf"],
+                    accessible_unit_count=profile["accessible_unit_count"],
+                    sparse_json=profile["sparse"],
+                    entities_json=profile["entities"],
+                    profile_checksum=_scoped_profile_checksum(candidate.tree_version, profile),
+                )
+            )
+        await session.flush()
+        await _verify_stored_source_profiles(session, candidate)
+
+
+@pytest.mark.asyncio
+async def test_query_snapshot_honors_configured_profile_limit_above_1024(monkeypatch):
+    await init_db()
+    monkeypatch.setattr(settings, "search_tree_profile_limit", 2048)
+    snapshot = _snapshot(f"project-{uuid4().hex}")
+    await _seed_search_units(snapshot)
+    candidate = prepare_tree_candidate(snapshot, _assignments(snapshot))
+    client = _qdrant_client(candidate)
+    await publish_tree_candidate(
+        snapshot, search_unit_assignments=_assignments(snapshot), qdrant_client=client
+    )
+    await client.aclose()
+
+    scope = {
+        "project_id": snapshot.project_id,
+        "source_ids": [_stable_id(snapshot.project_id, "source", "0")],
+        "document_version_ids": [_stable_id(snapshot.project_id, "version", "0")],
+        "tenant_id": "tenant-c",
+        "partition_id": "partition-public",
+    }
+    async with SessionLocal() as session:
+        existing_profiles = (
+            await session.scalars(
+                select(TreeRoutingProfile).where(
+                    TreeRoutingProfile.project_id == snapshot.project_id,
+                    TreeRoutingProfile.tree_version == candidate.tree_version,
+                    TreeRoutingProfile.source_id == scope["source_ids"][0],
+                    TreeRoutingProfile.document_version_id == scope["document_version_ids"][0],
+                    TreeRoutingProfile.partition_id == scope["partition_id"],
+                )
+            )
+        ).all()
+        assert existing_profiles
+        template = existing_profiles[0]
+        extras = []
+        for index in range(1025 - len(existing_profiles)):
+            profile = {
+                "project_id": template.project_id,
+                "tenant_id": template.tenant_id,
+                "source_id": template.source_id,
+                "document_version_id": template.document_version_id,
+                "partition_id": template.partition_id,
+                "node_id": f"limit-profile-{index:04d}",
+                "parent_id": template.parent_id,
+                "is_leaf": template.is_leaf,
+                "accessible_unit_count": template.accessible_unit_count,
+                "sparse": template.sparse_json,
+                "entities": template.entities_json,
+            }
+            extras.append(
+                TreeRoutingProfile(
+                    project_id=profile["project_id"],
+                    tree_version=candidate.tree_version,
+                    source_id=profile["source_id"],
+                    document_version_id=profile["document_version_id"],
+                    partition_id=profile["partition_id"],
+                    node_id=profile["node_id"],
+                    tenant_id=profile["tenant_id"],
+                    parent_id=profile["parent_id"],
+                    is_leaf=profile["is_leaf"],
+                    accessible_unit_count=profile["accessible_unit_count"],
+                    sparse_json=profile["sparse"],
+                    entities_json=profile["entities"],
+                    profile_checksum=_scoped_profile_checksum(candidate.tree_version, profile),
+                )
+            )
+        session.add_all(extras)
+        await session.commit()
+
+    pinned = await EngineManager(settings).get_routing_snapshot(query="alpha", scopes=[scope], planner={})
+    assert pinned is not None and pinned.groups
+    assert len(pinned.groups[0].profiles) == 1025
 
 
 @pytest.mark.asyncio

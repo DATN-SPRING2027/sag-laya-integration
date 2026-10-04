@@ -19,6 +19,14 @@
 - **Snapshot-scope finding fixed:** the compact projection initially aggregated profiles across document versions belonging to the same Source/partition. It now keys and fetches each profile by Source/version/partition; `test_query_snapshot_does_not_mix_profile_signals_across_document_versions` injects a stale-version profile and confirms the pinned version's routing scores are unchanged.
 - Review also checked Qdrant payload identity/filtering, ACL scope fingerprints and canonical version filters, lease acquisition/release, failure paths, SQL parameterization, and bounded profile reads. No direct ACL bypass or secret exposure was found in this change.
 
+## Follow-up PR review #20 (2026-10-04)
+
+- Added `document_version_id` to the persisted-profile verification order so it matches candidate ordering `(source_id, document_version_id, partition_id, node_id)`. `test_stored_profile_verification_orders_document_versions_before_nodes` reproduces the false-negative when that key is omitted.
+- Replaced the query-side 1,024 threshold with `settings.search_tree_profile_limit`. The same review exposed a second 1,024 cap in `GroupRoutingSnapshot.profiles`; that DTO cap now uses the configured limit too. `test_query_snapshot_honors_configured_profile_limit_above_1024` captures a request with 1,025 profiles under a configured limit of 2,048.
+- Kept the PostgreSQL session advisory lock across Qdrant writes so publishers for one project remain serialized, and moved it to a dedicated pool with four connections, no overflow, and a one-second checkout timeout. A busy lock pool returns `TreePublishInProgress` without consuming request/session-pool connections; only lock-pool checkout timeouts are translated, so request-pool errors retain their original cause. If unlock fails, the connection is invalidated so a session lock cannot be returned to the pool. This reserves up to four additional PostgreSQL connections per API process.
+- Removed the duplicate `_verify_staged_candidate` read before `_atomic_switch`; the switch transaction still re-reads and verifies the persisted manifest and profile rows under row locks.
+- No schema migration or new environment setting was added by this follow-up. PostgreSQL pool behavior has not been exercised against a live service; `asyncpg` is absent from the local API virtual environment.
+
 ## Checks run
 
 From `SAG/apps/api`:
@@ -27,7 +35,9 @@ From `SAG/apps/api`:
 .\.venv\Scripts\python.exe -m pytest tests/test_checkpoint_c_publish.py tests/test_search_unit_retrieval_service.py tests/test_query_routing_service.py -q
 ```
 
-Result: **35 passed**.
+Result: **35 passed** on the original implementation review.
+
+After the four new PR comments and the adjacent DTO limit finding were fixed, the same focused command returned **37 passed**. The two follow-up regressions also passed individually. The ordering regression fails when `document_version_id` is temporarily omitted, confirming that it exercises the reported mismatch.
 
 The changed feature/model/test files passed Ruff. `sag_api/core/db.py` contains two pre-existing `E501` findings on unchanged lines; its one-line additive change passed `ruff check sag_api/core/db.py --ignore E501`.
 

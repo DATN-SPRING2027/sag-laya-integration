@@ -35,6 +35,22 @@ engine: AsyncEngine = create_async_engine(
     pool_pre_ping=True,
 )
 
+# Session-level PostgreSQL advisory locks span Qdrant network I/O. Keep these
+# bounded lock connections out of the request/session pool so slow publishes
+# cannot consume the connections reserved for normal API traffic.
+if engine.dialect.name == "postgresql":
+    publish_lock_engine: AsyncEngine = create_async_engine(
+        settings.database_url,
+        echo=False,
+        future=True,
+        pool_pre_ping=True,
+        pool_size=4,
+        max_overflow=0,
+        pool_timeout=1.0,
+    )
+else:
+    publish_lock_engine = engine
+
 # SQLite: foreign keys enabled + concurrency friendly (WAL parallel read/write, busy_timeout
 # lets writes wait instead of locking immediately; 30s ceiling covers slow CI disk contention)
 if settings.database_url.startswith("sqlite"):
@@ -152,3 +168,5 @@ async def init_db() -> None:
 
 async def dispose_db() -> None:
     await engine.dispose()
+    if publish_lock_engine is not engine:
+        await publish_lock_engine.dispose()

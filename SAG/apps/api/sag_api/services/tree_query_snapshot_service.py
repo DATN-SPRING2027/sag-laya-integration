@@ -355,7 +355,7 @@ async def acquire_tree_query_snapshot(
                         [],
                     )
                 ]
-                if len(matching_profiles) > 1_024:
+                if len(matching_profiles) > settings.search_tree_profile_limit:
                     return None
                 query_profiles = _aggregate_source_profiles(
                     matching_profiles,
