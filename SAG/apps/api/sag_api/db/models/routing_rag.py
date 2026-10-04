@@ -247,3 +247,48 @@ class TreeManifest(Base):
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime(), server_default=func.now(), nullable=False
     )
+
+
+class TreeSnapshotLease(Base):
+    __tablename__ = "tree_snapshot_leases"
+    __table_args__ = (
+        Index("idx_tree_snapshot_leases_slot_expiry", "project_id", "routing_slot", "expires_at"),
+    )
+
+    request_snapshot_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    project_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    routing_slot: Mapped[str] = mapped_column(String(16), nullable=False)
+    tree_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    search_epoch: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), server_default=func.now(), nullable=False
+    )
+
+
+class TreeRoutingProfile(Base):
+    __tablename__ = "tree_routing_profiles"
+    __table_args__ = (
+        Index(
+            "idx_tree_routing_profiles_version_scope",
+            "project_id",
+            "tree_version",
+            "source_id",
+            "document_version_id",
+            "partition_id",
+        ),
+    )
+
+    project_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tree_version: Mapped[str] = mapped_column(String(64), primary_key=True)
+    source_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    document_version_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    partition_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    node_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    parent_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    is_leaf: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    accessible_unit_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    sparse_json: Mapped[list] = mapped_column(JSON, nullable=False)
+    entities_json: Mapped[list] = mapped_column(JSON, nullable=False)
+    profile_checksum: Mapped[str] = mapped_column(String(64), nullable=False)
