@@ -101,7 +101,7 @@ class GroupRoutingSnapshot(BaseModel):
     manifest_status: str
     manifest_checksum: str
     manifest_verified: bool
-    profiles: tuple[NodeProfile, ...] = Field(max_length=1_024)
+    profiles: tuple[NodeProfile, ...] = Field(max_length=settings.search_tree_profile_limit)
 
 
 class RoutingSnapshot(BaseModel):
@@ -145,6 +145,7 @@ class RouteDecision(BaseModel):
 
     snapshot_id: str | None = None
     request_snapshot_id: str | None = None
+    acl_scope_fingerprint: str | None = None
     project_id: str
     tree_version: str | None = None
     routing_slot: str | None = None
@@ -187,6 +188,7 @@ async def capture_routing_decisions(
     fallback_reason = "routing_snapshot_provider_unavailable"
     provider = getattr(engine_manager, "get_routing_snapshot", None)
     if callable(provider):
+        request_snapshot_id: str | None = None
         try:
             if timeout_seconds is None:
                 raw = await provider(query=query, scopes=scopes, planner=planner_trace)
@@ -194,8 +196,15 @@ async def capture_routing_decisions(
                 async with asyncio.timeout(max(0.01, float(timeout_seconds))):
                     raw = await provider(query=query, scopes=scopes, planner=planner_trace)
             if raw is not None:
+                if isinstance(raw, Mapping):
+                    candidate_id = raw.get("snapshot_id")
+                    request_snapshot_id = candidate_id if isinstance(candidate_id, str) else None
+                else:
+                    candidate_id = getattr(raw, "snapshot_id", None)
+                    request_snapshot_id = candidate_id if isinstance(candidate_id, str) else None
                 _validate_snapshot_profile_budget(raw)
                 snapshot = RoutingSnapshot.model_validate(raw)
+                request_snapshot_id = snapshot.snapshot_id
                 if not snapshot.groups or snapshot.captured_at is None:
                     raise ValueError("empty request routing snapshot")
                 by_scope = {profile.scope_fingerprint: profile for profile in snapshot.groups}
@@ -217,12 +226,26 @@ async def capture_routing_decisions(
                         str(scope["partition_id"]),
                     )
                     decision = route_snapshot(profile)
-                    decisions[key] = decision.model_copy(update={"request_snapshot_id": snapshot.snapshot_id})
+                    decisions[key] = decision.model_copy(
+                        update={
+                            "request_snapshot_id": snapshot.snapshot_id,
+                            "acl_scope_fingerprint": fingerprint,
+                        }
+                    )
                 return decisions
             fallback_code = "TREE_SNAPSHOT_UNAVAILABLE"
             fallback_reason = "routing_snapshot_unavailable"
         except Exception as error:  # noqa: BLE001 - stale/malformed snapshots use global escape
             log.warning("request tree snapshot unavailable error_type=%s", type(error).__name__)
+            release = getattr(engine_manager, "release_routing_snapshot", None)
+            if request_snapshot_id and callable(release):
+                try:
+                    await release(request_snapshot_id)
+                except Exception as release_error:  # noqa: BLE001 - cleanup must not hide safe fallback
+                    log.warning(
+                        "could not release invalid request tree snapshot error_type=%s",
+                        type(release_error).__name__,
+                    )
             fallback_code = "TREE_PROVIDER_ERROR"
             fallback_reason = "routing_snapshot_invalid_or_unavailable"
 

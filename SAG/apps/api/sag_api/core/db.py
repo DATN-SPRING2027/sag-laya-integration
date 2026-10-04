@@ -35,6 +35,22 @@ engine: AsyncEngine = create_async_engine(
     pool_pre_ping=True,
 )
 
+# Session-level PostgreSQL advisory locks span Qdrant network I/O. Keep these
+# bounded lock connections out of the request/session pool so slow publishes
+# cannot consume the connections reserved for normal API traffic.
+if engine.dialect.name == "postgresql":
+    publish_lock_engine: AsyncEngine = create_async_engine(
+        settings.database_url,
+        echo=False,
+        future=True,
+        pool_pre_ping=True,
+        pool_size=4,
+        max_overflow=0,
+        pool_timeout=1.0,
+    )
+else:
+    publish_lock_engine = engine
+
 # SQLite: foreign keys enabled + concurrency friendly (WAL parallel read/write, busy_timeout
 # lets writes wait instead of locking immediately; 30s ceiling covers slow CI disk contention)
 if settings.database_url.startswith("sqlite"):
@@ -88,6 +104,8 @@ _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
         "error_json": "JSON",
     },
     "universe_dirty_sources": {"revision": "INTEGER NOT NULL DEFAULT 1"},
+    "tree_manifests": {"manifest_json": "JSON NOT NULL DEFAULT '{}'"},
+    "tree_routing_profiles": {"document_version_id": "VARCHAR(128) NOT NULL DEFAULT ''"},
 }
 
 # Existing tables also need newly introduced hot-path indexes. Keep these
@@ -98,6 +116,10 @@ _INDEX_UPGRADES = (
     "CREATE INDEX IF NOT EXISTS ix_documents_source_sag_source ON documents (source_id, sag_source_id)",
     "CREATE INDEX IF NOT EXISTS ix_documents_source_active_created ON documents (source_id, is_active, created_at)",
     "CREATE INDEX IF NOT EXISTS ix_documents_tenant_project_logical ON documents (tenant_id, project_id, logical_source_id)",
+    (
+        "CREATE INDEX IF NOT EXISTS idx_tree_routing_profiles_version_scope "
+        "ON tree_routing_profiles (project_id, tree_version, source_id, document_version_id, partition_id)"
+    ),
 )
 
 
@@ -121,8 +143,16 @@ async def _ensure_columns() -> None:
 
 
 async def _ensure_indexes() -> None:
+    from sqlalchemy import inspect as sa_inspect
+
     async with engine.begin() as conn:
         for ddl in _INDEX_UPGRADES:
+            if "tree_routing_profiles" in ddl:
+                table_exists = await conn.run_sync(
+                    lambda sync_conn: sa_inspect(sync_conn).has_table("tree_routing_profiles")
+                )
+                if not table_exists:
+                    continue
             await conn.exec_driver_sql(ddl)
 
 
@@ -138,3 +168,5 @@ async def init_db() -> None:
 
 async def dispose_db() -> None:
     await engine.dispose()
+    if publish_lock_engine is not engine:
+        await publish_lock_engine.dispose()

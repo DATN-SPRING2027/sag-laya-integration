@@ -22,6 +22,8 @@ from sag_api.db.models.routing_rag import (
     SourceSnapshot,
     StageRun,
     TreeManifest,
+    TreeRoutingProfile,
+    TreeSnapshotLease,
 )
 from sag_api.db.models.setting import Setting
 from sag_api.db.models.source import Source
@@ -63,6 +65,8 @@ __all__ = [
     "StageRun",
     "Thread",
     "TreeManifest",
+    "TreeRoutingProfile",
+    "TreeSnapshotLease",
     "UniverseDirtySource",
     "UniverseOverview",
     "UniversePartition",
