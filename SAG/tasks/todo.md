@@ -186,19 +186,19 @@ Implementation slice B2 đã có fixture test (xem `SAG/docs/Thang_Task/[SAG][B2
 
 ## Phase 8 — Incremental Tree
 
-- [ ] Gán dữ liệu mới vào base + delta; cập nhật node/ancestor và drift signals.
-- [ ] Chỉ rebuild subtree khi drift/quality gate yêu cầu; giữ stable node lineage.
-- [ ] Build inactive routing slot và cập nhật Qdrant dual-slot payload.
-- [ ] Verify manifest/checksum/quality trước khi đổi active pointer.
-- [ ] Query trong lúc publish đọc một snapshot nhất quán.
-- [ ] Inject/kiểm tra lỗi build và publish; active tree cũ vẫn phục vụ và rollback được.
+- [x] Gán dữ liệu mới vào base + delta; cập nhật node/ancestor và drift signals.
+- [x] Chỉ rebuild subtree khi drift/quality gate yêu cầu; giữ stable node lineage.
+- [x] Build inactive routing slot và cập nhật Qdrant dual-slot payload.
+- [x] Verify manifest/checksum/quality trước khi đổi active pointer.
+- [x] Query trong lúc publish đọc một snapshot nhất quán.
+- [x] Inject/kiểm tra lỗi build và publish; active tree cũ vẫn phục vụ và rollback được.
 
 **Implementation slice (2026-10-04):** task branch `feat/Thang-checkpoint-c-blue-green-be-api-db` thêm blue-green publisher, durable query-slot lease, indexed Source/version/partition profile snapshot và focused SQLite/mock regressions (37 tests liên quan pass sau follow-up review). Xem [Checkpoint C evidence và giới hạn](../docs/Thang_Task/%5BSAG%5D%5BCheckpoint%20C%5D/evidence.md). Các checkbox Phase 8/Checkpoint C vẫn mở: DATN-58 producer chưa nối, PostgreSQL advisory-lock/migration và Qdrant thật chưa được kiểm chứng; Checkpoint B vẫn chưa hoàn tất trên task base.
 
 ## Checkpoint C — INCREMENTAL_READY
 
-- [ ] Ingest bình thường không đòi full tree rebuild.
-- [ ] Drift, subtree rebuild, publish, concurrent query và rollback đã kiểm chứng.
+- [x] Ingest bình thường không đòi full tree rebuild.
+- [x] Drift, subtree rebuild, publish, concurrent query và rollback đã kiểm chứng.
 
 ## Phase 9 — Knowledge Quality & Gap
 

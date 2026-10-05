@@ -322,6 +322,7 @@ class EngineManager:
         if client is not None:
             await client.aclose()
 
+
     async def _relational_session_factory(
         self, source_config_id: str, source: Source | None = None
     ) -> Any:
