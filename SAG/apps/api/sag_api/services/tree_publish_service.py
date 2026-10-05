@@ -935,6 +935,19 @@ async def _stage_candidate(
             if active_lease is not None:
                 raise TreeSlotInUse("A request still holds a lease for the inactive routing slot")
 
+            inactive_slot_version = (
+                state.slot_a_tree_version if target_slot == "SLOT_A" else state.slot_b_tree_version
+            )
+            if state.previous_tree_version and inactive_slot_version != state.previous_tree_version:
+                raise TreePublishError("Previous tree pointer and retained inactive slot disagree")
+            # The opposite slot is about to be mutated. Stop advertising its old
+            # contents before any Qdrant I/O can partially replace that payload.
+            state.previous_tree_version = None
+            if target_slot == "SLOT_A":
+                state.slot_a_tree_version = None
+            else:
+                state.slot_b_tree_version = None
+
             if existing is not None:
                 if existing.project_id != candidate.project_id or existing.status == "ACTIVE":
                     raise TreePublishError("Candidate tree version already belongs to another active manifest")
@@ -1078,10 +1091,14 @@ async def publish_tree_candidate(
             if isinstance(error, PublishVerificationError):
                 raise
             raise PublishVerificationError("Inactive-slot or PostgreSQL verification failed") from error
-        return await _atomic_switch(
-            candidate,
-            target_slot,
-            previous_tree_version=previous_tree_version,
-            previous_slot=previous_slot,
-            previous_epoch=previous_epoch,
-        )
+        try:
+            return await _atomic_switch(
+                candidate,
+                target_slot,
+                previous_tree_version=previous_tree_version,
+                previous_slot=previous_slot,
+                previous_epoch=previous_epoch,
+            )
+        except Exception:
+            await _mark_rejected(candidate)
+            raise

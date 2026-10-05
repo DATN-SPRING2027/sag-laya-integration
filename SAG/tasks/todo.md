@@ -176,13 +176,13 @@ Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL ev
 - [x] Trace planner/snapshot/nodes/version/reason/escape/coverage/blackhole và selection fallback.
 - [ ] Kiểm tra ACL leakage và routing blackhole bằng principal có quyền khác nhau.
 
-Implementation slice B2 đã có fixture test (xem `SAG/docs/Thang_Task/[SAG][B2]/todo.md`); các mục cần DATN-37/Phase 5, principal thật, gold corpus và benchmark vẫn mở. Không đánh dấu `ROUTING_READY` khi chưa có integration evidence.
+Implementation slice B2 và các phụ thuộc Phase 5 là lịch sử riêng trong `SAG/docs/Thang_Task/[SAG][B2]/todo.md`. Thang xác nhận DATN-35 / `ROUTING_READY` hoàn tất; ba checkbox bên dưới ghi nhận xác nhận task owner, task Checkpoint C không chạy lại acceptance B.
 
 ## Checkpoint B — ROUTING_READY
 
-- [ ] Tree ổn định và routing recall đạt ngưỡng benchmark.
-- [ ] Escape retrieval cứu được query route sai/inaccessible.
-- [ ] Tree không publish khi quality/ACL blackhole gate thất bại.
+- [x] Tree ổn định và routing recall đạt ngưỡng benchmark. *(DATN-35 / ROUTING_READY được Thang xác nhận hoàn tất.)*
+- [x] Escape retrieval cứu được query route sai/inaccessible. *(DATN-35 / ROUTING_READY được Thang xác nhận hoàn tất.)*
+- [x] Tree không publish khi quality/ACL blackhole gate thất bại. *(DATN-35 / ROUTING_READY được Thang xác nhận hoàn tất.)*
 
 ## Phase 8 — Incremental Tree
 
@@ -191,14 +191,19 @@ Implementation slice B2 đã có fixture test (xem `SAG/docs/Thang_Task/[SAG][B2
 - [x] Build inactive routing slot và cập nhật Qdrant dual-slot payload.
 - [x] Verify manifest/checksum/quality trước khi đổi active pointer.
 - [x] Query trong lúc publish đọc một snapshot nhất quán.
-- [x] Inject/kiểm tra lỗi build và publish; active tree cũ vẫn phục vụ và rollback được.
+- [x] Inject lỗi subtree build, Qdrant partial batch, manifest/count/checksum/quality gate và pointer switch; lỗi trước switch giữ active tree phục vụ.
+- [x] Rollback xác minh Qdrant slot rồi đổi active manifest/pointer/epoch cùng transaction PostgreSQL.
+- [x] Giữ request snapshot/lease xuyên publish và rollback; slot có query đang dùng không bị ghi đè.
 
-**Implementation slice (2026-10-04):** task branch `feat/Thang-checkpoint-c-blue-green-be-api-db` thêm blue-green publisher, durable query-slot lease, indexed Source/version/partition profile snapshot và focused SQLite/mock regressions (37 tests liên quan pass sau follow-up review). Xem [Checkpoint C evidence và giới hạn](../docs/Thang_Task/%5BSAG%5D%5BCheckpoint%20C%5D/evidence.md). Các checkbox Phase 8/Checkpoint C vẫn mở: DATN-58 producer chưa nối, PostgreSQL advisory-lock/migration và Qdrant thật chưa được kiểm chứng; Checkpoint B vẫn chưa hoàn tất trên task base.
+**Implementation evidence (2026-10-05):** các mục trên có regression local bằng SQLite + `httpx.MockTransport`; focused suite `test_checkpoint_c_publish.py`, `test_checkpoint_c_failure_rollback.py`, `test_checkpoint_c_incremental.py`, `test_search_unit_retrieval_service.py` và `test_query_routing_service.py` đạt **63 passed**. Chi tiết theo từng failure, kết quả và giới hạn môi trường: [Checkpoint C failure/rollback evidence](../docs/Thang_Task/%5BSAG%5D%5BCheckpoint%20C%5D2/evidence.md). Rollback giữ version trước trong slot đối diện cho tới khi publish tiếp theo reserve slot đó; lúc reserve, PG bỏ tham chiếu/slot version trước khi Qdrant bị sửa để partial write không được nhận nhầm là snapshot hợp lệ.
+
+**Giới hạn acceptance:** chưa có live PostgreSQL/Qdrant trong môi trường test này; DATN-58/59 producer chưa nối vào `publish_tree_candidate` ở task base. Vì vậy các checkbox Phase 8 thể hiện code/fixture coverage, chưa xác nhận triển khai runtime `INCREMENTAL_READY`. DATN-35 / `ROUTING_READY` được Thang xác nhận hoàn tất; các checkbox Checkpoint B phía trên phản ánh xác nhận đó, không phải kết quả kiểm thử lại của task C.
 
 ## Checkpoint C — INCREMENTAL_READY
 
-- [x] Ingest bình thường không đòi full tree rebuild.
-- [x] Drift, subtree rebuild, publish, concurrent query và rollback đã kiểm chứng.
+- [x] Ingest bình thường không đòi full tree rebuild trong incremental fixture tests.
+- [x] Drift/subtree failure, publish gates, partial Qdrant write, atomic switch failure, retained-slot rollback và request snapshots qua publish/rollback có focused regression.
+- [ ] Xác nhận end-to-end qua DATN-58/59 producer và live PostgreSQL/Qdrant trước khi ghi nhận runtime `INCREMENTAL_READY`.
 
 ## Phase 9 — Knowledge Quality & Gap
 

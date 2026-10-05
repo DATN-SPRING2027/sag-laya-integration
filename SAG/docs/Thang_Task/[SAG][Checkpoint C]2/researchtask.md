@@ -1,0 +1,102 @@
+# [SAG][Checkpoint C] Failure injection, rollback and acceptance evidence — Research Record
+
+## Task and base
+
+- Task spec: `[SAG][Checkpoint C]2.md` in this folder; user supplied the purpose, scope, acceptance, and dependencies DATN-58 / DATN-59.
+- Repository: `sag-laya-integration`.
+- Branch: `feat/Thang-checkpoint-c-failure-rollback-be-api`.
+- Base: fetched `origin/main` at `0102e1ec003be3f41923c6923f9333ea5875fa23` (Checkpoint C blue-green implementation PR #19). `git pull --ff-only origin main` reported already up to date.
+- Existing untracked artifacts in the prior Checkpoint C folder and this task folder were preserved. `research.md` in this task folder is an existing directory, so this record uses the mandated `researchtask.md` filename without replacing it.
+- Workspace `.agents/rules/` and repository root/SAG/API READMEs were inspected. No nested `AGENTS.md`, `GEMINI.md`, or `CLAUDE.md` was found. The Rule 05-required `PROJECT_MEMORY.md` does not exist in this checkout; `SAG/tasks/plan.md` and `SAG/tasks/todo.md` are the available project plan/checklist sources.
+
+## Current flow and contracts
+
+- `SAG/apps/api/sag_api/services/tree_publish_service.py::prepare_tree_candidate` freezes a checked routing candidate, checksum, quality gates, SearchUnit assignment bridge, leaf memberships, ACL-scoped profiles, and expected point counts.
+- `publish_tree_candidate` serializes writers per project, stages the inactive manifest/profile rows, verifies canonical PostgreSQL SearchUnit mappings, clears the inactive Qdrant slot with `wait=true`, writes dual-slot payload batches with completed acknowledgements, checks exact total/partition counts and point identities/ACL payloads, verifies the persisted manifest/profile projection, and commits active slot/version/search epoch together in `_atomic_switch`.
+- Failure verification catches errors before `_atomic_switch` and marks a non-active candidate `REJECTED`. `_atomic_switch` errors currently propagate outside that rejection handler. Candidate preparation occurs before any DB/Qdrant mutation.
+- The current model already stores both slot tree versions, active/previous tree versions, active slot, search epoch, last switch time, manifests with canonical JSON/checksum, and durable query-slot leases (`db/models/routing_rag.py::ProjectSearchState`, `TreeManifest`, `TreeSnapshotLease`). No schema change is needed for the planned rollback/test work.
+- Candidate manifests persist the SearchUnit assignments and routing-profile leaf memberships needed to reconstruct a previous candidate and verify/repair its Qdrant slot.
+- `tree_query_snapshot_service.py::acquire_tree_query_snapshot` reads the PG pointer/active manifest and scoped profiles in one transaction and records leases. `EngineManager` exposes acquire/release; `search_unit_retrieval_service` releases after local and escape Qdrant reads. Existing lease tests show a live query prevents a subsequent publisher from reusing its slot.
+- `incremental_tree_service.py::execute_tree_rollback` is a legacy PG-only rollback helper. It flips slot/version/status/epoch but does not verify or restore Qdrant. `test_checkpoint_c_incremental.py::test_fault_injection_and_rollback_restores_consistency` directly invokes the legacy atomic DB publisher after a failed mock write, then performs the PG-only rollback; it does not prove the mock Qdrant slot matches the restored manifest.
+- At this base there are no production call sites for `publish_tree_candidate` outside tests. DATN-58/59 ingestion/subtree integration is not wired into this publisher. This task will test the subtree builder's failure boundary and the current publish service without claiming producer integration.
+
+## Gaps to address
+
+1. No rollback API in the current blue-green publisher verifies the retained prior Qdrant slot before switching back.
+2. A candidate switch error is not caught by the publisher's rejection path.
+3. When a new publish starts overwriting the inactive slot, PostgreSQL still advertises the older slot version and `previous_tree_version` until the new switch commits; after a partial write that metadata can describe Qdrant content that no longer exists. Reserve/invalidate that inactive slot in the staging transaction before remote mutation, while keeping the active pointer and active slot untouched.
+4. Current focused tests cover point-count failure, uncompleted acknowledgement, ACL payload failure, and lease-based reuse protection, but not subtree-builder failure against an active tree, a partially applied Qdrant batch, an atomic pointer commit failure, Qdrant-verified rollback, or a query pinned through both publish and rollback.
+5. `SAG/tasks/todo.md` currently marks all Phase 8/Checkpoint C implementation lines checked while separately stating DATN-58 integration, PostgreSQL/Qdrant runtime verification and Checkpoint B readiness remain open. Update the Checkpoint C notes/checklist to point to new focused evidence without claiming live-service or broader phase acceptance.
+
+## ACL/security boundary
+
+- Candidate SearchUnit IDs and their Source, document version, project, tenant and security partition are checked against PostgreSQL before publish.
+- Qdrant verification uses exact tree/project/tenant/partition counts plus exact point IDs and per-point SearchUnit/Source/version/project/tenant/partition/slot payloads.
+- Request capture binds routing profiles to the caller's authorized Source/version/partition scope; retrieval carries the same pinned tree/slot/epoch and canonical ACL filter. Tests in this task must preserve these boundaries and fail closed on mismatches.
+- No auth/ACL contract or trust configuration change is planned.
+
+## Implementation plan
+
+1. Extend the current publisher service with a rollback operation that validates the retained previous manifest, profiles, slot mapping and Qdrant payload inventory before an atomic PG pointer/status/epoch switch. Reconstruct the immutable candidate from its persisted checksummed manifest; reject rollback if the previous slot is unavailable or corrupted.
+2. On staging a new publication, reserve the inactive slot in PostgreSQL by clearing its old slot-version/rollback eligibility before Qdrant cleanup or writes. This prevents a partial inactive-slot update from being represented as an intact retained snapshot; the current active pointer/version/slot remains unchanged.
+3. Include the atomic switch in failure handling so a rolled-back DB transaction leaves the old active pointer intact and the candidate is rejected when safe to do so.
+4. Add focused failure-injection tests for subtree build, quality/manifest/checksum/count/ACL verification, partial Qdrant writes, pointer switch transaction failure, successful publish/rollback Qdrant↔PG parity, and concurrent request snapshots across publish and rollback.
+5. Update all Phase 8/Checkpoint C rows and evidence notes in `SAG/tasks/todo.md`; append actual test outcomes, file changes and unverified live-service boundaries here after implementation.
+
+## Test matrix
+
+| Scenario | Expected evidence |
+|---|---|
+| Subtree build raises before slot preparation | Active PG pointer/manifest and old query snapshot stay unchanged; no Qdrant mutation occurs. |
+| Candidate fails quality, stored manifest/checksum, exact counts, or ACL payload verification | Candidate is rejected where staged; active version/slot/epoch and old-tree query remain unchanged. |
+| Qdrant applies one inactive batch then fails a later batch | Inactive slot is no longer advertised as the prior version; active slot and old-tree query remain usable; candidate does not become active. |
+| PG atomic switch fails during transaction | Transaction rolls back pointer/manifest status/epoch; failed candidate is rejected; old query remains usable. |
+| Successful publish then rollback within retained-slot window | Restored PG pointer, slot-version field, manifest status/checksum and Qdrant exact point payloads identify the same old version; epoch advances. |
+| Requests captured before/after publish and rollback | Every request retains one immutable slot/version/epoch; newly captured requests see the committed snapshot; leases prevent destructive slot reuse while reads are in flight. |
+
+## Validation boundary and risks
+
+- API documentation lists `pytest` and `ruff check .`; focused commands will run first and the relevant suite next.
+- Existing evidence used SQLite plus `httpx.MockTransport`; no local PostgreSQL or Qdrant service was documented. Live advisory/row-lock and Qdrant behavior must remain clearly separated from mock evidence unless such services are actually available during validation.
+- The term “retention window” is represented by the single prior tree retained in the opposite slot. It ends when a new publish reserves that slot; no numeric time-based rollback policy exists in the current schema/config. The implementation will make this boundary explicit and fail closed if the stored previous pointer and slot no longer match.
+- No migration/config/security impact is expected. No migration will be edited or added unless repository evidence reveals a necessary schema gap.
+
+## Implementation and review outcome
+
+### Files changed
+
+- `SAG/apps/api/sag_api/services/tree_publish_service.py`: reserve/invalidate the inactive slot's old PG version/rollback pointer before remote writes; reject a non-active candidate when the atomic pointer-switch transaction fails.
+- `SAG/apps/api/sag_api/services/tree_rollback_service.py`: new fail-closed rollback. Rehydrate and validate the retained checksummed manifest, assignments and leaf inventory; verify PG profiles/SearchUnits and Qdrant counts/point ACL payloads outside long DB transactions; recheck and atomically switch manifests, active slot/version and epoch in PG.
+- `SAG/apps/api/sag_api/services/incremental_tree_service.py`: mark the legacy `execute_tree_rollback` contract as PostgreSQL-only. It remains for legacy callers and is not the cross-store Checkpoint C rollback operation.
+- `SAG/apps/api/tests/checkpoint_c_test_support.py`: consolidate deterministic routing fixtures and a payload-aware Qdrant mock with acknowledged/partial-write behavior and filtered dense/sparse queries.
+- `SAG/apps/api/tests/test_checkpoint_c_failure_rollback.py`: fault injection, previous-tree read availability, PG/Qdrant parity, corrupt retained snapshot rejection and request reads/leases through publish/rollback.
+- `SAG/apps/api/tests/test_checkpoint_c_incremental.py`: subtree-build failure keeps the prior legacy coordinator snapshot; rename the old PG-only rollback test to make its boundary explicit.
+- `SAG/apps/api/tests/test_checkpoint_c_publish.py`: import shared fixtures instead of duplicating builders/mocks.
+- `SAG/tasks/todo.md`: update Phase 8 and Checkpoint C acceptance/evidence; reflect Thang's confirmation that DATN-35 / `ROUTING_READY` is complete without claiming this task reran it.
+- This folder contains the task spec, this research record, `plan.md` and `evidence.md`.
+
+### Actual validation (2026-10-05)
+
+- Focused API regression command covering `test_checkpoint_c_publish.py`, `test_checkpoint_c_failure_rollback.py`, `test_checkpoint_c_incremental.py`, `test_search_unit_retrieval_service.py`, `test_query_routing_service.py`: **63 passed in 8.87s** (rerun after strengthening concurrent Qdrant reads).
+- Ruff on all 7 changed Python files: **All checks passed**.
+- `compileall` on all 7 changed Python files: passed.
+- `uv build --out-dir "$env:TEMP/sag-checkpoint-c2-build"`: sdist and wheel built successfully outside the repo.
+- `git diff --check`: passed.
+- Full API suite was first started and remained without a summary/progress for approximately six minutes; it was stopped. A bounded diagnostic `pytest -q -x --tb=short` found the first existing-suite failure after **34 passed**: `tests/test_acl_runtime.py::test_global_scope_is_applied_before_search_unit_candidate_generation` patches `retrieve_search_unit_sections` with `record_search_unit_scope(..., principal, top_k)` but production `_prepare_global_search` passes `query_strategy_plan`. Neither file is changed in this task. The full suite is therefore not reported clean, and later tests' status is unknown.
+- Whole API Ruff reports 163 existing findings, including files not changed here. Changed-file lint is clean.
+
+### Review findings resolved
+
+- Inactive slot staging previously left the old previous-version metadata advertised while Qdrant was being partially overwritten. The short PG staging commit now removes that old slot mapping and rollback pointer before network I/O, while keeping the current active pointer untouched. A verification failure can no longer mistake partially written Qdrant as a retained prior snapshot.
+- Atomic switch errors previously fell outside the candidate rejection path. They now reject the candidate after a failed transaction, while `_mark_rejected` leaves an already-ACTIVE manifest alone if commit outcome is ambiguous.
+- The existing legacy rollback updated PG only. A separate cross-store service verifies the retained Qdrant slot, PG manifest/profile/SearchUnit inventory and ACL before atomic rollback; its failure paths leave the current tree active.
+- Query tests previously asserted routing snapshot objects across switches but not retrieval filters/results. The focused suite now routes the captured snapshot and reads dense/sparse candidates after the pointer has moved, checking version, source, document version and partition, including a retained lease after rollback.
+- Shared test fixtures were consolidated into one support module. No schema or dependency migration was introduced.
+
+### Impact, delivery and open acceptance
+
+- Database: PostgreSQL application rows only; no schema/migration/seed changes. Rollback pointer/slot/version metadata changes at stage and switch as above.
+- Configuration/security: no config, dependency, auth, ACL-policy or secret changes. Existing ACL checks are reused and exercised by negative payload tests.
+- Rollback plan: the previous version is eligible while its opposite slot contents remain. The next publish ends that window when it reserves that slot. Cross-store rollback fails closed after corruption/reuse. Reverting the code requires no down migration.
+- Task changes are committed locally on `feat/Thang-checkpoint-c-failure-rollback-be-api`; not pushed and no PR created. PR target remains `main`.
+- Runtime acceptance remains open: no live PG/Qdrant, multi-process/production load or crash test was available; DATN-58/59 producer is not wired into the publisher at this base. Do not mark operational `INCREMENTAL_READY` from mock evidence.
