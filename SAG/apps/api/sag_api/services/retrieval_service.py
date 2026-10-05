@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
 import re
 import time
@@ -193,7 +194,8 @@ def _section_key(section: RetrievedSection) -> tuple[str, str]:
     chunk = (section.chunk_id or "").strip()
     if chunk:
         return source, chunk
-    fingerprint = normalize_lexical_text(f"{section.heading}\n{section.content}")[:240]
+    normalized = normalize_lexical_text(f"{section.heading}\n{section.content}")
+    fingerprint = hashlib.sha256(normalized.encode("utf-8")).hexdigest() if normalized else ""
     return source, fingerprint
 
 
@@ -355,7 +357,7 @@ def rerank_sections(
     }
     active_retrievers = int(bool(semantic_ranks)) + int(bool(lexical_ranks))
     ideal_rrf_score = active_retrievers / (_RRF_K + 1)
-    ranked: list[tuple[float, int, int, int, tuple[str, str], RetrievedSection]] = []
+    ranked: list[tuple[float, int, tuple[str, str], RetrievedSection]] = []
 
     for key in candidate_keys:
         section = merged[key]
@@ -364,7 +366,6 @@ def rerank_sections(
         raw = semantic_scores.get(key, 0.0)
         relative_semantic_score = raw / top_semantic_score if top_semantic_score > 0 else 0.0
         lexical_score = lexical_scores[key]
-        exact = key in exact_keys
         lexical_match = lexical_rank is not None
         if _is_boilerplate(section) and not lexical_match and lexical_score < 0.35:
             continue
@@ -384,17 +385,12 @@ def rerank_sections(
         if not relevant:
             continue
         rank_sum = sum(rank for rank in (semantic_rank, lexical_rank) if rank is not None)
-        retriever_coverage = int(semantic_rank is not None) + int(lexical_rank is not None)
-        ranked.append(
-            (fused_score, retriever_coverage, int(exact), rank_sum, key, section)
-        )
+        ranked.append((fused_score, rank_sum, key, section))
 
-    ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3], item[4]))
+    ranked.sort(key=lambda item: (-item[0], item[1], item[2]))
     selected = [
         section.model_copy(update={"score": round(score, 6), "rank": index})
-        for index, (score, _coverage, _exact, _rank_sum, _key, section) in enumerate(
-            ranked[: max(1, limit)]
-        )
+        for index, (score, _rank_sum, _key, section) in enumerate(ranked[: max(1, limit)])
     ]
     return RerankResult(
         sections=selected,

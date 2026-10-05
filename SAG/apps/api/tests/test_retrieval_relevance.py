@@ -54,7 +54,7 @@ def test_rerank_prefers_direct_query_evidence_and_filters_unrelated_candidates()
     assert result.filtered_count == 2
 
 
-def test_rerank_uses_semantic_floor_when_no_lexical_signal_exists():
+def test_semantic_paraphrase_survives_without_lexical_overlap():
     result = rerank_sections(
         "如何改善配送劳动者的保障",
         [
@@ -65,6 +65,31 @@ def test_rerank_uses_semantic_floor_when_no_lexical_signal_exists():
     )
 
     assert [item.chunk_id for item in result.sections] == ["strong"]
+
+
+def test_vietnamese_domain_query_fuses_semantic_and_identifier_evidence():
+    semantic = section(
+        "semantic",
+        "Tìm kiếm tài liệu",
+        "Xếp hạng theo vị trí trong từng danh sách giúp tránh so sánh cosine với BM25.",
+        0.95,
+    )
+    lexical = section(
+        "datn-67",
+        "DATN-67",
+        "Task DATN-67 hợp nhất kết quả dense và BM25 bằng reciprocal rank fusion.",
+        0.01,
+    )
+
+    result = rerank_sections(
+        "DATN-67 hợp nhất tìm kiếm dense BM25 trong tài liệu pháp lý",
+        [semantic],
+        lexical=[lexical],
+        limit=8,
+    )
+
+    assert {item.chunk_id for item in result.sections} == {"semantic", "datn-67"}
+    assert all(0.0 <= item.score <= 1.0 for item in result.sections)
 
 
 def test_rerank_accepts_split_evidence_for_contiguous_chinese_query():
@@ -158,6 +183,9 @@ def test_rank_fusion_deduplicates_candidates_by_source_and_chunk():
         section("shared", "câu hỏi", "bản trùng ngắn", 0.9),
         section("shared", "câu hỏi", "bản trùng dài hơn trong semantic", 0.8),
         section("semantic-only", "câu hỏi", "semantic evidence", 0.7),
+        section("shared", "câu hỏi", "same chunk id in another source", 0.9).model_copy(
+            update={"source_config_id": "source-2"}
+        ),
     ]
     lexical = [
         section("shared", "câu hỏi", "bản trùng dài nhất trong lexical result", 0.99),
@@ -166,10 +194,57 @@ def test_rank_fusion_deduplicates_candidates_by_source_and_chunk():
 
     result = rerank_sections("câu hỏi", semantic, lexical=lexical, limit=8)
 
-    assert result.candidate_count == 3
-    assert len({item.chunk_id for item in result.sections}) == 3
+    assert result.candidate_count == 4
+    assert len({(item.source_config_id, item.chunk_id) for item in result.sections}) == 4
     shared = next(item for item in result.sections if item.chunk_id == "shared")
     assert shared.content == "bản trùng dài nhất trong lexical result"
+
+
+def test_missing_chunk_ids_use_full_content_fingerprint():
+    prefix = "Chính sách vận hành và kiểm soát truy cập " * 12
+    first = RetrievedSection(
+        heading="Hướng dẫn",
+        content=f"{prefix}Nghị định 15 yêu cầu đối soát hóa đơn điện tử.",
+        score=0.95,
+        source_config_id="source-1",
+    )
+    second = first.model_copy(
+        update={"content": f"{prefix}Nghị định 42 quy định thời hạn lưu trữ hồ sơ.", "score": 0.8}
+    )
+
+    result = rerank_sections(
+        "chính sách vận hành",
+        [first, second, first.model_copy()],
+        limit=8,
+    )
+
+    assert result.candidate_count == 2
+    assert {item.content for item in result.sections} == {first.content, second.content}
+
+
+def test_rank_fusion_rewards_rank_agreement_and_breaks_ties_by_key():
+    agreed = section("shared-top", "needle", "shared needle evidence", 0.95)
+    semantic = [
+        agreed,
+        section("dense-only", "needle", "dense needle evidence", 0.8),
+    ]
+    lexical = [
+        agreed.model_copy(update={"score": 0.01}),
+        section("sparse-only", "needle", "sparse needle evidence", 0.99),
+    ]
+    fused = rerank_sections("needle", semantic, lexical=lexical, limit=8)
+    assert fused.sections[0].chunk_id == "shared-top"
+
+    tied_semantic = [
+        section("b", "needle", "needle evidence B", 0.8),
+        section("a", "needle", "needle evidence A", 0.8),
+    ]
+    tied_lexical = [tied_semantic[1], tied_semantic[0]]
+    first = rerank_sections("needle", tied_semantic, lexical=tied_lexical, limit=8)
+    second = rerank_sections("needle", tied_semantic, lexical=tied_lexical, limit=8)
+
+    assert [item.chunk_id for item in first.sections] == ["a", "b"]
+    assert [item.chunk_id for item in first.sections] == [item.chunk_id for item in second.sections]
 
 
 def test_mmr_collapses_near_duplicates_and_preserves_all_query_identifiers():
@@ -452,6 +527,10 @@ def test_rrf_score_is_normalized_rank_score_for_single_retriever_candidates():
     scores = {item.chunk_id: item.score for item in result.sections}
     assert set(scores) == {"semantic-only", "lexical-only"}
     assert all(score == pytest.approx(0.5) for score in scores.values())
+    assert result.candidate_count == 2
+    assert result.relevant_count == 2
+    assert result.filtered_count == 0
+    assert result.lexical_count == 1
 
 
 @pytest.mark.asyncio

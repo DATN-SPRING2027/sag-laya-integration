@@ -74,12 +74,15 @@ Nguồn chuẩn: [Workflow v1.1](../docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1
 - [x] Relevance gate semantic-only bất biến khi retriever score được scale dương; có regression test.
 - [x] Trước dense/lexical candidate generation, giao Project được ký với mapping CONFIRMED Project→Source; client Source IDs chỉ thu hẹp scope.
 Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL evidence-path inventory](../docs/security/acl-evidence-path-inventory.md).
-- [ ] Collapse exact/near duplicate; kiểm tra MMR giữ evidence đa dạng.
+- [x] Dedupe exact retrieval candidate theo source-config/chunk key hoặc
+      fingerprint ổn định khi thiếu key; xem DATN-67 evidence.
+- [ ] Collapse near duplicate và kiểm tra MMR giữ evidence đa dạng.
 - [ ] Giới hạn candidate rerank và chỉ rerank khi còn latency budget.
 - [ ] Build context theo coverage/diversity và token budget.
 - [ ] Citation map được về source/version/block/page/anchor; kiểm tra no-answer khi evidence thiếu.
 - [ ] Xác nhận LLM Settings độc lập Laya và chỉ nhận evidence pack.
-- [ ] Ghi stage latency, requested/effective strategy và fallback trong trace.
+- [x] Ghi requested/effective strategy và P3 fallback reason trong `query_route`; regression `/search` và `/search/stream` không làm mất trace.
+- [ ] Bổ sung stage-level latency trace cho canonical retrieval.
 - [ ] Tạo/chạy retrieval regression corpus theo Phụ lục E của workflow.
 
 ### P4 task proposal — Global retrieval, ACL và fusion
@@ -90,15 +93,25 @@ Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL ev
 - [x] Fail closed khi scope thiếu (`503` trên request/`error` event trên SSE); scope rỗng hoặc request giao rỗng trả 0 evidence và không gọi retriever.
 - [x] Wire signed assertion verifier, Project→Source mapping resolver và unmapped-source denial; kiểm tra bằng contract/runtime tests. Owner-approved backfill script có sẵn, production approval/run được theo dõi riêng.
 - [x] Fuse semantic + lexical bằng RRF, không cộng raw score khác scale; score đầu ra chuẩn hóa về `[0, 1]` và ghi `fusion_method`/candidate counts.
-- [x] Dedupe candidate theo source/chunk và dùng tie-break xác định; giữ max semantic score, representative nội dung ổn định/dài hơn và ưu tiên exact lexical trước expansion-only match.
+- [x] Dedupe candidate theo source-config/chunk (SHA-256 fingerprint toàn nội dung khi thiếu key); tie-break theo fused score/rank/key. Giữ max semantic score, representative nội dung ổn định/dài hơn và exact lexical rank trước expansion-only match.
 - [x] Chuẩn hóa semantic-only relevance gate theo tỷ lệ so với score cao nhất trong cùng candidate set; test xác nhận scale `0.95/0.8` và `0.00095/0.0008` giữ cùng kết quả.
 - [x] Relevance gate xét tín hiệu lexical và semantic theo từng candidate; lexical hit của candidate khác không chặn dense evidence.
 - [x] Mô tả Search/Dify `score` là normalized RRF rank score; ghi rõ Dify `score_threshold` áp dụng trên thang này.
 - [x] Global `/search` và `/search/stream` bỏ event/graph retrieval trong P4; response giữ graph arrays rỗng. Source-scoped P3 path không đổi.
-- [x] Relevance/search strategy regressions: `test_retrieval_relevance.py`, `test_search_strategy.py`, `test_search_stream.py` pass.
+- [x] Relevance/search strategy regressions: `test_retrieval_relevance.py`, `test_search_strategy.py`, `test_search_stream.py`, `test_search_unit_retrieval_service.py` pass; xem [DATN-67 fusion evidence](../docs/tai_task/phase-4-fusion-evidence.md).
 - [x] ACL seam regressions: implicit scope, requested∩authorized, unauthorized/empty request, dense/lexical cùng scope, empty authorization, missing scope fail-closed trên `/search` và `/search/stream`; test dùng fake scope.
 - [x] Không dùng Knowledge Graph/Tree trong global P4 retrieval; không sửa ingestion/index lane hoặc shared contract/config.
 - [ ] Propagate Source provenance qua các lượt assistant phụ thuộc history; kiểm tra revoke khi lượt sau tóm tắt evidence cũ nhưng không có citation/tool riêng. Bộ lọc hiện chỉ xác minh provenance được ghi trên từng message.
+
+#### DATN-67 fusion/regression review — 2026-10-05
+
+- [x] P4.2 RRF, normalized score, stable dedupe fingerprint, deterministic
+      ordering và retrieval stats đã được regression.
+- [x] P4.4 semantic paraphrase, exact ID, tiếng Việt/domain, duplicate, rank
+      agreement, scale invariance, deterministic order, API và P3 fallback trace.
+- [x] Checkpoint P4.2 và DATN-67 code/review gate P4 complete; xem
+      [evidence report](../docs/tai_task/phase-4-fusion-evidence.md).
+- [ ] Production E2E/ACL acceptance vẫn theo DATN-61; không thuộc task này.
 
 ### P4 evidence context / citation / no-answer — implementation status (2026-10-01)
 
@@ -193,7 +206,9 @@ Implementation slice B2 đã có fixture test (xem `SAG/docs/Thang_Task/[SAG][B2
 - [x] Query trong lúc publish đọc một snapshot nhất quán.
 - [x] Inject/kiểm tra lỗi build và publish; active tree cũ vẫn phục vụ và rollback được.
 
-**Implementation slice (2026-10-04):** task branch `feat/Thang-checkpoint-c-blue-green-be-api-db` thêm blue-green publisher, durable query-slot lease, indexed Source/version/partition profile snapshot và focused SQLite/mock regressions (37 tests liên quan pass sau follow-up review). Xem [Checkpoint C evidence và giới hạn](../docs/Thang_Task/%5BSAG%5D%5BCheckpoint%20C%5D/evidence.md). Các checkbox Phase 8/Checkpoint C vẫn mở: DATN-58 producer chưa nối, PostgreSQL advisory-lock/migration và Qdrant thật chưa được kiểm chứng; Checkpoint B vẫn chưa hoàn tất trên task base.
+**Implementation slice (2026-10-04):** task branch `feat/Thang-checkpoint-c-blue-green-be-api-db` thêm blue-green publisher, durable query-slot lease, indexed Source/version/partition profile snapshot và focused SQLite/mock regressions (37 tests liên quan pass sau follow-up review). Xem [Checkpoint C evidence và giới hạn](../docs/Thang_Task/%5BSAG%5D%5BCheckpoint%20C%5D/evidence.md).
+
+**Update/subtree lane (2026-10-05):** nhận DATN-35 / `ROUTING_READY` là dependency đã hoàn tất theo task; không làm lại ACL resolver hoặc ingestion/index. `update_tree_incrementally` ghi base + delta idempotently, cập nhật profile/ancestor, lưu drift trace, chọn leaf/subtree hoặc partition mới cần rebuild và giữ nguyên sibling không bị ảnh hưởng. Regression evidence: [Phase 8 incremental update](../docs/tai_task/phase-8-incremental-update-evidence.md). Các check của lane này pass; publish, query snapshot consistency, rollback, production ACL và Qdrant thật vẫn là các acceptance riêng.
 
 ## Checkpoint C — INCREMENTAL_READY
 

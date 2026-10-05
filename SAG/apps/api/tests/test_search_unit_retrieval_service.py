@@ -483,6 +483,14 @@ async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_cit
     expected_candidate_count = 2 if has_decoy else 1
     assert outcome.stats["semantic_candidates"] == expected_candidate_count
     assert outcome.stats["lexical_candidates"] == expected_candidate_count
+    assert outcome.stats["candidates"] == expected_candidate_count
+    assert all(0.0 <= section.score <= 1.0 for section in outcome.sections)
+    if route_mode == "rerank_budget_exhausted":
+        assert outcome.stats["relevant"] is None
+        assert outcome.stats["filtered_irrelevant"] is None
+    else:
+        assert outcome.stats["relevant"] == expected_candidate_count
+        assert outcome.stats["filtered_irrelevant"] == 0
     indexed_request_count = len(requested_vectors)
     assert len(outcome.sections) == expected_candidate_count
     if route_mode == "wrong_route_nonempty":
