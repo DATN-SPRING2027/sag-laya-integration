@@ -209,7 +209,7 @@ async def test_partial_qdrant_batch_write_keeps_active_slot_queryable():
     assert all(group.routing_slot == "SLOT_B" for group in pinned.groups)
     await _assert_pinned_read(pinned, current_client)
     with pytest.raises(TreePublishError, match="No retained previous tree"):
-        await rollback_tree_candidate(project_id, qdrant_client=partial_client)
+        await rollback_tree_candidate(project_id, target_tree_version="unavailable", qdrant_client=partial_client)
     await manager.release_routing_snapshot(pinned.snapshot_id)
     await partial_client.aclose()
     await current_client.aclose()
@@ -290,7 +290,13 @@ async def test_rollback_restores_matching_postgres_manifest_and_qdrant_slot():
     current_client = _qdrant_client(current_candidate, shared_points=shared_points)
     await publish_tree_candidate(current, search_unit_assignments=_assignments(current), qdrant_client=current_client)
 
-    result = await rollback_tree_candidate(project_id, qdrant_client=current_client)
+    result = await rollback_tree_candidate(
+        project_id, target_tree_version=previous_candidate.tree_version, qdrant_client=current_client
+    )
+    retry_result = await rollback_tree_candidate(
+        project_id, target_tree_version=previous_candidate.tree_version, qdrant_client=current_client
+    )
+    assert retry_result == result
     assert (result.tree_version, result.routing_slot, result.search_epoch) == (
         previous_candidate.tree_version,
         "SLOT_A",
@@ -328,6 +334,39 @@ async def test_rollback_restores_matching_postgres_manifest_and_qdrant_slot():
 
 
 @pytest.mark.asyncio
+async def test_rollback_rejects_target_that_is_not_the_retained_version():
+    await init_db()
+    project_id = f"project-{uuid4().hex}"
+    previous = _snapshot(project_id, variant=0)
+    current = _snapshot(project_id, variant=1)
+    await _seed_search_units(previous)
+    shared_points: dict[str, dict] = {}
+    previous_candidate = prepare_tree_candidate(previous, _assignments(previous))
+    previous_client = _qdrant_client(previous_candidate, shared_points=shared_points)
+    await publish_tree_candidate(
+        previous, search_unit_assignments=_assignments(previous), qdrant_client=previous_client
+    )
+    current_candidate = prepare_tree_candidate(current, _assignments(current))
+    current_client = _qdrant_client(current_candidate, shared_points=shared_points)
+    await publish_tree_candidate(current, search_unit_assignments=_assignments(current), qdrant_client=current_client)
+
+    with pytest.raises(TreePublishError, match="not the retained previous tree"):
+        await rollback_tree_candidate(
+            project_id, target_tree_version="tree-not-retained", qdrant_client=current_client
+        )
+
+    async with SessionLocal() as session:
+        state = await session.get(ProjectSearchState, project_id)
+        assert state is not None
+        assert state.active_tree_version == current_candidate.tree_version
+        assert state.active_routing_slot == "SLOT_B"
+        assert state.previous_tree_version == previous_candidate.tree_version
+        assert state.active_search_epoch == 3
+    await previous_client.aclose()
+    await current_client.aclose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("corruption", ["qdrant", "checksum", "profile"])
 async def test_rollback_verification_failure_keeps_current_tree_active(corruption):
     await init_db()
@@ -359,7 +398,9 @@ async def test_rollback_verification_failure_keeps_current_tree_active(corruptio
             await session.commit()
 
     with pytest.raises(PublishVerificationError):
-        await rollback_tree_candidate(project_id, qdrant_client=current_client)
+        await rollback_tree_candidate(
+            project_id, target_tree_version=previous_candidate.tree_version, qdrant_client=current_client
+        )
 
     async with SessionLocal() as session:
         state = await session.get(ProjectSearchState, project_id)
@@ -417,7 +458,9 @@ async def test_concurrent_requests_keep_one_snapshot_across_publish_and_rollback
     assert before_rollback is not None
     new_read = asyncio.create_task(_assert_pinned_read(before_rollback, current_client))
     await asyncio.wait_for(current_query_started.wait(), timeout=5)
-    await rollback_tree_candidate(project_id, qdrant_client=current_client)
+    await rollback_tree_candidate(
+        project_id, target_tree_version=previous_candidate.tree_version, qdrant_client=current_client
+    )
     after_rollback = await manager.get_routing_snapshot(query="alpha", scopes=[_public_scope(previous)], planner={})
     assert after_rollback is not None
 

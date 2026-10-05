@@ -29,7 +29,11 @@ from sag_api.services.tree_publish_service import (
 )
 
 
-def _prepared_candidate_from_manifest(record: TreeManifest) -> PreparedTreeCandidate:
+def _prepared_candidate_from_manifest(
+    record: TreeManifest,
+    *,
+    expected_status: Literal["ACTIVE", "INACTIVE"] = "INACTIVE",
+) -> PreparedTreeCandidate:
     """Rehydrate the exact retained candidate needed to verify its Qdrant slot."""
     raw_manifest = record.manifest_json
     if isinstance(raw_manifest, str):
@@ -59,7 +63,7 @@ def _prepared_candidate_from_manifest(record: TreeManifest) -> PreparedTreeCandi
     source_tree_version = manifest.get("source_tree_version")
     expected_point_count = manifest.get("expected_point_count")
     if (
-        record.status != "INACTIVE"
+        record.status != expected_status
         or record.project_id != project_id
         or not isinstance(project_id, str)
         or not isinstance(tenant_id, str)
@@ -158,7 +162,7 @@ def _prepared_candidate_from_manifest(record: TreeManifest) -> PreparedTreeCandi
         leaf_count=record.leaf_count,
         max_leaf_size=record.max_leaf_size,
     )
-    _verify_persisted_manifest(record, candidate, expected_status="INACTIVE")
+    _verify_persisted_manifest(record, candidate, expected_status=expected_status)
     return candidate
 
 
@@ -221,12 +225,14 @@ async def _atomic_rollback(
 async def rollback_tree_candidate(
     project_id: str,
     *,
+    target_tree_version: str,
     qdrant_client: httpx.AsyncClient,
 ) -> TreePublishResult:
-    """Restore the previous tree while its opposite Qdrant slot is retained.
+    """Restore a specific retained tree while its Qdrant slot is available.
 
     A later publish ends this rollback window when it reserves and clears the
-    inactive slot. Rollback verifies that retained slot before changing PG.
+    inactive slot. A repeated request for the now-active target verifies the
+    active state and returns without switching the pointer again.
     """
     async with _project_publish_lock(project_id):
         async with SessionLocal() as session:
@@ -234,35 +240,67 @@ async def rollback_tree_candidate(
                 state = await session.scalar(
                     select(ProjectSearchState).where(ProjectSearchState.project_id == project_id).with_for_update()
                 )
-                if state is None or not state.active_tree_version or not state.previous_tree_version:
-                    raise TreePublishError("No retained previous tree is available for rollback")
+                if state is None or not state.active_tree_version:
+                    raise TreePublishError("No active tree is available for rollback")
                 current_slot = _active_slot(state)
                 current_tree_version = state.active_tree_version
                 current_epoch = state.active_search_epoch
-                previous_version = state.previous_tree_version
-                if previous_version == current_tree_version:
-                    raise TreePublishError("Previous and active tree versions are identical")
-                if state.slot_a_tree_version == previous_version:
-                    target_slot: Literal["SLOT_A", "SLOT_B"] = "SLOT_A"
-                elif state.slot_b_tree_version == previous_version:
-                    target_slot = "SLOT_B"
-                else:
-                    raise TreePublishError("Previous tree is no longer present in either Qdrant slot")
-                record = await session.scalar(
-                    select(TreeManifest)
-                    .where(
-                        TreeManifest.project_id == project_id,
-                        TreeManifest.tree_version == previous_version,
+
+                if target_tree_version == current_tree_version:
+                    record = await session.scalar(
+                        select(TreeManifest)
+                        .where(
+                            TreeManifest.project_id == project_id,
+                            TreeManifest.tree_version == target_tree_version,
+                        )
+                        .with_for_update()
                     )
-                    .with_for_update()
-                )
-                if record is None:
-                    raise PublishVerificationError("Retained previous tree manifest is missing")
-                candidate = _prepared_candidate_from_manifest(record)
-                await _verify_stored_source_profiles(session, candidate)
+                    if record is None:
+                        raise PublishVerificationError("Active tree manifest is missing")
+                    candidate = _prepared_candidate_from_manifest(record, expected_status="ACTIVE")
+                    await _verify_stored_source_profiles(session, candidate)
+                    target_slot = current_slot
+                    already_active = True
+                else:
+                    if not state.previous_tree_version:
+                        raise TreePublishError("No retained previous tree is available for rollback")
+                    previous_version = state.previous_tree_version
+                    if target_tree_version != previous_version:
+                        raise TreePublishError("Requested rollback target is not the retained previous tree")
+                    already_active = False
+
+                    if previous_version == current_tree_version:
+                        raise TreePublishError("Previous and active tree versions are identical")
+                    if state.slot_a_tree_version == previous_version:
+                        target_slot: Literal["SLOT_A", "SLOT_B"] = "SLOT_A"
+                    elif state.slot_b_tree_version == previous_version:
+                        target_slot = "SLOT_B"
+                    else:
+                        raise TreePublishError("Previous tree is no longer present in either Qdrant slot")
+                    record = await session.scalar(
+                        select(TreeManifest)
+                        .where(
+                            TreeManifest.project_id == project_id,
+                            TreeManifest.tree_version == previous_version,
+                        )
+                        .with_for_update()
+                    )
+                    if record is None:
+                        raise PublishVerificationError("Retained previous tree manifest is missing")
+                    candidate = _prepared_candidate_from_manifest(record)
+                    await _verify_stored_source_profiles(session, candidate)
 
         await _verify_database_search_units(candidate)
         await _verify_qdrant_slot(candidate, target_slot, qdrant_client)
+        if already_active:
+            return TreePublishResult(
+                project_id=candidate.project_id,
+                tree_version=candidate.tree_version,
+                routing_slot=target_slot,
+                search_epoch=current_epoch,
+                checksum=candidate.checksum,
+                point_count=candidate.expected_point_count,
+            )
         return await _atomic_rollback(
             candidate,
             target_slot,

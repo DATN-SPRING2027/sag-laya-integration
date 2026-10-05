@@ -192,10 +192,10 @@ Implementation slice B2 và các phụ thuộc Phase 5 là lịch sử riêng tr
 - [x] Verify manifest/checksum/quality trước khi đổi active pointer.
 - [x] Query trong lúc publish đọc một snapshot nhất quán.
 - [x] Inject lỗi subtree build, Qdrant partial batch, manifest/count/checksum/quality gate và pointer switch; lỗi trước switch giữ active tree phục vụ.
-- [x] Rollback xác minh Qdrant slot rồi đổi active manifest/pointer/epoch cùng transaction PostgreSQL.
+- [x] Rollback xác minh Qdrant slot rồi đổi active manifest/pointer/epoch cùng transaction PostgreSQL; retry cùng `target_tree_version` không toggle pointer hoặc tăng epoch.
 - [x] Giữ request snapshot/lease xuyên publish và rollback; slot có query đang dùng không bị ghi đè.
 
-**Implementation evidence (2026-10-05):** các mục trên có regression local bằng SQLite + `httpx.MockTransport`; focused suite `test_checkpoint_c_publish.py`, `test_checkpoint_c_failure_rollback.py`, `test_checkpoint_c_incremental.py`, `test_search_unit_retrieval_service.py` và `test_query_routing_service.py` đạt **63 passed**. Chi tiết theo từng failure, kết quả và giới hạn môi trường: [Checkpoint C failure/rollback evidence](../docs/Thang_Task/%5BSAG%5D%5BCheckpoint%20C%5D2/evidence.md). Rollback giữ version trước trong slot đối diện cho tới khi publish tiếp theo reserve slot đó; lúc reserve, PG bỏ tham chiếu/slot version trước khi Qdrant bị sửa để partial write không được nhận nhầm là snapshot hợp lệ.
+**Implementation evidence (2026-10-05):** các mục trên có regression local bằng SQLite + `httpx.MockTransport`; focused suite `test_checkpoint_c_publish.py`, `test_checkpoint_c_failure_rollback.py`, `test_checkpoint_c_incremental.py`, `test_search_unit_retrieval_service.py` và `test_query_routing_service.py` đạt **64 passed**. Chi tiết theo từng failure, kết quả và giới hạn môi trường: [Checkpoint C failure/rollback evidence](../docs/Thang_Task/%5BSAG%5D%5BCheckpoint%20C%5D2/evidence.md). Rollback giữ version trước trong slot đối diện cho tới khi publish tiếp theo reserve slot đó; retry cùng target đã active được xác minh và giữ nguyên epoch; lúc reserve slot cũ, PG bỏ tham chiếu trước khi Qdrant bị sửa để partial write không được nhận nhầm là snapshot hợp lệ.
 
 **Giới hạn acceptance:** chưa có live PostgreSQL/Qdrant trong môi trường test này; DATN-58/59 producer chưa nối vào `publish_tree_candidate` ở task base. Vì vậy các checkbox Phase 8 thể hiện code/fixture coverage, chưa xác nhận triển khai runtime `INCREMENTAL_READY`. DATN-35 / `ROUTING_READY` được Thang xác nhận hoàn tất; các checkbox Checkpoint B phía trên phản ánh xác nhận đó, không phải kết quả kiểm thử lại của task C.
 
@@ -203,7 +203,7 @@ Implementation slice B2 và các phụ thuộc Phase 5 là lịch sử riêng tr
 
 - [x] Ingest bình thường không đòi full tree rebuild trong incremental fixture tests.
 - [x] Drift/subtree failure, publish gates, partial Qdrant write, atomic switch failure, retained-slot rollback và request snapshots qua publish/rollback có focused regression.
-- [ ] Xác nhận end-to-end qua DATN-58/59 producer và live PostgreSQL/Qdrant trước khi ghi nhận runtime `INCREMENTAL_READY`.
+- [ ] Nối production producer DATN-58/59 vào publisher với mapping KnowledgeUnit→SearchUnit/source/version/partition đã được xác nhận, rồi kiểm chứng live PostgreSQL/Qdrant trước khi ghi nhận runtime `INCREMENTAL_READY`. Hiện publisher và rollback chưa có production caller; không tạo endpoint/mapping thay thế khi dependency contract còn thiếu.
 
 ## Phase 9 — Knowledge Quality & Gap
 

@@ -20,6 +20,14 @@
 - `incremental_tree_service.py::execute_tree_rollback` is a legacy PG-only rollback helper. It flips slot/version/status/epoch but does not verify or restore Qdrant. `test_checkpoint_c_incremental.py::test_fault_injection_and_rollback_restores_consistency` directly invokes the legacy atomic DB publisher after a failed mock write, then performs the PG-only rollback; it does not prove the mock Qdrant slot matches the restored manifest.
 - At this base there are no production call sites for `publish_tree_candidate` outside tests. DATN-58/59 ingestion/subtree integration is not wired into this publisher. This task will test the subtree builder's failure boundary and the current publish service without claiming producer integration.
 
+## Code-review follow-up (2026-10-05)
+
+- Review finding P1 confirmed by repository-wide Python call-site search: `publish_tree_candidate` and `rollback_tree_candidate` are invoked only from tests. `coordinate_ingest_delta` also has no production caller and still calls the legacy `execute_atomic_tree_publish` path rather than the blue-green publisher.
+- The current Checkpoint C APIs require a `TreeRoutingSnapshot` plus explicit `SearchUnitAssignment` records. The ingest coordinator accepts KnowledgeUnit inputs and scalar source/version defaults; it does not persist/provide the complete KnowledgeUnit→SearchUnit and source/version/partition mapping required by the publisher. No production KnowledgeUnit store/builder or endpoint/job contract is present in this checkout. Wiring an API or inventing that mapping here would bypass the producer and ACL contract, so this finding remains blocked on the DATN-58/59 producer contract and owner integration.
+- Review finding P2 confirmed: rollback chooses `state.previous_tree_version` implicitly; after a successful rollback `_atomic_rollback` sets that field to the version just left, so retrying the same command toggles the active pointer back and increments the epoch again.
+- Follow-up implementation: require an explicit `target_tree_version`; if it is already active, revalidate its active PG manifest/profile, canonical SearchUnit mappings and Qdrant slot and return the existing result without pointer or epoch mutation. Otherwise only roll back when the explicit target is the retained previous version. Add regression coverage for duplicate retries and update all call sites.
+- Validation plan: focused Checkpoint C failure/rollback tests, Ruff on changed Python files, and `git diff --check`. Do not claim P1/runtime acceptance closed without the producer integration dependency.
+
 ## Gaps to address
 
 1. No rollback API in the current blue-green publisher verifies the retained prior Qdrant slot before switching back.
@@ -100,3 +108,13 @@
 - Rollback plan: the previous version is eligible while its opposite slot contents remain. The next publish ends that window when it reserves that slot. Cross-store rollback fails closed after corruption/reuse. Reverting the code requires no down migration.
 - Task changes are committed locally on `feat/Thang-checkpoint-c-failure-rollback-be-api`; not pushed and no PR created. PR target remains `main`.
 - Runtime acceptance remains open: no live PG/Qdrant, multi-process/production load or crash test was available; DATN-58/59 producer is not wired into the publisher at this base. Do not mark operational `INCREMENTAL_READY` from mock evidence.
+
+### Review-fix outcome (2026-10-05)
+
+- `SAG/apps/api/sag_api/services/tree_rollback_service.py`: `rollback_tree_candidate` now requires `target_tree_version`. A target that is already active is rehydrated as an ACTIVE manifest, its stored profiles/SearchUnit mappings and Qdrant slot are verified, then the existing `TreePublishResult` is returned without changing active pointer, previous pointer, slot or search epoch. A non-active target is accepted only when it equals the retained previous version.
+- `SAG/apps/api/tests/test_checkpoint_c_failure_rollback.py`: added a red/green duplicate rollback regression; all existing rollback calls now name their target version.
+- `SAG/docs/Thang_Task/[SAG][Checkpoint C]2/evidence.md` and `SAG/tasks/todo.md`: record the idempotency evidence and keep producer/live-service acceptance explicitly open.
+- Validation after the code change: five focused Checkpoint C/query modules **64 passed in 7.78s**; rollback/failure module **12 passed in 3.09s**; includes rejection of a target that is not the retained version. Ruff and `compileall` for the two changed Python files passed; `git diff --check` passed.
+- `uv run` could not create its isolated dependency environment because building `litellm` needs the unavailable MSVC `link.exe`; the pre-existing API `.venv` successfully ran the focused tests. Packaging build was not rerun for this review-fix.
+- Review P1 remains unresolved for a concrete dependency reason: exhaustive call-site search shows no application caller for either blue-green API, and `coordinate_ingest_delta` is uncalled and still publishes through the legacy PG-only helper. No persistent KnowledgeUnit producer or complete KnowledgeUnit→SearchUnit/source/version/partition mapping is available in this checkout. Adding a route or synthesizing this bridge would be unsafe and would not make it the actual producer flow. DATN-58/59 owner integration is required before that finding/runtime acceptance can close.
+- No PostgreSQL schema, migration, dependency, configuration, authorization policy or secret changes. Local task branch remains `feat/Thang-checkpoint-c-failure-rollback-be-api`; push/PR are pending because workspace policy requires Thang to push.
