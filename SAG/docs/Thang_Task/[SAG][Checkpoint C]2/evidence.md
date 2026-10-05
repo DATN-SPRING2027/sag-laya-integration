@@ -82,7 +82,7 @@ Các finding có thể sửa an toàn trong task này đã sửa. Finding P1 v�
 - Không đổi authorization hoặc ACL contract; rollback tái dùng kiểm tra canonical mappings và Qdrant ACL. Không thêm secret hoặc log chứa payload thật.
 - Service không cung cấp endpoint public mới. Caller quản trị tương lai vẫn phải có authorization phù hợp.
 - Revert commit ứng dụng không cần down migration. Nếu cần khôi phục tree đang phục vụ, dùng verified rollback trước khi slot cũ bị reuse; không dùng legacy PG-only helper để khẳng định PG/Qdrant consistency.
-- Review-fix hiện đang được hoàn tất trên `feat/Thang-checkpoint-c-failure-rollback-be-api`; chưa push/chưa tạo PR. PR target `main`.
+- Review-fix đã commit local tại `06e6d66` trên `feat/Thang-checkpoint-c-failure-rollback-be-api`; chưa push/chưa tạo PR. PR target `main`.
 
 ## Lệnh tái lập
 
