@@ -708,10 +708,10 @@ async def test_fail_closed_qdrant_verification_and_unverified_publish_rejected()
 @pytest.mark.asyncio
 async def test_coordinate_ingest_delta_runtime_pipeline():
     """Verify runtime ingestion coordinator links delta, drift check, Qdrant update, verification, and publish."""
-    units = _base_units()
+    project_id = "proj-runtime-delta"
+    units = [replace(unit, project_id=project_id) for unit in _base_units()]
     edges = _base_edges()
     base_snapshot = build_routing_snapshot(units, edges, benchmark=_base_benchmark())
-    project_id = "proj-runtime-delta"
     collection = "search_units_runtime_test"
 
     # Initial publish of base tree
