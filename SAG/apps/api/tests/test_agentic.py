@@ -201,7 +201,15 @@ def test_dynamic_scene_stays_inside_single_system_message():
     assert messages[0]["content"] != with_scene[0]["content"]
 
 
-def test_initial_tool_policy_anchors_time_and_preserves_clarification():
+def test_initial_tool_policy_anchors_time_and_preserves_clarification(monkeypatch):
+    from sag_api.services import laya_router
+
+    monkeypatch.setattr(
+        laya_router,
+        "route_query",
+        lambda _query: {"is_chitchat": False, "confidence": 0.0},
+    )
+
     async def execute(arguments, context):
         return ToolResult(content="ok")
 

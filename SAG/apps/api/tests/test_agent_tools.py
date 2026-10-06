@@ -12,7 +12,7 @@ import httpx
 import pytest
 
 from sag_agent import ModelChunk, ToolCall
-from sag_api.sag import GraphEventInfo, RetrievedSection, SearchOutcome, SourceGraphInfo
+from sag_api.sag import RetrievedSection, SearchOutcome
 from sag_api.services.agent_service import _adapt_tool, _enabled_tool_names
 from sag_api.tools import registry
 from sag_api.tools.base import Tool, ToolContext, ToolMeta, ToolResult
@@ -34,22 +34,27 @@ ECHO_CITATION = {
 }
 
 
-def _test_locator(section):
-    return section.model_copy(
-        update={
-            "document_id": f"doc-{section.chunk_id}",
-            "document_version_id": f"version-{section.chunk_id}",
-            "document_name": "test.pdf",
-            "version_no": 1,
-            "page_from": 1,
-            "page_to": 1,
-            "anchor": f"section-{section.chunk_id}",
-        }
+def _canonical_test_section(chunk_id, content, source, *, heading=None, page=1):
+    return RetrievedSection(
+        chunk_id=chunk_id,
+        search_unit_id=chunk_id,
+        heading=heading or chunk_id,
+        content=content,
+        score=0.9,
+        source_id=source.id,
+        source_config_id=source.sag_source_config_id,
+        canonical_evidence_verified=True,
+        document_id=f"doc-{chunk_id}",
+        document_version_id=f"version-{chunk_id}",
+        document_name="test.pdf",
+        version_no=1,
+        page_from=page,
+        page_to=page,
+        anchor=f"section-{chunk_id}",
+        block_from_id=f"block-{chunk_id}",
+        block_to_id=f"block-{chunk_id}",
+        section_path=f"section/{chunk_id}",
     )
-
-
-async def _resolve_test_locators(sections, _sources):
-    return [_test_locator(section) for section in sections]
 
 
 class EchoTool(Tool):
@@ -119,110 +124,73 @@ class StubWebSearchTool(Tool):
 
 
 @pytest.mark.asyncio
-async def test_search_tool_prefers_exact_body_window_over_semantic_boilerplate(monkeypatch):
-    from sag_api.tools import builtin
+async def test_search_tool_returns_only_verified_traceable_evidence(monkeypatch):
+    from sag_api.services import search_unit_retrieval_service
 
-    monkeypatch.setattr(builtin, "resolve_traceable_evidence", _resolve_test_locators)
-    from sag_api.core.db import init_db
+    source = SimpleNamespace(id="source-1", name="娱乐新闻", sag_source_config_id="sc-1")
+    received = {}
 
-    await init_db()
-    class HybridEngine:
-        graph_calls = 0
+    async def retrieve_canonical(engine, sources, query, *, principal, top_k=None, query_strategy_plan=None):
+        received.update(engine=engine, sources=sources, query=query, principal=principal, top_k=top_k)
+        assert query_strategy_plan is not None
+        return SearchOutcome(
+            query=query,
+            stats={"routing": {"request_snapshot_id": "snapshot-a"}, "lexical_candidates": 1},
+            sections=[
+                RetrievedSection(
+                    chunk_id="unverified-nav",
+                    heading="版权声明",
+                    content="新浪首页 阅读排行榜 评论排行榜",
+                    score=0.64,
+                    source_id=source.id,
+                    source_config_id=source.sag_source_config_id,
+                    canonical_evidence_verified=True,
+                ),
+                _canonical_test_section(
+                    "body",
+                    "12月29日晚林俊杰官宣恋情，与女友七七相差21岁。",
+                    source,
+                    heading="林俊杰官宣恋情",
+                ),
+            ],
+        )
 
-        async def search_many(self, targets, query, *, strategy=None, top_k=None):
-            assert strategy == "vector"
-            return SearchOutcome(
-                query=query,
-                sections=[
-                    RetrievedSection(
-                        chunk_id="nav",
-                        heading="版权声明",
-                        content="新浪首页 阅读排行榜 评论排行榜",
-                        score=0.64,
-                        source_config_id="sc-1",
-                    )
-                ],
-            )
+    monkeypatch.setattr(search_unit_retrieval_service, "retrieve_search_unit_sections", retrieve_canonical)
 
-        async def grep_chunks(self, source_config_id, pattern, *, source=None, limit=20):
-            assert pattern == "林俊杰"
-            return [
-                {
-                    "chunk_id": "body",
-                    "heading": "林俊杰官宣恋情",
-                    "snippet": "12月29日晚林俊杰官宣恋情，与女友七七相差21岁。",
-                }
-            ]
+    class Engine:
+        async def graph_for_sections(self, *_args, **_kwargs):
+            raise AssertionError("SearchContext must not depend on knowledge enrichment")
 
-        async def graph_for_sections(self, sections, sources_by_config, **kwargs):
-            self.graph_calls += 1
-            assert kwargs["event_limit"] == max(12, len(sections))
-            assert sources_by_config["sc-1"].id == "source-1"
-            return SimpleNamespace(
-                events=[
-                    SimpleNamespace(
-                        id="event-1",
-                        source_config_id="sc-1",
-                        chunk_id=sections[0].chunk_id,
-                        title="林俊杰官宣恋情",
-                        summary="林俊杰于 12 月 29 日公开恋情。",
-                        content="12 月 29 日，林俊杰公开确认恋情，并介绍双方交往情况。",
-                        category="娱乐",
-                        score=0.95,
-                    )
-                ],
-                entities=[],
-                associations=[],
-            )
-
-    engine = HybridEngine()
-    source = SimpleNamespace(id="source-1", name="娱乐新闻", sag_source_config_id="sc-1"[:36])
-    host_context = ToolContext(engine_manager=engine, sources=[source], evidence_token_budget=10_000)
+    engine = Engine()
+    principal = SimpleNamespace(tenant_id="tenant-a", allowed_partition_ids=frozenset({"partition-a"}))
     result = await SearchContextTool().invoke(
-        {"query": "关于林俊杰最新动态 2024 2025", "top_k": 4},
-        host_context,
+        {"query": "林俊杰", "top_k": 4},
+        ToolContext(
+            engine_manager=engine,
+            sources=[source],
+            principal=principal,
+            evidence_token_budget=10_000,
+        ),
     )
 
-    assert result.citations[0]["chunk_id"] == "body"
+    assert received == {
+        "engine": engine,
+        "sources": [source],
+        "query": "林俊杰",
+        "principal": principal,
+        "top_k": 4,
+    }
+    assert [citation["chunk_id"] for citation in result.citations] == ["body"]
     assert result.citations[0]["document_id"] == "doc-body"
     assert result.citations[0]["document_version_id"] == "version-body"
     assert result.citations[0]["page_from"] == 1
     assert result.citations[0]["anchor"] == "section-body"
-    assert result.citations[0]["event_refs"][0]["title"] == "林俊杰官宣恋情"
-    assert result.citations[0]["event_refs"][0]["content"].startswith("12 月 29 日")
-    assert "summary" not in result.citations[0]
+    assert result.citations[0]["block_from_id"] == "block-body"
     assert "12月29日晚" in result.content
     assert result.data["lexical_count"] == 1
     assert result.data["section_count"] == 1
-    assert result.data["_graph"] is not None
-    assert result.data["_graph"].events[0].id == "event-1"
-    assert engine.graph_calls == 1
-
-    # The runtime adapter must reuse SearchContextTool's graph result instead
-    # of issuing a second graph query while constructing universe artifacts.
-    collected_citations: list[dict] = []
-    adapter_engine = HybridEngine()
-    adapter_context = ToolContext(
-        engine_manager=adapter_engine,
-        sources=[source],
-        evidence_token_budget=10_000,
-    )
-    adapted = _adapt_tool(SearchContextTool(), adapter_context, collected_citations)
-    runtime_result = await adapted.execute(
-        {"query": "关于林俊杰最新动态 2024 2025", "top_k": 4},
-        SimpleNamespace(
-            cancellation=SimpleNamespace(raise_if_cancelled=lambda: None),
-        ),
-    )
-
-    assert adapter_engine.graph_calls == 1
-    assert collected_citations[0]["event_refs"][0]["id"] == "event-1"
-    assert runtime_result.details["sources"] == [{"id": "source-1", "name": "娱乐新闻"}]
-    assert runtime_result.artifacts["citations"][0]["event_refs"][0]["summary"] == ("林俊杰于 12 月 29 日公开恋情。")
-    assert runtime_result.artifacts["citations"][0]["event_refs"][0]["content"].startswith(
-        "12 月 29 日"
-    )
-    assert runtime_result.details["matches"][0]["event_refs"][0]["category"] == "娱乐"
+    assert result.data["routing"] == {"request_snapshot_id": "snapshot-a"}
+    assert result.data["_graph"].events == []
 
 
 @pytest.mark.asyncio
@@ -247,153 +215,87 @@ async def test_web_search_trace_uses_internet_scope_instead_of_mounted_knowledge
 
 
 @pytest.mark.asyncio
-async def test_search_tool_graph_capacity_covers_every_returned_section(monkeypatch):
-    from sag_api.core.db import init_db
-    from sag_api.tools import builtin
+async def test_search_tool_numbers_every_returned_canonical_section(monkeypatch):
+    from sag_api.services import search_unit_retrieval_service
 
-    await init_db()
-    monkeypatch.setattr(builtin, "resolve_traceable_evidence", _resolve_test_locators)
-    class ManySectionEngine:
-        graph_calls = 0
-        event_limit = 0
+    source = SimpleNamespace(id="source-1", name="测试资料", sag_source_config_id="sc-1")
 
-        async def search_many(self, targets, query, *, strategy=None, top_k=None):
-            source_config_id = targets[0][0]
-            return SearchOutcome(
-                query=query,
-                sections=[
-                    RetrievedSection(
-                        chunk_id=f"chunk-{index}",
-                        heading=f"共同主题 {index}",
-                        content=f"共同主题的可核验证据 {index}",
-                        score=1.0 - index / 100,
-                        source_config_id=source_config_id,
-                    )
-                    for index in range(20)
-                ],
-            )
+    async def retrieve_canonical(_engine, _sources, query, *, principal, top_k=None, query_strategy_plan=None):
+        assert query == "共同主题"
+        assert top_k == 20
+        assert query_strategy_plan is not None
+        return SearchOutcome(
+            query=query,
+            sections=[
+                _canonical_test_section(
+                    f"chunk-{index}",
+                    f"共同主题的可核验证据 {index}",
+                    source,
+                    heading=f"共同主题 {index}",
+                )
+                for index in range(20)
+            ],
+        )
 
-        async def graph_for_sections(self, sections, sources_by_config, **kwargs):
-            self.graph_calls += 1
-            self.event_limit = kwargs["event_limit"]
-            return SourceGraphInfo(
-                events=[
-                    GraphEventInfo(
-                        id=f"event-{index}",
-                        source_id="document-1",
-                        source_config_id=section.source_config_id or "",
-                        chunk_id=section.chunk_id,
-                        title=f"真实事件 {index}",
-                        summary=f"真实事件摘要 {index}",
-                        category="测试",
-                    )
-                    for index, section in enumerate(sections)
-                ]
-            )
-
-    engine = ManySectionEngine()
-    source = SimpleNamespace(id="source-1", name="测试资料", sag_source_config_id="sc-1"[:36])
+    monkeypatch.setattr(search_unit_retrieval_service, "retrieve_search_unit_sections", retrieve_canonical)
     result = await SearchContextTool().invoke(
         {"query": "共同主题", "top_k": 20},
-        ToolContext(engine_manager=engine, sources=[source], evidence_token_budget=10_000),
+        ToolContext(
+            engine_manager=SimpleNamespace(),
+            sources=[source],
+            evidence_token_budget=100_000,
+        ),
     )
 
     assert len(result.citations) == 20
-    assert engine.graph_calls == 1
-    assert engine.event_limit == 20
-    assert all(len(citation["event_refs"]) == 1 for citation in result.citations)
+    assert [citation["n"] for citation in result.citations] == list(range(1, 21))
+    assert [citation["chunk_id"] for citation in result.citations] == [f"chunk-{index}" for index in range(20)]
+    assert "[20]" in result.content
+    assert all(citation["document_version_id"].startswith("version-") for citation in result.citations)
 
 
 @pytest.mark.asyncio
-async def test_search_tool_reuses_direct_event_recall_and_loads_traceable_evidence(monkeypatch):
-    from sag_api.core.db import init_db
-    from sag_api.tools import builtin
+async def test_search_tool_passes_acl_principal_to_canonical_reader_and_adapter(monkeypatch):
+    from sag_api.services import search_unit_retrieval_service
 
-    await init_db()
-    resolution_inputs = []
+    source = SimpleNamespace(id="source-1", name="人类简史", sag_source_config_id="sc-1")
+    principal = SimpleNamespace(tenant_id="tenant-a", allowed_partition_ids=frozenset({"partition-a"}))
+    calls = []
 
-    async def track_resolved_sections(sections, sources):
-        resolution_inputs.append([section.chunk_id for section in sections])
-        return await _resolve_test_locators(sections, sources)
+    async def retrieve_canonical(engine, sources, query, *, principal, top_k=None, query_strategy_plan=None):
+        calls.append((engine, sources, query, principal, top_k))
+        return SearchOutcome(
+            query=query,
+            sections=[
+                _canonical_test_section(
+                    "event-chunk",
+                    "维持复杂社会秩序需要存储并处理大量行政信息。",
+                    source,
+                    heading="帝国发展",
+                )
+            ],
+        )
 
-    monkeypatch.setattr(builtin, "resolve_traceable_evidence", track_resolved_sections)
-    class SparseEventEngine:
-        event_score_calls = 0
-        chunk_reads: list[tuple[str, str]] = []
+    monkeypatch.setattr(search_unit_retrieval_service, "retrieve_search_unit_sections", retrieve_canonical)
 
-        async def search_many(self, targets, query, *, strategy=None, top_k=None):
-            return SearchOutcome(
-                query=query,
-                sections=[
-                    RetrievedSection(
-                        chunk_id="nearby-chunk",
-                        heading="历史",
-                        content="帝国发展相关的背景资料，但这个分块本身没有抽取事项。",
-                        score=0.81,
-                        source_config_id=targets[0][0],
-                    )
-                ],
-            )
+    class Engine:
+        async def graph_for_sections(self, *_args, **_kwargs):
+            raise AssertionError("canonical SearchContext evidence must not require enrichment")
 
-        async def search_event_scores(self, query, sources_by_config, *, limit=None):
-            self.event_score_calls += 1
-            assert query == "帝国发展"
-            assert sources_by_config["sc-1"].id == "source-1"
-            assert limit == 2
-            return {("sc-1", "event-direct"): 0.97}
-
-        async def graph_for_sections(self, sections, sources_by_config, **kwargs):
-            assert kwargs["event_scores"] == {("sc-1", "event-direct"): 0.97}
-            return SourceGraphInfo(
-                events=[
-                    GraphEventInfo(
-                        id="event-direct",
-                        source_id="document-1",
-                        source_config_id="sc-1",
-                        chunk_id="event-chunk",
-                        title="帝国运转的信息需求与大脑存储局限",
-                        summary="帝国依赖大规模信息处理体系维持扩张与治理。",
-                        category="历史",
-                        score=0.97,
-                    )
-                ]
-            )
-
-        async def get_chunk(self, source_config_id, chunk_id, *, source=None):
-            self.chunk_reads.append((source_config_id, chunk_id))
-            assert source.id == "source-1"
-            return SimpleNamespace(
-                chunk_id=chunk_id,
-                heading="历史",
-                content="维持复杂社会秩序需要存储并处理大量行政信息。",
-                rank=12,
-            )
-
-    engine = SparseEventEngine()
-    source = SimpleNamespace(id="source-1", name="人类简史", sag_source_config_id="sc-1"[:36])
-    result = await SearchContextTool().invoke(
+    engine = Engine()
+    context = ToolContext(engine_manager=engine, sources=[source], principal=principal)
+    collected_citations: list[dict] = []
+    adapted = _adapt_tool(SearchContextTool(), context, collected_citations)
+    runtime_result = await adapted.execute(
         {"query": "帝国发展", "top_k": 2},
-        ToolContext(engine_manager=engine, sources=[source]),
+        SimpleNamespace(cancellation=SimpleNamespace(raise_if_cancelled=lambda: None)),
     )
 
-    assert engine.event_score_calls == 1
-    assert engine.chunk_reads == [("sc-1", "event-chunk")]
-    assert resolution_inputs == [["nearby-chunk"], ["event-chunk"]]
-    assert result.data["event_candidates"] == 1
-    assert result.data["event_count"] == 1
-    assert result.citations[0]["chunk_id"] == "event-chunk"
-    assert result.citations[0]["source_id"] == "source-1"
-    assert result.citations[0]["event_refs"] == [
-        {
-            "id": "event-direct",
-            "title": "帝国运转的信息需求与大脑存储局限",
-            "summary": "帝国依赖大规模信息处理体系维持扩张与治理。",
-            "category": "历史",
-        }
-    ]
-    assert result.content.startswith("[1] 事项：帝国运转的信息需求与大脑存储局限")
-    assert "摘要：帝国依赖大规模信息处理体系维持扩张与治理。" in result.content
-    assert "原文证据：\n维持复杂社会秩序需要存储并处理大量行政信息。" in result.content
+    assert calls == [(engine, [source], "帝国发展", principal, 2)]
+    assert collected_citations[0]["document_version_id"] == "version-event-chunk"
+    assert collected_citations[0]["block_from_id"] == "block-event-chunk"
+    assert runtime_result.details["sources"] == [{"id": "source-1", "name": "人类简史"}]
+    assert runtime_result.artifacts["citations"][0]["anchor"] == "section-event-chunk"
 
 
 @pytest.mark.asyncio
