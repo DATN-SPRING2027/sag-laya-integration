@@ -20,14 +20,6 @@ from sag_api.services.routing_tree_service import (
 from sag_api.services.tree_publish_service import SearchUnitAssignment
 
 
-class _AsyncMockTransport(httpx.AsyncBaseTransport):
-    def __init__(self, handler):
-        self._handler = handler
-
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        return await self._handler(request)
-
-
 def _snapshot(project_id: str, variant: int = 0):
     units = [
         KnowledgeUnitInput(
@@ -257,4 +249,4 @@ def _qdrant_client(
             return httpx.Response(200, json={"status": "ok", "result": result})
         return httpx.Response(404)
 
-    return httpx.AsyncClient(transport=_AsyncMockTransport(handler), base_url="http://qdrant.test")
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://qdrant.test")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -28,11 +29,12 @@ from sag_api.services.tree_publish_service import (
     PublishVerificationError,
     TreePublishError,
     TreeSlotInUse,
+    _checksum_manifest,
     build_inactive_slot_payloads,
     prepare_tree_candidate,
     publish_tree_candidate,
 )
-from sag_api.services.tree_rollback_service import rollback_tree_candidate
+from sag_api.services.tree_rollback_service import _prepared_candidate_from_manifest, rollback_tree_candidate
 
 
 async def _assert_pinned_read(snapshot, client):
@@ -100,6 +102,36 @@ async def test_quality_gate_failure_keeps_previous_query_snapshot():
     await manager.release_routing_snapshot(still_active.snapshot_id)
     await rejected_client.aclose()
     await active_client.aclose()
+
+
+@pytest.mark.parametrize("field_state", ["missing", "not-list"])
+def test_rehydrate_rejects_malformed_source_routing_profiles(field_state):
+    project_id = f"project-{uuid4().hex}"
+    snapshot = _snapshot(project_id)
+    candidate = prepare_tree_candidate(snapshot, _assignments(snapshot))
+    manifest = candidate.manifest
+    if field_state == "missing":
+        manifest.pop("source_routing_profiles")
+    else:
+        manifest["source_routing_profiles"] = "invalid"
+
+    checksum = _checksum_manifest(manifest)
+    tree_version = f"tree-{checksum[:24]}"
+    manifest["checksum"] = checksum
+    manifest["tree_version"] = tree_version
+    record = SimpleNamespace(
+        tree_version=tree_version,
+        project_id=project_id,
+        checksum=checksum,
+        status="INACTIVE",
+        manifest_json=manifest,
+        node_count=candidate.node_count,
+        leaf_count=candidate.leaf_count,
+        max_leaf_size=candidate.max_leaf_size,
+    )
+
+    with pytest.raises(PublishVerificationError, match="manifest is incomplete or not rollback eligible"):
+        _prepared_candidate_from_manifest(record)
 
 
 @pytest.mark.asyncio
@@ -290,6 +322,37 @@ async def test_rollback_restores_matching_postgres_manifest_and_qdrant_slot():
     current_client = _qdrant_client(current_candidate, shared_points=shared_points)
     await publish_tree_candidate(current, search_unit_assignments=_assignments(current), qdrant_client=current_client)
 
+    async with SessionLocal() as session:
+        session.add_all(
+            [
+                TreeSnapshotLease(
+                    request_snapshot_id="expired-rollback-lease",
+                    project_id=project_id,
+                    routing_slot="SLOT_B",
+                    tree_version=current_candidate.tree_version,
+                    search_epoch=3,
+                    expires_at=datetime.now(UTC) - timedelta(hours=1),
+                ),
+                TreeSnapshotLease(
+                    request_snapshot_id="live-rollback-lease",
+                    project_id=project_id,
+                    routing_slot="SLOT_B",
+                    tree_version=current_candidate.tree_version,
+                    search_epoch=3,
+                    expires_at=datetime.now(UTC) + timedelta(hours=1),
+                ),
+                TreeSnapshotLease(
+                    request_snapshot_id="other-project-expired-lease",
+                    project_id=f"other-{project_id}",
+                    routing_slot="SLOT_B",
+                    tree_version=current_candidate.tree_version,
+                    search_epoch=3,
+                    expires_at=datetime.now(UTC) - timedelta(hours=1),
+                ),
+            ]
+        )
+        await session.commit()
+
     result = await rollback_tree_candidate(
         project_id, target_tree_version=previous_candidate.tree_version, qdrant_client=current_client
     )
@@ -316,6 +379,9 @@ async def test_rollback_restores_matching_postgres_manifest_and_qdrant_slot():
         assert previous_record is not None and previous_record.status == "ACTIVE"
         assert previous_record.checksum == previous_candidate.checksum
         assert current_record is not None and current_record.status == "INACTIVE"
+        assert await session.get(TreeSnapshotLease, ("expired-rollback-lease", project_id)) is None
+        assert await session.get(TreeSnapshotLease, ("live-rollback-lease", project_id)) is not None
+        assert await session.get(TreeSnapshotLease, ("other-project-expired-lease", f"other-{project_id}")) is not None
     assert all(
         payload.get("tree_version_a") == previous_candidate.tree_version
         and payload.get("tree_version_b") == current_candidate.tree_version

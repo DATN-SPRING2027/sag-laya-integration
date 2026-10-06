@@ -8,10 +8,10 @@ from datetime import UTC, datetime
 from typing import Literal
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from sag_api.core.db import SessionLocal
-from sag_api.db.models.routing_rag import ProjectSearchState, TreeManifest
+from sag_api.db.models.routing_rag import ProjectSearchState, TreeManifest, TreeSnapshotLease
 from sag_api.services.tree_publish_service import (
     PreparedTreeCandidate,
     PublishVerificationError,
@@ -21,6 +21,7 @@ from sag_api.services.tree_publish_service import (
     TreePublishResult,
     _active_slot,
     _checksum_manifest,
+    _database_now,
     _project_publish_lock,
     _verify_database_search_units,
     _verify_persisted_manifest,
@@ -57,6 +58,7 @@ def _prepared_candidate_from_manifest(
     quality_gates = manifest.get("quality_gates")
     raw_assignments = manifest.get("search_unit_assignments")
     raw_profiles = manifest.get("routing_profiles")
+    raw_source_profiles = manifest.get("source_routing_profiles")
     raw_partition_counts = manifest.get("security_partition_search_unit_counts")
     project_id = manifest.get("project_id")
     tenant_id = manifest.get("tenant_id")
@@ -73,6 +75,7 @@ def _prepared_candidate_from_manifest(
         or any(value is not True for value in quality_gates.values())
         or not isinstance(raw_assignments, list)
         or not isinstance(raw_profiles, list)
+        or not isinstance(raw_source_profiles, list)
         or any(not isinstance(profile, dict) for profile in raw_profiles)
         or not isinstance(raw_partition_counts, dict)
         or isinstance(expected_point_count, bool)
@@ -134,7 +137,7 @@ def _prepared_candidate_from_manifest(
             not isinstance(key, str) or isinstance(value, bool) or not isinstance(value, int) or value <= 0
             for key, value in partition_counts
         )
-        or dict(partition_counts) != dict(Counter(item.partition_id for item in assignments))
+        or dict(partition_counts) != Counter(item.partition_id for item in assignments)
         or len(raw_profiles) != record.node_count
         or len(leaves) != record.leaf_count
         or max((len(members) for _node_id, members in leaves), default=0) != record.max_leaf_size
@@ -188,6 +191,7 @@ async def _atomic_rollback(
                 select(TreeManifest).where(TreeManifest.tree_version == current_tree_version).with_for_update()
             )
             _verify_persisted_manifest(target_record, candidate, expected_status="INACTIVE")
+            # Qdrant was checked outside this transaction; recheck profiles before switching pointers.
             await _verify_stored_source_profiles(session, candidate)
             if (
                 state is None
@@ -242,6 +246,13 @@ async def rollback_tree_candidate(
                 )
                 if state is None or not state.active_tree_version:
                     raise TreePublishError("No active tree is available for rollback")
+                database_now = await _database_now(session)
+                await session.execute(
+                    delete(TreeSnapshotLease).where(
+                        TreeSnapshotLease.project_id == project_id,
+                        TreeSnapshotLease.expires_at <= database_now,
+                    )
+                )
                 current_slot = _active_slot(state)
                 current_tree_version = state.active_tree_version
                 current_epoch = state.active_search_epoch
@@ -271,11 +282,13 @@ async def rollback_tree_candidate(
 
                     if previous_version == current_tree_version:
                         raise TreePublishError("Previous and active tree versions are identical")
-                    if state.slot_a_tree_version == previous_version:
-                        target_slot: Literal["SLOT_A", "SLOT_B"] = "SLOT_A"
-                    elif state.slot_b_tree_version == previous_version:
-                        target_slot = "SLOT_B"
-                    else:
+                    target_slot: Literal["SLOT_A", "SLOT_B"] = (
+                        "SLOT_B" if current_slot == "SLOT_A" else "SLOT_A"
+                    )
+                    slot_tree_version = (
+                        state.slot_a_tree_version if target_slot == "SLOT_A" else state.slot_b_tree_version
+                    )
+                    if slot_tree_version != previous_version:
                         raise TreePublishError("Previous tree is no longer present in either Qdrant slot")
                     record = await session.scalar(
                         select(TreeManifest)
