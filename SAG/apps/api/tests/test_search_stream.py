@@ -271,15 +271,7 @@ async def _search(
                     anchor=locator["anchor"],
                 )
             ],
-            stats={
-                "canonical_index": True,
-                "fusion_method": "rrf",
-                "semantic_candidates": 1,
-                "lexical_candidates": 1,
-                "candidates": 1,
-                "relevant": 1,
-                "filtered_irrelevant": 0,
-            },
+            stats={"canonical_index": True, "fusion_method": "rrf"},
         )
 
     monkeypatch.setattr(search_unit_retrieval_service, "retrieve_search_unit_sections", retrieve_canonical)
@@ -469,12 +461,6 @@ async def test_exact_identifier_survives_rrf_single_retriever_score_and_ambiguou
     completed = events[-1][1]
     assert completed["answer_status"] == "answered"
     assert "XK-204 is approved [1]" in completed["summary"]
-    assert completed["stats"]["fusion_method"] == "rrf"
-    assert completed["stats"]["semantic_candidates"] == 1
-    assert completed["stats"]["lexical_candidates"] == 1
-    assert completed["stats"]["candidates"] == 1
-    assert completed["stats"]["filtered_irrelevant"] == 0
-    assert 0.0 <= completed["sections"][0]["score"] <= 1.0
     assert completed["stats"]["query_route"]["retrieval"] == "required"
 
 

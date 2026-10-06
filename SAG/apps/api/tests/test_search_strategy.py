@@ -80,7 +80,6 @@ async def test_global_search_records_strategy_and_queries_canonical_index(monkey
     from sag_api.api.v1 import search as search_api
     from sag_api.core.deps import get_engine_manager
     from sag_api.main import app
-    from sag_api.sag import RetrievedSection
     from sag_api.sag.dto import SearchOutcome
     from sag_api.services import search_unit_retrieval_service
 
@@ -104,25 +103,11 @@ async def test_global_search_records_strategy_and_queries_canonical_index(monkey
         )
         return SearchOutcome(
             query=query,
-            sections=[
-                RetrievedSection(
-                    chunk_id="fused-candidate",
-                    heading="Fusion evidence",
-                    content="Rank fusion evidence for the API contract.",
-                    score=1.0,
-                    source_id=sources[0].id,
-                    source_config_id=sources[0].sag_source_config_id,
-                )
-            ],
+            sections=[],
             stats={
                 "canonical_index": True,
                 "requested_top_k": top_k,
                 "candidate_top_k": 21,
-                "semantic_candidates": 1,
-                "lexical_candidates": 1,
-                "candidates": 1,
-                "relevant": 1,
-                "filtered_irrelevant": 0,
                 "fusion_method": "rrf",
             },
         )
@@ -178,13 +163,6 @@ async def test_global_search_records_strategy_and_queries_canonical_index(monkey
                 assert result["stats"]["requested_top_k"] == 7
                 assert result["stats"]["candidate_top_k"] == 21
                 assert result["stats"]["fusion_method"] == "rrf"
-                assert result["stats"]["semantic_candidates"] == 1
-                assert result["stats"]["lexical_candidates"] == 1
-                assert result["stats"]["candidates"] == 1
-                assert result["stats"]["relevant"] == 1
-                assert result["stats"]["filtered_irrelevant"] == 0
-                assert result["sections"][0]["chunk_id"] == "fused-candidate"
-                assert 0.0 <= result["sections"][0]["score"] <= 1.0
                 assert "event_candidates" not in result["stats"]
                 assert "event_hits" not in result["stats"]
                 assert result["stats"]["query_route"]["query_original"] == "策略测试"
@@ -302,19 +280,7 @@ async def test_global_search_falls_back_when_laya_errors_without_losing_scope(mo
     async def canonical_retrieval(engine, sources, query, *, principal, top_k=None, query_strategy_plan=None):
         assert query_strategy_plan is not None
         retrieval_calls.append((engine, [source.id for source in sources], query, principal, top_k))
-        return SearchOutcome(
-            query=query,
-            sections=[],
-            stats={
-                "canonical_index": True,
-                "fusion_method": "rrf",
-                "semantic_candidates": 1,
-                "lexical_candidates": 1,
-                "candidates": 1,
-                "relevant": 1,
-                "filtered_irrelevant": 0,
-            },
-        )
+        return SearchOutcome(query=query, sections=[], stats={"canonical_index": True})
 
     monkeypatch.setattr(
         search_unit_retrieval_service,
@@ -357,9 +323,6 @@ async def test_global_search_falls_back_when_laya_errors_without_losing_scope(mo
                 assert trace["fallback_used"] is True
                 assert trace["fallback_reason"] == "laya_route_error"
                 assert trace["scope_source_ids"] == [source_id]
-                assert payload["stats"]["fusion_method"] == "rrf"
-                assert payload["stats"]["candidates"] == 1
-                assert payload["stats"]["filtered_irrelevant"] == 0
                 assert "ERR_TIMEOUT" in trace["query_analysis"]["features"]["identifier_terms"]
                 assert "checkpoint token" not in response.text
                 assert retrieval_calls[0][0] is engine

@@ -871,10 +871,16 @@ def update_tree_incrementally(
     )
     delta = assign_delta_units(base_snapshot, new_units, config)
     known_unit_ids = {unit.unit_id for unit in delta.updated_units}
+    unit_by_id = {unit.unit_id: unit for unit in delta.updated_units}
 
     edge_weights: dict[tuple[str, str], float] = {}
     for raw in base_manifest.get("edges", []):
         source, target, weight = raw
+        source_unit, target_unit = unit_by_id.get(source), unit_by_id.get(target)
+        if source_unit is None or target_unit is None:
+            raise ValueError("base graph edges must reference known Knowledge Units")
+        if source_unit.security_partition_id != target_unit.security_partition_id:
+            continue
         pair = tuple(sorted((source, target)))
         edge_weights[pair] = max(edge_weights.get(pair, 0.0), float(weight))
     for edge in new_edges:
@@ -891,6 +897,10 @@ def update_tree_incrementally(
             raise ValueError("delta graph edges require string IDs and finite weights in [0, 1]")
         if edge.source_unit_id not in known_unit_ids or edge.target_unit_id not in known_unit_ids:
             raise ValueError("delta graph edges must reference known Knowledge Units")
+        source_partition = unit_by_id[edge.source_unit_id].security_partition_id
+        target_partition = unit_by_id[edge.target_unit_id].security_partition_id
+        if source_partition != target_partition:
+            continue
         pair = tuple(sorted((edge.source_unit_id, edge.target_unit_id)))
         edge_weights[pair] = max(edge_weights.get(pair, 0.0), edge.weight)
     edges = [KnowledgeEdgeInput(left, right, weight) for (left, right), weight in sorted(edge_weights.items())]
@@ -934,6 +944,7 @@ def update_tree_incrementally(
 
     rebuilt: list[str] = []
     rebuilt_partitions: list[str] = []
+    subtree_quality_passed = snapshot.quality_gates.get("subtree_quality", True)
     if drift.trigger_rebuild and (drift.affected_node_ids or drift.new_partition_ids):
         nodes_by_id = {node.node_id: node for node in _walk(snapshot.roots)}
         candidates = sorted(
@@ -984,6 +995,7 @@ def update_tree_incrementally(
                 config=config,
                 unit_ids_to_include=extra_ids,
             )
+            subtree_quality_passed = subtree_quality_passed and snapshot.quality_gates.get("subtree_quality", True)
             rebuilt.append(node.node_id)
             pending_delta_ids.difference_update(extra_ids)
 
@@ -1015,6 +1027,7 @@ def update_tree_incrementally(
                 )
             )
             pending_delta_ids.difference_update(partition_unit_ids)
+            subtree_quality_passed = subtree_quality_passed and partition_tree.publishable
             snapshot = _refresh_incremental_snapshot(
                 snapshot,
                 roots,
@@ -1023,7 +1036,7 @@ def update_tree_incrementally(
                 delta_unit_ids=pending_delta_ids,
                 config=config,
                 lineage_events=list(snapshot.manifest.get("lineage_events", [])),
-                subtree_quality_passed=snapshot.publishable and partition_tree.publishable,
+                subtree_quality_passed=subtree_quality_passed,
             )
             rebuilt_partitions.append(partition_id)
 
@@ -1065,7 +1078,7 @@ def update_tree_incrementally(
         config=config,
         incremental_trace=drift_record,
         lineage_events=list(snapshot.manifest.get("lineage_events", [])),
-        subtree_quality_passed=snapshot.publishable,
+        subtree_quality_passed=subtree_quality_passed,
     )
     return IncrementalTreeUpdateResult(
         snapshot, delta, drift, tuple(rebuilt), tuple(rebuilt_partitions)
@@ -1546,7 +1559,7 @@ def build_query_routing_snapshot(
 
 
 # ---------------------------------------------------------------------------
-# Runtime Coordinator (Bridges Ingest Pipeline to Checkpoint C)
+# Ingest-Delta Service Coordinator (Checkpoint C contract)
 # ---------------------------------------------------------------------------
 
 
@@ -1578,16 +1591,9 @@ async def coordinate_ingest_delta(
     source_id: str = "src-1",
     document_version_id: str = "ver-1",
 ) -> IngestDeltaResult:
-    """Runtime coordinator linking the entire Checkpoint C pipeline during ingestion.
+    """Coordinate a Checkpoint C update for caller-provided Knowledge Units.
 
-    Steps:
-    1. Delta Assignment: assign new units to base tree without full rebuild.
-    2. Drift Detection: calculate drift scores on affected nodes.
-    3. Targeted Subtree Rebuild: if drift exceeds threshold, rebuild ONLY affected subtree.
-    4. Dual-Slot Payload Build: build inactive slot payloads.
-    5. Inactive Slot Update: push to Qdrant with wait=true.
-    6. Inactive Slot Verification: fail-closed Qdrant count & checksum verification.
-    7. Atomic PostgreSQL Switch: pessimistic lock, active slot pointer switch.
+    No production document-ingestion caller supplies this contract yet.
     """
     if project_id != base_snapshot.project_id:
         raise ValueError("project_id must match the base routing snapshot")

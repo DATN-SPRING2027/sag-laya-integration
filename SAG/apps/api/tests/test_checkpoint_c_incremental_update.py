@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from sag_api.services import incremental_tree_service
-from sag_api.services.incremental_tree_service import update_tree_incrementally
+from sag_api.services.incremental_tree_service import DriftReport, update_tree_incrementally
 from sag_api.services.routing_tree_service import (
     KnowledgeEdgeInput,
     KnowledgeUnitInput,
@@ -10,13 +12,13 @@ from sag_api.services.routing_tree_service import (
 )
 
 
-def _tree(config: TreeBuildConfig):
+def _tree(config: TreeBuildConfig, *, split_partition: bool = False):
     units = [
         KnowledgeUnitInput(
             unit_id=f"ku-{index}",
             tenant_id="tenant-1",
             project_id="project-1",
-            security_partition_id="partition-1",
+            security_partition_id="partition-2" if split_partition and index >= 4 else "partition-1",
             dense=(1.0, 0.0) if index < 4 else (0.0, 1.0),
             sparse=(("alpha" if index < 4 else "beta", 1.0),),
             entities=("Alpha" if index < 4 else "Beta",),
@@ -123,6 +125,54 @@ def test_drift_rebuilds_only_selected_subtree_and_is_deterministic(monkeypatch):
     retry = update_tree_incrementally(first.snapshot, [unit], [new_edge], config=config)
     assert retry.snapshot is first.snapshot
     assert retry.rebuilt_node_ids == ()
+
+
+def test_rebuilt_subtrees_accumulate_failed_quality_gates(monkeypatch):
+    config = TreeBuildConfig(min_cluster_size=2, target_cluster_size=4, max_cluster_size=8)
+    base, _ = _tree(config)
+    targets = base.roots[0].children
+    assert len(targets) == 2 and all(not node.children for node in targets)
+    units = [
+        replace(_new_unit(), unit_id=f"ku-rebuild-{index}", dense=node.profile.dense_medoid)
+        for index, node in enumerate(targets)
+    ]
+    edges = [KnowledgeEdgeInput(f"ku-{index * 4}", unit.unit_id, 0.9) for index, unit in enumerate(units)]
+    monkeypatch.setattr(
+        incremental_tree_service,
+        "compute_tree_drift",
+        lambda *_args, **_kwargs: DriftReport(0.0, 0.0, False, (), 2, True, tuple(n.node_id for n in targets)),
+    )
+    build = incremental_tree_service.build_routing_snapshot
+    build_count = 0
+
+    def fail_first_build(units, *args, **kwargs):
+        nonlocal build_count
+        snapshot = build(units, *args, **kwargs)
+        build_count += 1
+        if build_count == 1:
+            gates = dict(snapshot.quality_gates)
+            gates["injected_failure"] = False
+            return replace(snapshot, quality_gates=gates, publishable=False)
+        return snapshot
+
+    monkeypatch.setattr(incremental_tree_service, "build_routing_snapshot", fail_first_build)
+    result = update_tree_incrementally(base, units, edges, config=config)
+
+    assert build_count == 2
+    assert set(result.rebuilt_node_ids) == {node.node_id for node in targets}
+    assert result.snapshot.quality_gates["subtree_quality"] is False
+    assert result.snapshot.publishable is False
+
+
+def test_incremental_manifest_drops_cross_partition_edges():
+    config = TreeBuildConfig(min_cluster_size=2, target_cluster_size=4, max_cluster_size=8)
+    base, _ = _tree(config, split_partition=True)
+    cross_partition = KnowledgeEdgeInput("ku-3", "ku-4", 0.9)
+
+    result = update_tree_incrementally(base, [], [cross_partition], config=config)
+
+    assert result.snapshot.manifest["edges"] == base.manifest["edges"]
+    assert [root.security_partition_id for root in result.snapshot.roots] == ["partition-1", "partition-2"]
 
 
 def test_centroid_drift_rebuilds_only_the_shifted_leaf(monkeypatch):
