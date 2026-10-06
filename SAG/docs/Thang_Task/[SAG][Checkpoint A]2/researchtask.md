@@ -4,7 +4,8 @@
 - Repository baseline: `e2de5e7` (`origin/main`, PR #22 merged)
 - Task branch: `feat/Thang-checkpoint-a-production-e2e-acceptance-be-api`
 - Jira (read-only lookup on 2026-10-06): DATN-61 is In Progress, assigned to KeyT, with no comments; DATN-33 and DATN-34 are Done.
-- Status: local contract research recorded; production acceptance is not yet run.
+- PR #23 intent: preparatory local-test/evidence step only; it must not close DATN-61 or be treated as production acceptance.
+- Status: production gate is **OPEN / NOT ACCEPTED**; the real staging acceptance is not run.
 
 ## Findings verified in the repository
 
@@ -77,6 +78,8 @@
 - [x] Inspect the final diff/status and review the changes for correctness, architecture, security, and test intent; no actionable finding remains in this test/documentation-only diff.
 
 ## Acceptance evidence status
+
+PR #23 records local preparation only. Keep DATN-61 In Progress and all production acceptance items unchecked until a staging vertical run supplies the provider, corpus, trusted principal, approved mapping, manifest/locator evidence, and post-revocation results.
 
 | Requirement | Current status |
 |---|---|
