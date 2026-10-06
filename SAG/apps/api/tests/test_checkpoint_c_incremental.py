@@ -25,8 +25,10 @@ from sag_api.core.config import Settings
 from sag_api.core.db import SessionLocal, init_db
 from sag_api.db.models.routing_rag import ProjectSearchState, TreeManifest
 from sag_api.sag.engine_manager import EngineManager
+from sag_api.services import incremental_tree_service as incremental_service
 from sag_api.services.incremental_tree_service import (
     T_HIGH,
+    DriftReport,
     assign_delta_units,
     build_inactive_slot_payloads,
     build_query_routing_snapshot,
@@ -502,8 +504,8 @@ async def test_concurrent_queries_read_isolated_consistent_snapshot():
 
 
 @pytest.mark.asyncio
-async def test_fault_injection_and_rollback_restores_consistency():
-    """Verify that failed inactive write keeps active tree untouched, and rollback restores previous state."""
+async def test_legacy_pg_only_rollback_flips_previous_pointer():
+    """Exercise the legacy DB-only helper; cross-store rollback is tested elsewhere."""
     units = _base_units()
     edges = _base_edges()
     snapshot_v1 = build_routing_snapshot(units[:4], edges[:2])
@@ -910,4 +912,92 @@ async def test_multi_project_routing_snapshots_isolation():
     assert group_b.tree_version == snapshot_b.tree_version
     assert group_b.tenant_id == "tenant-beta"
     assert group_b.partition_id == "part-finance"
+
+
+@pytest.mark.asyncio
+async def test_subtree_build_failure_keeps_previous_tree_serving(monkeypatch):
+    project_id = "proj-subtree-build-failure"
+    units = [replace(unit, project_id=project_id) for unit in _base_units()]
+    base_snapshot = build_routing_snapshot(units, _base_edges(), benchmark=_base_benchmark())
+    affected_node = base_snapshot.roots[0].node_id
+
+    async with SessionLocal() as session:
+        await execute_atomic_tree_publish(session, project_id, base_snapshot, "SLOT_A")
+
+    async with SessionLocal() as session:
+        state_before = await session.get(ProjectSearchState, project_id)
+        manifest_before = await session.get(TreeManifest, base_snapshot.tree_version)
+        assert state_before is not None and manifest_before is not None
+        epoch_before = state_before.active_search_epoch
+        pinned_before = build_query_routing_snapshot(
+            state_before,
+            manifest_before,
+            [
+                {
+                    "project_id": project_id,
+                    "source_ids": ["src-1"],
+                    "document_version_ids": ["ver-1"],
+                    "tenant_id": "tenant-alpha",
+                    "partition_id": "part-tech",
+                }
+            ],
+        )
+
+    monkeypatch.setattr(
+        incremental_service,
+        "compute_tree_drift",
+        lambda *_args, **_kwargs: DriftReport(1.0, 1.0, False, (), 1, True, (affected_node,)),
+    )
+
+    def fail_subtree_build(*_args, **_kwargs):
+        raise RuntimeError("injected subtree build failure")
+
+    monkeypatch.setattr(incremental_service, "rebuild_drifted_subtree", fail_subtree_build)
+    qdrant_requests = []
+
+    def record_qdrant_request(request):
+        qdrant_requests.append(request)
+        return httpx.Response(500)
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(record_qdrant_request),
+        base_url="http://mock-qdrant:6333",
+    )
+    delta = replace(units[0], unit_id="ku-subtree-failure-delta")
+    with pytest.raises(RuntimeError, match="injected subtree build failure"):
+        async with SessionLocal() as session:
+            await coordinate_ingest_delta(
+                session,
+                project_id=project_id,
+                base_snapshot=base_snapshot,
+                new_units=[delta],
+                qdrant_client=client,
+                collection_name="search_units_subtree_build_failure",
+            )
+    await client.aclose()
+
+    async with SessionLocal() as session:
+        state_after = await session.get(ProjectSearchState, project_id)
+        manifest_after = await session.get(TreeManifest, base_snapshot.tree_version)
+        assert state_after is not None and manifest_after is not None
+        assert state_after.active_tree_version == base_snapshot.tree_version
+        assert state_after.active_routing_slot == "SLOT_A"
+        assert state_after.active_search_epoch == epoch_before
+        assert manifest_after.status == "ACTIVE"
+        pinned_after = build_query_routing_snapshot(
+            state_after,
+            manifest_after,
+            [
+                {
+                    "project_id": project_id,
+                    "source_ids": ["src-1"],
+                    "document_version_ids": ["ver-1"],
+                    "tenant_id": "tenant-alpha",
+                    "partition_id": "part-tech",
+                }
+            ],
+        )
+    assert not qdrant_requests
+    assert pinned_before.groups[0].tree_version == pinned_after.groups[0].tree_version
+    assert pinned_before.groups[0].routing_slot == pinned_after.groups[0].routing_slot == "SLOT_A"
 

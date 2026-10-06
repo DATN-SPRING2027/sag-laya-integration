@@ -1401,7 +1401,11 @@ async def execute_tree_rollback(
     session: AsyncSession,
     project_id: str,
 ) -> ProjectSearchState:
-    """Instant zero-downtime rollback to previous tree version in rollback window."""
+    """Legacy PostgreSQL-only pointer flip; not a cross-store rollback API.
+
+    Checkpoint C callers must use ``tree_rollback_service.rollback_tree_candidate``
+    so the retained Qdrant slot is verified before PostgreSQL changes.
+    """
     stmt = (
         select(ProjectSearchState)
         .where(ProjectSearchState.project_id == project_id)
