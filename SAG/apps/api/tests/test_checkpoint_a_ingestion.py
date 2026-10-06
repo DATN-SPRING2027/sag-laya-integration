@@ -985,11 +985,16 @@ async def test_checkpoint_a_extraction_failure_after_indexing_does_not_downgrade
         src_db = (await check_session.execute(select(Source).where(Source.id == source_id))).scalar_one()
         unit_db = (await check_session.execute(select(SearchUnit).where(SearchUnit.document_version_id == ver_id))).scalars().first()
         assert unit_db is not None
+        indexed_payload = next(
+            point["payload"]
+            for point in q_mock.points[f"search_units_{project_id}"].values()
+            if point["payload"].get("search_unit_id") == unit_db.id
+        )
 
         section = RetrievedSection(
             chunk_id=unit_db.id,
-            heading="Section",
-            content="Search ready content",
+            heading=indexed_payload.get("section_path") or "Section",
+            content=indexed_payload["content"],
             source_config_id=src_db.sag_source_config_id,
         )
         resolved = await resolve_traceable_evidence([section], [src_db])
