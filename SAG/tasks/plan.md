@@ -745,6 +745,8 @@ Checkpoint A xác nhận nhánh đầu đã truy vấn được và citation ho�
 
 **Cổng ra:** graph có thể tái tạo và truy nguyên; E2 backlog/failure không ảnh hưởng search; score calibration được đo trên corpus trước khi dùng cho tree.
 
+**Implementation status — 2026-10-06:** producer/store KnowledgeUnit và anchored evidence đã có; E0 deterministic, E1 bounded domain patterns, E2 queue độc lập có budget/concurrency/backpressure/lease/retry và replay validated responses. Sparse graph có partition-local BM25 quantile calibration, missing-signal renormalization và degree cap. PostgreSQL regressions xác nhận rebuild idempotent và knowledge lag/failure không giữ readiness/canonical write lock suốt quá trình build. Specialized E1 model và E2 provider calibration mở rộng còn là follow-up; xem [knowledge foundation evidence](../docs/tai_task/knowledge-foundation-evidence.md).
+
 ### Phase 6 — Knowledge Routing Tree
 
 **Phụ thuộc:** Phase 5.
@@ -773,10 +775,14 @@ Checkpoint A xác nhận nhánh đầu đã truy vấn được và citation ho�
 - Builder trả candidate snapshot kèm metrics/gates; quality fail cho trạng thái
   `REJECTED`. B2 fixture/contract được ghi tại
   [phase-6-tree-evidence.md](../docs/phase-6-tree-evidence.md).
-- **Chưa đạt Checkpoint B:** Phase 5 Knowledge Unit producer/store chưa được triển
-  khai ở repo; candidate chưa được persist/publish vào active pointer; routing
-  recall hiện chỉ đo bằng fixture, chưa có corpus benchmark. Không dùng task này để
-  đánh dấu `ROUTING_READY`; Checkpoint C incremental publish vẫn ngoài phạm vi.
+- Slice 2026-10-03 chỉ có synthetic fixture; producer/persistence/corpus được bổ sung
+  ngày 2026-10-06: Phase 5 feed builder và lưu inactive candidate cùng nodes,
+  profiles, graph, manifest và lineage. Corpus 5 tài liệu repo/13 query đạt recall@10
+  92,3%, không leakage/blackhole; rerun độc lập giữ checksum. Evidence và giới hạn
+  nằm trong [knowledge foundation evidence](../docs/tai_task/knowledge-foundation-evidence.md).
+- Publish/active-slot switching và SearchUnit membership bridge thuộc DATN-58–60,
+  ngoài scope slice này. Không dùng inactive candidate để đánh dấu `ROUTING_READY`
+  hoặc Checkpoint C `INCREMENTAL_READY`; staging/principal/provider gates còn mở.
 
 ### Phase 7 — Tree-guided Retrieval
 

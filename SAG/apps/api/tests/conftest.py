@@ -69,6 +69,7 @@ os.environ.setdefault("SAG_AUTH_MODE", "password")
 # would otherwise provision sources persisted by earlier cases in the background
 # while the current case is writing, introducing cross-test lock contention.
 os.environ["SAG_ENGINE_WARMUP_COUNT"] = "0"
+os.environ["SAG_KNOWLEDGE_WORKER_ENABLED"] = "false"
 # Bắt buộc ngoại tuyến: kể cả khi có .env chứa key thật, vẫn đảm bảo tính xác định của test (không gọi LLM)
 os.environ["SAG_LLM_API_KEY"] = ""
 os.environ["SAG_LLM_BASE_URL"] = ""
