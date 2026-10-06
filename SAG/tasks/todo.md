@@ -143,13 +143,17 @@ Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL ev
 
 ## Phase 5 — Knowledge Units & Graph
 
-- [ ] Xây Knowledge Unit ổn định, tách khỏi Search Unit.
-- [ ] Kiểm tra E0 deterministic, E1 model extraction và điều kiện đưa việc sang E2.
-- [ ] Đưa E2 vào queue async có token/day budget, concurrency, backpressure và retry độc lập.
-- [ ] Gắn evidence/provenance/confidence/validity cho entity, alias, claim, relation.
-- [ ] Sinh graph candidates từ semantic, lexical, entity, structure, citation và temporal signals.
-- [ ] Kiểm tra missing-signal renormalization, calibration [0,1], version config/quantile và sparse degree cap.
+- [x] Xây Knowledge Unit ổn định theo canonical passage/version/scope, tách khỏi Search Unit; rebuild/reparse giữ ID, provenance, validity và checksum; temporal validity/lineage thay đổi sẽ invalidate và rebuild evidence.
+- [x] E0 deterministic; E1 lightweight domain patterns có giới hạn; chọn E2 cho semantic relation hoặc low-confidence/high-importance. Entity/claim/relation là evidence candidates, không tự nâng thành fact.
+- [x] Queue PostgreSQL async độc lập: token/day budget theo tenant, concurrency toàn worker, capacity/max-age backpressure, lease recovery, timeout và bounded retries.
+- [x] Gắn exact block/quote/span, source/version/snapshot, extractor version, confidence và validity cho entity, alias, claim, relation; từ chối E2 thiếu anchor hoặc input stale.
+- [x] Sinh sparse graph candidates từ lexical/entity/structure/citation/temporal và optional dense semantic; semantic thiếu được renormalize, không lấy SearchUnit thay KnowledgeUnit.
+- [x] Calibration [0,1], BM25 q05/q95 theo partition, version config/weights và undirected degree cap; persist/verify graph manifest và edge rows.
 - [x] Xác nhận lỗi/queue lag không chặn hoặc hạ SEARCH_READY.
+- [x] Rebuild từ PostgreSQL canonical/source artifacts; replay response E2 đã validate sau khi mất derived store, không gọi lại model hoặc tính thêm budget; operator retry qua CLI.
+- [x] Regression review: E2 chưa cấu hình/disabled backlog không chặn FOUNDATION; completion thắng lease recovery không bị claim/token charge lặp; old lease không ghi đè success/failure; rebuild sửa text/scope/ordinal bị hỏng từ canonical input.
+- [ ] Calibrate specialized E1 NER/RE và E2 provider thật trên corpus nghiệp vụ mở rộng khi có model/provider và gold labels được duyệt; hiện dùng E1 patterns và E2 validated fake-provider regressions.
+- [x] Evidence: [knowledge-foundation-evidence.md](../docs/tai_task/knowledge-foundation-evidence.md), [corpus results](../docs/tai_task/knowledge-corpus-results.json) và [test_knowledge_foundation.py](../apps/api/tests/test_knowledge_foundation.py).
 
 ## Phase 6 — Knowledge Routing Tree
 
@@ -159,9 +163,12 @@ Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL ev
 - [x] Ghi manifest checksum theo input/config/edges/lineage, metrics cohesion, giant ratio, child-size entropy, edge cut, depth, routing recall và từng quality gate.
 - [x] Regression synthetic xác nhận deterministic rebuild, failed quality gate bị REJECTED và profile/edge không vượt security partition.
 - [x] Fixture contract sẵn sàng cho B2 planner/escape phát triển mock-first: [test_phase_6_routing_tree.py](../apps/api/tests/test_phase_6_routing_tree.py) và [phase-6-tree-evidence.md](../docs/phase-6-tree-evidence.md).
-- [ ] Tích hợp producer Knowledge Unit/Graph Phase 5 và persist node/profile/manifest/lineage; chỉ cập nhật active tree sau publish transaction. Phase 5 hiện chưa có Knowledge Unit store/builder trong repo, nên Phase 6 chỉ tạo candidate snapshot thuần và không đổi active pointer.
-- [ ] Chạy benchmark routing recall trên corpus/query thật, hiệu chỉnh quality thresholds; fixture hiện là synthetic contract evidence.
-- [ ] Hoàn tất end-to-end publish/failed-build-active-tree regression và ACL leakage kiểm tra trên DB/runtime.
+- [x] Tích hợp producer Knowledge Unit/Graph Phase 5 với builder hiện có; persist versioned node/profile/manifest/lineage trong PostgreSQL dưới `knowledge-candidate.v1`, trạng thái INACTIVE hoặc REJECTED; verify input/config/edge/profile/lineage checksums.
+- [x] Benchmark từ 5 tài liệu repo thật và 13 query có gold source anchors: 402 units, 2.379 edges, recall@10 = 12/13 (92,3%) ≥ 80%; ghi quality thresholds, calibration và từng query. Hai tiến trình với PYTHONHASHSEED khác nhau tạo cùng candidate checksum.
+- [x] PostgreSQL/runtime regressions cho tenant/project/partition/source isolation, source revocation, checksum corruption và failed quality/ACL gates; candidate build không đổi active pointer.
+- [ ] DATN-58–60: nối candidate vào incremental publish/active-slot switching, SearchUnit membership và rollback E2E. Phần này ngoài scope knowledge foundation; không đánh dấu ROUTING_READY/INCREMENTAL_READY.
+- [ ] Mở rộng benchmark với held-out corpus/query nghiệp vụ, signed principal và staging leakage/revocation trên dữ liệu thật trước rollout.
+- [x] Evidence producer/persistence/corpus: [knowledge-foundation-evidence.md](../docs/tai_task/knowledge-foundation-evidence.md). Corpus này đại diện kiến trúc/ingestion/security của repo, không thay nghiệm thu provider/Qdrant/production ACL.
 
 ## Phase 7 — Tree-guided Retrieval
 
