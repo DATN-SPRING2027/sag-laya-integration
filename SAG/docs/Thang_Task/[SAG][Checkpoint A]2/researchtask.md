@@ -3,9 +3,10 @@
 - Date: 2026-10-06
 - Repository baseline: `e2de5e7` (`origin/main`, PR #22 merged)
 - Task branch: `feat/Thang-checkpoint-a-production-e2e-acceptance-be-api`
-- Jira (read-only lookup on 2026-10-06): DATN-61 is In Progress, assigned to KeyT, with no comments; DATN-33 and DATN-34 are Done.
+- Jira lookup on 2026-10-06: DATN-61 is In Progress, assigned to KeyT; one comment now records the owner/staging request. DATN-33 and DATN-34 are Done.
 - PR #23 intent: preparatory local-test/evidence step only; it must not close DATN-61 or be treated as production acceptance.
 - Status: production gate is **OPEN / NOT ACCEPTED**; the real staging acceptance is not run.
+- Owner follow-up: requested the missing decisions and staging references in [DATN-61 comment 10107](https://trankimthang0207.atlassian.net/browse/DATN-61?focusedCommentId=10107); waiting for owner responses.
 
 ## Findings verified in the repository
 
@@ -47,7 +48,8 @@
 - [DATN-33](https://trankimthang0207.atlassian.net/browse/DATN-33) is **Done** for ingestion/index/readiness and enrichment independence; [DATN-34](https://trankimthang0207.atlassian.net/browse/DATN-34) is **Done** for global retrieval/context/citation. Their completed scopes do not approve a live Project→Source mapping, trusted production principal, or embedding identity. The unchecked `todo.md` owner item now points to DATN-61 for those remaining production gates.
 - [DATN-67](https://trankimthang0207.atlassian.net/browse/DATN-67), **To Do**, states DATN-61 owns production ACL issuer/JWKS, Project→Source mapping/backfill/revoke, and staging cross-tenant checks; DATN-61 and DATN-67 may proceed in parallel, and DATN-62 starts after both. This supports leaving the owner/staging gate open; it does not supply the missing owner decisions or runtime evidence.
 - [DATN-82](https://trankimthang0207.atlassian.net/browse/DATN-82) and subtasks DATN-207–212 are **To Do** for the separate Project Access Permission Provisioning V1 work package. Record it as adjacent authorization work, not as proof that a specific Checkpoint A contract is approved or as a confirmed blocker to DATN-61.
-- The prior Rovo search returned an incomplete-source warning. The issue status and descriptions above were therefore checked directly through Jira issue lookups; no comments or issue updates were sent.
+- On 2026-10-06, posted [comment 10107 on DATN-61](https://trankimthang0207.atlassian.net/browse/DATN-61?focusedCommentId=10107), requesting owner/source-of-truth confirmation for principal claims and issuer verification, Project→Source lifecycle, readiness/version/embedding identity, staging/corpus/principal/revoke setup, and FE staging access. This is a request only; no approvals or staging values have been received yet.
+- The prior Rovo search returned an incomplete-source warning. The issue status and descriptions above were therefore checked directly through Jira issue lookups. No Jira fields or status were changed; comment 10107 above is the owner request added for this task.
 
 ## Ordered plan and evidence checklist
 

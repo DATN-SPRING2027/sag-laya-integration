@@ -145,6 +145,8 @@ Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL ev
 
 **Local validation follow-up (2026-10-06):** Trên nhánh mới từ `e2de5e7`, API focused suite đạt **170 passed** và FE focused suite đạt **39 passed**; Ruff đạt trên ba test file SearchContext/ACL/agent đã sửa. Full API suite chưa chạy lại trên base mới. Lần full suite trên base cũ `64ec5b4` có **903 passed, 25 failed, 1 skipped, 8 errors, 108 warnings**; không có lỗi trong các test SearchContext đã cập nhật. Chi tiết và giới hạn attribution nằm trong [researchtask.md](../docs/Thang_Task/%5BSAG%5D%5BCheckpoint%20A%5D2/researchtask.md). PR #23 là bước chuẩn bị local, **không đóng DATN-61 và không phải production acceptance**. Các kết quả local dùng fixture/test doubles; staging/production gates vẫn mở và chưa xác nhận principal, Project→Source mapping hoặc embedding identity.
 
+**Owner follow-up (2026-10-06):** Đã đăng [yêu cầu xác nhận contract và staging trên DATN-61](https://trankimthang0207.atlassian.net/browse/DATN-61?focusedCommentId=10107); đang chờ owner trả lời hoặc dẫn nguồn tài liệu đã chốt. Chưa nhận được quyết định, profile/corpus hay quyền staging; không đánh dấu các mục production là hoàn tất.
+
 ## Phase 5 — Knowledge Units & Graph
 
 - [ ] Xây Knowledge Unit ổn định, tách khỏi Search Unit.
