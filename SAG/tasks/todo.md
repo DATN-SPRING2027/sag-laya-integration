@@ -145,7 +145,9 @@ Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL ev
 
 **Local validation follow-up (2026-10-06):** Trên nhánh mới từ `e2de5e7`, API focused suite đạt **170 passed** và FE focused suite đạt **39 passed**; Ruff đạt trên ba test file SearchContext/ACL/agent đã sửa. Full API suite chưa chạy lại trên base mới. Lần full suite trên base cũ `64ec5b4` có **903 passed, 25 failed, 1 skipped, 8 errors, 108 warnings**; không có lỗi trong các test SearchContext đã cập nhật. Chi tiết và giới hạn attribution nằm trong [researchtask.md](../docs/Thang_Task/%5BSAG%5D%5BCheckpoint%20A%5D2/researchtask.md). PR #23 là bước chuẩn bị local, **không đóng DATN-61 và không phải production acceptance**. Các kết quả local dùng fixture/test doubles; staging/production gates vẫn mở và chưa xác nhận principal, Project→Source mapping hoặc embedding identity.
 
-**Owner follow-up (2026-10-06):** Đã đăng [yêu cầu xác nhận contract và staging trên DATN-61](https://trankimthang0207.atlassian.net/browse/DATN-61?focusedCommentId=10107); đang chờ owner trả lời hoặc dẫn nguồn tài liệu đã chốt. Chưa nhận được quyết định, profile/corpus hay quyền staging; không đánh dấu các mục production là hoàn tất.
+**Owner follow-up (kiểm tra 2026-10-11; yêu cầu đăng 2026-10-06):** Đã đăng [yêu cầu xác nhận contract và staging trên DATN-61](https://trankimthang0207.atlassian.net/browse/DATN-61?focusedCommentId=10107). Jira hiện ở trạng thái In Review với hai comment, chưa có owner response; chưa nhận được quyết định, profile/corpus hay quyền staging. Giữ các mục production chưa hoàn tất.
+
+**Review follow-up (2026-10-11):** Đổi tên upload/worker regression để nêu rõ dùng `MockQdrantStorage` và `FakeIngestionEngine`; test mới pass **1/1**. Cập nhật research và evidence để phân biệt local regression với production acceptance. Các mục upload-to-real-Qdrant, post-revoke ACL và browser acceptance vẫn mở.
 
 ## Phase 5 — Knowledge Units & Graph
 

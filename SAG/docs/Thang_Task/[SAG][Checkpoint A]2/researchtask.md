@@ -1,12 +1,18 @@
 # Research and execution plan — [SAG][Checkpoint A] Production E2E
 
-- Date: 2026-10-06
+- Last reviewed: 2026-10-11 (research first recorded 2026-10-06)
 - Repository baseline: `e2de5e7` (`origin/main`, PR #22 merged)
 - Task branch: `feat/Thang-checkpoint-a-production-e2e-acceptance-be-api`
-- Jira lookup on 2026-10-06: DATN-61 is In Progress, assigned to KeyT; one comment now records the owner/staging request. DATN-33 and DATN-34 are Done.
+- Jira lookup on 2026-10-11: DATN-61 is In Review, assigned to KeyT, with two comments total; the latest is the owner/staging request (comment 10107), and no owner response has been recorded. Jira's last-updated timestamp is 2026-10-06. DATN-33 and DATN-34 are Done.
 - PR #23 intent: preparatory local-test/evidence step only; it must not close DATN-61 or be treated as production acceptance.
 - Status: production gate is **OPEN / NOT ACCEPTED**; the real staging acceptance is not run.
 - Owner follow-up: requested the missing decisions and staging references in [DATN-61 comment 10107](https://trankimthang0207.atlassian.net/browse/DATN-61?focusedCommentId=10107); waiting for owner responses.
+
+## Review finding follow-up (2026-10-11)
+
+- The production-acceptance finding remains open: PR #23 is explicitly preparatory, and no staging profile, approved principal/mapping, or real corpus has been supplied. Keep DATN-61 and all production acceptance boxes open.
+- Corrected stale Jira evidence: DATN-61 is **In Review**, with two comments total and no owner response to comment 10107.
+- Renamed the local test to `test_checkpoint_a_mocked_upload_api_worker_manifest_verification` and corrected its docs so the Qdrant/ingestion test doubles are explicit. The renamed test passed **1/1** on 2026-10-11; this does not provide staging evidence.
 
 ## Findings verified in the repository
 
@@ -32,7 +38,7 @@
 
 ## Existing evidence and its limits
 
-- `apps/api/tests/test_checkpoint_a_ingestion.py::test_checkpoint_a_e2e_real_upload_api_to_manifest_verified` exercises the upload HTTP route and worker path but replaces Qdrant with `MockQdrantStorage` and uses `FakeIngestionEngine`; it stops at a verified manifest and does not run `/search`, `/search/stream`, or `search_context` against a real index.
+- `apps/api/tests/test_checkpoint_a_ingestion.py::test_checkpoint_a_mocked_upload_api_worker_manifest_verification` exercises the upload HTTP route and worker path but replaces Qdrant with `MockQdrantStorage` and uses `FakeIngestionEngine`; it stops at a verified mock manifest and does not run `/search`, `/search/stream`, or `search_context` against a real index. This is a local mocked regression, not a real-provider E2E acceptance test.
 - `test_acl_runtime.py` seeds synthetic confirmed/pending/revoked mappings and principals. Retrieval, traceability, agent, and stream suites use fixture rows, fake engines/Qdrant, or stub LLMs. Checkpoint C publish/snapshot tests use local test persistence and a Qdrant double. These are useful regression evidence, not provider/staging acceptance.
 - `SAG/tasks/todo.md` already leaves production upload-to-answer, owner contract, staging leakage/revocation/enrichment/FE navigation, and answerability calibration unchecked. Keep them unchecked until corresponding evidence exists.
 
@@ -42,9 +48,9 @@
 - No live connection, upload, revoke, or mutation was attempted. Consequently the actual provider, corpus, model identity, deployment/runtime, and post-revoke result are **unknown**, and production acceptance cannot be claimed from local fixtures.
 - Owner confirmations are still needed for: (1) upload principal ↔ search assertion tenant/organization/partition authority, (2) who creates/confirms/revokes the Project-to-Source mapping for auto-created Project Sources, (3) readiness/current-attempt and historical-version policy, and (4) embedding model/revision/dimension identity recorded for a verified manifest.
 
-## Jira dependency evidence (read-only, 2026-10-06)
+## Jira dependency evidence (read-only; checked 2026-10-11)
 
-- [DATN-61](https://trankimthang0207.atlassian.net/browse/DATN-61) remains **In Progress**, assigned to KeyT, and has zero comments. Its linked issue [DATN-62](https://trankimthang0207.atlassian.net/browse/DATN-62) is **To Do**; the link direction says DATN-61 blocks DATN-62.
+- [DATN-61](https://trankimthang0207.atlassian.net/browse/DATN-61) is **In Review**, assigned to KeyT, and has two comments total; neither is an owner response to the open contract/staging request. Its linked issue [DATN-62](https://trankimthang0207.atlassian.net/browse/DATN-62) is **To Do**; the link direction says DATN-61 blocks DATN-62.
 - [DATN-33](https://trankimthang0207.atlassian.net/browse/DATN-33) is **Done** for ingestion/index/readiness and enrichment independence; [DATN-34](https://trankimthang0207.atlassian.net/browse/DATN-34) is **Done** for global retrieval/context/citation. Their completed scopes do not approve a live Project→Source mapping, trusted production principal, or embedding identity. The unchecked `todo.md` owner item now points to DATN-61 for those remaining production gates.
 - [DATN-67](https://trankimthang0207.atlassian.net/browse/DATN-67), **To Do**, states DATN-61 owns production ACL issuer/JWKS, Project→Source mapping/backfill/revoke, and staging cross-tenant checks; DATN-61 and DATN-67 may proceed in parallel, and DATN-62 starts after both. This supports leaving the owner/staging gate open; it does not supply the missing owner decisions or runtime evidence.
 - [DATN-82](https://trankimthang0207.atlassian.net/browse/DATN-82) and subtasks DATN-207–212 are **To Do** for the separate Project Access Permission Provisioning V1 work package. Record it as adjacent authorization work, not as proof that a specific Checkpoint A contract is approved or as a confirmed blocker to DATN-61.
@@ -81,7 +87,7 @@
 
 ## Acceptance evidence status
 
-PR #23 records local preparation only. Keep DATN-61 In Progress and all production acceptance items unchecked until a staging vertical run supplies the provider, corpus, trusted principal, approved mapping, manifest/locator evidence, and post-revocation results.
+PR #23 records local preparation only. DATN-61 is currently In Review; keep the issue and all production acceptance items open until a staging vertical run supplies the provider, corpus, trusted principal, approved mapping, manifest/locator evidence, and post-revocation results.
 
 | Requirement | Current status |
 |---|---|

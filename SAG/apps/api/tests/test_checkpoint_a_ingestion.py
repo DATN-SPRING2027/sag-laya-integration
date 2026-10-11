@@ -1007,20 +1007,20 @@ async def test_checkpoint_a_extraction_failure_after_indexing_does_not_downgrade
 
 
 # ==============================================================================
-# Gate 12: True E2E Upload API to Manifest Verified (Finding 5)
+# Gate 12: Mocked upload API → worker → manifest regression (Finding 5)
 # ==============================================================================
 @pytest.mark.asyncio
-async def test_checkpoint_a_e2e_real_upload_api_to_manifest_verified():
-    """Luồng E2E hoàn chỉnh từ HTTP Upload API thực tế đến worker xử lý và verify Qdrant manifest."""
+async def test_checkpoint_a_mocked_upload_api_worker_manifest_verification():
+    """Kiểm tra upload HTTP qua worker với Qdrant và ingestion test doubles."""
     await init_db()
-    project_id = f"proj_real_{uuid.uuid4().hex[:8]}"
+    project_id = f"proj_mock_{uuid.uuid4().hex[:8]}"
     token = create_access_token(
         subject="user_tester",
-        extra={"tenant_id": "tenant_real", "allowed_projects": [project_id], "allowed_partitions": ["sec_real"]},
+        extra={"tenant_id": "tenant_test", "allowed_projects": [project_id], "allowed_partitions": ["sec_test"]},
     )
     auth_header = {"Authorization": f"Bearer {token}"}
 
-    md_content = b"# Architecture Overview\n\nThis is a complete end-to-end integration test from upload API to verified Qdrant manifest."
+    md_content = b"# Architecture Overview\n\nThis is a mocked upload-to-worker regression test."
     transport = httpx.ASGITransport(app=app)
 
     async with _RealAsyncClient(transport=transport, base_url="http://test") as client:
@@ -1030,7 +1030,7 @@ async def test_checkpoint_a_e2e_real_upload_api_to_manifest_verified():
                 **auth_header,
                 "X-Continuum-User-Id": "user_tester",
                 "Idempotency-Key": f"idemp_{uuid.uuid4().hex[:12]}",
-                "X-Continuum-Security-Partition": "sec_real",
+                "X-Continuum-Security-Partition": "sec_test",
             },
             files={"file": ("architecture.md", md_content, "text/markdown")},
         )
