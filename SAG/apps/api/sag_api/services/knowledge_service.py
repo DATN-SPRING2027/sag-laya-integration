@@ -171,6 +171,8 @@ def extract_e0_e1(block: CanonicalBlock, config: KnowledgeConfig) -> tuple[list[
     importance = min(1.0, 0.25 + 0.1 * len(labels) + (0.25 if block.block_type in {"code", "table"} else 0))
     hard = bool(re.search(r"contradict|supersed|thay thế|trái ngược", text, re.IGNORECASE))
     return facts, {
+        # Foundation stage: Dense embeddings for Knowledge Unit are deferred to dedicated
+        # embedder follow-up; signals are calibrated and renormalized via fuse_signals().
         "dense": [],
         "sparse": sparse,
         "entities": labels,

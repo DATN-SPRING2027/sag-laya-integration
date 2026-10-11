@@ -72,6 +72,9 @@ async def enqueue(
     if kind == "E2" and not e2_enabled:
         return None
     await _queue_lock(session)
+    # Policy: E2 job identity is pinned by (version_id, unit_id, kind, input_hash) to avoid
+    # re-spending LLM tokens on rebuild. Changing SAG_KNOWLEDGE_E2_MODEL does not re-enqueue
+    # existing units automatically; re-enrichment requires explicit operator retry or re-ingestion.
     job_id = stable_id(version_id, unit_id or "", kind, input_hash)
     existing = await session.get(KnowledgeJob, job_id)
     if existing:

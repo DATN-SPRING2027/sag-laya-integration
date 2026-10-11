@@ -147,7 +147,7 @@ Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL ev
 - [x] E0 deterministic; E1 lightweight domain patterns có giới hạn; chọn E2 cho semantic relation hoặc low-confidence/high-importance. Entity/claim/relation là evidence candidates, không tự nâng thành fact.
 - [x] Queue PostgreSQL async độc lập: token/day budget theo tenant, concurrency toàn worker, capacity/max-age backpressure, lease recovery, timeout và bounded retries.
 - [x] Gắn exact block/quote/span, source/version/snapshot, extractor version, confidence và validity cho entity, alias, claim, relation; từ chối E2 thiếu anchor hoặc input stale.
-- [x] Sinh sparse graph candidates từ lexical/entity/structure/citation/temporal và optional dense semantic; semantic thiếu được renormalize, không lấy SearchUnit thay KnowledgeUnit.
+- [ ] Sinh graph candidates từ semantic, lexical, entity, structure, citation và temporal signals. *(PR #24 hoàn tất lexical, entity, structure, citation, temporal và missing-signal renormalization; semantic dense representation cho Knowledge Unit được để mở làm follow-up khi tích hợp Knowledge embedder).*
 - [x] Calibration [0,1], BM25 q05/q95 theo partition, version config/weights và undirected degree cap; persist/verify graph manifest và edge rows.
 - [x] Xác nhận lỗi/queue lag không chặn hoặc hạ SEARCH_READY.
 - [x] Rebuild từ PostgreSQL canonical/source artifacts; replay response E2 đã validate sau khi mất derived store, không gọi lại model hoặc tính thêm budget; operator retry qua CLI.

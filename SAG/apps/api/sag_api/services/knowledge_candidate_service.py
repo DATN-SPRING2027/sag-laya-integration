@@ -273,7 +273,7 @@ async def build_knowledge_candidate(
         config_version=config.version,
         node_count=len(profiles),
         leaf_count=len(leaves),
-        max_leaf_size=max(len(n.unit_ids) for n in leaves),
+        max_leaf_size=max((len(n.unit_ids) for n in leaves), default=0),
         giant_ratio=snapshot.metrics["giant_ratio"],
         routing_recall_at_k=snapshot.metrics["routing_recall_at_k"] or 0,
         escape_win_rate=0,
