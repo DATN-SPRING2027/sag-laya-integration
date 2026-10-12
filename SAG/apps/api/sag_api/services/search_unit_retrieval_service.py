@@ -40,6 +40,7 @@ from sag_api.sag.search_unit_store import (
     build_search_filter,
     build_sparse_query_vector,
 )
+from sag_api.services.knowledge_quality_persistence import record_query_demand
 from sag_api.services.query_routing_service import (
     RouteDecision,
     capture_routing_decisions,
@@ -78,6 +79,51 @@ class _SearchGroup:
     @property
     def scope_key(self) -> tuple[str, str, str, str]:
         return (self.project_id, self.source.id, self.tenant_id, self.partition_id)
+
+
+async def _record_routed_query_demand(
+    groups: list[_SearchGroup],
+    decisions: dict[tuple[str, str, str, str], RouteDecision],
+) -> None:
+    """Persist selected node counts without retaining query text or mismatched scopes."""
+    by_scope: dict[tuple[str, str, str, str], set[str]] = defaultdict(set)
+    for group in groups:
+        route = decisions.get(group.scope_key)
+        if (
+            route is None
+            or not route.routed
+            or not route.selected_nodes
+            or route.project_id != group.project_id
+            or not route.tree_version
+            or route.acl_scope_fingerprint != scope_fingerprint(routing_scope_for_group(group))
+        ):
+            continue
+        scope = (
+            group.tenant_id,
+            group.project_id,
+            group.partition_id,
+            route.tree_version,
+        )
+        by_scope[scope].update(node_id for node_id in route.selected_nodes if node_id)
+    if not by_scope:
+        return
+    try:
+        async with asyncio.timeout(0.1):
+            async with SessionLocal() as session:
+                occurred_at = datetime.now(UTC)
+                for (tenant_id, project_id, partition_id, tree_version), node_ids in sorted(by_scope.items()):
+                    await record_query_demand(
+                        session,
+                        tenant_id=tenant_id,
+                        project_id=project_id,
+                        security_partition_id=partition_id,
+                        tree_version=tree_version,
+                        node_ids=tuple(sorted(node_ids)),
+                        occurred_at=occurred_at,
+                    )
+                await session.commit()
+    except Exception as error:  # noqa: BLE001 - demand recording must never break retrieval
+        log.warning("knowledge query demand write failed error_type=%s", type(error).__name__)
 
 
 def _verified_manifest(metrics: Any, *, project_id: str) -> bool:
@@ -1116,6 +1162,7 @@ async def retrieve_search_unit_sections(
         graph_skip_reason=graph_skip_reason,
         selection_fallback_reason=selection_fallback_reason,
     )
+    await _record_routed_query_demand(groups, decisions)
     return SearchOutcome(
         query=query,
         sections=selected,

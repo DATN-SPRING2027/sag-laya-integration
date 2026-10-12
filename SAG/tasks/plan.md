@@ -814,11 +814,35 @@ Checkpoint A xác nhận nhánh đầu đã truy vấn được và citation ho�
 
 **Phụ thuộc:** Phase 6–7 và metrics/trace của Phase 4, 7.
 
-1. Tính coverage, source diversity, freshness, contradiction, query demand, uncertainty và growth rate theo node/topic.
-2. Tính gap priority từ tín hiệu có cấu trúc; version các metric/threshold.
-3. Chỉ gọi LLM để diễn đạt gap đã xác định thành câu hỏi; không để LLM tự phát hiện gap vô điều kiện.
+**Bằng chứng hiện trạng:** xem `SAG/docs/Thang_Task/[SAG][Phase 9}/research.md`. Routing trace tồn tại nhưng chưa được lưu thành demand aggregate; tree/profile metrics hiện tại đo chất lượng routing, không đo knowledge quality. DATN-62 và Checkpoint B đã hoàn tất; DATN-67 Phase 4 vẫn In Progress. V1 dùng trace/tree hiện có và ghi rõ giới hạn fixture/rollout.
 
-**Cổng ra:** gap có evidence/reason/priority truy nguyên được; score thay đổi theo dữ liệu kiểm thử dự kiến.
+**Contract V1:**
+
+1. Scope của một lần assessment là một tenant/project/security partition và một tree_version. Topic là node_id trong tree đó; không tự suy diễn taxonomy ngoài node.
+2. Coverage = tỷ lệ KnowledgeUnit hiện hành của node có ít nhất một KnowledgeEvidence còn hợp lệ và có quote/locator. Đây là anchored-evidence coverage, không phải semantic answerability.
+3. Source diversity = normalized Shannon entropy của source_id trong units/evidence hợp lệ.
+4. Freshness dùng as_of cố định và timestamp published_at → observed_at → ingested_at; tính decay theo half-life có version.
+5. Contradiction dùng tín hiệu edge được gắn nhãn CONTRADICTS và giữ trạng thái candidate/unresolved; kết quả gọi là contradiction-candidate rate, không tuyên bố conflict đã được xác minh.
+6. Query demand chỉ lưu daily aggregate theo tenant/project/partition/tree/node; không lưu raw query. Demand growth so sánh hai cửa sổ liên tiếp có cùng độ dài.
+7. Uncertainty là proxy từ confidence của evidence (1 - mean confidence), luôn gắn nhãn uncalibrated cho đến khi có calibration evidence.
+8. Scoring config/metric definitions/thresholds có version và checksum. Severity là weighted mean của các deficit/risks đã chuẩn hoá; importance kết hợp demand và demand growth; priority = clamp(severity × importance, 0, 1). Thiếu input bắt buộc là unknown kèm reason code, không mặc định thành zero.
+9. Persist assessment snapshot, component metrics, checksums, gap priority, supporting evidence IDs/locators và reason codes. Question có FK đến scored gap và kế thừa evidence/reason linkage.
+10. Chỉ gọi phrase-only LLM khi caller yêu cầu cho một gap eligible đã persist; model không chấm điểm, thêm evidence, gọi research tools hay mở task. No eligible gap thì không gọi model.
+
+**Làm rõ công thức V1:** phương trình tại mục 16.2 của workflow là mô hình mục tiêu khái quát. V1 dùng severity weighted mean và importance kết hợp demand/growth như trên vì hiện không có tín hiệu importance độc lập, freshness need theo domain hoặc uncertainty đã calibration. Đây là quyết định scoring đã duyệt trong research Phase 9; không được diễn giải các proxy hiện tại như mô hình hiệu chuẩn cuối cùng.
+
+**Task breakdown:**
+
+1. Định nghĩa frozen schemas/config/version và pure deterministic metric/scoring functions; viết fixtures trước implementation.
+2. Tạo model và migration additive cho demand aggregates, assessments, scored gaps, questions; không sửa migrations 0001–0003.
+3. Viết scoped collector từ tree node → current units → evidence/conflict candidates; fail closed khi scope/checksum/ACL lineage không khớp.
+4. Ghi demand aggregate từ route decision đã ACL-validated; chỉ giữ bucket count, không giữ query text. Bucket vắng ở một cửa sổ là unknown, không suy thành zero vì writer chỉ ghi node được route và có thể fail-soft trong rollout. Lỗi ghi demand không làm search trả dữ liệu sai scope; phải được log/trace.
+5. Thêm phrase-only question service nhận gap đã persisted, validate output, lưu linkage; không kết nối Phase 10/research tools.
+6. Chạy focused regressions và repository checks; cập nhật Phase 9 evidence ở todo.md và research.md.
+
+**Cổng ra:** cùng input/config/as_of/window cho cùng checksum, metrics, reason codes và priority; fixtures chứng minh priority đổi theo anchored evidence, freshness, contradiction candidates và demand; mọi question liên kết tới scored gap/evidence/reason; ACL isolation được kiểm tra. Fixture/local pass không được ghi nhận là production Phase 4/7 acceptance.
+
+**Rủi ro/giới hạn:** query demand chỉ bắt đầu có dữ liệu sau khi writer được triển khai; bucket/window thiếu là unknown cho tới khi có quan sát đủ, không backfill; confidence và CONTRADICTS hiện là candidate/proxy signals; live PostgreSQL/Qdrant và DATN-67 acceptance cần báo cáo riêng.
 
 ### Phase 10 — Research Agent
 
