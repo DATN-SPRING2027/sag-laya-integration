@@ -1,6 +1,6 @@
 # Research and execution plan — [SAG][Checkpoint A] Production E2E
 
-- Last reviewed: 2026-10-11 (research first recorded 2026-10-06)
+- Last reviewed: 2026-10-12 (research first recorded 2026-10-06)
 - Repository baseline: `e2de5e7` (`origin/main`, PR #22 merged)
 - Task branch: `feat/Thang-checkpoint-a-production-e2e-acceptance-be-api`
 - Jira lookup on 2026-10-11: DATN-61 is In Review, assigned to KeyT, with two comments total; the latest is the owner/staging request (comment 10107), and no owner response has been recorded. Jira's last-updated timestamp is 2026-10-06. DATN-33 and DATN-34 are Done.
@@ -27,6 +27,7 @@
 - Preserved the upstream Phase 5/6 updates in `SAG/tasks/todo.md` together with the Checkpoint A production items, which remain unchecked.
 - Focused tests after conflict resolution: `test_checkpoint_a_extraction_failure_after_indexing_does_not_downgrade_search_ready` and `test_checkpoint_a_mocked_upload_api_worker_manifest_verification` — **2 passed**.
 - The merge includes the already-merged PR #24 migration `SAG/apps/api/migrations/0003_knowledge_foundation.sql` and related models unchanged; this conflict fix adds no further schema or migration change. No new runtime configuration or secrets were introduced. Real provider/Qdrant, staging ACL revoke, and browser acceptance remain open.
+- Conflict resolution merge commit: `a9d4cad` on PR #23's task branch.
 
 ## Findings verified in the repository
 
