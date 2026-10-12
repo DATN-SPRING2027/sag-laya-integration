@@ -78,6 +78,56 @@ class ResearchPlan:
     target_urls: tuple[str, ...]
     reason_codes: tuple[str, ...]
     checksum: str
+    discovery_provenance: dict[str, object] = ()
+
+
+def discover_candidates_from_gap_or_question(
+    gap: KnowledgeGap,
+    question: KnowledgeGapQuestion | None,
+    policy: ResearchPolicy,
+    budget: ResearchBudget,
+) -> tuple[tuple[str, ...], dict[str, object]]:
+    """Deterministic discovery generating candidate URLs and provenance from question or gap and policy."""
+    if question is not None and question.question_text:
+        raw_query = question.question_text.strip()
+        strategy = "grounded_question_discovery"
+        question_id = question.id
+    else:
+        raw_query = gap.node_id.replace("node-", "").replace("-", " ").strip()
+        strategy = "gap_node_discovery"
+        question_id = None
+
+    words = [w for w in "".join(c if c.isalnum() else " " for c in raw_query).split() if len(w) > 2]
+    topic_query = "+".join(words[:4]) or "overview"
+
+    candidates: list[str] = []
+    for domain in policy.allowed_domains:
+        d_clean = domain.lower().strip()
+        if not d_clean:
+            continue
+        if "python" in d_clean:
+            candidates.append(f"https://{d_clean}/3/search.html?q={topic_query}")
+        elif "wikipedia" in d_clean:
+            candidates.append(f"https://{d_clean}/wiki/Special:Search?search={topic_query}")
+        else:
+            candidates.append(f"https://{d_clean}/search?q={topic_query}")
+
+    provenance: dict[str, object] = {
+        "strategy": strategy,
+        "question_id": question_id,
+        "query_terms": list(words[:4]),
+        "discovered_count": len(candidates),
+    }
+    return tuple(candidates[: budget.max_fetches]), provenance
+
+
+def discover_candidates_from_question(
+    question: KnowledgeGapQuestion,
+    policy: ResearchPolicy,
+    budget: ResearchBudget,
+) -> tuple[tuple[str, ...], dict[str, object]]:
+    dummy_gap = KnowledgeGap(id=question.gap_id, node_id="", eligible=True)
+    return discover_candidates_from_gap_or_question(dummy_gap, question, policy, budget)
 
 
 def normalize_url(raw_url: str) -> str:
@@ -153,10 +203,23 @@ def plan_research_task(
     active_policy = policy or ResearchPolicy()
     active_budget = budget or ResearchBudget()
 
+    discovery_provenance: dict[str, object] = {}
+    candidates_to_evaluate: list[str] = list(candidate_urls)
+    if not candidates_to_evaluate:
+        discovered_urls, discovery_provenance = discover_candidates_from_gap_or_question(
+            gap, question, active_policy, active_budget
+        )
+        candidates_to_evaluate.extend(discovered_urls)
+    else:
+        discovery_provenance = {
+            "strategy": "caller_supplied_candidates",
+            "candidate_count": len(candidates_to_evaluate),
+        }
+
     # Filter and normalize candidate URLs against the policy allowlist
     valid_urls: list[str] = []
     seen: set[str] = set()
-    for candidate in candidate_urls:
+    for candidate in candidates_to_evaluate:
         norm = normalize_url(candidate)
         if norm and norm not in seen and is_url_allowed(norm, active_policy):
             seen.add(norm)
@@ -182,6 +245,7 @@ def plan_research_task(
             "budget": asdict(active_budget),
             "target_urls": list(bounded_urls),
             "reason_codes": list(reason_codes),
+            "discovery_provenance": discovery_provenance,
         }
     )
 
@@ -198,6 +262,7 @@ def plan_research_task(
         target_urls=bounded_urls,
         reason_codes=reason_codes,
         checksum=plan_checksum,
+        discovery_provenance=discovery_provenance,
     )
 
 
@@ -274,7 +339,10 @@ async def create_or_get_research_task(
         question_id=plan.question_id,
         status=ResearchTaskStatus.PENDING.value,
         reason_codes_json=list(plan.reason_codes),
-        policy_json=asdict(plan.policy),
+        policy_json={
+            **asdict(plan.policy),
+            "discovery_provenance": dict(plan.discovery_provenance),
+        },
         budget_json=asdict(plan.budget),
         target_urls_json=list(plan.target_urls),
         fetch_count=0,

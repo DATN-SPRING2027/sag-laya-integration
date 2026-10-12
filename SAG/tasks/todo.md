@@ -275,6 +275,12 @@ Implementation slice B2 và các phụ thuộc Phase 5 là lịch sử riêng tr
 - [x] Research task bắt nguồn từ gap signal có căn cứ.
 - [x] Ingestion loop có giới hạn và dừng khi không có thông tin mới.
 
+**Implementation status (2026-10-12, Phase 10 & Checkpoint D):**
+- Đã hoàn tất toàn bộ 16/16 tests trong `test_research_planner.py` và `test_research_agent_checkpoint_d.py` (100% passed).
+- Bổ sung manual redirect revalidation (tối đa 5 hops, recheck allowlist và SSRF tại mỗi hop), streaming response với `max_bytes_per_page`, cumulative task cap `max_total_bytes`, terminal task idempotency, failure classification, duplicate check scoped by security partition, và automatic bounded discovery từ gap/question.
+- Dữ liệu fetch chuyển tiếp thành công sang normal ingestion `handle_document_upload` và cập nhật cây tri thức `update_tree_incrementally`.
+- Chi tiết xem tại [researchtask.md](../docs/Thang_Task/[SAG][Phase%2010]/researchtask.md) và [evidence.md](../docs/Thang_Task/[SAG][Phase%2010]/evidence.md).
+
 ## Phase 11 — Hardening
 
 - [ ] Cache keys chứa scope/ACL fingerprint/epoch, search/tree/model/planner/config version và filters cần thiết.

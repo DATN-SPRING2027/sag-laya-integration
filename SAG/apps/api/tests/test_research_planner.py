@@ -274,3 +274,47 @@ async def test_detect_eligible_gaps_and_task_persistence(test_session):
         min_priority=0.20,
     )
     assert len(detected_after) == 0
+
+
+def test_discover_candidates_from_question_and_provenance():
+    gap = KnowledgeGap(
+        id="gap-disc",
+        assessment_id="assess-1",
+        node_id="node-lang",
+        priority=0.75,
+        severity=0.8,
+        importance=0.7,
+        eligible=True,
+        metrics_json={},
+        reason_codes_json=["LOW_COVERAGE"],
+        evidence_refs_json=[],
+        checksum="c-disc",
+    )
+    question = KnowledgeGapQuestion(
+        id="q-disc",
+        gap_id="gap-disc",
+        question_text="How does async generators work in Python?",
+        generator_version="g1",
+        model_version="m1",
+        prompt_version="p1",
+        evidence_ids_json=[],
+        reason_codes_json=[],
+        checksum="cq-disc",
+    )
+    policy = ResearchPolicy(allowed_domains=("docs.python.org", "wikipedia.org"))
+    budget = ResearchBudget(max_fetches=2)
+
+    plan = plan_research_task(
+        gap,
+        question,
+        tenant_id="t1",
+        project_id="p1",
+        security_partition_id="part1",
+        tree_version="tv1",
+        policy=policy,
+        budget=budget,
+    )
+    assert len(plan.target_urls) == 2
+    assert plan.discovery_provenance["strategy"] == "grounded_question_discovery"
+    assert plan.discovery_provenance["question_id"] == "q-disc"
+
