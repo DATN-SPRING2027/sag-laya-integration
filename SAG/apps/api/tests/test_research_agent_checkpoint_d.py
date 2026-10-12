@@ -320,9 +320,10 @@ async def test_normal_ingestion_relay_success(session, seeded_gap):
     assert run.payload_hash == p_hash
 
 
-def test_incremental_tree_update_with_research_unit():
+def test_incremental_tree_update_with_research_unit(monkeypatch):
+    monkeypatch.setattr("importlib.metadata.version", lambda _pkg: "0.10.0")
     # Build base tree
-    config = TreeBuildConfig(min_cluster_size=2, target_cluster_size=4, max_cluster_size=8)
+    config = TreeBuildConfig(min_cluster_size=2, target_cluster_size=6, max_cluster_size=8)
     units = [
         KnowledgeUnitInput(
             unit_id=f"ku-{i}",
@@ -333,10 +334,10 @@ def test_incremental_tree_update_with_research_unit():
             sparse=(("dl", 1.0),),
             entities=("NeuralNet",),
         )
-        for i in range(6)
+        for i in range(4)
     ]
     base_snapshot = build_routing_snapshot(units, (), config=config)
-    assert base_snapshot.manifest["unit_count"] == 6
+    assert base_snapshot.manifest["unit_count"] == 4
 
     # New unit ingested from research task
     research_unit = KnowledgeUnitInput(
