@@ -277,11 +277,14 @@ Implementation slice B2 và các phụ thuộc Phase 5 là lịch sử riêng tr
 
 ## Phase 11 — Hardening
 
-- [ ] Cache keys chứa scope/ACL fingerprint/epoch, search/tree/model/planner/config version và filters cần thiết.
-- [ ] Answer cache tắt mặc định; semantic route cache chỉ bật sau khi đo precision và ACL isolation.
+- [x] Thêm exact route-decision cache key có scope/principal ACL fingerprint, SourceProjectMapping generation, current INDEX_SEARCH run/stage/manifest, search/tree/config/model/planner versions, query-profile inputs và filters; phân quyền và snapshot/lease mới vẫn chạy trước mỗi lần tra cache.
+- [x] Route-decision cache mặc định tắt; không có answer/evidence cache hoặc semantic query reuse. Semantic cache chưa được triển khai vì chưa có route-equivalence benchmark và enablement gate được owner thống nhất.
+- [x] Fixture bật cache để kiểm tra miss sau mapping revoke/regrant, reindex cùng document version, publish/rollback search epoch; key fixture kiểm tra tenant/project/partition, filter và tree config; cache hit gắn snapshot ID hiện tại, fallback không được lưu.
 - [ ] Đo p50/p95/p99 theo stage và end-to-end; đặt SLO/latency budget theo benchmark môi trường.
-- [ ] Chạy regression/load, ACL leakage/blackhole, retry/failure, cache invalidation, publish/rollback checks.
+- [ ] Chạy load/latency và live PostgreSQL/Qdrant ACL revoke/leakage/blackhole, retry/failure, publish/rollback verification.
 - [ ] Hoàn thiện dashboards/alerts và migration/rollback/rebuild runbook.
+
+**Evidence (2026-10-12):** focused cache/routing/retrieval/tree suite đạt **62 passed**; Checkpoint C publish/failure/rollback/incremental đạt **46 passed**. Full API suite bị chặn khi collect hai module phụ thuộc `litellm`; ACL/revoke/publish/rollback group có 58 passed và 6 lỗi khởi động vì thiếu package này (bản khóa cần MSVC linker). Ruff, format check cho cache/routing/test files, `compileall` và `git diff --check` đạt. Không dùng kết quả fixture để đóng staging/runtime acceptance. Semantic precision chưa đo; cache semantic vẫn không được triển khai/bật. Chi tiết: [Phase 11 evidence](../docs/Thang_Task/%5BSAG%5D%5BPhase%2011%5D/evidence.md).
 
 ## Hoàn tất
 

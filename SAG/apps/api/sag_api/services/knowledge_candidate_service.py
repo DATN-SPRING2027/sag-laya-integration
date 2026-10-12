@@ -123,6 +123,7 @@ def benchmark_routes(
             snapshot_id="offline-benchmark",
             captured_at=datetime(2026, 1, 1, tzinfo=UTC),
             tree_version=snapshot.tree_version,
+            tree_config_version=snapshot.manifest["config_version"],
             routing_slot="SLOT_A",
             search_epoch=1,
             manifest_status="ACTIVE",

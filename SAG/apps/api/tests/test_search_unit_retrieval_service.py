@@ -433,6 +433,7 @@ async def test_verified_search_ready_unit_flows_through_acl_dense_sparse_and_cit
                 partition_id=scope["partition_id"],
                 scope_fingerprint=fingerprint,
                 tree_version="tree-v1",
+                tree_config_version="routing-snapshot.v1",
                 routing_slot="SLOT_A",
                 search_epoch=1,
                 manifest_status="ACTIVE",

@@ -214,6 +214,9 @@ class Settings(BaseSettings):
     # Keep part of the routed query's deadline available to its ACL-scoped global escape.
     search_tree_escape_reserve_seconds: float = Field(default=1.5, ge=0.1, le=10.0)
     search_tree_snapshot_timeout: float = Field(default=1.0, ge=0.05, le=10.0)
+    # Exact, profile-content-addressed route decisions only. Semantic matching
+    # and answer/evidence caching have no enablement path in this release.
+    search_route_decision_cache_enabled: bool = False
     # Diversity knobs are retrieval quality parameters, not answerability/confidence thresholds.
     search_mmr_diversity_weight: float = Field(default=0.5, ge=0.0, le=1.0)
     search_near_duplicate_similarity: float = Field(default=0.98, ge=0.9, le=1.0)
