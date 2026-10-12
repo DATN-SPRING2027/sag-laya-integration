@@ -498,6 +498,8 @@ async def test_route_cache_does_not_store_fallback_decisions(monkeypatch):
         versions=("v1",),
         tenant_id="t1",
         partition_id="part1",
+        acl_mapping_version=1,
+        search_index_versions=(("v1", "run-1", "stage-1", "a" * 64),),
     )
     principal = SimpleNamespace(
         subject="user-1",
