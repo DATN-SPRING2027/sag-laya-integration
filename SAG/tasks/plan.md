@@ -148,13 +148,13 @@ phải bằng chứng user được phép xem.
 
 #### Task P4.2 — Rank fusion ổn định
 
-- [ ] Tách dense/engine candidates và lexical candidates thành các ranked lists.
-- [ ] Dùng RRF hoặc calibrated rank fusion; không cộng raw dense/sparse score.
-- [ ] Dedupe exact candidate theo source-config/chunk key, có fallback fingerprint
+- [x] Tách dense/engine candidates và lexical candidates thành các ranked lists.
+- [x] Dùng RRF hoặc calibrated rank fusion; không cộng raw dense/sparse score.
+- [x] Dedupe exact candidate theo source-config/chunk key, có fallback fingerprint
       ổn định; deterministic tie-break theo fused score/rank/key.
-- [ ] Chuẩn hóa score output về contract hiện có `[0, 1]` và ghi fusion method,
+- [x] Chuẩn hóa score output về contract hiện có `[0, 1]` và ghi fusion method,
       candidate counts, filtered counts trong retrieval stats.
-- [ ] Không thêm MMR/context/citation/no-answer vào task này.
+- [x] Không thêm MMR/context/citation/no-answer vào task này.
 
 #### Task P4.3 — Global query-flow integration
 
@@ -166,17 +166,17 @@ phải bằng chứng user được phép xem.
 
 #### Task P4.4 — Regression và review gate
 
-- [ ] Relevance: semantic paraphrase, exact identifier, Vietnamese/domain mix,
+- [x] Relevance: semantic paraphrase, exact identifier, Vietnamese/domain mix,
       duplicate candidate và deterministic ordering.
-- [ ] Fusion: raw score scale khác nhau không làm một retriever lấn át do scale;
+- [x] Fusion: raw score scale khác nhau không làm một retriever lấn át do scale;
       rank agreement và tie-break ổn định.
 - [x] ACL seam tests: intersection, implicit scope, empty scope, unauthorized
       request, dense/lexical parity, fail-closed `/search` và stream.
 - [ ] Production ACL: real assertion, Project→Source mapping/backfill, revoke
       behavior và cross-project/cross-organization leakage tests.
-- [ ] API: global `/search`, `/search/stream`, source scope và P3 trace không
+- [x] API: global `/search`, `/search/stream`, source scope và P3 trace không
       regression.
-- [ ] Cập nhật `tasks/todo.md` và Phase 4 review evidence sau khi code pass.
+- [x] Cập nhật `tasks/todo.md` và Phase 4 review evidence sau khi code pass (xem [phase-4-fusion-retrieval-evidence.md](../docs/tai_task/phase-4-fusion-retrieval-evidence.md)).
 
 ### Checkpoints
 
