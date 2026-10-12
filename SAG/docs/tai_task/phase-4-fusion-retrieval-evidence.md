@@ -13,12 +13,12 @@ Toàn bộ **99/99 test cases** thuộc tổ hợp Phase 4 Retrieval, Fusion và
 
 | Test Suite File | Số lượng Tests | Trạng thái | Thời gian thực thi |
 |---|:---:|:---:|:---:|
-| [`tests/test_phase_4_fusion_retrieval.py`](file:///d:/DoAnTotnghiep/sag-laya-integration/SAG/apps/api/tests/test_phase_4_fusion_retrieval.py) | **9** | **PASSED** | 4.29s |
+| [`tests/test_phase_4_fusion_retrieval.py`](file:///d:/DoAnTotnghiep/sag-laya-integration/SAG/apps/api/tests/test_phase_4_fusion_retrieval.py) | **9** | **PASSED** | 13.36s |
 | [`tests/test_retrieval_relevance.py`](file:///d:/DoAnTotnghiep/sag-laya-integration/SAG/apps/api/tests/test_retrieval_relevance.py) | **35** | **PASSED** | 4.05s |
-| [`tests/test_search_unit_retrieval_service.py`](file:///d:/DoAnTotnghiep/sag-laya-integration/SAG/apps/api/tests/test_search_unit_retrieval_service.py) | **20** | **PASSED** | 5.12s |
-| [`tests/test_search_strategy.py`](file:///d:/DoAnTotnghiep/sag-laya-integration/SAG/apps/api/tests/test_search_strategy.py) | **25** | **PASSED** | 6.80s |
-| [`tests/test_search_stream.py`](file:///d:/DoAnTotnghiep/sag-laya-integration/SAG/apps/api/tests/test_search_stream.py) | **10** | **PASSED** | 5.34s |
-| **TỔNG CỘNG** | **99** | **PASSED (100%)** | **29.84s** |
+| [`tests/test_search_unit_retrieval_service.py`](file:///d:/DoAnTotnghiep/sag-laya-integration/SAG/apps/api/tests/test_search_unit_retrieval_service.py) | **20** | **PASSED** | 5.45s |
+| [`tests/test_search_strategy.py`](file:///d:/DoAnTotnghiep/sag-laya-integration/SAG/apps/api/tests/test_search_strategy.py) | **24** | **PASSED** | 19.47s |
+| [`tests/test_search_stream.py`](file:///d:/DoAnTotnghiep/sag-laya-integration/SAG/apps/api/tests/test_search_stream.py) | **11** | **PASSED** | 14.09s |
+| **TỔNG CỘNG** | **99** | **PASSED (100%)** | **56.42s** |
 
 ---
 
@@ -34,12 +34,13 @@ Toàn bộ **99/99 test cases** thuộc tổ hợp Phase 4 Retrieval, Fusion và
 | `test_semantic_paraphrase_preserves_dense_evidence_without_lexical_overlap` | Truy vấn dạng diễn đạt lại bằng ngôn ngữ đời thường ("sinh em bé") đưa đúng văn bản pháp lý chính sách thai sản lên đầu dù không trùng từ khóa trực tiếp. | **PASSED** |
 | `test_exact_identifier_query_prioritizes_literal_code_over_generic_match` | Truy vấn chứa mã hiệu văn bản `"QD-2026/TT-BTC"` đưa chính xác tài liệu chứa mã hiệu lên vị trí #1 bảng xếp hạng, vượt qua các tài liệu chung chung có điểm semantic cao hơn. | **PASSED** |
 | `test_score_normalization_and_retrieval_stats_contract` | Khẳng định hợp đồng RerankResult: `0.0 <= score <= 1.0`, `rank >= 0`, `candidate_count == relevant_count + filtered_count`. | **PASSED** |
-| `test_canonical_search_unit_emits_rrf_fusion_trace` | Kiểm chứng luồng Canonical SearchUnit ghi nhận đúng `stats["fusion_method"] == "rrf"` cùng đầy đủ `semantic_candidates`, `lexical_candidates`, `candidates`, `relevant`, `filtered_irrelevant`. | **PASSED** |
+| `test_canonical_search_unit_emits_rrf_fusion_trace` | Thực thi retrieval pipeline thật với SQLite/Qdrant fixture, kiểm chứng ghi nhận đúng `stats["fusion_method"] == "rrf"` cùng đầy đủ `semantic_candidates`, `lexical_candidates`, `candidates`, `relevant`, `filtered_irrelevant`. | **PASSED** |
 
 ---
 
-## 3. Nhật ký Chạy Test Thực tế (CLI Log)
+## 3. Nhật ký Chạy Kiểm thử & Code Quality Thực tế
 
+### 3.1 Pytest Execution Logs
 ```
 rootdir: D:\DoAnTotnghiep\sag-laya-integration\SAG\apps\api
 configfile: pyproject.toml
@@ -56,10 +57,19 @@ tests/test_phase_4_fusion_retrieval.py::test_exact_identifier_query_prioritizes_
 tests/test_phase_4_fusion_retrieval.py::test_score_normalization_and_retrieval_stats_contract PASSED [ 88%]
 tests/test_phase_4_fusion_retrieval.py::test_canonical_search_unit_emits_rrf_fusion_trace PASSED [100%]
 
-======================== 9 passed, 1 warning in 4.29s =========================
+======================== 9 passed, 1 warning in 13.36s =========================
 
 Chạy toàn bộ 5 suites liên quan:
-99 passed, 2 warnings in 29.84s
+99 passed, 2 warnings in 56.42s
+```
+
+### 3.2 Linter & Diff Quality Gate (Ruff & Git Diff)
+```
+$ python -m ruff check tests/test_phase_4_fusion_retrieval.py
+All checks passed!
+
+$ git diff --check
+(clean, no trailing whitespace or diff issues)
 ```
 
 ---

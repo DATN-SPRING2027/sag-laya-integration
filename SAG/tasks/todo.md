@@ -74,12 +74,12 @@ Nguồn chuẩn: [Workflow v1.1](../docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1
 - [x] Relevance gate semantic-only bất biến khi retriever score được scale dương; có regression test.
 - [x] Trước dense/lexical candidate generation, giao Project được ký với mapping CONFIRMED Project→Source; client Source IDs chỉ thu hẹp scope.
 Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL evidence-path inventory](../docs/security/acl-evidence-path-inventory.md).
-- [x] Collapse exact/near duplicate; kiểm tra MMR giữ evidence đa dạng.
-- [x] Giới hạn candidate rerank và chỉ rerank khi còn latency budget.
-- [x] Build context theo coverage/diversity và token budget.
-- [x] Citation map được về source/version/block/page/anchor; kiểm tra no-answer khi evidence thiếu.
-- [x] Xác nhận LLM Settings độc lập Laya và chỉ nhận evidence pack.
-- [x] Ghi stage latency, requested/effective strategy và fallback trong trace.
+- [ ] Collapse exact/near duplicate; kiểm tra MMR giữ evidence đa dạng.
+- [ ] Giới hạn candidate rerank và chỉ rerank khi còn latency budget.
+- [ ] Build context theo coverage/diversity và token budget.
+- [ ] Citation map được về source/version/block/page/anchor; kiểm tra no-answer khi evidence thiếu.
+- [ ] Xác nhận LLM Settings độc lập Laya và chỉ nhận evidence pack.
+- [ ] Ghi stage latency, requested/effective strategy và fallback trong trace.
 - [x] Tạo/chạy retrieval regression corpus: bổ sung test suite `test_phase_4_fusion_retrieval.py` kiểm chứng scale invariance, Vietnamese domain queries, semantic paraphrase, exact identifiers và deterministic ordering; xem [phase-4-fusion-retrieval-evidence.md](../docs/tai_task/phase-4-fusion-retrieval-evidence.md).
 
 ### P4 task proposal — Global retrieval, ACL và fusion

@@ -14,11 +14,9 @@ Verifies:
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 
-from sag_api.sag import RetrievedSection, SearchOutcome
+from sag_api.sag import RetrievedSection
 from sag_api.services.retrieval_service import rerank_sections
 
 
@@ -349,53 +347,243 @@ def test_score_normalization_and_retrieval_stats_contract():
 # 9. Canonical SearchUnit Integration Emits RRF Fusion Trace
 # ==============================================================================
 @pytest.mark.asyncio
-async def test_canonical_search_unit_emits_rrf_fusion_trace(monkeypatch):
+async def test_canonical_search_unit_emits_rrf_fusion_trace():
     """Canonical search unit retrieval path must record fusion_method='rrf' and candidate stats."""
+    import hashlib
+    import uuid
+    from datetime import UTC, datetime, timedelta
+
+    import httpx
+
+    from sag_api.core.db import SessionLocal, init_db
+    from sag_api.core.principal_assertion import VerifiedPrincipal
+    from sag_api.db.models import (
+        CanonicalBlock,
+        Document,
+        DocumentVersion,
+        IngestionRun,
+        SearchUnit,
+        Source,
+        SourceProjectMapping,
+        StageRun,
+    )
+    from sag_api.enums import DocumentStatus
     from sag_api.services import search_unit_retrieval_service
-    from sag_api.services.query_strategy_planner import plan_query
+    from sag_api.services.search_index_service import generate_search_unit_point_id
 
-    source = SimpleNamespace(
-        id="src-1",
-        name="Tài liệu mẫu",
-        sag_source_config_id="sc-1",
-    )
-    principal = SimpleNamespace(tenant_id="tenant-vn", allowed_partition_ids=frozenset({"sec-vn"}))
+    await init_db()
+    suffix = uuid.uuid4().hex
+    project_id = f"project-{suffix}"
+    source_id = f"source-{suffix}"
+    source_config_id = f"config-{suffix}"
+    tenant_id = f"tenant-{suffix}"
+    partition_id = f"partition-{suffix}"
+    document_id = f"doc-{suffix}"
+    version_id = f"ver-{suffix}"
+    block_id = f"block-{suffix}"
+    unit_id = f"unit-{suffix}"
+    run_id = f"run-{suffix}"
+    content = "Quy trình đối soát và giải ngân hợp đồng tín dụng."
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    now = datetime.now(UTC)
+    manifest_checksum = hashlib.sha256(f"manifest-{suffix}".encode()).hexdigest()
 
-    dummy_outcome = SearchOutcome(
-        query="tra cứu quy trình",
-        sections=[
-            _section("unit_1", "Quy trình", "Nội dung quy trình chi tiết.", 0.95).model_copy(
-                update={"canonical_evidence_verified": True}
+    async with SessionLocal() as session:
+        source = Source(
+            id=source_id,
+            name="Tài liệu tín dụng",
+            sag_source_config_id=source_config_id,
+            config={},
+        )
+        session.add(source)
+        await session.flush()
+        session.add(
+            SourceProjectMapping(
+                source_id=source_id,
+                organization_id=f"org-{suffix}",
+                project_id=project_id,
+                state="CONFIRMED",
+                confirmed_at=now,
+                confirmed_by="test-owner",
+                approval_ref="test-approval",
             )
-        ],
-        stats={
-            "canonical_index": True,
-            "fusion_method": "rrf",
-            "semantic_candidates": 5,
-            "lexical_candidates": 3,
-            "candidates": 6,
-            "relevant": 4,
-            "filtered_irrelevant": 2,
-        },
+        )
+        await session.flush()
+        session.add(
+            Document(
+                id=document_id,
+                source_id=source_id,
+                tenant_id=tenant_id,
+                project_id=project_id,
+                filename="quy_trinh_tin_dung.md",
+                content_type="text/markdown",
+                size_bytes=len(content),
+                storage_path=f"/tmp/{document_id}",
+                status=DocumentStatus.READY,
+                is_active=True,
+            )
+        )
+        await session.flush()
+        session.add(
+            DocumentVersion(
+                id=version_id,
+                document_id=document_id,
+                version_no=1,
+                file_hash=hashlib.sha256(b"upload").hexdigest(),
+                status="RECEIVED",
+                search_status="SEARCH_READY",
+                search_ready_at=now,
+                metadata_json={"security_partition_id": partition_id},
+            )
+        )
+        await session.flush()
+        session.add(
+            IngestionRun(
+                id=run_id,
+                tenant_id=tenant_id,
+                project_id=project_id,
+                document_version_id=version_id,
+                idempotency_key=suffix,
+                payload_hash=hashlib.sha256(b"payload").hexdigest(),
+                status="SUCCEEDED",
+                started_at=now - timedelta(seconds=2),
+                completed_at=now,
+                created_at=now - timedelta(seconds=2),
+            )
+        )
+        await session.flush()
+        session.add(
+            CanonicalBlock(
+                id=block_id,
+                document_version_id=version_id,
+                ordinal=0,
+                block_type="paragraph",
+                page_from=1,
+                page_to=1,
+                section_path="Quy trình > Giải ngân",
+                source_anchor="anchor-giai-ngan",
+                normalized_text=content,
+                content_hash=content_hash,
+            )
+        )
+        session.add(
+            SearchUnit(
+                id=unit_id,
+                document_version_id=version_id,
+                block_from_id=block_id,
+                block_to_id=block_id,
+                security_partition_id=partition_id,
+                content_hash=content_hash,
+                token_count=10,
+                page_from=1,
+                page_to=1,
+                section_path="Quy trình > Giải ngân",
+            )
+        )
+        session.add(
+            StageRun(
+                id=f"stage-{suffix}",
+                run_id=run_id,
+                stage="INDEX_SEARCH",
+                status="SUCCESS",
+                duration_ms=1,
+                created_at=now,
+                metrics_json={
+                    "manifest_verified": True,
+                    "collection_name": f"search_units_{project_id}",
+                    "search_unit_count": 1,
+                    "pg_count": 1,
+                    "qdrant_count": 1,
+                    "qdrant_indexed_count": 1,
+                    "manifest_checksum": manifest_checksum,
+                    "qdrant_checksum": manifest_checksum,
+                },
+            )
+        )
+        await session.commit()
+        source = await session.get(Source, source_id)
+
+    principal = VerifiedPrincipal(
+        subject="user-p4-test",
+        organization_id=f"org-{suffix}",
+        allowed_project_ids=frozenset({project_id}),
+        issuer="https://issuer.invalid",
+        key_id="test-key",
+        token_id=f"token-{suffix}",
+        issued_at=1,
+        expires_at=2,
+        tenant_id=tenant_id,
+        allowed_partition_ids=frozenset({partition_id}),
     )
 
-    async def mock_retrieve(*args, **kwargs):
-        return dummy_outcome
+    point_id = generate_search_unit_point_id(f"search_units_{project_id}", unit_id)
 
-    monkeypatch.setattr(search_unit_retrieval_service, "retrieve_search_unit_sections", mock_retrieve)
+    async def qdrant_reply(request: httpx.Request) -> httpx.Response:
+        point_payload = {
+            "search_unit_id": unit_id,
+            "document_version_id": version_id,
+            "project_id": project_id,
+            "tenant_id": tenant_id,
+            "security_partition_id": partition_id,
+            "content_hash": content_hash,
+            "content": content,
+        }
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={"result": {"id": point_id, "score": 0.0, "payload": point_payload}},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "result": {
+                    "points": [
+                        {
+                            "id": point_id,
+                            "score": 0.85,
+                            "payload": point_payload,
+                        }
+                    ]
+                }
+            },
+        )
+
+    qdrant_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(qdrant_reply),
+        base_url="http://qdrant-test",
+    )
+
+    class Embedder:
+        async def generate(self, _query: str):
+            return [0.1, 0.9]
+
+    class SearchEngines:
+        async def get_sag_embedding(self, *_args):
+            return Embedder()
+
+        async def get_search_unit_qdrant_client(self):
+            return qdrant_client
+
+        async def get_routing_snapshot(self, **_kwargs):
+            return None
+
+    search_engines = SearchEngines()
 
     outcome = await search_unit_retrieval_service.retrieve_search_unit_sections(
-        SimpleNamespace(),
+        search_engines,
         [source],
-        "tra cứu quy trình",
+        "quy trình giải ngân",
         principal=principal,
         top_k=5,
-        query_strategy_plan=plan_query("tra cứu quy trình"),
     )
 
+    assert outcome.stats["canonical_index"] is True
     assert outcome.stats["fusion_method"] == "rrf"
-    assert outcome.stats["semantic_candidates"] == 5
-    assert outcome.stats["lexical_candidates"] == 3
-    assert outcome.stats["candidates"] == 6
-    assert outcome.stats["filtered_irrelevant"] == 2
-    assert all(0.0 <= s.score <= 1.0 for s in outcome.sections)
+    assert outcome.stats["semantic_candidates"] == 1
+    assert outcome.stats["lexical_candidates"] == 1
+    assert outcome.stats["candidates"] == 1
+    assert outcome.stats["relevant"] == 1
+    assert outcome.stats["filtered_irrelevant"] == 0
+    assert len(outcome.sections) == 1
+    assert outcome.sections[0].chunk_id == unit_id
+    assert 0.0 <= outcome.sections[0].score <= 1.0
