@@ -41,4 +41,4 @@
 - Corrected the evidence folder and recorded the two-window cold-start rule in the plan and todo evidence.
 - Ruff on the five changed Python files passed; Python 3.11 `py_compile` passed on the same files.
 - Pytest could not run after these edits: the default runner lacks `zleap`; the locked `uv` environment failed to build `litellm` because MSVC `link.exe` is unavailable, before test collection. The 26/26 Phase 9 and 27/27 routing/retrieval outcomes were reported by the reviewer before this follow-up, not rerun against these edits.
-- PR #26 remains open. The exact follow-up commit will be recorded after commit creation.
+- Implementation commit: `c5ca0946fd83f13f3cbd153b2d49dbb854f5d63b` (`fix(sag): address Phase 9 review feedback`). PR #26 remains open.
