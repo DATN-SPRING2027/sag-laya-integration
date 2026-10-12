@@ -67,6 +67,10 @@ class _ReadyVersion:
     tenant_id: str
     partition_id: str
     source: SearchableSource
+    acl_mapping_version: int = 0
+    ingestion_run_id: str = ""
+    index_stage_run_id: str = ""
+    search_manifest_checksum: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +80,8 @@ class _SearchGroup:
     partition_id: str
     source: SearchableSource
     versions: tuple[str, ...]
+    acl_mapping_version: int = 0
+    search_index_versions: tuple[tuple[str, str, str, str], ...] = ()
 
     @property
     def scope_key(self) -> tuple[str, str, str, str]:
@@ -225,6 +231,7 @@ async def _load_current_ready_versions_checked(
                 Document.project_id,
                 Document.tenant_id,
                 SearchUnit.security_partition_id,
+                SourceProjectMapping.mapping_version,
             )
             .join(DocumentVersion, DocumentVersion.id == SearchUnit.document_version_id)
             .join(Document, Document.id == DocumentVersion.document_id)
@@ -320,6 +327,10 @@ async def _load_current_ready_versions_checked(
             project_id=str(row.project_id),
             tenant_id=str(row.tenant_id),
             partition_id=str(row.security_partition_id),
+            acl_mapping_version=int(row.mapping_version),
+            ingestion_run_id=str(run.run_id),
+            index_stage_run_id=str(stage.id),
+            search_manifest_checksum=str(stage.metrics_json["manifest_checksum"]),
             source=source,
         )
     return versions
@@ -361,21 +372,32 @@ async def _hidden_reprocess_document_ids(session: AsyncSession, source_ids: list
 
 
 def _groups(versions: dict[str, _ReadyVersion]) -> list[_SearchGroup]:
-    grouped: dict[tuple[str, str, str, str], list[str]] = defaultdict(list)
-    source_by_scope: dict[tuple[str, str, str, str], SearchableSource] = {}
+    grouped: dict[tuple[str, str, str, str], list[_ReadyVersion]] = defaultdict(list)
     for version in versions.values():
         key = (version.project_id, version.source_id, version.tenant_id, version.partition_id)
-        grouped[key].append(version.document_version_id)
-        source_by_scope[key] = version.source
+        grouped[key].append(version)
     return [
         _SearchGroup(
             project_id=key[0],
             tenant_id=key[2],
             partition_id=key[3],
-            source=source_by_scope[key],
-            versions=tuple(sorted(set(version_ids))),
+            source=group_versions[0].source,
+            versions=tuple(sorted({version.document_version_id for version in group_versions})),
+            acl_mapping_version=group_versions[0].acl_mapping_version,
+            search_index_versions=tuple(
+                sorted(
+                    (
+                        version.document_version_id,
+                        version.ingestion_run_id,
+                        version.index_stage_run_id,
+                        version.search_manifest_checksum,
+                    )
+                    for version in group_versions
+                )
+            ),
         )
-        for key, version_ids in sorted(grouped.items())
+        for key, group_versions in sorted(grouped.items())
+        if len({version.acl_mapping_version for version in group_versions}) == 1
     ]
 
 
@@ -715,6 +737,7 @@ async def retrieve_search_unit_sections(
                 groups,
                 query=query,
                 planner_trace=strategy_plan.as_trace(),
+                principal=principal,
                 timeout_seconds=snapshot_budget,
             )
 

@@ -197,6 +197,7 @@ async def acquire_tree_query_snapshot(
                         load_only(
                             TreeManifest.tree_version,
                             TreeManifest.project_id,
+                            TreeManifest.config_version,
                             TreeManifest.status,
                             TreeManifest.checksum,
                         )
@@ -381,6 +382,7 @@ async def acquire_tree_query_snapshot(
                         partition_id=partition_id,
                         scope_fingerprint=request["scope_fingerprint"],
                         tree_version=state.active_tree_version,
+                        tree_config_version=record.config_version,
                         routing_slot=state.active_routing_slot,
                         search_epoch=state.active_search_epoch,
                         manifest_status=record.status,

@@ -1546,6 +1546,7 @@ def build_query_routing_snapshot(
                 partition_id=partition_id,
                 scope_fingerprint=fingerprint,
                 tree_version=state.active_tree_version or "",
+                tree_config_version=manifest_record.config_version,
                 routing_slot=state.active_routing_slot,  # type: ignore[arg-type]
                 search_epoch=state.active_search_epoch,
                 manifest_status=manifest_record.status,

@@ -20,6 +20,13 @@ from typing import Literal, Protocol
 from pydantic import BaseModel, ConfigDict, Field
 
 from sag_api.core.config import settings
+from sag_api.services.route_cache_service import (
+    ROUTE_DECISION_MODEL_VERSION,
+    build_route_decision_cache_key,
+    effective_acl_epoch,
+    principal_acl_fingerprint,
+    route_decision_cache,
+)
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +41,8 @@ class _RoutingGroup(Protocol):
     versions: tuple[str, ...]
     tenant_id: str
     partition_id: str
+    acl_mapping_version: int
+    search_index_versions: tuple[tuple[str, str, str, str], ...]
 
 
 def scope_fingerprint(scope: dict[str, object]) -> str:
@@ -96,6 +105,7 @@ class GroupRoutingSnapshot(BaseModel):
     partition_id: str
     scope_fingerprint: str
     tree_version: str
+    tree_config_version: str = Field(min_length=1, max_length=32)
     routing_slot: Literal["SLOT_A", "SLOT_B"]
     search_epoch: int = Field(ge=1)
     manifest_status: str
@@ -170,6 +180,21 @@ def routing_scope_for_group(group: _RoutingGroup) -> dict[str, object]:
         "document_version_ids": tuple(sorted(group.versions)),
         "tenant_id": str(group.tenant_id),
         "partition_id": str(group.partition_id),
+        "acl_mapping_version": getattr(group, "acl_mapping_version", 0),
+        "search_index_versions": tuple(
+            {
+                "document_version_id": document_version_id,
+                "ingestion_run_id": ingestion_run_id,
+                "index_stage_run_id": index_stage_run_id,
+                "manifest_checksum": manifest_checksum,
+            }
+            for (
+                document_version_id,
+                ingestion_run_id,
+                index_stage_run_id,
+                manifest_checksum,
+            ) in getattr(group, "search_index_versions", ())
+        ),
     }
 
 
@@ -179,11 +204,14 @@ async def capture_routing_decisions(
     *,
     query: str,
     planner_trace: dict[str, object],
+    principal: object | None = None,
     timeout_seconds: float | None = None,
 ) -> dict[tuple[str, str, str, str], RouteDecision]:
     """Capture all per-Project profiles in one provider call for request consistency."""
     scopes = [routing_scope_for_group(group) for group in groups]
     expected = {scope_fingerprint(scope): scope for scope in scopes}
+    acl_fingerprint = principal_acl_fingerprint(principal)
+    acl_epoch = effective_acl_epoch(scopes)
     fallback_code = "TREE_PROVIDER_UNAVAILABLE"
     fallback_reason = "routing_snapshot_provider_unavailable"
     provider = getattr(engine_manager, "get_routing_snapshot", None)
@@ -225,7 +253,32 @@ async def capture_routing_decisions(
                         str(scope["tenant_id"]),
                         str(scope["partition_id"]),
                     )
-                    decision = route_snapshot(profile)
+                    cache_key = None
+                    if settings.search_route_decision_cache_enabled and acl_fingerprint and acl_epoch:
+                        cache_key = build_route_decision_cache_key(
+                            profile,
+                            query=query,
+                            planner_trace=planner_trace,
+                            acl_fingerprint=acl_fingerprint,
+                            acl_epoch=acl_epoch,
+                            model_version=ROUTE_DECISION_MODEL_VERSION,
+                            filters={"authorized_scopes": scopes},
+                        )
+                    cached_decision = (
+                        route_decision_cache.get(cache_key, enabled=settings.search_route_decision_cache_enabled)
+                        if cache_key
+                        else None
+                    )
+                    if isinstance(cached_decision, RouteDecision):
+                        decision = cached_decision.model_copy(update={"snapshot_id": profile.snapshot_id})
+                    else:
+                        decision = route_snapshot(profile)
+                        if cache_key and decision.routed and decision.fallback_reason is None:
+                            route_decision_cache.put(
+                                cache_key,
+                                decision,
+                                enabled=settings.search_route_decision_cache_enabled,
+                            )
                     decisions[key] = decision.model_copy(
                         update={
                             "request_snapshot_id": snapshot.snapshot_id,

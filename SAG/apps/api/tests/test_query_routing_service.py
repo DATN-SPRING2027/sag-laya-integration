@@ -73,6 +73,7 @@ def _snapshot(*, accessible: bool = True, scores: tuple[float, float] = (0.9, 0.
         partition_id="part1",
         scope_fingerprint=fingerprint,
         tree_version="tree-v1",
+        tree_config_version="routing-snapshot.v1",
         routing_slot="SLOT_A",
         search_epoch=2,
         manifest_status="ACTIVE",
@@ -138,6 +139,8 @@ async def test_snapshot_provider_timeout_falls_back_to_global_search():
         versions=("v1",),
         tenant_id="t1",
         partition_id="part1",
+        acl_mapping_version=1,
+        search_index_versions=(("v1", "run-1", "stage-1", "a" * 64),),
     )
 
     class DelayedProvider:
@@ -175,6 +178,8 @@ async def test_oversized_request_snapshot_falls_back_before_profile_routing(monk
         versions=("v1",),
         tenant_id="t1",
         partition_id="part1",
+        acl_mapping_version=1,
+        search_index_versions=(("v1", "run-1", "stage-1", "a" * 64),),
     )
 
     class OversizedProvider:
@@ -191,3 +196,335 @@ async def test_oversized_request_snapshot_falls_back_before_profile_routing(monk
     route = decisions["p1", "s1", "t1", "part1"]
     assert not route.routed
     assert route.reason_code == "TREE_PROVIDER_ERROR"
+
+
+@pytest.mark.asyncio
+async def test_enabled_exact_cache_reuses_only_decision_after_fresh_snapshot(monkeypatch):
+    from sag_api.core.config import settings
+    from sag_api.services import query_routing_service
+    from sag_api.services.route_cache_service import route_decision_cache
+
+    monkeypatch.setattr(settings, "search_route_decision_cache_enabled", True)
+    route_decision_cache.clear()
+    source_snapshot = _snapshot()
+    provider_calls = 0
+    route_calls = 0
+
+    class RotatingSnapshotProvider:
+        async def get_routing_snapshot(self, **_kwargs):
+            nonlocal provider_calls
+            provider_calls += 1
+            group_snapshot = source_snapshot.model_copy(update={"snapshot_id": f"group-{provider_calls}"})
+            return RoutingSnapshot(
+                snapshot_id=f"request-{provider_calls}",
+                captured_at=group_snapshot.captured_at,
+                groups=(group_snapshot,),
+            )
+
+    original_route_snapshot = query_routing_service.route_snapshot
+
+    def counted_route_snapshot(snapshot, *, policy=None):
+        nonlocal route_calls
+        route_calls += 1
+        return original_route_snapshot(snapshot, policy=policy)
+
+    monkeypatch.setattr(query_routing_service, "route_snapshot", counted_route_snapshot)
+    group = SimpleNamespace(
+        project_id="p1",
+        source=SimpleNamespace(id="s1"),
+        versions=("v1",),
+        tenant_id="t1",
+        partition_id="part1",
+        acl_mapping_version=1,
+        search_index_versions=(("v1", "run-1", "stage-1", "a" * 64),),
+    )
+    principal = SimpleNamespace(
+        subject="user-1",
+        organization_id="org-1",
+        tenant_id="t1",
+        allowed_project_ids=frozenset({"p1"}),
+        allowed_partition_ids=frozenset({"part1"}),
+    )
+
+    first = await capture_routing_decisions(
+        RotatingSnapshotProvider(),
+        [group],
+        query="question",
+        planner_trace={"planner_version": "qsp-v1"},
+        principal=principal,
+    )
+    second = await capture_routing_decisions(
+        RotatingSnapshotProvider(),
+        [group],
+        query="question",
+        planner_trace={"planner_version": "qsp-v1"},
+        principal=principal,
+    )
+
+    first_route = first["p1", "s1", "t1", "part1"]
+    second_route = second["p1", "s1", "t1", "part1"]
+    assert provider_calls == 2
+    assert route_calls == 1
+    assert first_route.snapshot_id == "group-1"
+    assert second_route.snapshot_id == "group-2"
+    assert second_route.request_snapshot_id == "request-2"
+    assert second_route.membership_node_ids == first_route.membership_node_ids
+    route_decision_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_enabled_route_cache_misses_after_acl_index_publish_and_rollback_changes(monkeypatch):
+    from sag_api.core.config import settings
+    from sag_api.services import query_routing_service
+    from sag_api.services.route_cache_service import route_decision_cache
+
+    monkeypatch.setattr(settings, "search_route_decision_cache_enabled", True)
+    route_decision_cache.clear()
+    route_calls = 0
+    original_route_snapshot = query_routing_service.route_snapshot
+
+    def counted_route_snapshot(snapshot, *, policy=None):
+        nonlocal route_calls
+        route_calls += 1
+        return original_route_snapshot(snapshot, policy=policy)
+
+    monkeypatch.setattr(query_routing_service, "route_snapshot", counted_route_snapshot)
+    principal = SimpleNamespace(
+        subject="user-1",
+        organization_id="org-1",
+        tenant_id="t1",
+        allowed_project_ids=frozenset({"p1"}),
+        allowed_partition_ids=frozenset({"part1"}),
+    )
+    source_snapshot = _snapshot()
+    provider_calls = 0
+
+    class Provider:
+        def __init__(self, search_epoch: int = 2):
+            self.search_epoch = search_epoch
+
+        async def get_routing_snapshot(self, **_kwargs):
+            nonlocal provider_calls
+            provider_calls += 1
+            group_snapshot = source_snapshot.model_copy(
+                update={"snapshot_id": f"group-{provider_calls}", "search_epoch": self.search_epoch}
+            )
+            return RoutingSnapshot(
+                snapshot_id=f"request-{provider_calls}",
+                captured_at=group_snapshot.captured_at,
+                groups=(group_snapshot,),
+            )
+
+    def group(*, mapping_version: int, run_id: str, stage_id: str):
+        return SimpleNamespace(
+            project_id="p1",
+            source=SimpleNamespace(id="s1"),
+            versions=("v1",),
+            tenant_id="t1",
+            partition_id="part1",
+            acl_mapping_version=mapping_version,
+            search_index_versions=(("v1", run_id, stage_id, "a" * 64),),
+        )
+
+    for current_group, search_epoch in (
+        (group(mapping_version=1, run_id="run-1", stage_id="stage-1"), 2),
+        # Revoke/regrant returns to the same effective scope but advances the mapping generation.
+        (group(mapping_version=3, run_id="run-1", stage_id="stage-1"), 2),
+        # Reprocess retains DocumentVersion.id but creates a different current index attempt.
+        (group(mapping_version=3, run_id="run-2", stage_id="stage-2"), 2),
+        # Publish and rollback each advance active_search_epoch, even when a tree is reactivated.
+        (group(mapping_version=3, run_id="run-2", stage_id="stage-2"), 3),
+        (group(mapping_version=3, run_id="run-2", stage_id="stage-2"), 4),
+    ):
+        await capture_routing_decisions(
+            Provider(search_epoch),
+            [current_group],
+            query="question",
+            planner_trace={"planner_version": "qsp-v1"},
+            principal=principal,
+        )
+
+    assert provider_calls == 5
+    assert route_calls == 5
+    route_decision_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_route_cache_bypasses_when_current_principal_fingerprint_is_missing(monkeypatch):
+    from sag_api.core.config import settings
+    from sag_api.services import query_routing_service
+    from sag_api.services.route_cache_service import route_decision_cache
+
+    monkeypatch.setattr(settings, "search_route_decision_cache_enabled", True)
+    route_decision_cache.clear()
+    calls = 0
+    original_route_snapshot = query_routing_service.route_snapshot
+
+    def counted_route_snapshot(snapshot, *, policy=None):
+        nonlocal calls
+        calls += 1
+        return original_route_snapshot(snapshot, policy=policy)
+
+    monkeypatch.setattr(query_routing_service, "route_snapshot", counted_route_snapshot)
+    source_snapshot = _snapshot()
+    provider_calls = 0
+
+    class Provider:
+        async def get_routing_snapshot(self, **_kwargs):
+            nonlocal provider_calls
+            provider_calls += 1
+            group_snapshot = source_snapshot.model_copy(update={"snapshot_id": f"group-{provider_calls}"})
+            return RoutingSnapshot(
+                snapshot_id=f"request-{provider_calls}",
+                captured_at=group_snapshot.captured_at,
+                groups=(group_snapshot,),
+            )
+
+    group = SimpleNamespace(
+        project_id="p1",
+        source=SimpleNamespace(id="s1"),
+        versions=("v1",),
+        tenant_id="t1",
+        partition_id="part1",
+        acl_mapping_version=1,
+        search_index_versions=(("v1", "run-1", "stage-1", "a" * 64),),
+    )
+
+    for _ in range(2):
+        await capture_routing_decisions(
+            Provider(),
+            [group],
+            query="question",
+            planner_trace={"planner_version": "qsp-v1"},
+        )
+
+    assert calls == 2
+    assert len(route_decision_cache) == 0
+
+
+@pytest.mark.asyncio
+async def test_enabled_route_cache_does_not_reuse_decision_after_acl_scope_changes(monkeypatch):
+    from sag_api.core.config import settings
+    from sag_api.services import query_routing_service
+    from sag_api.services.route_cache_service import route_decision_cache
+
+    monkeypatch.setattr(settings, "search_route_decision_cache_enabled", True)
+    route_decision_cache.clear()
+    calls = 0
+    original_route_snapshot = query_routing_service.route_snapshot
+
+    def counted_route_snapshot(snapshot, *, policy=None):
+        nonlocal calls
+        calls += 1
+        return original_route_snapshot(snapshot, policy=policy)
+
+    monkeypatch.setattr(query_routing_service, "route_snapshot", counted_route_snapshot)
+    group = SimpleNamespace(
+        project_id="p1",
+        source=SimpleNamespace(id="s1"),
+        versions=("v1",),
+        tenant_id="t1",
+        partition_id="part1",
+        acl_mapping_version=1,
+        search_index_versions=(("v1", "run-1", "stage-1", "a" * 64),),
+    )
+    principal = SimpleNamespace(
+        subject="user-1",
+        organization_id="org-1",
+        tenant_id="t1",
+        allowed_project_ids=frozenset({"p1"}),
+        allowed_partition_ids=frozenset({"part1"}),
+    )
+
+    class SingleSnapshotProvider:
+        async def get_routing_snapshot(self, **_kwargs):
+            snapshot = _snapshot()
+            return RoutingSnapshot(
+                snapshot_id="request-snapshot",
+                captured_at=snapshot.captured_at,
+                groups=(snapshot,),
+            )
+
+    await capture_routing_decisions(
+        SingleSnapshotProvider(),
+        [group],
+        query="question",
+        planner_trace={"planner_version": "qsp-v1"},
+        principal=principal,
+    )
+    changed_principal = SimpleNamespace(
+        **{**principal.__dict__, "allowed_partition_ids": frozenset({"other-partition"})}
+    )
+    await capture_routing_decisions(
+        SingleSnapshotProvider(),
+        [group],
+        query="question",
+        planner_trace={"planner_version": "qsp-v1"},
+        principal=changed_principal,
+    )
+
+    assert calls == 2
+    route_decision_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_route_cache_does_not_store_fallback_decisions(monkeypatch):
+    from sag_api.core.config import settings
+    from sag_api.services import query_routing_service
+    from sag_api.services.route_cache_service import route_decision_cache
+
+    monkeypatch.setattr(settings, "search_route_decision_cache_enabled", True)
+    route_decision_cache.clear()
+    source_snapshot = _snapshot()
+    source_snapshot = source_snapshot.model_copy(
+        update={
+            "profiles": tuple(
+                profile.model_copy(update={"accessible_unit_count": 0}) for profile in source_snapshot.profiles
+            )
+        }
+    )
+    calls = 0
+    original_route_snapshot = query_routing_service.route_snapshot
+
+    def counted_route_snapshot(snapshot, *, policy=None):
+        nonlocal calls
+        calls += 1
+        return original_route_snapshot(snapshot, policy=policy)
+
+    monkeypatch.setattr(query_routing_service, "route_snapshot", counted_route_snapshot)
+    group = SimpleNamespace(
+        project_id="p1",
+        source=SimpleNamespace(id="s1"),
+        versions=("v1",),
+        tenant_id="t1",
+        partition_id="part1",
+    )
+    principal = SimpleNamespace(
+        subject="user-1",
+        organization_id="org-1",
+        tenant_id="t1",
+        allowed_project_ids=frozenset({"p1"}),
+        allowed_partition_ids=frozenset({"part1"}),
+    )
+
+    class Provider:
+        async def get_routing_snapshot(self, **_kwargs):
+            return RoutingSnapshot(
+                snapshot_id="request-snapshot",
+                captured_at=source_snapshot.captured_at,
+                groups=(source_snapshot,),
+            )
+
+    for _ in range(2):
+        result = await capture_routing_decisions(
+            Provider(),
+            [group],
+            query="question",
+            planner_trace={"planner_version": "qsp-v1"},
+            principal=principal,
+        )
+        assert not result["p1", "s1", "t1", "part1"].routed
+
+    assert calls == 2
+    assert len(route_decision_cache) == 0
+    route_decision_cache.clear()
