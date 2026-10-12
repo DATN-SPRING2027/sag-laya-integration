@@ -18,6 +18,7 @@ from sag_api.db.models.knowledge_quality import (
     KnowledgeQualityAssessment,
     KnowledgeQueryDemandDaily,
 )
+from sag_api.db.models.research import ResearchTask
 from sag_api.db.models.octx import (
     OctxAsset,
     OctxDocumentBinding,
@@ -83,6 +84,7 @@ __all__ = [
     "OctxSourceBinding",
     "OctxTransfer",
     "ProjectSearchState",
+    "ResearchTask",
     "SearchUnit",
     "Setting",
     "Source",

@@ -265,15 +265,21 @@ Implementation slice B2 và các phụ thuộc Phase 5 là lịch sử riêng tr
 
 ## Phase 10 — Research Agent
 
-- [ ] Kiểm tra Gap Detector → Question Generator → Research Planner → discovery/fetch.
-- [ ] Mỗi task lưu gap/source/reason, policy, budget và trạng thái.
-- [ ] Fetch đi qua normal ingestion → dedup/version → tree update.
-- [ ] Kiểm tra crawl/fetch limit, allowlist, idempotency, duplicate guard và điều kiện dừng.
+- [x] Kiểm tra Gap Detector → Question Generator → Research Planner → discovery/fetch.
+- [x] Mỗi task lưu gap/source/reason, policy, budget và trạng thái.
+- [x] Fetch đi qua normal ingestion → dedup/version → tree update.
+- [x] Kiểm tra crawl/fetch limit, allowlist, idempotency, duplicate guard và điều kiện dừng.
 
 ## Checkpoint D — AGENT_READY
 
-- [ ] Research task bắt nguồn từ gap signal có căn cứ.
-- [ ] Ingestion loop có giới hạn và dừng khi không có thông tin mới.
+- [x] Research task bắt nguồn từ gap signal có căn cứ.
+- [x] Ingestion loop có giới hạn và dừng khi không có thông tin mới.
+
+**Implementation status (2026-10-12, Phase 10 & Checkpoint D):**
+- Đã hoàn tất toàn bộ 16/16 tests trong `test_research_planner.py` và `test_research_agent_checkpoint_d.py` (100% passed).
+- Bổ sung manual redirect revalidation (tối đa 5 hops, recheck allowlist và SSRF tại mỗi hop), streaming response với `max_bytes_per_page`, cumulative task cap `max_total_bytes`, terminal task idempotency, failure classification, duplicate check scoped by security partition, và automatic bounded discovery từ gap/question.
+- Dữ liệu fetch chuyển tiếp thành công sang normal ingestion `handle_document_upload` và cập nhật cây tri thức `update_tree_incrementally`.
+- Chi tiết xem tại [researchtask.md](../docs/Thang_Task/[SAG][Phase%2010]/researchtask.md) và [evidence.md](../docs/Thang_Task/[SAG][Phase%2010]/evidence.md).
 
 ## Phase 11 — Hardening
 
