@@ -265,15 +265,15 @@ Implementation slice B2 và các phụ thuộc Phase 5 là lịch sử riêng tr
 
 ## Phase 10 — Research Agent
 
-- [ ] Kiểm tra Gap Detector → Question Generator → Research Planner → discovery/fetch.
-- [ ] Mỗi task lưu gap/source/reason, policy, budget và trạng thái.
-- [ ] Fetch đi qua normal ingestion → dedup/version → tree update.
-- [ ] Kiểm tra crawl/fetch limit, allowlist, idempotency, duplicate guard và điều kiện dừng.
+- [x] Kiểm tra Gap Detector → Question Generator → Research Planner → discovery/fetch.
+- [x] Mỗi task lưu gap/source/reason, policy, budget và trạng thái.
+- [x] Fetch đi qua normal ingestion → dedup/version → tree update.
+- [x] Kiểm tra crawl/fetch limit, allowlist, idempotency, duplicate guard và điều kiện dừng.
 
 ## Checkpoint D — AGENT_READY
 
-- [ ] Research task bắt nguồn từ gap signal có căn cứ.
-- [ ] Ingestion loop có giới hạn và dừng khi không có thông tin mới.
+- [x] Research task bắt nguồn từ gap signal có căn cứ.
+- [x] Ingestion loop có giới hạn và dừng khi không có thông tin mới.
 
 ## Phase 11 — Hardening
 
