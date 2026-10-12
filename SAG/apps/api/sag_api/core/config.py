@@ -81,6 +81,14 @@ class Settings(BaseSettings):
     upload_dir: str = "./.data/uploads"  # 上传原始文件落盘
     max_upload_mb: int = 25  # 单文件上传上限
     job_concurrency: int = 2  # 后台处理并发
+    knowledge_worker_enabled: bool = True
+    knowledge_concurrency: int = Field(default=2, ge=1, le=16)
+    knowledge_queue_capacity: int = Field(default=256, ge=1, le=10000)
+    knowledge_daily_tokens: int = Field(default=100000, ge=0)
+    # Optional independent OpenAI-compatible E2 endpoint; empty = E0/E1 only.
+    knowledge_e2_url: str = ""
+    knowledge_e2_api_key: str = ""
+    knowledge_e2_model: str = ""
     document_extract_concurrency: int = Field(default=30, ge=1, le=50)  # 单文档 chunk 抽取并发
     document_chunk_max_tokens: int = Field(default=1_000, ge=100, le=100_000)
     document_chunk_mode: Literal["standard", "heading_strict"] = "standard"

@@ -11,7 +11,7 @@ import time
 import uuid
 from typing import Sequence
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.error_taxonomy import ErrorLayer, ErrorStage
@@ -43,7 +43,16 @@ async def persist_canonical_blocks(
 
     # 1. Dọn dẹp bản ghi cũ của version này nếu đây là lần retry (Idempotent cleanup)
     # Xóa SearchUnit trước vì SearchUnit có FK trỏ tới CanonicalBlock không cascade
+    from sag_api.db.models import DocumentVersion
     from sag_api.db.models.routing_rag import SearchUnit
+
+    # Invalidate before rewriting artifacts; knowledge's short final fence sees one committed revision.
+    # Preserve historical evidence without taking enrichment locks in the search lane.
+    await session.execute(
+        update(DocumentVersion)
+        .where(DocumentVersion.id == document_version_id)
+        .values(knowledge_status="NOT_STARTED")
+    )
     await session.execute(
         delete(SearchUnit).where(SearchUnit.document_version_id == document_version_id)
     )

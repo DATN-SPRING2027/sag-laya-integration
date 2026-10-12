@@ -986,10 +986,13 @@ async def test_checkpoint_a_extraction_failure_after_indexing_does_not_downgrade
         unit_db = (await check_session.execute(select(SearchUnit).where(SearchUnit.document_version_id == ver_id))).scalars().first()
         assert unit_db is not None
 
+        # Locator verification requires the exact indexed text, not an unrelated placeholder.
+        collection = f"search_units_{project_id}"
+        indexed_text = q_mock.points[collection][generate_search_unit_point_id(collection, unit_db.id)]["payload"]["content"]
         section = RetrievedSection(
             chunk_id=unit_db.id,
             heading="Section",
-            content="Search ready content",
+            content=indexed_text,
             source_config_id=src_db.sag_source_config_id,
         )
         resolved = await resolve_traceable_evidence([section], [src_db])
@@ -999,6 +1002,8 @@ async def test_checkpoint_a_extraction_failure_after_indexing_does_not_downgrade
         assert resolved[0].document_version_id == ver_id
         assert resolved[0].version_no == 1
         assert resolved[0].anchor is not None and resolved[0].anchor.strip() != ""
+        mismatched = await resolve_traceable_evidence([section.model_copy(update={"content": "Unrelated text"})], [src_db])
+        assert not has_traceable_locator(mismatched[0])
 
 
 # ==============================================================================

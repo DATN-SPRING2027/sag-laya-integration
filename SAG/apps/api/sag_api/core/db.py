@@ -107,6 +107,7 @@ _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
     "universe_dirty_sources": {"revision": "INTEGER NOT NULL DEFAULT 1"},
     "tree_manifests": {"manifest_json": "JSON NOT NULL DEFAULT '{}'"},
     "tree_routing_profiles": {"document_version_id": "VARCHAR(128) NOT NULL DEFAULT ''"},
+    "knowledge_jobs": {"result_json": "JSON", "extractor_version": "VARCHAR(128)"},
 }
 
 # Existing tables also need newly introduced hot-path indexes. Keep these

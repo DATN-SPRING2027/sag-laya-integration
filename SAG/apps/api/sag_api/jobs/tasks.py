@@ -696,8 +696,7 @@ async def _process_document_unlocked(
                         ver.search_status = "FAILED"
                     ver.search_ready_at = None
                 # knowledge_status duy trì độc lập theo hợp đồng Phase 0 (chỉ chuyển khi tree/graph hoàn tất)
-                if ver.knowledge_status != "KNOWLEDGE_READY":
-                    ver.knowledge_status = "NOT_STARTED"
+                # The independent producer owns knowledge_status, including DATA_READY/QUEUED.
     await session.commit()
     log.info(
         "Xử lý tài liệu hoàn thành doc=%s parser=%s cached=%s chunks=%d events=%d tokens=%d",

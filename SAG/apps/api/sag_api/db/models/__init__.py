@@ -3,6 +3,15 @@
 from sag_api.db.models.agent import Agent, AgentBinding, Message, Thread
 from sag_api.db.models.document import Document
 from sag_api.db.models.job import Job
+from sag_api.db.models.knowledge import (
+    KnowledgeEvidence,
+    KnowledgeGraphBuild,
+    KnowledgeJob,
+    KnowledgeQueueControl,
+    KnowledgeTreeNode,
+    KnowledgeUnit,
+    KnowledgeUnitEdge,
+)
 from sag_api.db.models.octx import (
     OctxAsset,
     OctxDocumentBinding,
@@ -48,6 +57,13 @@ __all__ = [
     "IngestionRun",
     "Job",
     "KnowledgeGraphEdge",
+    "KnowledgeEvidence",
+    "KnowledgeGraphBuild",
+    "KnowledgeJob",
+    "KnowledgeQueueControl",
+    "KnowledgeTreeNode",
+    "KnowledgeUnit",
+    "KnowledgeUnitEdge",
     "Message",
     "OctxAsset",
     "OctxDocumentBinding",
