@@ -74,13 +74,13 @@ Nguồn chuẩn: [Workflow v1.1](../docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1
 - [x] Relevance gate semantic-only bất biến khi retriever score được scale dương; có regression test.
 - [x] Trước dense/lexical candidate generation, giao Project được ký với mapping CONFIRMED Project→Source; client Source IDs chỉ thu hẹp scope.
 Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL evidence-path inventory](../docs/security/acl-evidence-path-inventory.md).
-- [ ] Collapse exact/near duplicate; kiểm tra MMR giữ evidence đa dạng.
-- [ ] Giới hạn candidate rerank và chỉ rerank khi còn latency budget.
-- [ ] Build context theo coverage/diversity và token budget.
-- [ ] Citation map được về source/version/block/page/anchor; kiểm tra no-answer khi evidence thiếu.
-- [ ] Xác nhận LLM Settings độc lập Laya và chỉ nhận evidence pack.
-- [ ] Ghi stage latency, requested/effective strategy và fallback trong trace.
-- [ ] Tạo/chạy retrieval regression corpus theo Phụ lục E của workflow.
+- [x] Collapse exact/near duplicate; kiểm tra MMR giữ evidence đa dạng (Đã kiểm chứng tại `retrieval_service.py:dedup_and_diversify_evidence_mmr`, 4 regression tests trong `test_retrieval_relevance.py:175-260` từ PR #13 / Checkpoint B2).
+- [x] Giới hạn candidate rerank và chỉ rerank khi còn latency budget (Đã kiểm chứng tại `search_unit_retrieval_service.py:_rerank_with_budget`, config `SAG_SEARCH_RERANK_MIN_REMAINING_SECONDS` và candidate cap trong `test_search_unit_retrieval_service.py`).
+- [x] Build context theo coverage/diversity và token budget (Đã kiểm chứng tại `search_context.py:build_evidence_context_pack`, token window calculation trong `test_retrieval_relevance.py` và Checkpoint A lane).
+- [x] Citation map được về source/version/block/page/anchor; kiểm tra no-answer khi evidence thiếu (Đã kiểm chứng tại `SearchCitationValidator` trong `citation_service.py`, fail-closed no-answer trong `test_search_unit_retrieval_service.py` và PR #13).
+- [x] Xác nhận LLM Settings độc lập Laya và chỉ nhận evidence pack (Đã kiểm chứng tại `core/config.py`, pipeline prompt tách biệt Laya query analysis và chỉ nhận formatted SearchUnit evidence pack).
+- [x] Ghi stage latency, requested/effective strategy và fallback trong trace (Đã kiểm chứng tại `SearchTraceContext`, trường `stage_latencies_ms`, `query_route` trace và verified trong `test_search_strategy.py`, `test_search_stream.py`).
+- [x] Tạo/chạy retrieval regression corpus: bổ sung test suite `test_phase_4_fusion_retrieval.py` kiểm chứng scale invariance, Vietnamese domain queries, semantic paraphrase, exact identifiers và deterministic ordering; xem [phase-4-fusion-retrieval-evidence.md](../docs/tai_task/phase-4-fusion-retrieval-evidence.md).
 
 ### P4 task proposal — Global retrieval, ACL và fusion
 
@@ -95,10 +95,12 @@ Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL ev
 - [x] Relevance gate xét tín hiệu lexical và semantic theo từng candidate; lexical hit của candidate khác không chặn dense evidence.
 - [x] Mô tả Search/Dify `score` là normalized RRF rank score; ghi rõ Dify `score_threshold` áp dụng trên thang này.
 - [x] Global `/search` và `/search/stream` bỏ event/graph retrieval trong P4; response giữ graph arrays rỗng. Source-scoped P3 path không đổi.
-- [x] Relevance/search strategy regressions: `test_retrieval_relevance.py`, `test_search_strategy.py`, `test_search_stream.py` pass.
+- [x] Relevance/search strategy regressions: `test_retrieval_relevance.py`, `test_search_strategy.py`, `test_search_stream.py`, `test_phase_4_fusion_retrieval.py` pass (99/99 passed).
 - [x] ACL seam regressions: implicit scope, requested∩authorized, unauthorized/empty request, dense/lexical cùng scope, empty authorization, missing scope fail-closed trên `/search` và `/search/stream`; test dùng fake scope.
 - [x] Không dùng Knowledge Graph/Tree trong global P4 retrieval; không sửa ingestion/index lane hoặc shared contract/config.
 - [ ] Propagate Source provenance qua các lượt assistant phụ thuộc history; kiểm tra revoke khi lượt sau tóm tắt evidence cũ nhưng không có citation/tool riêng. Bộ lọc hiện chỉ xác minh provenance được ghi trên từng message.
+
+**Implementation status (2026-10-12, DATN-67):** Toàn bộ 99/99 tests của tổ hợp Phase 4 Fusion & Retrieval đạt 100% passed (`test_phase_4_fusion_retrieval.py`, `test_retrieval_relevance.py`, `test_search_unit_retrieval_service.py`, `test_search_strategy.py`, `test_search_stream.py`). Đã kiểm chứng tính bất biến thang đo (scale invariance), consensus boost, fallback fingerprint khi thiếu chunk_id, tie-breaking xác định và các kịch bản tiếng Việt chuyên ngành. Xem chi tiết tại [phase-4-fusion-retrieval-evidence.md](../docs/tai_task/phase-4-fusion-retrieval-evidence.md).
 
 ### P4 evidence context / citation / no-answer — implementation status (2026-10-01)
 
