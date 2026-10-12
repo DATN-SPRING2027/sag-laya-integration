@@ -12,6 +12,12 @@ from sag_api.db.models.knowledge import (
     KnowledgeUnit,
     KnowledgeUnitEdge,
 )
+from sag_api.db.models.knowledge_quality import (
+    KnowledgeGap,
+    KnowledgeGapQuestion,
+    KnowledgeQualityAssessment,
+    KnowledgeQueryDemandDaily,
+)
 from sag_api.db.models.octx import (
     OctxAsset,
     OctxDocumentBinding,
@@ -58,9 +64,13 @@ __all__ = [
     "Job",
     "KnowledgeGraphEdge",
     "KnowledgeEvidence",
+    "KnowledgeGap",
+    "KnowledgeGapQuestion",
     "KnowledgeGraphBuild",
     "KnowledgeJob",
     "KnowledgeQueueControl",
+    "KnowledgeQualityAssessment",
+    "KnowledgeQueryDemandDaily",
     "KnowledgeTreeNode",
     "KnowledgeUnit",
     "KnowledgeUnitEdge",

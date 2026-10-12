@@ -228,10 +228,40 @@ Implementation slice B2 và các phụ thuộc Phase 5 là lịch sử riêng tr
 
 ## Phase 9 — Knowledge Quality & Gap
 
-- [ ] Tính coverage, source diversity, freshness, contradiction, query demand, uncertainty và growth.
-- [ ] Gap priority có công thức/config version và evidence/reason truy nguyên được.
-- [ ] Xác nhận metrics/scoring có cấu trúc chạy trước LLM question generation.
-- [ ] LLM chỉ diễn đạt gap thành câu hỏi; không tự mở research task vô điều kiện.
+- [x] Thêm frozen input/output schemas và config có version cho metric definitions, normalization, scoring weights, thresholds, window và as_of.
+- [x] Thêm deterministic metrics theo tree node/topic: anchored-evidence coverage, source diversity, freshness decay, contradiction-candidate rate, query demand, uncalibrated uncertainty proxy và demand growth.
+- [x] Thêm fixtures chứng minh cùng input/config/as_of cho kết quả và checksum ổn định; thay evidence/freshness/conflict candidates/demand làm priority đổi đúng chiều.
+- [x] Thêm additive migration/model cho demand daily aggregates, assessment snapshots, scored gaps và generated questions; giữ metrics, input/config checksums, reason codes, evidence IDs/locators.
+- [x] Ghi daily query-demand counts từ route decision đã kiểm tra ACL; không lưu raw query hoặc message text.
+- [x] Coi bucket demand thiếu ở bất kỳ cửa sổ nào là unknown; không suy ra zero từ bucket vắng.
+- [x] Collector chỉ đọc current KnowledgeUnits/evidence/tree members trong cùng tenant/project/partition/version; manifest/profile checksum hoặc ACL lineage không khớp thì fail closed.
+- [x] Assessment snapshot giữ đầy đủ scorer input và xác thực input checksum cùng evidence lineage trước khi persist.
+- [x] Chỉ tạo question sau scoring và khi gap eligible; question phải trỏ đến gap persisted và giữ supporting evidence/reason linkage.
+- [x] Phrase-only LLM không được sửa score/scope/evidence hoặc gọi research tools; no eligible gap thì không gọi LLM.
+- [x] Kiểm tra tenant/project/partition scope, revoked/current source, incomplete freshness/demand, LLM error/invalid output và assessment/question persistence idempotency.
+- [x] Chạy focused suite và Ruff trên toàn bộ file Python thuộc Phase 9; full repository/API outcomes ghi bên dưới. API repo không khai báo typecheck/build command riêng.
+- [x] Cập nhật Phase 9 evidence và giới hạn production acceptance sau implementation/verification.
+
+**Implementation evidence (2026-10-12):**
+
+- Focused command từ `SAG/apps/api`: `python -m pytest -q tests/test_knowledge_quality_service.py tests/test_knowledge_quality_persistence.py tests/test_knowledge_query_demand.py tests/test_search_unit_retrieval_service.py tests/test_query_routing_service.py tests/test_knowledge_foundation.py` → **77 passed, 2 skipped** sau review fixes.
+- Ruff trên các file Phase 9 đã đổi (`knowledge_quality_service.py`, `knowledge_quality_persistence.py`, `knowledge_quality_repository.py`, `knowledge_gap_question_service.py`, model/init, retrieval service và 3 test file) → **All checks passed**.
+- `ruff check sag_api/ sag_agent/ tests/` theo `SAG/CONTRIBUTING.md` → **162 lỗi lint** trên phạm vi repository, gồm nhiều file ngoài task; không dọn refactor/lint ngoài phạm vi.
+- Full API `python -m pytest -q` → **955 passed, 3 skipped, 23 failed** trong 450.57s. Lượt chạy bắt đầu trước thay đổi code Phase 9 cuối; code cuối đã được kiểm tra lại bằng focused suite bên trên. Failure nằm ở các test ngoài Phase 9: ask_stream, document_cleanup_coordinator, document_parsing, document_resume, dsh_integration, experience, hardening, octx_runtime, quick_model_setup và units. Cần phân loại riêng trước khi xem toàn API là green.
+- Chạy `0004_knowledge_quality_gaps.sql` trên SQLite in-memory → **pass**, tạo đủ 4 bảng. Không có PostgreSQL/Qdrant live validation.
+- Migration 0004 chỉ thêm bảng/index/constraint; không sửa 0001–0003. Rollback sau khi consumer dừng phải drop theo thứ tự question → gap → assessment → demand; thao tác xóa dữ liệu Phase 9.
+- DATN-62 và Checkpoint B ROUTING_READY đã Done; DATN-67 Phase 4 vẫn In Progress. Query demand production chưa có lịch sử trước rollout, và fixture/local checks không chứng minh production acceptance.
+- Review fixes: numeric-only demand snapshot validation chặn raw query lách qua field aggregate; snapshot giữ scorer input đầy đủ và xác nhận checksum/lineage; collector/question loại source mapping không còn CONFIRMED; thiếu demand bucket/window là unknown; question output phải giữ exact evidence phrase. Metric/config và prompt/generator đã bump version tương ứng; question guard chỉ xác nhận lexical anchor, không chứng minh semantic entailment.
+
+**PR #26 review follow-up (2026-10-12):**
+
+- [x] Dùng lại `knowledge_service.checksum` trong scoring, persistence và question; xóa ba bản cài đặt checksum trùng lặp.
+- [x] Chuyển demand write khỏi response path bằng task nền có strong reference và completion callback; giữ ACL fingerprint, 100 ms timeout, fail-soft logging và không lưu raw query. Ghi demand vẫn best-effort, có thể mất khi process bị dừng cưỡng bức.
+- [x] Ghi rõ cold-start: demand/growth chỉ biết khi node có ít nhất một bucket trong cả cửa sổ hiện tại và cửa sổ liền trước; trước đó priority/question vẫn fail-closed.
+- [x] Sửa tên thư mục evidence thành `docs/Thang_Task/[SAG][Phase 9]/` và cập nhật liên kết trong plan.
+- Implementation commit: `c5ca0946fd83f13f3cbd153b2d49dbb854f5d63b` (`fix(sag): address Phase 9 review feedback`), thuộc PR #26.
+- Ruff trên 5 file Python đổi trong follow-up → **All checks passed**; Python 3.11 `py_compile` cùng 5 file → **pass**.
+- Chưa chạy được pytest sau follow-up: runner mặc định thiếu `zleap`; `uv run --frozen --extra dev --python 3.11 ...` dừng khi build `litellm` vì máy thiếu MSVC `link.exe`, trước khi test collection. Reviewer đã báo 26/26 Phase 9 và 27/27 routing/retrieval trước các thay đổi follow-up này; không coi đó là kiểm tra lại cho commit follow-up.
 
 ## Phase 10 — Research Agent
 
