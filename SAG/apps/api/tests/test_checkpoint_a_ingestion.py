@@ -985,14 +985,13 @@ async def test_checkpoint_a_extraction_failure_after_indexing_does_not_downgrade
         src_db = (await check_session.execute(select(Source).where(Source.id == source_id))).scalar_one()
         unit_db = (await check_session.execute(select(SearchUnit).where(SearchUnit.document_version_id == ver_id))).scalars().first()
         assert unit_db is not None
-
         # Locator verification requires the exact indexed text, not an unrelated placeholder.
         collection = f"search_units_{project_id}"
-        indexed_text = q_mock.points[collection][generate_search_unit_point_id(collection, unit_db.id)]["payload"]["content"]
+        indexed_payload = q_mock.points[collection][generate_search_unit_point_id(collection, unit_db.id)]["payload"]
         section = RetrievedSection(
             chunk_id=unit_db.id,
-            heading="Section",
-            content=indexed_text,
+            heading=indexed_payload.get("section_path") or "Section",
+            content=indexed_payload["content"],
             source_config_id=src_db.sag_source_config_id,
         )
         resolved = await resolve_traceable_evidence([section], [src_db])
@@ -1007,20 +1006,20 @@ async def test_checkpoint_a_extraction_failure_after_indexing_does_not_downgrade
 
 
 # ==============================================================================
-# Gate 12: True E2E Upload API to Manifest Verified (Finding 5)
+# Gate 12: Mocked upload API → worker → manifest regression (Finding 5)
 # ==============================================================================
 @pytest.mark.asyncio
-async def test_checkpoint_a_e2e_real_upload_api_to_manifest_verified():
-    """Luồng E2E hoàn chỉnh từ HTTP Upload API thực tế đến worker xử lý và verify Qdrant manifest."""
+async def test_checkpoint_a_mocked_upload_api_worker_manifest_verification():
+    """Kiểm tra upload HTTP qua worker với Qdrant và ingestion test doubles."""
     await init_db()
-    project_id = f"proj_real_{uuid.uuid4().hex[:8]}"
+    project_id = f"proj_mock_{uuid.uuid4().hex[:8]}"
     token = create_access_token(
         subject="user_tester",
-        extra={"tenant_id": "tenant_real", "allowed_projects": [project_id], "allowed_partitions": ["sec_real"]},
+        extra={"tenant_id": "tenant_test", "allowed_projects": [project_id], "allowed_partitions": ["sec_test"]},
     )
     auth_header = {"Authorization": f"Bearer {token}"}
 
-    md_content = b"# Architecture Overview\n\nThis is a complete end-to-end integration test from upload API to verified Qdrant manifest."
+    md_content = b"# Architecture Overview\n\nThis is a mocked upload-to-worker regression test."
     transport = httpx.ASGITransport(app=app)
 
     async with _RealAsyncClient(transport=transport, base_url="http://test") as client:
@@ -1030,7 +1029,7 @@ async def test_checkpoint_a_e2e_real_upload_api_to_manifest_verified():
                 **auth_header,
                 "X-Continuum-User-Id": "user_tester",
                 "Idempotency-Key": f"idemp_{uuid.uuid4().hex[:12]}",
-                "X-Continuum-Security-Partition": "sec_real",
+                "X-Continuum-Security-Partition": "sec_test",
             },
             files={"file": ("architecture.md", md_content, "text/markdown")},
         )

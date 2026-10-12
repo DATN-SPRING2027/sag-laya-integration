@@ -23,7 +23,7 @@
 | **Lọc và che giấu bí mật (Zero Secret Leakage)** | Module `sag_api.core.sanitizer` tẩy rửa toàn bộ Bearer token, `sk-...`, `ak-...`, basic auth URL, và query parameters nhạy cảm (`api_key`, `password`, `token`, `access_token`, `client_secret`) trong error message / log / DB. | `test_checkpoint_a_zero_secret_leakage` | **PASSED** |
 | **Khôi phục thảm họa (Disaster Recovery - SSOT)** | PostgreSQL là nguồn chân lý duy nhất (SSOT); hàm `rebuild_search_index_for_project` phục hồi nguyên trạng Qdrant vector index và verify manifest thành công khi xóa trắng Qdrant. | `test_checkpoint_a_disaster_recovery_rebuild` | **PASSED** |
 | **Lỗi Extraction sau khi Index không hạ `SEARCH_READY`** | Đảm bảo khi Phase 2C đã xác minh `SEARCH_READY`, lỗi từ legacy extraction hoặc LLM enrichment phía sau không được phép hạ cấp `search_status` hoặc xóa `search_ready_at`, đồng thời giữ `Document.status = READY` để evidence service resolve locator chính xác. | `test_checkpoint_a_extraction_failure_after_indexing_does_not_downgrade_search_ready` | **PASSED** |
-| **Kiểm thử E2E từ Upload API đến Manifest** | Chạy toàn bộ chu trình thực tế từ HTTP multipart upload API (`POST /api/v1/projects/{project_id}/documents/upload`) đến worker xử lý và xác minh Qdrant manifest. | `test_checkpoint_a_e2e_real_upload_api_to_manifest_verified` | **PASSED** |
+| **Kiểm thử local Upload API → Worker → Mock Manifest** | Kiểm tra luồng HTTP multipart upload (`POST /api/v1/projects/{project_id}/documents/upload`) qua worker với `FakeIngestionEngine` và `MockQdrantStorage`; xác minh manifest trong test double. Đây không phải E2E với Qdrant/provider thật và không gọi Search endpoints. | `test_checkpoint_a_mocked_upload_api_worker_manifest_verification` | **PASSED (local mocked regression)** |
 | **Xử lý Whitespace Anchor Fallback & Locator** | Khi `source_anchor` chỉ chứa khoảng trắng (`"   "`), tự động fallback sang `block-<id[:8]>`, cập nhật DB và verify resolve thành công qua `resolve_traceable_evidence`. | `test_checkpoint_a_whitespace_source_anchor_fallback_and_locator_resolution` | **PASSED** |
 
 ---
@@ -83,7 +83,7 @@ Các trường payload được đánh index lọc (`PAYLOAD_INDEX_FIELDS`):
   - Đồng bộ fallback anchor ngược lại vào `CanonicalBlock.source_anchor` và flush vào database.
   - Thêm test case `test_checkpoint_a_whitespace_source_anchor_fallback_and_locator_resolution`.
 - **Finding 4 [P2 - Observability]:** Thêm logic ghi nhận `StageRun(stage="INDEX_SEARCH", status="FAILED", ...)` trong khối xử lý lỗi của worker sau khi rollback; bổ sung assertion kiểm tra `StageRun` tồn tại trong DB sau lỗi.
-- **Finding 5 [P2 - E2E Test]:** Bổ sung test case `test_checkpoint_a_e2e_real_upload_api_to_manifest_verified` kiểm chứng luồng liên thông từ HTTP Upload API đến manifest verified.
+- **Finding 5 [P2 - Upload/worker regression]:** Bổ sung test case `test_checkpoint_a_mocked_upload_api_worker_manifest_verification` kiểm tra luồng HTTP Upload API đến worker và manifest dùng test doubles. Bài test không chứng minh Qdrant thật, `/search`, `/search/stream`, `search_context`, ACL revoke hay staging acceptance.
 
 ---
 
@@ -108,7 +108,7 @@ apps/api/tests/test_checkpoint_a_idempotent_retry_and_reprocess PASSED [ 50%]
 apps/api/tests/test_checkpoint_a_zero_secret_leakage PASSED [ 56%]
 apps/api/tests/test_checkpoint_a_disaster_recovery_rebuild PASSED [ 62%]
 apps/api/tests/test_checkpoint_a_extraction_failure_after_indexing_does_not_downgrade_search_ready PASSED [ 68%]
-apps/api/tests/test_checkpoint_a_e2e_real_upload_api_to_manifest_verified PASSED [ 75%]
+apps/api/tests/test_checkpoint_a_mocked_upload_api_worker_manifest_verification PASSED [ 75%]
 apps/api/tests/test_checkpoint_a_whitespace_source_anchor_fallback_and_locator_resolution PASSED [ 81%]
 apps/api/tests/test_checkpoint_a_reindex_demotes_readiness_before_deleting_points PASSED [ 87%]
 apps/api/tests/test_checkpoint_a_chunk_count_without_manifest_does_not_promote_search_ready PASSED [ 93%]
@@ -123,3 +123,5 @@ Suite bổ trợ liên quan:
 - `apps/api/tests/test_traceability.py`: 2/2 passed
 - `apps/api/tests/test_phase_1_upload_and_versioning.py`: 34/34 passed
 - **Tổng cộng: 75/75 passed (100%)**
+
+Ghi chú review ngày 2026-10-11: test upload/worker được đổi tên thành `test_checkpoint_a_mocked_upload_api_worker_manifest_verification` để phản ánh chính xác việc dùng `MockQdrantStorage` và `FakeIngestionEngine`. Chạy lại riêng test sau khi đổi tên: **1 passed**. Kết quả local này không xác nhận provider thật, Search endpoints, ACL revoke hoặc staging acceptance.

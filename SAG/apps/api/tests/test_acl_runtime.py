@@ -611,7 +611,7 @@ async def test_global_scope_is_applied_before_search_unit_candidate_generation(m
     class RecordingEngine:
         pass
 
-    async def record_search_unit_scope(_engine, sources, query, *, principal, top_k=None):
+    async def record_search_unit_scope(_engine, sources, query, *, principal, top_k=None, query_strategy_plan=None):
         retrieval_scope.append(
             {
                 "source_ids": [source.id for source in sources],
