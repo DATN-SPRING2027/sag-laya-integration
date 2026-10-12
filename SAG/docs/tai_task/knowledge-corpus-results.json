@@ -1,0 +1,527 @@
+{
+  "tree_version": "candidate-f5aebefc2ebe337229b69d1e",
+  "status": "INACTIVE",
+  "checksum": "f5aebefc2ebe337229b69d1eddb2677a6b4d990c11b661f1943a8803b855f2c7",
+  "database_dialect": "postgresql",
+  "schema": "knowledge_benchmark_20261006",
+  "node_count": 73,
+  "leaf_count": 60,
+  "source_artifacts": [
+    {
+      "path": "docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1.md",
+      "partition_id": "public",
+      "sha256": "87085d5d33cd229d05d8c85bacb4cdac2388f4691938a3e8681692f642b30709",
+      "source_id": "d08f3fee4e5d5f2c80bb5892d870f2b0",
+      "document_version_id": "27ea0531-9bfa-5737-a5a5-24a9684d20fd"
+    },
+    {
+      "path": "docs/phase-0-contracts-and-foundations.md",
+      "partition_id": "public",
+      "sha256": "c0a507b6faf10703b9bf4236aa33cc75c21e8c0c86267f72e7b38d71119a9751",
+      "source_id": "234e166d5ffc56e69e2c6ef317e1c15f",
+      "document_version_id": "c46e8f87-e7c6-5d75-817f-8cc3813fa95b"
+    },
+    {
+      "path": "docs/tai_task/phase-6-tree-evidence.md",
+      "partition_id": "public",
+      "sha256": "b796cea92215b54acb5204d9dfad880c7b0a77961c28c1d43b60472b038d4b14",
+      "source_id": "64fda5bec95c548f8083fb2de8307b32",
+      "document_version_id": "0c6a2b16-ac22-5fd2-9c26-79b21ff66aa5"
+    },
+    {
+      "path": "docs/security/acl-evidence-path-inventory.md",
+      "partition_id": "restricted",
+      "sha256": "b3f37af5a83130e2f14e2a0edf75798f16ae5792ec904e960527d7d0c9d88407",
+      "source_id": "200dbfaf295c5475a129cd75811da45d",
+      "document_version_id": "5293235c-3f97-502a-a28e-49aedc3a91c4"
+    },
+    {
+      "path": "docs/tai_task/checkpoint-a-ingestion-evidence.md",
+      "partition_id": "restricted",
+      "sha256": "6ec813651a89f7873b6293c93eb266078dff4157bbea00b9d1ac1617cca6d4f6",
+      "source_id": "ea60da0bceaf5123982c6d44245091e5",
+      "document_version_id": "cb75a58f-0491-5d96-9503-e9d5b12e4a8a"
+    }
+  ],
+  "evidence": {
+    "contract": "knowledge-candidate.v1",
+    "unit_count": 402,
+    "edge_count": 2379,
+    "config": {
+      "leiden_resolution": 0.05,
+      "max_children": 64,
+      "max_cluster_size": 32,
+      "max_depth": 5,
+      "max_edge_cut": 0.85,
+      "max_giant_ratio": 0.8,
+      "min_cluster_size": 2,
+      "min_cohesion": 0.15,
+      "min_partition_units": 2,
+      "min_routing_recall_at_k": 0.8,
+      "profile_sparse_terms": 64,
+      "target_cluster_size": 8,
+      "version": "knowledge-corpus-tree-v1"
+    },
+    "algorithm_versions": {
+      "igraph": "0.11.9",
+      "leidenalg": "0.10.2"
+    },
+    "metrics": {
+      "acl_blackhole_rate": 0.0,
+      "acl_routing_leakage_rate": 0.0,
+      "child_size_entropy": 4.017526985420955,
+      "cohesion": 0.41215625245775256,
+      "depth": 2,
+      "edge_cut": 0.5878437475422474,
+      "giant_ratio": 0.5555555555555556,
+      "routing_recall_at_k": 0.9230769230769231,
+      "routing_recall_k": 10
+    },
+    "quality_gates": {
+      "acl_blackhole": true,
+      "acl_partition_isolation": true,
+      "cluster_constraints": true,
+      "cohesion": true,
+      "edge_cut": true,
+      "giant_ratio": true,
+      "minimum_units": true,
+      "partition_profiles": true,
+      "routing_recall": true,
+      "tree_integrity": true
+    },
+    "graph_build_id": "graph-5a53d0c16a1b5bb0ead9266e",
+    "graph_checksum": "5a53d0c16a1b5bb0ead9266e0b6a2a00cd89c5776167aaeea3333541e9e9c328",
+    "graph_config": {
+      "version": "knowledge-v1",
+      "max_evidence_per_unit": 64,
+      "max_terms": 64,
+      "candidate_limit": 96,
+      "posting_limit": 24,
+      "max_degree": 32,
+      "edge_min_score": 0.55,
+      "e2_low_confidence": 0.65,
+      "e2_importance_min": 0.5,
+      "aliases": []
+    },
+    "calibrations": {
+      "public": {
+        "method": "symmetric-bm25-q05-q95-v1",
+        "q05": 0.0,
+        "q95": 32.8438852229871,
+        "pair_count": 22534,
+        "avg_doc_len": 47.28191489361702,
+        "unit_count": 376
+      },
+      "restricted": {
+        "method": "symmetric-bm25-q05-q95-v1",
+        "q05": 0.026302413453184317,
+        "q95": 33.65771950168298,
+        "pair_count": 325,
+        "avg_doc_len": 111.61538461538461,
+        "unit_count": 26
+      }
+    },
+    "routing_policy": {
+      "beam_width": 3,
+      "broad_entropy_threshold": 0.72,
+      "broad_margin_threshold": 0.1,
+      "decisive_margin": 0.18,
+      "membership_limit": 256
+    },
+    "component_checksums": {
+      "graph_checksum": "5a53d0c16a1b5bb0ead9266e0b6a2a00cd89c5776167aaeea3333541e9e9c328",
+      "profile_checksum": "457083dbb653194474a93eb8d548125e7296f0336e06090d502b1e9684eab046",
+      "input_checksum": "4ec4f16eb94da9f6340675509e960857e25ef80002438e1b150af0267d11b330",
+      "config_checksum": "4eca23dcd0bce3ae795ccadda79b37b31fdce060cbc3b64cb82c5a3bbc4bb739",
+      "edge_checksum": "d601a58df8f59b823f747a6713d761aceeb6d79547934429cdcd68b877909750",
+      "lineage_checksum": "d8beef2115a0ed02bceca48f577b5c00917b351fe07b92656343ff11b05d1eb9"
+    },
+    "queries": [
+      {
+        "query_id": "acl-acceptance",
+        "query": "acceptance unauthorized high-score vector lexical top-k cross-organization MCP stdio Dify",
+        "target_unit_id": "bb9f98bf-1f42-5a80-b773-7f0816021043",
+        "partition_id": "restricted",
+        "authorized_source_ids": [
+          "200dbfaf295c5475a129cd75811da45d"
+        ],
+        "k": 10,
+        "routed_unit_ids": [
+          "7dc77c93-db2b-5b11-a3e6-e105a09c8444",
+          "bb9f98bf-1f42-5a80-b773-7f0816021043",
+          "bc210934-1f00-52bb-86eb-50b35866f837",
+          "e80c5e4c-1523-5882-95f4-572e170913dd",
+          "c7a5e807-41c6-5ad3-abf5-b18c687955ee",
+          "dcc97159-bab7-5825-ae87-6c5f0d4eb669",
+          "9aeca610-c3d5-581b-ae53-302974738f98",
+          "7f796089-85ef-5e5a-af35-52138d5ba219",
+          "879ac66e-db0c-5425-9ff5-7cdb120ba5b4",
+          "f405c1d7-39d7-5b4a-b9ae-7ffb702cba49"
+        ],
+        "candidate_count": 10,
+        "authorized_count": 12,
+        "selected_node_ids": [
+          "2df0e888f5dec63789e03c4b74aae675",
+          "d45ea91942ebdfbc3919b2769d12b3e2"
+        ],
+        "reason_code": "ROUTE_UNCERTAIN_BROADENED",
+        "fallback_reason": null
+      },
+      {
+        "query_id": "acl-principal",
+        "query": "baseline SAG API local JWT Dify static API key allowed_project_ids authentication authorization",
+        "target_unit_id": "dcc97159-bab7-5825-ae87-6c5f0d4eb669",
+        "partition_id": "restricted",
+        "authorized_source_ids": [
+          "200dbfaf295c5475a129cd75811da45d"
+        ],
+        "k": 10,
+        "routed_unit_ids": [
+          "7dc77c93-db2b-5b11-a3e6-e105a09c8444",
+          "dcc97159-bab7-5825-ae87-6c5f0d4eb669",
+          "e80c5e4c-1523-5882-95f4-572e170913dd",
+          "c7a5e807-41c6-5ad3-abf5-b18c687955ee",
+          "879ac66e-db0c-5425-9ff5-7cdb120ba5b4",
+          "9aeca610-c3d5-581b-ae53-302974738f98",
+          "bb9f98bf-1f42-5a80-b773-7f0816021043",
+          "f405c1d7-39d7-5b4a-b9ae-7ffb702cba49",
+          "7bbe43cc-3a96-5966-8cf3-8ea6a0c69f77",
+          "7f796089-85ef-5e5a-af35-52138d5ba219"
+        ],
+        "candidate_count": 12,
+        "authorized_count": 12,
+        "selected_node_ids": [
+          "1c1f5cb60b79c93a243d452e8eaa4ac3",
+          "2c948fa5321583e377c1a94791362bdf"
+        ],
+        "reason_code": "ROUTE_UNCERTAIN_BROADENED",
+        "fallback_reason": null
+      },
+      {
+        "query_id": "e2-budget",
+        "query": "E2 daily token budget max queue age concurrency priority backpressure SEARCH_READY",
+        "target_unit_id": "6b3d3825-f74c-55b8-8a4a-13a54ad9169a",
+        "partition_id": "public",
+        "authorized_source_ids": [
+          "d08f3fee4e5d5f2c80bb5892d870f2b0",
+          "234e166d5ffc56e69e2c6ef317e1c15f",
+          "64fda5bec95c548f8083fb2de8307b32"
+        ],
+        "k": 10,
+        "routed_unit_ids": [
+          "6b3d3825-f74c-55b8-8a4a-13a54ad9169a",
+          "b1b2bd80-2527-59cb-abf8-781d2d6e1dce",
+          "c631578a-9045-5595-ac99-f0bfec4c9223",
+          "1e2edd01-fd56-5212-905e-33f633d73859",
+          "2c7a4a9f-d393-58b4-b596-a3e0f1fed6b9",
+          "3a1a614a-e18e-5e45-8a9e-99a123ffe784",
+          "482b37ad-5ecd-5341-840f-b6f9467f9f1b",
+          "a6055eb8-be0c-5c0d-95ca-3f7789d63008",
+          "c24d1c5f-1c47-5ad8-bd7b-c95d87b2d1c3",
+          "ed73a225-cdbe-5c2a-8435-392b638ff531"
+        ],
+        "candidate_count": 31,
+        "authorized_count": 376,
+        "selected_node_ids": [
+          "24fa93159981ad145eb64fec8e74caa0",
+          "bf7e06d3a4c1644c4ad339b028a96574",
+          "d8792edb4cbc14e07e2da7cde4e4ab60"
+        ],
+        "reason_code": "ROUTE_UNCERTAIN_BROADENED",
+        "fallback_reason": null
+      },
+      {
+        "query_id": "e2-evidence",
+        "query": "E2 structured JSON schema temporal_scope evidence_refs confidence anchor canonical claim relation",
+        "target_unit_id": "3a1a614a-e18e-5e45-8a9e-99a123ffe784",
+        "partition_id": "public",
+        "authorized_source_ids": [
+          "d08f3fee4e5d5f2c80bb5892d870f2b0",
+          "234e166d5ffc56e69e2c6ef317e1c15f",
+          "64fda5bec95c548f8083fb2de8307b32"
+        ],
+        "k": 10,
+        "routed_unit_ids": [
+          "3a1a614a-e18e-5e45-8a9e-99a123ffe784",
+          "6b3d3825-f74c-55b8-8a4a-13a54ad9169a",
+          "c631578a-9045-5595-ac99-f0bfec4c9223",
+          "1e2edd01-fd56-5212-905e-33f633d73859",
+          "34849ee5-9810-59ed-8a7e-35b3232393ae",
+          "8c4ef051-e3da-522d-a061-be911eed5e4d",
+          "4dfbaea9-fc85-5728-816d-34c9daccb384",
+          "e508183d-02aa-50ba-9130-0fb23c1dee5e",
+          "ed73a225-cdbe-5c2a-8435-392b638ff531",
+          "f46bedc9-8c2c-54e6-be4d-53a0dc383c44"
+        ],
+        "candidate_count": 32,
+        "authorized_count": 376,
+        "selected_node_ids": [
+          "36e84b052119cdc6c204ef836deee946",
+          "bf7e06d3a4c1644c4ad339b028a96574",
+          "dff029fa310c8fab4fe54c6f7b3cd6f8"
+        ],
+        "reason_code": "ROUTE_UNCERTAIN_BROADENED",
+        "fallback_reason": null
+      },
+      {
+        "query_id": "graph-degree",
+        "query": "MAX_DEGREE K_dense K_sparse K_entity defaults sparse graph",
+        "target_unit_id": "71242a1f-7b73-515f-baea-ed60035c8084",
+        "partition_id": "public",
+        "authorized_source_ids": [
+          "d08f3fee4e5d5f2c80bb5892d870f2b0",
+          "234e166d5ffc56e69e2c6ef317e1c15f",
+          "64fda5bec95c548f8083fb2de8307b32"
+        ],
+        "k": 10,
+        "routed_unit_ids": [
+          "71242a1f-7b73-515f-baea-ed60035c8084",
+          "4e30a959-d546-57ca-9e4a-e0a3d6b938f5",
+          "c01a1a7c-3375-5e5d-8d1b-d630dff84cbd",
+          "7c9b50d2-a806-551d-af49-b162ecfd5dc9",
+          "d77b0019-b5dd-5f0e-a1ca-40b9617149ae",
+          "0331dfca-7e7c-598e-83cb-118543567d74",
+          "03963452-12c1-5a82-a30a-721328ab94da",
+          "07767908-643f-5ea9-b6a6-660d7d3f7aa2",
+          "11cea2b8-e7a2-5754-9658-4fd371bd206e",
+          "13ced126-a253-5855-b3af-337dbfc518ed"
+        ],
+        "candidate_count": 86,
+        "authorized_count": 376,
+        "selected_node_ids": [
+          "741abb474fecc1f53654ac9bf455e4ca",
+          "d0b35dda28597928364d12296af981a8",
+          "d2e6fa4cfcd2296a5af1f34fc1033a43"
+        ],
+        "reason_code": "ROUTE_UNCERTAIN_BROADENED",
+        "fallback_reason": null
+      },
+      {
+        "query_id": "graph-lexical",
+        "query": "lexical_norm q05_bm25 q95_bm25 công thức percentile scaling",
+        "target_unit_id": "15c9aaad-3510-5b9b-9c59-c2bc4a941d2f",
+        "partition_id": "public",
+        "authorized_source_ids": [
+          "d08f3fee4e5d5f2c80bb5892d870f2b0",
+          "234e166d5ffc56e69e2c6ef317e1c15f",
+          "64fda5bec95c548f8083fb2de8307b32"
+        ],
+        "k": 10,
+        "routed_unit_ids": [
+          "15c9aaad-3510-5b9b-9c59-c2bc4a941d2f",
+          "d77b0019-b5dd-5f0e-a1ca-40b9617149ae",
+          "e5088251-8a55-5e0b-a445-9d5ba742a510",
+          "e55fac6f-9497-59c4-90d8-421cbd3a5109",
+          "01f85869-4c9b-5481-aa30-1ad63916bfbb",
+          "0331dfca-7e7c-598e-83cb-118543567d74",
+          "03963452-12c1-5a82-a30a-721328ab94da",
+          "03d6dff6-596d-5ba1-bc4b-6fe895a8caaf",
+          "07767908-643f-5ea9-b6a6-660d7d3f7aa2",
+          "11cea2b8-e7a2-5754-9658-4fd371bd206e"
+        ],
+        "candidate_count": 89,
+        "authorized_count": 376,
+        "selected_node_ids": [
+          "14851565da92751425e9a016f8f1dbd9",
+          "741abb474fecc1f53654ac9bf455e4ca",
+          "b69c59352a618d6cefdc42abb2f37906"
+        ],
+        "reason_code": "ROUTE_UNCERTAIN_BROADENED",
+        "fallback_reason": null
+      },
+      {
+        "query_id": "graph-missing",
+        "query": "Signal thiếu do extractor chưa chạy renormalize trọng số thế nào?",
+        "target_unit_id": "905690cb-400c-5baa-a0e1-c6cea1ef42c4",
+        "partition_id": "public",
+        "authorized_source_ids": [
+          "d08f3fee4e5d5f2c80bb5892d870f2b0",
+          "234e166d5ffc56e69e2c6ef317e1c15f",
+          "64fda5bec95c548f8083fb2de8307b32"
+        ],
+        "k": 10,
+        "routed_unit_ids": [
+          "7d3cb546-2978-5781-af89-8c1a3a382d48",
+          "e0cff59d-ed13-5408-ad2d-6e62a28e919f",
+          "1f425a5c-b66e-5450-b97f-e7ee9389c4cd",
+          "7e66c9a2-fe8d-5842-a848-0cd04ba15d68",
+          "9e2559c4-56ad-5365-8ed0-68a4a90b27d3",
+          "c24d1c5f-1c47-5ad8-bd7b-c95d87b2d1c3",
+          "d574c4c2-42d3-562b-85ce-89b40929108f",
+          "0a0fea10-6521-579c-a09f-154e0192f994",
+          "15626a38-6fb7-5876-9fe0-c60bfb598ba7",
+          "251a3862-5eec-51c5-8183-b95c409c244b"
+        ],
+        "candidate_count": 54,
+        "authorized_count": 376,
+        "selected_node_ids": [
+          "24fa93159981ad145eb64fec8e74caa0",
+          "b69c59352a618d6cefdc42abb2f37906",
+          "d0b35dda28597928364d12296af981a8"
+        ],
+        "reason_code": "ROUTE_UNCERTAIN_BROADENED",
+        "fallback_reason": null
+      },
+      {
+        "query_id": "identity-retry",
+        "query": "Idempotency-Key file_hash payload_hash HTTP 409 IDEMPOTENCY_PAYLOAD_MISMATCH",
+        "target_unit_id": "b2f0193d-bac3-56ff-83f9-da69478df56b",
+        "partition_id": "public",
+        "authorized_source_ids": [
+          "234e166d5ffc56e69e2c6ef317e1c15f"
+        ],
+        "k": 10,
+        "routed_unit_ids": [
+          "44d5a572-9bad-5edf-865b-217f2cf9fa84",
+          "304a9fa8-7c0d-5e41-b810-5547531319a3",
+          "b2f0193d-bac3-56ff-83f9-da69478df56b",
+          "a226dfe1-f825-554a-a553-0eb3f4f24d1b",
+          "7c9b50d2-a806-551d-af49-b162ecfd5dc9",
+          "6421c1b0-dbbb-5620-b8bd-2caae3f9bfa2",
+          "60f77d4f-042d-5c49-8c8a-ba64a940e5c1",
+          "04bf8a02-026e-582f-a21d-4696111db9be",
+          "0a0fea10-6521-579c-a09f-154e0192f994",
+          "1595e808-0a78-553b-9da9-e06a11cb115e"
+        ],
+        "candidate_count": 54,
+        "authorized_count": 54,
+        "selected_node_ids": [
+          "d0b35dda28597928364d12296af981a8",
+          "d2e6fa4cfcd2296a5af1f34fc1033a43"
+        ],
+        "reason_code": "ROUTE_UNCERTAIN_BROADENED",
+        "fallback_reason": null
+      },
+      {
+        "query_id": "ingestion-empty",
+        "query": "Empty Index EMPTY_INDEX zero secret leakage disaster recovery SEARCH_READY",
+        "target_unit_id": "d8ba5227-51f9-5485-b6e1-2415a5165775",
+        "partition_id": "restricted",
+        "authorized_source_ids": [
+          "ea60da0bceaf5123982c6d44245091e5"
+        ],
+        "k": 10,
+        "routed_unit_ids": [
+          "d8ba5227-51f9-5485-b6e1-2415a5165775",
+          "5cfe4f4e-6f56-5a5a-8317-c37292f7c563",
+          "680976a1-e8a6-5048-8c64-d1f77629681e",
+          "6c40332a-863a-5545-9e56-90cad3a05193",
+          "6d824310-2037-5745-942a-3cba0486ada8",
+          "ba97dfcb-d9a2-5c8e-aa6a-5af05c41dd47",
+          "4cc0f73f-d873-5eb5-a505-be26c0ea30cf"
+        ],
+        "candidate_count": 7,
+        "authorized_count": 14,
+        "selected_node_ids": [
+          "4218b4cbf33c65b6b2ed0e0ba24d01c6"
+        ],
+        "reason_code": "ROUTE_DESCENDED",
+        "fallback_reason": null
+      },
+      {
+        "query_id": "ingestion-sanitizer",
+        "query": "sanitizer snake_case kebab-case access_token client_secret password refresh_token id_token",
+        "target_unit_id": "5cfe4f4e-6f56-5a5a-8317-c37292f7c563",
+        "partition_id": "restricted",
+        "authorized_source_ids": [
+          "ea60da0bceaf5123982c6d44245091e5"
+        ],
+        "k": 10,
+        "routed_unit_ids": [
+          "5cfe4f4e-6f56-5a5a-8317-c37292f7c563",
+          "d8ba5227-51f9-5485-b6e1-2415a5165775",
+          "4cc0f73f-d873-5eb5-a505-be26c0ea30cf",
+          "680976a1-e8a6-5048-8c64-d1f77629681e",
+          "6c40332a-863a-5545-9e56-90cad3a05193",
+          "6d824310-2037-5745-942a-3cba0486ada8",
+          "ba97dfcb-d9a2-5c8e-aa6a-5af05c41dd47"
+        ],
+        "candidate_count": 7,
+        "authorized_count": 14,
+        "selected_node_ids": [
+          "4218b4cbf33c65b6b2ed0e0ba24d01c6"
+        ],
+        "reason_code": "ROUTE_DESCENDED",
+        "fallback_reason": null
+      },
+      {
+        "query_id": "source-truth",
+        "query": "PostgreSQL Source of Truth Qdrant Search Accelerator source metadata rebuildable",
+        "target_unit_id": "192ce96f-e0d7-55b3-9bf1-f7a3f1233c67",
+        "partition_id": "public",
+        "authorized_source_ids": [
+          "234e166d5ffc56e69e2c6ef317e1c15f"
+        ],
+        "k": 10,
+        "routed_unit_ids": [
+          "192ce96f-e0d7-55b3-9bf1-f7a3f1233c67",
+          "b2f0193d-bac3-56ff-83f9-da69478df56b",
+          "b15180a2-1e6f-53c3-889b-e467661ae393",
+          "31e2601f-4bb3-5b45-9fcd-8cbd8a8b3eca",
+          "476bdb0b-cbcd-5849-8bcc-9baab3c84a98",
+          "70d83286-b6e5-5957-a939-8bb16dbd3458",
+          "a38ca540-49f8-5c11-b086-deabbed9b9b4",
+          "f3ab0070-4dd2-5c13-bf1a-953b2c72095a",
+          "1ce07259-7552-52eb-b0d2-c92d13a14704",
+          "232dff02-e75b-506f-b5c6-c921e5714611"
+        ],
+        "candidate_count": 54,
+        "authorized_count": 54,
+        "selected_node_ids": [
+          "d0b35dda28597928364d12296af981a8",
+          "d2e6fa4cfcd2296a5af1f34fc1033a43"
+        ],
+        "reason_code": "ROUTE_UNCERTAIN_BROADENED",
+        "fallback_reason": null
+      },
+      {
+        "query_id": "tree-medoid",
+        "query": "immutable snapshot medoid 64 deterministic candidates lineage publishable REJECTED",
+        "target_unit_id": "de693916-c465-5df4-903e-f2c786ce08f9",
+        "partition_id": "public",
+        "authorized_source_ids": [
+          "64fda5bec95c548f8083fb2de8307b32"
+        ],
+        "k": 10,
+        "routed_unit_ids": [
+          "de693916-c465-5df4-903e-f2c786ce08f9",
+          "2312b0cc-97f3-5c17-938c-a5173e5273d4",
+          "f0068582-c89d-5b4c-83cf-62a26864f174",
+          "06f3b670-560f-5b8c-b700-8a3d741cd3d4",
+          "33e4ef8a-bf02-5861-b029-82fe565a6bcb"
+        ],
+        "candidate_count": 5,
+        "authorized_count": 9,
+        "selected_node_ids": [
+          "e7b8980ccdb00916c1971e1a1deb2edc"
+        ],
+        "reason_code": "ROUTE_DESCENDED",
+        "fallback_reason": null
+      },
+      {
+        "query_id": "tree-scope",
+        "query": "routing-snapshot.v1 tenant project security partition separate root cross-partition edges",
+        "target_unit_id": "f0068582-c89d-5b4c-83cf-62a26864f174",
+        "partition_id": "public",
+        "authorized_source_ids": [
+          "64fda5bec95c548f8083fb2de8307b32"
+        ],
+        "k": 10,
+        "routed_unit_ids": [
+          "f0068582-c89d-5b4c-83cf-62a26864f174",
+          "2312b0cc-97f3-5c17-938c-a5173e5273d4",
+          "33e4ef8a-bf02-5861-b029-82fe565a6bcb",
+          "de693916-c465-5df4-903e-f2c786ce08f9",
+          "06f3b670-560f-5b8c-b700-8a3d741cd3d4"
+        ],
+        "candidate_count": 5,
+        "authorized_count": 9,
+        "selected_node_ids": [
+          "e7b8980ccdb00916c1971e1a1deb2edc"
+        ],
+        "reason_code": "ROUTE_DESCENDED",
+        "fallback_reason": null
+      }
+    ]
+  }
+}

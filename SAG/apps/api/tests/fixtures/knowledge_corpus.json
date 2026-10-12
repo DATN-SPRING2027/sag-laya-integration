@@ -1,0 +1,39 @@
+{
+  "tenant_id": "knowledge-benchmark-tenant",
+  "project_id": "knowledge-benchmark-project",
+  "k": 10,
+  "documents": [
+    {"path": "docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1.md", "partition_id": "public"},
+    {"path": "docs/phase-0-contracts-and-foundations.md", "partition_id": "public"},
+    {"path": "docs/tai_task/phase-6-tree-evidence.md", "partition_id": "public"},
+    {"path": "docs/security/acl-evidence-path-inventory.md", "partition_id": "restricted"},
+    {"path": "docs/tai_task/checkpoint-a-ingestion-evidence.md", "partition_id": "restricted"}
+  ],
+  "tree_config": {
+    "version": "knowledge-corpus-tree-v1",
+    "target_cluster_size": 8,
+    "max_cluster_size": 32,
+    "max_children": 64,
+    "max_depth": 5,
+    "min_cohesion": 0.15,
+    "max_edge_cut": 0.85,
+    "max_giant_ratio": 0.8,
+    "min_routing_recall_at_k": 0.8
+  },
+  "routing_policy": {"beam_width": 3},
+  "queries": [
+    {"query_id": "graph-missing", "path": "docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1.md", "contains": "Signal bị thiếu", "query": "Signal thiếu do extractor chưa chạy renormalize trọng số thế nào?"},
+    {"query_id": "graph-lexical", "path": "docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1.md", "contains": "q05_bm25", "query": "lexical_norm q05_bm25 q95_bm25 công thức percentile scaling"},
+    {"query_id": "graph-degree", "path": "docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1.md", "contains": "| `MAX_DEGREE`", "query": "MAX_DEGREE K_dense K_sparse K_entity defaults sparse graph"},
+    {"query_id": "e2-budget", "path": "docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1.md", "contains": "**Backpressure bắt buộc:**", "query": "E2 daily token budget max queue age concurrency priority backpressure SEARCH_READY"},
+    {"query_id": "e2-evidence", "path": "docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1.md", "contains": "LLM job chạy asynchronous/off-peak", "query": "E2 structured JSON schema temporal_scope evidence_refs confidence anchor canonical claim relation"},
+    {"query_id": "identity-retry", "path": "docs/phase-0-contracts-and-foundations.md", "contains": "IDEMPOTENCY_PAYLOAD_MISMATCH", "query": "Idempotency-Key file_hash payload_hash HTTP 409 IDEMPOTENCY_PAYLOAD_MISMATCH", "authorized_paths": ["docs/phase-0-contracts-and-foundations.md"]},
+    {"query_id": "source-truth", "path": "docs/phase-0-contracts-and-foundations.md", "contains": "Source of Truth", "query": "PostgreSQL Source of Truth Qdrant Search Accelerator source metadata rebuildable", "authorized_paths": ["docs/phase-0-contracts-and-foundations.md"]},
+    {"query_id": "tree-scope", "path": "docs/tai_task/phase-6-tree-evidence.md", "contains": "routing-snapshot.v1", "query": "routing-snapshot.v1 tenant project security partition separate root cross-partition edges", "authorized_paths": ["docs/tai_task/phase-6-tree-evidence.md"]},
+    {"query_id": "tree-medoid", "path": "docs/tai_task/phase-6-tree-evidence.md", "contains": "The resulting immutable snapshot", "query": "immutable snapshot medoid 64 deterministic candidates lineage publishable REJECTED", "authorized_paths": ["docs/tai_task/phase-6-tree-evidence.md"]},
+    {"query_id": "acl-principal", "path": "docs/security/acl-evidence-path-inventory.md", "contains": "At this baseline, the SAG API", "query": "baseline SAG API local JWT Dify static API key allowed_project_ids authentication authorization", "authorized_paths": ["docs/security/acl-evidence-path-inventory.md"]},
+    {"query_id": "acl-acceptance", "path": "docs/security/acl-evidence-path-inventory.md", "contains": "The implementation is not complete", "query": "acceptance unauthorized high-score vector lexical top-k cross-organization MCP stdio Dify", "authorized_paths": ["docs/security/acl-evidence-path-inventory.md"]},
+    {"query_id": "ingestion-empty", "path": "docs/tai_task/checkpoint-a-ingestion-evidence.md", "contains": "Xử lý Empty Index", "query": "Empty Index EMPTY_INDEX zero secret leakage disaster recovery SEARCH_READY", "authorized_paths": ["docs/tai_task/checkpoint-a-ingestion-evidence.md"]},
+    {"query_id": "ingestion-sanitizer", "path": "docs/tai_task/checkpoint-a-ingestion-evidence.md", "contains": "Mở rộng regex trong", "query": "sanitizer snake_case kebab-case access_token client_secret password refresh_token id_token", "authorized_paths": ["docs/tai_task/checkpoint-a-ingestion-evidence.md"]}
+  ]
+}

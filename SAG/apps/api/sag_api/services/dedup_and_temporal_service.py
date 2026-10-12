@@ -17,7 +17,7 @@ import re
 from typing import Any, Sequence
 import uuid
 
-from sqlalchemy import and_, desc, or_, select
+from sqlalchemy import and_, desc, inspect, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.db.models.document import Document
@@ -293,6 +293,7 @@ async def resolve_temporal_supersedes(
         current_version.valid_from = cur_start
         current_version.valid_to = max_valid_to
         current_version.supersedes_id = None
+        current_version.knowledge_status = "NOT_STARTED"
         return {"action": "INITIAL", "active_version_id": current_version.id}
 
     # Find the version active at cur_start: valid_from <= cur_start < valid_to
@@ -389,6 +390,14 @@ async def resolve_temporal_supersedes(
             session.add(v)
         elif c_from <= v_from < c_to:
             current_version.valid_to = v_from
+
+    # Enrichment freezes validity/lineage; changed predecessors/successors need a new knowledge input.
+    for version in [*all_prev, current_version]:
+        if any(
+            inspect(version).attrs[field].history.has_changes()
+            for field in ("valid_from", "valid_to", "supersedes_id")
+        ):
+            version.knowledge_status = "NOT_STARTED"
 
     return {
         "action": action,

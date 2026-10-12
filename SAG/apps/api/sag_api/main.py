@@ -58,14 +58,20 @@ async def lifespan(app: FastAPI):
         log.warning("DSH 本机连接文件刷新失败：%s", error)
 
     runtime = KnowledgeRuntime(settings, SessionLocal, active_path=Path(settings.data_dir))
+    from sag_api.jobs.knowledge import KnowledgeWorker
+
+    knowledge_worker = KnowledgeWorker(SessionLocal, settings)
 
     try:
         async with principal_assertion_lifespan():
             await runtime.start(app)
+            if settings.knowledge_worker_enabled:
+                await knowledge_worker.start()
             yield
     finally:
         failures: list[BaseException] = []
         for cleanup in (
+            knowledge_worker.stop,
             runtime.stop,
             dispose_db,
         ):

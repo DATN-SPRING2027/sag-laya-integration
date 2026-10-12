@@ -14,6 +14,20 @@
 - Corrected stale Jira evidence: DATN-61 is **In Review**, with two comments total and no owner response to comment 10107.
 - Renamed the local test to `test_checkpoint_a_mocked_upload_api_worker_manifest_verification` and corrected its docs so the Qdrant/ingestion test doubles are explicit. The renamed test passed **1/1** on 2026-10-11; this does not provide staging evidence.
 
+## PR conflict research (2026-10-12)
+
+- Refreshed `origin/main` to `81945d8` (PR #24); PR #23 head is `1d2ef12` and its merge base is `e2de5e7`. GitHub reports a content conflict in `SAG/apps/api/tests/test_checkpoint_a_ingestion.py`.
+- The upstream version improves the extraction-failure locator test by loading the exact indexed point content via `generate_search_unit_point_id` and asserting mismatched content fails closed. PR #23 independently changed that test to read the exact payload and heading from the mock, and renamed the upload/worker test to disclose its mocked scope.
+- Resolution plan: preserve both improvements by reading the exact point payload, using its section path/content, retaining the mismatched-content fail-closed assertion, and keeping the honest mocked test name. Merge the unrelated Phase 5/6 `todo.md` updates from `origin/main` while retaining Checkpoint A's open acceptance items.
+- Focused verification: run the extraction-failure locator regression and the renamed mocked upload/worker test. Production/staging acceptance remains out of scope for conflict resolution and stays open.
+
+## Conflict resolution result (2026-10-12)
+
+- Merged the refreshed `origin/main` at `81945d8` into the PR #23 branch. Resolved the sole content conflict in `test_checkpoint_a_ingestion.py` by loading the exact deterministic Qdrant mock point payload, using its section path and content for locator resolution, and retaining the upstream assertion that unrelated content fails closed. Kept the renamed mocked upload/worker test.
+- Preserved the upstream Phase 5/6 updates in `SAG/tasks/todo.md` together with the Checkpoint A production items, which remain unchecked.
+- Focused tests after conflict resolution: `test_checkpoint_a_extraction_failure_after_indexing_does_not_downgrade_search_ready` and `test_checkpoint_a_mocked_upload_api_worker_manifest_verification` — **2 passed**.
+- The merge includes the already-merged PR #24 migration `SAG/apps/api/migrations/0003_knowledge_foundation.sql` and related models unchanged; this conflict fix adds no further schema or migration change. No new runtime configuration or secrets were introduced. Real provider/Qdrant, staging ACL revoke, and browser acceptance remain open.
+
 ## Findings verified in the repository
 
 ### Upload, identity, and source mapping
