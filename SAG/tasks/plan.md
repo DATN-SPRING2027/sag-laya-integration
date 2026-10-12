@@ -814,7 +814,7 @@ Checkpoint A xác nhận nhánh đầu đã truy vấn được và citation ho�
 
 **Phụ thuộc:** Phase 6–7 và metrics/trace của Phase 4, 7.
 
-**Bằng chứng hiện trạng:** xem `SAG/docs/Thang_Task/[SAG][Phase 9}/research.md`. Routing trace tồn tại nhưng chưa được lưu thành demand aggregate; tree/profile metrics hiện tại đo chất lượng routing, không đo knowledge quality. DATN-62 và Checkpoint B đã hoàn tất; DATN-67 Phase 4 vẫn In Progress. V1 dùng trace/tree hiện có và ghi rõ giới hạn fixture/rollout.
+**Bằng chứng hiện trạng:** xem `SAG/docs/Thang_Task/[SAG][Phase 9]/research.md`. Routing trace tồn tại nhưng chưa được lưu thành demand aggregate; tree/profile metrics hiện tại đo chất lượng routing, không đo knowledge quality. DATN-62 và Checkpoint B đã hoàn tất; DATN-67 Phase 4 vẫn In Progress. V1 dùng trace/tree hiện có và ghi rõ giới hạn fixture/rollout.
 
 **Contract V1:**
 
@@ -842,7 +842,7 @@ Checkpoint A xác nhận nhánh đầu đã truy vấn được và citation ho�
 
 **Cổng ra:** cùng input/config/as_of/window cho cùng checksum, metrics, reason codes và priority; fixtures chứng minh priority đổi theo anchored evidence, freshness, contradiction candidates và demand; mọi question liên kết tới scored gap/evidence/reason; ACL isolation được kiểm tra. Fixture/local pass không được ghi nhận là production Phase 4/7 acceptance.
 
-**Rủi ro/giới hạn:** query demand chỉ bắt đầu có dữ liệu sau khi writer được triển khai; bucket/window thiếu là unknown cho tới khi có quan sát đủ, không backfill; confidence và CONTRADICTS hiện là candidate/proxy signals; live PostgreSQL/Qdrant và DATN-67 acceptance cần báo cáo riêng.
+**Rủi ro/giới hạn:** query demand chỉ bắt đầu có dữ liệu sau khi writer được triển khai; node cần ít nhất một bucket quan sát trong cả cửa sổ hiện tại và cửa sổ trước đó trước khi demand/growth có thể được chấm; bucket/window thiếu là unknown, không backfill; confidence và CONTRADICTS hiện là candidate/proxy signals; live PostgreSQL/Qdrant và DATN-67 acceptance cần báo cáo riêng. Demand writer chạy nền và best-effort; shutdown/crash có thể làm mất một số lượt ghi, khi đó cửa sổ vẫn fail-closed thành unknown.
 
 ### Phase 10 — Research Agent
 

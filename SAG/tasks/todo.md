@@ -251,6 +251,15 @@ Implementation slice B2 và các phụ thuộc Phase 5 là lịch sử riêng tr
 - DATN-62 và Checkpoint B ROUTING_READY đã Done; DATN-67 Phase 4 vẫn In Progress. Query demand production chưa có lịch sử trước rollout, và fixture/local checks không chứng minh production acceptance.
 - Review fixes: numeric-only demand snapshot validation chặn raw query lách qua field aggregate; snapshot giữ scorer input đầy đủ và xác nhận checksum/lineage; collector/question loại source mapping không còn CONFIRMED; thiếu demand bucket/window là unknown; question output phải giữ exact evidence phrase. Metric/config và prompt/generator đã bump version tương ứng; question guard chỉ xác nhận lexical anchor, không chứng minh semantic entailment.
 
+**PR #26 review follow-up (2026-10-12):**
+
+- [x] Dùng lại `knowledge_service.checksum` trong scoring, persistence và question; xóa ba bản cài đặt checksum trùng lặp.
+- [x] Chuyển demand write khỏi response path bằng task nền có strong reference và completion callback; giữ ACL fingerprint, 100 ms timeout, fail-soft logging và không lưu raw query. Ghi demand vẫn best-effort, có thể mất khi process bị dừng cưỡng bức.
+- [x] Ghi rõ cold-start: demand/growth chỉ biết khi node có ít nhất một bucket trong cả cửa sổ hiện tại và cửa sổ liền trước; trước đó priority/question vẫn fail-closed.
+- [x] Sửa tên thư mục evidence thành `docs/Thang_Task/[SAG][Phase 9]/` và cập nhật liên kết trong plan.
+- Ruff trên 5 file Python đổi trong follow-up → **All checks passed**; Python 3.11 `py_compile` cùng 5 file → **pass**.
+- Chưa chạy được pytest sau follow-up: runner mặc định thiếu `zleap`; `uv run --frozen --extra dev --python 3.11 ...` dừng khi build `litellm` vì máy thiếu MSVC `link.exe`, trước khi test collection. Reviewer đã báo 26/26 Phase 9 và 27/27 routing/retrieval trước các thay đổi follow-up này; không coi đó là kiểm tra lại cho commit follow-up.
+
 ## Phase 10 — Research Agent
 
 - [ ] Kiểm tra Gap Detector → Question Generator → Research Planner → discovery/fetch.

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -19,6 +17,7 @@ from sag_api.services.knowledge_quality_service import (
     KnowledgeQualityResult,
     QualityTopicInput,
 )
+from sag_api.services.knowledge_service import checksum
 
 _DEMAND_KEY = (
     "tenant_id",
@@ -28,17 +27,6 @@ _DEMAND_KEY = (
     "node_id",
     "day",
 )
-def _checksum(value: object) -> str:
-    encoded = json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
 def _stable_id(namespace: str, value: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"sag:{namespace}:{value}"))
 
@@ -282,7 +270,7 @@ async def persist_scoring_results(
         if not isinstance(raw_scoring_input, dict):
             raise ValueError("assessment snapshot must retain the complete scoring input")
         scoring_input = QualityTopicInput.model_validate(raw_scoring_input)
-        if _checksum(scoring_input.model_dump(mode="json")) != result.input_checksum:
+        if checksum(scoring_input.model_dump(mode="json")) != result.input_checksum:
             raise ValueError("scoring input snapshot does not match the scored input checksum")
         if (
             scoring_input.node_id != result.node_id
@@ -336,11 +324,11 @@ async def persist_scoring_results(
             raise ValueError("assessment snapshot lineage does not match scored input")
 
     config_json = config.model_dump(mode="json")
-    config_checksum = _checksum(config_json)
+    config_checksum = checksum(config_json)
     if config_checksum != first.config_checksum:
         raise ValueError("scored config checksum does not match persisted config")
     snapshot_json = {node_id: input_snapshot[node_id] for node_id in sorted(input_snapshot)}
-    input_checksum = _checksum(
+    input_checksum = checksum(
         {
             "node_input_checksums": {result.node_id: result.input_checksum for result in ordered},
             "input_snapshot": snapshot_json,
@@ -348,7 +336,7 @@ async def persist_scoring_results(
     )
     results_json = {result.node_id: result.model_dump(mode="json") for result in ordered}
     reasons_json = {result.node_id: list(result.reason_codes) for result in ordered}
-    assessment_checksum = _checksum(
+    assessment_checksum = checksum(
         {
             "scope": {
                 "tenant_id": first.tenant_id,
@@ -412,7 +400,7 @@ async def persist_scoring_results(
                     if key in ref
                 }
             )
-        gap_checksum = _checksum(
+        gap_checksum = checksum(
             {
                 "assessment_checksum": assessment_checksum,
                 "node_id": result.node_id,

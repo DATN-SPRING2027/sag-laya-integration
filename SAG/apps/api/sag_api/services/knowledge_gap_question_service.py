@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import uuid
@@ -17,6 +16,7 @@ from sag_api.core.config import settings
 from sag_api.db.models import KnowledgeEvidence, KnowledgeGap, KnowledgeGapQuestion, KnowledgeQualityAssessment
 from sag_api.services.knowledge_candidate_service import current_units
 from sag_api.services.knowledge_quality_repository import confirmed_source_ids_for_quality_scope
+from sag_api.services.knowledge_service import checksum
 
 PhraseAdapter = Callable[[str], Awaitable[str]]
 GENERATOR_VERSION = "knowledge-gap-question-v2"
@@ -24,17 +24,6 @@ PROMPT_VERSION = "knowledge-gap-question-prompt-v2"
 MAX_QUESTION_CHARS = 320
 MAX_PROMPT_EVIDENCE = 5
 MAX_PROMPT_QUOTE_CHARS = 500
-
-
-def _checksum(value: object) -> str:
-    encoded = json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 async def _phrase_with_configured_llm(prompt_json: str) -> str:
@@ -220,7 +209,7 @@ async def generate_question_for_gap(
     _validate_evidence_anchor(question_text, bounded_evidence)
     evidence_ids = [ref["evidence_id"] for ref in evidence_refs]
     reason_codes = list(gap.reason_codes_json)
-    question_checksum = _checksum(
+    question_checksum = checksum(
         {
             "gap_checksum": gap.checksum,
             "question_text": question_text,

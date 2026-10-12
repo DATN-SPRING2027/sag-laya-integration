@@ -50,6 +50,7 @@ from sag_api.services.query_routing_service import (
 from sag_api.services.query_strategy_planner import QueryStrategyPlan, plan_query, promote_multi_hop
 
 log = get_logger("search_units")
+_routed_query_demand_tasks: set[asyncio.Task[None]] = set()
 
 
 class SearchableSource(Protocol):
@@ -124,6 +125,28 @@ async def _record_routed_query_demand(
                 await session.commit()
     except Exception as error:  # noqa: BLE001 - demand recording must never break retrieval
         log.warning("knowledge query demand write failed error_type=%s", type(error).__name__)
+
+
+def _finish_routed_query_demand(task: asyncio.Task[None]) -> None:
+    _routed_query_demand_tasks.discard(task)
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        log.warning("knowledge query demand task failed error_type=%s", type(error).__name__)
+
+
+def _schedule_routed_query_demand(
+    groups: list[_SearchGroup],
+    decisions: dict[tuple[str, str, str, str], RouteDecision],
+) -> None:
+    """Write approximate demand off the search response path."""
+    task = asyncio.create_task(
+        _record_routed_query_demand(groups, decisions),
+        name="sag-routed-query-demand",
+    )
+    _routed_query_demand_tasks.add(task)
+    task.add_done_callback(_finish_routed_query_demand)
 
 
 def _verified_manifest(metrics: Any, *, project_id: str) -> bool:
@@ -1162,7 +1185,7 @@ async def retrieve_search_unit_sections(
         graph_skip_reason=graph_skip_reason,
         selection_fallback_reason=selection_fallback_reason,
     )
-    await _record_routed_query_demand(groups, decisions)
+    _schedule_routed_query_demand(groups, decisions)
     return SearchOutcome(
         query=query,
         sections=selected,

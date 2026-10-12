@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -88,3 +89,34 @@ async def test_search_skips_demand_write_for_unrouted_or_acl_mismatched_group(mo
     await retrieval._record_routed_query_demand([group], {group.scope_key: no_route})
 
     assert writes == []
+
+
+@pytest.mark.asyncio
+async def test_search_schedules_demand_write_without_waiting_and_tracks_task(monkeypatch):
+    group = _group("source-a", "version-a")
+    decision = _route(group, ("node-a",))
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_write(_groups, _decisions):
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(retrieval, "_record_routed_query_demand", delayed_write)
+    existing_tasks = set(retrieval._routed_query_demand_tasks)
+
+    retrieval._schedule_routed_query_demand([group], {group.scope_key: decision})
+
+    scheduled_tasks = retrieval._routed_query_demand_tasks - existing_tasks
+    assert len(scheduled_tasks) == 1
+    task = next(iter(scheduled_tasks))
+    assert not started.is_set()
+    try:
+        await started.wait()
+        assert not task.done()
+    finally:
+        release.set()
+    await task
+    await asyncio.sleep(0)
+
+    assert task not in retrieval._routed_query_demand_tasks

@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 from datetime import UTC, datetime
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from sag_api.services.knowledge_service import checksum
 
 
 class EvidenceSignal(BaseModel):
@@ -172,17 +172,6 @@ class KnowledgeQualityResult(BaseModel):
     reason_codes: tuple[str, ...]
 
 
-def _checksum(value: object) -> str:
-    encoded = json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
 def _normalized_entropy(counts: list[int]) -> float:
     nonzero = [count for count in counts if count > 0]
     if len(nonzero) <= 1:
@@ -335,8 +324,8 @@ def score_topic(
     if priority is not None and priority < config.minimum_priority:
         reason_codes.append("PRIORITY_BELOW_THRESHOLD")
 
-    input_checksum = _checksum(topic.model_dump(mode="json"))
-    config_checksum = _checksum(config.model_dump(mode="json"))
+    input_checksum = checksum(topic.model_dump(mode="json"))
+    config_checksum = checksum(config.model_dump(mode="json"))
     payload = {
         "scope": {
             "tenant_id": topic.tenant_id,
@@ -378,7 +367,7 @@ def score_topic(
         config_version=config.version,
         config_checksum=config_checksum,
         input_checksum=input_checksum,
-        result_checksum=_checksum(payload),
+        result_checksum=checksum(payload),
         metrics=KnowledgeQualityMetrics(
             coverage=round(coverage, 12),
             source_diversity=round(source_diversity, 12),

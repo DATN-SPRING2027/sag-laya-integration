@@ -158,4 +158,13 @@ Fixtures cho thấy scoring checksum ổn định; thêm anchored evidence hoặ
 - `0004` thêm demand, assessment, gap và question tables. Rollback thủ công chỉ sau khi consumer dừng: drop theo thứ tự `knowledge_gap_questions`, `knowledge_gaps`, `knowledge_quality_assessments`, `knowledge_query_demand_daily`; thao tác này xóa toàn bộ dữ liệu Phase 9.
 - Search writer ghi qua session riêng và fail-soft trong tối đa 100 ms. Trước migration, lỗi table thiếu được log và search vẫn trả kết quả; demand chỉ bắt đầu khi writer và migration được deploy.
 - Không có live PostgreSQL/Qdrant test, production traffic check, authentication endpoint cho assessment/question, hay automatic Phase 10 integration trong task này.
-- Không push/commit trong lần bàn giao này. DATN-67 Phase 4 còn In Progress; Phase 9 local pass không đóng dependency hoặc checkpoint production.
+- PR #26 là thay đổi Phase 9 đang chờ review/merge trên `main`. DATN-67 Phase 4 còn In Progress; local fixtures không đóng dependency hoặc checkpoint production.
+
+## 10. PR #26 review follow-up
+
+- Scoring, persistence và question generation tái sử dụng `knowledge_service.checksum`, giữ nguyên canonical serialization và checksum values; ba hàm trùng lặp đã được xóa.
+- Retrieval khởi chạy demand write bằng task nền được giữ strong reference đến completion. Route scope/ACL fingerprint validation, session riêng, timeout 100 ms, logging và fail-soft behavior vẫn giữ nguyên. Đây là metric best-effort: process shutdown/crash có thể làm mất write đang chờ; bucket thiếu tiếp tục là unknown.
+- Cold-start yêu cầu ít nhất một daily bucket của node trong cửa sổ demand hiện tại **và** cửa sổ liền trước có cùng độ dài. Trước khi có hai bucket-window quan sát được này, demand/growth unknown và không đủ điều kiện sinh question; không backfill.
+- Evidence folder đã sửa từ `[SAG][Phase 9}` sang `[SAG][Phase 9]`; `tasks/plan.md` trỏ tới đường dẫn mới.
+- Follow-up local checks: Ruff trên 5 file Python và Python 3.11 `py_compile` đều pass. Pytest chưa collection được do môi trường thiếu `zleap`; dùng `uv run --frozen --extra dev --python 3.11` cũng dừng lúc build `litellm` vì thiếu MSVC `link.exe`. Reviewer báo 26/26 Phase 9 tests và 27/27 routing/retrieval tests trước follow-up; chưa rerun các test đó trên thay đổi follow-up.
+- Thay đổi follow-up không sửa schema, config hoặc public API. PR #26 vẫn chờ merge; production PostgreSQL/Qdrant và DATN-67 vẫn là giới hạn ngoài xác nhận local.
