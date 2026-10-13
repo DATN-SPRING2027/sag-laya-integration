@@ -684,7 +684,10 @@ async def retrieve_search_unit_sections(
         "candidate_top_k": candidate_limit,
         "candidate_unit_pool_limit": settings.search_unit_candidate_limit,
     }
+    t_start = time.perf_counter()
+    t_auth_start = time.perf_counter()
     if principal is None or not sources or not principal.tenant_id or not principal.allowed_partition_ids:
+        total_ms = round((time.perf_counter() - t_start) * 1000, 2)
         return SearchOutcome(
             query=query,
             sections=[],
@@ -693,13 +696,20 @@ async def retrieve_search_unit_sections(
                 "ready_versions": 0,
                 **retrieval_stats,
                 "routing": _empty_routing_trace(strategy_plan, "no_authorized_scope"),
+                "stage_latencies_ms": {
+                    "auth_scope": total_ms,
+                    "tree_route": 0.0,
+                    "candidate_retrieval": 0.0,
+                    "rank_fusion": 0.0,
+                    "diversity_selection": 0.0,
+                    "total_retrieval": total_ms,
+                },
+                "latency_total_ms": total_ms,
             },
         )
 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + max(0.1, float(settings.search_source_timeout))
-    t_start = time.perf_counter()
-    t_auth_start = time.perf_counter()
     try:
         async with asyncio.timeout_at(deadline):
             async with SessionLocal() as session:

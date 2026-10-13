@@ -66,8 +66,7 @@ Luồng truy vấn của SAG qua [`/search`](../../apps/api/sag_api/api/v1/searc
 [Stage 9: LLM Synthesis/Stream] ─── (LLMClient / stream_synthesize_search_answer)
 ```
 
-**Khoảng trống hiện tại (Current Gap):**
-Trong khi [`retrieval_service.py`](../../apps/api/sag_api/services/retrieval_service.py#L722-L724) ghi nhận `latency_engine_ms`, `latency_rerank_ms`, `latency_total_ms` cho luồng legacy, thì luồng Phase 2C/Phase 4 chuẩn thức tại [`search_unit_retrieval_service.py`](../../apps/api/sag_api/services/search_unit_retrieval_service.py#L1215-L1230) chưa đóng gói chi tiết từ điển `stage_latencies_ms` cho từng công đoạn trên. Việc chẩn đoán nút thắt cổ chai dưới tải cao vì thế bị khiếm khuyết.
+**Trạng thái hiện tại:** [`search_unit_retrieval_service.py`](../../apps/api/sag_api/services/search_unit_retrieval_service.py) hiện ghi latency theo request cho sáu stage retrieval. Chưa có percentile aggregation theo stage, histogram runtime hoặc benchmark p99 theo workload/môi trường đích.
 
 ### 2.2. Bản đồ các hàng đợi ngầm (Background Worker & Queues)
 Hệ thống SAG sở hữu 4 thành phần tác vụ ngầm cần được giám sát:
@@ -90,7 +89,7 @@ Hệ thống SAG sở hữu 4 thành phần tác vụ ngầm cần được giá
 ## 3. Đo Lường Độ Trễ, SLOs & Ngân Sách Thời Gian (Stage Latencies, SLOs & Latency Budgets)
 
 ### 3.1. Phân bổ ngân sách thời gian từng công đoạn (Per-Stage Latency Budgets)
-Dựa trên các bài đo thực tế trong [`eval_retrieval.py`](../../apps/api/scripts/eval_retrieval.py) và các bài kiểm thử hồi quy `test_retrieval_relevance.py`, ngân sách thời gian (Latency Budget) cho một truy vấn tìm kiếm toàn cục với cấu hình mặc định (`top_k=8`, `search_source_candidate_limit=16`) được thiết lập như sau:
+Các con số dưới đây là **mục tiêu đề xuất**, chưa phải kết quả benchmark. `eval_retrieval.py` hiện chỉ tổng hợp p50/p95 cho latency tổng retrieval; chưa có kết quả p99 hoặc percentile theo stage kèm môi trường và workload. Không dùng bảng này làm SLO đã nghiệm thu cho tới khi benchmark trên môi trường đích được lưu lại.
 
 | Stage ID | Tên công đoạn kỹ thuật | Mục tiêu p50 (ms) | Mục tiêu p95 (ms) | Trần tối đa p99 (ms) | Hành động khi cạn kiệt ngân sách |
 | :--- | :--- | :---: | :---: | :---: | :--- |
@@ -123,10 +122,10 @@ Khi thời gian còn lại của truy vấn chạm trần `settings.search_reran
 
 ## 4. Bảng Điều Khiển & Cảnh Báo Sức Khỏe (Dashboards & Alerts)
 
-### 4.1. Thiết kế Endpoint Giám Sát Tối Giản (`GET /api/v1/system/metrics`)
-Theo triết lý Ponytail: Không cài thêm thư viện `prometheus-client` nặng nề. Sử dụng một endpoint trả về định dạng plain text tiêu chuẩn (Prometheus Text Exposition Format 0.0.4) và JSON có thể đọc trực tiếp bởi Prometheus, Datadog hoặc Grafana Agent.
+### 4.1. Endpoint hiện có và metrics đề xuất
+`GET /api/v1/system/metrics` hiện xuất health, cấu hình queue/search và route-cache gauges ở Prometheus Text Exposition Format 0.0.4 hoặc JSON. Các metrics truy vấn, stage latency, queue depth, ACL và tree ở danh sách dưới đây là **đề xuất**, chưa được endpoint phát ra. PR này cũng chưa thêm dashboard hay file cấu hình alert có thể triển khai.
 
-#### Các chỉ số (Metrics) thu thập thời gian thực:
+#### Metrics mục tiêu (chưa triển khai):
 1. **Chỉ số truy vấn & Độ trễ (Query & Latency Metrics):**
    - `sag_search_requests_total{status="success|error"}`: Tổng số lượt tìm kiếm.
    - `sag_stage_latency_ms{stage="laya|acl|tree_route|engine_recall|rrf|mmr|locator|token_pack"}`: Histogram/Summary độ trễ theo từng chặng.
@@ -146,7 +145,9 @@ Theo triết lý Ponytail: Không cài thêm thư viện `prometheus-client` n�
    - `sag_tree_publish_reversals_total{project_id="..."}`: Số lần kích hoạt hoàn nguyên (Rollback).
    - `sag_tree_quality_gate_rejections_total`: Số lần candidate cây bị từ chối do trượt ngưỡng chất lượng.
 
-### 4.2. Ma trận Quy tắc Cảnh Báo (Alerting Rules Matrix)
+### 4.2. Bản nháp quy tắc cảnh báo (chưa triển khai)
+
+Các biểu thức sau chỉ là thiết kế. Chúng không hoạt động cho tới khi metrics đầu vào được phát ra và rule được cài vào Prometheus/Grafana.
 
 | Mã Cảnh Báo | Tên Cảnh Báo | Biểu Thức Điều Kiện (PromQL / Logic) | Mức Độ | Ý Nghĩa Kỹ Thuật & Hành Động Ứng Cứu |
 | :--- | :--- | :--- | :---: | :--- |
@@ -161,13 +162,13 @@ Theo triết lý Ponytail: Không cài thêm thư viện `prometheus-client` n�
 
 ## 5. Kế Hoạch Kiểm Thử Tải, Hồi Quy & Tiêm Lỗi (Test Matrix & Verification Suites)
 
-Hệ thống kiểm thử xác minh khả năng chịu tải và chống lỗi được kế thừa từ các bộ test đã có, mở rộng thêm các kịch bản kiểm tra dưới tải:
+Các suite dưới đây cung cấp regression/fault-injection evidence. Chúng không thay thế load test hoặc live PostgreSQL/Qdrant staging verification:
 
 ```text
 +---------------------------------------------------------------------------------------------------------+
 |                                    MA TRẬN CÁC BỘ KIỂM THỬ XÁC MINH                                     |
 +---------------------------------------------------------------------------------------------------------+
-| [1] KIỂM THỬ HỒI QUY & TẢI CAO (Regression & Load)                                                      |
+| [1] HỒI QUY & ĐÁNH GIÁ RETRIEVAL (Regression & Retrieval Evaluation)                                   |
 |     - scripts/eval_retrieval.py (Đo recall, latency p50/p95 trên tập query vàng)                       |
 |     - tests/test_retrieval_relevance.py (Xác minh RRF invariance, Vietnamese queries)                  |
 |     - tests/test_search_unit_retrieval_service.py (Candidate limits, rank interleave under timeout)      |
@@ -199,10 +200,9 @@ Hệ thống kiểm thử xác minh khả năng chịu tải và chống lỗi �
 - **Bối cảnh sử dụng:** Cụm Qdrant gặp sự cố mất phân vùng đĩa, node bị crash vĩnh viễn, hoặc phát hiện lệch dữ liệu (`StorageDriftDetected`).
 - **Nguyên lý bất biến:** PostgreSQL là **Source of Truth duy nhất**. Mọi điểm vector trong Qdrant được dựng lại trực tiếp từ bảng `search_units`, `document_versions` và `documents`.
 - **Thực thi:**
-  Sử dụng trực tiếp dịch vụ có sẵn trong [`rebuild_service.py`](../../apps/api/sag_api/services/rebuild_service.py):
+  Từ thư mục `SAG/apps/api`, chạy CLI vận hành đã thêm trong PR:
   ```bash
-  # Lệnh chạy Rebuild theo từng dự án hoặc phiên bản tài liệu (qua script vận hành chuẩn):
-  python -m sag_api.scripts.rebuild_index --project-id <PROJECT_ID>
+  python -m scripts.sag_ops rebuild-qdrant --project-id <PROJECT_ID>
   ```
 - **Các bước kiểm tra an toàn tích hợp trong code (`rebuild_service.py`):**
   1. Kiểm tra cô lập Project: Xác nhận `Document.project_id == project_id`. Nếu phát hiện `IngestionRun` có `project_id` xung đột $\rightarrow$ **Fail-closed ngay lập tức** (ném lỗi, gán `INDEX_FAILED`, không ghi đè dữ liệu).
@@ -214,16 +214,9 @@ Hệ thống kiểm thử xác minh khả năng chịu tải và chống lỗi �
 - **Bối cảnh sử dụng:** Sau khi xuất bản phiên bản cây mới ($V_{\text{next}}$), giám sát ghi nhận suy giảm chất lượng tìm kiếm, tăng đột biến escape retrieval, hoặc vi phạm chất lượng định tuyến.
 - **Nguyên lý bất biến:** Nhờ kiến trúc Dual-Slot (Slot A và Slot B) và lưu trữ phiên bản retained trong [`ProjectSearchState`](../../apps/api/sag_api/db/models/routing_rag.py), phiên bản trước đó vẫn còn nguyên vẹn 100% trong slot đối diện.
 - **Thực thi:**
-  Sử dụng dịch vụ hoàn nguyên chuẩn thức trong [`tree_rollback_service.py`](../../apps/api/sag_api/services/tree_rollback_service.py):
-  ```python
-  from sag_api.services.tree_rollback_service import rollback_tree_candidate
-  # Thực thi hoàn nguyên trong giao dịch nguyên tử duy nhất:
-  result = await rollback_tree_candidate(
-      session,
-      project_id=project_id,
-      target_tree_version=previous_tree_version,
-      qdrant_client=qdrant_client,
-  )
+  Lấy `previous_tree_version` hiện được giữ trong `ProjectSearchState`, rồi chạy từ thư mục `SAG/apps/api`:
+  ```bash
+  python -m scripts.sag_ops rollback-tree --project-id <PROJECT_ID> --target-version <PREVIOUS_TREE_VERSION>
   ```
 - **Quy trình vận hành 4 bước được bảo đảm bởi hệ thống:**
   1. **Kiểm tra hợp lệ:** Đọc `ProjectSearchState`, xác nhận `previous_tree_version` tồn tại và khớp với target yêu cầu.
@@ -259,6 +252,8 @@ Hệ thống quản lý 5 bản di trú SQL tăng dần trong [`apps/api/migrati
   ```
   Khởi động lại tiến trình API hoặc gọi cập nhật runtime setting. Toàn bộ logic tìm kiếm sẽ tự động bỏ qua cache LRU nội bộ mà không cần xóa dữ liệu trên đĩa (vì cache hoàn toàn in-memory và tuân thủ strict TTL/epoch).
 
+`python -m scripts.sag_ops cache-status` chỉ đọc cache của process CLI mới khởi chạy; kết quả không phản ánh cache của API worker.
+
 ---
 
 ## 7. Kiểm Toán Toàn Diện Bộ Tiêu Chuẩn Hoàn Thành (Definition of Done Audit)
@@ -276,78 +271,26 @@ Dưới đây là bảng kiểm toán chi tiết 10 tiêu chí hoàn thành cố
 | **7** | **LLM trả lời grounded hoặc nêu thiếu evidence; Laya lỗi không làm knowledge query thất bại.** | **ĐẠT** | [`evidence_service.py`](../../apps/api/sag_api/services/evidence_service.py), [`laya_router.py`](../../apps/api/sag_api/services/laya_router.py), [`search.py`](../../apps/api/sag_api/api/v1/search.py#L107) | [`test_laya_router.py`](../../apps/api/tests/test_laya_router.py), [`test_search_stream.py`](../../apps/api/tests/test_search_stream.py), [`test_traceability.py`](../../apps/api/tests/test_traceability.py) | [`phase-3-review-report.md`](../phase-3-review-report.md) |
 | **8** | **UI phân biệt processing, SEARCH_READY, KNOWLEDGE_READY, FAILED; trace/metrics đủ chẩn đoán.** | **ĐẠT** | [`system.py`](../../apps/api/sag_api/api/v1/system.py), [`documents.py`](../../apps/api/sag_api/api/v1/documents.py), [`search.py`](../../apps/api/sag_api/api/v1/search.py) | [`test_api_smoke.py`](../../apps/api/tests/test_api_smoke.py), [`test_search_stream.py`](../../apps/api/tests/test_search_stream.py) | [`phase-0-contracts-and-foundations.md`](../phase-0-contracts-and-foundations.md) |
 | **9** | **Gap/Research Agent có provenance, ngân sách và giới hạn; regression, integration và failure checks đạt.** | **ĐẠT** | [`knowledge_gap_question_service.py`](../../apps/api/sag_api/services/knowledge_gap_question_service.py), [`research_agent_service.py`](../../apps/api/sag_api/services/research_agent_service.py), [`research_planner_service.py`](../../apps/api/sag_api/services/research_planner_service.py) | [`test_research_planner.py`](../../apps/api/tests/test_research_planner.py), [`test_research_agent_checkpoint_d.py`](../../apps/api/tests/test_research_agent_checkpoint_d.py) (16/16 passed) | [`checkpoint-d-research-agent-evidence.md`](checkpoint-d-research-agent-evidence.md) |
-| **10**| **Cache không vượt ACL/version boundary; p50/p95/p99 và failure recovery có runbook.** | **ĐẠT** | [`route_cache_service.py`](../../apps/api/sag_api/services/route_cache_service.py), [`rebuild_service.py`](../../apps/api/sag_api/services/rebuild_service.py), [`tree_rollback_service.py`](../../apps/api/sag_api/services/tree_rollback_service.py) | [`test_route_cache_service.py`](../../apps/api/tests/test_route_cache_service.py), [`test_query_routing_service.py`](../../apps/api/tests/test_query_routing_service.py) (62/62 passed) | [`[SAG][Phase 11]/evidence.md`](../Thang_Task/[SAG][Phase%2011]/evidence.md), Tài liệu này (Mục 3, 4, 6) |
+| **10**| **Cache không vượt ACL/version boundary; p50/p95/p99 và failure recovery có runbook.** | **CHƯA ĐỦ EVIDENCE** | [`route_cache_service.py`](../../apps/api/sag_api/services/route_cache_service.py), [`rebuild_service.py`](../../apps/api/sag_api/services/rebuild_service.py), [`tree_rollback_service.py`](../../apps/api/sag_api/services/tree_rollback_service.py) | [`test_route_cache_service.py`](../../apps/api/tests/test_route_cache_service.py), [`test_query_routing_service.py`](../../apps/api/tests/test_query_routing_service.py) (62/62 passed) | Cache boundary có regression; benchmark percentile, live staging và alert deployment còn mở. |
 
 ---
 
-## 8. Chiến Lược Coding Tinh Gọn & Kế Hoạch Triển Khai (Coding Strategy & Work Packages)
+## 8. Trạng Thái Triển Khai & Việc Còn Mở
 
-Để hệ thống hoàn toàn đồng bộ 100% với tài liệu và hoàn tất các điểm còn mở trong Phase 11 và DoD, lộ trình lập trình theo chuẩn Ponytail được chia thành 4 gói công việc gọn nhẹ:
+### Đã có trong PR
+- Per-request latency cho sáu stage retrieval trong `SearchOutcome.stats`.
+- `/api/v1/system/metrics` xuất health/config/cache gauges dạng Prometheus hoặc JSON.
+- CLI rebuild Qdrant, rollback tree theo target version tường minh, và xem cache của process CLI.
+- Runbook rebuild/rollback cùng ma trận alert dạng tài liệu.
 
-```text
-+---------------------------------------------------------------------------------------------------------+
-|                                    LỘ TRÌNH TRIỂN KHAI 4 GÓI CÔNG VIỆC                                  |
-+---------------------------------------------------------------------------------------------------------+
-| [WP1] Bổ sung Từ Điển stage_latencies_ms vào SearchOutcome trong search_unit_retrieval_service.py        |
-|       ===> Ghi nhận thời gian chi tiết của 6 chặng retrieval nội bộ mà không làm chậm hệ thống.         |
-|                                                     |                                                   |
-|                                                     v                                                   |
-| [WP2] Thêm Endpoint Giám Sát /api/v1/system/metrics (Format Prometheus/JSON Stdlib)                     |
-|       ===> Phơi bày các chỉ số độ trễ, queue depth, cache hits, và active tree epoch tại system.py.     |
-|                                                     |                                                   |
-| [WP3] Viết Script CLI Điều Hành Vận Hành scripts/sag_ops.py                                             |
-|       ===> Gói gọn các thao tác Rebuild Qdrant, Rollback Tree, và Flush Cache vào 1 CLI công cụ duy nhất|
-|            tái sử dụng 100% logic từ rebuild_service và tree_rollback_service.                          |
-|                                                     |                                                   |
-| [WP4] Kiểm Chứng Suite Hồi Quy & Cập Nhật tasks/todo.md                                                 |
-|       ===> Chạy kiểm thử toàn diện, xác thực bằng chứng, tích chọn các mục hoàn tất trong todo.md.      |
-+---------------------------------------------------------------------------------------------------------+
-```
-
-### Chi tiết Gói Công Việc 1 (WP1): Bổ sung `stage_latencies_ms` vào `search_unit_retrieval_service.py`
-- **File tác động:** `SAG/apps/api/sag_api/services/search_unit_retrieval_service.py`
-- **Nội dung code:**
-  - Đặt `t0 = time.perf_counter()` tại các chặng: `auth_scope`, `tree_route`, `engine_retrieval`, `rank_fusion`, `mmr_diversity`.
-  - Đóng gói vào `retrieval_stats`:
-    ```python
-    "stage_latencies_ms": {
-        "auth_scope": round(t_auth * 1000, 2),
-        "tree_route": round(t_route * 1000, 2),
-        "candidate_retrieval": round(t_retrieval * 1000, 2),
-        "rank_fusion": round(t_fusion * 1000, 2),
-        "diversity_selection": round(t_diversity * 1000, 2),
-        "total_retrieval": round((time.perf_counter() - t_start) * 1000, 2),
-    }
-    ```
-- **Nguyên tắc Ponytail:** Tái sử dụng `time.perf_counter()` từ stdlib, overhead < 0.01ms.
-
-### Chi tiết Gói Công Việc 2 (WP2): Thêm Endpoint Giám Sát `/api/v1/system/metrics`
-- **File tác động:** `SAG/apps/api/sag_api/api/v1/system.py`
-- **Nội dung code:**
-  - Tạo route `GET /system/metrics` với tham số `format: Literal["json", "prometheus"] = "prometheus"`.
-  - Thu thập nhanh số liệu từ `JobQueue`, `KnowledgeQueueControl`, `route_decision_cache`, và `ProjectSearchState`.
-  - Trả về `PlainTextResponse` hoặc `JSONResponse`.
-- **Nguyên tắc Ponytail:** Không cài thư viện bên ngoài; dùng template string đơn giản để render format prometheus.
-
-### Chi tiết Gói Công Việc 3 (WP3): Script CLI Vận Hành `scripts/sag_ops.py`
-- **File tác động:** `SAG/apps/api/scripts/sag_ops.py`
-- **Nội dung code:**
-  - Cung cấp các lệnh con (subcommands) bằng `argparse` stdlib:
-    1. `python -m scripts.sag_ops rebuild-qdrant --project-id <ID>`
-    2. `python -m scripts.sag_ops rollback-tree --project-id <ID> --target-version <VER>`
-    3. `python -m scripts.sag_ops cache-status`
-- **Nguyên tắc Ponytail:** Chỉ là adapter gọi trực tiếp hàm của service, không viết lại một dòng logic nghiệp vụ nào.
-
-### Chi tiết Gói Công Việc 4 (WP4): Kiểm Chứng & Cập Nhật `SAG/tasks/todo.md`
-- **File tác động:** `SAG/tasks/todo.md`
-- **Nội dung hành động:**
-  - Chạy toàn bộ test suites liên quan để ghi nhận evidence.
-  - Cập nhật dấu `[x]` cho các mục Phase 11 và mục Hoàn tất (DoD) trong `todo.md`.
+### Còn mở
+- Benchmark p50/p95/p99 theo stage và end-to-end trên workload/môi trường đích.
+- Live load, ACL, failure/retry và publish/rollback verification trên staging.
+- Runtime metrics cần cho các alert, dashboard và alert-rule config có thể deploy.
+- Kiểm chứng các runbook trên môi trường vận hành thực tế.
 
 ---
 
-## 9. Đánh Giá & Rà Soát Chất Lượng (Continuous Review & Verification)
+## 9. Giới Hạn Bằng Chứng
 
-- **Độ chính xác kỹ thuật:** Đã đối soát 100% với mã nguồn hiện hữu của SAG (không suy đoán tên hàm hay bảng cơ sở dữ liệu).
-- **Ranh giới bảo mật:** Đảm bảo toàn bộ các thao tác chẩn đoán và vận hành tuân thủ nguyên tắc cách ly bảo mật (Tenant / Project / Security Partition isolation), Fail-Closed khi thiếu token hay quyền.
-- **Tính khả thi thực thi:** Các thay đổi mã nguồn dự kiến có diff cực kỳ ngắn, không phá vỡ bất kỳ API contract hay schema database sẵn có nào. Toàn bộ mã code tiếp theo sẽ tuân thủ tuyệt đối 100% theo các quyết định kỹ thuật trong tài liệu nghiên cứu này.
+Tài liệu này phân biệt code/runtime đã có với mục tiêu đề xuất. Test fixture/local không xác nhận live staging, SLO benchmark hoặc khả năng hoạt động của alert. Các mục còn mở được theo dõi tại [`SAG/tasks/todo.md`](../../tasks/todo.md).

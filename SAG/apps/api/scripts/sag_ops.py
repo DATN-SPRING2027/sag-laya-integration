@@ -56,13 +56,16 @@ async def run_rebuild_qdrant(project_id: str) -> bool:
             await client.aclose()
 
 
-async def run_rollback_tree(project_id: str, target_tree_version: str | None = None) -> bool:
+async def run_rollback_tree(project_id: str, target_tree_version: str) -> bool:
     """Rollback blue-green routing tree candidate for a project."""
     from sag_api.sag.engine_manager import EngineManager
     from sag_api.services.tree_rollback_service import rollback_tree_candidate
 
     if not project_id or not project_id.strip():
         print(json.dumps({"status": "error", "message": "project_id cannot be empty"}), file=sys.stderr)
+        return False
+    if not target_tree_version or not target_tree_version.strip():
+        print(json.dumps({"status": "error", "message": "target_tree_version cannot be empty"}), file=sys.stderr)
         return False
 
     log.info(
@@ -74,23 +77,21 @@ async def run_rollback_tree(project_id: str, target_tree_version: str | None = N
     client = await engine_manager.get_search_unit_qdrant_client()
 
     try:
-        async with SessionLocal() as session:
-            result = await rollback_tree_candidate(
-                session,
-                project_id=project_id,
-                target_tree_version=target_tree_version,
-                qdrant_client=client,
-            )
-            data = {
-                "status": "success",
-                "project_id": result.project_id,
-                "active_slot": result.active_slot,
-                "active_tree_version": result.active_tree_version,
-                "active_search_epoch": result.active_search_epoch,
-                "retained_previous_tree_version": result.retained_previous_tree_version,
-            }
-            print(json.dumps(data, indent=2))
-            return True
+        result = await rollback_tree_candidate(
+            project_id,
+            target_tree_version=target_tree_version,
+            qdrant_client=client,
+        )
+        data = {
+            "status": "success",
+            "project_id": result.project_id,
+            "active_slot": result.active_slot,
+            "active_tree_version": result.active_tree_version,
+            "active_search_epoch": result.active_search_epoch,
+            "retained_previous_tree_version": result.retained_previous_tree_version,
+        }
+        print(json.dumps(data, indent=2))
+        return True
     except Exception as error:
         log.error("Tree rollback failed: %s", error)
         print(json.dumps({"status": "error", "message": str(error)}), file=sys.stderr)
@@ -105,6 +106,7 @@ def run_cache_status() -> None:
     from sag_api.services.route_cache_service import route_decision_cache
 
     status = {
+        "scope": "cli_process",
         "enabled": settings.search_route_decision_cache_enabled or route_decision_cache.enabled,
         "current_entries": len(route_decision_cache),
         "max_entries": route_decision_cache.max_entries,
@@ -123,9 +125,9 @@ def main() -> None:
         "rollback-tree", help="Rollback active routing tree to retained previous version"
     )
     rollback_parser.add_argument("--project-id", required=True, help="Target project ID")
-    rollback_parser.add_argument("--target-version", default=None, help="Optional exact tree version to restore")
+    rollback_parser.add_argument("--target-version", required=True, help="Exact retained tree version to restore")
 
-    subparsers.add_parser("cache-status", help="Inspect in-memory route decision cache")
+    subparsers.add_parser("cache-status", help="Inspect this CLI process's in-memory route decision cache")
 
     args = parser.parse_args()
 
