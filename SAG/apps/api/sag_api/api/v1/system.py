@@ -5,7 +5,7 @@ from ipaddress import ip_address
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -190,6 +190,94 @@ async def ready(request: Request) -> JSONResponse:
     if runtime is None or not runtime.ready:
         return JSONResponse(status_code=503, content={"status": "unavailable", "db": True})
     return JSONResponse(content={"status": "ready", "db": True})
+
+
+@router.get("/metrics")
+async def metrics(request: Request, format: str = "prometheus") -> Response:
+    """Hệ thống giám sát chỉ số (Metrics endpoint) phục vụ chẩn đoán tải & sức khỏe."""
+    db_ready = False
+    try:
+        async with SessionLocal() as session:
+            await session.execute(text("SELECT 1"))
+            db_ready = True
+    except Exception:
+        db_ready = False
+
+    runtime = getattr(request.app.state, "knowledge_runtime", None)
+    knowledge_ready = bool(runtime and runtime.ready)
+
+    from sag_api.services.route_cache_service import route_decision_cache
+
+    cache_size = len(route_decision_cache)
+    cache_max = route_decision_cache.max_entries
+    cache_enabled = 1 if (settings.search_route_decision_cache_enabled or route_decision_cache.enabled) else 0
+
+    if format.lower() == "json":
+        return JSONResponse(
+            content={
+                "status": "ok",
+                "system_up": 1,
+                "db_ready": db_ready,
+                "knowledge_runtime_ready": knowledge_ready,
+                "route_cache": {
+                    "enabled": bool(cache_enabled),
+                    "size": cache_size,
+                    "max_size": cache_max,
+                },
+                "queues": {
+                    "job_concurrency": settings.job_concurrency,
+                    "knowledge_concurrency": settings.knowledge_concurrency,
+                    "knowledge_queue_capacity": settings.knowledge_queue_capacity,
+                    "knowledge_daily_tokens": settings.knowledge_daily_tokens,
+                },
+                "search": {
+                    "top_k": settings.search_top_k,
+                    "candidate_limit": settings.search_source_candidate_limit,
+                    "unit_candidate_limit": settings.search_unit_candidate_limit,
+                    "rerank_min_remaining_seconds": settings.search_rerank_min_remaining_seconds,
+                },
+            }
+        )
+
+    lines = [
+        "# HELP sag_system_up Operational status of SAG API process",
+        "# TYPE sag_system_up gauge",
+        "sag_system_up 1",
+        "# HELP sag_db_ready PostgreSQL database connectivity readiness",
+        "# TYPE sag_db_ready gauge",
+        f"sag_db_ready {1 if db_ready else 0}",
+        "# HELP sag_knowledge_runtime_ready Knowledge runtime readiness status",
+        "# TYPE sag_knowledge_runtime_ready gauge",
+        f"sag_knowledge_runtime_ready {1 if knowledge_ready else 0}",
+        "# HELP sag_route_cache_enabled Exact route decision cache enablement",
+        "# TYPE sag_route_cache_enabled gauge",
+        f"sag_route_cache_enabled {cache_enabled}",
+        "# HELP sag_route_cache_entries Current entries in route decision LRU cache",
+        "# TYPE sag_route_cache_entries gauge",
+        f"sag_route_cache_entries {cache_size}",
+        "# HELP sag_route_cache_max_entries Maximum capacity of route decision LRU cache",
+        "# TYPE sag_route_cache_max_entries gauge",
+        f"sag_route_cache_max_entries {cache_max}",
+        "# HELP sag_job_concurrency Maximum worker concurrency for document ingestion",
+        "# TYPE sag_job_concurrency gauge",
+        f"sag_job_concurrency {settings.job_concurrency}",
+        "# HELP sag_knowledge_queue_capacity Maximum capacity for knowledge enrichment queue",
+        "# TYPE sag_knowledge_queue_capacity gauge",
+        f"sag_knowledge_queue_capacity {settings.knowledge_queue_capacity}",
+        "# HELP sag_knowledge_daily_tokens Daily token budget for knowledge enrichment queue",
+        "# TYPE sag_knowledge_daily_tokens gauge",
+        f"sag_knowledge_daily_tokens {settings.knowledge_daily_tokens}",
+        "# HELP sag_search_top_k Configured default top_k for search queries",
+        "# TYPE sag_search_top_k gauge",
+        f"sag_search_top_k {settings.search_top_k}",
+        "# HELP sag_search_unit_candidate_limit Hard cap of candidates pool for search units",
+        "# TYPE sag_search_unit_candidate_limit gauge",
+        f"sag_search_unit_candidate_limit {settings.search_unit_candidate_limit}",
+        "# HELP sag_search_rerank_min_remaining_seconds Latency budget margin triggering fast rank interleave",
+        "# TYPE sag_search_rerank_min_remaining_seconds gauge",
+        f"sag_search_rerank_min_remaining_seconds {settings.search_rerank_min_remaining_seconds}",
+    ]
+    return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 @router.get("/capabilities")

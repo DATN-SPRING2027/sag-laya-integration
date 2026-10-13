@@ -751,3 +751,52 @@ async def test_candidate_hydration_database_errors_are_sanitized(monkeypatch):
     assert "secret-password" not in str(error.value)
     assert "db.internal" not in str(error.value)
     await qdrant_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stage_latencies_are_measured_and_reported_in_stats(monkeypatch):
+    from types import SimpleNamespace
+
+    source = SimpleNamespace(id="src-1", name="S1", sag_source_config_id="cfg-1")
+    principal = VerifiedPrincipal(
+        subject="user-1",
+        organization_id="org-1",
+        allowed_project_ids=frozenset({"proj-1"}),
+        issuer="https://issuer.invalid",
+        key_id="k-1",
+        token_id="tok-1",
+        issued_at=1,
+        expires_at=2,
+        tenant_id="tenant-1",
+        allowed_partition_ids=frozenset({"part-1"}),
+    )
+
+    # Empty ready versions path
+    async def fake_load_current_ready_versions(*_args, **_kwargs):
+        return {}
+
+    monkeypatch.setattr(retrieval, "_load_current_ready_versions", fake_load_current_ready_versions)
+
+    outcome = await retrieval.retrieve_search_unit_sections(
+        None,
+        [source],
+        "test query",
+        principal=principal,
+        top_k=5,
+    )
+
+    assert "stage_latencies_ms" in outcome.stats
+    stage_latencies = outcome.stats["stage_latencies_ms"]
+    expected_stages = (
+        "auth_scope",
+        "tree_route",
+        "candidate_retrieval",
+        "rank_fusion",
+        "diversity_selection",
+        "total_retrieval",
+    )
+    for key in expected_stages:
+        assert key in stage_latencies
+        assert isinstance(stage_latencies[key], float)
+    assert "latency_total_ms" in outcome.stats
+    assert isinstance(outcome.stats["latency_total_ms"], float)

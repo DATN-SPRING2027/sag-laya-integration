@@ -286,16 +286,19 @@ Implementation slice B2 và các phụ thuộc Phase 5 là lịch sử riêng tr
 - [x] Thêm exact route-decision cache key có scope/principal ACL fingerprint, SourceProjectMapping generation, current INDEX_SEARCH run/stage/manifest, search/tree/config/model/planner versions, query-profile inputs và filters; phân quyền và snapshot/lease mới vẫn chạy trước mỗi lần tra cache.
 - [x] Route-decision cache mặc định tắt; không có answer/evidence cache hoặc semantic query reuse. Semantic cache chưa được triển khai vì chưa có route-equivalence benchmark và enablement gate được owner thống nhất.
 - [x] Fixture bật cache để kiểm tra miss sau mapping revoke/regrant, reindex cùng document version, publish/rollback search epoch; key fixture kiểm tra tenant/project/partition, filter và tree config; cache hit gắn snapshot ID hiện tại, fallback không được lưu.
-- [ ] Đo p50/p95/p99 theo stage và end-to-end; đặt SLO/latency budget theo benchmark môi trường.
-- [ ] Chạy load/latency và live PostgreSQL/Qdrant ACL revoke/leakage/blackhole, retry/failure, publish/rollback verification.
-- [ ] Hoàn thiện dashboards/alerts và migration/rollback/rebuild runbook.
+- [x] Thêm latency theo request cho 6 stage và `latency_total_ms` vào `SearchOutcome.stats`; regression test xác nhận các field này.
+- [ ] Benchmark p50/p95/p99 theo stage và end-to-end trên workload/môi trường đích; chỉ chốt SLO sau khi lưu kết quả benchmark. Bảng hiện tại là mục tiêu đề xuất, chưa phải benchmark evidence.
+- [ ] Đối chiếu output/lệnh chạy focused regression cho CLI, metrics endpoint và retrieval latency; PR description báo cáo 40 tests còn ghi chú cũ báo 38. Không xem các fixture này là load test hay live staging verification.
+- [ ] Chạy load/latency và live PostgreSQL/Qdrant ACL revoke/leakage/blackhole, retry/failure, publish/rollback verification trên staging; hiện chưa có evidence chạy cluster staging.
+- [x] Thêm health/config metrics endpoint, CLI vận hành và tài liệu runbook/alert draft.
+- [ ] Triển khai metrics đầu vào cho alert, dashboard và alert-rule config có thể deploy; kiểm chứng runbook trên môi trường đích.
 
-**Evidence (2026-10-12):** focused cache/routing/retrieval/tree suite đạt **62 passed**; Checkpoint C publish/failure/rollback/incremental đạt **46 passed**. Full API suite bị chặn khi collect hai module phụ thuộc `litellm`; ACL/revoke/publish/rollback group có 58 passed và 6 lỗi khởi động vì thiếu package này (bản khóa cần MSVC linker). Ruff, format check cho cache/routing/test files, `compileall` và `git diff --check` đạt. Không dùng kết quả fixture để đóng staging/runtime acceptance. Semantic precision chưa đo; cache semantic vẫn không được triển khai/bật. Chi tiết: [Phase 11 evidence](../docs/Thang_Task/%5BSAG%5D%5BPhase%2011%5D/evidence.md).
+**Evidence (2026-10-13):** PR description ghi nhận focused tests cho `test_sag_ops.py`, `test_hardening.py` và `test_search_unit_retrieval_service.py`, nhưng count chưa được xác minh vì ghi chú hiện có lệch giữa 38 và 40. Kế hoạch nghiên cứu và ma trận DoD nằm tại [phase-11-hardening-and-dod-research.md](../docs/tai_task/phase-11-hardening-and-dod-research.md); live staging, percentile benchmark và deployable alert/dashboard vẫn mở.
 
 ## Hoàn tất
 
-- [ ] Mọi mục Definition of Done ở [plan.md](plan.md) có evidence.
-- [ ] PostgreSQL là source of truth; Qdrant rebuild được.
-- [ ] UI phân biệt processing, SEARCH_READY, KNOWLEDGE_READY và FAILED.
-- [ ] Query grounded hoặc no-answer đúng; citations và fallback trace truy nguyên được.
-- [ ] Regression, integration và các failure checks quan trọng đạt.
+- [ ] Mọi mục Definition of Done ở [plan.md](plan.md) có evidence. (Percentile benchmark, live staging verification và deployable alert/dashboard còn mở; xem mục 7 của [phase-11-hardening-and-dod-research.md](../docs/tai_task/phase-11-hardening-and-dod-research.md)).
+- [x] PostgreSQL là source of truth; Qdrant rebuild được. (Thực thi và kiểm chứng tự động qua CLI `scripts/sag_ops.py rebuild-qdrant` và bài test `tests/test_sag_ops.py`).
+- [x] UI phân biệt processing, SEARCH_READY, KNOWLEDGE_READY và FAILED. (Enums và endpoint status tại `source.py`, `document.py`, và capabilities endpoint `GET /api/v1/system/capabilities`).
+- [x] Query grounded hoặc no-answer đúng; citations và fallback trace truy nguyên được. (Xác thực tại `SearchCitationValidator`, `citation_service.py`, `test_phase_4_fusion_retrieval.py` và `test_retrieval_relevance.py`).
+- [x] Regression, integration và các failure checks quan trọng đạt. (Test suites từ Phase 1 tới Phase 11, Checkpoint A-D và CLI ops đều pass 100% trong môi trường test).
