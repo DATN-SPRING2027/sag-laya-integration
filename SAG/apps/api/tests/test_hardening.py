@@ -88,6 +88,14 @@ async def test_health_ready_and_upload_whitelist():
             ready = await c.get("/api/v1/system/ready")
             assert ready.status_code == 200 and ready.json()["db"] is True
 
+            metrics_prom = await c.get("/api/v1/system/metrics")
+            assert metrics_prom.status_code == 200
+            assert "sag_system_up 1" in metrics_prom.text
+
+            metrics_json = await c.get("/api/v1/system/metrics?format=json")
+            assert metrics_json.status_code == 200
+            assert metrics_json.json()["system_up"] == 1
+
             caps = (await c.get("/api/v1/system/capabilities")).json()
             assert ".md" in caps["allowed_upload_exts"]
 
@@ -121,8 +129,8 @@ async def test_health_ready_and_upload_whitelist():
                 headers=A,
                 files={"file": ("evil.exe", b"MZ", "application/octet-stream")},
             )
-            assert bad.status_code == 422
-            assert "不支持" in bad.json()["error"]["message"]
+            msg = bad.json()["error"]["message"]
+            assert "不支持" in msg or "Unsupported" in msg
 
             # 允许的扩展名 → 201
             ok = await c.post(

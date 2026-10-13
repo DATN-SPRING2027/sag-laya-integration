@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import math
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -697,6 +698,8 @@ async def retrieve_search_unit_sections(
 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + max(0.1, float(settings.search_source_timeout))
+    t_start = time.perf_counter()
+    t_auth_start = time.perf_counter()
     try:
         async with asyncio.timeout_at(deadline):
             async with SessionLocal() as session:
@@ -704,8 +707,10 @@ async def retrieve_search_unit_sections(
     except TimeoutError as error:
         log.warning("canonical search authorization exceeded query budget")
         raise ServiceUnavailableError("Canonical search exceeded the query budget") from error
+    t_auth_ms = round((time.perf_counter() - t_auth_start) * 1000, 2)
     groups = _groups(ready_versions)
     if not groups:
+        total_ms = round((time.perf_counter() - t_start) * 1000, 2)
         return SearchOutcome(
             query=query,
             sections=[],
@@ -714,8 +719,20 @@ async def retrieve_search_unit_sections(
                 "ready_versions": 0,
                 **retrieval_stats,
                 "routing": _empty_routing_trace(strategy_plan, "no_verified_search_ready_group"),
+                "stage_latencies_ms": {
+                    "auth_scope": t_auth_ms,
+                    "tree_route": 0.0,
+                    "candidate_retrieval": 0.0,
+                    "rank_fusion": 0.0,
+                    "diversity_selection": 0.0,
+                    "total_retrieval": total_ms,
+                },
+                "latency_total_ms": total_ms,
             },
         )
+
+    t_route_ms = 0.0
+    t_retrieval_ms = 0.0
 
     decisions: dict[tuple[str, str, str, str], RouteDecision] = {}
     local_failures: dict[tuple[str, str, str, str], str] = {}
@@ -732,6 +749,7 @@ async def retrieve_search_unit_sections(
                     deadline - loop.time() - float(settings.search_tree_escape_reserve_seconds),
                 ),
             )
+            t_route_start = time.perf_counter()
             decisions = await capture_routing_decisions(
                 engine_manager,
                 groups,
@@ -740,6 +758,7 @@ async def retrieve_search_unit_sections(
                 principal=principal,
                 timeout_seconds=snapshot_budget,
             )
+            t_route_ms = round((time.perf_counter() - t_route_start) * 1000, 2)
 
             async def bounded(group: _SearchGroup):
                 async with semaphore:
@@ -823,6 +842,7 @@ async def retrieve_search_unit_sections(
                         path_results.append((group, route, "global_escape", escape_result[1], escape_result[2]))
                     return path_results, local_failure, escape_failure
 
+            t_retrieval_start = time.perf_counter()
             group_tasks = [asyncio.create_task(bounded(group)) for group in groups]
             try:
                 path_groups = await asyncio.gather(*group_tasks)
@@ -831,6 +851,7 @@ async def retrieve_search_unit_sections(
                     task.cancel()
                 await asyncio.gather(*group_tasks, return_exceptions=True)
                 raise
+            t_retrieval_ms = round((time.perf_counter() - t_retrieval_start) * 1000, 2)
         channel_results = [item for path_group, _local_failure, _escape_failure in path_groups for item in path_group]
         local_failures = {
             group.scope_key: local_failure
@@ -937,6 +958,7 @@ async def retrieve_search_unit_sections(
             if effective_plan.primary_strategy.value == "MULTI_HOP"
             else None,
         )
+        total_ms = round((time.perf_counter() - t_start) * 1000, 2)
         return SearchOutcome(
             query=query,
             sections=[],
@@ -945,6 +967,15 @@ async def retrieve_search_unit_sections(
                 "ready_versions": len(ready_versions),
                 **retrieval_stats,
                 "routing": routing,
+                "stage_latencies_ms": {
+                    "auth_scope": t_auth_ms,
+                    "tree_route": t_route_ms,
+                    "candidate_retrieval": t_retrieval_ms,
+                    "rank_fusion": 0.0,
+                    "diversity_selection": 0.0,
+                    "total_retrieval": total_ms,
+                },
+                "latency_total_ms": total_ms,
             },
         )
 
@@ -1137,6 +1168,7 @@ async def retrieve_search_unit_sections(
     lexical = _fair_rank_merge(lexical_lists)
     selection_fallback_reason = None
     rerank_remaining = deadline - loop.time()
+    t_rerank_start = time.perf_counter()
     if rerank_remaining <= settings.search_rerank_min_remaining_seconds:
         selection_fallback_reason = "rerank_budget_exhausted"
         fallback_pool = _fair_rank_merge([semantic, lexical])
@@ -1161,18 +1193,24 @@ async def retrieve_search_unit_sections(
             "semantic_answerability": "unknown",
         }
         selection_method = "latency_fallback_rank_interleave"
+        t_fusion_ms = 0.0
+        t_diversity_ms = round((time.perf_counter() - t_rerank_start) * 1000, 2)
     else:
+        t_fusion_start = time.perf_counter()
         fused = rerank_sections(query, semantic, lexical=lexical, limit=candidate_limit)
+        t_fusion_ms = round((time.perf_counter() - t_fusion_start) * 1000, 2)
         rerank_stats = {
             "candidates": fused.candidate_count,
             "relevant": fused.relevant_count,
             "filtered_irrelevant": fused.filtered_count,
         }
+        t_div_start = time.perf_counter()
         selected, diversity_stats = select_diverse_sections(
             query,
             fused.sections,
             limit=requested_limit,
         )
+        t_diversity_ms = round((time.perf_counter() - t_div_start) * 1000, 2)
         coverage = {
             **diversity_stats,
             "status": _structural_coverage_status(len(selected), diversity_stats),
@@ -1209,6 +1247,7 @@ async def retrieve_search_unit_sections(
         selection_fallback_reason=selection_fallback_reason,
     )
     _schedule_routed_query_demand(groups, decisions)
+    total_retrieval_ms = round((time.perf_counter() - t_start) * 1000, 2)
     return SearchOutcome(
         query=query,
         sections=selected,
@@ -1225,6 +1264,15 @@ async def retrieve_search_unit_sections(
             "coverage": coverage,
             "routing": routing,
             "selection_fallback_reason": selection_fallback_reason,
+            "stage_latencies_ms": {
+                "auth_scope": t_auth_ms,
+                "tree_route": t_route_ms,
+                "candidate_retrieval": t_retrieval_ms,
+                "rank_fusion": t_fusion_ms,
+                "diversity_selection": t_diversity_ms,
+                "total_retrieval": total_retrieval_ms,
+            },
+            "latency_total_ms": total_retrieval_ms,
         },
     )
 
