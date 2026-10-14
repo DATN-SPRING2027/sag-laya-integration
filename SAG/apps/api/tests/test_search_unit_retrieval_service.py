@@ -800,3 +800,58 @@ async def test_stage_latencies_are_measured_and_reported_in_stats(monkeypatch):
         assert isinstance(stage_latencies[key], float)
     assert "latency_total_ms" in outcome.stats
     assert isinstance(outcome.stats["latency_total_ms"], float)
+
+
+@pytest.mark.asyncio
+async def test_literal_grep_uses_all_ready_canonical_blocks_and_escapes_wildcards(monkeypatch):
+    from types import SimpleNamespace
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from sag_api.db.base import Base
+    from sag_api.db.models import CanonicalBlock
+
+    engine = create_async_engine("sqlite+aiosqlite://")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    async with async_sessionmaker(engine, expire_on_commit=False)() as session:
+        session.add_all(
+            [
+                CanonicalBlock(
+                    id="match-1", document_version_id="ready-version", ordinal=1,
+                    block_type="paragraph", page_from=1, page_to=1, section_path="Intro",
+                    source_anchor=None, normalized_text="Contains A_B% literally", content_hash="a" * 64,
+                ),
+                CanonicalBlock(
+                    id="match-2", document_version_id="ready-version", ordinal=2,
+                    block_type="paragraph", page_from=1, page_to=1, section_path="Details",
+                    source_anchor=None, normalized_text="Another a_b% match", content_hash="b" * 64,
+                ),
+                CanonicalBlock(
+                    id="hidden-match", document_version_id="hidden-version", ordinal=1,
+                    block_type="paragraph", page_from=1, page_to=1, section_path="Hidden",
+                    source_anchor=None, normalized_text="A_B% secret", content_hash="c" * 64,
+                ),
+                CanonicalBlock(
+                    id="wildcard-only", document_version_id="ready-version", ordinal=3,
+                    block_type="paragraph", page_from=1, page_to=1, section_path="Other",
+                    source_anchor=None, normalized_text="Contains A1BXX but no literal", content_hash="d" * 64,
+                ),
+            ]
+        )
+        await session.commit()
+
+        async def ready_versions(*_args, **_kwargs):
+            return {"ready-version": object()}
+
+        monkeypatch.setattr(retrieval, "_load_current_ready_versions", ready_versions)
+        results = await retrieval.grep_search_unit_blocks(
+            session,
+            [SimpleNamespace(id="source-1")],
+            "a_b%",
+            principal=SimpleNamespace(),
+            limit=10,
+        )
+
+    assert [block.id for block in results] == ["match-1", "match-2"]
+    await engine.dispose()

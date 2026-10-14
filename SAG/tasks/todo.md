@@ -288,12 +288,12 @@ Implementation slice B2 và các phụ thuộc Phase 5 là lịch sử riêng tr
 - [x] Fixture bật cache để kiểm tra miss sau mapping revoke/regrant, reindex cùng document version, publish/rollback search epoch; key fixture kiểm tra tenant/project/partition, filter và tree config; cache hit gắn snapshot ID hiện tại, fallback không được lưu.
 - [x] Thêm latency theo request cho 6 stage và `latency_total_ms` vào `SearchOutcome.stats`; regression test xác nhận các field này.
 - [ ] Benchmark p50/p95/p99 theo stage và end-to-end trên workload/môi trường đích; chỉ chốt SLO sau khi lưu kết quả benchmark. Bảng hiện tại là mục tiêu đề xuất, chưa phải benchmark evidence.
-- [ ] Đối chiếu output/lệnh chạy focused regression cho CLI, metrics endpoint và retrieval latency; PR description báo cáo 40 tests còn ghi chú cũ báo 38. Không xem các fixture này là load test hay live staging verification.
+- [x] Đã đối chiếu focused regression cho CLI, metrics endpoint và retrieval latency; xem evidence ngày 2026-10-14 bên dưới. Đây không phải load test hoặc live staging verification.
 - [ ] Chạy load/latency và live PostgreSQL/Qdrant ACL revoke/leakage/blackhole, retry/failure, publish/rollback verification trên staging; hiện chưa có evidence chạy cluster staging.
 - [x] Thêm health/config metrics endpoint, CLI vận hành và tài liệu runbook/alert draft.
 - [ ] Triển khai metrics đầu vào cho alert, dashboard và alert-rule config có thể deploy; kiểm chứng runbook trên môi trường đích.
 
-**Evidence (2026-10-13):** PR description ghi nhận focused tests cho `test_sag_ops.py`, `test_hardening.py` và `test_search_unit_retrieval_service.py`, nhưng count chưa được xác minh vì ghi chú hiện có lệch giữa 38 và 40. Kế hoạch nghiên cứu và ma trận DoD nằm tại [phase-11-hardening-and-dod-research.md](../docs/tai_task/phase-11-hardening-and-dod-research.md); live staging, percentile benchmark và deployable alert/dashboard vẫn mở.
+**Evidence (2026-10-14):** `pytest -q tests/test_sag_ops.py tests/test_hardening.py tests/test_search_unit_retrieval_service.py` đạt 41 passed, 1 warning. `pytest -q tests/test_search_unit_retrieval_service.py tests/test_agent_history_acl.py tests/test_client_form.py tests/test_legacy_conversation_migration.py` đạt 42 passed, 1 warning. Đây là focused regression; full suite 1,040 test, live Qdrant/staging, percentile benchmark và deployable alert/dashboard vẫn chưa được xác nhận. Kế hoạch nghiên cứu và ma trận DoD nằm tại [phase-11-hardening-and-dod-research.md](../docs/tai_task/phase-11-hardening-and-dod-research.md).
 
 ## Hoàn tất
 
@@ -301,4 +301,4 @@ Implementation slice B2 và các phụ thuộc Phase 5 là lịch sử riêng tr
 - [x] PostgreSQL là source of truth; Qdrant rebuild được. (Thực thi và kiểm chứng tự động qua CLI `scripts/sag_ops.py rebuild-qdrant` và bài test `tests/test_sag_ops.py`).
 - [x] UI phân biệt processing, SEARCH_READY, KNOWLEDGE_READY và FAILED. (Enums và endpoint status tại `source.py`, `document.py`, và capabilities endpoint `GET /api/v1/system/capabilities`).
 - [x] Query grounded hoặc no-answer đúng; citations và fallback trace truy nguyên được. (Xác thực tại `SearchCitationValidator`, `citation_service.py`, `test_phase_4_fusion_retrieval.py` và `test_retrieval_relevance.py`).
-- [x] Regression, integration và các failure checks quan trọng đạt. (Test suites từ Phase 1 tới Phase 11, Checkpoint A-D và CLI ops đều pass 100% trong môi trường test).
+- [ ] Regression, integration và các failure checks quan trọng của toàn dự án đều đạt. (Focused suites nêu trên đã pass; full suite 1,040 test chưa hoàn tất.)

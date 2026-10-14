@@ -228,20 +228,39 @@ Các suite dưới đây cung cấp regression/fault-injection evidence. Chúng 
   4. **Bảo tồn Lease truy vấn đang chạy:** Không xóa bất kỳ dữ liệu slot nào cho đến khi hết hạn `TreeSnapshotLease`. Các truy vấn phát sinh trước rollback tiếp tục đọc snapshot cũ; truy vấn mới ngay lập tức đọc snapshot đã hoàn nguyên.
 
 ### 6.3. Runbook 3: Quy Trình Di Trú & Hoàn Nguyên Cơ Sở Dữ Liệu (Database Migration & Rollback)
-Hệ thống quản lý 5 bản di trú SQL tăng dần trong [`apps/api/migrations/`](../../apps/api/migrations):
+Hệ thống quản lý 6 bản di trú SQL trong [`apps/api/migrations/`](../../apps/api/migrations):
 - `0001_phase_0_routing_rag_schema.sql`: Khởi tạo bảng nền tảng (Documents, Versions, SearchUnits, IngestionRuns).
 - `0002_checkpoint_c_publish_snapshots.sql`: Bổ sung `ProjectSearchState`, `TreeManifest`, `TreeRoutingProfile`, `TreeSnapshotLease`.
 - `0003_knowledge_foundation.sql`: Bổ sung `KnowledgeUnit`, `KnowledgeEvidence`, `KnowledgeJob`, `KnowledgeQueueControl`.
 - `0004_knowledge_quality_gaps.sql`: Bổ sung `KnowledgeQueryDemandDaily`, `KnowledgeQualityAssessment`, `KnowledgeGap`, `KnowledgeGapQuestion`.
 - `0005_research_agent_tasks.sql`: Bổ sung `ResearchTask`.
+- `0006_backend_integrity.sql`: Bổ sung owner scope và ingestion state, tạo bảng idempotency, nới `documents.owner_id`, đổi `documents.id` và các cột FK tham chiếu sang `VARCHAR(36)`.
 
-**Quy tắc hoàn nguyên an toàn:**
-- Mọi migration đều có tính chất lũy kế (**additive**).
-- Khi buộc phải hoàn nguyên schema, phải thực hiện theo thứ tự ngược lại: `0005` $\rightarrow$ `0004` $\rightarrow$ `0003` $\rightarrow$ `0002` $\rightarrow$ `0001`.
-- Cảnh báo: Việc drop bảng ở các migration sẽ làm mất lịch sử metadata tương ứng, do đó trước khi thực hiện phải tạo dump snapshot của PostgreSQL:
-  ```bash
-  pg_dump -h $SAG_PG_HOST -U $SAG_PG_USER -d $SAG_PG_DATABASE -Fc -f "sag_backup_$(date +%Y%m%d_%H%M%S).dump"
-  ```
+**Triển khai `0006` an toàn:**
+- Đây không phải migration chỉ thêm cột. Nó đổi kiểu `documents.id` và các cột FK tương ứng trong cùng transaction; PostgreSQL cần khóa các bảng liên quan, nên lên lịch cửa sổ bảo trì, dừng API cũ trước khi migrate và giữ ghi tạm dừng đến khi owner mapping xong. Thử trước trên bản restore có kích thước dữ liệu gần production.
+- Trước khi chạy, kiểm tra mọi `documents.id` dài tối đa 36 ký tự. Ghi nhận số hàng ở `agents`, `threads`, `documents` và các bảng có FK tới `documents`. Migration sẽ thất bại nếu ID hiện có dài hơn giới hạn mới.
+- Nâng cấp schema, chạy quy trình gán owner bên dưới, rồi mới đưa API phiên bản mới vào phục vụ. Không tự suy đoán owner cho agent/thread cũ. Hàng chưa được map vẫn được giữ trong DB nhưng API owner-scoped sẽ không hiển thị.
+- Với cài đặt đã có hội thoại, tạo mapping JSON theo từng owner đã xác minh:
+
+      {
+        "agents": {"<private-agent-id>": "<64-hex-owner-key>"},
+        "threads": {"<thread-id>": "<64-hex-owner-key>"}
+      }
+
+  Owner key phải tương ứng với principal đã xác nhận qua `conversation_owner_key`; không map shared default agent. Chạy dry-run trước, xem số hàng còn chưa map và attachment thiếu, rồi mới áp dụng:
+
+      cd SAG/apps/api
+      python -m scripts.migrate_legacy_conversations --mapping owner-map.json
+      python -m scripts.migrate_legacy_conversations --mapping owner-map.json --apply
+
+  Script kiểm tra agent/thread cùng owner, chỉ copy attachment legacy được tham chiếu bởi thread đã map vào `attachments/<owner_key>/`, và giữ nguyên file phẳng làm bản dự phòng. Nếu không có mapping đã xác minh thì chỉ chạy dry-run.
+- `0006` không có rollback tự động an toàn: sau cutover, ID hoặc owner ID mới có thể không vừa kiểu cột cũ. Phương án hoàn nguyên đáng tin cậy là phục hồi PostgreSQL từ backup trước migration; chỉ dùng reverse DDL sau khi chứng minh dữ liệu tương thích và đã thử trên bản restore.
+
+Trước khi triển khai, tạo dump snapshot PostgreSQL:
+
+      pg_dump -h $SAG_PG_HOST -U $SAG_PG_USER -d $SAG_PG_DATABASE -Fc -f "sag_backup_$(date +%Y%m%d_%H%M%S).dump"
+
+Sau migration, kiểm tra schema, row counts, API health, owner separation, tìm kiếm và đọc lại hội thoại/attachment đã map trước khi mở traffic.
 
 ### 6.4. Runbook 4: Vô Hiệu Hóa Khẩn Cấp Bộ Nhớ Đệm Định Tuyến (Emergency Cache Invalidation)
 - **Bối cảnh sử dụng:** Phát hiện dữ liệu cache định tuyến không giải phóng kịp thời khi thay đổi chính sách bảo mật bất thường.

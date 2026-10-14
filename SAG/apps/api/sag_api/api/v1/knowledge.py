@@ -72,26 +72,24 @@ async def grep(
     """精确文本匹配：按原文字面内容查找，大小写不敏感。"""
     source = await get_source(session, source_id)
     if source.id in await versioned_source_ids(session, [source.id]):
-        from sag_api.services.query_strategy_planner import plan_query
-        from sag_api.services.search_unit_retrieval_service import retrieve_search_unit_sections
+        from sag_api.services.search_unit_retrieval_service import grep_search_unit_blocks
 
-        outcome = await retrieve_search_unit_sections(
-            engine_manager,
+        blocks = await grep_search_unit_blocks(
+            session,
             [source],
             pattern,
             principal=principal,
-            top_k=limit,
-            query_strategy_plan=plan_query(pattern, requested_mode="EXACT"),
+            limit=limit,
         )
         matches = [
             GrepMatchOut(
-                chunk_id=section.chunk_id or section.search_unit_id or "",
-                heading=section.heading or "片段",
-                snippet=section.content,
+                chunk_id=block.id,
+                heading=block.section_path or "片段",
+                snippet=block.normalized_text,
                 source_id=source.id,
                 source_name=source.name,
             )
-            for section in outcome.sections
+            for block in blocks
         ]
         return GrepResponse(pattern=pattern, matches=matches, count=len(matches))
     rows = await engine_manager.grep_chunks(

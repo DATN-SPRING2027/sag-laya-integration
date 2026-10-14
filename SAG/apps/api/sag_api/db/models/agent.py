@@ -49,7 +49,7 @@ class Message(IDMixin, TimestampMixin, Base):
     __table_args__ = (Index("ix_messages_thread_created_id", "thread_id", "created_at", "id"),)
 
     thread_id: Mapped[str] = mapped_column(ForeignKey("threads.id", ondelete="CASCADE"))
-    # 图片附件 meta：[{id, name, media_type}]（文件在 upload_dir/attachments/）
+    # Chat image upload metadata, not Source/Document metadata; files are scoped to the conversation owner.
     attachments: Mapped[list] = mapped_column("attachments_json", JSON, default=list)
     # Agentic 执行轨迹：[{kind:thinking|tool, step, name?, args?, ms, count?}]（助手消息）
     steps: Mapped[list] = mapped_column("steps_json", JSON, default=list)
