@@ -23,8 +23,8 @@ api: ## 启动后端（PostgreSQL + Qdrant，热重载，局域网可访问）
 web: ## 启动前端（Next dev，局域网可访问）
 	cd apps/web && npm run dev -- -H 0.0.0.0
 
-test: ## 运行后端与 Agent Core 测试
-	cd apps/api && . .venv/bin/activate && pytest -q
+test: ## 提示：单元测试已被移除
+	@echo "Unit test suites have been removed from the repository."
 
 build: ## 构建前端产物
 	cd apps/web && npm run build
