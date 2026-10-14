@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_agent import AgentRuntime, EventType
+from sag_api.core.conversation_ownership import get_conversation_owner
 from sag_api.core.db import SessionLocal, get_session
 from sag_api.core.deps import (
     get_agent_runtime,
@@ -71,6 +72,7 @@ async def chat_completions(
     agent_id: str,
     body: ChatCompletionRequest,
     _user: User = Depends(get_current_user),
+    owner_key: str = Depends(get_conversation_owner),
     principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
@@ -78,7 +80,7 @@ async def chat_completions(
     tool_registry: ToolRegistry = Depends(get_tool_registry),
     agent_runtime: AgentRuntime = Depends(get_agent_runtime),
 ):
-    agent = await svc.get_agent(session, agent_id)
+    agent = await svc.get_agent(session, agent_id, owner_key=owner_key)
     query, history = _split_query(body.messages)
 
     plan = svc.build_ask_context(agent=agent, query=query, history=history)

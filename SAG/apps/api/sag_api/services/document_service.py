@@ -22,6 +22,8 @@ from sag_api.core.identity import (
     generate_version_id,
     normalize_idempotency_key,
 )
+from sag_api.core.logging import get_logger
+from sag_api.core.principal_assertion import VerifiedPrincipal as AssertionVerifiedPrincipal
 from sag_api.db.base import new_id
 from sag_api.db.models import Document, Job, Source
 from sag_api.db.models.routing_rag import (
@@ -29,6 +31,7 @@ from sag_api.db.models.routing_rag import (
     IngestionRun,
     SourceSnapshot,
     StageRun,
+    UploadIdempotencyKey,
 )
 from sag_api.enums import ConnectorKind, DocumentStatus, JobStatus, JobType, SourceType
 from sag_api.jobs import JobQueue
@@ -40,6 +43,8 @@ from sag_api.schemas.routing_rag import (
 )
 from sag_api.services.source_operation_service import touch_source_revision
 
+log = get_logger("services.document")
+
 
 async def _enqueue_persisted_job(job_queue: JobQueue, job_id: str) -> None:
     """Dispatch a committed job with queue-level retry supervision when available."""
@@ -48,6 +53,22 @@ async def _enqueue_persisted_job(job_queue: JobQueue, job_id: str) -> None:
         await durable(job_id)
         return
     await job_queue.enqueue(job_id)
+
+
+async def _find_upload_run(
+    session: AsyncSession, *, tenant_id: str, project_id: str, idempotency_key: str
+) -> IngestionRun | None:
+    run = await session.scalar(
+        select(IngestionRun).where(
+            IngestionRun.tenant_id == tenant_id,
+            IngestionRun.project_id == project_id,
+            IngestionRun.idempotency_key == idempotency_key,
+        )
+    )
+    if run is not None:
+        return run
+    key = await session.get(UploadIdempotencyKey, (tenant_id, project_id, idempotency_key))
+    return await session.get(IngestionRun, key.run_id) if key is not None else None
 
 
 async def list_documents(session: AsyncSession, source_id: str) -> list[Document]:
@@ -74,9 +95,20 @@ async def get_public_document(
     session: AsyncSession,
     source: Source,
     document_id: str,
+    *,
+    principal: AssertionVerifiedPrincipal,
 ) -> Document:
     """Resolve a document for public reads after the logical-delete barrier."""
-    document = await get_document(session, source, document_id)
+    from sag_api.services.source_service import get_authorized_document
+
+    document = await get_authorized_document(
+        session,
+        principal=principal,
+        source_ids=[source.id],
+        document_id=document_id,
+    )
+    if document is None:
+        raise NotFoundError("Document not found")
     if document.status in {
         DocumentStatus.DELETING,
         DocumentStatus.DELETE_FAILED,
@@ -144,13 +176,18 @@ async def ingest_content(
     session: AsyncSession,
     source: Source,
     *,
+    tenant_id: str,
+    project_id: str,
+    owner_id: str,
+    security_partition_id: str,
+    client_token: str,
     text: str | None = None,
     title: str | None = None,
     messages: list[dict] | None = None,
-    upload_dir: str,
-    job_queue: JobQueue,
+    logical_source_id: str | None = None,
+    job_queue: JobQueue | None = None,
 ) -> Document:
-    """Unified ingestion: normalize text or a batch of messages into a document -> reuse ingest/extract pipeline (continuous ingestion)."""
+    """Normalize text or messages and send them through canonical partitioned ingestion."""
     from sag_api.core.errors import ValidationError
 
     if messages:
@@ -162,15 +199,23 @@ async def ingest_content(
     else:
         raise ValidationError("Please provide text or messages")
 
-    document, _job = await create_document_from_upload(
+    result = await handle_document_upload(
         session,
-        source,
-        filename=filename,
+        tenant_id=tenant_id,
+        project_id=project_id,
+        owner_id=owner_id,
+        security_partition_id=security_partition_id,
+        client_token=client_token,
+        file_bytes=content.encode("utf-8"),
+        original_filename=filename,
         content_type="text/markdown",
-        data=content.encode("utf-8"),
-        upload_dir=upload_dir,
+        logical_source_id=logical_source_id or f"source:{source.id}:{filename}",
         job_queue=job_queue,
+        source_id=source.id,
     )
+    document = await session.get(Document, result.document_id)
+    if document is None:
+        raise NotFoundError("Document not found after ingestion")
     return document
 
 
@@ -271,7 +316,7 @@ async def reprocess_document(
         source_id=source.id,
         document_id=document.id,
         status=JobStatus.QUEUED,
-        # If previous failure already created a MinerU task, reprocessing should continue polling instead of charging again.
+        # Reuse a previous MinerU task instead of charging again after a failed job.
         payload=payload,
     )
     session.add(job)
@@ -338,8 +383,8 @@ def _source_sum_clause(source_id: str, column):
 async def _refresh_source_counts(session: AsyncSession, source: Source) -> None:
     """Atomically recalculate source aggregate counts.
 
-    Deletion tasks and document-level changes (upload/delete, etc.) can be committed concurrently;
-    use a single UPDATE at the database layer to serialize count updates, avoiding lost updates from interleaved SELECT-then-assign.
+    Deletion tasks and document-level changes can commit concurrently. A single
+    database UPDATE avoids lost counts from interleaved SELECT-then-assign.
     """
     document_count = (
         select(func.count(Document.id))
@@ -534,7 +579,10 @@ async def resume_document(
     )
     if is_legacy_checkpoint:
         if not os.path.isfile(document.storage_path):
-            raise ConflictError("Legacy extraction checkpoint cannot be restored and original file no longer exists; please re-upload original file")
+            raise ConflictError(
+                "Legacy extraction checkpoint cannot be restored and original file no longer "
+                "exists; please re-upload original file"
+            )
         payload.pop("process_checkpoint", None)
     payload.pop("pause_requested", None)
     payload["resume_requested"] = True
@@ -873,8 +921,8 @@ async def get_or_create_project_source(
     tenant_id: str,
     project_id: str,
 ) -> Source:
-    """Ánh xạ (tenant_id, project_id) sang một SAG Source tương ứng để phục vụ worker xử lý và bảo toàn toàn vẹn dữ liệu."""
-    hash_digest = hashlib.sha256(f"{tenant_id}:{project_id}".encode("utf-8")).hexdigest()[:32]
+    """将 (tenant_id, project_id) 映射到供 ingestion worker 使用的 Source。"""
+    hash_digest = hashlib.sha256(f"{tenant_id}:{project_id}".encode()).hexdigest()[:32]
     config_id = f"tp_{hash_digest}"
     stmt = select(Source).where(Source.sag_source_config_id == config_id).limit(1)
     source = (await session.execute(stmt)).scalar_one_or_none()
@@ -893,8 +941,14 @@ async def get_or_create_project_source(
             "project_id": project_id,
         },
     )
-    session.add(source)
-    await session.flush()
+    try:
+        async with session.begin_nested():
+            session.add(source)
+            await session.flush()
+    except IntegrityError:
+        source = (await session.execute(stmt)).scalar_one_or_none()
+        if source is None:
+            raise
     return source
 
 
@@ -909,8 +963,10 @@ async def handle_document_upload(
     file_bytes: bytes,
     original_filename: str,
     content_type: str = "application/octet-stream",
+    content_hash: str | None = None,
     logical_source_id: str | None = None,
     source_published_at: datetime | None = None,
+    research_task_id: str | None = None,
     job_queue: JobQueue | None = None,
     source_id: str | None = None,
 ) -> DocumentUploadResponse:
@@ -927,22 +983,14 @@ async def handle_document_upload(
 
     _check_upload_file(original_filename, file_bytes)
 
-    # Ánh xạ (tenant_id, project_id) sang SAG Source nếu chưa truyền source_id để đảm bảo tính tương thích với worker và DB
-    if not source_id:
-        proj_source = await get_or_create_project_source(session, tenant_id, project_id)
-        source_id = proj_source.id
-
     payload_hash = compute_payload_hash(file_bytes)
     idempotency_key = normalize_idempotency_key(client_token)
     logical_id = (logical_source_id or original_filename).strip()
 
     # Step 1: Pre-allocation lookup by (tenant_id, project_id, idempotency_key)
-    lookup_stmt = select(IngestionRun).where(
-        IngestionRun.tenant_id == tenant_id,
-        IngestionRun.project_id == project_id,
-        IngestionRun.idempotency_key == idempotency_key,
+    existing_run = await _find_upload_run(
+        session, tenant_id=tenant_id, project_id=project_id, idempotency_key=idempotency_key
     )
-    existing_run = (await session.execute(lookup_stmt)).scalar_one_or_none()
 
     if existing_run:
         # Check payload match
@@ -958,6 +1006,15 @@ async def handle_document_upload(
             )
         doc_ver = await session.get(DocumentVersion, existing_run.document_version_id)
         if doc_ver:
+            bound_partition = (doc_ver.metadata_json or {}).get("security_partition_id")
+            if bound_partition != security_partition_id:
+                raise ConflictError(
+                    "Idempotency key is already bound to a different security partition",
+                    layer=ErrorLayer.CLIENT,
+                    stage=ErrorStage.UPLOAD,
+                    code="IDEMPOTENCY_PARTITION_MISMATCH",
+                    retryable=False,
+                )
             bound_doc = await session.get(Document, doc_ver.document_id)
             if bound_doc and bound_doc.logical_source_id != logical_id:
                 raise ConflictError(
@@ -981,11 +1038,13 @@ async def handle_document_upload(
             is_duplicate=True,
         )
 
-    # Step 2: Persist raw payload to immutable content-addressed storage
-    storage_path = _save_snapshot_file(payload_hash, original_filename, file_bytes)
+    if not source_id:
+        proj_source = await get_or_create_project_source(session, tenant_id, project_id)
+        source_id = proj_source.id
 
     # Step 3: Attempt creation in transaction with serialization and retry on race conditions
     max_retries = 3
+    duplicate_response: DocumentUploadResponse | None = None
     for attempt in range(max_retries):
         try:
             async with session.begin_nested():
@@ -1005,6 +1064,7 @@ async def handle_document_upload(
                 is_new_doc = False
                 if not doc:
                     is_new_doc = True
+                    storage_path = _save_snapshot_file(payload_hash, original_filename, file_bytes)
                     doc_id = generate_doc_id(tenant_id, project_id, logical_id)
                     doc = Document(
                         id=doc_id,
@@ -1024,10 +1084,6 @@ async def handle_document_upload(
                     version_no = 1
                     supersedes_id = None
                 else:
-                    doc.storage_path = storage_path
-                    if source_id and not doc.source_id:
-                        doc.source_id = source_id
-
                     # Find latest version for this document under row lock
                     v_stmt = (
                         select(DocumentVersion)
@@ -1037,6 +1093,16 @@ async def handle_document_upload(
                         .with_for_update()
                     )
                     latest_ver = (await session.execute(v_stmt)).scalar_one_or_none()
+                    if latest_ver is None or (
+                        (latest_ver.metadata_json or {}).get("security_partition_id") != security_partition_id
+                    ):
+                        raise ConflictError(
+                            "Logical document already belongs to a different security partition",
+                            layer=ErrorLayer.CLIENT,
+                            stage=ErrorStage.UPLOAD,
+                            code="DOCUMENT_PARTITION_MISMATCH",
+                            retryable=False,
+                        )
                     if latest_ver and latest_ver.file_hash == payload_hash:
                         # Exact duplicate: Cùng hash + cùng source identity
                         # Duplicate policy: Do NOT parse again or schedule pipeline!
@@ -1047,17 +1113,42 @@ async def handle_document_upload(
                             .limit(1)
                         )
                         existing_run = (await session.execute(run_stmt)).scalar_one_or_none()
-                        return DocumentUploadResponse(
+                        if existing_run is None:
+                            existing_run = IngestionRun(
+                                id=str(uuid.uuid4()),
+                                tenant_id=tenant_id,
+                                project_id=project_id,
+                                document_version_id=latest_ver.id,
+                                idempotency_key=idempotency_key,
+                                payload_hash=payload_hash,
+                                content_hash=content_hash or payload_hash,
+                                current_stage="DUPLICATE",
+                                status="SUCCEEDED",
+                                completed_at=now_utc,
+                            )
+                            session.add(existing_run)
+                        else:
+                            session.add(
+                                UploadIdempotencyKey(
+                                    tenant_id=tenant_id,
+                                    project_id=project_id,
+                                    idempotency_key=idempotency_key,
+                                    run_id=existing_run.id,
+                                )
+                            )
+                        await session.flush()
+                        duplicate_response = DocumentUploadResponse(
                             document_id=doc.id,
                             version_no=latest_ver.version_no,
                             version_id=latest_ver.id,
-                            run_id=existing_run.id if existing_run else "",
+                            run_id=existing_run.id,
                             file_hash=payload_hash,
                             status=latest_ver.status,
                             search_status=latest_ver.search_status,
                             knowledge_status=latest_ver.knowledge_status,
                             is_duplicate=True,
                         )
+                        break
                     elif latest_ver:
                         # Đóng khoảng hiệu lực của phiên bản cũ tại thời điểm phiên bản mới bắt đầu (Comment #13)
                         latest_ver.valid_to = now_utc
@@ -1066,6 +1157,10 @@ async def handle_document_upload(
                     else:
                         version_no = 1
                         supersedes_id = None
+                    storage_path = _save_snapshot_file(payload_hash, original_filename, file_bytes)
+                    doc.storage_path = storage_path
+                    if source_id and not doc.source_id:
+                        doc.source_id = source_id
 
                 version_id = generate_version_id(doc.id, version_no)
 
@@ -1110,6 +1205,8 @@ async def handle_document_upload(
                     document_version_id=doc_version.id,
                     idempotency_key=idempotency_key,
                     payload_hash=payload_hash,
+                    content_hash=content_hash or payload_hash,
+                    research_task_id=research_task_id,
                     current_stage="RECEIVE",
                     status=initial_status,
                 )
@@ -1153,12 +1250,9 @@ async def handle_document_upload(
                 break
         except IntegrityError:
             # Race condition recovery: concurrent insert with same (tenant_id, project_id, idempotency_key)
-            stmt = select(IngestionRun).where(
-                IngestionRun.tenant_id == tenant_id,
-                IngestionRun.project_id == project_id,
-                IngestionRun.idempotency_key == idempotency_key,
+            existing = await _find_upload_run(
+                session, tenant_id=tenant_id, project_id=project_id, idempotency_key=idempotency_key
             )
-            existing = (await session.execute(stmt)).scalar_one_or_none()
             if existing:
                 if existing.payload_hash != payload_hash:
                     raise ConflictError(
@@ -1169,9 +1263,17 @@ async def handle_document_upload(
                         stage=ErrorStage.UPLOAD,
                         code="IDEMPOTENCY_PAYLOAD_MISMATCH",
                         retryable=False,
-                    )
+                    ) from None
                 doc_ver = await session.get(DocumentVersion, existing.document_version_id)
                 if doc_ver:
+                    if (doc_ver.metadata_json or {}).get("security_partition_id") != security_partition_id:
+                        raise ConflictError(
+                            "Idempotency key is already bound to a different security partition",
+                            layer=ErrorLayer.CLIENT,
+                            stage=ErrorStage.UPLOAD,
+                            code="IDEMPOTENCY_PARTITION_MISMATCH",
+                            retryable=False,
+                        ) from None
                     bound_doc = await session.get(Document, doc_ver.document_id)
                     if bound_doc and bound_doc.logical_source_id != logical_id:
                         raise ConflictError(
@@ -1182,7 +1284,7 @@ async def handle_document_upload(
                             stage=ErrorStage.UPLOAD,
                             code="IDEMPOTENCY_IDENTITY_MISMATCH",
                             retryable=False,
-                        )
+                        ) from None
                 return DocumentUploadResponse(
                     document_id=doc_ver.document_id if doc_ver else "",
                     version_no=doc_ver.version_no if doc_ver else 1,
@@ -1198,6 +1300,9 @@ async def handle_document_upload(
                 raise
 
     await session.commit()
+
+    if duplicate_response is not None:
+        return duplicate_response
 
     # Durable enqueue after transaction commit
     if job_queue is not None:
@@ -1255,7 +1360,8 @@ async def get_document_version_status(
             partition = (doc_ver.metadata_json or {}).get("security_partition_id")
             if not partition or not principal.has_partition_access(partition):
                 raise ForbiddenError(
-                    f"Principal '{principal.user_id}' is not authorized to access security partition '{partition or 'NONE'}'"
+                    f"Principal '{principal.user_id}' is not authorized to access security partition "
+                    f"'{partition or 'NONE'}'"
                 )
 
     run_stmt = (
@@ -1283,7 +1389,9 @@ async def get_document_version_status(
                 status=s.status, duration_ms=s.duration_ms
             )
         if latest_run.error_code or latest_run.error_message:
-            code = latest_run.error_code or f"{latest_run.error_layer or 'API'}_{latest_run.error_stage or 'INGEST'}_FAILED"
+            code = latest_run.error_code or (
+                f"{latest_run.error_layer or 'API'}_{latest_run.error_stage or 'INGEST'}_FAILED"
+            )
             err_info = {
                 "layer": latest_run.error_layer or "API",
                 "stage": latest_run.error_stage or "INGEST",

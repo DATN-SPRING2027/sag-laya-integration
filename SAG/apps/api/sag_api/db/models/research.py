@@ -50,6 +50,7 @@ class ResearchTask(Base):
     reason_codes_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     policy_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     budget_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    execution_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     target_urls_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     fetch_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

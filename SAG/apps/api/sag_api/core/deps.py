@@ -225,4 +225,16 @@ async def require_path_source_access(
     source = await get_authorized_source(session, principal=principal, source_id=source_id)
     if source is None:
         raise NotFoundError("信源不存在")
+    document_id = request.path_params.get("document_id") or request.query_params.get("document_id")
+    if document_id:
+        from sag_api.services.source_service import get_authorized_document
+
+        document = await get_authorized_document(
+            session,
+            principal=principal,
+            source_ids=[source.id],
+            document_id=document_id,
+        )
+        if document is None:
+            raise NotFoundError("Document not found")
     return source

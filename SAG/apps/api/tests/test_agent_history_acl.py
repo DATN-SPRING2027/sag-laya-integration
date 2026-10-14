@@ -69,14 +69,29 @@ async def test_revoked_answer_preserves_roles_in_message_api_and_llm_history(mon
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
         async with async_sessionmaker(engine, expire_on_commit=False)() as session:
-            session.add(Agent(id="history-agent", name="history", avatar="", persona={}))
-            session.add(Thread(id="history-thread", agent_id="history-agent", title="history"))
+            session.add(
+                Agent(
+                    id="history-agent",
+                    owner_key="history-owner",
+                    name="history",
+                    avatar="",
+                    persona={},
+                )
+            )
+            session.add(
+                Thread(
+                    id="history-thread",
+                    owner_key="history-owner",
+                    agent_id="history-agent",
+                    title="history",
+                )
+            )
             session.add_all(turns)
             await session.commit()
 
             page = await message_api(
                 "history-agent", "history-thread", limit=40, cursor=None,
-                _user=None, principal=principal, session=session,
+                owner_key="history-owner", principal=principal, session=session,
             )
             assert [item.role.value for item in page.items] == [
                 "user", "assistant", "user", "assistant", "user",

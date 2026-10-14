@@ -52,7 +52,7 @@ from sag_api.services.retrieval_service import (
     stream_synthesize_search_answer,
     synthesize_search_answer,
 )
-from sag_api.services.source_service import search_source_candidates
+from sag_api.services.source_service import search_source_candidates, versioned_source_ids
 
 router = APIRouter(prefix="/sources/{source_id}/search", tags=["search"])
 global_router = APIRouter(prefix="/search", tags=["search"])
@@ -482,24 +482,37 @@ async def search(
         from sag_api.core.errors import NotFoundError
 
         raise NotFoundError("信源不存在")
-    refs = {source.sag_source_config_id: source}
+    partitioned = source.id in await versioned_source_ids(session, [source.id])
     route_plan = await _build_query_route(body.query, [source_id], body.strategy)
     if route_plan.need_retrieval:
-        outcome, event_scores = await asyncio.gather(
-            retrieve_relevant_sections(
+        if partitioned:
+            from sag_api.services.search_unit_retrieval_service import retrieve_search_unit_sections
+
+            outcome = await retrieve_search_unit_sections(
                 engine_manager,
                 [source],
                 body.query,
-                strategy=route_plan.strategy,
+                principal=principal,
                 top_k=body.top_k,
-            ),
-            recall_event_scores(
-                engine_manager,
-                body.query,
-                refs,
-                limit=body.top_k,
-            ),
-        )
+                query_strategy_plan=route_plan.strategy_plan,
+            )
+            event_scores = {}
+        else:
+            outcome, event_scores = await asyncio.gather(
+                retrieve_relevant_sections(
+                    engine_manager,
+                    [source],
+                    body.query,
+                    strategy=route_plan.strategy,
+                    top_k=body.top_k,
+                ),
+                recall_event_scores(
+                    engine_manager,
+                    body.query,
+                    {source.sag_source_config_id: source},
+                    limit=body.top_k,
+                ),
+            )
         stats = _with_query_route_stats(
             {
                 **outcome.stats,
@@ -522,11 +535,15 @@ async def search(
         outcome = SearchOutcome(query=body.query, sections=[], stats=stats)
     for section in outcome.sections:
         section.source_config_id = section.source_config_id or source.sag_source_config_id
-    graph_fields = await _event_graph_fields(
-        engine_manager,
-        outcome.sections,
-        refs,
-        event_scores=event_scores,
+    graph_fields = (
+        {"events": [], "entities": [], "relations": []}
+        if partitioned
+        else await _event_graph_fields(
+            engine_manager,
+            outcome.sections,
+            {source.sag_source_config_id: source},
+            event_scores=event_scores,
+        )
     )
     answer = (
         await synthesize_search_answer(body.query, outcome.sections, llm=llm, sources=[source])
@@ -661,16 +678,32 @@ async def _run_one_strategy(
     strategy: str,
     top_k: int | None,
     source_refs: dict[str, Source],
+    principal: VerifiedPrincipal,
+    partitioned_ids: set[str],
 ) -> EvalStrategyResultOut:
     """一次跑一个策略,任何失败都吸掉转成 error 字段,不让 gather 把整个对比搞崩。"""
     try:
-        outcome = await retrieve_relevant_sections(
-            engine_manager,
-            sources,
-            query,
-            strategy=strategy,
-            top_k=top_k,
-        )
+        sections = []
+        stats: dict[str, Any] = {}
+        canonical_sources = [source for source in sources if source.id in partitioned_ids]
+        legacy_sources = [source for source in sources if source.id not in partitioned_ids]
+        if canonical_sources:
+            return EvalStrategyResultOut(
+                strategy=strategy,  # type: ignore[arg-type]
+                sections=[],
+                stats={"canonical_sources": len(canonical_sources)},
+                error="Legacy search strategies cannot be compared for versioned Sources",
+            )
+        if legacy_sources:
+            legacy = await retrieve_relevant_sections(
+                engine_manager,
+                legacy_sources,
+                query,
+                strategy=strategy,
+                top_k=top_k,
+            )
+            sections.extend(legacy.sections)
+            stats["legacy"] = legacy.stats
     except Exception as error:  # noqa: BLE001
         log.warning("eval-compare 策略 %s 失败:%s", strategy, error)
         return EvalStrategyResultOut(
@@ -680,7 +713,8 @@ async def _run_one_strategy(
             error=getattr(error, "message", None) or str(error),
         )
     section_outputs: list[SectionOut] = []
-    for section in outcome.sections:
+    sections.sort(key=lambda section: section.score, reverse=True)
+    for section in sections[: max(1, min(int(top_k or settings.search_top_k), 50))]:
         source = source_refs.get(section.source_config_id or "")
         if source is None:
             continue
@@ -696,7 +730,7 @@ async def _run_one_strategy(
     return EvalStrategyResultOut(
         strategy=strategy,  # type: ignore[arg-type]
         sections=section_outputs,
-        stats=dict(outcome.stats),
+        stats=stats,
     )
 
 
@@ -732,6 +766,7 @@ async def eval_compare(
     await session.commit()  # 释放 DB 连接;检索阶段可能长跑
 
     source_refs = {source.sag_source_config_id: source for source in sources}
+    partitioned_ids = await versioned_source_ids(session, [source.id for source in sources])
     if not sources:
         empty_results = [
             EvalStrategyResultOut(
@@ -758,6 +793,8 @@ async def eval_compare(
                 strategy,
                 body.top_k,
                 source_refs,
+                principal,
+                partitioned_ids,
             )
             for strategy in ordered_strategies
         )

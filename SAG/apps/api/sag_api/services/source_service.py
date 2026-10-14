@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 
-from sqlalchemy import delete, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,8 +22,8 @@ from sag_api.core.errors import (
 from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal
 from sag_api.db.base import new_id
-from sag_api.db.models import AgentBinding, Job, Source, SourceProjectMapping
-from sag_api.enums import CONNECTOR_SOURCE_TYPE, BindingTargetType, JobStatus, JobType, SourceType
+from sag_api.db.models import AgentBinding, Document, DocumentVersion, Job, Source, SourceProjectMapping
+from sag_api.enums import CONNECTOR_SOURCE_TYPE, BindingTargetType, DocumentStatus, JobStatus, JobType, SourceType
 from sag_api.jobs import JobQueue
 from sag_api.sag import EngineManager
 from sag_api.schemas.source import SourceCreate, SourceUpdate
@@ -45,6 +45,7 @@ def _authorized_source_statement(principal: VerifiedPrincipal):
             SourceProjectMapping.organization_id == principal.organization_id,
             SourceProjectMapping.project_id.in_(principal.allowed_project_ids),
         )
+        .distinct()
     )
 
 
@@ -145,6 +146,183 @@ async def get_authorized_source(
     else:
         log.info("source scope resolved operation=read effective_source_count=1")
     return source
+
+
+async def get_authorized_source_project(
+    session: AsyncSession,
+    *,
+    principal: VerifiedPrincipal,
+    source_id: str,
+    project_id: str | None = None,
+) -> str:
+    """Resolve exactly one confirmed Project scope for a Source write."""
+    if not principal.tenant_id or not principal.allowed_project_ids:
+        raise ForbiddenError("A signed tenant and Project scope are required for Source writes")
+    if project_id is not None and project_id not in principal.allowed_project_ids:
+        raise ForbiddenError("The requested Project is outside the principal scope")
+    stmt = select(SourceProjectMapping.project_id).where(
+        SourceProjectMapping.source_id == source_id,
+        SourceProjectMapping.organization_id == principal.organization_id,
+        SourceProjectMapping.project_id.in_(principal.allowed_project_ids),
+        SourceProjectMapping.state == "CONFIRMED",
+    )
+    if project_id is not None:
+        stmt = stmt.where(SourceProjectMapping.project_id == project_id)
+    stmt = (
+        stmt
+        .distinct()
+        .order_by(SourceProjectMapping.project_id)
+        .limit(2)
+    )
+    try:
+        project_ids = list((await session.scalars(stmt)).all())
+    except SQLAlchemyError as error:
+        log.exception("source scope resolution failed operation=write")
+        raise ServiceUnavailableError("Source authorization mapping is unavailable") from error
+    if not project_ids:
+        raise NotFoundError("信源不存在")
+    if len(project_ids) != 1:
+        raise ValidationError("project_id is required when the Source is mapped to multiple Projects")
+    return project_ids[0]
+
+
+async def versioned_source_ids(session: AsyncSession, source_ids: list[str]) -> set[str]:
+    """Find Sources whose legacy readers cannot enforce version-level ACLs."""
+    if not source_ids:
+        return set()
+    try:
+        rows = await session.scalars(
+            select(Document.source_id)
+            .join(DocumentVersion, DocumentVersion.document_id == Document.id)
+            .where(Document.source_id.in_(source_ids))
+            .distinct()
+        )
+        return set(rows.all())
+    except SQLAlchemyError as error:
+        log.exception("source partition inspection failed operation=read")
+        raise ServiceUnavailableError("Source partition metadata is unavailable") from error
+
+
+def _visible_document_clause(principal: VerifiedPrincipal):
+    partition = DocumentVersion.metadata_json["security_partition_id"].as_string()
+    has_version = select(DocumentVersion.id).where(DocumentVersion.document_id == Document.id).exists()
+    has_allowed_version = select(DocumentVersion.id).where(
+        DocumentVersion.document_id == Document.id,
+        partition.in_(principal.allowed_partition_ids),
+    ).exists()
+    has_unavailable_version = select(DocumentVersion.id).where(
+        DocumentVersion.document_id == Document.id,
+        or_(partition.is_(None), partition.not_in(principal.allowed_partition_ids)),
+    ).exists()
+    source_mapped = select(SourceProjectMapping.id).where(
+        SourceProjectMapping.source_id == Document.source_id,
+        SourceProjectMapping.organization_id == principal.organization_id,
+        SourceProjectMapping.project_id.in_(principal.allowed_project_ids),
+        SourceProjectMapping.state == "CONFIRMED",
+    ).exists()
+    document_project_mapped = select(SourceProjectMapping.id).where(
+        SourceProjectMapping.source_id == Document.source_id,
+        SourceProjectMapping.organization_id == principal.organization_id,
+        SourceProjectMapping.project_id == Document.project_id,
+        SourceProjectMapping.project_id.in_(principal.allowed_project_ids),
+        SourceProjectMapping.state == "CONFIRMED",
+    ).exists()
+    return and_(
+        source_mapped,
+        or_(
+            and_(Document.project_id.is_(None), ~has_version),
+            and_(
+                Document.tenant_id == principal.tenant_id,
+                Document.project_id.in_(principal.allowed_project_ids),
+                document_project_mapped,
+                has_allowed_version,
+                ~has_unavailable_version,
+            ),
+        ),
+    )
+
+
+async def get_authorized_document(
+    session: AsyncSession,
+    *,
+    principal: VerifiedPrincipal,
+    source_ids: list[str],
+    document_id: str,
+) -> Document | None:
+    if not source_ids:
+        return None
+    try:
+        return await session.scalar(
+            select(Document).where(
+                Document.id == document_id,
+                Document.source_id.in_(source_ids),
+                Document.is_active.is_(True),
+                Document.status.not_in([DocumentStatus.DELETING, DocumentStatus.DELETE_FAILED]),
+                _visible_document_clause(principal),
+            )
+        )
+    except SQLAlchemyError as error:
+        log.exception("document scope resolution failed operation=read")
+        raise ServiceUnavailableError("Document authorization scope is unavailable") from error
+
+
+async def list_authorized_documents(
+    session: AsyncSession,
+    *,
+    principal: VerifiedPrincipal,
+    source_ids: list[str],
+    limit: int | None = None,
+) -> list[Document]:
+    if not source_ids:
+        return []
+    try:
+        statement = (
+            select(Document)
+            .where(
+                Document.source_id.in_(source_ids),
+                Document.is_active.is_(True),
+                Document.status.not_in([DocumentStatus.DELETING, DocumentStatus.DELETE_FAILED]),
+                _visible_document_clause(principal),
+            )
+            .order_by(Document.created_at.desc(), Document.id.desc())
+        )
+        if limit is not None:
+            statement = statement.limit(max(1, limit))
+        rows = await session.scalars(statement)
+        return list(rows.all())
+    except SQLAlchemyError as error:
+        log.exception("document scope resolution failed operation=list")
+        raise ServiceUnavailableError("Document authorization scope is unavailable") from error
+
+
+async def visible_source_counts(
+    session: AsyncSession,
+    *,
+    principal: VerifiedPrincipal,
+    source_ids: list[str],
+) -> dict[str, tuple[int, int, int]]:
+    if not source_ids:
+        return {}
+    rows = await session.execute(
+        select(
+            Document.source_id,
+            func.count(Document.id),
+            func.coalesce(func.sum(Document.chunk_count), 0),
+            func.coalesce(func.sum(Document.event_count), 0),
+        )
+        .where(
+            Document.source_id.in_(source_ids),
+            Document.is_active.is_(True),
+            Document.status.not_in([DocumentStatus.DELETING, DocumentStatus.DELETE_FAILED]),
+            _visible_document_clause(principal),
+        )
+        .group_by(Document.source_id)
+    )
+    return {
+        source_id: (int(documents), int(chunks), int(events))
+        for source_id, documents, chunks, events in rows
+        if source_id is not None
+    }
 
 
 async def get_authorized_source_ids(

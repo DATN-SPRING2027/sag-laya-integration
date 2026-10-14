@@ -19,7 +19,11 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
+from sag_api.core.principal_assertion import VerifiedPrincipal
+from sag_api.services.query_strategy_planner import plan_query
 from sag_api.services.retrieval_service import retrieve_relevant_sections
+from sag_api.services.search_unit_retrieval_service import retrieve_search_unit_sections
+from sag_api.services.source_service import versioned_source_ids
 
 if TYPE_CHECKING:
     from sag_api.db.models import Document, Source
@@ -101,6 +105,7 @@ class MCPScope:
 
     engine_manager: EngineManager
     sources: tuple[Source, ...]
+    principal: VerifiedPrincipal
 
 
 _scope: contextvars.ContextVar[MCPScope | None] = contextvars.ContextVar(
@@ -116,13 +121,17 @@ def _require_scope() -> MCPScope:
 
 
 @contextlib.contextmanager
-def use_scope(engine_manager: EngineManager, sources: Source | Iterable[Source]):
+def use_scope(
+    engine_manager: EngineManager,
+    sources: Source | Iterable[Source],
+    principal: VerifiedPrincipal,
+):
     """在上下文内绑定一个信源或一组信源。"""
     if hasattr(sources, "sag_source_config_id"):
         selected = (sources,)
     else:
         selected = tuple(sources)
-    token = _scope.set(MCPScope(engine_manager=engine_manager, sources=selected))
+    token = _scope.set(MCPScope(engine_manager=engine_manager, sources=selected, principal=principal))
     try:
         yield
     finally:
@@ -163,10 +172,15 @@ async def _document_in_scope(
     scope: MCPScope, document_id: str
 ) -> tuple[Document, Source] | None:
     from sag_api.core.db import SessionLocal
-    from sag_api.db.models import Document
+    from sag_api.services.source_service import get_authorized_document
 
     async with SessionLocal() as session:
-        document = await session.get(Document, (document_id or "").strip())
+        document = await get_authorized_document(
+            session,
+            principal=scope.principal,
+            source_ids=[source.id for source in scope.sources],
+            document_id=(document_id or "").strip(),
+        )
     if document is None:
         return None
     source = next((item for item in scope.sources if item.id == document.source_id), None)
@@ -200,7 +214,7 @@ def build_source_mcp(
         if not scope.sources:
             return "（知识库还没有信源）"
         return "\n".join(
-            f"- {_source_title(source)} · {source.document_count} 文档 · {source.chunk_count} 分块"
+            f"- {_source_title(source)}"
             for source in scope.sources
         )
 
@@ -224,13 +238,34 @@ def build_source_mcp(
         normalized = (query or "").strip()
         if not normalized:
             return "（空查询）"
-        outcome = await retrieve_relevant_sections(
-            scope.engine_manager,
-            selected,
-            normalized,
-            top_k=max(1, min(top_k, 50)),
-        )
-        return _sections_to_text(outcome.sections, selected)
+        from sag_api.core.db import SessionLocal
+
+        async with SessionLocal() as session:
+            partitioned_ids = await versioned_source_ids(session, [source.id for source in selected])
+        bounded_top_k = max(1, min(top_k, 50))
+        sections = []
+        canonical_sources = [source for source in selected if source.id in partitioned_ids]
+        legacy_sources = [source for source in selected if source.id not in partitioned_ids]
+        if canonical_sources:
+            canonical = await retrieve_search_unit_sections(
+                scope.engine_manager,
+                canonical_sources,
+                normalized,
+                principal=scope.principal,
+                top_k=bounded_top_k,
+                query_strategy_plan=plan_query(normalized),
+            )
+            sections.extend(canonical.sections)
+        if legacy_sources:
+            legacy = await retrieve_relevant_sections(
+                scope.engine_manager,
+                legacy_sources,
+                normalized,
+                top_k=bounded_top_k,
+            )
+            sections.extend(legacy.sections)
+        sections.sort(key=lambda item: item.score, reverse=True)
+        return _sections_to_text(sections[:bounded_top_k], selected)
 
     @mcp.tool(
         title=MCP_TOOL_LABELS["get_entity"],
@@ -252,39 +287,45 @@ def build_source_mcp(
         if not target:
             return "（未找到该实体）"
 
-        async def _one(source: Source) -> str | None:
+        from sag_api.core.db import SessionLocal
+
+        async with SessionLocal() as session:
+            partitioned_ids = await versioned_source_ids(session, [source.id for source in selected])
+        matches = []
+        canonical_sources = [source for source in selected if source.id in partitioned_ids]
+        legacy_sources = [source for source in selected if source.id not in partitioned_ids]
+        if canonical_sources:
+            outcome = await retrieve_search_unit_sections(
+                scope.engine_manager,
+                canonical_sources,
+                target,
+                principal=scope.principal,
+                top_k=6,
+                query_strategy_plan=plan_query(target),
+            )
+            if outcome.sections:
+                matches.append(_sections_to_text(outcome.sections, canonical_sources))
+        async def _legacy_entity(source: Source) -> str | None:
             try:
-                scid = source.sag_source_config_id
                 entities = await scope.engine_manager.list_entities(
-                    scid, source=source, limit=200
+                    source.sag_source_config_id, source=source, limit=200
                 )
                 lowered = target.lower()
-                match = next(
-                    (entity for entity in entities if (entity.name or "").lower() == lowered),
-                    None,
-                )
-                if match is None:
-                    match = next(
-                        (
-                            entity
-                            for entity in entities
-                            if lowered in (entity.name or "").lower()
-                        ),
-                        None,
-                    )
-                if match is None:
+                entity = next((item for item in entities if (item.name or "").lower() == lowered), None)
+                entity = entity or next((item for item in entities if lowered in (item.name or "").lower()), None)
+                if entity is None:
                     return None
                 snippets = await scope.engine_manager.entity_context(
-                    scid, match.id, source=source, limit=6
+                    source.sag_source_config_id, entity.id, source=source, limit=6
                 )
-                body = "\n\n".join(snippets) if snippets else (match.description or "")
+                body = "\n\n".join(snippets) if snippets else (entity.description or "")
                 prefix = f"来源：{_source_title(source)}\n" if len(selected) > 1 else ""
-                return f"{prefix}实体「{match.name}」（{match.type}）：\n{body}".strip()
+                return f"{prefix}实体「{entity.name}」（{entity.type}）：\n{body}".strip()
             except Exception:
                 return None
 
-        results = await asyncio.gather(*(_one(source) for source in selected))
-        matches = [result for result in results if result]
+        legacy_matches = await asyncio.gather(*(_legacy_entity(source) for source in legacy_sources))
+        matches.extend(item for item in legacy_matches if item)
         return "\n\n".join(matches) if matches else "（未找到该实体）"
 
     @mcp.tool(
@@ -297,24 +338,15 @@ def build_source_mcp(
         selected = _selected_sources(scope, source_id)
         if not selected:
             return "（知识库还没有信源）" if not source_id else "（信源不存在或不在当前作用域）"
-        from sqlalchemy import select
-
         from sag_api.core.db import SessionLocal
-        from sag_api.db.models import Document
+        from sag_api.services.source_service import list_authorized_documents
 
         source_ids = [source.id for source in selected]
         async with SessionLocal() as session:
-            documents = list(
-                (
-                    await session.execute(
-                        select(Document)
-                        .where(Document.source_id.in_(source_ids))
-                        .order_by(Document.created_at, Document.id)
-                    )
-                )
-                .scalars()
-                .all()
+            documents = await list_authorized_documents(
+                session, principal=scope.principal, source_ids=source_ids
             )
+        documents.sort(key=lambda document: (document.created_at, document.id))
         if not documents:
             return "（知识库还没有文档）"
         by_source: dict[str, list[Document]] = {item.id: [] for item in selected}
@@ -387,35 +419,44 @@ def build_source_mcp(
             return "（空匹配串）"
         bounded_limit = max(1, min(limit, 100))
 
-        async def _one(source: Source) -> list[dict]:
+        from sag_api.core.db import SessionLocal
+
+        async with SessionLocal() as session:
+            partitioned_ids = await versioned_source_ids(session, [source.id for source in selected])
+        blocks = []
+        canonical_sources = [source for source in selected if source.id in partitioned_ids]
+        legacy_sources = [source for source in selected if source.id not in partitioned_ids]
+        if canonical_sources:
+            outcome = await retrieve_search_unit_sections(
+                scope.engine_manager,
+                canonical_sources,
+                needle,
+                principal=scope.principal,
+                top_k=bounded_limit,
+                query_strategy_plan=plan_query(needle, requested_mode="EXACT"),
+            )
+            if outcome.sections:
+                blocks.extend(_sections_to_text(outcome.sections, canonical_sources).split("\n\n"))
+
+        async def _legacy_grep(source: Source) -> list[dict]:
             try:
                 return await scope.engine_manager.grep_chunks(
-                    source.sag_source_config_id,
-                    needle,
-                    source=source,
-                    limit=bounded_limit,
+                    source.sag_source_config_id, needle, source=source, limit=bounded_limit
                 )
             except Exception:
                 return []
 
-        results = await asyncio.gather(*(_one(source) for source in selected))
-        blocks = []
-        for source, rows in zip(selected, results, strict=True):
+        results = await asyncio.gather(*(_legacy_grep(source) for source in legacy_sources))
+        for source, rows in zip(legacy_sources, results, strict=True):
             for row in rows:
-                source_line = (
-                    f"来源：{_source_title(source)}\n" if len(selected) > 1 else ""
-                )
+                source_line = f"来源：{_source_title(source)}\n" if len(selected) > 1 else ""
                 blocks.append(
                     f"{row['heading'] or '片段'}（chunk_id={row['chunk_id']}）\n"
                     f"{source_line}{row['snippet']}"
                 )
-                if len(blocks) >= bounded_limit:
-                    break
-            if len(blocks) >= bounded_limit:
-                break
         if not blocks:
             return "（未匹配到内容）"
-        return "\n\n".join(f"[{index}] {block}" for index, block in enumerate(blocks, 1))
+        return "\n\n".join(f"[{index}] {block}" for index, block in enumerate(blocks[:bounded_limit], 1))
 
     @mcp.tool(
         title=MCP_TOOL_LABELS["read"],
@@ -472,20 +513,46 @@ def build_source_mcp(
         if not cid:
             return "（缺少 chunk_id）"
 
-        async def _one(source: Source):
-            try:
-                chunk = await scope.engine_manager.get_chunk(
-                    source.sag_source_config_id, cid, source=source
-                )
-                return source, chunk
-            except Exception:
-                return source, None
+        from sag_api.core.db import SessionLocal
+        from sag_api.services.search_unit_retrieval_service import get_search_unit_citation
 
-        results = await asyncio.gather(*(_one(source) for source in selected))
-        found = next(((source, chunk) for source, chunk in results if chunk is not None), None)
+        partitioned_ids: set[str] = set()
+        found = None
+        async with SessionLocal() as session:
+            partitioned_ids = await versioned_source_ids(session, [source.id for source in selected])
+            for source in selected:
+                citation = await get_search_unit_citation(
+                    session,
+                    source=source,
+                    principal=scope.principal,
+                    search_unit_id=cid,
+                    engine_manager=scope.engine_manager,
+                )
+                if citation is not None:
+                    found = (source, citation)
+                    break
+        if found is None:
+            legacy_sources = [source for source in selected if source.id not in partitioned_ids]
+            async def _one(source: Source):
+                try:
+                    chunk = await scope.engine_manager.get_chunk(
+                        source.sag_source_config_id, cid, source=source
+                    )
+                    return source, chunk
+                except Exception:
+                    return source, None
+
+            results = await asyncio.gather(*(_one(source) for source in legacy_sources))
+            legacy = next(((source, chunk) for source, chunk in results if chunk is not None), None)
+            found = legacy
         if found is None:
             return "（未找到该分块）"
         source, chunk = found
+        if isinstance(chunk, dict):
+            heading = str(chunk.get("heading") or "").strip()
+            content = str(chunk.get("content") or "")
+            body = f"{heading}\n\n{content}".strip() if heading else content
+            return f"来源：{_source_title(source)}\n\n{body}" if len(selected) > 1 else body
         heading = (chunk.heading or "").strip()
         body = f"{heading}\n\n{chunk.content}".strip() if heading else chunk.content
         return f"来源：{_source_title(source)}\n\n{body}" if len(selected) > 1 else body

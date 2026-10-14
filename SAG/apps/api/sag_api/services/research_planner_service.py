@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass
 from enum import StrEnum
 from urllib.parse import urlsplit, urlunsplit
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.db.models import (
@@ -63,6 +63,16 @@ class ResearchBudget:
     timeout_seconds: float = 15.0
     max_retries: int = 2
 
+    def __post_init__(self) -> None:
+        if (
+            not 1 <= self.max_fetches <= 100
+            or not 1 <= self.max_bytes_per_page <= 8 * 1024 * 1024
+            or not 1 <= self.max_total_bytes <= 100 * 1024 * 1024
+            or not 0 < self.timeout_seconds <= 60
+            or not 0 <= self.max_retries <= 5
+        ):
+            raise ValueError("Research budget exceeds supported bounds")
+
 
 @dataclass(frozen=True, slots=True)
 class ResearchPlan:
@@ -79,6 +89,7 @@ class ResearchPlan:
     reason_codes: tuple[str, ...]
     checksum: str
     discovery_provenance: dict[str, object] = ()
+    gap_checksum: str = ""
 
 
 def discover_candidates_from_gap_or_question(
@@ -263,6 +274,7 @@ def plan_research_task(
         reason_codes=reason_codes,
         checksum=plan_checksum,
         discovery_provenance=discovery_provenance,
+        gap_checksum=gap.checksum,
     )
 
 
@@ -276,7 +288,18 @@ async def detect_eligible_gaps(
     min_priority: float = DEFAULT_MIN_PRIORITY,
     limit: int = 10,
 ) -> list[tuple[KnowledgeGap, KnowledgeQualityAssessment]]:
-    """Detect eligible scored gaps in scope without active research tasks."""
+    """Exclude active and already-handled gap revisions before applying the limit."""
+    if limit < 1:
+        return []
+    handled = select(ResearchTask.id).where(
+        ResearchTask.gap_id == KnowledgeGap.id,
+        or_(
+            ResearchTask.status.in_([status.value for status in ACTIVE_TASK_STATUSES]),
+            ResearchTask.execution_json["gap_checksum"].as_string() == KnowledgeGap.checksum,
+            # Older tasks have no revision checkpoint; do not silently rerun them.
+            ResearchTask.execution_json["gap_checksum"].as_string().is_(None),
+        ),
+    ).exists()
     stmt = (
         select(KnowledgeGap, KnowledgeQualityAssessment)
         .join(
@@ -290,30 +313,12 @@ async def detect_eligible_gaps(
             KnowledgeQualityAssessment.tree_version == tree_version,
             KnowledgeGap.eligible.is_(True),
             KnowledgeGap.priority >= min_priority,
+            ~handled,
         )
         .order_by(KnowledgeGap.priority.desc(), KnowledgeGap.created_at.desc())
-        .limit(limit * 2)  # Buffer for active task exclusion
+        .limit(limit)
     )
-    rows = (await session.execute(stmt)).all()
-
-    # Collect gaps that already have active research tasks
-    gap_ids = [gap.id for gap, _ in rows]
-    active_gap_ids: set[str] = set()
-    if gap_ids:
-        active_stmt = select(ResearchTask.gap_id).where(
-            ResearchTask.gap_id.in_(gap_ids),
-            ResearchTask.status.in_([status.value for status in ACTIVE_TASK_STATUSES]),
-        )
-        active_gap_ids = set((await session.scalars(active_stmt)).all())
-
-    eligible: list[tuple[KnowledgeGap, KnowledgeQualityAssessment]] = []
-    for gap, assessment in rows:
-        if gap.id not in active_gap_ids:
-            eligible.append((gap, assessment))
-            if len(eligible) >= limit:
-                break
-
-    return eligible
+    return list((await session.execute(stmt)).all())
 
 
 async def create_or_get_research_task(
@@ -344,6 +349,7 @@ async def create_or_get_research_task(
             "discovery_provenance": dict(plan.discovery_provenance),
         },
         budget_json=asdict(plan.budget),
+        execution_json={"gap_checksum": plan.gap_checksum},
         target_urls_json=list(plan.target_urls),
         fetch_count=0,
         retry_count=0,

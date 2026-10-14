@@ -524,7 +524,7 @@ async def test_normal_ingestion_relay_success(session, seeded_gap):
     assert run.payload_hash == p_hash
 
 
-async def test_e2e_full_research_flow_from_gap_to_tree_update(session, seeded_gap, monkeypatch):
+async def test_e2e_research_flow_waits_for_ingestion_indexing(session, seeded_gap, monkeypatch):
     monkeypatch.setattr("importlib.metadata.version", lambda _pkg: "0.10.0")
     # Base tree snapshot setup
     config = TreeBuildConfig(min_cluster_size=2, target_cluster_size=6, max_cluster_size=8)
@@ -567,13 +567,11 @@ async def test_e2e_full_research_flow_from_gap_to_tree_update(session, seeded_ga
         tree_config=config,
     )
 
-    # Assert full pipeline completion
+    # The fetch step queues normal ingestion; indexing owns task completion and tree publication.
     assert task is not None
-    assert task.status == ResearchTaskStatus.COMPLETED.value
+    assert task.status == ResearchTaskStatus.INGESTING.value
     assert len(task.ingestion_run_ids_json) >= 1
-    assert tree_result is not None
-    assert tree_result.drift.trigger_rebuild is False
-    assert any("ku-research-" in u.get("unit_id", "") for u in tree_result.snapshot.manifest["units"])
+    assert tree_result is None
 
 
 def test_incremental_tree_update_with_research_unit(monkeypatch):

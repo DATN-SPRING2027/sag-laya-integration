@@ -13,16 +13,16 @@ Follows Ponytail minimalism:
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 import hashlib
-from typing import Any, Sequence
 import uuid
+from collections.abc import Sequence
+from datetime import UTC, datetime
+from typing import Any
 
 import httpx
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sag_api.core.config import settings
 from sag_api.core.logging import get_logger
 from sag_api.core.sanitizer import sanitize_error_message
 from sag_api.db.models.routing_rag import (
@@ -404,7 +404,7 @@ async def index_search_units_to_qdrant(
 
     # 3. Build points with both dense and sparse representations
     points = []
-    for unit, vec, text in zip(units, vectors, texts):
+    for unit, vec, text in zip(units, vectors, texts, strict=True):
         point_id = generate_search_unit_point_id(collection_name, unit.id)
         b_start = blocks_by_id.get(unit.block_from_id) if blocks_by_id else None
         raw_anchor = b_start.source_anchor if b_start and b_start.source_anchor else None
@@ -708,7 +708,11 @@ async def run_search_indexing_stage(
                     json=scroll_body,
                 )
                 if not scroll_res.is_success:
-                    log.warning("Qdrant scroll returned status %d: %s", scroll_res.status_code, sanitize_error_message(scroll_res.text))
+                    log.warning(
+                        "Qdrant scroll returned status %d: %s",
+                        scroll_res.status_code,
+                        sanitize_error_message(scroll_res.text),
+                    )
                     all_q_points = None
                     break
 
@@ -747,6 +751,17 @@ async def run_search_indexing_stage(
         manifest_verified = (qdrant_checksum == manifest_checksum)
 
     if manifest_verified and units:
+        from sag_api.services.dedup_and_temporal_service import resolve_temporal_supersedes
+
+        # Serialize publication, while retaining the previous version if indexing fails.
+        await session.execute(
+            select(Document.id).where(Document.id == document_version.document_id).with_for_update()
+        )
+        await resolve_temporal_supersedes(
+            session,
+            current_version=document_version,
+            document_id=document_version.document_id,
+        )
         document_version.search_status = "SEARCH_READY"
         document_version.search_ready_at = datetime.now(UTC)
     else:
@@ -764,7 +779,11 @@ async def run_search_indexing_stage(
         if not units:
             err_text = "EMPTY_INDEX: Document has no text content to index"
         elif not manifest_verified:
-            err_text = sanitize_error_message(indexing_error) if indexing_error else "Qdrant client missing or manifest count/checksum mismatch"
+            err_text = (
+                sanitize_error_message(indexing_error)
+                if indexing_error
+                else "Qdrant client missing or manifest count/checksum mismatch"
+            )
 
         stage_run = StageRun(
             id=str(uuid.uuid4()),
@@ -782,14 +801,20 @@ async def run_search_indexing_stage(
                 "qdrant_checksum": qdrant_checksum,
                 "manifest_verified": manifest_verified,
                 "collection_name": collection_name,
-                "error": sanitize_error_message(indexing_error) if indexing_error else (err_text if not is_success else None),
+                "error": (
+                    sanitize_error_message(indexing_error)
+                    if indexing_error
+                    else (err_text if not is_success else None)
+                ),
             },
         )
         session.add(stage_run)
 
     if not manifest_verified:
         err_msg = indexing_error or (
-            f"Search indexing failed: manifest verification mismatch (units={len(units)}, pg={pg_count}, qdrant={qdrant_count}, qdrant_checksum={qdrant_checksum})"
+            "Search indexing failed: manifest verification mismatch "
+            f"(units={len(units)}, pg={pg_count}, qdrant={qdrant_count}, "
+            f"qdrant_checksum={qdrant_checksum})"
         )
         raise RuntimeError(err_msg)
 

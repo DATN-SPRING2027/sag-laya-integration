@@ -47,7 +47,7 @@ class DocumentVersion(Base):
     )
     source_published_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     observed_at: Mapped[datetime] = mapped_column(
-        UTCDateTime(), server_default=func.now(), nullable=False
+        UTCDateTime(), default=lambda: datetime.now(UTC), server_default=func.now(), nullable=False
     )
     ingested_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     valid_from: Mapped[datetime] = mapped_column(
@@ -94,6 +94,8 @@ class IngestionRun(Base):
             name="uq_ingestion_runs_tenant_project_idempotency"
         ),
         Index("idx_ingestion_runs_tenant_project", "tenant_id", "project_id"),
+        Index("idx_ingestion_runs_content_hash", "tenant_id", "project_id", "content_hash"),
+        Index("idx_ingestion_runs_research_task", "research_task_id"),
         Index("idx_ingestion_runs_status", "status"),
     )
 
@@ -105,6 +107,10 @@ class IngestionRun(Base):
     )
     idempotency_key: Mapped[str] = mapped_column(String(64), nullable=False)
     payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    research_task_id: Mapped[str | None] = mapped_column(
+        ForeignKey("research_tasks.id", ondelete="SET NULL"), nullable=True
+    )
     current_stage: Mapped[str] = mapped_column(String(32), default="RECEIVE", nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="QUEUED", nullable=False)
     attempt_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
@@ -117,6 +123,19 @@ class IngestionRun(Base):
     completed_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime(), server_default=func.now(), nullable=False
+    )
+
+
+class UploadIdempotencyKey(Base):
+    """Bind retry keys to the original run, including content-duplicate uploads."""
+
+    __tablename__ = "upload_idempotency_keys"
+
+    tenant_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    project_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    idempotency_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("ingestion_runs.id", ondelete="CASCADE"), nullable=False
     )
 
 
