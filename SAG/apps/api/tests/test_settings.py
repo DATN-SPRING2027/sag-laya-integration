@@ -11,6 +11,31 @@ import pytest
 
 from sag_api.core.config import Settings, settings
 
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("database_url", "sqlite+aiosqlite:///sag.db", "SAG_DATABASE_URL must use PostgreSQL"),
+        ("sag_relational_provider", "sqlite", "SAG_SAG_RELATIONAL_PROVIDER must be postgres"),
+        ("sag_vector_provider", "pgvector", "SAG_SAG_VECTOR_PROVIDER must be qdrant"),
+        ("sag_qdrant_url", "file:///qdrant", "SAG_SAG_QDRANT_URL must be an absolute HTTP"),
+    ],
+)
+def test_production_storage_rejects_non_postgres_or_qdrant_backends(field, value, message):
+    from pydantic import ValidationError
+
+    values = {
+        "environment": "prod",
+        "secret_key": "production-secret-with-at-least-32-bytes",
+        "database_url": "postgresql+asyncpg://sag:secret@postgres:5432/sag",
+        "sag_relational_provider": "postgres",
+        "sag_vector_provider": "qdrant",
+        "sag_qdrant_url": "http://qdrant:6333",
+    }
+    with pytest.raises(ValidationError, match=message):
+        Settings(**(values | {field: value}))
+
+
 _RESTORE = (
     "llm_provider",
     "llm_base_url",

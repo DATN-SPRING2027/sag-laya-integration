@@ -1012,7 +1012,22 @@ async def test_checkpoint_a_extraction_failure_after_indexing_does_not_downgrade
 async def test_checkpoint_a_mocked_upload_api_worker_manifest_verification():
     """Kiểm tra upload HTTP qua worker với Qdrant và ingestion test doubles."""
     await init_db()
+    from sag_api.core.principal_assertion import VerifiedPrincipal, require_principal_assertion
+
     project_id = f"proj_mock_{uuid.uuid4().hex[:8]}"
+    principal = VerifiedPrincipal(
+        subject="user_tester",
+        organization_id="pytest-org",
+        allowed_project_ids=frozenset({project_id}),
+        issuer="https://pytest.invalid",
+        key_id="pytest-key",
+        token_id="pytest-assertion",
+        issued_at=0,
+        expires_at=2**31,
+        tenant_id="tenant_test",
+        allowed_partition_ids=frozenset({"sec_test"}),
+    )
+    app.dependency_overrides[require_principal_assertion] = lambda: principal
     token = create_access_token(
         subject="user_tester",
         extra={"tenant_id": "tenant_test", "allowed_projects": [project_id], "allowed_partitions": ["sec_test"]},

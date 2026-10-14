@@ -1,6 +1,7 @@
 """/ask SSE full path: model turns, tools, terminal errors, and persistence."""
 
 import asyncio
+import uuid
 from contextlib import asynccontextmanager
 
 import httpx
@@ -68,8 +69,8 @@ class GreedyLLM(AgenticLLM):
             tool_calls=(
                 ToolCall(
                     id=f"c{self.tool_turns}",
-                    name="search_context",
-                    arguments={"query": f"第{self.tool_turns}轮"},
+                    name="get_time",
+                    arguments={},
                 ),
             ),
             finish_reason="tool_calls",
@@ -106,7 +107,7 @@ class WebSearchFixtureTool(HostTool):
 
 async def _setup(c):
     r = await c.post(
-        "/api/v1/auth/register", json={"email": f"stream{id(c)}@t.com", "password": "password123"}
+        "/api/v1/auth/register", json={"email": f"stream-{uuid.uuid4().hex}@t.com", "password": "password123"}
     )
     assert r.status_code == 201, r.text
     H = {"Authorization": f"Bearer {r.json()['access_token']}"}
@@ -332,7 +333,7 @@ async def test_ask_stream_partial_answer_preserved_on_failure():
             ask = await c.post(
                 f"/api/v1/agents/{a['id']}/threads/{th['id']}/ask",
                 headers=H,
-                json={"query": "分段失败"},
+                json={"query": "分段失败", "web_enabled": True},
             )
             assert "event: run.failed" in ask.text
             msgs = (
@@ -386,13 +387,13 @@ async def test_ask_stream_failure_then_success_preserves_history_order():
             first = await c.post(
                 f"/api/v1/agents/{a['id']}/threads/{th['id']}/ask",
                 headers=H,
-                json={"query": "第一个问题"},
+                    json={"query": "第一个问题", "web_enabled": True},
             )
             assert "event: run.failed" in first.text
             second = await c.post(
                 f"/api/v1/agents/{a['id']}/threads/{th['id']}/ask",
                 headers=H,
-                json={"query": "第二个问题"},
+                    json={"query": "第二个问题", "web_enabled": True},
             )
             assert "event: run.completed" in second.text
 
@@ -430,7 +431,7 @@ async def test_ask_stream_exhausts_max_steps_then_answers(monkeypatch):
             ask = await c.post(
                 f"/api/v1/agents/{a['id']}/threads/{th['id']}/ask",
                 headers=H,
-                json={"query": "打满轮次"},
+                json={"query": "现在几点"},
             )
             body = ask.text
             assert llm.tool_turns == 2                              # 工具轮恰好打满上限

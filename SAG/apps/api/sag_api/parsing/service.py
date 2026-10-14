@@ -1,4 +1,4 @@
-"""文档解析路由、缓存与 MarkItDown 本地转换。"""
+"""Điều phối phân tích tài liệu, bộ nhớ đệm và chuyển đổi cục bộ bằng MarkItDown."""
 
 from __future__ import annotations
 
@@ -62,7 +62,7 @@ async def prepare_document(
     on_state: ParseStateCallback | None = None,
     should_pause: PauseCallback | None = None,
 ) -> PreparedDocument:
-    """返回可直接交给 zleap-sag 的 Markdown 路径，保留原始上传文件。"""
+    """Trả về đường dẫn Markdown có thể chuyển trực tiếp cho zleap-sag và giữ lại tệp tải lên ban đầu."""
     suffix = os.path.splitext(path)[1].lower()
     if suffix in {".md", ".markdown"}:
         return PreparedDocument(path=path, provider="original")
@@ -83,7 +83,7 @@ async def prepare_document(
         )
         return cached_fallback
 
-    # 同一进程内同一文档只做一次转换，避免并发“重新处理”重复创建付费任务。
+    # Chỉ chuyển đổi mỗi tài liệu một lần trong cùng tiến trình để tránh tạo trùng tác vụ tính phí khi xử lý lại đồng thời.
     async with _lock_for(cache_path):
         if _is_cached(cache_path):
             await _emit_cached_state(
@@ -205,7 +205,7 @@ async def _prepare_and_cache(
                 fallback_signature,
                 fallback_marker_path,
                 mineru_message=_state_string(fallback, "mineru_error")
-                or "MinerU 解析失败",
+                or "Phân tích bằng MinerU thất bại",
                 mineru_error_code=_state_string(fallback, "mineru_error_code")
                 or UpstreamError.code,
                 on_state=track_state,
@@ -261,7 +261,7 @@ async def _prepare_markitdown_fallback(
         "provider": "markitdown",
         "signature": signature,
         "status": "running",
-        # 只用于诊断；恢复时始终从原文件路径重新推导并校验缓存路径。
+        # Chỉ dùng để chẩn đoán; khi khôi phục luôn suy ra lại đường dẫn bộ nhớ đệm từ tệp gốc và xác thực đường dẫn đó.
         "cache_path": cache_path,
         "mineru_error": mineru_message,
         "mineru_error_code": mineru_error_code,
@@ -281,7 +281,7 @@ async def _prepare_markitdown_fallback(
                 markdown = await _convert_with_markitdown(path)
                 await asyncio.to_thread(_write_markdown, cache_path, markdown)
             await asyncio.to_thread(_write_fallback_marker, marker_path)
-    except Exception as fallback_error:  # noqa: BLE001 - 本地转换/写盘错误合并上游原因
+    except Exception as fallback_error:  # noqa: BLE001 - Gộp lỗi chuyển đổi/ghi tệp cục bộ với nguyên nhân từ upstream.
         fallback_message = _exception_message(fallback_error)
         await on_state(
             {
@@ -295,8 +295,8 @@ async def _prepare_markitdown_fallback(
             }
         )
         message = (
-            f"MinerU 解析失败：{mineru_message}；"
-            f"MarkItDown 回退失败：{fallback_message}"
+            f"Phân tích bằng MinerU thất bại: {mineru_message}; "
+            f"phương án dự phòng MarkItDown cũng thất bại: {fallback_message}"
         )
         if mineru_error_code == ServiceUnavailableError.code:
             raise ServiceUnavailableError(message) from fallback_error
@@ -361,7 +361,7 @@ def _cached_fallback_document(
         provider="markitdown",
         cached=True,
         fallback_from="mineru",
-        fallback_error="MinerU 曾解析失败，已复用 MarkItDown 回退缓存",
+        fallback_error="MinerU từng phân tích thất bại; đã dùng lại bộ nhớ đệm dự phòng của MarkItDown",
     )
 
 
@@ -407,7 +407,7 @@ def _lock_for(path: str) -> asyncio.Lock:
 
 
 def parsed_sidecar_paths(path: str) -> list[str]:
-    """列出一个原文件旁的解析缓存，供删除文档时一并清理。"""
+    """Liệt kê bộ nhớ đệm phân tích cạnh tệp gốc để xóa cùng tài liệu."""
     directory = os.path.dirname(path) or "."
     prefix = os.path.basename(path) + ".parsed."
     try:
@@ -466,12 +466,12 @@ async def _convert_with_markitdown(path: str) -> str:
     try:
         markdown = await asyncio.to_thread(_markitdown_sync, path)
     except (ImportError, ModuleNotFoundError) as exc:
-        raise UpstreamError("MarkItDown 未安装，无法解析该文件") from exc
-    except Exception as exc:  # noqa: BLE001 - 第三方转换器错误统一映射
-        raise ValidationError(f"MarkItDown 解析失败：{exc}") from exc
+        raise UpstreamError("Chưa cài MarkItDown nên không thể phân tích tệp này") from exc
+    except Exception as exc:  # noqa: BLE001 - Ánh xạ thống nhất lỗi từ bộ chuyển đổi bên thứ ba.
+        raise ValidationError(f"Phân tích bằng MarkItDown thất bại: {exc}") from exc
     markdown = markdown.strip()
     if not _is_meaningful_markdown(markdown):
-        raise ValidationError("MarkItDown 未从文件中解析出有效文本")
+        raise ValidationError("MarkItDown không trích xuất được văn bản hợp lệ từ tệp")
     return markdown + "\n"
 
 
@@ -479,10 +479,10 @@ def _convert_plain_text(path: str) -> str:
     try:
         decoded = read_text_file(path)
     except TextDecodingError as exc:
-        raise ValidationError(f"文本编码识别失败：{exc}") from exc
+        raise ValidationError(f"Không nhận diện được mã hóa văn bản: {exc}") from exc
     text = decoded.text.strip()
     if not _is_meaningful_markdown(text):
-        raise ValidationError("文本文件中没有可解析的有效内容")
+        raise ValidationError("Tệp văn bản không có nội dung hợp lệ để phân tích")
     return text + "\n"
 
 
@@ -515,10 +515,10 @@ def _markitdown_sync(path: str) -> str:
     else:
         result = MarkItDown().convert(path)
     markdown = getattr(result, "markdown", None)
-    if markdown is None:  # 兼容 0.0.x / 早期 0.1.x 返回对象
+    if markdown is None:  # Tương thích với đối tượng trả về từ phiên bản 0.0.x và các bản 0.1.x đầu tiên.
         markdown = getattr(result, "text_content", None)
     if not isinstance(markdown, str):
-        raise TypeError("MarkItDown 返回了未知结果格式")
+        raise TypeError("MarkItDown trả về định dạng kết quả không xác định")
     return markdown
 
 
@@ -662,8 +662,8 @@ def _write_markdown(path: str, markdown: str) -> None:
         prefix=".parsed-", suffix=".md", dir=os.path.dirname(path) or "."
     )
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as target:
-            target.write(markdown)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as target:
+            target.write(markdown.replace("\r\n", "\n").replace("\r", "\n"))
         os.replace(temp_path, path)
     except Exception:
         try:

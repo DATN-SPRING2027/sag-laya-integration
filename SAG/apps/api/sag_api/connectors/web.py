@@ -1,20 +1,17 @@
-"""网页连接器 —— 首个动态连接器。
+"""Bộ kết nối web — bộ kết nối động đầu tiên.
 
-抓取用户给定的网页正文，转为 Markdown 交给引擎处理。演示「采集层抽象」如何
-接入外部信息源：`discover()` 列举 URL，`fetch()` 抓取并抽取正文 → 复用同一
-ingest → extract 管线。（MVP 只抓给定 URL，不跟随链接爬取。）
+Lấy nội dung trang web do người dùng cung cấp, chuyển thành Markdown để engine xử lý. Minh họa cách
+lớp thu thập dữ liệu tích hợp nguồn bên ngoài: `discover()` liệt kê URL, `fetch()` tải và trích xuất nội dung,
+sau đó dùng lại pipeline ingest → extract. (MVP chỉ tải URL được chỉ định, không theo liên kết để thu thập.)
 """
 
 from __future__ import annotations
 
-import hashlib
 import os
 import re
 import tempfile
 from typing import Any
 from urllib.parse import urlparse
-
-import httpx
 
 from sag_api.connectors.base import (
     ConfigField,
@@ -29,7 +26,6 @@ from sag_api.enums import ConnectorKind
 
 log = get_logger("connectors.web")
 
-_TIMEOUT = 20.0
 _MAX_HTML_BYTES = 8 * 1024 * 1024
 
 
@@ -76,24 +72,24 @@ def extract_web_markdown(html: str) -> str:
         if md and md.strip():
             return md
     except Exception as e:  # noqa: BLE001
-        log.warning("trafilatura 抽取失败，回退裸文本：%s", e)
+        log.warning("Trích xuất bằng trafilatura thất bại, chuyển sang văn bản thuần: %s", e)
     return _strip_tags(html)
 
 
 class WebConnector(Connector):
     meta = ConnectorMeta(
         kind=ConnectorKind.WEB,
-        title="网页",
-        description="抓取网页正文并转为 Markdown 入库。适合文档站、博客、公开知识页。",
+        title="Trang web",
+        description="Tải nội dung trang web, chuyển thành Markdown và lưu vào kho. Phù hợp với trang tài liệu, blog và trang tri thức công khai.",
         supports_sync=True,
         config_fields=[
             ConfigField(
                 key="urls",
-                label="网页地址",
+                label="Địa chỉ trang web",
                 type="text",
                 required=True,
                 placeholder="https://example.com/docs\nhttps://example.com/faq",
-                help="每行一个 URL；点击「同步」抓取。",
+                help="Mỗi dòng một URL; nhấn “Đồng bộ” để tải nội dung.",
             )
         ],
     )
@@ -101,11 +97,11 @@ class WebConnector(Connector):
     def validate_config(self, config: dict[str, Any]) -> None:
         urls = _parse_urls(config)
         if not urls:
-            raise ValidationError("请至少填写一个网页地址")
+            raise ValidationError("Vui lòng nhập ít nhất một địa chỉ trang web")
         for u in urls:
             p = urlparse(u)
             if p.scheme not in ("http", "https") or not p.netloc:
-                raise ValidationError(f"无效的网页地址：{u}")
+                raise ValidationError(f"Địa chỉ trang web không hợp lệ: {u}")
 
     async def discover(self, config: dict[str, Any]) -> list[DiscoveredDoc]:
         return [
@@ -115,27 +111,26 @@ class WebConnector(Connector):
 
     async def fetch(self, config: dict[str, Any], doc: DiscoveredDoc) -> LocalFile:
         try:
-            async with httpx.AsyncClient(
-                timeout=_TIMEOUT,
-                follow_redirects=True,
-                headers={"User-Agent": "sag-bot/0.1 (+https://github.com/Zleap-AI/SAG)"},
-            ) as client:
-                resp = await client.get(doc.external_id)
-                resp.raise_for_status()
-                html = resp.text[: _MAX_HTML_BYTES]
+            # Reuse the public-page fetcher's redirect, address, content-type,
+            # and streaming byte guards for user-configured source URLs.
+            from sag_api.tools.builtin import _download_public_web_page
+
+            final_url, html = await _download_public_web_page(
+                doc.external_id,
+                max_bytes=_MAX_HTML_BYTES,
+            )
         except Exception as e:  # noqa: BLE001
-            raise UpstreamError(f"抓取失败 {doc.external_id}：{e}") from e
+            raise UpstreamError(f"Tải trang thất bại {doc.external_id}: {e}") from e
 
         body = extract_web_markdown(html)
         if not body.strip():
-            raise UpstreamError(f"未能从页面提取到正文：{doc.external_id}")
+            raise UpstreamError(f"Không trích xuất được nội dung từ trang: {doc.external_id}")
 
         title = extract_web_title(html) or doc.filename
-        content = f"# {title}\n\n> 来源：{doc.external_id}\n\n{body}\n"
+        content = f"# {title}\n\n> Nguồn: {final_url}\n\n{body}\n"
 
-        digest = hashlib.md5(doc.external_id.encode()).hexdigest()[:12]
-        path = os.path.join(tempfile.gettempdir(), f"sag-web-{digest}.md")
-        with open(path, "w", encoding="utf-8") as f:
+        fd, path = tempfile.mkstemp(prefix="sag-web-", suffix=".md")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
         return LocalFile(
             path=path,

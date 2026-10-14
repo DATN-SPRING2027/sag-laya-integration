@@ -1,4 +1,4 @@
-"""认证原语：密码哈希（bcrypt）与 JWT 令牌。"""
+"""Các thành phần xác thực cơ bản: băm mật khẩu bằng bcrypt và token JWT."""
 
 from __future__ import annotations
 
@@ -11,11 +11,14 @@ import jwt
 from sag_api.core.config import settings
 
 _ALGO = "HS256"
-_BCRYPT_MAX_BYTES = 72  # bcrypt 硬限制
+_BCRYPT_MAX_BYTES = 72  # Giới hạn cứng của bcrypt.
 
 
 def _clip(password: str) -> bytes:
-    return password.encode("utf-8")[:_BCRYPT_MAX_BYTES]
+    encoded = password.encode("utf-8")
+    if len(encoded) > _BCRYPT_MAX_BYTES:
+        raise ValueError(f"Password exceeds bcrypt's {_BCRYPT_MAX_BYTES}-byte limit")
+    return encoded
 
 
 def hash_password(password: str) -> str:
@@ -24,7 +27,8 @@ def hash_password(password: str) -> str:
 
 def verify_password(password: str, password_hash: str) -> bool:
     try:
-        return bcrypt.checkpw(_clip(password), password_hash.encode("utf-8"))
+        # Older bcrypt records were created from the first 72 bytes of a password.
+        return bcrypt.checkpw(password.encode("utf-8")[:_BCRYPT_MAX_BYTES], password_hash.encode("utf-8"))
     except (ValueError, TypeError):
         return False
 
@@ -43,5 +47,5 @@ def create_access_token(subject: str, extra: dict[str, Any] | None = None) -> st
 
 
 def decode_token(token: str) -> dict[str, Any]:
-    """解码并校验 JWT；失败抛 `jwt.PyJWTError`。"""
+    """Giải mã và xác thực JWT; nếu thất bại sẽ phát sinh `jwt.PyJWTError`."""
     return jwt.decode(token, settings.secret_key, algorithms=[_ALGO])

@@ -796,7 +796,9 @@ async def test_delete_control_state_checkpoint_does_not_advance_visible_progress
 
 
 @pytest.mark.asyncio
-async def test_deleting_one_active_document_temporarily_yields_and_resumes_its_peer(tmp_path):
+async def test_deleting_one_active_document_temporarily_yields_and_resumes_its_peer(
+    tmp_path, monkeypatch
+):
     import asyncio
 
     from sqlalchemy import select
@@ -807,6 +809,15 @@ async def test_deleting_one_active_document_temporarily_yields_and_resumes_its_p
     from sag_api.jobs.inproc import InProcessAsyncQueue
     from sag_api.sag.dto import ProcessOutcome
     from sag_api.services.document_service import create_document_from_upload, delete_document
+
+    async def skip_universe_refresh(*_args, **_kwargs):
+        return []
+
+    # This test covers source maintenance scheduling, not the follow-up universe worker.
+    monkeypatch.setattr(
+        "sag_api.services.universe_service.schedule_universe_refresh",
+        skip_universe_refresh,
+    )
 
     class CoordinatedEngine:
         def __init__(self):

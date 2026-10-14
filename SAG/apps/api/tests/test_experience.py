@@ -86,14 +86,15 @@ async def test_empty_response_injection_and_prompt_preview():
             assert EMPTY in completed["prompt_preview"]
             assert "公司的报销流程是怎样的？" in completed["prompt_preview"]
             assert "你好！" not in completed["prompt_preview"]
+            assert completed["answer_status"] == "no_answer"
             tokens = "".join(d["payload"]["delta"] for e, d in events if e == "message.delta")
-            assert tokens == "你好！"
+            assert tokens == EMPTY
 
             # 该轮回答已落库
             msgs = (await c.get(f"/api/v1/agents/{agent['id']}/threads/{thread['id']}/messages", headers=A)).json()[
                 "items"
             ]
-            saved = next(m for m in msgs if m["content"] == "你好！" and m["role"] == "assistant")
+            saved = next(m for m in msgs if m["content"] == EMPTY and m["role"] == "assistant")
             # Historical snapshots can embed revoked turns, so the API omits
             # them while retaining the original model input in storage for audit.
             assert saved["prompt_preview"] == ""
@@ -101,7 +102,7 @@ async def test_empty_response_injection_and_prompt_preview():
                 stored = await session.get(Message, saved["id"])
                 assert stored is not None
                 assert stored.prompt_preview == completed["prompt_preview"]
-                assert stored.content not in stored.prompt_preview
+                assert "你好！" not in stored.prompt_preview
 
 
 @pytest.mark.asyncio

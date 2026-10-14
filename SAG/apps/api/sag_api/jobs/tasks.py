@@ -517,7 +517,6 @@ async def _process_document_unlocked(
                     ing_run.error_message = pipe_err_str
                     session.add(ing_run)
 
-                    from sag_api.db.models import StageRun
                     stage_name = "INDEX_SEARCH" if current_pipeline_stage == "INDEX" else (
                         "CANONICAL_EXTRACTION" if current_pipeline_stage == "PARSE" else (
                             "DEDUP_TEMPORAL" if current_pipeline_stage == "DEDUP" else "INGEST"
@@ -987,24 +986,26 @@ async def _sync_source_unlocked(session: AsyncSession, job: Job, *, job_queue=No
     for d in discovered:
         try:
             local = await connector.fetch(source.config or {}, d)
-            with open(local.path, "rb") as f:
-                data = f.read()
         except Exception as e:  # noqa: BLE001 - Thất bại từng bài không ảnh hưởng đến đồng bộ tổng thể
             log.warning("Đồng bộ thu thập thất bại %s: %s", d.external_id, getattr(e, "message", None) or e)
             continue
-        await create_document_from_upload(
-            session,
-            source,
-            filename=local.filename,
-            content_type=local.content_type,
-            data=data,
-            upload_dir=settings.upload_dir,
-            job_queue=job_queue,
-        )
         try:
-            os.remove(local.path)
-        except OSError:
-            pass
+            with open(local.path, "rb") as f:
+                data = f.read()
+            await create_document_from_upload(
+                session,
+                source,
+                filename=local.filename,
+                content_type=local.content_type,
+                data=data,
+                upload_dir=settings.upload_dir,
+                job_queue=job_queue,
+            )
+        finally:
+            try:
+                os.remove(local.path)
+            except OSError:
+                pass
         fetched += 1
 
     job.progress = 1.0

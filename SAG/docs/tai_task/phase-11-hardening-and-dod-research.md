@@ -20,7 +20,7 @@
 ### 1.2. Triết lý thực thi Ponytail (The Lazy Senior Developer Way)
 Hệ thống phải được tối ưu theo các nấc thang Ponytail:
 1. **YAGNI (Không suy diễn nhu cầu tương lai):** Không dựng hệ thống distributed tracing khổng lồ hay cài đặt thêm SDK phụ thuộc bên ngoài khi Standard Library và các cấu trúc dữ liệu nội tại của FastAPI/Python đủ giải quyết bài toán.
-2. **Tái sử dụng mã nguồn có sẵn:** 
+2. **Tái sử dụng mã nguồn có sẵn:**
    - Tái sử dụng logic đo kiểm `latency_ms` trong [`retrieval_service.py`](../../apps/api/sag_api/services/retrieval_service.py) và [`eval_retrieval.py`](../../apps/api/scripts/eval_retrieval.py).
    - Tái sử dụng `rebuild_search_index_for_project` và `rebuild_search_index_for_version` trong [`rebuild_service.py`](../../apps/api/sag_api/services/rebuild_service.py) cho quy trình phục hồi Qdrant.
    - Tái sử dụng `rollback_tree_candidate` trong [`tree_rollback_service.py`](../../apps/api/sag_api/services/tree_rollback_service.py) cho việc hoàn nguyên cây tri thức.

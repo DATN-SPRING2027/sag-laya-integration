@@ -862,7 +862,10 @@ async def test_document_job_preserves_engine_error_before_first_checkpoint(
     from sag_api.enums import DocumentStatus
     from sag_api.jobs import tasks
 
-    raw_reason = "engine extraction failed before checkpoint " + "diagnostic " * 40
+    raw_reason = ("engine extraction failed before checkpoint " + "diagnostic " * 40).strip()
+    from sag_api.core.sanitizer import sanitize_error_message
+
+    expected_reason = sanitize_error_message(raw_reason)
     document = SimpleNamespace(
         id="doc-engine-failed",
         source_id="source-1",
@@ -927,10 +930,10 @@ async def test_document_job_preserves_engine_error_before_first_checkpoint(
             FakeSession(), job, engine_manager=FakeEngineManager()
         )
 
-    assert document.error == raw_reason
+    assert document.error == expected_reason
     assert len(document.error) > 300
     warning_text = " ".join(record.getMessage() for record in caplog.records)
-    assert raw_reason in warning_text
+    assert expected_reason in warning_text
 
 
 @pytest.mark.asyncio
@@ -941,7 +944,10 @@ async def test_document_job_preserves_engine_error_on_resumed_checkpoint(
     from sag_api.enums import DocumentStatus
     from sag_api.jobs import tasks
 
-    raw_reason = "resumed engine extraction failed " + "checkpoint diagnostic " * 30
+    raw_reason = ("resumed engine extraction failed " + "checkpoint diagnostic " * 30).strip()
+    from sag_api.core.sanitizer import sanitize_error_message
+
+    expected_reason = sanitize_error_message(raw_reason)
     document = SimpleNamespace(
         id="doc-resumed-engine-failed",
         source_id="source-1",
@@ -1002,10 +1008,10 @@ async def test_document_job_preserves_engine_error_on_resumed_checkpoint(
             FakeSession(), job, engine_manager=FakeEngineManager()
         )
 
-    assert document.error == raw_reason
+    assert document.error == expected_reason
     assert len(document.error) > 300
     warning_text = " ".join(record.getMessage() for record in caplog.records)
-    assert raw_reason in warning_text
+    assert expected_reason in warning_text
 
 
 class _FakeAsyncClient:

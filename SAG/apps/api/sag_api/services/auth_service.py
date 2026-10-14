@@ -1,4 +1,4 @@
-"""认证与用户领域逻辑（单用户）。"""
+"""Logic nghiệp vụ về xác thực và người dùng (chế độ một người dùng)."""
 
 from __future__ import annotations
 
@@ -10,23 +10,29 @@ from sag_api.core.security import hash_password, verify_password
 from sag_api.db.models import User
 
 
+def _password_hash(password: str) -> str:
+    if len(password.encode("utf-8")) > 72:
+        raise ValidationError("Mật khẩu không được vượt quá giới hạn 72 byte UTF-8 của bcrypt")
+    return hash_password(password)
+
+
 async def register_user(session: AsyncSession, *, email: str, password: str, name: str = "") -> User:
     from sag_api.core.config import settings
 
     existing = await session.scalar(select(User).where(User.email == email))
     if existing is not None:
-        raise ConflictError("该邮箱已注册")
+        raise ConflictError("Email này đã được đăng ký")
 
-    # 本地名字身份不算密码账号；切换 password 模式时仍允许建立首个正式凭据。
+    # Danh tính chỉ có tên cục bộ không được xem là tài khoản mật khẩu; vẫn cho phép tạo thông tin đăng nhập chính thức đầu tiên khi chuyển sang chế độ password.
     credential_count = await session.scalar(
         select(func.count()).select_from(User).where(User.email != "")
     ) or 0
     if credential_count > 0 and not settings.allow_registration:
-        raise ForbiddenError("注册已关闭")
+        raise ForbiddenError("Đăng ký đã bị đóng")
 
     user = User(
         email=email,
-        password_hash=hash_password(password),
+        password_hash=_password_hash(password),
         name=name or email.split("@")[0],
     )
     session.add(user)
@@ -38,9 +44,9 @@ async def register_user(session: AsyncSession, *, email: str, password: str, nam
 async def authenticate(session: AsyncSession, *, email: str, password: str) -> User:
     user = await session.scalar(select(User).where(User.email == email))
     if user is None or not verify_password(password, user.password_hash):
-        raise AuthError("邮箱或密码错误")
+        raise AuthError("Email hoặc mật khẩu không chính xác")
     if not user.is_active:
-        raise ForbiddenError("账号已停用")
+        raise ForbiddenError("Tài khoản đã bị vô hiệu hóa")
     return user
 
 
@@ -75,9 +81,9 @@ async def authenticate_or_register(
 
     if user is not None:
         if password_supplied and not verify_password(password, user.password_hash):
-            raise AuthError("身份验证失败")
+            raise AuthError("Xác thực danh tính thất bại")
         if not user.is_active:
-            raise ForbiddenError("账号已停用")
+            raise ForbiddenError("Tài khoản đã bị vô hiệu hóa")
         if rename_local_user:
             user.name = name
             await session.commit()
@@ -85,14 +91,14 @@ async def authenticate_or_register(
         return user
 
     if not name:
-        raise ValidationError("请先填写名字")
+        raise ValidationError("Vui lòng nhập tên trước")
 
     if not allow_create:
-        raise AuthError("邮箱或密码错误")
+        raise AuthError("Email hoặc mật khẩu không chính xác")
 
     user = User(
         email=email,
-        password_hash=hash_password(password),
+        password_hash=_password_hash(password),
         name=name,
     )
     session.add(user)

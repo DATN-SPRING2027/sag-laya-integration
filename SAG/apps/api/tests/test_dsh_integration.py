@@ -70,6 +70,8 @@ async def _connector_api_resource():
         token_id="dsh-test-assertion",
         issued_at=1,
         expires_at=2,
+        tenant_id="tenant_continuum_default",
+        allowed_partition_ids=frozenset({"public"}),
     )
     email = f"dsh-api-cleanup-{uuid4().hex}@example.test"
     source_ids: list[str] = []
@@ -150,6 +152,7 @@ def test_connection_file_path_uses_override_and_platform_config_directories(
     assert connection_file_path(SimpleNamespace(dsh_connection_file=str(override))) == override
 
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(dsh_integration_service.Path, "home", lambda: tmp_path / "home")
     monkeypatch.setattr(sys, "platform", "darwin")
     assert connection_file_path(SimpleNamespace(dsh_connection_file=None)) == (
         tmp_path / "home" / "Library" / "Application Support" / "SAG" / "dsh-connection.json"
@@ -683,7 +686,7 @@ async def test_local_discovery_mode_rejects_public_docker_port_binding(
 async def test_connector_token_calls_approved_knowledge_apis(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from sag_api.sag.dto import ChunkInfo
+    from sag_api.core.deps import get_job_queue
 
     async with _connector_api_resource() as (
         client,
@@ -693,6 +696,15 @@ async def test_connector_token_calls_approved_knowledge_apis(
         source_id,
         source_ids,
     ):
+        class FakeQueue:
+            async def enqueue(self, _job_id: str):
+                return None
+
+            def begin_source_maintenance(self, _source_id: str, _job_id: str):
+                return None
+
+        # This test checks HTTP persistence and authorization, not worker scheduling.
+        monkeypatch.setitem(app.dependency_overrides, get_job_queue, FakeQueue)
         listed = await client.get("/api/v1/sources", headers=connector_headers)
         created = await client.post(
             "/api/v1/sources",
@@ -706,6 +718,7 @@ async def test_connector_token_calls_approved_knowledge_apis(
             headers=connector_headers,
             files={"file": ("dsh.md", b"# dsh", "text/markdown")},
         )
+        assert uploaded.status_code == 201, uploaded.text
         document_id = uploaded.json()["id"]
         documents = await client.get(
             f"/api/v1/sources/{source_id}/documents",
@@ -725,16 +738,24 @@ async def test_connector_token_calls_approved_knowledge_apis(
             headers=connector_headers,
         )
 
-        async def fake_get_chunk(_source_config_id, chunk_id, *, source=None):
+        async def fake_get_search_unit_citation(
+            _session, *, source, principal, search_unit_id, engine_manager
+        ):
             assert source is not None and source.id == source_id
-            return ChunkInfo(
-                chunk_id=chunk_id,
-                heading="DSH",
-                content="connector readable content",
-                rank=1,
-            )
+            assert search_unit_id == "chunk-for-dsh"
+            return {
+                "chunk_id": search_unit_id,
+                "heading": "DSH",
+                "content": "connector readable content",
+                "rank": 0,
+                "source_id": source.id,
+                "source_name": source.name,
+            }
 
-        monkeypatch.setattr(app.state.engine_manager, "get_chunk", fake_get_chunk)
+        monkeypatch.setattr(
+            "sag_api.services.search_unit_retrieval_service.get_search_unit_citation",
+            fake_get_search_unit_citation,
+        )
         read = await client.get(
             f"/api/v1/sources/{source_id}/chunks/chunk-for-dsh",
             headers=connector_headers,
@@ -889,7 +910,7 @@ async def test_connector_global_search_is_structured_only(
     from sag_api.api.v1 import search as search_module
     from sag_api.sag import RetrievedSection, SearchOutcome
     from sag_api.schemas.search import SearchResponse, SectionOut
-    from sag_api.services import universe_service
+    from sag_api.services import retrieval_service, universe_service
 
     class SpyLLM:
         configured = True
@@ -910,11 +931,19 @@ async def test_connector_global_search_is_structured_only(
         section = RetrievedSection(
             chunk_id="structured-chunk",
             heading="Structured evidence",
-            content="Connector receives this evidence without SAG generation.",
+            content="This structured search evidence lets the connector receive results without SAG generation.",
             score=0.98,
             rank=0,
             source_id="document-structured",
             source_config_id=source.sag_source_config_id,
+            canonical_evidence_verified=True,
+            document_id="document-structured",
+            document_version_id="version-structured",
+            document_name="dsh.md",
+            version_no=1,
+            page_from=1,
+            page_to=1,
+            anchor="dsh.md#section-1",
         )
         return search_module._PreparedGlobalSearch(
             sources=[source],
@@ -941,7 +970,11 @@ async def test_connector_global_search_is_structured_only(
         save_calls += 1
         return SimpleNamespace(id="jwt-exploration"), SimpleNamespace()
 
+    async def preserve_verified_sections(sections, _sources):
+        return sections
+
     monkeypatch.setattr(search_module, "_prepare_global_search", fake_prepare)
+    monkeypatch.setattr(retrieval_service, "resolve_traceable_evidence", preserve_verified_sections)
     monkeypatch.setattr(universe_service, "save_exploration", fake_save_exploration)
     spy_llm = SpyLLM()
 

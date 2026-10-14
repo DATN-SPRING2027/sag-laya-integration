@@ -14,7 +14,7 @@ from dataclasses import dataclass, replace
 from urllib.parse import urljoin, urlsplit
 
 import httpx
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.connectors.web import extract_web_markdown, extract_web_title
@@ -466,7 +466,17 @@ async def finalize_research_task(session: AsyncSession, task_id: str) -> None:
         await session.execute(
             select(IngestionRun, DocumentVersion)
             .join(DocumentVersion, DocumentVersion.id == IngestionRun.document_version_id)
-            .where(IngestionRun.research_task_id == task.id)
+            .where(
+                IngestionRun.tenant_id == task.tenant_id,
+                IngestionRun.project_id == task.project_id,
+                or_(
+                    IngestionRun.research_task_id == task.id,
+                    and_(
+                        IngestionRun.research_task_id.is_(None),
+                        IngestionRun.id.in_(expected_run_ids),
+                    ),
+                ),
+            )
         )
     ).all()
     runs_by_id = {run.id: (run, version) for run, version in rows}

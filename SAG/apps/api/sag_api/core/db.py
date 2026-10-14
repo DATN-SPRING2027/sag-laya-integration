@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator
 
-from sqlalchemy import event
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -164,12 +164,10 @@ async def _ensure_indexes() -> None:
 
     async with engine.begin() as conn:
         for ddl in _INDEX_UPGRADES:
-            if "tree_routing_profiles" in ddl:
-                table_exists = await conn.run_sync(
-                    lambda sync_conn: sa_inspect(sync_conn).has_table("tree_routing_profiles")
-                )
-                if not table_exists:
-                    continue
+            table = ddl.split(" ON ", 1)[1].split(" ", 1)[0]
+            table_exists = await conn.run_sync(lambda sync_conn: sa_inspect(sync_conn).has_table(table))
+            if not table_exists:
+                continue
             await conn.exec_driver_sql(ddl)
 
 
@@ -178,6 +176,43 @@ async def _ensure_document_schema_widths() -> None:
     if engine.dialect.name != "postgresql":
         return
     async with engine.begin() as conn:
+        # Avoid reacquiring table locks during startup after the one-time widening is complete.
+        needs_upgrade = await conn.scalar(
+            text(
+                """
+                SELECT
+                  NOT EXISTS (
+                    SELECT 1 FROM pg_attribute
+                    WHERE attrelid = 'documents'::regclass AND attname = 'id'
+                      AND attnum > 0 AND NOT attisdropped
+                      AND atttypid = 'character varying'::regtype AND atttypmod = 40
+                  )
+                  OR NOT EXISTS (
+                    SELECT 1 FROM pg_attribute
+                    WHERE attrelid = 'documents'::regclass AND attname = 'owner_id'
+                      AND attnum > 0 AND NOT attisdropped
+                      AND atttypid = 'character varying'::regtype AND atttypmod = 260
+                  )
+                  OR EXISTS (
+                    SELECT 1
+                    FROM pg_constraint fk
+                    CROSS JOIN LATERAL unnest(fk.conkey, fk.confkey) AS keys(local_attnum, target_attnum)
+                    JOIN pg_attribute local_col
+                      ON local_col.attrelid = fk.conrelid AND local_col.attnum = keys.local_attnum
+                    JOIN pg_attribute target_col
+                      ON target_col.attrelid = fk.confrelid AND target_col.attnum = keys.target_attnum
+                    WHERE fk.contype = 'f' AND fk.confrelid = 'documents'::regclass
+                      AND target_col.attname = 'id'
+                      AND (
+                        local_col.atttypid <> 'character varying'::regtype
+                        OR local_col.atttypmod <> 40
+                      )
+                  )
+                """
+            )
+        )
+        if not needs_upgrade:
+            return
         await conn.exec_driver_sql(
             """
             DO $$

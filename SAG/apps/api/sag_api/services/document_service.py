@@ -624,7 +624,24 @@ async def delete_document(
     *,
     job_queue: JobQueue | None = None,
 ) -> Job:
-    document = await get_document(session, source, document_id)
+    try:
+        document = await get_document(session, source, document_id)
+    except NotFoundError:
+        completed_jobs = await session.scalars(
+            select(Job)
+            .where(
+                Job.source_id == source.id,
+                Job.type == JobType.DELETE_DOCUMENT,
+                Job.status == JobStatus.SUCCEEDED,
+                Job.payload["target_document_id"].as_string() == document_id,
+            )
+            .order_by(Job.created_at.desc(), Job.id.desc())
+            .limit(1)
+        )
+        completed = completed_jobs.first()
+        if completed is None:
+            raise
+        return completed
     source_record_id = source.id
     derived_source_ids = await _document_derived_source_ids(session, document)
     existing = await session.scalar(
@@ -697,27 +714,16 @@ async def delete_document(
                 # A worker claimed the processor after the optimistic read.
                 # Roll back any partial fence and use cooperative deletion.
                 await session.rollback()
-                completed_jobs = list(
-                    (
-                        await session.scalars(
-                            select(Job)
-                            .where(
-                                Job.source_id == source_record_id,
-                                Job.type == JobType.DELETE_DOCUMENT,
-                                Job.status == JobStatus.SUCCEEDED,
-                            )
-                            .order_by(Job.created_at.desc(), Job.id.desc())
-                            .limit(100)
-                        )
-                    ).all()
-                )
-                completed = next(
-                    (
-                        candidate
-                        for candidate in completed_jobs
-                        if (candidate.payload or {}).get("target_document_id") == target_document_id
-                    ),
-                    None,
+                completed = await session.scalar(
+                    select(Job)
+                    .where(
+                        Job.source_id == source_record_id,
+                        Job.type == JobType.DELETE_DOCUMENT,
+                        Job.status == JobStatus.SUCCEEDED,
+                        Job.payload["target_document_id"].as_string() == target_document_id,
+                    )
+                    .order_by(Job.created_at.desc(), Job.id.desc())
+                    .limit(1)
                 )
                 if completed is not None:
                     return completed
@@ -746,27 +752,16 @@ async def delete_document(
         )
         if claimed.rowcount != 1:
             await session.rollback()
-            completed_jobs = list(
-                (
-                    await session.scalars(
-                        select(Job)
-                        .where(
-                            Job.source_id == source_record_id,
-                            Job.type == JobType.DELETE_DOCUMENT,
-                            Job.status == JobStatus.SUCCEEDED,
-                        )
-                        .order_by(Job.created_at.desc(), Job.id.desc())
-                        .limit(100)
-                    )
-                ).all()
-            )
-            completed = next(
-                (
-                    candidate
-                    for candidate in completed_jobs
-                    if (candidate.payload or {}).get("target_document_id") == target_document_id
-                ),
-                None,
+            completed = await session.scalar(
+                select(Job)
+                .where(
+                    Job.source_id == source_record_id,
+                    Job.type == JobType.DELETE_DOCUMENT,
+                    Job.status == JobStatus.SUCCEEDED,
+                    Job.payload["target_document_id"].as_string() == target_document_id,
+                )
+                .order_by(Job.created_at.desc(), Job.id.desc())
+                .limit(1)
             )
             if completed is not None:
                 return completed
@@ -921,7 +916,7 @@ async def get_or_create_project_source(
     tenant_id: str,
     project_id: str,
 ) -> Source:
-    """将 (tenant_id, project_id) 映射到供 ingestion worker 使用的 Source。"""
+    """Ánh xạ (tenant_id, project_id) thành Source để ingestion worker sử dụng."""
     hash_digest = hashlib.sha256(f"{tenant_id}:{project_id}".encode()).hexdigest()[:32]
     config_id = f"tp_{hash_digest}"
     stmt = select(Source).where(Source.sag_source_config_id == config_id).limit(1)
