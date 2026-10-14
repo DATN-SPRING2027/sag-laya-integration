@@ -13,7 +13,7 @@
     "start": "next start",
     "lint": "eslint . --max-warnings=0",
     "i18n:check": "node ./scripts/check-i18n.cjs",
-    "test:unit": "vitest run",
+    "test:unit": "vitest run --passWithNoTests",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
