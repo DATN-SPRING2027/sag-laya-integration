@@ -81,7 +81,7 @@ async def test_sag_ops_empty_project_id_validation(capsys):
     captured = capsys.readouterr()
     assert "project_id cannot be empty" in captured.err
 
-    assert await run_rollback_tree("   ", "") is False
+    assert await run_rollback_tree("   ") is False
     captured = capsys.readouterr()
     assert "project_id cannot be empty" in captured.err
 
