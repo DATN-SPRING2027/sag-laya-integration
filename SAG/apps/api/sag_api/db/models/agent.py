@@ -13,6 +13,7 @@ class Agent(IDMixin, TimestampMixin, Base):
 
     __tablename__ = "agents"
 
+    owner_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     name: Mapped[str] = mapped_column(String(120))
     avatar: Mapped[str] = mapped_column(String(64), default="")  # emoji / 首字母
     # 默认 agent：开箱即用的主对话入口，知识库=全部信源（resolve_sources 特判）
@@ -37,6 +38,7 @@ class AgentBinding(IDMixin, TimestampMixin, Base):
 class Thread(IDMixin, TimestampMixin, Base):
     __tablename__ = "threads"
 
+    owner_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id", ondelete="CASCADE"), index=True)
     title: Mapped[str] = mapped_column(String(300), default="新会话")
     archived: Mapped[bool] = mapped_column(default=False, index=True)
@@ -47,7 +49,7 @@ class Message(IDMixin, TimestampMixin, Base):
     __table_args__ = (Index("ix_messages_thread_created_id", "thread_id", "created_at", "id"),)
 
     thread_id: Mapped[str] = mapped_column(ForeignKey("threads.id", ondelete="CASCADE"))
-    # 图片附件 meta：[{id, name, media_type}]（文件在 upload_dir/attachments/）
+    # Chat image upload metadata, not Source/Document metadata; files are scoped to the conversation owner.
     attachments: Mapped[list] = mapped_column("attachments_json", JSON, default=list)
     # Agentic 执行轨迹：[{kind:thinking|tool, step, name?, args?, ms, count?}]（助手消息）
     steps: Mapped[list] = mapped_column("steps_json", JSON, default=list)

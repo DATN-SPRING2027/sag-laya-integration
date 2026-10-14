@@ -1,6 +1,7 @@
 """R3 稳定硬化：就绪/存活探针、上传白名单、Job 退避重试、引擎 LRU 逐出。"""
 
 import asyncio
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import httpx
@@ -40,6 +41,38 @@ async def test_source_creation_rolls_back_when_engine_provision_fails():
             await session.execute(select(Source).where(Source.name == "must-not-be-partial"))
         ).scalar_one_or_none()
         assert stored is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("needs_upgrade", "expected_ddl"), [(False, 0), (True, 1)])
+async def test_postgres_document_width_repair_only_runs_when_needed(monkeypatch, needs_upgrade, expected_ddl):
+    import sag_api.core.db as db
+
+    class Connection:
+        def __init__(self):
+            self.statements = []
+
+        async def scalar(self, _statement):
+            return needs_upgrade
+
+        async def exec_driver_sql(self, statement):
+            self.statements.append(statement)
+
+    connection = Connection()
+
+    class Engine:
+        dialect = SimpleNamespace(name="postgresql")
+
+        @asynccontextmanager
+        async def begin(self):
+            yield connection
+
+    monkeypatch.setattr(db, "engine", Engine())
+
+    await db._ensure_document_schema_widths()
+
+    assert len(connection.statements) == expected_ddl
+    monkeypatch.undo()
 
 
 @pytest.mark.asyncio

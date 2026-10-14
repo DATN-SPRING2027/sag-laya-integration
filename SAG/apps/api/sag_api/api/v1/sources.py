@@ -28,9 +28,20 @@ from sag_api.services.source_service import (
     list_sources,
     sync_source,
     update_source,
+    versioned_source_ids,
+    visible_source_counts,
 )
 
 router = APIRouter(prefix="/sources", tags=["sources"])
+
+
+async def _source_out(session: AsyncSession, source: Source, principal: VerifiedPrincipal) -> SourceOut:
+    counts = (await visible_source_counts(session, principal=principal, source_ids=[source.id])).get(
+        source.id, (0, 0, 0)
+    )
+    return SourceOut.model_validate(source).model_copy(
+        update={"document_count": counts[0], "chunk_count": counts[1], "event_count": counts[2]}
+    )
 
 
 # 注意：静态路由须在 /{source_id} 之前声明
@@ -45,7 +56,18 @@ async def list_(
     principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
 ) -> list[SourceOut]:
-    return [SourceOut.model_validate(s) for s in await list_sources(session, principal=principal)]
+    sources = await list_sources(session, principal=principal)
+    counts = await visible_source_counts(session, principal=principal, source_ids=[source.id for source in sources])
+    return [
+        SourceOut.model_validate(source).model_copy(
+            update={
+                "document_count": counts.get(source.id, (0, 0, 0))[0],
+                "chunk_count": counts.get(source.id, (0, 0, 0))[1],
+                "event_count": counts.get(source.id, (0, 0, 0))[2],
+            }
+        )
+        for source in sources
+    ]
 
 
 @router.post("", response_model=SourceCreateOut, status_code=201)
@@ -66,8 +88,10 @@ async def get_(
     source_id: str,
     _user: User = Depends(get_current_user),
     source: Source = Depends(require_path_source_access),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    session: AsyncSession = Depends(get_session),
 ) -> SourceOut:
-    return SourceOut.model_validate(source)
+    return await _source_out(session, source, principal)
 
 
 @router.patch("/{source_id}", response_model=SourceOut)
@@ -76,10 +100,12 @@ async def update_(
     body: SourceUpdate,
     _user: User = Depends(get_current_user),
     _authorized_source: Source = Depends(require_path_source_access),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
     job_queue: JobQueue = Depends(get_job_queue),
 ) -> SourceOut:
-    return SourceOut.model_validate(await update_source(session, source_id, body, job_queue=job_queue))
+    source = await update_source(session, source_id, body, job_queue=job_queue)
+    return await _source_out(session, source, principal)
 
 
 @router.delete("/{source_id}", response_model=Ok)
@@ -134,8 +160,11 @@ async def get_chunk(
     if canonical is not None:
         return canonical
 
-    chunk = await engine_manager.get_chunk(source.sag_source_config_id, chunk_id, source=source)
-    if chunk is None:
+    partitioned = source.id in await versioned_source_ids(session, [source.id])
+    chunk = None
+    if not partitioned:
+        chunk = await engine_manager.get_chunk(source.sag_source_config_id, chunk_id, source=source)
+    if chunk is None and not partitioned:
         from datetime import UTC, datetime
 
         from sag_api.db.models import OctxInstallation

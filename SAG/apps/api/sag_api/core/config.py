@@ -19,7 +19,7 @@ from typing import Annotated, Literal
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import Field, PrivateAttr, field_validator
+from pydantic import Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from sag_api.core.model_providers import ModelProviderId, get_model_provider
@@ -360,6 +360,20 @@ class Settings(BaseSettings):
         host = f"[{hostname}]" if ":" in hostname else hostname
         authority = f"{host}:{port}" if port is not None else host
         return urlunsplit((parsed.scheme.lower(), authority, path, "", ""))
+
+    @model_validator(mode="after")
+    def _require_production_storage_backends(self) -> Settings:
+        if self.environment == "prod":
+            if urlsplit(self.database_url).scheme != "postgresql+asyncpg":
+                raise ValueError("SAG_DATABASE_URL must use PostgreSQL with asyncpg in prod")
+            if self.sag_relational_provider != "postgres":
+                raise ValueError("SAG_SAG_RELATIONAL_PROVIDER must be postgres in prod")
+            if self.sag_vector_provider != "qdrant":
+                raise ValueError("SAG_SAG_VECTOR_PROVIDER must be qdrant in prod")
+            qdrant_url = urlsplit(self.sag_qdrant_url)
+            if qdrant_url.scheme not in {"http", "https"} or not qdrant_url.hostname:
+                raise ValueError("SAG_SAG_QDRANT_URL must be an absolute HTTP(S) URL in prod")
+        return self
 
     @property
     def effective_data_dir(self) -> str:

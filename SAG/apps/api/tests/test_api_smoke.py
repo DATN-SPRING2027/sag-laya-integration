@@ -9,8 +9,12 @@ import pytest
 
 
 @pytest.mark.asyncio
-async def test_end_to_end_offline():
+async def test_end_to_end_offline(monkeypatch):
+    from sag_api.core.deps import get_job_queue
     from sag_api.main import app
+
+    # This smoke test exercises HTTP persistence; worker lifecycle has dedicated tests.
+    monkeypatch.setitem(app.dependency_overrides, get_job_queue, lambda: None)
 
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
@@ -89,9 +93,11 @@ async def test_end_to_end_offline():
 
 
 @pytest.mark.asyncio
-async def test_folder_import_upload_logs_batch_document_and_request_ids(caplog):
+async def test_folder_import_upload_logs_batch_document_and_request_ids(monkeypatch, caplog):
+    from sag_api.core.deps import get_job_queue
     from sag_api.main import app
 
+    monkeypatch.setitem(app.dependency_overrides, get_job_queue, lambda: None)
     batch_id = "018f5f7e-89ab-7def-8123-0123456789a0"
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
@@ -172,9 +178,11 @@ async def test_folder_import_upload_rejects_malformed_batch_before_document_pers
 
 
 @pytest.mark.asyncio
-async def test_folder_import_upload_strips_client_paths_from_logs_and_document_name(caplog):
+async def test_folder_import_upload_strips_client_paths_from_logs_and_document_name(monkeypatch, caplog):
+    from sag_api.core.deps import get_job_queue
     from sag_api.main import app
 
+    monkeypatch.setitem(app.dependency_overrides, get_job_queue, lambda: None)
     batch_id = "018f5f7e-89ab-7def-8123-0123456789a0"
     uploaded_files = [
         ("/private/client-folder/posix.md", "posix.md"),
@@ -226,7 +234,7 @@ async def test_folder_import_upload_strips_client_paths_from_logs_and_document_n
 
 
 @pytest.mark.asyncio
-async def test_uploaded_document_reaches_ready_through_background_queue():
+async def test_uploaded_document_reaches_ready_through_background_queue(monkeypatch):
     from sqlalchemy import select
 
     from sag_api.core.db import SessionLocal
@@ -234,6 +242,10 @@ async def test_uploaded_document_reaches_ready_through_background_queue():
     from sag_api.enums import JobStatus, JobType
     from sag_api.main import app
     from sag_api.sag.dto import ProcessCheckpoint, ProcessOutcome
+    from sag_api.services import search_index_service
+
+    async def mark_search_ready(_session, *, document_version, **_kwargs):
+        document_version.search_status = "SEARCH_READY"
 
     class OfflineDocumentEngine:
         async def process_document(self, _config_id, _path, **kwargs):
@@ -270,6 +282,8 @@ async def test_uploaded_document_reaches_ready_through_background_queue():
                 "relation_count": 0,
                 "time_buckets": [],
             }
+
+    monkeypatch.setattr(search_index_service, "run_search_indexing_stage", mark_search_ready)
 
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):

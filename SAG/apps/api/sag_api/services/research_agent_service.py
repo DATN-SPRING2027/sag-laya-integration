@@ -10,11 +10,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from urllib.parse import urljoin, urlsplit
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.connectors.web import extract_web_markdown, extract_web_title
@@ -67,6 +67,7 @@ class FetchOutcome:
     status_code: int | None = None
     content_bytes: bytes = b""
     payload_hash: str = ""
+    content_hash: str = ""
     title: str = ""
     markdown: str = ""
     error: str | None = None
@@ -105,6 +106,7 @@ async def fetch_url_bounded(
             timeout=budget.timeout_seconds,
             follow_redirects=False,
             headers={"User-Agent": _USER_AGENT},
+            trust_env=False,
         )
         close_client = True
 
@@ -192,6 +194,7 @@ async def fetch_url_bounded(
                         title = extract_web_title(html_text) or urlsplit(current_url).netloc
                         full_markdown = f"# {title}\n\n> Source: {current_url}\n\n{markdown_body}\n"
                         payload_hash = hashlib.sha256(full_markdown.encode("utf-8")).hexdigest()
+                        content_hash = hashlib.sha256(markdown_body.encode("utf-8")).hexdigest()
 
                         return FetchOutcome(
                             url=url,
@@ -199,6 +202,7 @@ async def fetch_url_bounded(
                             status_code=response.status_code,
                             content_bytes=content_bytes,
                             payload_hash=payload_hash,
+                            content_hash=content_hash,
                             title=title,
                             markdown=full_markdown,
                             retry_count=retries,
@@ -245,6 +249,7 @@ async def execute_research_task(
     # Prevent re-executing terminal tasks
     if task.status in {
         ResearchTaskStatus.COMPLETED.value,
+        ResearchTaskStatus.INGESTING.value,
         ResearchTaskStatus.STOPPED_NO_NEW_INFO.value,
         ResearchTaskStatus.FAILED.value,
         ResearchTaskStatus.CANCELLED.value,
@@ -261,13 +266,30 @@ async def execute_research_task(
 
     target_urls: list[str] = list(task.target_urls_json)
     outcomes: list[FetchOutcome] = []
-    seen_payload_hashes: set[str] = set()
     ingested_run_ids: list[str] = list(task.ingestion_run_ids_json)
     ingested_version_ids: list[str] = list(task.document_version_ids_json)
     has_new_information = False
-    total_bytes_fetched = 0
+    execution = dict(task.execution_json or {})
+    total_bytes_fetched = max(0, int(execution.get("total_bytes_fetched", 0) or 0))
+    attempted_urls = set(execution.get("attempted_urls", []))
+    seen_content_hashes = set(execution.get("content_hashes", []))
+
+    def mark_attempted(url: str) -> None:
+        attempted_urls.add(url)
+        execution["attempted_urls"] = sorted(attempted_urls)
+        task.execution_json = execution
+
+    def remember_ingestion(run_id: str | None, version_id: str | None) -> None:
+        if run_id and run_id not in ingested_run_ids:
+            ingested_run_ids.append(run_id)
+        if version_id and version_id not in ingested_version_ids:
+            ingested_version_ids.append(version_id)
+        task.ingestion_run_ids_json = ingested_run_ids
+        task.document_version_ids_json = ingested_version_ids
 
     for url in target_urls:
+        if url in attempted_urls:
+            continue
         if task.fetch_count >= budget.max_fetches:
             log.info("Task %s reached max_fetches budget cap (%s)", task.id, budget.max_fetches)
             break
@@ -276,62 +298,81 @@ async def execute_research_task(
             log.info("Task %s reached max_total_bytes budget cap (%s)", task.id, budget.max_total_bytes)
             break
 
-        outcome = await fetcher(url, policy, budget)
+        remaining_bytes = budget.max_total_bytes - total_bytes_fetched
+        fetch_budget = replace(budget, max_bytes_per_page=min(budget.max_bytes_per_page, remaining_bytes))
+        outcome = await fetcher(url, policy, fetch_budget)
         task.fetch_count += 1
         task.retry_count += outcome.retry_count
         total_bytes_fetched += len(outcome.content_bytes)
+        execution["total_bytes_fetched"] = total_bytes_fetched
+        task.execution_json = execution
+        await session.flush()
 
         if not outcome.success or outcome.is_no_info or not outcome.payload_hash:
             outcomes.append(outcome)
+            mark_attempted(url)
             continue
 
+        content_hash = outcome.content_hash or hashlib.sha256(outcome.markdown.encode("utf-8")).hexdigest()
+
         # Check duplicate within this task execution
-        if outcome.payload_hash in seen_payload_hashes:
+        if content_hash in seen_content_hashes:
             outcome = FetchOutcome(
                 url=outcome.url,
                 success=True,
                 status_code=outcome.status_code,
                 content_bytes=outcome.content_bytes,
                 payload_hash=outcome.payload_hash,
+                content_hash=content_hash,
                 title=outcome.title,
                 markdown=outcome.markdown,
                 retry_count=outcome.retry_count,
                 is_duplicate=True,
             )
             outcomes.append(outcome)
+            mark_attempted(url)
             continue
 
         # Check duplicate against existing IngestionRuns in this tenant, project AND partition
         existing_run_stmt = (
-            select(IngestionRun.id)
+            select(IngestionRun)
             .join(DocumentVersion, DocumentVersion.id == IngestionRun.document_version_id)
             .where(
                 IngestionRun.tenant_id == task.tenant_id,
                 IngestionRun.project_id == task.project_id,
-                IngestionRun.payload_hash == outcome.payload_hash,
+                or_(IngestionRun.content_hash == content_hash, IngestionRun.payload_hash == outcome.payload_hash),
                 DocumentVersion.metadata_json["security_partition_id"].as_string() == task.security_partition_id,
             )
+            .order_by(
+                (IngestionRun.research_task_id == task.id).desc(),
+                IngestionRun.created_at.desc(),
+                IngestionRun.id.desc(),
+            )
+            .limit(1)
         )
-        existing_run_id = (await session.execute(existing_run_stmt)).scalar_one_or_none()
-        if existing_run_id is not None:
+        existing_run = (await session.execute(existing_run_stmt)).scalar_one_or_none()
+        if existing_run is not None:
+            if existing_run.research_task_id == task.id:
+                has_new_information = True
+                remember_ingestion(existing_run.id, existing_run.document_version_id)
             outcome = FetchOutcome(
                 url=outcome.url,
                 success=True,
                 status_code=outcome.status_code,
                 content_bytes=outcome.content_bytes,
                 payload_hash=outcome.payload_hash,
+                content_hash=content_hash,
                 title=outcome.title,
                 markdown=outcome.markdown,
                 retry_count=outcome.retry_count,
                 is_duplicate=True,
             )
+            seen_content_hashes.add(content_hash)
+            execution["content_hashes"] = sorted(seen_content_hashes)
+            task.execution_json = execution
             outcomes.append(outcome)
+            mark_attempted(url)
             continue
-
-        # We have verified new, non-duplicate information
-        seen_payload_hashes.add(outcome.payload_hash)
-        has_new_information = True
-        outcomes.append(outcome)
 
         # Relay to Normal Ingestion Pipeline via handle_document_upload
         client_token = f"research-task-{task.id}-{outcome.payload_hash[:16]}"
@@ -349,29 +390,46 @@ async def execute_research_task(
             file_bytes=file_bytes,
             original_filename=original_filename,
             content_type="text/markdown",
+            content_hash=content_hash,
             logical_source_id=f"web:{normalize_url(url)}",
+            research_task_id=task.id,
             job_queue=job_queue,
         )
 
         if upload_res.is_duplicate:
+            existing_run = await session.get(IngestionRun, upload_res.run_id) if upload_res.run_id else None
+            if existing_run and existing_run.research_task_id == task.id:
+                has_new_information = True
+                remember_ingestion(existing_run.id, upload_res.version_id)
             outcome = FetchOutcome(
                 url=outcome.url,
                 success=True,
                 status_code=outcome.status_code,
                 content_bytes=outcome.content_bytes,
                 payload_hash=outcome.payload_hash,
+                content_hash=content_hash,
                 title=outcome.title,
                 markdown=outcome.markdown,
                 retry_count=outcome.retry_count,
                 is_duplicate=True,
             )
+            seen_content_hashes.add(content_hash)
+            execution["content_hashes"] = sorted(seen_content_hashes)
+            task.execution_json = execution
+            outcomes.append(outcome)
+            mark_attempted(url)
             continue
 
-        if upload_res.run_id and upload_res.run_id not in ingested_run_ids:
-            ingested_run_ids.append(upload_res.run_id)
-        if upload_res.version_id and upload_res.version_id not in ingested_version_ids:
-            ingested_version_ids.append(upload_res.version_id)
+        has_new_information = True
+        outcomes.append(outcome)
+        seen_content_hashes.add(content_hash)
+        execution["content_hashes"] = sorted(seen_content_hashes)
+        task.execution_json = execution
+        mark_attempted(url)
 
+        remember_ingestion(upload_res.run_id, upload_res.version_id)
+
+    task.execution_json = execution
     task.ingestion_run_ids_json = ingested_run_ids
     task.document_version_ids_json = ingested_version_ids
 
@@ -390,7 +448,55 @@ async def execute_research_task(
         task.error_message = "; ".join(errors) if errors else "All fetch attempts failed"
 
     await session.flush()
+    await finalize_research_task(session, task.id)
     return task, outcomes
+
+
+async def finalize_research_task(session: AsyncSession, task_id: str) -> None:
+    """Complete research only after every linked ingestion run reaches a terminal state."""
+    task = await session.get(ResearchTask, task_id)
+    if task is None or task.status != ResearchTaskStatus.INGESTING.value:
+        return
+
+    expected_run_ids = set(task.ingestion_run_ids_json or [])
+    if not expected_run_ids:
+        return
+
+    rows = (
+        await session.execute(
+            select(IngestionRun, DocumentVersion)
+            .join(DocumentVersion, DocumentVersion.id == IngestionRun.document_version_id)
+            .where(
+                IngestionRun.tenant_id == task.tenant_id,
+                IngestionRun.project_id == task.project_id,
+                or_(
+                    IngestionRun.research_task_id == task.id,
+                    and_(
+                        IngestionRun.research_task_id.is_(None),
+                        IngestionRun.id.in_(expected_run_ids),
+                    ),
+                ),
+            )
+        )
+    ).all()
+    runs_by_id = {run.id: (run, version) for run, version in rows}
+    if not expected_run_ids.issubset(runs_by_id):
+        return
+
+    results = [runs_by_id[run_id] for run_id in expected_run_ids]
+    if any(run.status not in {"SUCCEEDED", "FAILED"} for run, _ in results):
+        return
+
+    if all(run.status == "SUCCEEDED" and version.search_status == "SEARCH_READY" for run, version in results):
+        task.status = ResearchTaskStatus.COMPLETED.value
+        task.error_message = None
+    else:
+        task.status = ResearchTaskStatus.FAILED.value
+        task.error_message = next(
+            (run.error_message for run, _ in results if run.error_message),
+            "One or more research documents failed to reach SEARCH_READY",
+        )
+    await session.flush()
 
 
 def apply_incremental_tree_update_for_research(
@@ -443,7 +549,7 @@ async def run_bounded_research_flow(
     base_snapshot: RoutingSnapshot | None = None,
     tree_config: TreeBuildConfig | None = None,
 ) -> tuple[ResearchTask | None, list[FetchOutcome], IncrementalTreeUpdateResult | None]:
-    """Run full bounded research workflow: Gap -> Question -> Discovery -> Plan -> Fetch -> Ingestion -> Tree Update."""
+    """Run bounded research through ingestion; indexing publishes real SearchUnits and tree updates."""
     eligible_gaps = await detect_eligible_gaps(
         session,
         tenant_id=tenant_id,
@@ -488,29 +594,6 @@ async def run_bounded_research_flow(
         fetch_adapter=fetch_adapter,
     )
 
-    tree_result: IncrementalTreeUpdateResult | None = None
-    if task.status == ResearchTaskStatus.INGESTING.value and base_snapshot is not None:
-        delta_units: list[KnowledgeUnitInput] = []
-        for idx, outcome in enumerate(outcomes):
-            if outcome.success and not outcome.is_duplicate and not outcome.is_no_info:
-                delta_units.append(
-                    KnowledgeUnitInput(
-                        unit_id=f"ku-research-{task.id[:8]}-{idx}",
-                        tenant_id=task.tenant_id,
-                        project_id=task.project_id,
-                        security_partition_id=task.security_partition_id,
-                        dense=(1.0, 0.0),
-                        sparse=(("research", 1.0), (outcome.payload_hash[:8], 1.0)),
-                        entities=(outcome.title or "ResearchDoc",),
-                    )
-                )
-        if delta_units:
-            tree_result = complete_research_task_with_tree_update(
-                task,
-                base_snapshot,
-                delta_units,
-                config=tree_config,
-            )
-            await session.flush()
-
-    return task, outcomes, tree_result
+    # The ingestion/index pipeline owns real SearchUnit embeddings and tree publication.
+    # Do not publish fabricated vectors or mark the task complete from fetched Markdown.
+    return task, outcomes, None

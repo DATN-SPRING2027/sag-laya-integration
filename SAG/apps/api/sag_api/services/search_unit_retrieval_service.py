@@ -208,6 +208,36 @@ async def _load_current_ready_versions(
         raise ServiceUnavailableError("Canonical search authorization is unavailable") from error
 
 
+async def grep_search_unit_blocks(
+    session: AsyncSession,
+    sources: list[SearchableSource],
+    pattern: str,
+    *,
+    principal: VerifiedPrincipal,
+    limit: int,
+) -> list[CanonicalBlock]:
+    """Find literal text in every currently searchable, ACL-scoped canonical block."""
+    versions = await _load_current_ready_versions(session, sources, principal)
+    if not versions:
+        return []
+
+    escaped = pattern.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    try:
+        rows = await session.scalars(
+            select(CanonicalBlock)
+            .where(
+                CanonicalBlock.document_version_id.in_(versions),
+                CanonicalBlock.normalized_text.ilike(f"%{escaped}%", escape="\\"),
+            )
+            .order_by(CanonicalBlock.document_version_id, CanonicalBlock.ordinal)
+            .limit(limit)
+        )
+        return list(rows.all())
+    except SQLAlchemyError as error:
+        log.warning("canonical literal search unavailable error_type=%s", type(error).__name__)
+        raise ServiceUnavailableError("Canonical literal search is unavailable") from error
+
+
 async def _load_current_ready_versions_checked(
     session: AsyncSession,
     sources: list[SearchableSource],

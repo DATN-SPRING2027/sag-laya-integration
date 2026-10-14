@@ -4,7 +4,7 @@ from sqlalchemy import JSON, BigInteger, Boolean, ForeignKey, Index, Integer, St
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column
 
-from sag_api.db.base import Base, IDMixin, TimestampMixin
+from sag_api.db.base import Base, IDMixin, TimestampMixin, new_id
 from sag_api.enums import DocumentStatus
 
 
@@ -16,11 +16,13 @@ class Document(IDMixin, TimestampMixin, Base):
         Index("ix_documents_tenant_project_logical", "tenant_id", "project_id", "logical_source_id"),
     )
 
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+
     tenant_id: Mapped[str] = mapped_column(
         String(64), default="tenant_continuum_default", server_default="tenant_continuum_default"
     )
     project_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
-    owner_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    owner_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     logical_source_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
 
     source_id: Mapped[str | None] = mapped_column(

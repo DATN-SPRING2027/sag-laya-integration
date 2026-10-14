@@ -77,6 +77,21 @@ _API_KEY = re.compile(r"(?i)\b(?:sk|ak)-[a-z0-9._-]{6,}\b")
 _URL = re.compile(r"https?://[^\s；，,]+")
 
 
+async def _finalize_research_task_for_run(session: AsyncSession, run_id: str | None) -> None:
+    if not run_id:
+        return
+    try:
+        run = await session.get(IngestionRun, run_id)
+        if run and run.research_task_id:
+            from sag_api.services.research_agent_service import finalize_research_task
+
+            await finalize_research_task(session, run.research_task_id)
+            await session.commit()
+    except Exception as exc:  # noqa: BLE001 - research status must not fail document processing
+        await session.rollback()
+        log.warning("Could not finalize research task for ingestion run %s: %s", run_id, sanitize_error_message(exc))
+
+
 def _mineru_details(state: dict[str, Any] | None = None) -> tuple[str, str]:
     current = state or {}
     service = current.get("mineru_service")
@@ -502,7 +517,6 @@ async def _process_document_unlocked(
                     ing_run.error_message = pipe_err_str
                     session.add(ing_run)
 
-                    from sag_api.db.models import StageRun
                     stage_name = "INDEX_SEARCH" if current_pipeline_stage == "INDEX" else (
                         "CANONICAL_EXTRACTION" if current_pipeline_stage == "PARSE" else (
                             "DEDUP_TEMPORAL" if current_pipeline_stage == "DEDUP" else "INGEST"
@@ -633,6 +647,7 @@ async def _process_document_unlocked(
                         ver.search_ready_at = None
                     session.add(ver)
         await session.commit()
+        await _finalize_research_task_for_run(session, run_id)
         raise
 
     await session.refresh(document)
@@ -698,6 +713,7 @@ async def _process_document_unlocked(
                 # knowledge_status duy trì độc lập theo hợp đồng Phase 0 (chỉ chuyển khi tree/graph hoàn tất)
                 # The independent producer owns knowledge_status, including DATA_READY/QUEUED.
     await session.commit()
+    await _finalize_research_task_for_run(session, run_id)
     log.info(
         "Xử lý tài liệu hoàn thành doc=%s parser=%s cached=%s chunks=%d events=%d tokens=%d",
         document.id,
@@ -970,24 +986,26 @@ async def _sync_source_unlocked(session: AsyncSession, job: Job, *, job_queue=No
     for d in discovered:
         try:
             local = await connector.fetch(source.config or {}, d)
-            with open(local.path, "rb") as f:
-                data = f.read()
         except Exception as e:  # noqa: BLE001 - Thất bại từng bài không ảnh hưởng đến đồng bộ tổng thể
             log.warning("Đồng bộ thu thập thất bại %s: %s", d.external_id, getattr(e, "message", None) or e)
             continue
-        await create_document_from_upload(
-            session,
-            source,
-            filename=local.filename,
-            content_type=local.content_type,
-            data=data,
-            upload_dir=settings.upload_dir,
-            job_queue=job_queue,
-        )
         try:
-            os.remove(local.path)
-        except OSError:
-            pass
+            with open(local.path, "rb") as f:
+                data = f.read()
+            await create_document_from_upload(
+                session,
+                source,
+                filename=local.filename,
+                content_type=local.content_type,
+                data=data,
+                upload_dir=settings.upload_dir,
+                job_queue=job_queue,
+            )
+        finally:
+            try:
+                os.remove(local.path)
+            except OSError:
+                pass
         fetched += 1
 
     job.progress = 1.0

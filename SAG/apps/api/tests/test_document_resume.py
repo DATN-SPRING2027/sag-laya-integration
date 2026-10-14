@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -19,7 +20,8 @@ from sag_api.enums import DocumentStatus
 async def test_public_document_reads_hide_logically_deleted_rows(hidden_status):
     from sag_api.core.db import SessionLocal, init_db
     from sag_api.core.errors import NotFoundError
-    from sag_api.db.models import Document, Source
+    from sag_api.core.principal_assertion import VerifiedPrincipal
+    from sag_api.db.models import Document, Source, SourceProjectMapping
     from sag_api.services.document_service import get_document, get_public_document
 
     await init_db()
@@ -30,6 +32,17 @@ async def test_public_document_reads_hide_logically_deleted_rows(hidden_status):
         )
         session.add(source)
         await session.flush()
+        session.add(
+            SourceProjectMapping(
+                source_id=source.id,
+                organization_id="hidden-read-org",
+                project_id="hidden-read-project",
+                state="CONFIRMED",
+                confirmed_at=datetime.now(UTC),
+                confirmed_by="test",
+                approval_ref="test",
+            )
+        )
         document = Document(
             source_id=source.id,
             filename="hidden.md",
@@ -41,9 +54,19 @@ async def test_public_document_reads_hide_logically_deleted_rows(hidden_status):
         session.add(document)
         await session.commit()
 
+        principal = VerifiedPrincipal(
+            subject="hidden-read-user",
+            organization_id="hidden-read-org",
+            allowed_project_ids=frozenset({"hidden-read-project"}),
+            issuer="https://pytest.invalid",
+            key_id="pytest-key",
+            token_id="pytest-assertion",
+            issued_at=0,
+            expires_at=2**31,
+        )
         assert await get_document(session, source, document.id) is not None
-        with pytest.raises(NotFoundError, match="文档不存在"):
-            await get_public_document(session, source, document.id)
+        with pytest.raises(NotFoundError, match="Document not found"):
+            await get_public_document(session, source, document.id, principal=principal)
 
 
 
@@ -663,7 +686,7 @@ async def test_resume_legacy_checkpoint_restarts_from_file_or_blocks_without_it(
         assert documents[0].status is DocumentStatus.PENDING
         assert queue.ids == [jobs[0].id]
 
-        with pytest.raises(ConflictError, match="原文件"):
+        with pytest.raises(ConflictError, match="original file"):
             await resume_document(session, source, documents[1].id, job_queue=queue)
         await session.refresh(jobs[1])
         assert jobs[1].status is JobStatus.PAUSED
@@ -1209,7 +1232,10 @@ async def test_reprocess_cleanup_job_deletes_old_data_before_queuing_processing(
         assert engine.deleted == ["engine-latest", "engine-old"]
         assert len(process_jobs) == 1
         assert process_jobs[0].status == JobStatus.QUEUED
-        assert process_jobs[0].payload == {}
+        assert process_jobs[0].payload == {
+            "phase2_skipped": True,
+            "phase2_skip_reason": "MISSING_PROJECT_OR_VERSION",
+        }
         assert cleanup.payload["cleanup_completed"] is True
         assert queue.ids == [process_jobs[0].id, process_jobs[0].id]
 
@@ -1742,7 +1768,7 @@ async def test_pause_cannot_overwrite_delete_that_commits_after_job_lookup(monke
 
         monkeypatch.setattr(session, "scalar", scalar_then_delete)
 
-        with pytest.raises(ConflictError, match="删除|状态"):
+        with pytest.raises(ConflictError, match="deleting|deletion failed"):
             await pause_document(session, source, document_id)
 
         await session.refresh(document)
@@ -1826,7 +1852,7 @@ async def test_resume_cannot_overwrite_delete_that_commits_after_job_lookup(monk
 
         monkeypatch.setattr(session, "scalar", scalar_then_delete)
 
-        with pytest.raises(ConflictError, match="删除|状态"):
+        with pytest.raises(ConflictError, match="deleting|deletion failed"):
             await resume_document(session, source, document_id, job_queue=queue)
 
         await session.refresh(document)
@@ -1873,7 +1899,7 @@ async def test_pause_rejects_ready_document_while_job_completion_is_committing()
         )
         await session.commit()
 
-        with pytest.raises(ConflictError, match="结束|状态"):
+        with pytest.raises(ConflictError, match="completed or state has changed"):
             await pause_document(session, source, document.id)
 
 

@@ -11,23 +11,26 @@ Follows Ponytail minimalism:
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 import hashlib
 import re
-from typing import Any, Sequence
 import uuid
+from collections.abc import Sequence
+from datetime import UTC, datetime
+from typing import Any
 
-from sqlalchemy import and_, desc, inspect, or_, select
+from sqlalchemy import desc, inspect, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sag_api.core.logging import get_logger
 from sag_api.db.models.document import Document
 from sag_api.db.models.routing_rag import (
     CanonicalBlock,
     DocumentVersion,
     KnowledgeGraphEdge,
-    SearchUnit,
     StageRun,
 )
+
+log = get_logger("services.dedup_temporal")
 
 # Standard edge relation taxonomy for Phase 2B
 RELATION_EQUIVALENT = "EQUIVALENT"
@@ -61,7 +64,7 @@ def compute_minhash_signature(tokens: Sequence[str], num_perm: int = 128) -> lis
         # 32-bit unsigned sentinel (0xFFFFFFFF) covering the full 8-hex-char MD5 space
         min_val = 0xFFFFFFFF
         for s in shingles:
-            h = int(hashlib.md5(f"{i}:{s}".encode("utf-8")).hexdigest()[:8], 16)
+            h = int(hashlib.md5(f"{i}:{s}".encode()).hexdigest()[:8], 16)
             if h < min_val:
                 min_val = h
         signature.append(min_val)
@@ -72,7 +75,7 @@ def estimate_minhash_similarity(sig1: Sequence[int], sig2: Sequence[int]) -> flo
     """Estimate Jaccard similarity between two MinHash signatures."""
     if not sig1 or not sig2 or len(sig1) != len(sig2):
         return 0.0
-    matches = sum(1 for a, b in zip(sig1, sig2) if a == b)
+    matches = sum(1 for a, b in zip(sig1, sig2, strict=True) if a == b)
     return matches / len(sig1)
 
 
@@ -81,7 +84,7 @@ def compute_cosine_similarity(vec1: Sequence[float], vec2: Sequence[float]) -> f
     import math
     if not vec1 or not vec2 or len(vec1) != len(vec2):
         return 0.0
-    dot = sum(float(a) * float(b) for a, b in zip(vec1, vec2))
+    dot = sum(float(a) * float(b) for a, b in zip(vec1, vec2, strict=True))
     norm1 = math.sqrt(sum(float(a) * float(a) for a in vec1))
     norm2 = math.sqrt(sum(float(b) * float(b) for b in vec2))
     if norm1 == 0.0 or norm2 == 0.0:
@@ -276,6 +279,7 @@ async def resolve_temporal_supersedes(
         .where(
             DocumentVersion.document_id == document_id,
             DocumentVersion.id != current_version.id,
+            DocumentVersion.search_status == "SEARCH_READY",
         )
         .order_by(DocumentVersion.valid_from.asc())
     )
@@ -299,7 +303,12 @@ async def resolve_temporal_supersedes(
     # Find the version active at cur_start: valid_from <= cur_start < valid_to
     active_at_start = None
     for v in all_prev:
-        raw_from = getattr(v, "source_published_at", None) or getattr(v, "observed_at", None) or getattr(v, "valid_from", None) or getattr(v, "created_at", None)
+        raw_from = (
+            getattr(v, "source_published_at", None)
+            or getattr(v, "observed_at", None)
+            or getattr(v, "valid_from", None)
+            or getattr(v, "created_at", None)
+        )
         v_from = raw_from.replace(tzinfo=UTC) if raw_from and raw_from.tzinfo is None else raw_from
         raw_to = v.valid_to or max_valid_to
         v_to = raw_to.replace(tzinfo=UTC) if raw_to and raw_to.tzinfo is None else raw_to
@@ -335,8 +344,10 @@ async def resolve_temporal_supersedes(
         action = "SUPERSEDED"
         active_v = next(
             (
-                v for v in all_prev
-                if v.valid_to and (v.valid_to.replace(tzinfo=UTC) if v.valid_to.tzinfo is None else v.valid_to) >= max_valid_to
+                v
+                for v in all_prev
+                if v.valid_to
+                and (v.valid_to.replace(tzinfo=UTC) if v.valid_to.tzinfo is None else v.valid_to) >= max_valid_to
             ),
             current_version,
         )
@@ -346,7 +357,12 @@ async def resolve_temporal_supersedes(
         future_vers = []
         past_vers = []
         for v in all_prev:
-            raw_from = getattr(v, "source_published_at", None) or getattr(v, "observed_at", None) or getattr(v, "valid_from", None) or getattr(v, "created_at", None)
+            raw_from = (
+                getattr(v, "source_published_at", None)
+                or getattr(v, "observed_at", None)
+                or getattr(v, "valid_from", None)
+                or getattr(v, "created_at", None)
+            )
             vf = raw_from.replace(tzinfo=UTC) if raw_from and raw_from.tzinfo is None else raw_from
             raw_to = v.valid_to or max_valid_to
             vt = raw_to.replace(tzinfo=UTC) if raw_to and raw_to.tzinfo is None else raw_to
@@ -490,7 +506,7 @@ async def run_dedup_and_temporal_stage(
                         vecs = [embedder(t) for t in texts_to_embed]
                 else:
                     vecs = []
-                for bid, vec in zip(ids_to_embed, vecs):
+                for bid, vec in zip(ids_to_embed, vecs, strict=False):
                     block_embeddings[bid] = vec
         except Exception as emb_err:
             log.warning("Could not compute block embeddings for Tier 4 dedup: %s", emb_err)
@@ -513,7 +529,11 @@ async def run_dedup_and_temporal_stage(
             block_candidates: list[dict[str, Any]] = []
             for pb in eval_blocks:
                 pb_sig = prior_sig_by_id.get(pb.id)
-                sim = estimate_minhash_similarity(b_sig, pb_sig) if pb_sig else compute_text_similarity(b.normalized_text, pb.normalized_text)
+                sim = (
+                    estimate_minhash_similarity(b_sig, pb_sig)
+                    if pb_sig
+                    else compute_text_similarity(b.normalized_text, pb.normalized_text)
+                )
 
                 cosine_sim = 0.0
                 if b.id in block_embeddings and pb.id in block_embeddings:
@@ -559,12 +579,8 @@ async def run_dedup_and_temporal_stage(
                 block_candidates.sort(key=lambda c: (c["similarity_score"], str(c["target_block_id"])), reverse=True)
                 near_dup_candidates.append(block_candidates[0])
 
-    # 3. Temporal Resolution (Non-overlapping bi-temporal validity)
-    temporal_result = await resolve_temporal_supersedes(
-        session,
-        current_version=document_version,
-        document_id=document_id,
-    )
+    # Publish validity changes only after the replacement index is verified.
+    temporal_result = {"action": "PENDING_INDEX", "active_version_id": None}
 
     # 4. Update DocumentVersion metadata with Evidence Mapping & Dedup audit
     meta = dict(document_version.metadata_json or {})

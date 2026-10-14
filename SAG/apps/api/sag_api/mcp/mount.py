@@ -101,7 +101,7 @@ class ScopedKnowledgeMCP:
             return
 
         engine_manager = self._parent.state.engine_manager
-        with use_scope(engine_manager, sources):
+        with use_scope(engine_manager, sources, principal):
             await self._mcp(scope, receive, send)
 
 

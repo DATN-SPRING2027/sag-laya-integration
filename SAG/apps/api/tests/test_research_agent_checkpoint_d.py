@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from sag_api.db.base import Base
 from sag_api.db.models import (
+    DocumentVersion,
     IngestionRun,
     KnowledgeGap,
     KnowledgeGapQuestion,
@@ -35,6 +36,7 @@ from sag_api.services.research_agent_service import (
     apply_incremental_tree_update_for_research,
     execute_research_task,
     fetch_url_bounded,
+    finalize_research_task,
     run_bounded_research_flow,
 )
 from sag_api.services.research_planner_service import (
@@ -524,7 +526,47 @@ async def test_normal_ingestion_relay_success(session, seeded_gap):
     assert run.payload_hash == p_hash
 
 
-async def test_e2e_full_research_flow_from_gap_to_tree_update(session, seeded_gap, monkeypatch):
+async def test_finalize_research_task_accepts_legacy_task_run_links(session, seeded_gap):
+    gap, question = seeded_gap
+    plan = plan_research_task(
+        gap,
+        question,
+        tenant_id="tenant-d",
+        project_id="project-d",
+        security_partition_id="partition-d",
+        tree_version="tree-v1",
+        policy=ResearchPolicy(allowed_domains=("example.com",)),
+        budget=ResearchBudget(max_fetches=1),
+        candidate_urls=["https://example.com/research"],
+    )
+    task, _ = await create_or_get_research_task(session, plan)
+    await session.commit()
+
+    upload = await handle_document_upload(
+        session,
+        tenant_id="tenant-d",
+        project_id="project-d",
+        owner_id="research-agent",
+        security_partition_id="partition-d",
+        client_token="legacy-research-run",
+        file_bytes=b"# Research\n\nVerified content.",
+        original_filename="research.md",
+    )
+    run = await session.get(IngestionRun, upload.run_id)
+    version = await session.get(DocumentVersion, upload.version_id)
+    run.status = "SUCCEEDED"
+    version.search_status = "SEARCH_READY"
+    task.status = ResearchTaskStatus.INGESTING.value
+    task.ingestion_run_ids_json = [run.id]
+    task.document_version_ids_json = [version.id]
+    await session.commit()
+
+    await finalize_research_task(session, task.id)
+
+    assert task.status == ResearchTaskStatus.COMPLETED.value
+
+
+async def test_e2e_research_flow_waits_for_ingestion_indexing(session, seeded_gap, monkeypatch):
     monkeypatch.setattr("importlib.metadata.version", lambda _pkg: "0.10.0")
     # Base tree snapshot setup
     config = TreeBuildConfig(min_cluster_size=2, target_cluster_size=6, max_cluster_size=8)
@@ -567,13 +609,11 @@ async def test_e2e_full_research_flow_from_gap_to_tree_update(session, seeded_ga
         tree_config=config,
     )
 
-    # Assert full pipeline completion
+    # The fetch step queues normal ingestion; indexing owns task completion and tree publication.
     assert task is not None
-    assert task.status == ResearchTaskStatus.COMPLETED.value
+    assert task.status == ResearchTaskStatus.INGESTING.value
     assert len(task.ingestion_run_ids_json) >= 1
-    assert tree_result is not None
-    assert tree_result.drift.trigger_rebuild is False
-    assert any("ku-research-" in u.get("unit_id", "") for u in tree_result.snapshot.manifest["units"])
+    assert tree_result is None
 
 
 def test_incremental_tree_update_with_research_unit(monkeypatch):

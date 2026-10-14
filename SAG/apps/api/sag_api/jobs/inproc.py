@@ -721,7 +721,7 @@ class InProcessAsyncQueue(JobQueue):
                     # document when identical control requests raced. Keep the
                     # most advanced job of each type and make the rest inert
                     # before workers are allowed to recover them.
-                    active_by_document: dict[tuple[str, JobType], list] = {}
+                    active_by_document: dict[tuple[str, JobType, str], list] = {}
                     for candidate in rows:
                         target_id = candidate.document_id or str(
                             (candidate.payload or {}).get("target_document_id") or ""
@@ -732,7 +732,12 @@ class InProcessAsyncQueue(JobQueue):
                             JobType.DELETE_DOCUMENT,
                         }:
                             active_by_document.setdefault(
-                                (target_id, candidate.type), []
+                                (
+                                    target_id,
+                                    candidate.type,
+                                    str((candidate.payload or {}).get("document_version_id")
+                                        or (candidate.payload or {}).get("run_id") or ""),
+                                ), []
                             ).append(candidate)
                     for candidates in active_by_document.values():
                         if len(candidates) < 2:

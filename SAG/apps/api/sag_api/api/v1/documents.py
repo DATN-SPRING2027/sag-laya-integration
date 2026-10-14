@@ -24,14 +24,14 @@ from sag_api.core.deps import (
     get_current_user_or_connector,
     get_engine_manager,
     get_job_queue,
-    get_verified_principal,
     require_path_source_access,
 )
 from sag_api.core.error_taxonomy import ErrorLayer, ErrorStage
 from sag_api.core.errors import ApiError, ConflictError, ForbiddenError, NotFoundError, ValidationError
-from sag_api.core.identity import VerifiedPrincipal
+from sag_api.core.identity import VerifiedPrincipal as LocalVerifiedPrincipal
 from sag_api.core.logging import get_logger
-from sag_api.db.models import User
+from sag_api.core.principal_assertion import VerifiedPrincipal, require_principal_assertion
+from sag_api.db.models import Document, User
 from sag_api.enums import DocumentStatus
 from sag_api.jobs import JobQueue
 from sag_api.parsing.text import (
@@ -48,19 +48,21 @@ from sag_api.schemas.routing_rag import (
     DocumentVersionStatusResponse,
 )
 from sag_api.services.document_service import (
-    create_document_from_upload,
     delete_document,
     get_document_version_status,
     get_public_document,
     handle_document_upload,
     ingest_content,
-    list_documents,
     pause_document,
     reprocess_document,
     resume_document,
 )
 from sag_api.services.source_operation_service import source_document_mutation
-from sag_api.services.source_service import get_source
+from sag_api.services.source_service import (
+    get_authorized_source_project,
+    get_source,
+    list_authorized_documents,
+)
 
 router = APIRouter(
     prefix="/sources/{source_id}/documents",
@@ -85,6 +87,30 @@ def _check_extension(filename: str | None) -> None:
 def _upload_filename(filename: str | None) -> str:
     """Strip client paths from multipart filenames on POSIX and Windows."""
     return (filename or "upload").replace("\\", "/").rsplit("/", maxsplit=1)[-1] or "upload"
+
+
+async def _source_upload_scope(
+    session: AsyncSession,
+    *,
+    principal: VerifiedPrincipal,
+    source_id: str,
+    project_id: str | None,
+    partition_id: str | None,
+) -> tuple[str, str, str]:
+    project_id = await get_authorized_source_project(
+        session,
+        principal=principal,
+        source_id=source_id,
+        project_id=project_id,
+    )
+    if not partition_id or not partition_id.strip():
+        if len(principal.allowed_partition_ids) == 1:
+            partition_id = next(iter(principal.allowed_partition_ids))
+        else:
+            raise ValidationError("X-Continuum-Security-Partition is required for this principal")
+    if partition_id not in principal.allowed_partition_ids:
+        raise ForbiddenError("The requested security partition is outside the principal scope")
+    return principal.tenant_id, project_id, partition_id
 
 
 async def _read_upload_file_bounded(file: UploadFile, max_bytes: int) -> bytes:
@@ -136,7 +162,8 @@ def _verify_mime_signature(filename: str, file_bytes: bytes) -> None:
             or file_bytes.startswith(b"PK\x07\x08")
         ):
             raise ValidationError(
-                f"Định dạng nội dung không khớp phần mở rộng: tệp '{filename}' ({ext}) thiếu chữ ký ZIP container hợp lệ (PK)",
+                f"Định dạng nội dung không khớp phần mở rộng: tệp '{filename}' ({ext}) "
+                "thiếu chữ ký ZIP container hợp lệ (PK)",
                 layer=ErrorLayer.CLIENT,
                 stage=ErrorStage.UPLOAD,
             )
@@ -156,7 +183,8 @@ def _verify_mime_signature(filename: str, file_bytes: bytes) -> None:
             or (b"\x00" in file_bytes)
         ):
             raise ValidationError(
-                f"Tệp nhị phân hoặc hình ảnh trá hình dưới phần mở rộng văn bản '{ext}' không được phép cho '{filename}'",
+                f"Tệp nhị phân hoặc hình ảnh trá hình dưới phần mở rộng văn bản '{ext}' "
+                f"không được phép cho '{filename}'",
                 layer=ErrorLayer.CLIENT,
                 stage=ErrorStage.UPLOAD,
             )
@@ -166,20 +194,28 @@ def _verify_mime_signature(filename: str, file_bytes: bytes) -> None:
 async def list_(
     source_id: str,
     _user: User = Depends(get_current_user_or_connector),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
 ) -> list[DocumentOut]:
     source = await get_source(session, source_id)
-    return [DocumentOut.model_validate(d) for d in await list_documents(session, source.id)]
+    documents = await list_authorized_documents(session, principal=principal, source_ids=[source.id])
+    return [DocumentOut.model_validate(d) for d in documents]
 
 
 @router.post("", response_model=DocumentOut, status_code=201)
 async def upload(
     source_id: str,
-    request: Request = None,
+    response: Response,
+    request: Request,
     file: UploadFile = File(...),
+    project_id: str | None = Form(None),
+    logical_source_id: str | None = Form(None),
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+    x_continuum_security_partition: str | None = Header(None, alias="X-Continuum-Security-Partition"),
     _user: User = Depends(get_current_user_or_connector),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
-    job_queue: JobQueue = Depends(get_job_queue),
+    job_queue: JobQueue | None = Depends(get_job_queue),
 ) -> DocumentOut:
     folder_import_header = request.headers.get("X-SAG-Folder-Import-Id") if request else None
     filename = _upload_filename(file.filename)
@@ -202,11 +238,7 @@ async def upload(
     try:
         _check_extension(filename)
         max_upload_bytes = settings.max_upload_mb * 1024 * 1024
-        data = await file.read(max_upload_bytes + 1)
-        if not data:
-            raise ValidationError("File content is empty")
-        if len(data) > max_upload_bytes:
-            raise ValidationError(f"File size exceeds the {settings.max_upload_mb}MB limit")
+        data = await _read_upload_file_bounded(file, max_upload_bytes)
         _verify_mime_signature(filename, data)
         if folder_import_id is not None:
             log.info(
@@ -220,15 +252,32 @@ async def upload(
             )
         async with source_document_mutation(SessionLocal, source_id, "document-upload"):
             source = await get_source(session, source_id)
-            document, _job = await create_document_from_upload(
+            tenant_id, authorized_project_id, partition_id = await _source_upload_scope(
                 session,
-                source,
-                filename=filename,
-                content_type=file.content_type or "application/octet-stream",
-                data=data,
-                upload_dir=settings.upload_dir,
-                job_queue=job_queue,
+                principal=principal,
+                source_id=source.id,
+                project_id=project_id,
+                partition_id=x_continuum_security_partition,
             )
+            result = await handle_document_upload(
+                session,
+                tenant_id=tenant_id,
+                project_id=authorized_project_id,
+                owner_id=principal.subject,
+                security_partition_id=partition_id,
+                client_token=idempotency_key or f"source-upload-{uuid.uuid4().hex}",
+                file_bytes=data,
+                original_filename=filename,
+                content_type=file.content_type or "application/octet-stream",
+                logical_source_id=logical_source_id or f"source:{source.id}:{filename}",
+                job_queue=job_queue,
+                source_id=source.id,
+            )
+            document = await session.get(Document, result.document_id)
+            if document is None:
+                raise NotFoundError("Document not found after ingestion")
+            if response is not None and result.is_duplicate:
+                response.status_code = status.HTTP_200_OK
     except ApiError as exc:
         if folder_import_id is not None:
             log.warning(
@@ -261,20 +310,35 @@ async def upload(
 async def ingest(
     source_id: str,
     body: IngestRequest,
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+    x_continuum_security_partition: str | None = Header(None, alias="X-Continuum-Security-Partition"),
     _user: User = Depends(get_current_user_or_connector),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
-    job_queue: JobQueue = Depends(get_job_queue),
+    job_queue: JobQueue | None = Depends(get_job_queue),
 ) -> DocumentOut:
     """Unified ingestion endpoint: external systems continuously push text or messages into source."""
     async with source_document_mutation(SessionLocal, source_id, "document-ingest"):
         source = await get_source(session, source_id)
+        tenant_id, project_id, partition_id = await _source_upload_scope(
+            session,
+            principal=principal,
+            source_id=source.id,
+            project_id=body.project_id,
+            partition_id=x_continuum_security_partition,
+        )
         document = await ingest_content(
             session,
             source,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            owner_id=principal.subject,
+            security_partition_id=partition_id,
+            client_token=idempotency_key or f"source-ingest-{uuid.uuid4().hex}",
             text=body.text,
             title=body.title,
             messages=[m.model_dump() for m in body.messages] if body.messages else None,
-            upload_dir=settings.upload_dir,
+            logical_source_id=body.logical_source_id,
             job_queue=job_queue,
         )
     return DocumentOut.model_validate(document)
@@ -285,10 +349,13 @@ async def get_(
     source_id: str,
     document_id: str,
     _user: User = Depends(get_current_user_or_connector),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
 ) -> DocumentOut:
     source = await get_source(session, source_id)
-    return DocumentOut.model_validate(await get_public_document(session, source, document_id))
+    return DocumentOut.model_validate(
+        await get_public_document(session, source, document_id, principal=principal)
+    )
 
 
 @router.get("/{document_id}/file")
@@ -296,6 +363,7 @@ async def get_file(
     source_id: str,
     document_id: str,
     _user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
 ):
     """Original file (preview/download). Returns 404 when file has been cleaned up."""
@@ -306,7 +374,7 @@ async def get_file(
     from sag_api.core.errors import NotFoundError
 
     source = await get_source(session, source_id)
-    document = await get_public_document(session, source, document_id)
+    document = await get_public_document(session, source, document_id, principal=principal)
     if document.octx_installation_id:
         raise NotFoundError("OCTX bundle does not contain the original file; inspect parsed content instead")
     if not document.storage_path or not os.path.isfile(document.storage_path):
@@ -324,6 +392,7 @@ async def get_preview(
     source_id: str,
     document_id: str,
     _user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
 ):
     """Return preview directly consumable by browser; text is normalized to UTF-8 while download preserves raw bytes."""
@@ -332,7 +401,7 @@ async def get_preview(
     from fastapi.responses import FileResponse, Response
 
     source = await get_source(session, source_id)
-    document = await get_public_document(session, source, document_id)
+    document = await get_public_document(session, source, document_id, principal=principal)
     if document.octx_installation_id:
         raise NotFoundError("OCTX bundle does not contain the original file; inspect parsed content instead")
     if not document.storage_path or not os.path.isfile(document.storage_path):
@@ -360,6 +429,7 @@ async def get_parsed(
     source_id: str,
     document_id: str,
     _user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
 ):
@@ -367,7 +437,7 @@ async def get_parsed(
     from fastapi.responses import Response
 
     source = await get_source(session, source_id)
-    document = await get_public_document(session, source, document_id)
+    document = await get_public_document(session, source, document_id, principal=principal)
     if document.status != DocumentStatus.READY:
         if document.status == DocumentStatus.FAILED:
             raise ConflictError(document.error or "Document parsing failed, no parsed content available")
@@ -472,49 +542,39 @@ async def upload_document_version(
     x_continuum_user_id: str | None = Header(None, alias="X-Continuum-User-Id"),
     x_continuum_security_partition: str | None = Header(None, alias="X-Continuum-Security-Partition"),
     x_continuum_tenant_id: str | None = Header(None, alias="X-Continuum-Tenant-Id"),
-    principal: VerifiedPrincipal = Depends(get_verified_principal),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
     job_queue: JobQueue | None = Depends(get_job_queue),
 ) -> DocumentUploadResponse:
     # Scope check 1: Project membership boundary
-    if not principal.has_project_access(project_id):
+    if project_id not in principal.allowed_project_ids:
         raise ForbiddenError(
-            f"Principal '{principal.user_id}' is not authorized to access project '{project_id}'"
+            f"Principal '{principal.subject}' is not authorized to access project '{project_id}'"
         )
 
-    # Scope check 2: Owner identity / prevent caller impersonation
-    if x_continuum_user_id:
-        if not principal.is_service and x_continuum_user_id != principal.user_id:
-            raise ForbiddenError(
-                f"Caller cannot impersonate user '{x_continuum_user_id}' with principal '{principal.user_id}'"
-            )
-        owner_id = x_continuum_user_id
-    else:
-        owner_id = principal.user_id
+    # The signed assertion is authoritative; compatibility headers may only echo it.
+    if x_continuum_user_id and x_continuum_user_id != principal.subject:
+        raise ForbiddenError("X-Continuum-User-Id does not match the signed principal")
+    if not principal.tenant_id:
+        raise ForbiddenError("The signed principal assertion has no tenant scope")
+    if x_continuum_tenant_id and x_continuum_tenant_id != principal.tenant_id:
+        raise ForbiddenError("X-Continuum-Tenant-Id does not match the signed principal")
+    owner_id = principal.subject
+    tenant_id = principal.tenant_id
 
-    # Scope check 3: Tenant scope
-    if x_continuum_tenant_id:
-        if not principal.is_service and x_continuum_tenant_id != principal.tenant_id:
-            raise ForbiddenError(
-                f"Tenant mismatch: caller requested '{x_continuum_tenant_id}' but principal belongs to '{principal.tenant_id}'"
-            )
-        tenant_id = x_continuum_tenant_id
-    else:
-        tenant_id = principal.tenant_id
-
-    # Scope check 4: Security partition authorization
+    # Scope check 2: Security partition authorization
     partition = x_continuum_security_partition
     if not partition or not partition.strip():
-        if principal.allowed_partitions and "*" not in principal.allowed_partitions:
-            partition = next(iter(principal.allowed_partitions))
+        if len(principal.allowed_partition_ids) == 1:
+            partition = next(iter(principal.allowed_partition_ids))
         else:
             raise ValidationError(
                 "X-Continuum-Security-Partition header is required to enforce data isolation"
             )
 
-    if not principal.has_partition_access(partition):
+    if partition not in principal.allowed_partition_ids:
         raise ForbiddenError(
-            f"Principal '{principal.user_id}' is not authorized for security partition '{partition}'"
+            f"Principal '{principal.subject}' is not authorized for security partition '{partition}'"
         )
 
     filename = _upload_filename(file.filename)
@@ -556,17 +616,22 @@ async def query_document_version_status(
     project_id: str,
     document_id: str,
     version_no: int,
-    principal: VerifiedPrincipal = Depends(get_verified_principal),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
 ) -> DocumentVersionStatusResponse:
-    if not principal.has_project_access(project_id):
+    if project_id not in principal.allowed_project_ids or not principal.tenant_id:
         raise ForbiddenError(
-            f"Principal '{principal.user_id}' is not authorized to access project '{project_id}'"
+            f"Principal '{principal.subject}' is not authorized to access project '{project_id}'"
         )
     return await get_document_version_status(
         session,
         project_id=project_id,
         document_id=document_id,
         version_no=version_no,
-        principal=principal,
+        principal=LocalVerifiedPrincipal(
+            user_id=principal.subject,
+            tenant_id=principal.tenant_id,
+            allowed_projects=principal.allowed_project_ids,
+            allowed_partitions=principal.allowed_partition_ids,
+        ),
     )

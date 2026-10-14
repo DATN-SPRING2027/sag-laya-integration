@@ -8,10 +8,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
 from sag_agent import AgentRuntime, EventType, RunHandle
+from sag_api.core.conversation_ownership import get_conversation_owner
 from sag_api.core.db import SessionLocal, get_session
 from sag_api.core.deps import (
     get_agent_runtime,
-    get_current_user,
     get_engine_manager,
     get_llm,
     get_tool_registry,
@@ -20,7 +20,6 @@ from sag_api.core.error_taxonomy import ErrorCode
 from sag_api.core.errors import ConfigurationError, ConflictError, NotFoundError
 from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal, require_principal_assertion
-from sag_api.db.models import User
 from sag_api.generation import LLMClient
 from sag_api.sag import EngineManager
 from sag_api.schemas.agent import (
@@ -57,9 +56,10 @@ async def _owned_run(
     agent_id: str,
     thread_id: str,
     run_id: str,
+    owner_key: str,
 ) -> RunHandle:
-    agent = await svc.get_agent(session, agent_id)
-    await svc.get_thread(session, agent.id, thread_id)
+    agent = await svc.get_agent(session, agent_id, owner_key=owner_key)
+    await svc.get_thread(session, agent.id, thread_id, owner_key=owner_key)
     handle = runtime.get_run(run_id)
     metadata = handle.context.metadata if handle is not None else {}
     if (
@@ -74,24 +74,26 @@ async def _owned_run(
 # ── CRUD ────────────────────────────────────────────────────────────
 @router.get("", response_model=list[AgentOut])
 async def list_(
-    _user: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)
+    owner_key: str = Depends(get_conversation_owner), session: AsyncSession = Depends(get_session)
 ):
-    return [AgentOut.model_validate(a) for a in await svc.list_agents(session)]
+    return [AgentOut.model_validate(a) for a in await svc.list_agents(session, owner_key=owner_key)]
 
 
 @router.post("", response_model=AgentOut, status_code=201)
 async def create(
     body: AgentCreate,
-    _user: User = Depends(get_current_user),
+    owner_key: str = Depends(get_conversation_owner),
     session: AsyncSession = Depends(get_session),
 ):
-    agent = await svc.create_agent(session, name=body.name, avatar=body.avatar, persona=body.persona)
+    agent = await svc.create_agent(
+        session, owner_key=owner_key, name=body.name, avatar=body.avatar, persona=body.persona
+    )
     return AgentOut.model_validate(agent)
 
 
 @router.get("/default", response_model=AgentOut)
 async def get_default(
-    _user: User = Depends(get_current_user),
+    owner_key: str = Depends(get_conversation_owner),
     session: AsyncSession = Depends(get_session),
 ):
     """默认 agent（get-or-create）：客户端主对话入口，知识库=全部信源。"""
@@ -101,21 +103,21 @@ async def get_default(
 @router.get("/{agent_id}", response_model=AgentOut)
 async def get_(
     agent_id: str,
-    _user: User = Depends(get_current_user),
+    owner_key: str = Depends(get_conversation_owner),
     session: AsyncSession = Depends(get_session),
 ):
-    return AgentOut.model_validate(await svc.get_agent(session, agent_id))
+    return AgentOut.model_validate(await svc.get_agent(session, agent_id, owner_key=owner_key))
 
 
 @router.patch("/{agent_id}", response_model=AgentOut)
 async def update_(
     agent_id: str,
     body: AgentUpdate,
-    _user: User = Depends(get_current_user),
+    owner_key: str = Depends(get_conversation_owner),
     session: AsyncSession = Depends(get_session),
 ):
     agent = await svc.update_agent(
-        session, agent_id, name=body.name, avatar=body.avatar, persona=body.persona
+        session, agent_id, owner_key=owner_key, name=body.name, avatar=body.avatar, persona=body.persona
     )
     return AgentOut.model_validate(agent)
 
@@ -123,10 +125,10 @@ async def update_(
 @router.delete("/{agent_id}", response_model=Ok)
 async def delete_(
     agent_id: str,
-    _user: User = Depends(get_current_user),
+    owner_key: str = Depends(get_conversation_owner),
     session: AsyncSession = Depends(get_session),
 ):
-    await svc.delete_agent(session, agent_id)
+    await svc.delete_agent(session, agent_id, owner_key=owner_key)
     return Ok(detail="Agent 已删除")
 
 
@@ -134,10 +136,10 @@ async def delete_(
 @router.get("/{agent_id}/bindings", response_model=list[BindingOut])
 async def list_bindings(
     agent_id: str,
-    _user: User = Depends(get_current_user),
+    owner_key: str = Depends(get_conversation_owner),
     session: AsyncSession = Depends(get_session),
 ):
-    agent = await svc.get_agent(session, agent_id)
+    agent = await svc.get_agent(session, agent_id, owner_key=owner_key)
     return [BindingOut.model_validate(b) for b in await svc.list_bindings(session, agent)]
 
 
@@ -145,10 +147,10 @@ async def list_bindings(
 async def add_binding(
     agent_id: str,
     body: BindingCreate,
-    _user: User = Depends(get_current_user),
+    owner_key: str = Depends(get_conversation_owner),
     session: AsyncSession = Depends(get_session),
 ):
-    agent = await svc.get_agent(session, agent_id)
+    agent = await svc.get_agent(session, agent_id, owner_key=owner_key, write=True)
     b = await svc.add_binding(
         session, agent, target_type=body.target_type, target_id=body.target_id, config=body.config
     )
@@ -159,10 +161,10 @@ async def add_binding(
 async def remove_binding(
     agent_id: str,
     binding_id: str,
-    _user: User = Depends(get_current_user),
+    owner_key: str = Depends(get_conversation_owner),
     session: AsyncSession = Depends(get_session),
 ):
-    agent = await svc.get_agent(session, agent_id)
+    agent = await svc.get_agent(session, agent_id, owner_key=owner_key, write=True)
     await svc.remove_binding(session, agent, binding_id)
     return Ok(detail="已解绑")
 
@@ -178,15 +180,16 @@ async def list_threads(
         le=svc.THREAD_PAGE_MAX,
     ),
     offset: int = Query(default=0, ge=0),
-    _user: User = Depends(get_current_user),
+    owner_key: str = Depends(get_conversation_owner),
     session: AsyncSession = Depends(get_session),
 ):
-    agent = await svc.get_agent(session, agent_id)
+    agent = await svc.get_agent(session, agent_id, owner_key=owner_key)
     return [
         ThreadOut.model_validate(t)
         for t in await svc.list_threads(
             session,
             agent.id,
+            owner_key=owner_key,
             archived=archived,
             limit=limit,
             offset=offset,
@@ -198,11 +201,11 @@ async def list_threads(
 async def create_thread(
     agent_id: str,
     body: ThreadCreate,
-    _user: User = Depends(get_current_user),
+    owner_key: str = Depends(get_conversation_owner),
     session: AsyncSession = Depends(get_session),
 ):
-    agent = await svc.get_agent(session, agent_id)
-    thread = await svc.create_thread(session, agent, body.title)
+    agent = await svc.get_agent(session, agent_id, owner_key=owner_key)
+    thread = await svc.create_thread(session, agent, body.title, owner_key=owner_key)
     return ThreadOut.model_validate(thread)
 
 
@@ -211,12 +214,12 @@ async def update_thread(
     agent_id: str,
     thread_id: str,
     body: ThreadUpdate,
-    _user: User = Depends(get_current_user),
+    owner_key: str = Depends(get_conversation_owner),
     session: AsyncSession = Depends(get_session),
 ):
-    agent = await svc.get_agent(session, agent_id)
+    agent = await svc.get_agent(session, agent_id, owner_key=owner_key)
     t = await svc.update_thread(
-        session, agent.id, thread_id, title=body.title, archived=body.archived
+        session, agent.id, thread_id, owner_key=owner_key, title=body.title, archived=body.archived
     )
     return ThreadOut.model_validate(t)
 
@@ -227,12 +230,12 @@ async def messages(
     thread_id: str,
     limit: int = Query(default=svc.MESSAGE_PAGE_DEFAULT, ge=1, le=svc.MESSAGE_PAGE_MAX),
     cursor: str | None = Query(default=None, max_length=svc.MESSAGE_CURSOR_MAX_LENGTH),
-    _user: User = Depends(get_current_user),
+    owner_key: str = Depends(get_conversation_owner),
     principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
 ):
-    agent = await svc.get_agent(session, agent_id)
-    thread = await svc.get_thread(session, agent.id, thread_id)
+    agent = await svc.get_agent(session, agent_id, owner_key=owner_key)
+    thread = await svc.get_thread(session, agent.id, thread_id, owner_key=owner_key)
     page = await svc.list_messages_page(session, thread.id, limit=limit, cursor=cursor)
     visible_messages = await svc.filter_messages_for_scope(
         session,
@@ -250,11 +253,11 @@ async def messages(
 async def delete_thread(
     agent_id: str,
     thread_id: str,
-    _user: User = Depends(get_current_user),
+    owner_key: str = Depends(get_conversation_owner),
     session: AsyncSession = Depends(get_session),
 ):
-    agent = await svc.get_agent(session, agent_id)
-    await svc.delete_thread(session, agent.id, thread_id)
+    agent = await svc.get_agent(session, agent_id, owner_key=owner_key)
+    await svc.delete_thread(session, agent.id, thread_id, owner_key=owner_key)
     return Ok(detail="会话已删除")
 
 
@@ -263,11 +266,11 @@ async def delete_message(
     agent_id: str,
     thread_id: str,
     message_id: str,
-    _user: User = Depends(get_current_user),
+    owner_key: str = Depends(get_conversation_owner),
     session: AsyncSession = Depends(get_session),
 ):
-    agent = await svc.get_agent(session, agent_id)
-    await svc.delete_message(session, agent.id, thread_id, message_id)
+    agent = await svc.get_agent(session, agent_id, owner_key=owner_key)
+    await svc.delete_message(session, agent.id, thread_id, message_id, owner_key=owner_key)
     return Ok(detail="已删除")
 
 
@@ -276,7 +279,7 @@ async def cancel_run(
     agent_id: str,
     thread_id: str,
     run_id: str,
-    _user: User = Depends(get_current_user),
+    owner_key: str = Depends(get_conversation_owner),
     session: AsyncSession = Depends(get_session),
     agent_runtime: AgentRuntime = Depends(get_agent_runtime),
 ):
@@ -286,6 +289,7 @@ async def cancel_run(
         agent_id=agent_id,
         thread_id=thread_id,
         run_id=run_id,
+        owner_key=owner_key,
     )
     handle.cancel()
     return Ok(detail="已停止")
@@ -300,7 +304,7 @@ async def approve_tool_call(
     thread_id: str,
     run_id: str,
     tool_call_id: str,
-    _user: User = Depends(get_current_user),
+    owner_key: str = Depends(get_conversation_owner),
     session: AsyncSession = Depends(get_session),
     agent_runtime: AgentRuntime = Depends(get_agent_runtime),
 ):
@@ -310,6 +314,7 @@ async def approve_tool_call(
         agent_id=agent_id,
         thread_id=thread_id,
         run_id=run_id,
+        owner_key=owner_key,
     )
     if not handle.approve(tool_call_id):
         raise ConflictError("工具调用当前不等待审批")
@@ -326,7 +331,7 @@ async def reject_tool_call(
     run_id: str,
     tool_call_id: str,
     body: ToolRejection,
-    _user: User = Depends(get_current_user),
+    owner_key: str = Depends(get_conversation_owner),
     session: AsyncSession = Depends(get_session),
     agent_runtime: AgentRuntime = Depends(get_agent_runtime),
 ):
@@ -336,6 +341,7 @@ async def reject_tool_call(
         agent_id=agent_id,
         thread_id=thread_id,
         run_id=run_id,
+        owner_key=owner_key,
     )
     if not handle.reject(tool_call_id, body.reason):
         raise ConflictError("工具调用当前不等待审批")
@@ -347,7 +353,7 @@ async def ask(
     agent_id: str,
     thread_id: str,
     body: AskRequest,
-    _user: User = Depends(get_current_user),
+    owner_key: str = Depends(get_conversation_owner),
     principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
@@ -355,8 +361,8 @@ async def ask(
     tool_registry: ToolRegistry = Depends(get_tool_registry),
     agent_runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> EventSourceResponse:
-    agent = await svc.get_agent(session, agent_id)
-    thread = await svc.get_thread(session, agent.id, thread_id)
+    agent = await svc.get_agent(session, agent_id, owner_key=owner_key)
+    thread = await svc.get_thread(session, agent.id, thread_id, owner_key=owner_key)
     if not llm.configured:
         raise ConfigurationError("尚未配置 LLM，无法生成回答")
     plan = await svc.prepare_ask(
@@ -367,6 +373,7 @@ async def ask(
         attachments=body.attachments,
         source_ids=body.source_ids,
         principal=principal,
+        owner_key=owner_key,
         llm=llm,
     )
     web_enabled = body.effective_web_enabled

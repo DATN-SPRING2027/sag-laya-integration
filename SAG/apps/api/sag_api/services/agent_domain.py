@@ -131,23 +131,28 @@ def _decode_message_cursor(thread_id: str, value: str) -> tuple[datetime, str]:
 
 
 # ── CRUD ────────────────────────────────────────────────────────────
-async def list_agents(session: AsyncSession) -> list[Agent]:
-    rows = await session.execute(select(Agent).order_by(Agent.created_at.desc()))
+async def list_agents(session: AsyncSession, *, owner_key: str) -> list[Agent]:
+    rows = await session.execute(
+        select(Agent).where(or_(Agent.owner_key == owner_key, Agent.is_default.is_(True)))
+        .order_by(Agent.created_at.desc())
+    )
     return list(rows.scalars().all())
 
 
-async def get_agent(session: AsyncSession, agent_id: str) -> Agent:
+async def get_agent(session: AsyncSession, agent_id: str, *, owner_key: str, write: bool = False) -> Agent:
     agent = await session.get(Agent, agent_id)
-    if agent is None:
+    if agent is None or (agent.owner_key != owner_key and (write or not agent.is_default)):
         raise NotFoundError("Agent 不存在")
     return agent
 
 
-async def create_agent(session: AsyncSession, *, name: str, avatar: str = "", persona: dict | None = None) -> Agent:
+async def create_agent(
+    session: AsyncSession, *, owner_key: str, name: str, avatar: str = "", persona: dict | None = None,
+) -> Agent:
     name = name.strip()
     if not name:
         raise ValidationError("Agent 名称不能为空")
-    agent = Agent(name=name, avatar=avatar or name[:1], persona=persona or {})
+    agent = Agent(owner_key=owner_key, name=name, avatar=avatar or name[:1], persona=persona or {})
     session.add(agent)
     await session.commit()
     await session.refresh(agent)
@@ -158,11 +163,12 @@ async def update_agent(
     session: AsyncSession,
     agent_id: str,
     *,
+    owner_key: str,
     name: str | None = None,
     avatar: str | None = None,
     persona: dict | None = None,
 ) -> Agent:
-    agent = await get_agent(session, agent_id)
+    agent = await get_agent(session, agent_id, owner_key=owner_key, write=True)
     if name is not None:
         agent.name = name
     if avatar is not None:
@@ -205,8 +211,8 @@ async def get_default_agent(session: AsyncSession) -> Agent:
     return agent
 
 
-async def delete_agent(session: AsyncSession, agent_id: str) -> None:
-    agent = await get_agent(session, agent_id)
+async def delete_agent(session: AsyncSession, agent_id: str, *, owner_key: str) -> None:
+    agent = await get_agent(session, agent_id, owner_key=owner_key, write=True)
     await session.delete(agent)
     await session.commit()
 
@@ -314,13 +320,14 @@ async def list_threads(
     session: AsyncSession,
     agent_id: str,
     *,
+    owner_key: str,
     archived: bool = False,
     limit: int = THREAD_PAGE_DEFAULT,
     offset: int = 0,
 ) -> list[Thread]:
     statement = (
         select(Thread)
-        .where(Thread.agent_id == agent_id, Thread.archived.is_(archived))
+        .where(Thread.agent_id == agent_id, Thread.owner_key == owner_key, Thread.archived.is_(archived))
         .order_by(Thread.updated_at.desc(), Thread.id.desc())
     )
     if offset:
@@ -335,10 +342,11 @@ async def update_thread(
     agent_id: str,
     thread_id: str,
     *,
+    owner_key: str,
     title: str | None = None,
     archived: bool | None = None,
 ) -> Thread:
-    thread = await get_thread(session, agent_id, thread_id)
+    thread = await get_thread(session, agent_id, thread_id, owner_key=owner_key)
     if title is not None and title.strip():
         thread.title = title.strip()[:200]
     if archived is not None:
@@ -348,23 +356,24 @@ async def update_thread(
     return thread
 
 
-async def create_thread(session: AsyncSession, agent: Agent, title: str = "新会话") -> Thread:
-    thread = Thread(agent_id=agent.id, title=title or "新会话")
+async def create_thread(session: AsyncSession, agent: Agent, title: str = "新会话", *, owner_key: str) -> Thread:
+    await get_agent(session, agent.id, owner_key=owner_key)
+    thread = Thread(agent_id=agent.id, owner_key=owner_key, title=title or "新会话")
     session.add(thread)
     await session.commit()
     await session.refresh(thread)
     return thread
 
 
-async def get_thread(session: AsyncSession, agent_id: str, thread_id: str) -> Thread:
+async def get_thread(session: AsyncSession, agent_id: str, thread_id: str, *, owner_key: str) -> Thread:
     thread = await session.get(Thread, thread_id)
-    if thread is None or thread.agent_id != agent_id:
+    if thread is None or thread.agent_id != agent_id or thread.owner_key != owner_key:
         raise NotFoundError("会话不存在")
     return thread
 
 
-async def delete_thread(session: AsyncSession, agent_id: str, thread_id: str) -> None:
-    thread = await get_thread(session, agent_id, thread_id)
+async def delete_thread(session: AsyncSession, agent_id: str, thread_id: str, *, owner_key: str) -> None:
+    thread = await get_thread(session, agent_id, thread_id, owner_key=owner_key)
     await session.delete(thread)
     await session.commit()
 
@@ -623,14 +632,16 @@ async def prepare_ask(
     attachments: list[str] | None = None,
     source_ids: list[str] | None = None,
     principal: VerifiedPrincipal,
+    owner_key: str,
     llm=None,
 ) -> AskPlan:
     """落库用户消息（含图片附件 meta）、解析历史（超上下文阈值时主动压缩），组装计划。"""
     from sag_api.api.v1.attachments import attachment_path
 
+    await get_thread(session, agent.id, thread.id, owner_key=owner_key)
     resolved: list[dict] = []
     for aid in attachments or []:
-        path = attachment_path(aid)
+        path = attachment_path(aid, owner_key=owner_key)
         if path is None:
             raise ValidationError(f"附件不存在或已过期：{aid}")
         ext = aid.rsplit(".", 1)[-1].lower()
@@ -676,8 +687,10 @@ async def prepare_ask(
     return plan
 
 
-async def delete_message(session: AsyncSession, agent_id: str, thread_id: str, message_id: str) -> None:
-    thread = await get_thread(session, agent_id, thread_id)
+async def delete_message(
+    session: AsyncSession, agent_id: str, thread_id: str, message_id: str, *, owner_key: str,
+) -> None:
+    thread = await get_thread(session, agent_id, thread_id, owner_key=owner_key)
     message = await session.get(Message, message_id)
     if message is None or message.thread_id != thread.id:
         raise NotFoundError("消息不存在")

@@ -7,12 +7,25 @@ import pytest
 
 
 @pytest.mark.asyncio
-async def test_delete_cleanup_and_registration():
+async def test_delete_cleanup_and_registration(monkeypatch):
     from sag_api.core.config import settings
+    from sag_api.core.deps import get_job_queue
     from sag_api.core.db import SessionLocal
     from sag_api.db.models import Source
     from sag_api.main import app
 
+    class FakeQueue:
+        async def enqueue(self, _job_id: str):
+            return None
+
+        def request_source_stop(self, _source_id: str):
+            return None
+
+        def clear_source_stop(self, _source_id: str):
+            return None
+
+    # Keep cleanup deterministic; queue lifecycle has dedicated tests.
+    monkeypatch.setitem(app.dependency_overrides, get_job_queue, FakeQueue)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
@@ -25,12 +38,10 @@ async def test_delete_cleanup_and_registration():
 
             src = (await c.post("/api/v1/sources", headers=H, json={"name": "手册"})).json()
             sid = src["id"]
-            await c.post(
-                f"/api/v1/sources/{sid}/documents",
-                headers=H,
-                files={"file": ("a.md", b"# t\nhello\n", "text/markdown")},
-            )
             upload_dir = os.path.join(settings.upload_dir, sid)
+            os.makedirs(upload_dir, exist_ok=True)
+            with open(os.path.join(upload_dir, "legacy.md"), "wb") as legacy_file:
+                legacy_file.write(b"# Legacy upload\n")
             assert os.path.isdir(upload_dir), "上传目录应已创建"
 
             agent = (await c.post("/api/v1/agents", headers=H, json={"name": "小助"})).json()

@@ -46,13 +46,15 @@ def _initialize_request(client_name: str, request_id: int = 1) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_source_mcp_lists_and_calls_tools_over_engine():
+async def test_source_mcp_lists_and_calls_tools_over_engine(monkeypatch):
     """知识库 MCP server：真实引擎 + 全库作用域，探索与检索工具均可调用。"""
     from sqlalchemy import select
 
     from sag_api.core.db import SessionLocal
+    from sag_api.core.principal_assertion import VerifiedPrincipal
     from sag_api.db.models import Source
     from sag_api.main import app
+    from sag_api.services import search_unit_retrieval_service
 
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
@@ -78,8 +80,20 @@ async def test_source_mcp_lists_and_calls_tools_over_engine():
                 )
 
             mcp = build_source_mcp()
+            principal = VerifiedPrincipal(
+                subject="pytest-user",
+                organization_id="pytest-org",
+                allowed_project_ids=frozenset({"pytest-project"}),
+                issuer="https://pytest.invalid",
+                key_id="pytest-key",
+                token_id="pytest-assertion",
+                issued_at=0,
+                expires_at=2**31,
+                tenant_id="tenant_continuum_default",
+                allowed_partition_ids=frozenset({"*"}),
+            )
             # 作用域须在 connect（起服务任务）之前设置，任务会复制含作用域的上下文
-            with use_scope(app.state.engine_manager, sources):
+            with use_scope(app.state.engine_manager, sources, principal):
                 async with connect(mcp) as client:
                     await client.initialize()
                     listed = await client.list_tools()
@@ -123,8 +137,18 @@ async def test_source_mcp_lists_and_calls_tools_over_engine():
                     assert "hello mcp world" in r_read.content[0].text
                     r_out = await client.call_tool("outline", {"document_id": doc["id"]})
                     assert isinstance(r_out.content[0].text, str)  # 处理中→占位文案亦可
-                    r_grep = await client.call_tool("grep", {"pattern": "不存在的串xyz", "source_id": src["id"]})
-                    assert "未匹配" in r_grep.content[0].text or "chunk_id" in r_grep.content[0].text
+                    async def exact_grep(*_args, **_kwargs):
+                        return [
+                            SimpleNamespace(
+                                id="canonical-block",
+                                section_path="Exact match",
+                                normalized_text="literal needle appears here",
+                            )
+                        ]
+
+                    monkeypatch.setattr(search_unit_retrieval_service, "grep_search_unit_blocks", exact_grep)
+                    r_grep = await client.call_tool("grep", {"pattern": "literal needle", "source_id": src["id"]})
+                    assert "literal needle appears here" in r_grep.content[0].text
 
                     r_chunk = await client.call_tool(
                         "get_chunk", {"chunk_id": "does-not-exist", "source_id": src["id"]}

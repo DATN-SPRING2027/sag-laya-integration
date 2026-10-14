@@ -7,7 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.db import get_session
 from sag_api.core.deps import get_current_user, get_engine_manager, require_path_source_access
-from sag_api.core.errors import NotFoundError, ValidationError
+from sag_api.core.errors import ForbiddenError, NotFoundError, ValidationError
+from sag_api.core.principal_assertion import VerifiedPrincipal, require_principal_assertion
 from sag_api.db.models import User
 from sag_api.sag import EngineManager
 from sag_api.schemas.chunk import (
@@ -18,7 +19,7 @@ from sag_api.schemas.chunk import (
     ReadResponse,
 )
 from sag_api.services.document_service import get_public_document
-from sag_api.services.source_service import get_source
+from sag_api.services.source_service import get_source, versioned_source_ids
 
 router = APIRouter(
     prefix="/sources/{source_id}",
@@ -32,12 +33,13 @@ async def outline(
     source_id: str,
     document_id: str = Query(min_length=1),
     _user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
 ) -> OutlineOut:
     """文档大纲：标题 + chunk_id，按阅读顺序排列。"""
     source = await get_source(session, source_id)
-    document = await get_public_document(session, source, document_id)
+    document = await get_public_document(session, source, document_id, principal=principal)
     if not document.sag_source_id:
         raise NotFoundError("文档尚无大纲，可能仍在处理中")
     rows = await engine_manager.list_chunk_headings(
@@ -63,11 +65,33 @@ async def grep(
     pattern: str = Query(min_length=1),
     limit: int = Query(default=20, ge=1, le=100),
     _user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
 ) -> GrepResponse:
     """精确文本匹配：按原文字面内容查找，大小写不敏感。"""
     source = await get_source(session, source_id)
+    if source.id in await versioned_source_ids(session, [source.id]):
+        from sag_api.services.search_unit_retrieval_service import grep_search_unit_blocks
+
+        blocks = await grep_search_unit_blocks(
+            session,
+            [source],
+            pattern,
+            principal=principal,
+            limit=limit,
+        )
+        matches = [
+            GrepMatchOut(
+                chunk_id=block.id,
+                heading=block.section_path or "片段",
+                snippet=block.normalized_text,
+                source_id=source.id,
+                source_name=source.name,
+            )
+            for block in blocks
+        ]
+        return GrepResponse(pattern=pattern, matches=matches, count=len(matches))
     rows = await engine_manager.grep_chunks(
         source.sag_source_config_id,
         pattern,
@@ -92,11 +116,12 @@ async def read(
     offset: int = Query(default=1, ge=1),
     limit: int = Query(default=120, ge=1, le=500),
     _user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
 ) -> ReadResponse:
     """按行分页读取原始文件。"""
     source = await get_source(session, source_id)
-    document = await get_public_document(session, source, document_id)
+    document = await get_public_document(session, source, document_id, principal=principal)
     if not document.storage_path or not os.path.isfile(document.storage_path):
         raise NotFoundError("原始文件不存在或已清理")
     try:
@@ -129,6 +154,8 @@ async def entity_context(
 ) -> EntityContextOut:
     """查询实体的相关事件上下文。先精确名称匹配、再子串匹配。"""
     source = await get_source(session, source_id)
+    if source.id in await versioned_source_ids(session, [source.id]):
+        raise ForbiddenError("Versioned Sources require ACL-filtered search; legacy entity context is unavailable")
     target = name.strip()
     if not target:
         raise ValidationError("实体名称不能为空")

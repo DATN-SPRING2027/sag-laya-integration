@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.db import SessionLocal, get_session
 from sag_api.core.deps import get_current_user, get_job_queue, require_path_source_access, require_principal_assertion
-from sag_api.core.errors import ConflictError, NotFoundError
+from sag_api.core.errors import ConflictError, ForbiddenError, NotFoundError
 from sag_api.core.principal_assertion import VerifiedPrincipal
 from sag_api.db.models import OctxAsset, OctxRelease, OctxSourceBinding, OctxTransfer, Source, User
 from sag_api.db.models.octx import transition_transfer
@@ -59,6 +59,25 @@ async def _authorize_transfer_source(
         source_id=source_id,
     ) is None:
         raise NotFoundError("OCTX transfer not found")
+    if transfer.direction is OctxTransferDirection.EXPORT and source_id is not None:
+        checkpoint = transfer.checkpoint or {}
+        if str(checkpoint.get("export_scope") or "source") == "document":
+            from sag_api.services.source_service import get_authorized_document
+
+            document_id = str(checkpoint.get("document_id") or "")
+            document = await get_authorized_document(
+                session,
+                principal=principal,
+                source_ids=[source_id],
+                document_id=document_id,
+            )
+            if document is None:
+                raise NotFoundError("OCTX transfer not found")
+        else:
+            from sag_api.services.source_service import versioned_source_ids
+
+            if source_id in await versioned_source_ids(session, [source_id]):
+                raise NotFoundError("OCTX transfer not found")
     if transfer.direction is OctxTransferDirection.EXPORT and source_id is None:
         raise NotFoundError("OCTX transfer not found")
 
@@ -224,6 +243,10 @@ async def create_export(
     session: AsyncSession = Depends(get_session),
     job_queue: JobQueue = Depends(get_job_queue),
 ) -> OctxTransferOut:
+    from sag_api.services.source_service import versioned_source_ids
+
+    if source_id in await versioned_source_ids(session, [source_id]):
+        raise ForbiddenError("Source-wide OCTX export is unavailable for versioned data with partition ACLs")
     async with export_request_admission(SessionLocal, source_id):
         transfer = await create_export_transfer(
             session,

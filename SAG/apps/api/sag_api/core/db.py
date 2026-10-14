@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator
 
-from sqlalchemy import event
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -76,7 +76,7 @@ async def get_session() -> AsyncIterator[AsyncSession]:
 # create_all only creates new tables and does not alter existing tables, so we idempotently
 # ADD COLUMN for evolving fields.
 _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
-    "agents": {"is_default": "BOOLEAN NOT NULL DEFAULT FALSE"},
+    "agents": {"is_default": "BOOLEAN NOT NULL DEFAULT FALSE", "owner_key": "VARCHAR(64)"},
     "documents": {
         "progress": "INTEGER NOT NULL DEFAULT 0",
         "token_usage": "BIGINT NOT NULL DEFAULT 0",
@@ -93,10 +93,10 @@ _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
         "fallback_reason": "TEXT",
         "tenant_id": "VARCHAR(64) NOT NULL DEFAULT 'tenant_continuum_default'",
         "project_id": "VARCHAR(64)",
-        "owner_id": "VARCHAR(64)",
+        "owner_id": "VARCHAR(256)",
         "logical_source_id": "VARCHAR(128)",
     },
-    "threads": {"archived": "BOOLEAN NOT NULL DEFAULT FALSE"},
+    "threads": {"archived": "BOOLEAN NOT NULL DEFAULT FALSE", "owner_key": "VARCHAR(64)"},
     "messages": {
         "attachments_json": "JSON",
         "steps_json": "JSON",
@@ -108,6 +108,11 @@ _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
     "tree_manifests": {"manifest_json": "JSON NOT NULL DEFAULT '{}'"},
     "tree_routing_profiles": {"document_version_id": "VARCHAR(128) NOT NULL DEFAULT ''"},
     "knowledge_jobs": {"result_json": "JSON", "extractor_version": "VARCHAR(128)"},
+    "research_tasks": {"execution_json": "JSON NOT NULL DEFAULT '{}'"},
+    "ingestion_runs": {
+        "content_hash": "VARCHAR(64)",
+        "research_task_id": "VARCHAR(36) REFERENCES research_tasks(id) ON DELETE SET NULL",
+    },
 }
 
 # Existing tables also need newly introduced hot-path indexes. Keep these
@@ -115,6 +120,13 @@ _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
 # the same DDL in their migration runner.
 _INDEX_UPGRADES = (
     "CREATE INDEX IF NOT EXISTS ix_messages_thread_created_id ON messages (thread_id, created_at, id)",
+    "CREATE INDEX IF NOT EXISTS ix_agents_owner_key ON agents (owner_key)",
+    "CREATE INDEX IF NOT EXISTS ix_threads_owner_key ON threads (owner_key)",
+    (
+        "CREATE INDEX IF NOT EXISTS idx_ingestion_runs_content_hash "
+        "ON ingestion_runs (tenant_id, project_id, content_hash)"
+    ),
+    "CREATE INDEX IF NOT EXISTS idx_ingestion_runs_research_task ON ingestion_runs (research_task_id)",
     "CREATE INDEX IF NOT EXISTS ix_documents_source_sag_source ON documents (source_id, sag_source_id)",
     "CREATE INDEX IF NOT EXISTS ix_documents_source_active_created ON documents (source_id, is_active, created_at)",
     (
@@ -152,13 +164,86 @@ async def _ensure_indexes() -> None:
 
     async with engine.begin() as conn:
         for ddl in _INDEX_UPGRADES:
-            if "tree_routing_profiles" in ddl:
-                table_exists = await conn.run_sync(
-                    lambda sync_conn: sa_inspect(sync_conn).has_table("tree_routing_profiles")
-                )
-                if not table_exists:
-                    continue
+            table = ddl.split(" ON ", 1)[1].split(" ", 1)[0]
+            table_exists = await conn.run_sync(lambda sync_conn: sa_inspect(sync_conn).has_table(table))
+            if not table_exists:
+                continue
             await conn.exec_driver_sql(ddl)
+
+
+async def _ensure_document_schema_widths() -> None:
+    """Widen legacy document columns for canonical IDs and signed principal subjects."""
+    if engine.dialect.name != "postgresql":
+        return
+    async with engine.begin() as conn:
+        # Avoid reacquiring table locks during startup after the one-time widening is complete.
+        needs_upgrade = await conn.scalar(
+            text(
+                """
+                SELECT
+                  NOT EXISTS (
+                    SELECT 1 FROM pg_attribute
+                    WHERE attrelid = 'documents'::regclass AND attname = 'id'
+                      AND attnum > 0 AND NOT attisdropped
+                      AND atttypid = 'character varying'::regtype AND atttypmod = 40
+                  )
+                  OR NOT EXISTS (
+                    SELECT 1 FROM pg_attribute
+                    WHERE attrelid = 'documents'::regclass AND attname = 'owner_id'
+                      AND attnum > 0 AND NOT attisdropped
+                      AND atttypid = 'character varying'::regtype AND atttypmod = 260
+                  )
+                  OR EXISTS (
+                    SELECT 1
+                    FROM pg_constraint fk
+                    CROSS JOIN LATERAL unnest(fk.conkey, fk.confkey) AS keys(local_attnum, target_attnum)
+                    JOIN pg_attribute local_col
+                      ON local_col.attrelid = fk.conrelid AND local_col.attnum = keys.local_attnum
+                    JOIN pg_attribute target_col
+                      ON target_col.attrelid = fk.confrelid AND target_col.attnum = keys.target_attnum
+                    WHERE fk.contype = 'f' AND fk.confrelid = 'documents'::regclass
+                      AND target_col.attname = 'id'
+                      AND (
+                        local_col.atttypid <> 'character varying'::regtype
+                        OR local_col.atttypmod <> 40
+                      )
+                  )
+                """
+            )
+        )
+        if not needs_upgrade:
+            return
+        await conn.exec_driver_sql(
+            """
+            DO $$
+            DECLARE fk RECORD;
+            BEGIN
+              CREATE TEMP TABLE sag_document_fks ON COMMIT DROP AS
+                SELECT conrelid::regclass AS rel, conname, pg_get_constraintdef(oid) AS definition
+                FROM pg_constraint
+                WHERE contype = 'f' AND confrelid = 'documents'::regclass;
+              CREATE TEMP TABLE sag_document_fk_columns ON COMMIT DROP AS
+                SELECT DISTINCT c.conrelid::regclass AS rel, local_col.attname AS column_name
+                FROM pg_constraint c
+                CROSS JOIN LATERAL unnest(c.conkey, c.confkey) AS keys(local_attnum, target_attnum)
+                JOIN pg_attribute local_col ON local_col.attrelid = c.conrelid AND local_col.attnum = keys.local_attnum
+                JOIN pg_attribute target_col ON target_col.attrelid = c.confrelid
+                  AND target_col.attnum = keys.target_attnum
+                WHERE c.contype = 'f' AND c.confrelid = 'documents'::regclass AND target_col.attname = 'id';
+              FOR fk IN SELECT * FROM sag_document_fks LOOP
+                EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', fk.rel, fk.conname);
+              END LOOP;
+              ALTER TABLE documents ALTER COLUMN id TYPE VARCHAR(36);
+              ALTER TABLE documents ALTER COLUMN owner_id TYPE VARCHAR(256);
+              FOR fk IN SELECT * FROM sag_document_fk_columns LOOP
+                EXECUTE format('ALTER TABLE %s ALTER COLUMN %I TYPE VARCHAR(36)', fk.rel, fk.column_name);
+              END LOOP;
+              FOR fk IN SELECT * FROM sag_document_fks LOOP
+                EXECUTE format('ALTER TABLE %s ADD CONSTRAINT %I %s', fk.rel, fk.conname, fk.definition);
+              END LOOP;
+            END $$;
+            """
+        )
 
 
 async def init_db() -> None:
@@ -168,6 +253,7 @@ async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     await _ensure_columns()
+    await _ensure_document_schema_widths()
     await _ensure_indexes()
 
 
