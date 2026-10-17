@@ -51,6 +51,10 @@ class ModelConfigUpdate(BaseModel):
     llm_timeout_ms: int | None = Field(default=None, ge=1_000, le=600_000)
     llm_max_retries: int | None = Field(default=None, ge=0, le=10)
 
+    decision_provider: Literal["siliconflow", "disabled"] | None = None
+    decision_model: str | None = Field(default=None, min_length=1, max_length=200)
+    siliconflow_api_key: str | None = Field(default=None, max_length=500)
+
     embedding_model: str | None = Field(default=None, min_length=1, max_length=200)
     embedding_base_url: str | None = Field(default=None, max_length=500)
     embedding_api_key: str | None = Field(default=None, max_length=500)
@@ -117,3 +121,22 @@ class ModelConfigUpdate(BaseModel):
         if value is None:
             raise ValueError("模型接入方式不能为 null")
         return value
+
+    @field_validator("decision_provider")
+    @classmethod
+    def reject_null_decision_provider(cls, value: str | None) -> str:
+        if value is None:
+            raise ValueError("Decision Router 接入方式不能为 null")
+        return value
+
+    @field_validator("decision_model")
+    @classmethod
+    def normalize_decision_model(cls, value: str | None) -> str:
+        if value is None or not value.strip():
+            raise ValueError("Decision model ID 不能为空")
+        return value.strip()
+
+    @field_validator("siliconflow_api_key")
+    @classmethod
+    def normalize_siliconflow_api_key(cls, value: str | None) -> str | None:
+        return value.strip() if value is not None else None

@@ -39,6 +39,7 @@ export function AuthImage({
     }
     let alive = true;
     fetch(api.attachmentUrl(id), {
+      credentials: "include",
       headers: {
         Authorization: `Bearer ${getToken() ?? ""}`,
         "Accept-Language": locale,

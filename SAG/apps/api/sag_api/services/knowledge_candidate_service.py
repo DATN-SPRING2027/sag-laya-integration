@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sag_api.db.models import (
     Document,
     DocumentVersion,
+    KnowledgeGraphBuild,
     KnowledgeTreeNode,
     KnowledgeUnit,
     TreeManifest,
@@ -36,6 +37,7 @@ from sag_api.services.routing_tree_service import (
     KnowledgeEdgeInput,
     KnowledgeUnitInput,
     RoutingBenchmarkCase,
+    RoutingSnapshot,
     TreeBuildConfig,
     _profile,
     _walk,
@@ -165,7 +167,14 @@ def benchmark_routes(
     return cases, evidence
 
 
-async def current_units(session: AsyncSession, tenant_id: str, project_id: str) -> list[KnowledgeUnit]:
+async def current_units(
+    session: AsyncSession,
+    tenant_id: str,
+    project_id: str,
+    *,
+    allow_empty: bool = False,
+) -> list[KnowledgeUnit]:
+    now = datetime.now(UTC)
     units = (
         await session.scalars(
             select(KnowledgeUnit)
@@ -178,6 +187,9 @@ async def current_units(session: AsyncSession, tenant_id: str, project_id: str) 
                 Document.is_active.is_(True),
                 DocumentVersion.knowledge_status == "DATA_READY",
                 DocumentVersion.search_status.in_(("READY", "SEARCH_READY")),
+                DocumentVersion.valid_from <= now,
+                DocumentVersion.valid_to > now,
+                DocumentVersion.search_ready_at.is_not(None),
             )
             .order_by(KnowledgeUnit.id)
         )
@@ -205,9 +217,35 @@ async def current_units(session: AsyncSession, tenant_id: str, project_id: str) 
             or unit.checksum != await unit_checksum(session, unit)
         ):
             raise ValueError("Knowledge candidate input/evidence/ACL checksum mismatch")
-    if not units:
+    if not units and not allow_empty:
         raise ValueError("No current Knowledge Units for tenant/project")
     return list(units)
+
+
+async def build_project_routing_snapshot(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    project_id: str,
+    queries: list[CorpusQuery],
+    config: TreeBuildConfig,
+    graph_config: KnowledgeConfig = KnowledgeConfig(),
+    routing_policy: RoutingPolicy = RoutingPolicy(),
+    allow_empty: bool = False,
+) -> tuple[RoutingSnapshot, list[KnowledgeUnit], KnowledgeGraphBuild, list[dict]] | None:
+    units = await current_units(session, tenant_id, project_id, allow_empty=allow_empty)
+    if not units:
+        return None
+    graph = await persist_graph(session, units, graph_config)
+    inputs = [routing_unit(unit) for unit in units]
+    edges = [
+        KnowledgeEdgeInput(edge["source"], edge["target"], edge["weight"])
+        for edge in graph.manifest_json["edges"]
+    ]
+    topology = build_routing_snapshot(inputs, edges, config=config)
+    cases, benchmark = benchmark_routes(topology, units, queries, routing_policy)
+    snapshot = build_routing_snapshot(inputs, edges, config=config, benchmark=cases)
+    return snapshot, units, graph, benchmark
 
 
 async def build_knowledge_candidate(
@@ -221,13 +259,18 @@ async def build_knowledge_candidate(
     routing_policy: RoutingPolicy = RoutingPolicy(),
 ) -> TreeManifest:
     await knowledge_lock(session, "build:" + checksum([tenant_id, project_id]))
-    units = await current_units(session, tenant_id, project_id)
-    graph = await persist_graph(session, units, graph_config)
-    inputs = [routing_unit(u) for u in units]
-    edges = [KnowledgeEdgeInput(e["source"], e["target"], e["weight"]) for e in graph.manifest_json["edges"]]
-    topology = build_routing_snapshot(inputs, edges, config=config)
-    cases, benchmark = benchmark_routes(topology, units, queries, routing_policy)
-    snapshot = build_routing_snapshot(inputs, edges, config=config, benchmark=cases)
+    built = await build_project_routing_snapshot(
+        session,
+        tenant_id=tenant_id,
+        project_id=project_id,
+        queries=queries,
+        config=config,
+        graph_config=graph_config,
+        routing_policy=routing_policy,
+    )
+    if built is None:
+        raise ValueError("No current Knowledge Units for tenant/project")
+    snapshot, units, graph, benchmark = built
     if snapshot.manifest["checksum"] != _checksum_manifest(snapshot.manifest):
         raise ValueError("Routing builder manifest checksum mismatch")
     profiles, _ = _routing_profile_payload(snapshot)

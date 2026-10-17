@@ -326,6 +326,7 @@ class KnowledgeWorker:
         config: KnowledgeConfig = KnowledgeConfig(),
         policy: QueuePolicy | None = None,
         enrich=None,
+        job_queue=None,
     ):
         self.sessions, self.settings, self.config = session_factory, settings, config
         self.policy = policy or QueuePolicy(
@@ -334,6 +335,7 @@ class KnowledgeWorker:
             daily_tokens=settings.knowledge_daily_tokens,
         )
         self.enrich = enrich
+        self.job_queue = job_queue
         self.task = None
         self.running: set[asyncio.Task] = set()
         self.discovery_after = ""
@@ -463,6 +465,19 @@ class KnowledgeWorker:
                         current.result_json, current.extractor_version = result, extractor
                     current.status, current.lease_token, current.lease_until = "SUCCEEDED", None, None
                     await session.commit()
+                    if self.job_queue is not None:
+                        try:
+                            from sag_api.services.universe_tree_service import enqueue_tree_rebuild_for_version
+
+                            await enqueue_tree_rebuild_for_version(
+                                session,
+                                self.job_queue,
+                                current.document_version_id,
+                                reason=f"knowledge_{current.kind.lower()}_ready",
+                            )
+                        except Exception as error:  # noqa: BLE001 - tree scheduling must not retry completed extraction
+                            await session.rollback()
+                            log.warning("Universe tree rebuild scheduling delayed (%s)", type(error).__name__)
         except Exception as error:
             # Store only error class; provider bodies/credentials/document text never enter job errors.
             async with self.sessions() as session:

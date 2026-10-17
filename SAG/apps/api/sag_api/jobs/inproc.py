@@ -118,6 +118,7 @@ class InProcessAsyncQueue(JobQueue):
         self._workers: list[asyncio.Task] = []
         self._retry_tasks: set[asyncio.Task] = set()
         self._universe_user_locks: dict[str, asyncio.Lock] = {}
+        self._universe_project_locks: dict[str, asyncio.Lock] = {}
         self._source_maintenance_jobs: dict[str, set[str]] = {}
         self._source_maintenance_tasks: dict[str, asyncio.Task] = {}
         self._source_maintenance_ready: set[str] = set()
@@ -929,11 +930,35 @@ class InProcessAsyncQueue(JobQueue):
                 if job.type == JobType.INDEX_UNIVERSE
                 else ""
             )
+            universe_project_ids = (
+                sorted(
+                    {
+                        project_id
+                        for project_id in (job.payload or {}).get("project_ids", [])
+                        if isinstance(project_id, str) and project_id
+                    }
+                )
+                if job.type == JobType.REBUILD_UNIVERSE_TREE
+                else []
+            )
 
         if universe_user_id:
             lock = self._universe_user_locks.setdefault(universe_user_id, asyncio.Lock())
             async with lock:
                 await self._run_job(job_id)
+            return
+        if universe_project_ids:
+            locks = [
+                self._universe_project_locks.setdefault(project_id, asyncio.Lock())
+                for project_id in universe_project_ids
+            ]
+            for lock in locks:
+                await lock.acquire()
+            try:
+                await self._run_job(job_id)
+            finally:
+                for lock in reversed(locks):
+                    lock.release()
             return
         await self._run_job(job_id)
 

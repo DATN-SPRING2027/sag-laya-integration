@@ -65,6 +65,7 @@ async def lifespan(app: FastAPI):
     try:
         async with principal_assertion_lifespan():
             await runtime.start(app)
+            knowledge_worker.job_queue = app.state.job_queue
             if settings.knowledge_worker_enabled:
                 await knowledge_worker.start()
             yield

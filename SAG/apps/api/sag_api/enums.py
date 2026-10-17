@@ -65,6 +65,7 @@ class JobType(StrEnum):
     DELETE_DOCUMENT = "delete_document"
     SYNC_SOURCE = "sync_source"
     INDEX_UNIVERSE = "index_universe"
+    REBUILD_UNIVERSE_TREE = "rebuild_universe_tree"
     OCTX_PREFLIGHT = "octx_preflight"
     OCTX_IMPORT = "octx_import"
     OCTX_EXPORT = "octx_export"

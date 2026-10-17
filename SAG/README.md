@@ -189,7 +189,7 @@ docker compose up -d --build
 
 No API key, Python runtime, Node runtime, or external database is required to boot the application. When both services are healthy, open:
 
-- Web application: [http://localhost:3000](http://localhost:3000)
+- Web application: [http://localhost:3002](http://localhost:3002)
 - API documentation: [http://localhost:8000/docs](http://localhost:8000/docs)
 
 On first launch:
@@ -199,25 +199,23 @@ On first launch:
 3. Create a source, upload documents, and wait until their status is **Ready**.
 4. Search, open the original source, or start a cited conversation.
 
-The UI and services still start without model credentials. Embeddings are required for indexing/vector retrieval; the LLM is required for event extraction, query understanding, and generated answers.
+The UI and services still start without model credentials. Embeddings are required for indexing/vector retrieval; the LLM is required for event extraction and generated answers. The optional Decision Router classifies query intent.
 
-### Laya local router
+### Decision Router
 
-SAG includes Laya as a pinned API dependency and uses it as a lightweight intent router before retrieval. For an offline/local deployment, download the Laya bundle once and point SAG at its root directory:
+SAG uses Kev-4B through SiliconFlow's System One API (`POST https://api.siliconflow.cn/v1/systemone`). Set `SAG_SILICONFLOW_API_KEY` or enter the key in **Settings → Models** to enable cloud classification. Query text and supplied decision context are sent to SiliconFlow. If the key is missing or the request fails, SAG keeps retrieval enabled. Set the provider to `disabled` to skip decision classification. Saved model settings in the database remain authoritative over `.env` defaults.
 
-```bash
-export SAG_ENABLE_LAYA=true
-export SAG_LAYA_MODEL_PATH=/models/laya
-export SAG_LAYA_DEVICE=cpu
+After changing the API key in `.env`, restart the API container:
+
+```powershell
+docker compose up -d --build api
 ```
-
-The directory must contain the `multilingual/` checkpoint. SAG keeps one router instance per process and falls back immediately if the package or checkpoint is unavailable; a missing local model must not block chat requests.
 
 #### Model settings precedence
 
-`SAG_LLM_*` values in Docker Compose or `.env` provide the initial model configuration. After an administrator saves model settings in the web UI, the persisted Settings value is used for subsequent extraction and generation jobs without a restart.
+`SAG_LLM_*` and `SAG_DECISION_*` values in Docker Compose or `.env` provide the initial model configuration. After an administrator saves model settings in the web UI, the persisted Settings value is used without a restart.
 
-To make the deployment configuration mandatory, set `SAG_LOCK_LLM_CONFIG=true`. SAG then shows the generation fields as locked in Settings and continues to use the `SAG_LLM_*` values. Change Docker Compose or `.env` and restart the API container to update a locked configuration. API keys remain deployment-managed and are never returned by the Settings API.
+To make the deployment configuration mandatory, set `SAG_LOCK_LLM_CONFIG=true`. SAG then locks generation and Decision Router fields in Settings and continues to use the deployment values. Change Docker Compose or `.env` and restart the API container to update a locked configuration. API keys are never returned by the Settings API.
 
 ### Import knowledge
 
@@ -374,7 +372,7 @@ Default persistence:
 
 ### Network and production safety
 
-The default Compose configuration binds ports 3000 and 8000 to `127.0.0.1` and uses `SAG_AUTH_MODE=local`: the name is a local identity, not password authentication. Do not expose this default mode to an untrusted network.
+The default Compose configuration binds ports 3002 and 8000 to `127.0.0.1` and uses `SAG_AUTH_MODE=local`: the name is a local identity, not password authentication. Do not expose this default mode to an untrusted network.
 
 For custom ports or a trusted LAN address:
 
@@ -443,7 +441,7 @@ uvicorn sag_api.main:app --reload
 ```
 
 ```bash
-# Terminal 2: Web at http://localhost:3000
+# Terminal 2: Web at http://localhost:3002
 cd apps/web
 npm install
 npm run dev

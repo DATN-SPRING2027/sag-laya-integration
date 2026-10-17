@@ -66,9 +66,9 @@ class StaleTreePublish(TreePublishError):
 
 @dataclass(frozen=True, slots=True)
 class SearchUnitAssignment:
-    """Explicit DATN-58 bridge from one KnowledgeUnit to a canonical SearchUnit."""
+    """Map one canonical SearchUnit to the KnowledgeUnits it contains."""
 
-    knowledge_unit_id: str
+    knowledge_unit_ids: tuple[str, ...]
     search_unit_id: str
     source_id: str
     document_version_id: str
@@ -303,15 +303,13 @@ def prepare_tree_candidate(
     if any(not isinstance(item, SearchUnitAssignment) for item in raw_assignments):
         raise PublishVerificationError("SearchUnit assignment contract is invalid")
     if any(
-        not all(
+        not isinstance(item.knowledge_unit_ids, tuple)
+        or not item.knowledge_unit_ids
+        or any(not isinstance(value, str) for value in item.knowledge_unit_ids)
+        or len(set(item.knowledge_unit_ids)) != len(item.knowledge_unit_ids)
+        or not all(
             isinstance(value, str)
-            for value in (
-                item.knowledge_unit_id,
-                item.search_unit_id,
-                item.source_id,
-                item.document_version_id,
-                item.partition_id,
-            )
+            for value in (item.search_unit_id, item.source_id, item.document_version_id, item.partition_id)
         )
         for item in raw_assignments
     ):
@@ -327,21 +325,22 @@ def prepare_tree_candidate(
             any(
                 not value.strip()
                 for value in (
-                    item.knowledge_unit_id,
                     item.search_unit_id,
                     item.source_id,
                     item.document_version_id,
                     item.partition_id,
                 )
             )
-            or partition_by_unit.get(item.knowledge_unit_id) != item.partition_id
         ):
             raise PublishVerificationError("SearchUnit assignment crosses the tree or ACL partition")
         identity = (item.source_id, item.document_version_id, item.partition_id)
-        previous_identity = scope_by_knowledge.setdefault(item.knowledge_unit_id, identity)
-        if previous_identity != identity:
-            raise PublishVerificationError("KnowledgeUnit feature spans multiple Source/version scopes")
-        mapped_knowledge_ids.add(item.knowledge_unit_id)
+        for knowledge_unit_id in item.knowledge_unit_ids:
+            if not knowledge_unit_id.strip() or partition_by_unit.get(knowledge_unit_id) != item.partition_id:
+                raise PublishVerificationError("SearchUnit assignment crosses the tree or ACL partition")
+            previous_identity = scope_by_knowledge.setdefault(knowledge_unit_id, identity)
+            if previous_identity != identity:
+                raise PublishVerificationError("KnowledgeUnit feature spans multiple Source/version scopes")
+            mapped_knowledge_ids.add(knowledge_unit_id)
         partition_counts[item.partition_id] += 1
     if mapped_knowledge_ids != set(unit_ids):
         raise PublishVerificationError("Every KnowledgeUnit must map to at least one SearchUnit")
@@ -430,14 +429,22 @@ def build_inactive_slot_payloads(
         for node_id, members in candidate.leaf_memberships
         for knowledge_unit_id in members
     }
-    search_units_by_leaf: dict[str, list[str]] = defaultdict(list)
+    search_units_by_route: dict[tuple[str, tuple[str, ...]], list[str]] = defaultdict(list)
     for item in candidate.search_unit_assignments:
-        node_id = leaf_by_knowledge.get(item.knowledge_unit_id)
-        if node_id is None:
+        node_ids = tuple(
+            sorted(
+                {
+                    leaf_by_knowledge[unit_id]
+                    for unit_id in item.knowledge_unit_ids
+                    if unit_id in leaf_by_knowledge
+                }
+            )
+        )
+        if not node_ids:
             raise PublishVerificationError("SearchUnit assignment has no leaf membership")
-        search_units_by_leaf[node_id].append(item.search_unit_id)
+        search_units_by_route[(node_ids[0], node_ids[1:])].append(item.search_unit_id)
     batches: list[dict[str, Any]] = []
-    for node_id, unit_ids in sorted(search_units_by_leaf.items()):
+    for (node_id, secondary_node_ids), unit_ids in sorted(search_units_by_route.items()):
         point_ids = [generate_search_unit_point_id(collection_name, unit_id) for unit_id in sorted(unit_ids)]
         for start in range(0, len(point_ids), _MAX_QDRANT_POINT_BATCH):
             points = point_ids[start : start + _MAX_QDRANT_POINT_BATCH]
@@ -447,7 +454,7 @@ def build_inactive_slot_payloads(
                         "points": points,
                         "payload": {
                             f"primary_node_{slot}": node_id,
-                            f"secondary_node_ids_{slot}": [],
+                            f"secondary_node_ids_{slot}": list(secondary_node_ids),
                             f"tree_version_{slot}": candidate.tree_version,
                         },
                     }
@@ -597,13 +604,14 @@ async def _verify_qdrant_point_payloads(
         for node_id, members in candidate.leaf_memberships
         for unit_id in members
     }
-    expected = {
-        generate_search_unit_point_id(collection, item.search_unit_id): (
+    expected = {}
+    for item in candidate.search_unit_assignments:
+        node_ids = tuple(sorted({leaf_by_knowledge[unit_id] for unit_id in item.knowledge_unit_ids}))
+        expected[generate_search_unit_point_id(collection, item.search_unit_id)] = (
             item,
-            leaf_by_knowledge[item.knowledge_unit_id],
+            node_ids[0],
+            list(node_ids[1:]),
         )
-        for item in candidate.search_unit_assignments
-    }
     ids = sorted(expected)
     path = f"/collections/{quote(collection, safe='')}/points"
     for start in range(0, len(ids), _MAX_QDRANT_POINT_BATCH):
@@ -621,6 +629,7 @@ async def _verify_qdrant_point_payloads(
                         "tenant_id",
                         "security_partition_id",
                         f"primary_node_{slot}",
+                        f"secondary_node_ids_{slot}",
                         f"tree_version_{slot}",
                     ],
                     "with_vector": False,
@@ -649,7 +658,7 @@ async def _verify_qdrant_point_payloads(
             if point_id not in batch or point_id in observed:
                 raise PublishVerificationError("Qdrant exact point IDs differ from the candidate")
             observed.add(point_id)
-            item, leaf_node_id = expected[point_id]
+            item, leaf_node_id, secondary_node_ids = expected[point_id]
             payload = point["payload"]
             required = {
                 "search_unit_id": item.search_unit_id,
@@ -659,6 +668,7 @@ async def _verify_qdrant_point_payloads(
                 "tenant_id": candidate.tenant_id,
                 "security_partition_id": item.partition_id,
                 f"primary_node_{slot}": leaf_node_id,
+                f"secondary_node_ids_{slot}": secondary_node_ids,
                 f"tree_version_{slot}": candidate.tree_version,
             }
             if any(payload.get(key) != value for key, value in required.items()):

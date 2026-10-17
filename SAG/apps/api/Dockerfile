@@ -5,9 +5,6 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
-# 默认镜像安装 PostgreSQL/Qdrant 部署所需依赖。
-ARG SAG_API_EXTRAS=""
-
 RUN apt-get update \
  && apt-get install -y --no-install-recommends build-essential curl \
  && rm -rf /var/lib/apt/lists/*
@@ -15,7 +12,7 @@ RUN apt-get update \
 # 先装第三方依赖；业务代码变化不会让这一层失效。
 COPY pyproject.toml ./
 RUN pip install --upgrade pip hatchling \
- && python -c 'import os, tomllib; p=tomllib.load(open("pyproject.toml", "rb")); deps=list(p["project"]["dependencies"]); deps += p["project"]["optional-dependencies"].get(os.environ.get("SAG_API_EXTRAS", ""), []); print("\n".join(deps))' > /tmp/requirements.txt \
+ && python -c 'import tomllib; p=tomllib.load(open("pyproject.toml", "rb")); deps=list(p["project"]["dependencies"])+p["project"]["optional-dependencies"]["postgres"]; print("\n".join(deps))' > /tmp/requirements.txt \
  && pip install -r /tmp/requirements.txt
 
 # 再安装本项目本身（无依赖解析，保持快速重建）。

@@ -117,6 +117,8 @@ PAYLOAD_INDEX_FIELDS = [
     ("valid_to_ts", "integer"),
     ("primary_node_a", "keyword"),
     ("primary_node_b", "keyword"),
+    ("secondary_node_ids_a", "keyword"),
+    ("secondary_node_ids_b", "keyword"),
 ]
 
 

@@ -53,6 +53,26 @@ class UniversePolicyOut(BaseModel):
     edge_budget_mobile: int
 
 
+class UniverseTreeNodeOut(BaseModel):
+    id: str
+    parent_id: str | None = None
+    depth: int = Field(ge=0)
+    label: str
+    is_leaf: bool
+    unit_count: int = Field(ge=0)
+    source_count: int = Field(ge=0)
+
+
+class UniverseTreeOut(BaseModel):
+    project_id: str
+    tree_version: str
+    search_epoch: int = Field(ge=1)
+    node_count: int = Field(ge=0)
+    unit_count: int = Field(ge=0)
+    source_count: int = Field(ge=0)
+    nodes: list[UniverseTreeNodeOut] = Field(default_factory=list)
+
+
 class UniverseManifestOut(BaseModel):
     version: str | None = None
     status: Literal["empty", "building", "ready", "stale", "failed"]
@@ -60,6 +80,7 @@ class UniverseManifestOut(BaseModel):
     as_of: datetime | None = None
     bounds: dict[str, float] = Field(default_factory=dict)
     partitions: list[UniversePartitionOut] = Field(default_factory=list)
+    trees: list[UniverseTreeOut] = Field(default_factory=list)
     counts: dict[str, int] = Field(default_factory=dict)
     policy: UniversePolicyOut
 

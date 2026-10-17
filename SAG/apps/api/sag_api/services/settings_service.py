@@ -39,6 +39,9 @@ _FIELDS = frozenset(
         "llm_context_window",
         "llm_timeout_ms",
         "llm_max_retries",
+        "decision_provider",
+        "decision_model",
+        "siliconflow_api_key",
         "embedding_model",
         "embedding_base_url",
         "embedding_api_key",
@@ -58,8 +61,10 @@ _FIELDS = frozenset(
         "sag_language",
     }
 )
-_SECRET_FIELDS = frozenset({"llm_api_key", "embedding_api_key", "mineru_api_key"})
-_NULLABLE_FIELDS = frozenset({"llm_base_url", "embedding_base_url", "embedding_dimensions", "mineru_base_url"})
+_SECRET_FIELDS = frozenset({"llm_api_key", "siliconflow_api_key", "embedding_api_key", "mineru_api_key"})
+_NULLABLE_FIELDS = frozenset(
+    {"llm_base_url", "embedding_base_url", "embedding_dimensions", "mineru_base_url"}
+)
 _LOCKABLE_LLM_FIELDS = frozenset(
     {
         "llm_provider",
@@ -71,11 +76,15 @@ _LOCKABLE_LLM_FIELDS = frozenset(
         "llm_context_window",
         "llm_timeout_ms",
         "llm_max_retries",
+        "decision_provider",
+        "decision_model",
+        "siliconflow_api_key",
     }
 )
 _MODEL_CONFIG_SOURCES = {field: "default" for field in _FIELDS - _SECRET_FIELDS}
 
 _OPENAI_COMPATIBLE = get_model_provider("openai")
+
 
 QUICK_SETUP_302 = {
     "llm_provider": _OPENAI_COMPATIBLE.id,
@@ -143,6 +152,18 @@ async def _reject_incompatible_embedding_change(
 def _normalize_overrides(overrides: dict) -> dict:
     """清理持久化配置，确保已下线或非法策略不会进入运行时。"""
     normalized = dict(overrides)
+    decision_provider = normalized.get("decision_provider")
+    legacy_provider = (
+        decision_provider.strip().lower()
+        if isinstance(decision_provider, str) and decision_provider.strip().lower() in {"laya", "openrouter"}
+        else None
+    )
+    if legacy_provider:
+        normalized["decision_provider"] = "siliconflow"
+    if legacy_provider or normalized.get("decision_model") == "typesafe/jev-1.14":
+        normalized["decision_model"] = "Kev-4b"
+    for obsolete_field in ("openrouter_api_key", "laya_model_path", "laya_device"):
+        normalized.pop(obsolete_field, None)
     for field in ("llm_base_url", "embedding_base_url", "mineru_base_url"):
         value = normalized.get(field)
         if isinstance(value, str):
@@ -298,6 +319,9 @@ def effective_model_config() -> dict:
         "llm_timeout_ms": _settings.llm_timeout_ms,
         "llm_max_retries": _settings.llm_max_retries,
         "llm_api_key_set": bool(_settings.llm_api_key),
+        "decision_provider": _settings.decision_provider,
+        "decision_model": _settings.decision_model,
+        "siliconflow_api_key_set": bool(_settings.siliconflow_api_key),
         "embedding_model": _settings.embedding_model,
         "embedding_base_url": _settings.embedding_base_url,
         "embedding_dimensions": _settings.embedding_dimensions,

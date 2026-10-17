@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
 from starlette.requests import Request
 
 from sag_api.core.config import settings
-from sag_api.core.errors import AuthError, ServiceUnavailableError
+from sag_api.core.errors import AuthError, ForbiddenError, ServiceUnavailableError
 from sag_api.core.logging import get_logger
 
 log = get_logger("security.principal_assertion")
@@ -51,7 +51,11 @@ _FORBIDDEN_SCOPE_ALIASES = frozenset(
         "documentIds",
         "document_ids",
         "allowed_partition_ids",
+        "partitionId",
+        "partitionIds",
+        "securityPartitionId",
         "securityPartitionIds",
+        "security_partition_id",
         "security_partition_ids",
     }
 )
@@ -166,7 +170,18 @@ class PrincipalAssertionVerifier:
                 issuer=self.issuer,
                 audience=self.audience,
                 options={
-                    "require": ["iss", "aud", "sub", "orgId", "allowedProjectIds", "iat", "exp", "jti"],
+                    "require": [
+                        "iss",
+                        "aud",
+                        "sub",
+                        "orgId",
+                        "tenantId",
+                        "allowedProjectIds",
+                        "allowedPartitionIds",
+                        "iat",
+                        "exp",
+                        "jti",
+                    ],
                     "strict_aud": True,
                 },
                 leeway=self.clock_skew_seconds,
@@ -181,8 +196,8 @@ class PrincipalAssertionVerifier:
         subject = claims.get("sub")
         organization_id = claims.get("orgId")
         project_ids = claims.get("allowedProjectIds")
-        tenant_id = claims.get("tenantId", "")
-        partition_ids = claims.get("allowedPartitionIds", [])
+        tenant_id = claims.get("tenantId")
+        partition_ids = claims.get("allowedPartitionIds")
         token_id = claims.get("jti")
         if _FORBIDDEN_SCOPE_ALIASES.intersection(claims):
             raise AuthError("Principal assertion contains unsupported scope aliases")
@@ -199,9 +214,7 @@ class PrincipalAssertionVerifier:
             raise AuthError("Principal assertion lifetime is invalid")
         if not self._valid_identifier(subject) or not self._valid_identifier(organization_id):
             raise AuthError("Principal assertion identity is invalid")
-        if "tenantId" in claims and (
-            not self._valid_identifier(tenant_id) or len(tenant_id) > 64
-        ):
+        if not self._valid_identifier(tenant_id) or len(tenant_id) > 64:
             raise AuthError("Principal assertion Tenant scope is invalid")
         if (
             not isinstance(project_ids, list)
@@ -213,7 +226,11 @@ class PrincipalAssertionVerifier:
         if (
             not isinstance(partition_ids, list)
             or len(partition_ids) > self.max_project_ids
-            or any(not self._valid_identifier(partition_id) for partition_id in partition_ids)
+            or any(
+                not self._valid_identifier(partition_id)
+                or len(partition_id) > 64
+                for partition_id in partition_ids
+            )
             or len(set(partition_ids)) != len(partition_ids)
         ):
             raise AuthError("Principal assertion partition scope is invalid")
@@ -376,5 +393,5 @@ def get_principal_assertion_verifier() -> PrincipalAssertionVerifier:
 async def require_principal_assertion(request: Request) -> VerifiedPrincipal:
     assertions = request.headers.getlist("X-SAG-Principal-Assertion")
     if len(assertions) != 1 or not assertions[0]:
-        raise AuthError("Missing Continuum principal assertion")
+        raise ForbiddenError("Missing Continuum principal assertion")
     return await get_principal_assertion_verifier().verify(assertions[0])

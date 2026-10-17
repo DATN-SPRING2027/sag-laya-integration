@@ -75,10 +75,14 @@ export function ModelConfigForm() {
   const [mineruOfficialModel, setMineruOfficialModel] =
     React.useState<ModelConfig["mineru_official_model"]>("vlm");
   const [mineruKey, setMineruKey] = React.useState("");
+  const [decisionProvider, setDecisionProvider] =
+    React.useState<ModelConfig["decision_provider"]>("siliconflow");
+  const [decisionModel, setDecisionModel] = React.useState("Kev-4b");
+  const [siliconflowKey, setSiliconflowKey] = React.useState("");
 
-  const [layaTestQuery, setLayaTestQuery] = React.useState("Xin chào bạn, hôm nay thế nào?");
-  const [layaTesting, setLayaTesting] = React.useState(false);
-  const [layaResult, setLayaResult] = React.useState<{
+  const [decisionTestQuery, setDecisionTestQuery] = React.useState("Xin chào bạn, hôm nay thế nào?");
+  const [decisionTesting, setDecisionTesting] = React.useState(false);
+  const [decisionResult, setDecisionResult] = React.useState<{
     query: string;
     is_chitchat: boolean;
     need_retrieval: boolean;
@@ -87,19 +91,25 @@ export function ModelConfigForm() {
     confidence: number;
     latency_ms: number;
     model: string;
+    fallback_used: boolean;
+    fallback_reason: string | null;
   } | null>(null);
 
-  async function testLaya() {
-    if (!layaTestQuery.trim()) return;
-    setLayaTesting(true);
+  async function testDecisionRouter() {
+    if (!decisionTestQuery.trim()) return;
+    setDecisionTesting(true);
     try {
-      const res = await api.routeLaya(layaTestQuery.trim());
-      setLayaResult(res);
-      toast.success(`Đã phân loại ý định qua Laya trong ${res.latency_ms}ms`);
+      const res = await api.routeDecision(decisionTestQuery.trim());
+      setDecisionResult(res);
+      if (res.fallback_used) {
+        toast.warning(`Decision Router đang fallback: ${res.fallback_reason ?? "unknown"}`);
+      } else {
+        toast.success(`Đã phân loại bằng ${res.model} trong ${res.latency_ms}ms`);
+      }
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : "Không thể gọi Laya router");
+      toast.error(err instanceof ApiError ? err.message : "Không thể gọi Decision Router");
     } finally {
-      setLayaTesting(false);
+      setDecisionTesting(false);
     }
   }
 
@@ -121,6 +131,9 @@ export function ModelConfigForm() {
     setMineruBaseUrl(config.mineru_base_url ?? "");
     setMineruVersion(config.mineru_version);
     setMineruOfficialModel(config.mineru_official_model);
+    setDecisionProvider(config.decision_provider);
+    setDecisionModel(config.decision_model);
+    setSiliconflowKey("");
     setLlmKey("");
     setEmbKey("");
     setMineruKey("");
@@ -175,6 +188,8 @@ export function ModelConfigForm() {
       llm_timeout_ms: timeoutMs,
       llm_max_retries: maxRetries,
       llm_context_window: ctxWindow,
+      decision_provider: decisionProvider,
+      decision_model: decisionModel.trim(),
       embedding_model: embModel.trim(),
       embedding_base_url: embBaseUrl.trim(),
       embedding_dimensions: embDims.trim() ? Number(embDims) : null,
@@ -185,6 +200,7 @@ export function ModelConfigForm() {
       mineru_official_model: mineruOfficialModel,
     };
     if (llmKey.trim()) patch.llm_api_key = llmKey.trim();
+    if (siliconflowKey.trim()) patch.siliconflow_api_key = siliconflowKey.trim();
     if (embKey.trim()) patch.embedding_api_key = embKey.trim();
     if (mineruKey.trim()) patch.mineru_api_key = mineruKey.trim();
     return patch;
@@ -207,6 +223,8 @@ export function ModelConfigForm() {
         llm_max_tokens: config.llm_max_tokens,
         llm_timeout_ms: config.llm_timeout_ms,
         llm_max_retries: config.llm_max_retries,
+        decision_provider: config.decision_provider,
+        decision_model: config.decision_model,
         embedding_model: config.embedding_model,
         embedding_base_url: config.embedding_base_url,
         embedding_dimensions: config.embedding_dimensions,
@@ -216,6 +234,7 @@ export function ModelConfigForm() {
         mineru_version: config.mineru_version,
         mineru_official_model: config.mineru_official_model,
         llm_api_key_changed: Boolean(llmKey.trim()),
+        siliconflow_api_key_changed: Boolean(siliconflowKey.trim()),
         embedding_api_key_changed: Boolean(embKey.trim()),
         mineru_api_key_changed: Boolean(mineruKey.trim()),
       });
@@ -343,6 +362,10 @@ export function ModelConfigForm() {
 
   const providerSpec = providers.find((provider) => provider.id === llmProvider)!;
   const llmLocked = isLlmConfigLocked(cfg);
+  const decisionConfigDirty =
+    decisionProvider !== cfg.decision_provider ||
+    decisionModel.trim() !== cfg.decision_model ||
+    Boolean(siliconflowKey.trim());
 
   const keyPlaceholder = (isSet: boolean) => (isSet ? t("keyConfigured") : "sk-…");
   const generationKeyPlaceholder =
@@ -715,38 +738,83 @@ export function ModelConfigForm() {
       </SettingsSection>
 
       <SettingsSection
-        title="Decision Router & Guardrail (Laya)"
-        description="Mô hình quyết định siêu nhẹ (~33ms) chạy offline phân loại ý định người dùng và guardrail, tự động bỏ qua truy vấn vector DB khi gặp câu chào hỏi/tán gẫu để tối ưu tốc độ và chi phí."
+        title="Decision Router (Kev-4B / SiliconFlow)"
+        description="Kev-4B phân loại ý định qua SiliconFlow. Lỗi hoặc thiếu API key sẽ fallback sang truy xuất."
       >
         <SettingsRow
-          title="Trạng thái Laya Engine"
-          description="Laya Decision Engine chạy trực tiếp từ bộ nhớ đệm cục bộ (Multilingual 322M), không tốn chi phí gọi API bên ngoài."
+          title="Mô hình quyết định"
+          description="API key SiliconFlow này tách riêng, không thay đổi LLM dùng để trả lời hoặc trích xuất."
         >
           <div className="flex flex-col gap-4">
-            <div className="flex flex-wrap items-center gap-3">
-              <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-600 dark:text-emerald-400">
-                <span className="size-2 rounded-full bg-emerald-500 animate-pulse" />
-                Đang hoạt động (Multilingual 322M · Cache Offline)
-              </span>
-              <span className="text-xs text-muted-foreground">
-                Độ trễ trung bình: ~30 - 35ms · Checkpoint: convaiinnovations/laya
-              </span>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field>
+                <FieldLabel htmlFor="decision-provider">Decision Router</FieldLabel>
+                <Select
+                  value={decisionProvider}
+                  onValueChange={(value) => setDecisionProvider(value as ModelConfig["decision_provider"])}
+                  disabled={llmLocked}
+                >
+                  <SelectTrigger id="decision-provider">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="siliconflow">SiliconFlow — Kev-4B</SelectItem>
+                    <SelectItem value="disabled">Tắt, luôn truy xuất</SelectItem>
+                  </SelectContent>
+                </Select>
+                <FieldDescription>
+                  {decisionProvider === "siliconflow"
+                    ? cfg.siliconflow_api_key_set || siliconflowKey.trim()
+                      ? "SiliconFlow đã có API key."
+                      : "Thêm API key để bật Kev-4B; nếu thiếu, SAG sẽ fallback sang truy xuất."
+                    : "Không gọi mô hình quyết định; mọi câu hỏi tiếp tục truy xuất."}
+                </FieldDescription>
+              </Field>
+              {decisionProvider === "siliconflow" && (
+                <Field>
+                  <FieldLabel htmlFor="decision-model">SiliconFlow model ID</FieldLabel>
+                  <Input
+                    id="decision-model"
+                    value={decisionModel}
+                    disabled={llmLocked}
+                    onChange={(event) => setDecisionModel(event.target.value)}
+                    placeholder="Kev-4b"
+                  />
+                </Field>
+              )}
+              {decisionProvider === "siliconflow" && (
+                <Field className="sm:col-span-2">
+                  <FieldLabel htmlFor="siliconflow-key">SiliconFlow API Key</FieldLabel>
+                  <Input
+                    id="siliconflow-key"
+                    type="password"
+                    autoComplete="off"
+                    value={siliconflowKey}
+                    disabled={llmLocked}
+                    onChange={(event) => setSiliconflowKey(event.target.value)}
+                    placeholder={cfg.siliconflow_api_key_set ? t("keyConfigured") : "sk-…"}
+                  />
+                  <FieldDescription>
+                    Key được lưu ở SAG và không gửi về trình duyệt sau khi lưu. Hãy lưu cấu hình trước khi chạy kiểm tra.
+                  </FieldDescription>
+                </Field>
+              )}
             </div>
 
             <div className="rounded-lg border bg-muted/30 p-3.5">
               <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-2">
-                Thử nghiệm phân loại câu hỏi (Interactive Test)
+                Kiểm tra Decision Router
               </div>
-              <div className="flex flex-col sm:flex-row gap-2">
+              <div className="flex flex-col gap-2 sm:flex-row">
                 <Input
-                  value={layaTestQuery}
-                  onChange={(event) => setLayaTestQuery(event.target.value)}
-                  placeholder="Nhập câu hỏi thử nghiệm, ví dụ: 'Xin chào bạn' hoặc 'Quy trình thanh toán'"
+                  value={decisionTestQuery}
+                  onChange={(event) => setDecisionTestQuery(event.target.value)}
+                  placeholder="Nhập câu hỏi thử nghiệm"
                   className="flex-1 text-sm"
                   onKeyDown={(event) => {
                     if (event.key === "Enter") {
                       event.preventDefault();
-                      void testLaya();
+                      void testDecisionRouter();
                     }
                   }}
                 />
@@ -754,44 +822,37 @@ export function ModelConfigForm() {
                   type="button"
                   variant="outline"
                   size="sm"
-                  disabled={layaTesting || !layaTestQuery.trim()}
-                  onClick={() => void testLaya()}
+                  disabled={decisionTesting || saving || decisionConfigDirty || !decisionTestQuery.trim()}
+                  onClick={() => void testDecisionRouter()}
                   className="whitespace-nowrap"
                 >
-                  {layaTesting ? <Spinner /> : <Sparkles className="size-4" />}
-                  Kiểm tra Laya Router
+                  {decisionTesting ? <Spinner /> : <Sparkles className="size-4" />}
+                  Kiểm tra Kev-4B
                 </Button>
               </div>
 
-              {layaResult && (
+              {decisionResult && (
                 <div className="mt-3 rounded-md border bg-background p-3 text-xs flex flex-col gap-2">
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="font-semibold text-foreground">Kết quả:</span>
-                    <span
-                      className={cn(
-                        "rounded px-2 py-0.5 font-medium",
-                        layaResult.is_chitchat
-                          ? "bg-blue-500/10 text-blue-600 dark:text-blue-400"
-                          : "bg-purple-500/10 text-purple-600 dark:text-purple-400"
-                      )}
-                    >
-                      {layaResult.is_chitchat ? "💬 Chitchat / Xã giao" : "📄 Yêu cầu tra cứu tri thức"}
-                    </span>
-                    <span className="rounded bg-muted px-2 py-0.5">
-                      Chủ đề: <strong className="text-foreground">{layaResult.domain}</strong>
-                    </span>
-                    <span className="rounded bg-muted px-2 py-0.5">
-                      Cần Search DB:{" "}
-                      <strong className={layaResult.need_retrieval ? "text-amber-600" : "text-emerald-600"}>
-                        {layaResult.need_retrieval ? "Có" : "Không (Bỏ qua)"}
-                      </strong>
-                    </span>
-                    <span className="rounded bg-muted px-2 py-0.5">
-                      Độ trễ: <strong className="text-foreground">{layaResult.latency_ms}ms</strong>
-                    </span>
-                    <span className="rounded bg-muted px-2 py-0.5">
-                      Độ tin cậy: <strong className="text-foreground">{(layaResult.confidence * 100).toFixed(1)}%</strong>
-                    </span>
+                    <span className="rounded bg-muted px-2 py-0.5">Model: {decisionResult.model}</span>
+                    {decisionResult.fallback_used ? (
+                      <span className="rounded bg-amber-500/10 px-2 py-0.5 text-amber-700 dark:text-amber-400">
+                        Fallback: {decisionResult.fallback_reason}
+                      </span>
+                    ) : (
+                      <>
+                        <span className="rounded bg-muted px-2 py-0.5">
+                          Ý định: <strong className="text-foreground">{decisionResult.is_chitchat ? "Chitchat" : "Tra cứu"}</strong>
+                        </span>
+                        <span className="rounded bg-muted px-2 py-0.5">
+                          Độ trễ: <strong className="text-foreground">{decisionResult.latency_ms}ms</strong>
+                        </span>
+                        <span className="rounded bg-muted px-2 py-0.5">
+                          Độ tin cậy: <strong className="text-foreground">{(decisionResult.confidence * 100).toFixed(1)}%</strong>
+                        </span>
+                      </>
+                    )}
                   </div>
                 </div>
               )}
