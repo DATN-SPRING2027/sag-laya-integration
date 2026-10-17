@@ -10,7 +10,7 @@ from sag_api.api.v1 import (
     insights,
     jobs,
     knowledge,
-    laya,
+    decision,
     octx,
     openai,
     search,
@@ -36,7 +36,7 @@ for _module in (
     system,
     universe,
     octx,
-    laya,
+    decision,
 ):
     api_router.include_router(_module.router)
 api_router.include_router(documents.project_router)

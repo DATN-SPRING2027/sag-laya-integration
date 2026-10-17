@@ -1366,6 +1366,21 @@
       "relatedEvents": "related events",
       "relatedEntities": "related entities"
     },
+    "tree": {
+      "empty": "Không có cây Project đang hoạt động trong phạm vi dữ liệu bạn được cấp quyền.",
+      "building": "Đang dựng cây Universe từ dữ liệu SAG đã lập chỉ mục…",
+      "stale": "Cây Universe chưa đồng bộ với dữ liệu SAG; đang chờ dựng lại.",
+      "failed": "Cây Project hiện hành không vượt qua được kiểm tra toàn vẹn.",
+      "project": "Project",
+      "nodes": "nút",
+      "units": "đơn vị",
+      "sources": "nguồn",
+      "routed": "Nút được định tuyến",
+      "branches": "nhánh",
+      "expand": "Mở nhánh",
+      "collapse": "Thu gọn nhánh",
+      "overview": "{projects, number} project · {nodes, number} nút · {units} đơn vị"
+    },
     "loadProgress": {
       "rowAria": "Loading progress for {label}",
       "complete": "The full time range has been explored; the current view is stable",

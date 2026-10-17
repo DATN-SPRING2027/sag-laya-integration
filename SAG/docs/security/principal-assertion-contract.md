@@ -1,7 +1,7 @@
 # Principal Assertion Contract — Continuum to SAG
 
-> **Status:** Draft for BE/Continuum and security review. Not frozen and not a
-> statement that a runtime issuer or verifier is already deployed.
+> **Status:** Proposed runtime profile for the Continuum-to-SAG integration.
+> Deployment still requires matching issuer/key configuration and organization scope data.
 >
 > **Date:** 2026-09-30
 > **Authority:** BE/Continuum resolves identity, organization context, and
@@ -31,12 +31,12 @@ sequenceDiagram
     participant R as Retrieval/read boundary
     User->>BE: authenticated request
     BE->>BE: resolve org and allowed Projects
-    BE->>SAG: short-lived signed principal assertion
+    BE->>SAG: short-lived assertion (tenant + Projects + partitions)
     SAG->>SAG: verify issuer, audience, signature, claims and time
     SAG->>Map: allowed_project_ids + org_id
     Map-->>SAG: confirmed authorized_source_ids
     SAG->>SAG: requested_source_ids ∩ authorized_source_ids
-    SAG->>R: effective_source_ids (or stop if empty)
+    SAG->>R: tenant + allowed_partition_ids + effective_source_ids (or stop if empty)
 ```
 
 ## 2. Token and transport profile (proposed v1)
@@ -47,8 +47,10 @@ sequenceDiagram
 | `iss` | Exact, environment-specific Continuum issuer identifier configured by SAG | SAG accepts only configured issuer values; no issuer supplied by the request can add trust. Exact production URI/identifier is pending BE. |
 | `aud` | Exact SAG API audience, proposed literal `sag-api` | A token for another service is invalid. No wildcard or substring audience checks. |
 | `sub` | Stable, opaque canonical Continuum user/principal ID | SAG uses it for principal identity/audit only, not role lookup. Service identities need an explicit service-principal profile issued by BE. |
-| `orgId` | Canonical Organization ID using the current BE/IAM wire naming | SAG normalizes this to internal `org_id`. Do not add a second `tenantId` claim unless BE confirms a distinct tenant boundary and defines its consistency rule. |
-| `allowedProjectIds` | Proposed required array of unique, non-empty opaque Project IDs resolved by BE for this principal and `orgId` | SAG normalizes this to internal `allowed_project_ids`. Empty array is valid and means no accessible Projects; missing/malformed is invalid. The current BE access token does not provide this claim, so it is a new assertion-contract requirement. SAG never substitutes `activeProjectId`, a role, or a client value. |
+| `orgId` | Canonical Organization ID using the current BE/IAM wire naming | SAG normalizes this to internal `org_id`; BE separately supplies the configured SAG tenant ID. |
+| `tenantId` | Required SAG tenant ID configured on the Organization in BE | Must exactly match `tenant_id` on SAG documents, search units, and tree records. Missing configuration denies the assertion. |
+| `allowedProjectIds` | Required array of unique Project IDs resolved by BE's Project read policy for this principal and `orgId` | SAG normalizes this to internal `allowed_project_ids`. Empty array means no accessible Projects; more than 256 is rejected rather than truncated. |
+| `allowedPartitionIds` | Required array of unique SAG security partition IDs from the principal's active BE Organization membership | Empty array grants no evidence. IDs are never inferred from the request or SAG data. More than 256 is rejected. |
 | `iat`, `exp` | Required NumericDate claims | `exp` must be later than `iat`; maximum lifetime is enforced by local config. |
 | `nbf` | Optional NumericDate; when present it is validated with the same skew policy | Avoid adding it unless the issuer has a real activation-time requirement. |
 | `jti` | Required unique issuance identifier for correlation/revocation operations | Proposed bearer profile does **not** consume `jti` as a single-use nonce. No replay prevention is claimed. |
@@ -68,26 +70,27 @@ The v1 required claim set is:
   "aud": "sag-api",
   "sub": "<opaque-principal-id>",
   "orgId": "<opaque-organization-id>",
+  "tenantId": "<configured-sag-tenant-id>",
   "allowedProjectIds": ["<opaque-project-id>"],
+  "allowedPartitionIds": ["<security-partition-id>"],
   "iat": 0,
   "exp": 0,
   "jti": "<unique-issuance-id>"
 }
 ```
 
-The example is structural only; values are not credentials. The issuer and SAG
-must agree whether the project list is capped by count/token size. SAG must
-reject an over-limit assertion rather than silently truncate its authorization
-scope. The numeric limit is an open freeze item because it must fit actual BE
-membership sizes and service header limits.
+The example is structural only; values are not credentials. SAG rejects project
+or partition scopes larger than 256 and compact assertions larger than 16 KiB;
+the issuer must enforce the same limits and never truncate either scope.
 
 Validation requirements:
 
 - Require exactly one trusted principal token on protected evidence requests.
 - Verify the JWS signature before trusting any payload claim.
 - Match `iss` and `aud` exactly against deployment configuration.
-- Require non-empty `sub` and `orgId`; require `allowedProjectIds` to be an
-  array of unique, non-empty strings. An empty array returns no evidence.
+- Require non-empty `sub`, `orgId`, and `tenantId`; require
+  `allowedProjectIds` and `allowedPartitionIds` to be arrays of unique,
+  non-empty strings. An empty scope array returns no evidence.
 - Require safe integer `iat`/`exp`, enforce maximum lifetime, and reject an
   `iat` too far in the future or an expired/not-yet-valid assertion.
 - Ignore no cryptographic validation error and never retry the request without
@@ -96,6 +99,23 @@ Validation requirements:
   invalid or incomplete assertion.
 
 ## 4. Signature, JWKS and key rotation
+
+### Runtime wiring
+
+- The Continuum issuer must resolve `tenantId`, allowed Projects, and
+  `allowedPartitionIds` from its own authorization data. Partition IDs must
+  match the exact `security_partition_id` values written by SAG ingestion;
+  missing tenant or an empty partition scope grants no evidence.
+- The issuer configures `SAG_PRINCIPAL_ASSERTION_ISSUER`, a key ID, and an
+  asymmetric signing key. Configure the matching issuer in SAG and set
+  `SAG_PRINCIPAL_ASSERTION_JWKS_URL` to the issuer's fixed HTTPS JWKS endpoint.
+- The separate trusted BFF obtains the assertion server-side and forwards it
+  to SAG in `X-SAG-Principal-Assertion`; it must overwrite or strip any value
+  supplied by the browser and must never return the assertion to JavaScript.
+  Set `NEXT_PUBLIC_API_BASE` to the public SAG route exposed by that BFF. SAG
+  does not assume the BFF's repository, route layout, or session-refresh path.
+- The browser's SAG `Authorization` credential remains separate from the
+  Continuum session. The BFF owns session renewal and assertion issuance.
 
 ### Proposed algorithm
 

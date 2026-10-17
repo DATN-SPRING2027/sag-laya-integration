@@ -48,12 +48,15 @@ function resolveApiBase(): string {
     const { protocol, hostname } = window.location;
     const isLocalHost = hostname === "localhost" || hostname === "127.0.0.1";
     if (!isLocalHost) {
-      const pointsToLocal =
-        !configured ||
-        configured.includes("localhost") ||
-        configured.includes("127.0.0.1");
-      if (pointsToLocal) {
-        return `${protocol}//${hostname}:8000`;
+      if (!configured) return `${protocol}//${hostname}:8000`;
+      try {
+        const apiUrl = new URL(configured, window.location.origin);
+        if (apiUrl.hostname === "localhost" || apiUrl.hostname === "127.0.0.1") {
+          apiUrl.hostname = hostname;
+        }
+        return apiUrl.toString().replace(/\/$/, "");
+      } catch {
+        // Keep relative API bases relative to the current host.
       }
     }
   }
@@ -225,16 +228,20 @@ async function streamGlobalSearch(
   const searchStartMs = Date.now();
   let response: Response;
   try {
-    response = await fetch(`${API_BASE}/api/v1/search/stream`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Accept-Language": readClientLocale(),
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    response = await fetch(
+      `${API_BASE}/api/v1/search/stream`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept-Language": readClientLocale(),
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify(body),
+        credentials: "include",
+        signal: combinedSignal,
       },
-      body: JSON.stringify(body),
-      signal: combinedSignal,
-    });
+    );
   } catch (error) {
     clearStreamTimeout();
     if (timeoutReason) {
@@ -463,7 +470,12 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
   const startMs = Date.now();
   let res: Response;
   try {
-    res = await fetch(`${API_BASE}${path}`, { ...requestInit, headers, signal });
+    res = await fetch(`${API_BASE}${path}`, {
+      ...requestInit,
+      headers,
+      credentials: "include",
+      signal,
+    });
   } catch (e) {
     const durationMs = Date.now() - startMs;
     const isTimeout = e instanceof DOMException && e.name === "TimeoutError";
@@ -1100,12 +1112,16 @@ export const api = {
     }),
   downloadDshConnection: async (): Promise<Blob> => {
     const token = getToken();
-    const res = await fetch(`${API_BASE}/api/v1/system/dsh/export`, {
-      headers: {
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        "Accept-Language": readClientLocale(),
+    const res = await fetch(
+      `${API_BASE}/api/v1/system/dsh/export`,
+      {
+        credentials: "include",
+        headers: {
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          "Accept-Language": readClientLocale(),
+        },
       },
-    });
+    );
     if (!res.ok) {
       let code = "download_failed";
       let message = res.statusText || clientErrorMessage("requestFailed");
@@ -1139,6 +1155,7 @@ export const api = {
     const res = await fetch(
       `${API_BASE}/api/v1/octx/transfers/${transferId}/artifact`,
       {
+        credentials: "include",
         headers: {
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
           "Accept-Language": readClientLocale(),
@@ -1192,7 +1209,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
-  routeLaya: (query: string) =>
+  routeDecision: (query: string) =>
     request<{
       query: string;
       is_chitchat: boolean;
@@ -1202,7 +1219,9 @@ export const api = {
       confidence: number;
       latency_ms: number;
       model: string;
-    }>("/api/v1/laya/route", {
+      fallback_used: boolean;
+      fallback_reason: string | null;
+    }>("/api/v1/decision/route", {
       method: "POST",
       body: JSON.stringify({ query }),
     }),

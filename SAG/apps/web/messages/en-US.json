@@ -1360,6 +1360,21 @@
       "relatedEvents": "related events",
       "relatedEntities": "related entities"
     },
+    "tree": {
+      "empty": "No active Project tree is available in your authorized data.",
+      "building": "Building the Universe tree from indexed SAG data…",
+      "stale": "The Universe tree is out of date with SAG data and needs rebuilding.",
+      "failed": "The active Project tree failed integrity validation.",
+      "project": "Project",
+      "nodes": "Nodes",
+      "units": "units",
+      "sources": "sources",
+      "routed": "Routed nodes",
+      "branches": "branches",
+      "expand": "Expand branch",
+      "collapse": "Collapse branch",
+      "overview": "{projects, plural, one {# project} other {# projects}} · {nodes, number} nodes · {units} units"
+    },
     "loadProgress": {
       "rowAria": "Loading progress for {label}",
       "complete": "The full time range has been explored; the current view is stable",

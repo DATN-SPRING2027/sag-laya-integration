@@ -4,6 +4,7 @@ import type {
   UniverseActivationNode,
   UniverseGraphPatch,
   UniverseRelation,
+  UniverseTreeRoute,
 } from "./types";
 import { clientErrorMessage } from "../i18n/client-errors";
 
@@ -172,6 +173,7 @@ export function dispatchUniverseActivation(
     nodes: activation.nodes,
     relations: activation.relations,
     source_hits: activation.source_hits,
+    tree_routes: activation.tree_routes,
   };
   window.dispatchEvent(new CustomEvent(UNIVERSE_ACTIVATE_EVENT, { detail }));
   return detail.epoch ?? universeEpoch;
@@ -225,6 +227,29 @@ export function activationFromSearch(response: SearchResponse): UniverseActivati
       state: "active",
     }));
   });
+  const routing = response.stats.routing;
+  const rawGroups = routing && typeof routing === "object" && !Array.isArray(routing)
+    ? (routing as { groups?: unknown }).groups
+    : undefined;
+  const treeRoutes: UniverseTreeRoute[] = Array.isArray(rawGroups)
+    ? rawGroups.flatMap((group) => {
+        if (!group || typeof group !== "object" || Array.isArray(group)) return [];
+        const value = group as Record<string, unknown>;
+        const nodeIds = Array.isArray(value.selected_nodes)
+          ? value.selected_nodes.filter((nodeId): nodeId is string => typeof nodeId === "string")
+          : [];
+        if (
+          typeof value.project_id !== "string"
+          || typeof value.tree_version !== "string"
+          || nodeIds.length === 0
+        ) return [];
+        return [{
+          project_id: value.project_id,
+          tree_version: value.tree_version,
+          node_ids: [...new Set(nodeIds)],
+        }];
+      })
+    : [];
   return {
     origin: "search",
     query: response.query,
@@ -240,6 +265,7 @@ export function activationFromSearch(response: SearchResponse): UniverseActivati
       }),
     ),
     source_hits: response.source_hits,
+    tree_routes: treeRoutes,
   };
 }
 

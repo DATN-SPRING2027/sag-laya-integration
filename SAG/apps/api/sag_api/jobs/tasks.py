@@ -740,6 +740,25 @@ async def _process_document_unlocked(
                 source.id,
                 sanitize_error_message(uni_err),
             )
+        if run_id:
+            try:
+                ingestion_run = await session.get(IngestionRun, run_id)
+                if ingestion_run is not None:
+                    from sag_api.services.universe_tree_service import enqueue_tree_rebuild_for_version
+
+                    await enqueue_tree_rebuild_for_version(
+                        session,
+                        job_queue,
+                        ingestion_run.document_version_id,
+                        reason="document_search_ready",
+                    )
+            except Exception as tree_err:  # noqa: BLE001 - tree scheduling must not fail document ingestion
+                await session.rollback()
+                log.warning(
+                    "Universe tree rebuild scheduling delayed doc=%s: %s",
+                    document.id,
+                    sanitize_error_message(tree_err),
+                )
 
 
 async def delete_document_task(
@@ -1017,16 +1036,58 @@ async def _sync_source_unlocked(session: AsyncSession, job: Job, *, job_queue=No
 async def index_universe(session: AsyncSession, job: Job, *, engine_manager: EngineManager, job_queue=None) -> None:
     """Rebuild one user's aggregate universe overview from authoritative graph data."""
     from sag_api.db.models import User
-    from sag_api.services.universe_service import rebuild_universe_overview
 
     user_id = str((job.payload or {}).get("user_id") or "")
     if not user_id or await session.get(User, user_id) is None:
         raise NotFoundError("Người dùng sở hữu knowledge universe không tồn tại")
     job.progress = 0.1
     await session.commit()
-    overview = await rebuild_universe_overview(session, engine_manager, user_id)
+
+
+async def rebuild_universe_tree(
+    session: AsyncSession,
+    job: Job,
+    *,
+    engine_manager: EngineManager,
+    job_queue=None,
+) -> None:
+    from sag_api.services.universe_tree_service import rebuild_project_universe_tree
+
+    payload = job.payload or {}
+    tenant_id = payload.get("tenant_id")
+    project_ids = payload.get("project_ids")
+    if (
+        not isinstance(tenant_id, str)
+        or not tenant_id.strip()
+        or not isinstance(project_ids, list)
+        or not project_ids
+        or any(not isinstance(project_id, str) or not project_id.strip() for project_id in project_ids)
+        or len(set(project_ids)) != len(project_ids)
+    ):
+        raise ValueError("Universe tree rebuild job scope is invalid")
+
+    results = []
+    for index, project_id in enumerate(project_ids):
+        result = await rebuild_project_universe_tree(
+            session,
+            engine_manager,
+            tenant_id=tenant_id,
+            project_id=project_id,
+        )
+        results.append(
+            {"project_id": project_id, "status": "empty"}
+            if result is None
+            else {
+                "project_id": result.project_id,
+                "tree_version": result.tree_version,
+                "search_epoch": result.search_epoch,
+                "point_count": result.point_count,
+            }
+        )
+        job.progress = 0.9 * (index + 1) / len(project_ids)
+        job.payload = {**payload, "results": results}
+        await session.commit()
     job.progress = 1.0
-    job.payload = {**(job.payload or {}), "overview_id": overview.id}
     await session.commit()
 
 
@@ -1036,6 +1097,7 @@ TASK_HANDLERS: dict[JobType, TaskHandler] = {
     JobType.DELETE_DOCUMENT: delete_document_task,
     JobType.SYNC_SOURCE: sync_source,
     JobType.INDEX_UNIVERSE: index_universe,
+    JobType.REBUILD_UNIVERSE_TREE: rebuild_universe_tree,
     JobType.OCTX_PREFLIGHT: preflight_octx,
     JobType.OCTX_IMPORT: import_octx,
     JobType.OCTX_EXPORT: export_octx,

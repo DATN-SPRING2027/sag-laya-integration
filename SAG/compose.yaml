@@ -34,8 +34,6 @@ services:
     build:
       context: ./apps/api
       dockerfile: Dockerfile
-      args:
-        SAG_API_EXTRAS: postgres
     depends_on:
       db:
         condition: service_healthy
@@ -44,14 +42,12 @@ services:
       SAG_DEBUG: "false"
       # 仅供本地快速启动；切换 prod 时应用会拒绝这个已知弱密钥。
       SAG_SECRET_KEY: ${SAG_SECRET_KEY:-dev-insecure-secret-change-me-in-production-0123456789}
-      SAG_CORS_ORIGINS: ${SAG_CORS_ORIGINS:-http://localhost:3000}
+      SAG_CORS_ORIGINS: ${SAG_CORS_ORIGINS:-http://localhost:3002}
       SAG_AUTH_MODE: ${SAG_AUTH_MODE:-local}
       SAG_ALLOW_REGISTRATION: ${SAG_ALLOW_REGISTRATION:-false}
-      # Laya routing is local to the API process; mount a checkpoint directory
-      # and set SAG_LAYA_MODEL_PATH when running fully offline.
-      SAG_ENABLE_LAYA: ${SAG_ENABLE_LAYA:-true}
-      SAG_LAYA_MODEL_PATH: ${SAG_LAYA_MODEL_PATH:-}
-      SAG_LAYA_DEVICE: ${SAG_LAYA_DEVICE:-}
+      SAG_DECISION_PROVIDER: ${SAG_DECISION_PROVIDER:-siliconflow}
+      SAG_DECISION_MODEL: ${SAG_DECISION_MODEL:-Kev-4b}
+      SAG_SILICONFLOW_API_KEY: ${SAG_SILICONFLOW_API_KEY:-}
       # API 仍仅绑定宿主 loopback；允许容器识别经 Docker 网关转发的本机发现请求。
       SAG_DSH_LOCAL_DISCOVERY: ${SAG_DSH_LOCAL_DISCOVERY:-true}
       SAG_DSH_LOCAL_DISCOVERY_BIND_ADDRESS: ${BIND_ADDRESS:-127.0.0.1}
@@ -139,7 +135,7 @@ services:
       api:
         condition: service_healthy
     ports:
-      - "${BIND_ADDRESS:-127.0.0.1}:${WEB_PORT:-3000}:3000"
+      - "${BIND_ADDRESS:-127.0.0.1}:${WEB_PORT:-3002}:3000"
     healthcheck:
       test:
         - CMD

@@ -189,7 +189,7 @@ docker compose up -d --build
 
 启动应用不需要提前准备 API Key、Python、Node 或外部数据库。两个服务健康后打开：
 
-- Web 应用：[http://localhost:3000](http://localhost:3000)
+- Web 应用：[http://localhost:3002](http://localhost:3002)
 - API 文档：[http://localhost:8000/docs](http://localhost:8000/docs)
 
 首次使用：
@@ -431,7 +431,7 @@ uvicorn sag_api.main:app --reload
 ```
 
 ```bash
-# 终端 2：Web，地址 http://localhost:3000
+# 终端 2：Web，地址 http://localhost:3002
 cd apps/web
 npm install
 npm run dev

@@ -1360,6 +1360,21 @@
       "relatedEvents": "关联事件",
       "relatedEntities": "关联实体"
     },
+    "tree": {
+      "empty": "当前授权数据中没有活动的 Project 树。",
+      "building": "正在根据已索引的 SAG 数据构建 Universe 树…",
+      "stale": "Universe 树与 SAG 数据不同步，需要重新构建。",
+      "failed": "活动 Project 树未通过完整性校验。",
+      "project": "Project",
+      "nodes": "节点",
+      "units": "单元",
+      "sources": "来源",
+      "routed": "已路由节点",
+      "branches": "分支",
+      "expand": "展开分支",
+      "collapse": "折叠分支",
+      "overview": "{projects, number} 个 Project · {nodes, number} 个节点 · {units} 个单元"
+    },
     "loadProgress": {
       "rowAria": "{label}加载进度",
       "complete": "已探索完整个时间范围，当前视图保持稳定",

@@ -545,9 +545,13 @@ def build_routing_snapshot(
         "cohesion": cohesion >= config.min_cohesion,
         "edge_cut": edge_cut <= config.max_edge_cut,
         "giant_ratio": largest_group_ratio <= config.max_giant_ratio,
-        "routing_recall": recall is not None and recall >= config.min_routing_recall_at_k,
-        "acl_partition_isolation": acl_leakage_rate == 0.0,
-        "acl_blackhole": acl_blackhole_rate == 0.0,
+        "routing_recall": (
+            recall >= config.min_routing_recall_at_k
+            if recall is not None
+            else config.min_routing_recall_at_k == 0
+        ),
+        "acl_partition_isolation": acl_leakage_rate == 0.0 if acl_leakage_rate is not None else True,
+        "acl_blackhole": acl_blackhole_rate == 0.0 if acl_blackhole_rate is not None else True,
         "tree_integrity": _tree_integrity(roots, set(unit_map)),
         "cluster_constraints": all(
             len(node.children) <= config.max_children

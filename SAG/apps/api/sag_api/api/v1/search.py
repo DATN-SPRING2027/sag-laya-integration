@@ -41,7 +41,7 @@ from sag_api.schemas.search import (
     SectionOut,
 )
 from sag_api.services.eval.llm_judge import judge_pairwise
-from sag_api.services.laya_router import CHAT_HIGH_CONFIDENCE, route_query
+from sag_api.services.decision_router import CHAT_HIGH_CONFIDENCE, route_query
 from sag_api.services.query_analysis import analyze_query
 from sag_api.services.query_strategy_planner import QueryStrategyPlan, plan_query
 from sag_api.services.retrieval_service import (
@@ -104,9 +104,9 @@ async def _build_query_route(
     strategy_plan = plan_query(query, requested_mode=requested_retrieval_mode, features=analysis.features)
     route_error = False
     try:
-        laya = await asyncio.to_thread(route_query, query)
-    except Exception:  # noqa: BLE001 - Laya must never break retrieval
-        laya = {
+        decision = await asyncio.to_thread(route_query, query)
+    except Exception:  # noqa: BLE001 - Decision Router must never break retrieval
+        decision = {
             "coarse_intent": "AMBIGUOUS",
             "is_chitchat": False,
             "need_retrieval": True,
@@ -114,21 +114,21 @@ async def _build_query_route(
             "confidence": 0.0,
             "model": "fallback",
             "fallback_used": True,
-            "fallback_reason": "laya_route_error",
-            "reason_codes": ["LAYA_ROUTE_ERROR"],
+            "fallback_reason": "decision_route_error",
+            "reason_codes": ["DECISION_ROUTE_ERROR"],
         }
         route_error = True
 
-    confidence = laya.get("confidence", 0.0)
+    confidence = decision.get("confidence", 0.0)
     try:
         confidence = max(0.0, min(1.0, float(confidence)))
     except (TypeError, ValueError):
         confidence = 0.0
-    coarse_intent = str(laya.get("coarse_intent") or "").upper()
+    coarse_intent = str(decision.get("coarse_intent") or "").upper()
     if not coarse_intent:
-        if bool(laya.get("is_chitchat")) and confidence >= CHAT_HIGH_CONFIDENCE:
+        if bool(decision.get("is_chitchat")) and confidence >= CHAT_HIGH_CONFIDENCE:
             coarse_intent = "CHAT"
-        elif bool(laya.get("need_retrieval", True)):
+        elif bool(decision.get("need_retrieval", True)):
             coarse_intent = "KNOWLEDGE"
         else:
             coarse_intent = "AMBIGUOUS"
@@ -139,18 +139,18 @@ async def _build_query_route(
     need_retrieval = coarse_intent != "CHAT"
 
     configured_strategy = normalize_search_strategy(settings.search_strategy)
-    suggested_strategy = normalize_search_strategy(str(laya.get("suggested_strategy") or configured_strategy))
+    suggested_strategy = normalize_search_strategy(str(decision.get("suggested_strategy") or configured_strategy))
     if suggested_strategy not in SEARCH_STRATEGIES:
         suggested_strategy = configured_strategy if configured_strategy in SEARCH_STRATEGIES else "vector"
     effective_strategy = normalize_search_strategy(requested_strategy or suggested_strategy)
     if effective_strategy not in SEARCH_STRATEGIES:
         effective_strategy = configured_strategy if configured_strategy in SEARCH_STRATEGIES else "vector"
 
-    fallback_used = bool(laya.get("fallback_used")) or route_error
-    fallback_reason = laya.get("fallback_reason")
+    fallback_used = bool(decision.get("fallback_used")) or route_error
+    fallback_reason = decision.get("fallback_reason")
     if route_error:
-        fallback_reason = "laya_route_error"
-    reason_codes = [str(value) for value in (laya.get("reason_codes") or [])]
+        fallback_reason = "decision_route_error"
+    reason_codes = [str(value) for value in (decision.get("reason_codes") or [])]
     if requested_strategy:
         reason_codes.append("EXPLICIT_STRATEGY")
     reason_codes.extend(code for code in _query_feature_reason_codes(analysis.features) if code not in reason_codes)
@@ -160,7 +160,7 @@ async def _build_query_route(
         "scope_source_ids": list(source_ids) if source_ids is not None else None,
         "coarse_intent": coarse_intent,
         "confidence": round(confidence, 4),
-        "model": laya.get("model", "fallback"),
+        "model": decision.get("model", "fallback"),
         "suggested_strategy": suggested_strategy,
         "requested_strategy": requested_strategy or "auto",
         "effective_strategy": effective_strategy,

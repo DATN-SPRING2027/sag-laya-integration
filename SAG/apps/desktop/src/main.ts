@@ -254,7 +254,7 @@ function createMainWindow(webUrl: string): BrowserWindow {
 async function bootstrap(): Promise<void> {
   splashWindow = createSplashWindow();
   const devWebUrl =
-    process.env.SAG_DESKTOP_DEV_WEB_URL || "http://127.0.0.1:3000";
+    process.env.SAG_DESKTOP_DEV_WEB_URL || "http://127.0.0.1:3002";
   try {
     runtime = app.isPackaged
       ? await startPackagedRuntime()
