@@ -6,10 +6,9 @@ function tokenKey(): string {
   return tokenCookieName(window.location.host);
 }
 
-export function setToken(token: string) {
+export function setToken(token: string, maxAgeSeconds = 60 * 60 * 24 * 7) {
   if (typeof document === "undefined") return;
-  // 7 天，SameSite=Lax
-  document.cookie = `${tokenKey()}=${token}; path=/; max-age=${60 * 60 * 24 * 7}; SameSite=Lax`;
+  document.cookie = `${tokenKey()}=${token}; path=/; max-age=${maxAgeSeconds}; SameSite=Lax`;
 }
 
 export function getToken(): string | null {

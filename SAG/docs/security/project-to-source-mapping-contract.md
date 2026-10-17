@@ -4,13 +4,21 @@
 > schema/migration or confirmed legacy mapping is implied by this document.
 >
 > **Date:** 2026-09-30
-> **Boundary:** BE/Continuum owns identity and Project authorization. SAG owns
-> Source metadata and the authoritative mapping from a Source to its Project.
+> **Boundary:** BE/Continuum owns identity, Project authorization, and the
+> decision to assign a Source to a Project. SAG stores the resulting opaque
+> Project ID as data-scope metadata; it does not own BE Projects or memberships.
+> For the selected integrated user flow, see [BE–SAG IAM Integration Decision](be-iam-integration-decision.md).
+
+> **Integrated-flow note:** The `allowed_project_ids` assertion model below
+> describes the current direct-to-SAG ACL implementation. In the BE-BFF flow,
+> BE validates the user and selected Project; SAG receives that scope from its
+> authenticated BE service caller and uses the Source association only to
+> filter SAG data.
 
 ## 1. Purpose and invariants
 
-This contract defines how a verified principal's `allowed_project_ids` become
-the exact Source scope SAG may search or read. It does not add independent
+This contract defines how a BE-authorized Project ID becomes the exact Source
+scope SAG may search or read. It does not add independent
 Document or Document-version ACL in P1/P4. Documents, versions, chunks, events,
 entities, and derived evidence inherit authorization from their owning Source.
 
@@ -26,8 +34,8 @@ The Project-to-Source mapping and every consumer must preserve:
 
 | Data | Authority/source of truth | SAG responsibility |
 |---|---|---|
-| User, Organization, Project, membership and Project authorization | Continuum/BE | Verify the signed decision; do not join BE MongoDB or infer roles. |
-| SAG Source, Document, job, storage and index lineage | SAG PostgreSQL and SAG-owned stores | Maintain the Source's confirmed Project mapping and inherit its scope for children. |
+| User, Organization, Project, membership and Project authorization | Continuum/BE | Decide access; SAG does not create or infer users, memberships, or roles. |
+| SAG Source, Document, job, storage and index lineage | SAG PostgreSQL and SAG-owned stores | Store the BE-authorized Project ID with the Source and inherit its data scope for children. |
 | Project IDs in the SAG mapping | Opaque external IDs issued by BE | Compare exact ID and `org_id`; do not create a fake FK to a Project table that SAG does not own. |
 | Qdrant/vector payload | Retrieval accelerator | Never treat a payload as authority or as the only mapping source. |
 
@@ -55,7 +63,7 @@ Logical mapping states:
 |---|---|---|
 | `UNMAPPED` | No mapping exists | No |
 | `PENDING` | A mapping was proposed/imported but not confirmed by the trusted mapping workflow | No |
-| `CONFIRMED` | Exactly one validated `(org_id, project_id)` assignment is active | Yes, only for assertions whose `org_id` matches and whose `allowed_project_ids` contains `project_id` |
+| `CONFIRMED` | Exactly one BE-authorized `(org_id, project_id)` assignment is active | Yes, only when the verified request scope contains that Project ID |
 | `REVOKED` | A previously confirmed mapping was revoked or replaced; retain audit history | No |
 
 `Source.status`/ingestion readiness is independent from mapping state. A

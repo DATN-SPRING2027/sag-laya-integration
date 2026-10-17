@@ -22,6 +22,7 @@ from sag_api.core.principal_assertion import (
 )
 from sag_api.core.principal_assertion import (
     require_principal_assertion,
+    require_project_read_principal,
 )
 from sag_api.core.security import decode_token
 from sag_api.db.models import User
@@ -36,7 +37,7 @@ _AuthKind = Literal["jwt", "connector"]
 
 
 def _require_matching_auth_mode(payload: dict) -> None:
-    if settings.auth_mode == "password" and payload.get("auth_mode") != "password":
+    if settings.auth_mode in {"password", "continuum"} and payload.get("auth_mode") != settings.auth_mode:
         raise AuthError("Chế độ xác thực đã thay đổi, vui lòng đăng nhập lại")
 
 
@@ -210,12 +211,11 @@ async def get_verified_principal(
     return principal
 
 
-async def require_path_source_access(
+async def _resolve_path_source_access(
     request: Request,
-    principal: AssertionVerifiedPrincipal = Depends(require_principal_assertion),
-    session: AsyncSession = Depends(get_session),
+    principal: AssertionVerifiedPrincipal,
+    session: AsyncSession,
 ):
-    """Authorize the route's Source before a handler reads metadata or evidence."""
     from sag_api.core.errors import NotFoundError
     from sag_api.services.source_service import get_authorized_source
 
@@ -238,3 +238,16 @@ async def require_path_source_access(
         if document is None:
             raise NotFoundError("Document not found")
     return source
+
+
+async def require_path_source_access(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+):
+    """Use the scoped session for GETs; mutations still require a BE assertion."""
+    principal = (
+        await require_project_read_principal(request)
+        if request.method == "GET"
+        else await require_principal_assertion(request)
+    )
+    return await _resolve_path_source_access(request, principal, session)

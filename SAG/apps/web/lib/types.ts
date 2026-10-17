@@ -16,7 +16,7 @@ export interface TokenResponse {
   user: User;
 }
 
-export type AuthMode = "local" | "password";
+export type AuthMode = "local" | "password" | "continuum";
 
 export interface AuthStatus {
   mode: AuthMode;

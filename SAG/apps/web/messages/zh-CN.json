@@ -114,6 +114,13 @@
     "passwordPlaceholder": "输入密码",
     "register": "创建账号",
     "submit": "登录",
+    "continueWithContinuum": "使用 Continuum 继续",
+    "continuumDescription": "使用 Continuum 账户登录 SAG。",
+    "continuumUnavailable": "尚未配置 Continuum 登录。",
+      "selectProjectTitle": "选择 Project",
+      "selectProjectDescription": "SAG 将使用你在 Continuum 中有权访问的 Project。",
+      "noAccessibleProjects": "此组织中没有可访问的 Project。",
+      "projectSelectionFailed": "无法继续使用此 Project。请重新登录后再试。",
     "submitting": "正在登录",
     "welcome": "欢迎回来，{name}",
     "failed": "登录失败，请稍后重试"

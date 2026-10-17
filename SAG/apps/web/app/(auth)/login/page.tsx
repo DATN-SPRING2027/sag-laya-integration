@@ -26,6 +26,7 @@ export default function LaunchPage() {
   const [authStatus, setAuthStatus] = React.useState<AuthStatus | null>(null);
   const [statusFailed, setStatusFailed] = React.useState(false);
   const [loading, setLoading] = React.useState(false);
+  const autoSsoStarted = React.useRef(false);
 
   const loadAuthStatus = React.useCallback(async () => {
     setStatusFailed(false);
@@ -63,6 +64,33 @@ export default function LaunchPage() {
       setLoading(false);
     }
   }
+
+  const continueWithContinuum = React.useCallback(() => {
+    const configuredUrl = process.env.NEXT_PUBLIC_CONTINUUM_SSO_URL;
+    if (!configuredUrl) {
+      toast.error(t("continuumUnavailable"));
+      return;
+    }
+    try {
+      const url = new URL(configuredUrl);
+      if (url.protocol !== "http:" && url.protocol !== "https:") {
+        throw new Error("Invalid sign-in URL");
+      }
+      const state = window.crypto.randomUUID();
+      window.sessionStorage.setItem("sag-continuum-sso-state", state);
+      url.searchParams.set("state", state);
+      window.location.assign(url.toString());
+    } catch {
+      toast.error(t("continuumUnavailable"));
+    }
+  }, [t]);
+
+  React.useEffect(() => {
+    if (authStatus?.mode !== "continuum" || autoSsoStarted.current) return;
+    autoSsoStarted.current = true;
+    if (new URLSearchParams(window.location.search).has("sso")) return;
+    continueWithContinuum();
+  }, [authStatus, continueWithContinuum]);
 
   return (
     <main className="relative flex min-h-[100svh] w-full flex-col px-5 py-5 sm:px-9 sm:py-7">
@@ -102,6 +130,21 @@ export default function LaunchPage() {
             {!authStatus ? (
               <div className="py-4 text-center text-sm text-muted-foreground">
                 {statusFailed ? t("statusFailed") : t("loading")}
+              </div>
+            ) : authStatus.mode === "continuum" ? (
+              <div className="flex flex-col gap-4 py-2 text-center">
+                <p className="text-sm leading-6 text-muted-foreground">
+                  {t("continuumDescription")}
+                </p>
+                <Button
+                  type="button"
+                  size="lg"
+                  onClick={() => continueWithContinuum()}
+                  className="w-full"
+                >
+                  <ArrowRight className="size-4" />
+                  {t("continueWithContinuum")}
+                </Button>
               </div>
             ) : authStatus.mode === "local" ? (
               <Field>
@@ -167,23 +210,25 @@ export default function LaunchPage() {
                 {t("retry")}
               </Button>
             ) : null}
-            <Button
-              type="submit"
-              size="lg"
-              disabled={
-                loading ||
-                !authStatus ||
-                (authStatus.mode === "local" ? !name.trim() : !email.trim() || !password)
-              }
-              className="mt-1 w-full"
-            >
-              {loading ? <Spinner /> : <ArrowRight className="size-4" />}
-              {loading
-                ? t("submitting")
-                : authStatus?.registration_required
-                  ? t("register")
-                  : t("submit")}
-            </Button>
+            {authStatus?.mode !== "continuum" && (
+              <Button
+                type="submit"
+                size="lg"
+                disabled={
+                  loading ||
+                  !authStatus ||
+                  (authStatus.mode === "local" ? !name.trim() : !email.trim() || !password)
+                }
+                className="mt-1 w-full"
+              >
+                {loading ? <Spinner /> : <ArrowRight className="size-4" />}
+                {loading
+                  ? t("submitting")
+                  : authStatus?.registration_required
+                    ? t("register")
+                    : t("submit")}
+              </Button>
+            )}
           </form>
         </div>
       </section>

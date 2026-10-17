@@ -114,6 +114,13 @@
     "passwordPlaceholder": "Enter your password",
     "register": "Create account",
     "submit": "Sign in",
+    "continueWithContinuum": "Continue with Continuum",
+    "continuumDescription": "Use your Continuum account to sign in to SAG.",
+    "continuumUnavailable": "Continuum sign-in is not configured.",
+      "selectProjectTitle": "Choose a Project",
+      "selectProjectDescription": "SAG will use the Project you can access in Continuum.",
+      "noAccessibleProjects": "No accessible Projects were found for this organization.",
+      "projectSelectionFailed": "Could not continue with this Project. Return to sign in and try again.",
     "submitting": "Signing in",
     "welcome": "Welcome back, {name}",
     "failed": "Sign-in failed. Please try again later."

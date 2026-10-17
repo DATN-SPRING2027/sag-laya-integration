@@ -6,6 +6,18 @@
 **Authority:** BE/Continuum resolves principal and Project access. SAG verifies
 the signed assertion and owns the confirmed Project→Source mapping.
 
+> **BE integration direction:** This plan records the current assertion-based
+> ACL runtime. The selected integrated user flow is described in [BE–SAG IAM
+> Integration Decision](../docs/security/be-iam-integration-decision.md): BE
+> owns user sessions and Project authorization, and its BFF calls SAG through
+> service authentication. Do not add a BE per-user assertion signer/JWKS path
+> for that flow. Existing assertion routes remain a separate current runtime
+> boundary until the selected document endpoints are migrated.
+
+The local first slice now covers only project-scoped document-version status
+reads. This change adds no upload route or document-write permission; the SAG
+web client and other API routes have not moved to the BE BFF.
+
 ## Plan and current result
 
 | Step | Work | State |

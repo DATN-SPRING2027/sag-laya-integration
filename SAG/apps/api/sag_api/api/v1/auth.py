@@ -1,29 +1,38 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+import re
+import secrets
+
+from fastapi import APIRouter, Depends, Request, Response
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.config import settings
 from sag_api.core.db import get_session
 from sag_api.core.deps import get_current_user
-from sag_api.core.errors import ForbiddenError
+from sag_api.core.errors import ForbiddenError, ValidationError
+from sag_api.core.principal_assertion import require_bff_service_token, required_bff_header
 from sag_api.core.security import create_access_token
 from sag_api.db.models import User
 from sag_api.schemas.auth import LoginRequest, RegisterRequest, TokenResponse, UserOut
-from sag_api.services.auth_service import authenticate, authenticate_or_register, register_user
+from sag_api.services.auth_service import (
+    authenticate,
+    authenticate_or_register,
+    get_or_create_continuum_user,
+    register_user,
+)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 @router.get("/status")
 async def auth_status(session: AsyncSession = Depends(get_session)) -> dict[str, bool | str]:
+    if settings.auth_mode == "continuum":
+        return {"mode": "continuum", "registration_required": False, "registration_open": False}
     if settings.auth_mode == "local":
         return {"mode": "local", "registration_required": False, "registration_open": False}
 
-    credential_count = await session.scalar(
-        select(func.count()).select_from(User).where(User.email != "")
-    ) or 0
+    credential_count = await session.scalar(select(func.count()).select_from(User).where(User.email != "")) or 0
     registration_required = credential_count == 0
     return {
         "mode": "password",
@@ -45,6 +54,8 @@ async def login(
     body: LoginRequest,
     session: AsyncSession = Depends(get_session),
 ) -> TokenResponse:
+    if settings.auth_mode == "continuum":
+        raise ForbiddenError("Sign in through Continuum")
     if settings.auth_mode == "password":
         user = await authenticate(session, email=body.email, password=body.password or "")
     else:
@@ -57,6 +68,40 @@ async def login(
             exact_existing=False,
         )
     return TokenResponse(access_token=create_access_token(user.id), user=UserOut.model_validate(user))
+
+
+@router.post("/continuum-login", response_model=TokenResponse)
+async def continuum_login(
+    request: Request,
+    response: Response,
+    session: AsyncSession = Depends(get_session),
+) -> TokenResponse:
+    response.headers["Cache-Control"] = "no-store"
+    await require_bff_service_token(request)
+    subject = required_bff_header(request, "X-Continuum-User-Id", max_length=32)
+    name = required_bff_header(request, "X-Continuum-Name", max_length=120)
+    organization_id = required_bff_header(request, "X-Continuum-Organization-Id", max_length=64)
+    project_id = required_bff_header(request, "X-Continuum-Project-Id", max_length=64)
+    if not re.fullmatch(r"[a-fA-F0-9]{24}", subject):
+        raise ValidationError("Continuum user ID is invalid")
+    user = await get_or_create_continuum_user(
+        session,
+        subject=subject,
+        name=name,
+    )
+    return TokenResponse(
+        access_token=create_access_token(
+            user.id,
+            extra={
+                "org_id": organization_id,
+                "tenant_id": organization_id,
+                "project_id": project_id,
+                "security_partition": project_id,
+                "jti": secrets.token_urlsafe(24),
+            },
+        ),
+        user=UserOut.model_validate(user),
+    )
 
 
 @router.get("/me", response_model=UserOut)

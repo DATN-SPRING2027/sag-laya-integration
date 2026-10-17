@@ -35,11 +35,16 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 def create_access_token(subject: str, extra: dict[str, Any] | None = None) -> str:
     now = datetime.now(UTC)
+    lifetime_minutes = (
+        min(settings.access_token_expire_minutes, 15)
+        if settings.auth_mode == "continuum"
+        else settings.access_token_expire_minutes
+    )
     payload: dict[str, Any] = {
         "sub": subject,
         "auth_mode": settings.auth_mode,
         "iat": now,
-        "exp": now + timedelta(minutes=settings.access_token_expire_minutes),
+        "exp": now + timedelta(minutes=lifetime_minutes),
     }
     if extra:
         payload.update(extra)

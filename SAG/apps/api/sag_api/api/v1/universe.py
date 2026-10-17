@@ -14,7 +14,11 @@ from sag_api.core.config import settings
 from sag_api.core.db import get_session
 from sag_api.core.deps import get_current_user, get_engine_manager, get_job_queue
 from sag_api.core.errors import NotFoundError, ServiceUnavailableError
-from sag_api.core.principal_assertion import VerifiedPrincipal, require_principal_assertion
+from sag_api.core.principal_assertion import (
+    VerifiedPrincipal,
+    require_principal_assertion,
+    require_project_read_principal,
+)
 from sag_api.db.models import (
     ProjectSearchState,
     Source,
@@ -75,7 +79,7 @@ def _failed_manifest() -> UniverseManifestOut:
 async def manifest(
     session: AsyncSession = Depends(get_session),
     user: User = Depends(get_current_user),
-    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
 ) -> UniverseManifestOut:
     del user
     if not principal.allowed_project_ids or not principal.tenant_id or not principal.allowed_partition_ids:
@@ -480,7 +484,7 @@ async def node_detail(
     node_id: str,
     source_id: str = Query(min_length=1, max_length=64),
     _user: User = Depends(get_current_user),
-    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
 ) -> UniverseNodeDetailOut:
@@ -519,7 +523,7 @@ async def rebuild(
 async def explorations(
     limit: int = Query(20, ge=1, le=100),
     user: User = Depends(get_current_user),
-    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
     session: AsyncSession = Depends(get_session),
 ) -> list[ExplorationSessionOut]:
     rows = await list_explorations(session, user.id, limit=limit)
@@ -557,7 +561,7 @@ async def explorations(
 async def exploration_detail(
     exploration_id: str,
     user: User = Depends(get_current_user),
-    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
     session: AsyncSession = Depends(get_session),
 ) -> ExplorationDetailOut:
     item, steps = await get_exploration(session, user.id, exploration_id)

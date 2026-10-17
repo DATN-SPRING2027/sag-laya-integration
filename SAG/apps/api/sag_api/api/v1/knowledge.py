@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sag_api.core.db import get_session
 from sag_api.core.deps import get_current_user, get_engine_manager, require_path_source_access
 from sag_api.core.errors import ForbiddenError, NotFoundError, ValidationError
-from sag_api.core.principal_assertion import VerifiedPrincipal, require_principal_assertion
+from sag_api.core.principal_assertion import VerifiedPrincipal, require_project_read_principal
 from sag_api.db.models import User
 from sag_api.sag import EngineManager
 from sag_api.schemas.chunk import (
@@ -33,7 +33,7 @@ async def outline(
     source_id: str,
     document_id: str = Query(min_length=1),
     _user: User = Depends(get_current_user),
-    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
 ) -> OutlineOut:
@@ -65,7 +65,7 @@ async def grep(
     pattern: str = Query(min_length=1),
     limit: int = Query(default=20, ge=1, le=100),
     _user: User = Depends(get_current_user),
-    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
 ) -> GrepResponse:
@@ -116,7 +116,7 @@ async def read(
     offset: int = Query(default=1, ge=1),
     limit: int = Query(default=120, ge=1, le=500),
     _user: User = Depends(get_current_user),
-    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
     session: AsyncSession = Depends(get_session),
 ) -> ReadResponse:
     """按行分页读取原始文件。"""
