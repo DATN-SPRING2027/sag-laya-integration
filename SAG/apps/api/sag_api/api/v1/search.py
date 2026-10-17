@@ -21,7 +21,7 @@ from sag_api.core.deps import (
 from sag_api.core.error_taxonomy import ErrorCode
 from sag_api.core.errors import ApiError, ValidationError
 from sag_api.core.logging import get_logger
-from sag_api.core.principal_assertion import VerifiedPrincipal, require_principal_assertion
+from sag_api.core.principal_assertion import VerifiedPrincipal, require_project_read_principal
 from sag_api.db.models import Source, User
 from sag_api.enums import SEARCH_STRATEGIES, normalize_search_strategy
 from sag_api.generation import LLMClient
@@ -40,8 +40,8 @@ from sag_api.schemas.search import (
     SearchSourceHitOut,
     SectionOut,
 )
-from sag_api.services.eval.llm_judge import judge_pairwise
 from sag_api.services.decision_router import CHAT_HIGH_CONFIDENCE, route_query
+from sag_api.services.eval.llm_judge import judge_pairwise
 from sag_api.services.query_analysis import analyze_query
 from sag_api.services.query_strategy_planner import QueryStrategyPlan, plan_query
 from sag_api.services.retrieval_service import (
@@ -470,7 +470,7 @@ async def search(
     source_id: str,
     body: SearchRequest,
     _user: User = Depends(get_current_user),
-    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
     llm: LLMClient = Depends(get_llm),
@@ -575,7 +575,7 @@ async def global_search(
     request: Request,
     body: GlobalSearchRequest,
     _user: User = Depends(get_current_user_or_connector),
-    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
     llm: LLMClient = Depends(get_llm),
@@ -609,7 +609,7 @@ async def global_search(
 async def global_search_stream(
     body: GlobalSearchRequest,
     user: User = Depends(get_current_user),
-    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
     llm: LLMClient = Depends(get_llm),
@@ -738,7 +738,7 @@ async def _run_one_strategy(
 async def eval_compare(
     body: EvalCompareRequest,
     _user: User = Depends(get_current_user),
-    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
     llm: LLMClient = Depends(get_llm),

@@ -45,8 +45,8 @@ class Settings(BaseSettings):
     debug: bool = True
     secret_key: str = "dev-insecure-secret-change-me-in-production-0123456789"
     access_token_expire_minutes: int = 60 * 24 * 7  # 7 天
-    # local 保留单机名字身份；password 强制邮箱密码认证。
-    auth_mode: Literal["local", "password"] = "local"
+    # continuum delegates interactive sign-in to Continuum; local/password are standalone modes.
+    auth_mode: Literal["local", "password", "continuum"] = "local"
     # 业务展示时区；数据库与 API 时间戳始终使用 UTC。
     timezone: str = "Asia/Shanghai"
     # NoDecode 让逗号分隔值先进入下方 validator，避免 settings 源强制按 JSON 解码。
@@ -65,6 +65,8 @@ class Settings(BaseSettings):
     principal_assertion_clock_skew_seconds: int = Field(default=5, ge=0, le=30)
     principal_assertion_jwks_cache_ttl_seconds: int = Field(default=60, ge=1, le=60)
     principal_assertion_max_project_ids: int = Field(default=256, ge=1, le=4096)
+    # Shared only between Continuum BE and this API for project-scoped BFF calls.
+    bff_service_token: str | None = None
     # 供桌面端启动时写入本地 DSH 连接文件的公开地址与可选文件位置。
     dsh_public_url: str = "http://127.0.0.1:8000"
     dsh_connection_file: str | None = None
@@ -347,6 +349,17 @@ class Settings(BaseSettings):
         ):
             raise ValueError("principal_assertion_jwks_url must be a fixed HTTPS URL without credentials")
         return normalized
+
+    @field_validator("bff_service_token")
+    @classmethod
+    def _validate_bff_service_token(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value.strip():
+            return None
+        if not value or value != value.strip() or len(value) < 32:
+            raise ValueError("bff_service_token must contain at least 32 non-padded characters")
+        return value
 
     @field_validator("dsh_public_url")
     @classmethod

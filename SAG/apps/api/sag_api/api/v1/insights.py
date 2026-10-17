@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sag_api.core.db import get_session
 from sag_api.core.deps import get_current_user, get_engine_manager, require_path_source_access
 from sag_api.core.errors import ForbiddenError
-from sag_api.core.principal_assertion import VerifiedPrincipal, require_principal_assertion
+from sag_api.core.principal_assertion import VerifiedPrincipal, require_project_read_principal
 from sag_api.db.models import User
 from sag_api.sag import EngineManager
 from sag_api.schemas.insight import EntityOut, SourceGraphOut
@@ -26,7 +26,7 @@ async def entities(
     types: str | None = None,
     limit: int = 100,
     _user: User = Depends(get_current_user),
-    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
 ) -> list[EntityOut]:
@@ -46,7 +46,7 @@ async def graph(
     entity_limit: int = Query(default=1_000, ge=1, le=10_000),
     document_ids: list[str] | None = Query(default=None, max_length=1_000),
     _user: User = Depends(get_current_user),
-    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
 ) -> SourceGraphOut:

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import secrets
+
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.errors import AuthError, ConflictError, ForbiddenError, ValidationError
@@ -23,10 +26,9 @@ async def register_user(session: AsyncSession, *, email: str, password: str, nam
     if existing is not None:
         raise ConflictError("Email này đã được đăng ký")
 
-    # Danh tính chỉ có tên cục bộ không được xem là tài khoản mật khẩu; vẫn cho phép tạo thông tin đăng nhập chính thức đầu tiên khi chuyển sang chế độ password.
-    credential_count = await session.scalar(
-        select(func.count()).select_from(User).where(User.email != "")
-    ) or 0
+    # Danh tính chỉ có tên cục bộ chưa phải tài khoản mật khẩu; vẫn cho phép
+    # tạo credential đầu tiên khi chuyển sang password mode.
+    credential_count = await session.scalar(select(func.count()).select_from(User).where(User.email != "")) or 0
     if credential_count > 0 and not settings.allow_registration:
         raise ForbiddenError("Đăng ký đã bị đóng")
 
@@ -70,13 +72,9 @@ async def authenticate_or_register(
     else:
         user = None
         if name:
-            user = await session.scalar(
-                select(User).where(User.name == name).order_by(User.created_at.asc()).limit(1)
-            )
+            user = await session.scalar(select(User).where(User.name == name).order_by(User.created_at.asc()).limit(1))
         if user is None and not exact_existing:
-            user = await session.scalar(
-                select(User).order_by(User.created_at.asc()).limit(1)
-            )
+            user = await session.scalar(select(User).order_by(User.created_at.asc()).limit(1))
             rename_local_user = user is not None and bool(name) and user.name != name
 
     if user is not None:
@@ -103,6 +101,50 @@ async def authenticate_or_register(
     )
     session.add(user)
     await session.commit()
+    await session.refresh(user)
+    return user
+
+
+async def get_or_create_continuum_user(
+    session: AsyncSession,
+    *,
+    subject: str,
+    name: str,
+) -> User:
+    from sag_api.core.config import settings
+
+    if settings.auth_mode != "continuum":
+        raise ForbiddenError("Continuum sign-in is not enabled")
+    synthetic_email = f"continuum-{subject}@sag.invalid"
+    user = await session.get(User, subject)
+    if user is None:
+        user = User(
+            id=subject,
+            email=synthetic_email,
+            password_hash=_password_hash(secrets.token_urlsafe(32)),
+            name=name,
+        )
+        session.add(user)
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            user = await session.get(User, subject)
+            if user is None:
+                user = await session.scalar(select(User).where(User.email == synthetic_email))
+            if user is None:
+                raise
+            if user.id != subject or user.email != synthetic_email:
+                raise ConflictError("Continuum identity conflicts with an existing SAG user") from None
+            if not user.is_active:
+                raise ForbiddenError("Tài khoản đã bị vô hiệu hóa") from None
+    elif user.email != synthetic_email:
+        raise ConflictError("Continuum identity conflicts with an existing SAG user")
+    elif not user.is_active:
+        raise ForbiddenError("Tài khoản đã bị vô hiệu hóa")
+    else:
+        user.name = name
+        await session.commit()
     await session.refresh(user)
     return user
 

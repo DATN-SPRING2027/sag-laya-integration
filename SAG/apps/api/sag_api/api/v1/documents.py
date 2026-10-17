@@ -30,7 +30,12 @@ from sag_api.core.error_taxonomy import ErrorLayer, ErrorStage
 from sag_api.core.errors import ApiError, ConflictError, ForbiddenError, NotFoundError, ValidationError
 from sag_api.core.identity import VerifiedPrincipal as LocalVerifiedPrincipal
 from sag_api.core.logging import get_logger
-from sag_api.core.principal_assertion import VerifiedPrincipal, require_principal_assertion
+from sag_api.core.principal_assertion import (
+    VerifiedPrincipal,
+    require_principal_assertion,
+    require_project_bff_principal,
+    require_project_read_principal,
+)
 from sag_api.db.models import Document, User
 from sag_api.enums import DocumentStatus
 from sag_api.jobs import JobQueue
@@ -194,7 +199,7 @@ def _verify_mime_signature(filename: str, file_bytes: bytes) -> None:
 async def list_(
     source_id: str,
     _user: User = Depends(get_current_user_or_connector),
-    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
     session: AsyncSession = Depends(get_session),
 ) -> list[DocumentOut]:
     source = await get_source(session, source_id)
@@ -349,7 +354,7 @@ async def get_(
     source_id: str,
     document_id: str,
     _user: User = Depends(get_current_user_or_connector),
-    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
     session: AsyncSession = Depends(get_session),
 ) -> DocumentOut:
     source = await get_source(session, source_id)
@@ -363,7 +368,7 @@ async def get_file(
     source_id: str,
     document_id: str,
     _user: User = Depends(get_current_user),
-    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
     session: AsyncSession = Depends(get_session),
 ):
     """Original file (preview/download). Returns 404 when file has been cleaned up."""
@@ -392,7 +397,7 @@ async def get_preview(
     source_id: str,
     document_id: str,
     _user: User = Depends(get_current_user),
-    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
     session: AsyncSession = Depends(get_session),
 ):
     """Return preview directly consumable by browser; text is normalized to UTF-8 while download preserves raw bytes."""
@@ -429,7 +434,7 @@ async def get_parsed(
     source_id: str,
     document_id: str,
     _user: User = Depends(get_current_user),
-    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
 ):
@@ -616,7 +621,7 @@ async def query_document_version_status(
     project_id: str,
     document_id: str,
     version_no: int,
-    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_project_bff_principal),
     session: AsyncSession = Depends(get_session),
 ) -> DocumentVersionStatusResponse:
     if project_id not in principal.allowed_project_ids or not principal.tenant_id:

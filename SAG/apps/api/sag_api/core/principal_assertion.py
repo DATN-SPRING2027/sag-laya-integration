@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -18,6 +19,7 @@ from starlette.requests import Request
 from sag_api.core.config import settings
 from sag_api.core.errors import AuthError, ForbiddenError, ServiceUnavailableError
 from sag_api.core.logging import get_logger
+from sag_api.core.security import decode_token
 
 log = get_logger("security.principal_assertion")
 MAX_ASSERTION_BYTES = 16 * 1024
@@ -25,6 +27,7 @@ MAX_JWKS_BYTES = 256 * 1024
 MAX_JWKS_KEYS = 256
 JWKS_FETCH_TIMEOUT_SECONDS = 3.0
 UNKNOWN_KID_REFRESH_COOLDOWN_SECONDS = 1
+MAX_CONTINUUM_SESSION_SECONDS = 15 * 60
 _PRIVATE_RSA_JWK_MEMBERS = frozenset({"d", "p", "q", "dp", "dq", "qi", "oth"})
 _FORBIDDEN_SCOPE_ALIASES = frozenset(
     {
@@ -395,3 +398,121 @@ async def require_principal_assertion(request: Request) -> VerifiedPrincipal:
     if len(assertions) != 1 or not assertions[0]:
         raise ForbiddenError("Missing Continuum principal assertion")
     return await get_principal_assertion_verifier().verify(assertions[0])
+
+
+async def require_project_read_principal(request: Request) -> VerifiedPrincipal:
+    """Resolve the scoped SAG session for interactive, read-only Project APIs."""
+    if request.headers.getlist("X-SAG-Principal-Assertion") or settings.auth_mode != "continuum":
+        return await require_principal_assertion(request)
+
+    authorizations = request.headers.getlist("authorization")
+    if len(authorizations) != 1:
+        raise AuthError("Missing Continuum SAG session")
+    parts = authorizations[0].split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise AuthError("Missing Continuum SAG session")
+    try:
+        payload = decode_token(parts[1])
+    except jwt.PyJWTError as error:
+        raise AuthError("Continuum SAG session is invalid or expired") from error
+
+    subject = payload.get("sub")
+    organization_id = payload.get("org_id")
+    tenant_id = payload.get("tenant_id")
+    project_id = payload.get("project_id")
+    partition_id = payload.get("security_partition")
+    token_id = payload.get("jti")
+    issued_at = payload.get("iat")
+    expires_at = payload.get("exp")
+    if (
+        payload.get("auth_mode") != "continuum"
+        or not isinstance(subject, str)
+        or len(subject) > 32
+        or not isinstance(organization_id, str)
+        or len(organization_id) > 64
+        or not isinstance(tenant_id, str)
+        or tenant_id != organization_id
+        or not isinstance(project_id, str)
+        or len(project_id) > 64
+        or not isinstance(partition_id, str)
+        or partition_id != project_id
+        or not isinstance(token_id, str)
+        or not token_id
+        or type(issued_at) not in (int, float)
+        or type(expires_at) not in (int, float)
+        or expires_at <= issued_at
+        or expires_at - issued_at > MAX_CONTINUUM_SESSION_SECONDS
+        or any(not value or value != value.strip() for value in (subject, organization_id, project_id))
+    ):
+        raise ForbiddenError("Continuum SAG session has no valid Project scope")
+
+    principal = VerifiedPrincipal(
+        subject=subject,
+        organization_id=organization_id,
+        allowed_project_ids=frozenset({project_id}),
+        issuer="continuum-sag-session",
+        key_id="sag-hs256-session",
+        token_id=token_id,
+        issued_at=int(issued_at),
+        expires_at=int(expires_at),
+        tenant_id=tenant_id,
+        allowed_partition_ids=frozenset({partition_id}),
+    )
+    request.state.principal = principal
+    return principal
+
+
+async def require_bff_service_token(request: Request) -> None:
+    service_tokens = request.headers.getlist("X-SAG-BFF-Service-Token")
+    if len(service_tokens) != 1 or not service_tokens[0]:
+        raise ForbiddenError("Invalid Continuum service credential")
+    if settings.bff_service_token is None:
+        raise ServiceUnavailableError("Continuum service authentication is not configured")
+    if not secrets.compare_digest(service_tokens[0], settings.bff_service_token):
+        raise ForbiddenError("Invalid Continuum service credential")
+
+
+def required_bff_header(request: Request, name: str, *, max_length: int = 256) -> str:
+    values = request.headers.getlist(name)
+    if len(values) != 1:
+        raise ForbiddenError("Invalid Continuum service context")
+    value = values[0]
+    if not value or value != value.strip() or len(value) > max_length:
+        raise ForbiddenError("Invalid Continuum service context")
+    return value
+
+
+async def require_project_bff_principal(request: Request) -> VerifiedPrincipal:
+    """Accept a tightly scoped BE service context on project document endpoints."""
+    service_tokens = request.headers.getlist("X-SAG-BFF-Service-Token")
+    if not service_tokens:
+        return await require_principal_assertion(request)
+    await require_bff_service_token(request)
+
+    subject = required_bff_header(request, "X-Continuum-User-Id")
+    organization_id = required_bff_header(request, "X-Continuum-Organization-Id")
+    project_id = required_bff_header(request, "X-Continuum-Project-Id")
+    partition_id = required_bff_header(
+        request,
+        "X-Continuum-Security-Partition",
+        max_length=64,
+    )
+    route_project_id = request.path_params.get("project_id")
+    if project_id != route_project_id or partition_id != project_id:
+        raise ForbiddenError("Continuum service scope does not match the requested Project")
+
+    issued_at = int(time.time())
+    principal = VerifiedPrincipal(
+        subject=subject,
+        organization_id=organization_id,
+        allowed_project_ids=frozenset({project_id}),
+        issuer="continuum-be-bff",
+        key_id="service-token",
+        token_id=secrets.token_urlsafe(18),
+        issued_at=issued_at,
+        expires_at=issued_at + 60,
+        tenant_id=organization_id,
+        allowed_partition_ids=frozenset({partition_id}),
+    )
+    request.state.principal = principal
+    return principal

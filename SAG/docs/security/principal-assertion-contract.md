@@ -1,7 +1,8 @@
 # Principal Assertion Contract — Continuum to SAG
 
-> **Status:** Proposed runtime profile for the Continuum-to-SAG integration.
-> Deployment still requires matching issuer/key configuration and organization scope data.
+> **Status:** Draft profile for direct-to-SAG requests. The selected BE-BFF
+> integration path is documented in [BE–SAG IAM Integration Decision](be-iam-integration-decision.md)
+> and does not use a per-user principal assertion.
 >
 > **Date:** 2026-09-30
 > **Authority:** BE/Continuum resolves identity, organization context, and
@@ -20,25 +21,26 @@ This records the local integration check, not a production deployment claim:
   the same verified principal, so successful SAG login alone cannot populate
   Universe. This is a fail-closed authorization result, not a failed SAG login.
 - The checked BE snapshot (`DATN-BE` commit `df87910`) issues ordinary
-  15-minute HS256 access tokens. Those tokens are not the signed SAG assertion:
-  they do not carry `iss`, `aud`, `allowedProjectIds`, `tenantId`, or
-  `allowedPartitionIds`, and use a different signing profile from the proposed
-  dedicated-key RS256 assertion. No BE auth-path implementation was found that
-  issues this SAG assertion and forwards it server-to-server. The browser token
-  or local SAG JWT must not be substituted for it.
+  15-minute HS256 access tokens. They are not standard OIDC access tokens and
+  must not be shared with SAG or validated there by sharing `JWT_SECRET`. Under
+  the selected BE-BFF flow, BE validates its own session and calls SAG through
+  an authenticated service channel; no per-user assertion is sent to SAG.
+- The current worktree implements Project selection through the BE login BFF.
+  BE checks the selected Project and asks SAG to issue a short-lived SAG token
+  scoped to that single Project. SAG read and retrieval routes consume this
+  scope; document writes remain unavailable through the browser session.
 - The local SAG PostgreSQL instance checked during the same troubleshooting
   session had zero `Source` rows and zero `SourceProjectMapping` rows. Even after
   the identity bridge is wired, that database cannot render mapped Universe
   data until real Sources and confirmed Project mappings exist. This count is
   specific to that local database snapshot.
 
-To close the integration gap, the trusted BE/BFF path must authenticate the BE
-principal, resolve the current Organization and authorized Projects plus the
-SAG `tenantId` and `allowedPartitionIds`, sign the agreed assertion, and inject
-it into SAG server-to-server requests. SAG must trust the matching issuer,
-audience, and JWKS configuration. Real SAG Source records and confirmed
-Project-to-Source mappings must also exist before Universe can show data. Do
-not infer or fabricate scopes or mappings to make the UI render.
+The current login flow keeps Project authorization in BE: Project choices are
+display-only until the user selects one, and BE rechecks it before issuing the
+scoped SAG token. Real SAG Sources and confirmed Source-to-Project associations
+are still required for existing data; do not infer or fabricate them. The
+assertion profile below applies to separately authorized direct-to-SAG service
+requests; the browser flow uses the scoped SAG session instead.
 
 ## 1. Scope and security invariants
 

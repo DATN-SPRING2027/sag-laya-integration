@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.db import get_session
 from sag_api.core.deps import get_current_user
-from sag_api.core.principal_assertion import VerifiedPrincipal, require_principal_assertion
+from sag_api.core.principal_assertion import VerifiedPrincipal, require_project_read_principal
 from sag_api.db.models import User
 from sag_api.services.source_service import list_authorized_documents, list_sources
 
@@ -19,7 +19,7 @@ async def list_activity(
     limit: int = Query(default=20, ge=1, le=50),
     source_ids: list[str] | None = Query(default=None, max_length=100),
     _user: User = Depends(get_current_user),
-    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
     session: AsyncSession = Depends(get_session),
 ) -> list[dict]:
     sources = await list_sources(session, principal=principal)

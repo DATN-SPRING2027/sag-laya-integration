@@ -114,6 +114,13 @@
     "passwordPlaceholder": "Enter your password",
     "register": "Create account",
     "submit": "Sign in",
+    "continueWithContinuum": "Tiếp tục bằng Continuum",
+    "continuumDescription": "Dùng tài khoản Continuum để đăng nhập SAG.",
+    "continuumUnavailable": "Chưa cấu hình đăng nhập Continuum.",
+      "selectProjectTitle": "Chọn Project",
+      "selectProjectDescription": "SAG sẽ dùng Project mà bạn có quyền truy cập trong Continuum.",
+      "noAccessibleProjects": "Tổ chức này chưa có Project nào bạn được phép truy cập.",
+      "projectSelectionFailed": "Không thể tiếp tục với Project này. Hãy đăng nhập lại rồi thử lại.",
     "submitting": "Signing in",
     "welcome": "Welcome back, {name}",
     "failed": "Sign-in failed. Please try again later."

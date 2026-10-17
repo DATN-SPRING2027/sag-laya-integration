@@ -45,7 +45,6 @@ def _authorized_source_statement(principal: VerifiedPrincipal):
             SourceProjectMapping.organization_id == principal.organization_id,
             SourceProjectMapping.project_id.in_(principal.allowed_project_ids),
         )
-        .distinct()
     )
 
 

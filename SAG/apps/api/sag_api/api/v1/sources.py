@@ -13,7 +13,11 @@ from sag_api.core.deps import (
     get_job_queue,
     require_path_source_access,
 )
-from sag_api.core.principal_assertion import VerifiedPrincipal, require_principal_assertion
+from sag_api.core.principal_assertion import (
+    VerifiedPrincipal,
+    require_principal_assertion,
+    require_project_read_principal,
+)
 from sag_api.db.models import Source, User
 from sag_api.jobs import JobQueue
 from sag_api.mcp.server import MCP_TOOL_DETAILS, MCP_TOOL_NAMES
@@ -53,7 +57,7 @@ async def list_connectors() -> list[ConnectorOut]:
 @router.get("", response_model=list[SourceOut])
 async def list_(
     _user: User = Depends(get_current_user_or_connector),
-    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
     session: AsyncSession = Depends(get_session),
 ) -> list[SourceOut]:
     sources = await list_sources(session, principal=principal)
@@ -88,7 +92,7 @@ async def get_(
     source_id: str,
     _user: User = Depends(get_current_user),
     source: Source = Depends(require_path_source_access),
-    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
     session: AsyncSession = Depends(get_session),
 ) -> SourceOut:
     return await _source_out(session, source, principal)
@@ -142,7 +146,7 @@ async def get_chunk(
     chunk_id: str,
     _user: User = Depends(get_current_user_or_connector),
     source: Source = Depends(require_path_source_access),
-    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
 ) -> dict:
