@@ -8,7 +8,7 @@ const desktopRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 const webRoot = path.resolve(desktopRoot, "../web");
 const apiRoot = path.resolve(desktopRoot, "../api");
 const apiUrl = "http://127.0.0.1:8000/api/v1/system/health";
-const webUrl = "http://127.0.0.1:3000";
+const webUrl = "http://127.0.0.1:3002";
 const children = [];
 let stopping = false;
 

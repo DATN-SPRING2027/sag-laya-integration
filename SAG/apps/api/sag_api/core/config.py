@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     # 业务展示时区；数据库与 API 时间戳始终使用 UTC。
     timezone: str = "Asia/Shanghai"
     # NoDecode 让逗号分隔值先进入下方 validator，避免 settings 源强制按 JSON 解码。
-    cors_origins: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["http://localhost:3000"])
+    cors_origins: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["http://localhost:3002"])
     # 关闭后仅允许首个用户注册（部署引导），其余返回 403
     allow_registration: bool = True
     # Dify 外部知识库调用的专用服务密钥；未配置时兼容端点拒绝服务。
@@ -256,12 +256,23 @@ class Settings(BaseSettings):
     history_keep_recent: int = 8  # 历史压缩时原文保留的最近消息数
     # 只装载最近有界窗口；更旧对话应进入滚动摘要，不做全表回放。
     history_load_limit: int = Field(default=200, ge=1, le=1000)
-    enable_laya: bool = Field(default=True, description="启用 Laya 决策模型前置路由")
-    laya_model_path: str | None = Field(
-        default=None,
-        description="本地 Laya checkpoint 根目录；为空时使用 Hugging Face cache/repository",
-    )
-    laya_device: str | None = Field(default=None, description="Laya 推理设备，例如 cpu 或 cuda")
+    decision_provider: Literal["siliconflow", "disabled"] = "siliconflow"
+    decision_model: str = Field(default="Kev-4b", min_length=1, max_length=200)
+    siliconflow_api_key: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_decision_config(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        provider = data.get("decision_provider")
+        normalized_provider = provider.strip().lower() if isinstance(provider, str) else provider
+        if normalized_provider is None or normalized_provider == "" or normalized_provider in ("laya", "openrouter"):
+            data["decision_provider"] = "siliconflow"
+        if normalized_provider in ("laya", "openrouter") or data.get("decision_model") == "typesafe/jev-1.14":
+            data["decision_model"] = "Kev-4b"
+        return data
 
     @field_validator("cors_origins", mode="before")
     @classmethod

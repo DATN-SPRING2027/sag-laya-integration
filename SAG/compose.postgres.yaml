@@ -29,9 +29,6 @@ services:
     restart: unless-stopped
 
   api:
-    build:
-      args:
-        SAG_API_EXTRAS: postgres
     depends_on:
       db:
         condition: service_healthy

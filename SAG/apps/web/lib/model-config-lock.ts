@@ -8,6 +8,9 @@ const LLM_FIELDS = new Set([
   "llm_context_window",
   "llm_timeout_ms",
   "llm_max_retries",
+  "decision_provider",
+  "decision_model",
+  "siliconflow_api_key",
 ]);
 
 export function isLlmConfigLocked(config: { locked_fields: string[] }) {

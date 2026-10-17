@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections.abc import AsyncIterator, Mapping
@@ -136,7 +137,7 @@ def _named_tool_choice(name: str) -> dict[str, Any]:
     return {"type": "function", "function": {"name": name}}
 
 
-def _initial_tool_choice(
+async def _initial_tool_choice(
     query: str,
     tools: tuple[AgentTool, ...],
     *,
@@ -162,11 +163,11 @@ def _initial_tool_choice(
     if not normalized or _DIRECT_RESPONSE_HINT.search(normalized):
         return "auto"
 
-    # Laya 33ms Neural Decision Router (nhận diện tiếng Việt & đa ngôn ngữ)
+    # Cloud decision routing is kept off the event loop; failures never block retrieval.
     try:
-        from sag_api.services.laya_router import route_query
-        laya_res = route_query(normalized)
-        if laya_res.get("is_chitchat") and laya_res.get("confidence", 0) >= 0.65:
+        from sag_api.services.decision_router import route_query
+        decision = await asyncio.to_thread(route_query, normalized)
+        if decision.get("is_chitchat") and decision.get("confidence", 0) >= 0.65:
             return "none"
     except Exception:  # noqa: BLE001
         pass
@@ -778,7 +779,7 @@ async def generate_stream(
             # output and tool-result messages. This is the only content the UI
             # may describe as the model's starting context.
             frozen_prompt_preview = build_prompt_preview(run_messages)
-            initial_tool_choice = _initial_tool_choice(
+            initial_tool_choice = await _initial_tool_choice(
                 plan.query,
                 tools,
                 knowledge_only=knowledge_only,

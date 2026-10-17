@@ -197,6 +197,9 @@ export interface ModelConfig {
   llm_timeout_ms: number;
   llm_max_retries: number;
   llm_api_key_set: boolean;
+  decision_provider: "siliconflow" | "disabled";
+  decision_model: string;
+  siliconflow_api_key_set: boolean;
   embedding_model: string;
   embedding_base_url: string | null;
   embedding_dimensions: number | null;
@@ -228,6 +231,9 @@ export type ModelConfigPatch = Partial<{
   llm_max_tokens: number;
   llm_timeout_ms: number;
   llm_max_retries: number;
+  decision_provider: ModelConfig["decision_provider"];
+  decision_model: string;
+  siliconflow_api_key: string;
   embedding_model: string;
   embedding_base_url: string;
   embedding_api_key: string;
@@ -500,6 +506,7 @@ export interface UniverseManifest {
     max_z?: number;
   };
   partitions: UniversePartition[];
+  trees: UniverseTree[];
   counts: {
     sources?: number;
     partitions?: number;
@@ -507,8 +514,36 @@ export interface UniverseManifest {
     entities?: number;
     nodes?: number;
     relations?: number;
+    trees?: number;
+    units?: number;
   };
   policy: UniversePolicy;
+}
+
+export interface UniverseTreeNode {
+  id: string;
+  parent_id: string | null;
+  depth: number;
+  label: string;
+  is_leaf: boolean;
+  unit_count: number;
+  source_count: number;
+}
+
+export interface UniverseTree {
+  project_id: string;
+  tree_version: string;
+  search_epoch: number;
+  node_count: number;
+  unit_count: number;
+  source_count: number;
+  nodes: UniverseTreeNode[];
+}
+
+export interface UniverseTreeRoute {
+  project_id: string;
+  tree_version: string;
+  node_ids: string[];
 }
 
 export interface UniversePolicy {
@@ -581,6 +616,7 @@ export interface UniverseActivation {
   nodes: UniverseActivationNode[];
   relations: UniverseRelation[];
   source_hits?: SearchSourceHit[];
+  tree_routes?: UniverseTreeRoute[];
 }
 
 export interface UniversePatchNode {

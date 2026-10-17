@@ -27,6 +27,7 @@ import type {
   UniverseGraphPatch,
   UniverseManifest,
   UniverseNodeKind,
+  UniverseTreeRoute,
   UniverseTimelineDirection,
 } from "@/lib/types";
 import {
@@ -130,6 +131,7 @@ import {
   UniverseScene,
   universeSourceAccent,
 } from "@/components/features/universe-scene";
+import { UniverseTreeView } from "@/components/features/universe-tree-view";
 import type {
   UniverseSceneData,
   UniverseSceneExplorationView,
@@ -320,6 +322,7 @@ export function KnowledgeUniverse({
   );
   const [dimensions, setDimensions] = React.useState({ width: 1, height: 1 });
   const [manifest, setManifest] = React.useState<UniverseManifest | null>(null);
+  const [treeRoutes, setTreeRoutes] = React.useState<UniverseTreeRoute[]>([]);
   const [working, setWorking] = React.useState<UniverseWorkingSet>(emptyUniverseWorkingSet());
   const [timelineWindow, setTimelineWindow] =
     React.useState<UniverseTimelineWindowState | null>(null);
@@ -1311,6 +1314,7 @@ export function KnowledgeUniverse({
       const eventEpoch = activation?.epoch ?? activationEventEpochRef.current + 1;
       if (!activation || eventEpoch < activationEventEpochRef.current) return;
       activationEventEpochRef.current = eventEpoch;
+      setTreeRoutes(activation.tree_routes ?? []);
       const origin = activation.origin ?? "assistant";
       const context = readUniverseContext();
       if (
@@ -1373,6 +1377,7 @@ export function KnowledgeUniverse({
       const eventEpoch = value?.epoch ?? activationEventEpochRef.current + 1;
       if (eventEpoch < activationEventEpochRef.current) return;
       activationEventEpochRef.current = eventEpoch;
+      setTreeRoutes([]);
       const searchReset = value?.owner?.startsWith("search") ?? false;
       const context = readUniverseContext();
       if (
@@ -3591,12 +3596,18 @@ export function KnowledgeUniverse({
   }, [t]);
 
   React.useEffect(() => {
+    if (!interactive) {
+      autoRebuildAttemptedRef.current = false;
+      return;
+    }
     if (
-      !interactive
-      || !manifest?.stale
+      !manifest?.stale
       || manifest.status !== "stale"
-      || autoRebuildAttemptedRef.current
-    ) return;
+    ) {
+      autoRebuildAttemptedRef.current = false;
+      return;
+    }
+    if (autoRebuildAttemptedRef.current) return;
     autoRebuildAttemptedRef.current = true;
     void rebuild();
   }, [interactive, manifest, rebuild]);
@@ -3633,7 +3644,29 @@ export function KnowledgeUniverse({
       data-universe-visible-bundles={timelineWindow?.visibleBundleIds.length ?? 0}
       data-universe-cached-bundles={timelineWindow?.cacheBundleIds.length ?? 0}
     >
-      {webglAvailable === true && sceneUnavailableReason === null && manifest ? (
+      {manifest && ((manifest.trees?.length ?? 0) > 0 || ["empty", "building", "stale", "failed"].includes(manifest.status)) ? (
+        <UniverseTreeView
+          trees={manifest.trees ?? []}
+          routes={treeRoutes}
+          labels={{
+            empty: rebuilding || manifest.status === "building"
+              ? t("tree.building")
+              : manifest.status === "stale"
+                ? t("tree.stale")
+                : manifest.status === "failed"
+                  ? t("tree.failed")
+                  : t("tree.empty"),
+            project: t("tree.project"),
+            nodes: t("tree.nodes"),
+            units: t("tree.units"),
+            sources: t("tree.sources"),
+            routed: t("tree.routed"),
+            branches: t("tree.branches"),
+            expand: t("tree.expand"),
+            collapse: t("tree.collapse"),
+          }}
+        />
+      ) : webglAvailable === true && sceneUnavailableReason === null && manifest ? (
         <div className="sag-universe-graph absolute inset-0">
           <UniverseScene
             key={`universe-scene:${sceneAttempt}`}
@@ -3798,35 +3831,47 @@ export function KnowledgeUniverse({
                   ease: [0.22, 1, 0.36, 1],
                 }}
               >
-                <span className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap">
-                  <CircleDot className="size-3.5 text-[#a3c0ff]" />
-                  <span className="hidden sm:inline">{t("legend.entities")}</span>
-                </span>
-                <span className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap">
-                  <Sparkles className="size-3.5 text-amber-300" />
-                  <span className="hidden sm:inline">{t("legend.events")}</span>
-                </span>
-                {summary ? (
-                  <span className="min-w-0 max-w-64 truncate border-l border-border/70 pl-2 tabular-nums sm:pl-3" title={summary.query}>
-                    {t("stats.result", visibleGraphCounts)}
+                {manifest?.trees?.length ? (
+                  <span className="min-w-0 max-w-72 truncate tabular-nums" title={summary?.query}>
+                    {t("tree.overview", {
+                      projects: manifest.trees.length,
+                      nodes: manifest.counts.nodes ?? 0,
+                      units: compactCount(manifest.counts.units ?? 0, locale),
+                    })}
                   </span>
-                ) : manifest ? (
-                  <span className="min-w-0 truncate border-l border-border/70 pl-2 tabular-nums sm:pl-3">
-                    {manifest.version
-                      ? t("stats.overview", {
-                          sources: manifest.counts.sources ?? 0,
-                          entities: compactCount(manifest.counts.entities ?? 0, locale),
-                          events: compactCount(manifest.counts.events ?? 0, locale),
-                        })
-                      : t("stats.overviewBuilding", {
-                          sources: manifest.counts.sources ?? 0,
-                          events: compactCount(manifest.counts.events ?? 0, locale),
-                        })}
-                    {(manifest.counts.sources ?? 0) > renderedSourcePartitions.length
-                      ? t("stats.visibleContours", { count: renderedSourcePartitions.length })
-                      : ""}
-                  </span>
-                ) : null}
+                ) : (
+                  <>
+                    <span className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap">
+                      <CircleDot className="size-3.5 text-[#a3c0ff]" />
+                      <span className="hidden sm:inline">{t("legend.entities")}</span>
+                    </span>
+                    <span className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap">
+                      <Sparkles className="size-3.5 text-amber-300" />
+                      <span className="hidden sm:inline">{t("legend.events")}</span>
+                    </span>
+                    {summary ? (
+                      <span className="min-w-0 max-w-64 truncate border-l border-border/70 pl-2 tabular-nums sm:pl-3" title={summary.query}>
+                        {t("stats.result", visibleGraphCounts)}
+                      </span>
+                    ) : manifest ? (
+                      <span className="min-w-0 truncate border-l border-border/70 pl-2 tabular-nums sm:pl-3">
+                        {manifest.version
+                          ? t("stats.overview", {
+                              sources: manifest.counts.sources ?? 0,
+                              entities: compactCount(manifest.counts.entities ?? 0, locale),
+                              events: compactCount(manifest.counts.events ?? 0, locale),
+                            })
+                          : t("stats.overviewBuilding", {
+                              sources: manifest.counts.sources ?? 0,
+                              events: compactCount(manifest.counts.events ?? 0, locale),
+                            })}
+                        {(manifest.counts.sources ?? 0) > renderedSourcePartitions.length
+                          ? t("stats.visibleContours", { count: renderedSourcePartitions.length })
+                          : ""}
+                      </span>
+                    ) : null}
+                  </>
+                )}
                 {(manifest?.status === "failed" || manifest?.stale || manifest?.status === "building") && (
                   <TooltipProvider delayDuration={220}>
                     <Tooltip>
@@ -3840,7 +3885,7 @@ export function KnowledgeUniverse({
                           )}
                           role="status"
                           aria-label={manifest.status === "failed"
-                            ? t("rebuild.failed")
+                            ? t("tree.failed")
                             : manifest.status === "building" || rebuilding
                               ? t("rebuild.running")
                               : t("rebuild.ready")}
@@ -3848,7 +3893,7 @@ export function KnowledgeUniverse({
                       </TooltipTrigger>
                       <TooltipContent side="bottom">
                         {manifest.status === "failed"
-                          ? t("rebuild.failed")
+                          ? t("tree.failed")
                           : manifest.status === "building" || rebuilding
                             ? t("rebuild.running")
                             : t("rebuild.ready")}

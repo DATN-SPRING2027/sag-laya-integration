@@ -370,6 +370,7 @@ function OriginalDocumentPreview({
     (async () => {
       try {
         const res = await fetch(previewUrl, {
+          credentials: "include",
           headers: {
             Authorization: `Bearer ${getToken() ?? ""}`,
             "Accept-Language": locale,
@@ -428,6 +429,7 @@ function OriginalDocumentPreview({
   async function download() {
     try {
       const res = await fetch(fileUrl, {
+        credentials: "include",
         headers: {
           Authorization: `Bearer ${getToken() ?? ""}`,
           "Accept-Language": locale,
@@ -522,6 +524,7 @@ function ParsedDocumentPreview({ doc }: { doc: Doc }) {
     const controller = new AbortController();
     setState({ phase: "loading" });
     fetch(parsedUrl, {
+      credentials: "include",
       headers: {
         Authorization: `Bearer ${getToken() ?? ""}`,
         "Accept-Language": locale,

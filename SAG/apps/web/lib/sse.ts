@@ -142,6 +142,7 @@ async function streamPost(
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
       body: JSON.stringify(body),
+      credentials: "include",
       signal,
     });
   } catch (e) {
