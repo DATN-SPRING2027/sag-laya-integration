@@ -8,6 +8,38 @@
 > Project authorization. SAG verifies the signed decision and consumes the
 > resolved scope; SAG does not infer membership, roles, or permission hierarchy.
 
+## Current local integration status (2026-10-17)
+
+This records the local integration check, not a production deployment claim:
+
+- The SAG UI can authenticate a local SAG account. That session only identifies
+  the user to SAG; it does not establish a BE/Continuum identity or authorization.
+- The local browser-to-SAG API request path did not supply
+  `X-SAG-Principal-Assertion`. `GET /api/v1/sources` therefore returned `403`
+  (`Missing Continuum principal assertion`). Source and Universe routes require
+  the same verified principal, so successful SAG login alone cannot populate
+  Universe. This is a fail-closed authorization result, not a failed SAG login.
+- The checked BE snapshot (`DATN-BE` commit `df87910`) issues ordinary
+  15-minute HS256 access tokens. Those tokens are not the signed SAG assertion:
+  they do not carry `iss`, `aud`, `allowedProjectIds`, `tenantId`, or
+  `allowedPartitionIds`, and use a different signing profile from the proposed
+  dedicated-key RS256 assertion. No BE auth-path implementation was found that
+  issues this SAG assertion and forwards it server-to-server. The browser token
+  or local SAG JWT must not be substituted for it.
+- The local SAG PostgreSQL instance checked during the same troubleshooting
+  session had zero `Source` rows and zero `SourceProjectMapping` rows. Even after
+  the identity bridge is wired, that database cannot render mapped Universe
+  data until real Sources and confirmed Project mappings exist. This count is
+  specific to that local database snapshot.
+
+To close the integration gap, the trusted BE/BFF path must authenticate the BE
+principal, resolve the current Organization and authorized Projects plus the
+SAG `tenantId` and `allowedPartitionIds`, sign the agreed assertion, and inject
+it into SAG server-to-server requests. SAG must trust the matching issuer,
+audience, and JWKS configuration. Real SAG Source records and confirmed
+Project-to-Source mappings must also exist before Universe can show data. Do
+not infer or fabricate scopes or mappings to make the UI render.
+
 ## 1. Scope and security invariants
 
 This contract covers user or service-principal requests that can produce or
@@ -200,7 +232,8 @@ process-local cache is explicitly insufficient.
 
 | Failure | Result | Retrieval behavior |
 |---|---|---|
-| Missing, malformed, invalid signature, wrong issuer/audience, bad claims, future `iat`, expired token | `401`-class authentication failure | No Source query or retrieval call. |
+| Missing assertion | `403`-class authorization-context failure | No Source query or retrieval call; do not clear an otherwise valid SAG application session solely for this missing BE context. |
+| Malformed assertion, invalid signature, wrong issuer/audience, bad claims, future `iat`, expired token | `401`-class verification failure | No Source query or retrieval call. |
 | Unknown `kid` after one JWKS refresh | `401`-class verification failure | No retrieval call. |
 | JWKS unavailable and no still-valid configured key can verify the assertion | `503`-class dependency failure | No retrieval call; never fall back to local SAG user JWT, connector-global access, or no-filter search. |
 | Valid principal with empty Project scope or empty effective Source scope | Empty/no-evidence response | Do not invoke dense, lexical, event/graph, or direct-read engine calls. |
@@ -250,7 +283,7 @@ revocation, and leakage tests across every reachable evidence path.
 | Replay | Short-lived bearer; `jti` correlation only, no single-use guard | Security owner approves exposure or requests shared replay store. |
 | Project count/token size cap | Reject over-limit; never truncate | Agree numeric cap from realistic memberships/proxy limits. |
 | Service principals | Authority-issued scoped grant; static keys alone do not grant evidence | BE defines Dify/MCP/connector issuance and lifecycle. |
-| Failure status | 401 for invalid assertion, 503 for unavailable trust/mapping dependency, zero retrieval either way | Align with public API error convention. |
+| Failure status | 403 for missing assertion; the documented non-enumerating response for denied resources; 401 for invalid assertion; 503 for unavailable trust/mapping dependency; zero retrieval either way | Align with public API error convention. |
 
 No implementation may treat this draft as frozen until these rows are reviewed
 and the issuer/scope contract exists in BE/Continuum.
