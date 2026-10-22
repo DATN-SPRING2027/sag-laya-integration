@@ -13,8 +13,8 @@ from sag_api.enums import ConnectorKind
 class FileUploadConnector(Connector):
     meta = ConnectorMeta(
         kind=ConnectorKind.FILE_UPLOAD,
-        title="文件上传",
-        description="上传本地文档（Markdown / 文本 / PDF 等），由引擎解析、分块、向量化并抽取事件与实体。",
+        title="File Upload",
+        description="Upload local documents (Markdown / text / PDF, etc.) to be parsed, chunked, embedded, and extracted into events and entities.",
         supports_sync=False,
         config_fields=[],
     )

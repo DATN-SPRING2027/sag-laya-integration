@@ -176,9 +176,28 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
+async def _qdrant_ready(request: Request) -> bool | None:
+    """Check Qdrant connectivity when it is the configured vector provider."""
+    if settings.sag_vector_provider != "qdrant":
+        return None
+    engine_manager = getattr(request.app.state, "engine_manager", None)
+    if engine_manager is None:
+        return False
+    try:
+        client = await engine_manager.get_search_unit_qdrant_client()
+        response = await client.get("/collections", timeout=3.0)
+    except Exception as error:  # noqa: BLE001
+        log.warning("Qdrant readiness check failed (%s)", type(error).__name__)
+        return False
+    if response.status_code != 200:
+        log.warning("Qdrant readiness check returned HTTP %d", response.status_code)
+        return False
+    return True
+
+
 @router.get("/ready")
 async def ready(request: Request) -> JSONResponse:
-    """就绪探针：数据库与知识运行时均就绪才返回 200。"""
+    """就绪探针：数据库、知识运行时与配置的向量后端均就绪才返回 200。"""
     try:
         async with SessionLocal() as session:
             await session.execute(text("SELECT 1"))
@@ -187,9 +206,19 @@ async def ready(request: Request) -> JSONResponse:
         return JSONResponse(status_code=503, content={"status": "unavailable", "db": False})
 
     runtime = getattr(request.app.state, "knowledge_runtime", None)
-    if runtime is None or not runtime.ready:
-        return JSONResponse(status_code=503, content={"status": "unavailable", "db": True})
-    return JSONResponse(content={"status": "ready", "db": True})
+    runtime_ready = bool(runtime and runtime.ready)
+    qdrant_ready = await _qdrant_ready(request)
+    if not runtime_ready or qdrant_ready is False:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unavailable",
+                "db": True,
+                "knowledge_runtime": runtime_ready,
+                "qdrant": qdrant_ready,
+            },
+        )
+    return JSONResponse(content={"status": "ready", "db": True, "qdrant": qdrant_ready})
 
 
 @router.get("/metrics")
@@ -205,6 +234,7 @@ async def metrics(request: Request, format: str = "prometheus") -> Response:
 
     runtime = getattr(request.app.state, "knowledge_runtime", None)
     knowledge_ready = bool(runtime and runtime.ready)
+    qdrant_ready = await _qdrant_ready(request)
 
     from sag_api.services.route_cache_service import route_decision_cache
 
@@ -219,6 +249,7 @@ async def metrics(request: Request, format: str = "prometheus") -> Response:
                 "system_up": 1,
                 "db_ready": db_ready,
                 "knowledge_runtime_ready": knowledge_ready,
+                "qdrant_ready": qdrant_ready,
                 "route_cache": {
                     "enabled": bool(cache_enabled),
                     "size": cache_size,
@@ -277,6 +308,14 @@ async def metrics(request: Request, format: str = "prometheus") -> Response:
         "# TYPE sag_search_rerank_min_remaining_seconds gauge",
         f"sag_search_rerank_min_remaining_seconds {settings.search_rerank_min_remaining_seconds}",
     ]
+    if qdrant_ready is not None:
+        lines.extend(
+            [
+                "# HELP sag_qdrant_ready Qdrant REST connectivity readiness",
+                "# TYPE sag_qdrant_ready gauge",
+                f"sag_qdrant_ready {1 if qdrant_ready else 0}",
+            ]
+        )
     return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
@@ -404,7 +443,7 @@ async def knowledge_mcp_descriptor(
     source_count = len(await list_sources(session, principal=principal))
     base = str(request.base_url).rstrip("/")
     return {
-        "name": "SAG 知识库",
+        "name": "SAG Knowledge Base",
         "scope": "knowledge_base",
         "source_count": source_count,
         "tools": list(MCP_TOOL_NAMES),
@@ -417,13 +456,13 @@ async def knowledge_mcp_descriptor(
                 "X-SAG-Principal-Assertion": "<short-lived-continuum-assertion>",
             },
             "note": (
-                "MCP 只加载本次已授权信源；受信任服务端代理必须注入 Continuum 断言。"
-                "source_id 只能进一步收窄该作用域。"
+                "MCP loads only authorized sources for the current principal; trusted server proxies must inject the Continuum assertion. "
+                "source_id can only narrow this scope."
             ),
         },
         "stdio": {
             "available": False,
-            "note": "stdio 已停用，直到每次工具调用都能携带并重新校验当前 BE/Continuum 主体断言。",
+            "note": "stdio is disabled until every tool call carries and validates the current BE/Continuum principal assertion.",
         },
     }
 

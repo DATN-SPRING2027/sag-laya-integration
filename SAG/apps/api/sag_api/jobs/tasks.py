@@ -256,8 +256,14 @@ async def _process_document_unlocked(
     # A worker retry reuses the document row. Clear the previous attempt's
     # failure before parsing can block for a long time, so active processing
     # never carries a stale terminal error.
-    if document.error is not None and document.status not in _CONTROL_TRANSITION_STATES:
+    if (
+        document.error is not None
+        or document.error_layer is not None
+        or document.error_stage is not None
+    ) and document.status not in _CONTROL_TRANSITION_STATES:
         document.error = None
+        document.error_layer = None
+        document.error_stage = None
         await session.commit()
 
     async def refresh_payload() -> dict:
@@ -558,6 +564,7 @@ async def _process_document_unlocked(
             max_concurrency=settings.document_extract_concurrency,
             document_title=Path(document.filename).stem.strip(),
             original_path=target_storage_path if prepared is not None else None,
+            document_version_id=doc_ver.id if (run_id and "doc_ver" in locals() and doc_ver is not None) else None,
         )
         if outcome.paused:
             await _pause_or_yield()
@@ -677,6 +684,8 @@ async def _process_document_unlocked(
             progress=100,
             token_usage=outcome.token_usage,
             error=None,
+            error_layer=None,
+            error_stage=None,
         )
         .execution_options(synchronize_session=False)
     )
@@ -744,6 +753,47 @@ async def _process_document_unlocked(
             try:
                 ingestion_run = await session.get(IngestionRun, run_id)
                 if ingestion_run is not None:
+                    if getattr(settings, "document_fast_graph_enabled", True) and getattr(
+                        settings, "knowledge_worker_enabled", True
+                    ):
+                        try:
+                            from sag_api.jobs.knowledge import _embed_blocks
+                            from sag_api.services.knowledge_service import (
+                                KnowledgeConfig,
+                                rebuild_knowledge_version,
+                                version_input,
+                            )
+
+                            k_cfg = KnowledgeConfig()
+                            _, k_blocks, _, _ = await version_input(
+                                session, ingestion_run.document_version_id, k_cfg
+                            )
+                            non_heading_blocks = [
+                                (b.id, b.normalized_text)
+                                for b in k_blocks
+                                if b.block_type != "heading" and b.normalized_text.strip()
+                            ]
+                            dense_by_block_id = None
+                            if non_heading_blocks:
+                                kb_embedder = await engine_manager.get_sag_embedding(
+                                    source.sag_source_config_id, source
+                                )
+                                dense_by_block_id = await _embed_blocks(kb_embedder, non_heading_blocks)
+                            await rebuild_knowledge_version(
+                                session,
+                                ingestion_run.document_version_id,
+                                k_cfg,
+                                dense_by_block_id=dense_by_block_id,
+                            )
+                            await session.commit()
+                        except Exception as kb_err:  # noqa: BLE001
+                            await session.rollback()
+                            log.warning(
+                                "Inline foundation knowledge build deferred to worker doc=%s: %s",
+                                document.id,
+                                sanitize_error_message(kb_err),
+                            )
+
                     from sag_api.services.universe_tree_service import enqueue_tree_rebuild_for_version
 
                     await enqueue_tree_rebuild_for_version(

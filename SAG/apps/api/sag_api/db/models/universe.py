@@ -113,7 +113,7 @@ class ExplorationSession(IDMixin, TimestampMixin, Base):
     user_id: Mapped[str] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
-    title: Mapped[str] = mapped_column(String(300), default="新探索")
+    title: Mapped[str] = mapped_column(String(300), default="New exploration")
     source_ids: Mapped[list] = mapped_column("source_ids_json", JSON, default=list)
 
 

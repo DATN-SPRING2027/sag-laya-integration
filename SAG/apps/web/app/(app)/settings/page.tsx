@@ -23,7 +23,6 @@ import {
   settingsTabHref,
 } from "@/lib/settings-config";
 import {
-  useUniverseEntityCategories,
   useUniverseViewPreferences,
 } from "@/lib/universe-view-preferences";
 
@@ -32,7 +31,6 @@ const tabTriggerClassName =
   "data-[state=active]:border-foreground data-[state=active]:bg-transparent data-[state=active]:shadow-none";
 
 function GraphSettings() {
-  const entityCategories = useUniverseEntityCategories();
   const { preferences, updatePreferences, resetPreferences } =
     useUniverseViewPreferences();
 
@@ -41,7 +39,6 @@ function GraphSettings() {
       preferences={preferences}
       onChange={updatePreferences}
       onReset={resetPreferences}
-      entityCategories={entityCategories}
     />
   );
 }

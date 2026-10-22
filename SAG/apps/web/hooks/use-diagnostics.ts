@@ -14,8 +14,10 @@ import {
 
 export type { DiagEntry, DiagEnvironment, DiagEventType, DiagExport, DiagLogFile };
 
+const EMPTY_SNAPSHOT: DiagEntry[] = [];
+
 function emptySnapshot(): DiagEntry[] {
-  return [];
+  return EMPTY_SNAPSHOT;
 }
 
 /**

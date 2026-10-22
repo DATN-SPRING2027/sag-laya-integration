@@ -1,0 +1,1089 @@
+{
+  "timestamp": "2026-10-21T14:33:59.698956+00:00",
+  "file_tested": "d:\\DoAnTotnghiep\\Dataset\\Project1\\00_START_HERE.md",
+  "file_bytes": 6025,
+  "clean_report": {
+    "dropped_schemas": [
+      "knowledge_benchmark_20261006",
+      "sag_metric_e2e_67a1eb46",
+      "sag"
+    ],
+    "recreated_schema": "sag",
+    "deleted_qdrant_collections": [
+      "entity_vectors",
+      "event_entity_vectors",
+      "event_vectors_wide",
+      "search_units_6ad61cb2e1f989c367a1eb46",
+      "source_chunks"
+    ],
+    "sag_tables_created_count": 46,
+    "sag_tables": [
+      "agent_bindings",
+      "agents",
+      "canonical_blocks",
+      "document_versions",
+      "documents",
+      "exploration_sessions",
+      "exploration_steps",
+      "ingestion_runs",
+      "jobs",
+      "knowledge_evidence",
+      "knowledge_gap_questions",
+      "knowledge_gaps",
+      "knowledge_graph_builds",
+      "knowledge_graph_edges",
+      "knowledge_jobs",
+      "knowledge_quality_assessments",
+      "knowledge_query_demand_daily",
+      "knowledge_queue_control",
+      "knowledge_tree_nodes",
+      "knowledge_unit_edges",
+      "knowledge_units",
+      "messages",
+      "octx_assets",
+      "octx_document_bindings",
+      "octx_installations",
+      "octx_operation_leases",
+      "octx_releases",
+      "octx_source_bindings",
+      "octx_transfers",
+      "project_search_state",
+      "research_tasks",
+      "search_units",
+      "settings",
+      "source_project_mappings",
+      "source_snapshots",
+      "sources",
+      "stage_runs",
+      "threads",
+      "tree_manifests",
+      "tree_routing_profiles",
+      "tree_snapshot_leases",
+      "universe_dirty_sources",
+      "universe_overviews",
+      "universe_partitions",
+      "upload_idempotency_keys",
+      "users"
+    ]
+  },
+  "timings": {
+    "upload_http_ms": 576.65,
+    "ingestion_and_sag_engine_s": 30.92,
+    "knowledge_and_tree_s": 1.58,
+    "total_pipeline_s": 65.69
+  },
+  "postgres_profile": {
+    "non_empty_tables": {
+      "agents": 1,
+      "article": 1,
+      "article_section": 2,
+      "canonical_blocks": 13,
+      "data_source": 2,
+      "document_versions": 1,
+      "documents": 1,
+      "entity": 21,
+      "entity_type": 17,
+      "event_entity": 22,
+      "ingestion_runs": 1,
+      "jobs": 3,
+      "knowledge_evidence": 236,
+      "knowledge_graph_builds": 1,
+      "knowledge_jobs": 1,
+      "knowledge_query_demand_daily": 1,
+      "knowledge_queue_control": 2,
+      "knowledge_unit_edges": 10,
+      "knowledge_units": 7,
+      "project_search_state": 1,
+      "sag_schema_meta": 1,
+      "search_units": 6,
+      "settings": 1,
+      "source_chunk": 2,
+      "source_event": 6,
+      "source_project_mappings": 1,
+      "source_snapshots": 1,
+      "sources": 1,
+      "stage_runs": 6,
+      "tree_manifests": 1,
+      "tree_routing_profiles": 1,
+      "universe_dirty_sources": 1,
+      "users": 1
+    },
+    "stage_runs": [
+      {
+        "stage": "receive",
+        "status": "SUCCESS",
+        "duration_ms": 10.0,
+        "metrics": {
+          "byte_size": 6025
+        }
+      },
+      {
+        "stage": "PARSE",
+        "status": "SUCCESS",
+        "duration_ms": 16.00000000325963,
+        "metrics": {
+          "block_count": 13,
+          "types": {
+            "paragraph": 2,
+            "list": 5,
+            "heading": 6
+          }
+        }
+      },
+      {
+        "stage": "DEDUP_TEMPORAL",
+        "status": "SUCCESS",
+        "duration_ms": 174.179,
+        "metrics": {
+          "exact_duplicate_found": false,
+          "exact_duplicate_of": null,
+          "exact_block_matches": 0,
+          "near_duplicate_candidates_count": 0,
+          "near_duplicate_candidates": [],
+          "temporal_action": "PENDING_INDEX",
+          "active_version_id": null
+        }
+      },
+      {
+        "stage": "INDEX_SEARCH",
+        "status": "SUCCESS",
+        "duration_ms": 6685.491,
+        "metrics": {
+          "search_unit_count": 6,
+          "pg_count": 6,
+          "qdrant_count": 6,
+          "qdrant_indexed_count": 6,
+          "manifest_checksum": "23ab005694c3d621035087bbe9c3e7dc0918c7b517debc0226615f15546f14f0",
+          "qdrant_checksum": "23ab005694c3d621035087bbe9c3e7dc0918c7b517debc0226615f15546f14f0",
+          "manifest_verified": true,
+          "collection_name": "search_units_6ad61cb2e1f989c367a1eb46",
+          "error": null
+        }
+      },
+      {
+        "stage": "loading",
+        "status": "SUCCESS",
+        "duration_ms": 1.0,
+        "metrics": {}
+      },
+      {
+        "stage": "extracting",
+        "status": "SUCCESS",
+        "duration_ms": 1.0,
+        "metrics": {}
+      }
+    ],
+    "canonical_blocks": {
+      "count": 13,
+      "block_types": [
+        "paragraph",
+        "list",
+        "heading"
+      ],
+      "section_paths": [
+        "Bộ Dữ Liệu Northstar Commerce v1.0 — Hướng Dẫn Vận Hành & Khai Thác",
+        "Bộ Dữ Liệu Northstar Commerce v1.0 — Hướng Dẫn Vận Hành & Khai Thác > 1. Bối cảnh kịch bản (Dataset Scenario)",
+        "Bộ Dữ Liệu Northstar Commerce v1.0 — Hướng Dẫn Vận Hành & Khai Thác > 1. Bối cảnh kịch bản (Dataset Scenario)",
+        "Bộ Dữ Liệu Northstar Commerce v1.0 — Hướng Dẫn Vận Hành & Khai Thác > 1. Bối cảnh kịch bản (Dataset Scenario)",
+        "Bộ Dữ Liệu Northstar Commerce v1.0 — Hướng Dẫn Vận Hành & Khai Thác > 2. Quy mô dữ liệu chuẩn (Canonical Data Scale)",
+        "Bộ Dữ Liệu Northstar Commerce v1.0 — Hướng Dẫn Vận Hành & Khai Thác > 2. Quy mô dữ liệu chuẩn (Canonical Data Scale)",
+        "Bộ Dữ Liệu Northstar Commerce v1.0 — Hướng Dẫn Vận Hành & Khai Thác > 3. Kiến trúc đóng gói: File vật lý vs Bản ghi logic",
+        "Bộ Dữ Liệu Northstar Commerce v1.0 — Hướng Dẫn Vận Hành & Khai Thác > 3. Kiến trúc đóng gói: File vật lý vs Bản ghi logic",
+        "Bộ Dữ Liệu Northstar Commerce v1.0 — Hướng Dẫn Vận Hành & Khai Thác > 3. Kiến trúc đóng gói: File vật lý vs Bản ghi logic",
+        "Bộ Dữ Liệu Northstar Commerce v1.0 — Hướng Dẫn Vận Hành & Khai Thác > 4. Thứ tự nạp dữ liệu khuyến nghị (Ingestion Pipeline)",
+        "Bộ Dữ Liệu Northstar Commerce v1.0 — Hướng Dẫn Vận Hành & Khai Thác > 4. Thứ tự nạp dữ liệu khuyến nghị (Ingestion Pipeline)",
+        "Bộ Dữ Liệu Northstar Commerce v1.0 — Hướng Dẫn Vận Hành & Khai Thác > 5. Hướng dẫn sử dụng Dataset_Catalog.xlsx",
+        "Bộ Dữ Liệu Northstar Commerce v1.0 — Hướng Dẫn Vận Hành & Khai Thác > 5. Hướng dẫn sử dụng Dataset_Catalog.xlsx"
+      ],
+      "total_chars": 5122
+    },
+    "search_units": {
+      "count": 6,
+      "avg_tokens": 148.7,
+      "min_tokens": 14,
+      "max_tokens": 261
+    },
+    "knowledge_units": {
+      "total_current": 7,
+      "with_valid_dense_vector_1024": 7,
+      "cjk_contaminated_count": 0,
+      "samples": [
+        {
+          "id": "979408d8-9153-5fef-ade7-1d3033679010",
+          "ordinal": 2,
+          "text_preview": "Bộ dữ liệu mô phỏng công ty công nghệ hư cấu **Northstar Commerce Systems**, đang xây dựng nền tảng thương mại điện tử đa tenant (multi-tenant ecommerce platform) cho khách hàng me",
+          "vec_dim": 1024,
+          "entities_count": 4,
+          "entities_sample": [
+            "Meridian Outfitters",
+            "Northstar Commerce",
+            "Northstar Commerce Systems",
+            "PulsePay Network"
+          ]
+        },
+        {
+          "id": "d7e2a5d1-0556-5dd3-b5a8-8fdf4af74241",
+          "ordinal": 3,
+          "text_preview": "- Nguồn cảm hứng domain và công nghệ: Dự án mã nguồn mở **Bagisto** (kiến trúc Laravel + Vue.js: https://github.com/bagisto/bagisto).\n- **Tính tổng hợp (Synthetic)**: 100% dữ liệu ",
+          "vec_dim": 1024,
+          "entities_count": 5,
+          "entities_sample": [
+            "100%",
+            "API",
+            "Bagisto",
+            "example.invalid",
+            "https://github.com/bagisto/bagisto"
+          ]
+        },
+        {
+          "id": "d4cf8e54-e832-57f3-abe2-d707f54d31e7",
+          "ordinal": 5,
+          "text_preview": "- **3 Tổ chức (Organizations)**: `ORG-NSC` (Northstar), `ORG-MERIDIAN` (Meridian), `ORG-PULSEPAY` (PulsePay).\n- **10 Phòng ban (Departments)**: 8 phòng ban Northstar, 1 Merchandisi",
+          "vec_dim": 1024,
+          "entities_count": 40,
+          "entities_sample": [
+            "/cuối.",
+            "/documents.jsonl",
+            "1.400",
+            "2.500",
+            "2026-04-16",
+            "2026-09-29",
+            "2026-10-12",
+            "ACL",
+            "API Ops",
+            "CART",
+            "CAT",
+            "CHKO"
+          ]
+        },
+        {
+          "id": "0abb55aa-12ce-5508-8c20-8e097c81e6fc",
+          "ordinal": 7,
+          "text_preview": "Để đáp ứng nghiêm ngặt giới hạn hệ thống (**dưới 160 file vật lý tổng cộng trong thư mục Dataset**):",
+          "vec_dim": 1024,
+          "entities_count": 1,
+          "entities_sample": [
+            "file vật lý"
+          ]
+        },
+        {
+          "id": "717d9903-6350-54cc-985f-88d6365cc8ab",
+          "ordinal": 8,
+          "text_preview": "- **Tổng số file vật lý trong v1**: Đúng **107 files** (gồm 56 bundles + 10 docx + 12 formal md + 6 fixtures + 12 jsonl + 6 eval + 4 docs + 1 tool).\n- **Tổng số file trong toàn bộ ",
+          "vec_dim": 1024,
+          "entities_count": 18,
+          "entities_sample": [
+            "/2026",
+            "/a",
+            "1.373",
+            "1.400",
+            "<a id=\"doc-cat-20260416-01\"></a>",
+            "ADR",
+            "API",
+            "DOCX",
+            "HTML",
+            "Logical Documents",
+            "Monthly Markdown Bundles",
+            "PRD"
+          ]
+        },
+        {
+          "id": "1251359b-c205-5a71-9bbc-706461e2c4fe",
+          "ordinal": 10,
+          "text_preview": "1. **Thực thể nền tảng**: `organizations` → `departments` → `members` → `access_groups` → `group_memberships`.\n2. **Dự án & Sprints**: `projects` → `sprints` → `project_memberships",
+          "vec_dim": 1024,
+          "entities_count": 28,
+          "entities_sample": [
+            "/a",
+            "/documents.jsonl",
+            "/docx/",
+            "/markdown/bundles/",
+            "/markdown/formal/",
+            "1.373",
+            "<a id=\"...\"></a>",
+            "ACL",
+            "Content Ingestion",
+            "DOCX",
+            "access_groups",
+            "classification"
+          ]
+        },
+        {
+          "id": "23659d5a-c96b-5fab-8d9a-473548646faa",
+          "ordinal": 12,
+          "text_preview": "1. Mở file `Dataset_Catalog.xlsx` bằng Microsoft Excel hoặc LibreOffice Calc.\n2. **Tab Overview**: Xem tổng quan chỉ số KPI, biểu đồ phân bố trạng thái Jira issue và bảng tiến độ 8",
+          "vec_dim": 1024,
+          "entities_count": 23,
+          "entities_sample": [
+            "/closed.",
+            "2.500",
+            "ACL",
+            "Dataset_Catalog.xlsx",
+            "KPI",
+            "LibreOffice Calc",
+            "Microsoft Excel",
+            "RAG",
+            "Tab Documents",
+            "Tab Issues",
+            "Tab Overview",
+            "Tab Sprints"
+          ]
+        }
+      ]
+    },
+    "knowledge_evidence": {
+      "count": 236,
+      "by_tier": {
+        "E1": 113,
+        "E0": 123
+      },
+      "by_extractor": {
+        "e1-sag-engine-bridge-v1": 9,
+        "e0-lexer-v1": 83,
+        "e0-statements-v1": 40,
+        "e1-domain-patterns-v1": 104
+      }
+    },
+    "knowledge_unit_edges": {
+      "count": 10,
+      "avg_weight": 0.6334
+    },
+    "sag_source_events": {
+      "count": 6,
+      "cjk_contaminated_count": 0,
+      "samples": [
+        {
+          "id": "e43e5819-c2d2-4e0b-8042-a7b18bd0c89c",
+          "title": "Bộ dữ liệu Northstar Commerce v1.0 mô phỏng công ty công nghệ",
+          "summary": "Bộ dữ liệu Northstar Commerce v1.0 mô phỏng một công ty công nghệ hư cấu tích hợp với PulsePay Network và Meridian Outfitters."
+        },
+        {
+          "id": "02fd2936-61df-4036-8552-1028e3559ec3",
+          "title": "Bộ dữ liệu chứa 1.400 bản ghi tài liệu logic",
+          "summary": "Bộ dữ liệu Northstar Commerce v1.0 chứa đúng 1.400 bản ghi tài liệu logic được đăng ký đầy đủ trong structured/documents.jsonl."
+        },
+        {
+          "id": "8f76b319-5257-484b-9c44-43c669df9a74",
+          "title": "Kiến trúc đóng gói dữ liệu tối ưu dưới 160 file",
+          "summary": "Bộ dữ liệu Northstar Commerce v1.0 được đóng gói với tổng số 107 file vật lý, đảm bảo không vượt quá giới hạn 160 file."
+        },
+        {
+          "id": "93f20978-96d9-4634-8fec-ebde0781ea82",
+          "title": "Thứ tự nạp dữ liệu nền tảng",
+          "summary": "Thứ tự nạp dữ liệu nền tảng bao gồm organizations, departments, members, access_groups và group_memberships."
+        },
+        {
+          "id": "650e819d-5f03-4a6c-9c58-09c493539d87",
+          "title": "Thứ tự nạp dữ liệu dự án và sprint",
+          "summary": "Dữ liệu dự án và sprint được nạp theo thứ tự projects, sprints và project_memberships."
+        },
+        {
+          "id": "82267a11-661c-4bb6-ba7e-e5fe9a20374e",
+          "title": "Thứ tự nạp dữ liệu tiến độ và nhiệm vụ",
+          "summary": "Tiến độ và nhiệm vụ được nạp theo thứ tự issues, issue_comments và issue_changelog."
+        }
+      ]
+    },
+    "sag_entities": {
+      "count": 21,
+      "cjk_contaminated_count": 0,
+      "by_type": {
+        "organization": 4,
+        "system": 12,
+        "concept": 4,
+        "standard": 1
+      },
+      "samples": [
+        {
+          "type": "organization",
+          "name": "Northstar Commerce Systems",
+          "description": "Organization in 00_START_HERE"
+        },
+        {
+          "type": "organization",
+          "name": "Meridian Outfitters",
+          "description": "Organization in 00_START_HERE"
+        },
+        {
+          "type": "organization",
+          "name": "PulsePay Network",
+          "description": "Organization in 00_START_HERE"
+        },
+        {
+          "type": "system",
+          "name": "Bagisto",
+          "description": "System in 00_START_HERE"
+        },
+        {
+          "type": "organization",
+          "name": "Northstar Commerce",
+          "description": "Organization in 00_START_HERE"
+        },
+        {
+          "type": "concept",
+          "name": "structured/documents.jsonl",
+          "description": "Concept in 00_START_HERE"
+        },
+        {
+          "type": "concept",
+          "name": "Logical Documents",
+          "description": "Concept in 00_START_HERE"
+        },
+        {
+          "type": "concept",
+          "name": "manifest.json",
+          "description": "Concept in 00_START_HERE"
+        },
+        {
+          "type": "standard",
+          "name": "SHA-256",
+          "description": "Standard in 00_START_HERE"
+        },
+        {
+          "type": "concept",
+          "name": "file vật lý",
+          "description": "Concept in 00_START_HERE"
+        },
+        {
+          "type": "system",
+          "name": "organizations",
+          "description": "System in 00_START_HERE"
+        },
+        {
+          "type": "system",
+          "name": "departments",
+          "description": "System in 00_START_HERE"
+        }
+      ]
+    },
+    "tree_routing_profiles": {
+      "count": 1,
+      "cjk_contaminated_count": 0
+    }
+  },
+  "qdrant_profile": {
+    "entity_vectors": {
+      "points_count": 0,
+      "status": "green",
+      "by_vector_type": {},
+      "sample_vectors": null,
+      "sample_payload_keys": []
+    },
+    "event_entity_vectors": {
+      "points_count": 0,
+      "status": "green",
+      "by_vector_type": {},
+      "sample_vectors": null,
+      "sample_payload_keys": []
+    },
+    "event_vectors_wide": {
+      "points_count": 0,
+      "status": "green",
+      "by_vector_type": {},
+      "sample_vectors": null,
+      "sample_payload_keys": []
+    },
+    "search_units_6ad61cb2e1f989c367a1eb46": {
+      "points_count": 6,
+      "status": "green",
+      "by_vector_type": {
+        "search_unit": 6
+      },
+      "sample_vectors": {
+        "content_vector": 1024,
+        "bm25_sparse": "sparse(103 nnz)"
+      },
+      "sample_payload_keys": [
+        "_sag_id",
+        "block_from_id",
+        "block_to_id",
+        "content",
+        "content_hash",
+        "document_id",
+        "document_version_id",
+        "page_from",
+        "page_to",
+        "primary_node_a",
+        "primary_node_b",
+        "project_id",
+        "search_unit_id",
+        "secondary_node_ids_a",
+        "secondary_node_ids_b",
+        "section_path",
+        "security_partition_id",
+        "source_anchor",
+        "source_id",
+        "tenant_id",
+        "token_count",
+        "tree_version_a",
+        "tree_version_b",
+        "valid_from",
+        "valid_from_iso",
+        "valid_from_ts",
+        "valid_to",
+        "valid_to_iso",
+        "valid_to_ts",
+        "version_no"
+      ]
+    },
+    "source_chunks": {
+      "points_count": 0,
+      "status": "green",
+      "by_vector_type": {},
+      "sample_vectors": null,
+      "sample_payload_keys": []
+    }
+  },
+  "search_evaluation": [
+    {
+      "query": "Quy mô dữ liệu chuẩn của bộ dữ liệu Northstar Commerce v1.0 gồm bao nhiêu tổ chức, dự án, sprints, tài liệu logic và Jira issues?",
+      "http_status": 200,
+      "wall_ms": 7638.66,
+      "answer_status": "answered",
+      "summary": "- **Tổ chức**: 3 [1].  \n- **Dự án**: 8 [1].  \n- **Sprints**: 104 [1].  \n- **Tài liệu logic**: 1.400 [1].  \n- **Jira issues**: 2.500 [1].",
+      "has_cjk_in_summary": false,
+      "citations_count": 1,
+      "citations": [
+        {
+          "kind": "internal",
+          "n": 1,
+          "document_id": "24ad7315-21b7-5f9f-9867-df4ac4e4ac91",
+          "document_version_id": "90e02b7c-b88c-5145-b7c5-8c10b37269b5",
+          "document_name": "00_START_HERE.md",
+          "version_no": 1,
+          "chunk_id": "cfab41f1-8645-50f9-8e61-854fbe93937b",
+          "search_unit_id": "cfab41f1-8645-50f9-8e61-854fbe93937b",
+          "block_from_id": "3f7d69d1-5d51-5f78-bbb4-81530c462ebb",
+          "block_to_id": "ee0cda05-8de2-564f-ae43-e9f5e315c96d",
+          "section_path": "Bộ Dữ Liệu Northstar Commerce v1.0 — Hướng Dẫn Vận Hành & Khai Thác > 2. Quy mô dữ liệu chuẩn (Canonical Data Scale)",
+          "page_from": 1,
+          "page_to": 1,
+          "anchor": "h2-4",
+          "heading": "Bộ Dữ Liệu Northstar Commerce v1.0 — Hướng Dẫn Vận Hành & Khai Thác > 2. Quy mô dữ liệu chuẩn (Canonical Data Scale)",
+          "snippet": "2. Quy mô dữ liệu chuẩn (Canonical Data Scale) - **3 Tổ chức (Organizations)**: `ORG-NSC` (Northstar), `ORG-MERIDIAN` (Meridian), `ORG-PULSEPAY` (PulsePay). - **10 Phòng ban (Departments)**: 8 phòng ban Northstar, 1 Merchandising (Meridian), 1 API Ops (PulsePay). - **74 Hồ sơ thành viên (Members)**: 60 nhân sự nội bộ Northstar, 8 nhân sự Meridian, 6 nhân sự PulsePay. Trong đó có 71 thành viên active và 3 cựu nhân viên (inactive, quyền hạn đã bị thu hồi). - **8 Dự án (Projects)**: `NSC-CAT`, `NSC-SRCH`, `NSC-CART`, `NSC-CHKO`, `NSC-PAY`, `NSC-INV`, `NSC-ORD`, `NSC-PLAT`. - **104 Sprints**: 13 sprint liên tiếp, mỗi sprint 14 ngày tính cả ngày đầu/cuối. Sprint 13 chạy từ 2026-09-29 đến hết 2026-10-12 và có issue c…",
+          "score": 1.0,
+          "source_id": "123fccab4b14437fb4178caca0f4bcbc",
+          "source_name": "Project 6ad61cb2e1f989c367a1eb46"
+        }
+      ],
+      "sections_count": 6,
+      "events_count": 0,
+      "stats": {
+        "canonical_index": true,
+        "ready_versions": 1,
+        "requested_top_k": 6,
+        "candidate_top_k": 18,
+        "candidate_unit_pool_limit": 1024,
+        "candidate_units_before_cap": 6,
+        "candidate_units_after_cap": 6,
+        "candidate_units_truncated": 0,
+        "semantic_candidates": 6,
+        "lexical_candidates": 6,
+        "candidates": 6,
+        "relevant": 6,
+        "filtered_irrelevant": 0,
+        "fusion_method": "rrf",
+        "selection_method": "authorized_content_dedup_mmr",
+        "cross_scope_merge": "rank_interleave",
+        "coverage": {
+          "candidate_count": 6,
+          "deduplicated_count": 0,
+          "diversity_weight": 0.5,
+          "near_duplicate_similarity": 0.98,
+          "required_anchor_count": 1,
+          "covered_anchor_count": 1,
+          "anchor_coverage": "complete",
+          "status": "structurally_sufficient",
+          "canonical_locator_verified": true,
+          "semantic_answerability": "unknown"
+        },
+        "routing": {
+          "planner": {
+            "planner_version": "qsp-v1",
+            "requested_strategy": "AUTO",
+            "effective_strategy": "EXACT",
+            "modifiers": [],
+            "reason_codes": [
+              "EXACT_IDENTIFIER_PRESENT",
+              "EXACT_PATH_PRESENT"
+            ],
+            "multi_hop_eligible": false
+          },
+          "request_snapshot_id": "01189b16-8c9b-49d4-b874-a75f5fbed68c",
+          "groups": [
+            {
+              "project_id": "6ad61cb2e1f989c367a1eb46",
+              "source_id": "123fccab4b14437fb4178caca0f4bcbc",
+              "partition_id": "6ad61cb2e1f989c367a1eb46",
+              "snapshot_id": "7c9c40d5-a8a5-4c08-9337-b89658532f2d",
+              "request_snapshot_id": "01189b16-8c9b-49d4-b874-a75f5fbed68c",
+              "acl_scope_fingerprint": "d29d52bdacf0208887cb299d28320e2c4d313474a457084a78c70b9f7764ba5b",
+              "tree_version": "tree-90e831e69d5a3200ef3b7f27",
+              "routing_slot": "SLOT_A",
+              "search_epoch": 2,
+              "selected_nodes": [
+                "652e2a337e1c3c7ae84fce2845bf54af"
+              ],
+              "membership_count": 1,
+              "entropy": 0.0,
+              "margin": 1.0,
+              "broad_route": false,
+              "reason_code": "ROUTE_DESCENDED",
+              "fallback_reason": null,
+              "branch_local_candidates": 5,
+              "global_candidates": 6,
+              "escape_recovered_candidates": 1,
+              "escape_attempted": true,
+              "escape_trigger": "reserved_parallel_global_escape",
+              "local_failure": null,
+              "escape_failure": null,
+              "blackhole_detected": false
+            }
+          ],
+          "coverage": {
+            "candidate_count": 6,
+            "deduplicated_count": 0,
+            "diversity_weight": 0.5,
+            "near_duplicate_similarity": 0.98,
+            "required_anchor_count": 1,
+            "covered_anchor_count": 1,
+            "anchor_coverage": "complete",
+            "status": "structurally_sufficient",
+            "canonical_locator_verified": true,
+            "semantic_answerability": "unknown"
+          },
+          "selection_fallback_reason": null,
+          "multi_hop": {
+            "eligible": false,
+            "effective": "EXACT",
+            "graph_expansion_attempted": false,
+            "graph_expanded_candidates": 0,
+            "graph_expansion_skip_reason": null
+          },
+          "fallback_used": true
+        },
+        "selection_fallback_reason": null,
+        "stage_latencies_ms": {
+          "auth_scope": 55.81,
+          "tree_route": 61.26,
+          "candidate_retrieval": 1384.89,
+          "rank_fusion": 2.87,
+          "diversity_selection": 7.55,
+          "total_retrieval": 1569.95
+        },
+        "latency_total_ms": 1569.95,
+        "event_candidates": 0,
+        "query_route": {
+          "version": "query-flow-v1",
+          "query_original": "Quy mô dữ liệu chuẩn của bộ dữ liệu Northstar Commerce v1.0 gồm bao nhiêu tổ chức, dự án, sprints, tài liệu logic và Jira issues?",
+          "scope_source_ids": [
+            "123fccab4b14437fb4178caca0f4bcbc"
+          ],
+          "coarse_intent": "KNOWLEDGE",
+          "confidence": 0.9249,
+          "model": "Kev-4b",
+          "suggested_strategy": "vector",
+          "requested_strategy": "auto",
+          "effective_strategy": "vector",
+          "retrieval": "required",
+          "fallback_used": false,
+          "fallback_reason": null,
+          "reason_codes": [
+            "KNOWLEDGE_INTENT",
+            "EXACT_IDENTIFIER",
+            "EXACT_PATH_OR_SYMBOL"
+          ],
+          "query_analysis": {
+            "normalized_phrase": "quymdliuchuncabdliunorthstarcommercev10gmbaonhiutchcdnsprintslogicvjiraissues",
+            "lookup_terms": [
+              "quy",
+              "li",
+              "chu",
+              "northstar"
+            ],
+            "features": {
+              "exact_terms": [],
+              "identifier_terms": [
+                "v1.0"
+              ],
+              "path_terms": [
+                "v1.0"
+              ],
+              "temporal_cues": [],
+              "relation_cues": [],
+              "global_cues": [],
+              "multi_hop": false
+            }
+          },
+          "retrieval_fallback_used": false
+        },
+        "event_hits": 0,
+        "event_recall": "chunk"
+      }
+    },
+    {
+      "query": "What are the three organizations in the Northstar Commerce scenario and what open-source architecture inspired the platform?",
+      "http_status": 200,
+      "wall_ms": 8083.11,
+      "answer_status": "answered",
+      "summary": "The three organizations in the Northstar Commerce scenario are **ORG-NSC** (Northstar), **ORG-MERIDIAN** (Meridian), and **ORG-PULSEPAY** (PulsePay). The platform was inspired by the open-source architecture **Bagisto**, which uses **Laravel + Vue.js** [1].",
+      "has_cjk_in_summary": false,
+      "citations_count": 1,
+      "citations": [
+        {
+          "kind": "internal",
+          "n": 1,
+          "document_id": "24ad7315-21b7-5f9f-9867-df4ac4e4ac91",
+          "document_version_id": "90e02b7c-b88c-5145-b7c5-8c10b37269b5",
+          "document_name": "00_START_HERE.md",
+          "version_no": 1,
+          "chunk_id": "590d6a47-199f-5964-b285-634b67763749",
+          "search_unit_id": "590d6a47-199f-5964-b285-634b67763749",
+          "block_from_id": "3527662c-96d6-59bc-a569-55777bb143be",
+          "block_to_id": "21e2587b-fb17-5aa9-a171-c578ec989e0b",
+          "section_path": "Bộ Dữ Liệu Northstar Commerce v1.0 — Hướng Dẫn Vận Hành & Khai Thác > 1. Bối cảnh kịch bản (Dataset Scenario)",
+          "page_from": 1,
+          "page_to": 1,
+          "anchor": "h2-1",
+          "heading": "Bộ Dữ Liệu Northstar Commerce v1.0 — Hướng Dẫn Vận Hành & Khai Thác > 1. Bối cảnh kịch bản (Dataset Scenario)",
+          "snippet": "1. Bối cảnh kịch bản (Dataset Scenario) Bộ dữ liệu mô phỏng công ty công nghệ hư cấu **Northstar Commerce Systems**, đang xây dựng nền tảng thương mại điện tử đa tenant (multi-tenant ecommerce platform) cho khách hàng merchant pilot là **Meridian Outfitters**, tích hợp với đối tác cổng thanh toán **PulsePay Network**. - Nguồn cảm hứng domain và công nghệ: Dự án mã nguồn mở **Bagisto** (kiến trúc Laravel + Vue.js: https://github.com/bagisto/bagisto). - **Tính tổng hợp (Synthetic)**: 100% dữ liệu nhân sự, công ty, ticket, thẻ thanh toán, sự cố và tài liệu đều là dữ liệu giả lập phục vụ kiểm thử và demo. Mọi địa chỉ email sử dụng tên miền an toàn `example.invalid`. Không chứa bất kỳ bí mật, API key thật hay dữ liệ…",
+          "score": 1.0,
+          "source_id": "123fccab4b14437fb4178caca0f4bcbc",
+          "source_name": "Project 6ad61cb2e1f989c367a1eb46"
+        }
+      ],
+      "sections_count": 4,
+      "events_count": 0,
+      "stats": {
+        "canonical_index": true,
+        "ready_versions": 1,
+        "requested_top_k": 6,
+        "candidate_top_k": 18,
+        "candidate_unit_pool_limit": 1024,
+        "candidate_units_before_cap": 6,
+        "candidate_units_after_cap": 6,
+        "candidate_units_truncated": 0,
+        "semantic_candidates": 6,
+        "lexical_candidates": 4,
+        "candidates": 6,
+        "relevant": 4,
+        "filtered_irrelevant": 2,
+        "fusion_method": "rrf",
+        "selection_method": "authorized_content_dedup_mmr",
+        "cross_scope_merge": "rank_interleave",
+        "coverage": {
+          "candidate_count": 4,
+          "deduplicated_count": 0,
+          "diversity_weight": 0.5,
+          "near_duplicate_similarity": 0.98,
+          "required_anchor_count": 0,
+          "covered_anchor_count": 0,
+          "anchor_coverage": "not_required",
+          "status": "unknown",
+          "canonical_locator_verified": true,
+          "semantic_answerability": "unknown"
+        },
+        "routing": {
+          "planner": {
+            "planner_version": "qsp-v1",
+            "requested_strategy": "AUTO",
+            "effective_strategy": "LOCAL_FACTUAL",
+            "modifiers": [],
+            "reason_codes": [
+              "DEFAULT_LOCAL_FACTUAL"
+            ],
+            "multi_hop_eligible": false
+          },
+          "request_snapshot_id": "c9e3d5c2-d896-474b-8362-d33f196198e3",
+          "groups": [
+            {
+              "project_id": "6ad61cb2e1f989c367a1eb46",
+              "source_id": "123fccab4b14437fb4178caca0f4bcbc",
+              "partition_id": "6ad61cb2e1f989c367a1eb46",
+              "snapshot_id": "8940971b-8a6d-44df-9bb8-5fa7c170267b",
+              "request_snapshot_id": "c9e3d5c2-d896-474b-8362-d33f196198e3",
+              "acl_scope_fingerprint": "d29d52bdacf0208887cb299d28320e2c4d313474a457084a78c70b9f7764ba5b",
+              "tree_version": "tree-90e831e69d5a3200ef3b7f27",
+              "routing_slot": "SLOT_A",
+              "search_epoch": 2,
+              "selected_nodes": [
+                "652e2a337e1c3c7ae84fce2845bf54af"
+              ],
+              "membership_count": 1,
+              "entropy": 0.0,
+              "margin": 1.0,
+              "broad_route": false,
+              "reason_code": "ROUTE_DESCENDED",
+              "fallback_reason": null,
+              "branch_local_candidates": 5,
+              "global_candidates": 6,
+              "escape_recovered_candidates": 1,
+              "escape_attempted": true,
+              "escape_trigger": "reserved_parallel_global_escape",
+              "local_failure": null,
+              "escape_failure": null,
+              "blackhole_detected": false
+            }
+          ],
+          "coverage": {
+            "candidate_count": 4,
+            "deduplicated_count": 0,
+            "diversity_weight": 0.5,
+            "near_duplicate_similarity": 0.98,
+            "required_anchor_count": 0,
+            "covered_anchor_count": 0,
+            "anchor_coverage": "not_required",
+            "status": "unknown",
+            "canonical_locator_verified": true,
+            "semantic_answerability": "unknown"
+          },
+          "selection_fallback_reason": null,
+          "multi_hop": {
+            "eligible": false,
+            "effective": "LOCAL_FACTUAL",
+            "graph_expansion_attempted": false,
+            "graph_expanded_candidates": 0,
+            "graph_expansion_skip_reason": null
+          },
+          "fallback_used": true
+        },
+        "selection_fallback_reason": null,
+        "stage_latencies_ms": {
+          "auth_scope": 17.36,
+          "tree_route": 27.42,
+          "candidate_retrieval": 2804.45,
+          "rank_fusion": 2.5,
+          "diversity_selection": 2.56,
+          "total_retrieval": 2888.33
+        },
+        "latency_total_ms": 2888.33,
+        "event_candidates": 0,
+        "query_route": {
+          "version": "query-flow-v1",
+          "query_original": "What are the three organizations in the Northstar Commerce scenario and what open-source architecture inspired the platform?",
+          "scope_source_ids": [
+            "123fccab4b14437fb4178caca0f4bcbc"
+          ],
+          "coarse_intent": "KNOWLEDGE",
+          "confidence": 0.8844,
+          "model": "Kev-4b",
+          "suggested_strategy": "vector",
+          "requested_strategy": "auto",
+          "effective_strategy": "vector",
+          "retrieval": "required",
+          "fallback_used": false,
+          "fallback_reason": null,
+          "reason_codes": [
+            "KNOWLEDGE_INTENT"
+          ],
+          "query_analysis": {
+            "normalized_phrase": "whatarethethreeorganizationsinthenorthstarcommercescenarioandwhatopensourcearchitectureinspiredtheplatform",
+            "lookup_terms": [
+              "what",
+              "are",
+              "the",
+              "three"
+            ],
+            "features": {
+              "exact_terms": [],
+              "identifier_terms": [],
+              "path_terms": [],
+              "temporal_cues": [],
+              "relation_cues": [],
+              "global_cues": [],
+              "multi_hop": false
+            }
+          },
+          "retrieval_fallback_used": false
+        },
+        "event_hits": 0,
+        "event_recall": "chunk"
+      }
+    },
+    {
+      "query": "Mối liên hệ giữa tổ chức org_northstar_commerce, các dự án prj_checkout_core và thứ tự đọc tài liệu được khuyến nghị như thế nào?",
+      "http_status": 200,
+      "wall_ms": 10890.52,
+      "answer_status": "answered",
+      "summary": "Mối liên hệ giữa tổ chức `org_northstar_commerce` và dự án `prj_checkout_core` là: `prj_checkout_core` là một trong 8 dự án thuộc tổ chức `org_northstar_commerce`. Thứ tự đọc tài liệu được khuyến nghị là: trước tiên đọc các tài liệu liên quan đến tổ chức và phòng ban, sau đó là các tài liệu liên quan đến dự án và sprints, cuối cùng là tài liệu liên quan đến các issue và test case. [6]",
+      "has_cjk_in_summary": false,
+      "citations_count": 1,
+      "citations": [
+        {
+          "kind": "internal",
+          "n": 6,
+          "document_id": "24ad7315-21b7-5f9f-9867-df4ac4e4ac91",
+          "document_version_id": "90e02b7c-b88c-5145-b7c5-8c10b37269b5",
+          "document_name": "00_START_HERE.md",
+          "version_no": 1,
+          "chunk_id": "b082bbbc-3881-53b4-a0df-58693c459d77",
+          "search_unit_id": "b082bbbc-3881-53b4-a0df-58693c459d77",
+          "block_from_id": "fc4fd297-4dd7-5714-8ee7-5ba23608f087",
+          "block_to_id": "29c414c0-1d0a-5aaa-8718-3d94d95d3fc3",
+          "section_path": "Bộ Dữ Liệu Northstar Commerce v1.0 — Hướng Dẫn Vận Hành & Khai Thác > 4. Thứ tự nạp dữ liệu khuyến nghị (Ingestion Pipeline)",
+          "page_from": 1,
+          "page_to": 1,
+          "anchor": "h2-9",
+          "heading": "Bộ Dữ Liệu Northstar Commerce v1.0 — Hướng Dẫn Vận Hành & Khai Thác > 4. Thứ tự nạp dữ liệu khuyến nghị (Ingestion Pipeline)",
+          "snippet": "4. Thứ tự nạp dữ liệu khuyến nghị (Ingestion Pipeline) 1. **Thực thể nền tảng**: `organizations` → `departments` → `members` → `access_groups` → `group_memberships`. 2. **Dự án & Sprints**: `projects` → `sprints` → `project_memberships`. 3. **Tiến độ và nhiệm vụ**: `issues` → `issue_comments` → `issue_changelog`. 4. **Nạp kho tài liệu (Content Ingestion)**: - Nạp các file DOCX trong `documents/docx/` và Markdown trong `documents/markdown/formal/`. - Phân đoạn 56 bundles trong `documents/markdown/bundles/` theo các thẻ neo `<a id=\"...\"></a>` để tạo đúng 1.373 chunks tài liệu tương ứng với `structured/documents.jsonl`. 5. **Đánh chỉ mục vector & tìm kiếm**: - Gắn nhãn `access_groups`, `classification`, và `scope`…",
+          "score": 0.9841,
+          "source_id": "123fccab4b14437fb4178caca0f4bcbc",
+          "source_name": "Project 6ad61cb2e1f989c367a1eb46"
+        }
+      ],
+      "sections_count": 6,
+      "events_count": 0,
+      "stats": {
+        "canonical_index": true,
+        "ready_versions": 1,
+        "requested_top_k": 6,
+        "candidate_top_k": 18,
+        "candidate_unit_pool_limit": 1024,
+        "candidate_units_before_cap": 6,
+        "candidate_units_after_cap": 6,
+        "candidate_units_truncated": 0,
+        "semantic_candidates": 6,
+        "lexical_candidates": 6,
+        "candidates": 6,
+        "relevant": 6,
+        "filtered_irrelevant": 0,
+        "fusion_method": "rrf",
+        "selection_method": "authorized_content_dedup_mmr",
+        "cross_scope_merge": "rank_interleave",
+        "coverage": {
+          "candidate_count": 6,
+          "deduplicated_count": 0,
+          "diversity_weight": 0.5,
+          "near_duplicate_similarity": 0.98,
+          "required_anchor_count": 0,
+          "covered_anchor_count": 0,
+          "anchor_coverage": "not_required",
+          "status": "unknown",
+          "canonical_locator_verified": true,
+          "semantic_answerability": "unknown"
+        },
+        "routing": {
+          "planner": {
+            "planner_version": "qsp-v1",
+            "requested_strategy": "AUTO",
+            "effective_strategy": "ENTITY_RELATIONAL",
+            "modifiers": [],
+            "reason_codes": [
+              "RELATION_CUE_PRESENT",
+              "MULTI_HOP_CANDIDATE"
+            ],
+            "multi_hop_eligible": true
+          },
+          "request_snapshot_id": "a11fc53b-c4ca-4ff4-91d8-fbb9a09d4dd3",
+          "groups": [
+            {
+              "project_id": "6ad61cb2e1f989c367a1eb46",
+              "source_id": "123fccab4b14437fb4178caca0f4bcbc",
+              "partition_id": "6ad61cb2e1f989c367a1eb46",
+              "snapshot_id": "9825d0ab-a25a-452c-81f8-7aec2825e2c0",
+              "request_snapshot_id": "a11fc53b-c4ca-4ff4-91d8-fbb9a09d4dd3",
+              "acl_scope_fingerprint": "d29d52bdacf0208887cb299d28320e2c4d313474a457084a78c70b9f7764ba5b",
+              "tree_version": "tree-90e831e69d5a3200ef3b7f27",
+              "routing_slot": "SLOT_A",
+              "search_epoch": 2,
+              "selected_nodes": [
+                "652e2a337e1c3c7ae84fce2845bf54af"
+              ],
+              "membership_count": 1,
+              "entropy": 0.0,
+              "margin": 1.0,
+              "broad_route": false,
+              "reason_code": "ROUTE_DESCENDED",
+              "fallback_reason": null,
+              "branch_local_candidates": 5,
+              "global_candidates": 6,
+              "escape_recovered_candidates": 1,
+              "escape_attempted": true,
+              "escape_trigger": "reserved_parallel_global_escape",
+              "local_failure": null,
+              "escape_failure": null,
+              "blackhole_detected": false
+            }
+          ],
+          "coverage": {
+            "candidate_count": 6,
+            "deduplicated_count": 0,
+            "diversity_weight": 0.5,
+            "near_duplicate_similarity": 0.98,
+            "required_anchor_count": 0,
+            "covered_anchor_count": 0,
+            "anchor_coverage": "not_required",
+            "status": "unknown",
+            "canonical_locator_verified": true,
+            "semantic_answerability": "unknown"
+          },
+          "selection_fallback_reason": null,
+          "multi_hop": {
+            "eligible": true,
+            "effective": "ENTITY_RELATIONAL",
+            "graph_expansion_attempted": false,
+            "graph_expanded_candidates": 0,
+            "graph_expansion_skip_reason": null
+          },
+          "fallback_used": true
+        },
+        "selection_fallback_reason": null,
+        "stage_latencies_ms": {
+          "auth_scope": 17.11,
+          "tree_route": 12.55,
+          "candidate_retrieval": 2399.62,
+          "rank_fusion": 1.22,
+          "diversity_selection": 5.21,
+          "total_retrieval": 2464.68
+        },
+        "latency_total_ms": 2464.68,
+        "event_candidates": 0,
+        "query_route": {
+          "version": "query-flow-v1",
+          "query_original": "Mối liên hệ giữa tổ chức org_northstar_commerce, các dự án prj_checkout_core và thứ tự đọc tài liệu được khuyến nghị như thế nào?",
+          "scope_source_ids": [
+            "123fccab4b14437fb4178caca0f4bcbc"
+          ],
+          "coarse_intent": "AMBIGUOUS",
+          "confidence": 0.561,
+          "model": "Kev-4b",
+          "suggested_strategy": "multi",
+          "requested_strategy": "auto",
+          "effective_strategy": "multi",
+          "retrieval": "required",
+          "fallback_used": false,
+          "fallback_reason": null,
+          "reason_codes": [
+            "INTENT_CONFIDENCE_LOW",
+            "RELATION_CUE",
+            "MULTI_HOP_CUE"
+          ],
+          "query_analysis": {
+            "normalized_phrase": "milinhgiatchcorgnorthstarcommerceccdnprjcheckoutcorevthtcckhuynnghnhthno",
+            "lookup_terms": [
+              "li",
+              "gi",
+              "ch",
+              "org_northstar_commerce"
+            ],
+            "features": {
+              "exact_terms": [],
+              "identifier_terms": [],
+              "path_terms": [],
+              "temporal_cues": [],
+              "relation_cues": [
+                "mối liên hệ",
+                "liên hệ"
+              ],
+              "global_cues": [],
+              "multi_hop": true
+            }
+          },
+          "retrieval_fallback_used": false
+        },
+        "event_hits": 0,
+        "event_recall": "chunk"
+      }
+    }
+  ]
+}

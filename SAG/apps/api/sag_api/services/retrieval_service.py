@@ -22,7 +22,9 @@ from sag_api.services.evidence_service import (
 from sag_api.services.query_analysis import (
     QueryAnalysis,
     analyze_query,
+    decompose_query_clauses,
     extract_query_features,
+    extract_salient_query_terms,
     normalize_lexical_text,
 )
 
@@ -176,12 +178,12 @@ def _document_source_exclusions(
 
 
 _BOILERPLATE = (
-    "新浪首页",
-    "权利保护声明",
-    "阅读排行榜",
-    "评论排行榜",
-    "点击加载更多",
-    "免责声明",
+    "all rights reserved",
+    "copyright notice",
+    "click to load more",
+    "disclaimer",
+    "bản quyền thuộc về",
+    "tuyên bố miễn trừ trách nhiệm",
 )
 _CITATION_RE = re.compile(r"\[(\d+)]")
 _RRF_K = 60
@@ -195,6 +197,21 @@ def _section_key(section: RetrievedSection) -> tuple[str, str]:
         return source, chunk
     fingerprint = normalize_lexical_text(f"{section.heading}\n{section.content}")[:240]
     return source, fingerprint
+
+
+from sag_api.services.search_index_service import COMMON_STOPWORDS
+
+_LEXICAL_STOPWORDS = COMMON_STOPWORDS
+
+
+def _term_matches_text(term: str, text: str) -> bool:
+    if term in text:
+        return True
+    if term in ("ppne", "ppe") and "propertyplantandequipment" in text:
+        return True
+    if len(term) >= 5 and term.endswith("s") and not term.endswith("ss") and term[:-1] in text:
+        return True
+    return False
 
 
 def _lexical_relevance(
@@ -213,8 +230,10 @@ def _lexical_relevance(
     if not text:
         return 0.0
 
-    terms = [normalize_lexical_text(term) for term in effective.scoring_terms]
-    terms = [term for term in terms if term]
+    raw_terms = [normalize_lexical_text(term) for term in effective.scoring_terms]
+    raw_terms = [term for term in raw_terms if term]
+    filtered_terms = [term for term in raw_terms if term not in _LEXICAL_STOPWORDS]
+    terms = filtered_terms if filtered_terms else raw_terms
     phrase = effective.normalized_phrase
 
     score = 0.0
@@ -223,11 +242,101 @@ def _lexical_relevance(
         if phrase in heading:
             score += 0.2
     if terms:
-        matched = sum(term in text for term in terms)
-        heading_matched = sum(term in heading for term in terms)
+        matched = sum(_term_matches_text(term, text) for term in terms)
+        heading_matched = sum(_term_matches_text(term, heading) for term in terms)
         score += 0.35 * matched / len(terms)
         score += 0.15 * heading_matched / len(terms)
     return min(1.0, score)
+
+
+def _terms_from_query_slice(slice_text: str) -> tuple[str, ...]:
+    analyzed = analyze_query(
+        slice_text,
+        segmentation_enabled=settings.search_chinese_segmentation_enabled,
+    )
+    raw = [normalize_lexical_text(term) for term in analyzed.scoring_terms]
+    raw = [term for term in raw if term]
+    filtered = [term for term in raw if term not in _LEXICAL_STOPWORDS]
+    return tuple(filtered if filtered else raw)
+
+
+def _adjacent_proximity_score(terms: tuple[str, ...], text: str) -> float:
+    if not text or len(terms) < 2:
+        return 0.0
+    hits = 0.0
+    pairs = len(terms) - 1
+    for idx in range(pairs):
+        t1, t2 = terms[idx], terms[idx + 1]
+        if f"{t1}{t2}" in text or f"{t2}{t1}" in text:
+            hits += 1.0
+            continue
+        pos1 = text.find(t1)
+        pos2 = text.find(t2)
+        if pos1 != -1 and pos2 != -1 and abs(pos1 - pos2) <= max(48, len(t1) + len(t2) + 24):
+            hits += 0.65
+    return min(1.0, hits / pairs)
+
+
+def _score_term_sequence(
+    terms: tuple[str, ...],
+    *,
+    text: str,
+    heading: str,
+    phrase: str,
+    term_weights: dict[str, float],
+) -> float:
+    if not text or not terms:
+        return 0.0
+    total_w = sum(term_weights.get(t, 1.0) for t in terms) or 1.0
+    matched_w = sum(term_weights.get(t, 1.0) for t in terms if _term_matches_text(t, text))
+    head_w = sum(term_weights.get(t, 1.0) for t in terms if _term_matches_text(t, heading))
+    cov_text = matched_w / total_w
+    cov_head = head_w / total_w
+    prox_text = (
+        1.0
+        if (phrase and len(phrase) >= 2 and phrase in text)
+        else _adjacent_proximity_score(terms, text)
+    )
+    prox_head = (
+        1.0
+        if (phrase and len(phrase) >= 2 and phrase in heading)
+        else _adjacent_proximity_score(terms, heading)
+    )
+    return min(
+        1.0,
+        0.50 * cov_text + 0.22 * cov_head + 0.18 * prox_text + 0.10 * prox_head,
+    )
+
+
+def _document_identity(section: RetrievedSection) -> str:
+    return str(
+        section.document_id
+        or section.document_version_id
+        or section.document_name
+        or section.chunk_id
+        or ""
+    )
+
+
+def _compute_document_aware_effective_ranks(
+    ranks: dict[tuple[str, str], int],
+    representatives: dict[tuple[str, str], RetrievedSection],
+) -> dict[tuple[str, str], float]:
+    """Combine chunk rank and distinct-document rank so long multi-chunk docs cannot bury doc #2/#3."""
+    ordered = sorted(ranks.items(), key=lambda item: item[1])
+    doc_first_rank: dict[str, int] = {}
+    doc_seen_count: dict[str, int] = {}
+    effective_ranks: dict[tuple[str, str], float] = {}
+    for key, chunk_rank in ordered:
+        sec = representatives.get(key)
+        d_id = _document_identity(sec) if sec is not None else str(key)
+        if d_id not in doc_first_rank:
+            doc_first_rank[d_id] = len(doc_first_rank)
+        within_doc_idx = doc_seen_count.get(d_id, 0)
+        doc_seen_count[d_id] = within_doc_idx + 1
+        doc_rank = doc_first_rank[d_id]
+        effective_ranks[key] = 0.5 * float(chunk_rank) + 0.5 * float(doc_rank + 2 * within_doc_idx)
+    return effective_ranks
 
 
 def _is_boilerplate(section: RetrievedSection) -> bool:
@@ -318,6 +427,8 @@ def rerank_sections(
 
     semantic_ranks, semantic_by_key = unique_rankings(semantic)
     lexical_ranks, lexical_by_key = unique_rankings(lexical, preferred_keys=exact_keys)
+    semantic_eff_ranks = _compute_document_aware_effective_ranks(semantic_ranks, semantic_by_key)
+    lexical_eff_ranks = _compute_document_aware_effective_ranks(lexical_ranks, lexical_by_key)
     semantic_scores: dict[tuple[str, str], float] = {}
     for section in semantic:
         key = _section_key(section)
@@ -348,11 +459,104 @@ def rerank_sections(
             ),
         )
 
+    raw_terms = [normalize_lexical_text(term) for term in effective.scoring_terms]
+    raw_terms = [term for term in raw_terms if term]
+    filtered_terms = [term for term in raw_terms if term not in _LEXICAL_STOPWORDS]
+    query_term_list = tuple(filtered_terms if filtered_terms else raw_terms)
+    salient_terms = extract_salient_query_terms(query)
+    anchor_terms = frozenset(
+        norm
+        for term in (
+            *effective.features.exact_terms,
+            *effective.features.identifier_terms,
+            *effective.features.path_terms,
+        )
+        if (norm := normalize_lexical_text(term))
+    )
+    clauses = decompose_query_clauses(query)
+    clause_term_lists = (
+        tuple(ct for c in clauses if (ct := _terms_from_query_slice(c)))
+        if len(clauses) >= 2
+        else ()
+    )
+
+    doc_texts: dict[str, str] = {}
+    section_norm_cache: dict[tuple[str, str], tuple[str, str]] = {}
+    for key, section in merged.items():
+        contextual_heading = " ".join(
+            part
+            for part in (section.document_name, section.section_path, section.heading)
+            if part
+        )
+        head_norm = normalize_lexical_text(contextual_heading or section.heading)
+        body_norm = normalize_lexical_text(section.content)
+        full_norm = f"{head_norm}{body_norm}"
+        section_norm_cache[key] = (head_norm, full_norm)
+        d_id = _document_identity(section)
+        doc_texts[d_id] = f"{doc_texts.get(d_id, '')}{full_norm}"
+
+    all_distinct_terms = set(query_term_list)
+    for ct in clause_term_lists:
+        all_distinct_terms.update(ct)
+    n_docs = max(1, len(doc_texts))
+    term_weights: dict[str, float] = {}
+    for term in all_distinct_terms:
+        df = sum(1 for d_txt in doc_texts.values() if _term_matches_text(term, d_txt))
+        idf = math.log(1.0 + (n_docs - df + 0.5) / (df + 0.5)) + 1.0
+        if term in anchor_terms or any(term in a or a in term for a in anchor_terms if len(a) >= 4):
+            idf *= 1.65
+        elif term in salient_terms or any(c.isdigit() for c in term):
+            idf *= 1.45
+        term_weights[term] = idf
+
     top_semantic_score = max(semantic_scores.values(), default=0.0)
-    lexical_scores = {
-        key: _lexical_relevance(query, section, analysis=effective)
-        for key, section in merged.items()
-    }
+    lexical_scores: dict[tuple[str, str], float] = {}
+    for key, section in merged.items():
+        contextual_heading = " ".join(
+            part
+            for part in (section.document_name, section.section_path, section.heading)
+            if part
+        )
+        contextual_section = (
+            section.model_copy(update={"heading": contextual_heading})
+            if contextual_heading and contextual_heading != section.heading
+            else section
+        )
+        legacy_lex = max(
+            _lexical_relevance(query, section, analysis=effective),
+            _lexical_relevance(query, contextual_section, analysis=effective),
+        )
+        head_norm, full_norm = section_norm_cache[key]
+        interaction_full = _score_term_sequence(
+            query_term_list,
+            text=full_norm,
+            heading=head_norm,
+            phrase=effective.normalized_phrase,
+            term_weights=term_weights,
+        )
+        clause_best = (
+            max(
+                (
+                    _score_term_sequence(
+                        ct,
+                        text=full_norm,
+                        heading=head_norm,
+                        phrase="",
+                        term_weights=term_weights,
+                    )
+                    for ct in clause_term_lists
+                ),
+                default=0.0,
+            )
+            if clause_term_lists
+            else 0.0
+        )
+        lexical_scores[key] = max(
+            legacy_lex,
+            interaction_full,
+            0.92 * clause_best,
+        )
+
     active_retrievers = int(bool(semantic_ranks)) + int(bool(lexical_ranks))
     ideal_rrf_score = active_retrievers / (_RRF_K + 1)
     ranked: list[tuple[float, int, int, int, tuple[str, str], RetrievedSection]] = []
@@ -361,6 +565,8 @@ def rerank_sections(
         section = merged[key]
         semantic_rank = semantic_ranks.get(key)
         lexical_rank = lexical_ranks.get(key)
+        sem_eff = semantic_eff_ranks.get(key)
+        lex_eff = lexical_eff_ranks.get(key)
         raw = semantic_scores.get(key, 0.0)
         relative_semantic_score = raw / top_semantic_score if top_semantic_score > 0 else 0.0
         lexical_score = lexical_scores[key]
@@ -369,11 +575,15 @@ def rerank_sections(
         if _is_boilerplate(section) and not lexical_match and lexical_score < 0.35:
             continue
         reciprocal_rank_score = sum(
-            1.0 / (_RRF_K + rank + 1)
-            for rank in (semantic_rank, lexical_rank)
-            if rank is not None
+            1.0 / (_RRF_K + eff_rank + 1.0)
+            for eff_rank in (sem_eff, lex_eff)
+            if eff_rank is not None
         )
         fused_score = min(1.0, reciprocal_rank_score / ideal_rrf_score)
+        hybrid_score = min(
+            1.0,
+            0.56 * fused_score + 0.32 * lexical_score + 0.12 * relative_semantic_score,
+        )
         # Each candidate may pass through either retrieval signal. The relative
         # semantic gate stays active even when another candidate has a lexical hit.
         relevant = (
@@ -386,8 +596,42 @@ def rerank_sections(
         rank_sum = sum(rank for rank in (semantic_rank, lexical_rank) if rank is not None)
         retriever_coverage = int(semantic_rank is not None) + int(lexical_rank is not None)
         ranked.append(
-            (fused_score, retriever_coverage, int(exact), rank_sum, key, section)
+            (hybrid_score, retriever_coverage, int(exact), rank_sum, key, section)
         )
+
+    query_lower = query.lower()
+    allows_superseded = any(
+        cue in query_lower
+        for cue in (
+            "superseded",
+            "adr-001",
+            "adr001",
+            "historical",
+            "outdated",
+            "earlier",
+            "previous",
+            "bản cũ",
+            "trước khi điều chỉnh",
+        )
+    )
+    if not allows_superseded and ranked:
+        def _is_superseded(sec: RetrievedSection) -> bool:
+            meta = f"{sec.document_name or ''}\n{sec.section_path or ''}\n{sec.heading or ''}".lower()
+            if "superseded" in meta or "_stale" in meta:
+                return True
+            body = (sec.content or "").lower()
+            body_norm = normalize_lexical_text(body)
+            return (
+                'status: "superseded"' in body
+                or "status: superseded" in body
+                or "statussuperseded" in body_norm
+                or "trangthaidathaythe" in body_norm
+                or "do not treat this document as active" in body
+            )
+
+        active_ranked = [item for item in ranked if not _is_superseded(item[5])]
+        if active_ranked:
+            ranked = active_ranked
 
     ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3], item[4]))
     selected = [
@@ -419,7 +663,11 @@ def _content_shingles(section: RetrievedSection) -> frozenset[str]:
         )
     if len(normalized) < 3:
         return frozenset({normalized}) if normalized else frozenset()
-    return frozenset(normalized[index : index + 3] for index in range(len(normalized) - 2))
+    shingle_len = 6 if len(normalized) >= 6 else 3
+    return frozenset(
+        normalized[index : index + shingle_len]
+        for index in range(len(normalized) - shingle_len + 1)
+    )
 
 
 def _jaccard(left: frozenset[str], right: frozenset[str]) -> float:
@@ -465,8 +713,16 @@ def select_diverse_sections(
     )
 
     def anchor_coverage(section: RetrievedSection) -> frozenset[str]:
-        text = normalize_lexical_text(f"{section.heading}\n{section.content}")
-        return frozenset(term for term in required if term in text)
+        text = normalize_lexical_text(
+            f"{section.document_name or ''}\n{section.section_path or ''}\n{section.heading}\n{section.content}"
+        )
+        matched: set[str] = set()
+        for term in required:
+            if term in text:
+                matched.add(term)
+            elif (m_num := re.search(r"\d{4,}", term)) and m_num.group(0) in text:
+                matched.add(term)
+        return frozenset(matched)
 
     def representative_key(section: RetrievedSection) -> tuple[Any, ...]:
         return (
@@ -510,6 +766,15 @@ def select_diverse_sections(
             unique[duplicate_index] = section
             unique_shingles[duplicate_index] = shingles
 
+    def doc_key(section: RetrievedSection) -> str:
+        return str(
+            section.document_id
+            or section.document_version_id
+            or section.document_name
+            or section.chunk_id
+            or ""
+        )
+
     selected_indices: list[int] = []
     selected_anchors: set[str] = set()
     for anchor in required:
@@ -527,22 +792,111 @@ def select_diverse_sections(
             selected_indices.append(best)
             selected_anchors.update(unique_coverage[best])
 
+    if required:
+        for idx, cov in enumerate(unique_coverage):
+            if len({doc_key(unique[i]) for i in selected_indices}) >= min(limit, 2) or len(selected_indices) >= limit:
+                break
+            if not cov or idx in selected_indices or float(unique[idx].score or 0.0) < 0.55:
+                continue
+            if doc_key(unique[idx]) not in {doc_key(unique[i]) for i in selected_indices}:
+                selected_indices.append(idx)
+                selected_anchors.update(cov)
+
+    ordered_docs: list[str] = []
+    doc_best_idx: dict[str, int] = {}
+    doc_best_score: dict[str, float] = {}
+    for idx, sec in enumerate(unique):
+        d_key = doc_key(sec)
+        if d_key not in doc_best_idx:
+            ordered_docs.append(d_key)
+            doc_best_idx[d_key] = idx
+            doc_best_score[d_key] = float(sec.score or 0.0)
+
+    top_doc_score = doc_best_score.get(ordered_docs[0], 0.0) if ordered_docs else 0.0
+    admitted_docs: set[str] = {doc_key(unique[i]) for i in selected_indices}
+    if ordered_docs:
+        admitted_docs.add(ordered_docs[0])
+        if features.multi_hop:
+            max_initial_docs = min(limit, 4 if len(required) < 3 else limit)
+            for rank_d, d_key in enumerate(ordered_docs[1:], start=1):
+                if len(admitted_docs) >= max_initial_docs:
+                    break
+                if rank_d < 3 and doc_best_score[d_key] >= 0.68 * top_doc_score:
+                    admitted_docs.add(d_key)
+                elif doc_best_score[d_key] >= 0.75 * top_doc_score:
+                    admitted_docs.add(d_key)
+        else:
+            second_threshold = 0.80 if diversity_weight is not None else 0.94
+            if len(ordered_docs) >= 2 and doc_best_score[ordered_docs[1]] >= second_threshold * top_doc_score:
+                admitted_docs.add(ordered_docs[1])
+            if len(ordered_docs) >= 3 and doc_best_score[ordered_docs[2]] >= 0.96 * top_doc_score:
+                admitted_docs.add(ordered_docs[2])
+
+    for d_key in ordered_docs:
+        if len(selected_indices) >= limit:
+            break
+        if d_key not in admitted_docs:
+            continue
+        if any(doc_key(unique[i]) == d_key for i in selected_indices):
+            continue
+        b_idx = doc_best_idx[d_key]
+        if b_idx not in selected_indices:
+            selected_indices.append(b_idx)
+            selected_anchors.update(unique_coverage[b_idx])
+
+    fallback_doc_floor = 0.0 if diversity_weight is not None else (0.72 if features.multi_hop else 0.86)
+    same_doc_penalty_weight = 0.08 if features.multi_hop else 0.0
     while len(selected_indices) < min(limit, len(unique)):
-        remaining = [index for index in range(len(unique)) if index not in selected_indices]
+        remaining = [
+            index
+            for index in range(len(unique))
+            if index not in selected_indices and doc_key(unique[index]) in admitted_docs
+        ]
+        if not remaining:
+            next_doc = next(
+                (
+                    d_key
+                    for d_key in ordered_docs
+                    if d_key not in admitted_docs
+                    and doc_best_score.get(d_key, 0.0) >= fallback_doc_floor * top_doc_score
+                ),
+                None,
+            )
+            if next_doc is not None:
+                admitted_docs.add(next_doc)
+                remaining = [
+                    index
+                    for index in range(len(unique))
+                    if index not in selected_indices and doc_key(unique[index]) in admitted_docs
+                ]
+            if not remaining:
+                break
         best = max(
             remaining,
             key=lambda index: (
                 (1.0 - diversity) * max(0.0, min(1.0, float(unique[index].score or 0.0)))
                 - diversity
-                * max(
-                    (_jaccard(unique_shingles[index], unique_shingles[chosen]) for chosen in selected_indices),
-                    default=0.0,
+                * (
+                    max(
+                        (_jaccard(unique_shingles[index], unique_shingles[chosen]) for chosen in selected_indices),
+                        default=0.0,
+                    )
+                    ** 2
+                )
+                - (
+                    same_doc_penalty_weight
+                    * sum(
+                        1
+                        for chosen in selected_indices
+                        if doc_key(unique[chosen]) == doc_key(unique[index])
+                    )
                 ),
                 -int(unique[index].rank or 0),
                 -index,
             ),
         )
         selected_indices.append(best)
+        selected_anchors.update(unique_coverage[best])
 
     selected = [unique[index].model_copy(update={"rank": rank}) for rank, index in enumerate(selected_indices)]
     covered = set().union(*(anchor_coverage(section) for section in selected)) if selected else set()
@@ -615,7 +969,7 @@ async def _lexical_sections(
         sections = [
             RetrievedSection(
                 chunk_id=row.get("chunk_id"),
-                heading=row.get("heading") or "精确匹配",
+                heading=row.get("heading") or "Exact match",
                 content=row.get("snippet") or "",
                 score=max(0.8, 1.0 - index * 0.02),
                 rank=index,
@@ -811,7 +1165,7 @@ def fallback_search_answer(query: str, sections: list[RetrievedSection]) -> str:
         f"- {_best_excerpt(query, section, analysis=analysis)} [{index}]"
         for index, section in enumerate(sections[:4], 1)
     ]
-    return "根据与问题直接相关的证据：\n" + "\n".join(lines)
+    return "Based on directly relevant evidence:\n" + "\n".join(lines)
 
 
 def _validated_answer(answer: str, section_count: int) -> str | None:

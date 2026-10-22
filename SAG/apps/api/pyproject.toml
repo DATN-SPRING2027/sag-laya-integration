@@ -57,6 +57,7 @@ packages = ["sag_api", "sag_agent"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = ["ai_smoke: opt-in live requests to configured AI services"]
 
 [tool.ruff]
 line-length = 120

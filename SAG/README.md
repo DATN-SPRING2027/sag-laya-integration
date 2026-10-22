@@ -203,7 +203,7 @@ The UI and services still start without model credentials. Embeddings are requir
 
 ### Decision Router
 
-SAG uses Kev-4B through SiliconFlow's System One API (`POST https://api.siliconflow.cn/v1/systemone`). Set `SAG_SILICONFLOW_API_KEY` or enter the key in **Settings → Models** to enable cloud classification. Query text and supplied decision context are sent to SiliconFlow. If the key is missing or the request fails, SAG keeps retrieval enabled. Set the provider to `disabled` to skip decision classification. Saved model settings in the database remain authoritative over `.env` defaults.
+SAG uses Kev-4B through SiliconFlow's System One API (`POST https://api.siliconflow.com/v1/systemone`). Set `SAG_SILICONFLOW_API_KEY` or enter the key in **Settings → Models** to enable cloud classification. Query text and supplied decision context are sent to SiliconFlow. If the key is missing or the request fails, SAG keeps retrieval enabled. Set the provider to `disabled` to skip decision classification. Saved model settings in the database remain authoritative over `.env` defaults.
 
 After changing the API key in `.env`, restart the API container:
 

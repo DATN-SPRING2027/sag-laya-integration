@@ -33,6 +33,11 @@ from sag_api.services.query_routing_service import (
 from sag_api.services.tree_publish_service import _database_now, _scoped_profile_checksum
 
 _TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
+_AGGREGATED_SCOPE_NODE_CACHE: dict[
+    tuple[Any, ...],
+    list[tuple[str, str | None, bool, int, list[list[Any]], list[str]]],
+] = {}
+_AGGREGATED_SCOPE_NODE_CACHE_MAX = 128
 
 
 def _query_signal_scores(query: str, profile: dict[str, Any]) -> dict[str, float]:
@@ -93,68 +98,101 @@ def _aggregate_source_profiles(
     fingerprint: str,
     query: str,
 ) -> tuple[QueryNodeProfile, ...] | None:
-    by_node: dict[str, dict[str, Any]] = {}
-    for record in records:
-        profile = _source_profile_payload(record)
-        if (
-            record.project_id != project_id
-            or record.tenant_id != tenant_id
-            or record.tree_version != tree_version
-            or record.source_id not in source_ids
-            or record.document_version_id not in document_version_ids
-            or record.partition_id != partition_id
-            or record.profile_checksum != _scoped_profile_checksum(tree_version, profile)
-            or not isinstance(record.node_id, str)
-            or not record.node_id
-            or (record.parent_id is not None and not isinstance(record.parent_id, str))
-            or not isinstance(record.is_leaf, bool)
-            or isinstance(record.accessible_unit_count, bool)
-            or not isinstance(record.accessible_unit_count, int)
-            or record.accessible_unit_count <= 0
-            or not isinstance(record.sparse_json, list)
-            or not isinstance(record.entities_json, list)
-            or any(not isinstance(entity, str) for entity in record.entities_json)
-        ):
-            return None
-        aggregate = by_node.setdefault(
-            record.node_id,
-            {
-                "parent_id": record.parent_id,
-                "is_leaf": record.is_leaf,
-                "accessible_unit_count": 0,
-                "sparse": defaultdict(list),
-                "entities": set(),
-            },
-        )
-        if aggregate["parent_id"] != record.parent_id or aggregate["is_leaf"] != record.is_leaf:
-            return None
-        aggregate["accessible_unit_count"] += record.accessible_unit_count
-        for item in record.sparse_json:
+    cache_sig = (
+        project_id,
+        tenant_id,
+        tree_version,
+        fingerprint,
+        tuple(
+            (
+                r.node_id,
+                r.document_version_id,
+                r.profile_checksum,
+                r.accessible_unit_count,
+            )
+            for r in records
+        ),
+    )
+    cached_nodes = _AGGREGATED_SCOPE_NODE_CACHE.get(cache_sig)
+    if cached_nodes is None:
+        by_node: dict[str, dict[str, Any]] = {}
+        for record in records:
+            profile = _source_profile_payload(record)
             if (
-                not isinstance(item, list)
-                or len(item) != 2
-                or not isinstance(item[0], str)
-                or isinstance(item[1], bool)
-                or not isinstance(item[1], (int, float))
-                or not math.isfinite(float(item[1]))
-                or float(item[1]) < 0.0
+                record.project_id != project_id
+                or record.tenant_id != tenant_id
+                or record.tree_version != tree_version
+                or record.source_id not in source_ids
+                or record.document_version_id not in document_version_ids
+                or record.partition_id != partition_id
+                or record.profile_checksum != _scoped_profile_checksum(tree_version, profile)
+                or not isinstance(record.node_id, str)
+                or not record.node_id
+                or (record.parent_id is not None and not isinstance(record.parent_id, str))
+                or not isinstance(record.is_leaf, bool)
+                or isinstance(record.accessible_unit_count, bool)
+                or not isinstance(record.accessible_unit_count, int)
+                or record.accessible_unit_count <= 0
+                or not isinstance(record.sparse_json, list)
+                or not isinstance(record.entities_json, list)
+                or any(not isinstance(entity, str) for entity in record.entities_json)
             ):
                 return None
-            aggregate["sparse"][item[0]].append(float(item[1]))
-        aggregate["entities"].update(record.entities_json)
+            aggregate = by_node.setdefault(
+                record.node_id,
+                {
+                    "parent_id": record.parent_id,
+                    "is_leaf": record.is_leaf,
+                    "accessible_unit_count": 0,
+                    "sparse": defaultdict(list),
+                    "entities": set(),
+                },
+            )
+            if aggregate["parent_id"] != record.parent_id or aggregate["is_leaf"] != record.is_leaf:
+                return None
+            aggregate["accessible_unit_count"] += record.accessible_unit_count
+            for item in record.sparse_json:
+                if (
+                    not isinstance(item, list)
+                    or len(item) != 2
+                    or not isinstance(item[0], str)
+                    or isinstance(item[1], bool)
+                    or not isinstance(item[1], (int, float))
+                    or not math.isfinite(float(item[1]))
+                    or float(item[1]) < 0.0
+                ):
+                    return None
+                aggregate["sparse"][item[0]].append(float(item[1]))
+            aggregate["entities"].update(record.entities_json)
+
+        cached_nodes = []
+        for node_id, aggregate in sorted(by_node.items()):
+            sparse = sorted(
+                ((term, math.fsum(weights)) for term, weights in aggregate["sparse"].items()),
+                key=lambda item: (-item[1], item[0]),
+            )
+            cached_nodes.append(
+                (
+                    node_id,
+                    aggregate["parent_id"],
+                    aggregate["is_leaf"],
+                    aggregate["accessible_unit_count"],
+                    [[term, weight] for term, weight in sparse],
+                    sorted(aggregate["entities"]),
+                )
+            )
+        if len(_AGGREGATED_SCOPE_NODE_CACHE) >= _AGGREGATED_SCOPE_NODE_CACHE_MAX:
+            _AGGREGATED_SCOPE_NODE_CACHE.pop(next(iter(_AGGREGATED_SCOPE_NODE_CACHE)))
+        _AGGREGATED_SCOPE_NODE_CACHE[cache_sig] = cached_nodes
 
     profiles: list[QueryNodeProfile] = []
-    for node_id, aggregate in sorted(by_node.items()):
-        sparse = sorted(
-            ((term, math.fsum(weights)) for term, weights in aggregate["sparse"].items()),
-            key=lambda item: (-item[1], item[0]),
-        )
+    for node_id, parent_id, is_leaf, unit_count, sparse_list, entities_list in cached_nodes:
         profiles.append(
             QueryNodeProfile(
                 node_id=node_id,
-                parent_id=aggregate["parent_id"],
-                is_leaf=aggregate["is_leaf"],
-                accessible_unit_count=aggregate["accessible_unit_count"],
+                parent_id=parent_id,
+                is_leaf=is_leaf,
+                accessible_unit_count=unit_count,
                 project_id=project_id,
                 source_ids=source_ids,
                 document_version_ids=document_version_ids,
@@ -165,8 +203,8 @@ def _aggregate_source_profiles(
                 signal_scores=_query_signal_scores(
                     query,
                     {
-                        "sparse": [[term, weight] for term, weight in sparse],
-                        "entities": sorted(aggregate["entities"]),
+                        "sparse": sparse_list,
+                        "entities": entities_list,
                     },
                 ),
             )
@@ -190,6 +228,17 @@ async def acquire_tree_query_snapshot(
     request_snapshot_id = str(uuid4())
     async with session_factory() as session:
         async with session.begin():
+            active_state_projects = (
+                await session.scalars(
+                    select(ProjectSearchState.project_id).where(
+                        ProjectSearchState.project_id.in_(projects),
+                        ProjectSearchState.active_tree_version.is_not(None),
+                    )
+                )
+            ).all()
+            if len(set(active_state_projects)) != len(projects):
+                return None
+
             rows = (
                 await session.execute(
                     select(ProjectSearchState, TreeManifest)

@@ -12,7 +12,6 @@ from sag_api.core.logging import get_logger
 
 log = get_logger("decision_router")
 CHAT_HIGH_CONFIDENCE = 0.65
-_SILICONFLOW_SYSTEMONE_URL = "https://api.siliconflow.cn/v1/systemone"
 _DECISION_QUESTIONS = {
     "intent_type": {
         "type": "choice",
@@ -144,7 +143,7 @@ def route_query(query: str, context: dict[str, Any] | None = None) -> dict[str, 
     start_time = time.perf_counter()
     try:
         response = httpx.post(
-            _SILICONFLOW_SYSTEMONE_URL,
+            f"{settings.siliconflow_base_url.rstrip('/')}/systemone",
             headers={
                 "Authorization": f"Bearer {settings.siliconflow_api_key}",
                 "Content-Type": "application/json",
@@ -160,6 +159,11 @@ def route_query(query: str, context: dict[str, Any] | None = None) -> dict[str, 
         latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
         model = str(payload.get("model") or settings.decision_model)
         return _route_from_answers(query, answers, model, latency_ms, "siliconflow")
+    except httpx.HTTPStatusError as exc:
+        # Status codes help diagnose provider configuration without exposing
+        # the response body or request credentials in application logs.
+        log.warning("SiliconFlow Decision request failed (HTTP %d)", exc.response.status_code)
+        return _fallback_route(query, "siliconflow_request_failed")
     except Exception as exc:  # noqa: BLE001 - provider failure must not block retrieval
         log.warning("SiliconFlow Decision request failed (%s)", type(exc).__name__)
         return _fallback_route(query, "siliconflow_request_failed")

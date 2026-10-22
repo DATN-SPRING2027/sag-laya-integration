@@ -60,63 +60,63 @@ _TOOL_LABELS = {
 }
 
 _DIRECT_INTENT = re.compile(
-    r"^(?:你好(?:呀|啊)?|您好(?:呀|啊)?|嗨|哈[啰罗喽]|hi|hello|hey|"
-    r"早上好|下午好|晚上好|在吗|你在吗|谢谢(?:你)?|感谢(?:你)?|多谢|"
-    r"再见|拜拜|你是谁(?:呀|啊)?|你叫什么(?:名字)?|who are you|"
+    r"^(?:xin chào|chào(?: bạn)?|hi|hello|hey|"
+    r"chào buổi sáng|chào buổi chiều|chào buổi tối|cảm ơn(?: bạn)?|thanks|thank you|"
+    r"tạm biệt|bye|bạn là ai|tên bạn là gì|who are you|"
     r"what(?:'|’)s your name)[!！?？。,.，\s]*$",
     re.IGNORECASE,
 )
 _DIRECT_RESPONSE_HINT = re.compile(
-    r"(?:翻译|改写|润色|续写|纠错|起名|写一首|写一段|生成文案|头脑风暴)"
-    r"|(?:总结|概括)(?:以下|这段|这篇|我提供的)",
+    r"(?:dịch|viết lại|chỉnh sửa|sửa lỗi|đặt tên|viết một|tạo nội dung|brainstorm|"
+    r"translate|rewrite|proofread|brainstorm)"
+    r"|(?:tóm tắt|khái quát|summarize)\s+(?:đoạn sau|văn bản này|nội dung sau| the following)",
     re.IGNORECASE,
 )
 _CLARIFICATION_FIRST_INTENT = re.compile(
-    r"^(?:(?:请|帮我|麻烦你|能否|可以|please)\s*)?"
-    r"(?:分析|总结|介绍|推荐|比较|对比|规划|看看|说说|查一下|analyse|analyze|summarize|"
-    r"recommend|compare|plan)(?:一下)?[!！?？。,.，\s]*$"
-    r"|^(?:最近|现在|目前|这个|那个|昨天|上周|上个月|去年|过去(?:一段时间)?)?"
-    r"(?:怎么样|怎么办|如何)[!！?？。,.，\s]*$",
+    r"^(?:(?:hãy|giúp tôi|vui lòng|làm ơn|please)\s*)?"
+    r"(?:phân tích|tóm tắt|giới thiệu|đề xuất|so sánh|lập kế hoạch|kiểm tra|analyse|analyze|summarize|"
+    r"recommend|compare|plan)[!！?？。,.，\s]*$"
+    r"|^(?:gần đây|hiện tại|bây giờ|cái này|cái đó|hôm qua|tuần trước|tháng trước|năm ngoái)?"
+    r"(?:như thế nào|ra sao|làm sao)[!！?？。,.，\s]*$",
     re.IGNORECASE,
 )
 _SIMPLE_ARITHMETIC = re.compile(r"^[\d\s+\-*/().=？?]+$")
 _TIME_INTENT = re.compile(
-    r"(?:现在|今天|当前).{0,6}(?:几点|时间|日期|星期)|(?:时区|timezone|what time|current time)",
+    r"(?:bây giờ|hôm nay|hiện tại).{0,10}(?:mấy giờ|thời gian|ngày mấy|thứ mấy)|(?:múi giờ|timezone|what time|current time)",
     re.IGNORECASE,
 )
 _TIME_ONLY_INTENT = re.compile(
-    r"(?:现在(?:是)?(?:几点(?:了)?|什么时间|几号|几月几号|日期|星期几|周几)"
-    r"|今天(?:是)?(?:几号|几月几号|什么日期|日期|星期几|周几)"
-    r"|当前(?:时间|日期)(?:是)?(?:多少|什么)?"
-    r"|北京时间几点(?:了)?"
+    r"(?:bây giờ(?:\s+là)?\s*(?:mấy giờ|thời gian nào|ngày mấy|thứ mấy)"
+    r"|hôm nay(?:\s+là)?\s*(?:ngày mấy|ngày bao nhiêu|thứ mấy)"
+    r"|thời gian hiện tại(?:\s+là)?"
     r"|what time is it(?: now)?"
     r"|what(?:'s| is) (?:the )?(?:current time|current date|date today|today's date|day is it(?: today)?))"
     r"[\s!?？。,.，]*",
     re.IGNORECASE,
 )
 _RELATIVE_TIME_INTENT = re.compile(
-    r"(?:过去|近)\s*(?:[一二三四五六七八九十百两\d]+|几|数)\s*(?:天|日|周|星期|个?月|季度|年)"
-    r"|(?:昨天|前天|明天|后天|上周|本周|下周|上个?月|本月|下个?月|去年|今年|明年)"
+    r"(?:trong|khoảng)\s*(?:\d+|vài|mấy)\s*(?:ngày|tuần|tháng|quý|năm)\s*(?:qua|tới|gần đây)"
+    r"|\b(?:hôm qua|hôm kia|ngày mai|ngày kia|tuần trước|tuần này|tuần sau|tháng trước|tháng này|tháng sau|năm ngoái|năm nay|năm sau)\b"
     r"|\b(?:yesterday|tomorrow)\b"
     r"|\b(?:last|past|next)\s+(?:(?:\d+|one|two|three|several|few)\s+)?"
     r"(?:days?|weeks?|months?|quarters?|years?)\b",
     re.IGNORECASE,
 )
 _TIME_SENSITIVE_INTENT = re.compile(
-    r"(?:最近|最新|近期|当前|现行|实时|截至|今日|今天|本周|本月|今年|刚刚|"
+    r"(?:gần đây|mới nhất|hiện tại|hiện hành|thời gian thực|tính đến|hôm nay|tuần này|tháng này|năm nay|vừa mới|"
     r"latest|recent|current|today|this (?:week|month|year)|as of)"
-    r".{0,40}(?:新闻|更新|版本|发布|价格|行情|天气|趋势|发展|政策|法规|赛程|日程|状态|变化|"
+    r".{0,40}(?:tin tức|cập nhật|phiên bản|phát hành|giá|thời tiết|xu hướng|chính sách|quy định|lịch trình|trạng thái|thay đổi|"
     r"news|updates?|versions?|releases?|price|weather|trends?|policy|schedule|status|changes?)",
     re.IGNORECASE,
 )
 _EXPLICIT_RESEARCH_INTENT = re.compile(
-    r"(?:资料|知识库|文档|来源|引用|证据|数据|统计|研究|报告|调研|查找|搜索|检索|核实|"
+    r"(?:tài liệu|kho tri thức|nguồn|trích dẫn|bằng chứng|dữ liệu|thống kê|nghiên cứu|báo cáo|tìm kiếm|tra cứu|xác minh|"
     r"sources?|citations?|evidence|data|statistics|research|report|find|search|look up|verify)",
     re.IGNORECASE,
 )
 _RESEARCH_TOOL = re.compile(
     r"(?:search|find|query|browse|web|news|weather|price|knowledge|document|lookup|read|"
-    r"检索|搜索|查询|新闻|天气|行情|知识|文档|网页)",
+    r"tìm kiếm|tra cứu|truy vấn|tin tức|thời tiết|giá|tri thức|tài liệu|trang web)",
     re.IGNORECASE,
 )
 # Numeric knowledge markers are plain ``[n]``. A numeric Markdown link label

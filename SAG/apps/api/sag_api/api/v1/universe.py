@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Path, Query
 from sqlalchemy import select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
@@ -13,7 +13,7 @@ from sqlalchemy.orm import load_only
 from sag_api.core.config import settings
 from sag_api.core.db import get_session
 from sag_api.core.deps import get_current_user, get_engine_manager, get_job_queue
-from sag_api.core.errors import NotFoundError, ServiceUnavailableError
+from sag_api.core.errors import ConflictError, NotFoundError, ServiceUnavailableError
 from sag_api.core.principal_assertion import (
     VerifiedPrincipal,
     require_principal_assertion,
@@ -35,14 +35,26 @@ from sag_api.schemas.universe import (
     ExplorationStepOut,
     UniverseExpandIn,
     UniverseGraphPatchOut,
+    UniverseKnowledgeDetailOut,
+    UniverseKnowledgePageOut,
+    UniverseKnowledgeResolveIn,
+    UniverseKnowledgeResolveOut,
     UniverseManifestOut,
     UniverseNodeDetailOut,
     UniverseTimelineIn,
     UniverseTimelineSliceOut,
+    UniverseTreeOut,
 )
 from sag_api.services.search_unit_retrieval_service import _load_current_ready_versions
 from sag_api.services.source_service import get_authorized_source, get_authorized_source_ids, search_source_candidates
 from sag_api.services.tree_query_snapshot_service import _aggregate_source_profiles
+from sag_api.services.universe_knowledge_service import (
+    knowledge_universe_detail,
+    knowledge_universe_page,
+    load_knowledge_universe_snapshot,
+    load_source_universe_snapshots,
+    resolve_knowledge_universe_references,
+)
 from sag_api.services.universe_service import (
     _universe_policy,
     get_exploration,
@@ -373,12 +385,14 @@ async def manifest(
         for node_id, node in sorted(nodes.items(), key=lambda item: (int(item[1]["depth"]), item[0])):
             entities = node["entities"]
             terms = node["terms"]
+            readable_entities = [value for value in entities if any(char.isalpha() for char in value)]
+            readable_terms = [value for value in terms if len(value) > 2 and any(char.isalpha() for char in value)]
             label = (
-                min(entities, key=lambda value: (-entities[value], value.casefold(), value))
-                if entities
-                else min(terms, key=lambda value: (-terms[value], value.casefold(), value))
-                if terms
-                else node_id
+                min(readable_entities, key=lambda value: (-entities[value], value.casefold(), value))
+                if readable_entities
+                else " · ".join(sorted(readable_terms, key=lambda value: (-terms[value], value.casefold()))[:3])
+                if readable_terms
+                else ""
             )
             output_nodes.append(
                 {
@@ -427,6 +441,99 @@ async def manifest(
         },
         policy=_universe_policy(),
     )
+
+
+@router.get("/knowledge/overview", response_model=UniverseManifestOut)
+async def knowledge_overview(
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
+) -> UniverseManifestOut:
+    value = await manifest(session=session, user=user, principal=principal)
+    if value.trees:
+        return value
+    snapshots = await load_source_universe_snapshots(session, principal)
+    return value.model_copy(update={
+        "trees": [snapshot.tree for snapshot in snapshots],
+        "counts": {**value.counts, "trees": 0,
+                   "sources": sum(snapshot.tree.source_count for snapshot in snapshots),
+                   "nodes": sum(snapshot.tree.node_count for snapshot in snapshots),
+                   "units": sum(snapshot.tree.unit_count for snapshot in snapshots)},
+    })
+
+
+async def _knowledge_snapshot(session, user, principal, project_id: str, tree_version: str):
+    if tree_version.startswith("source-"):
+        snapshots = await load_source_universe_snapshots(session, principal, project_id)
+        snapshot = next((item for item in snapshots if item.tree.tree_version == tree_version), None)
+        if snapshot is None:
+            raise ConflictError("The knowledge source snapshot changed; refresh the universe")
+        return snapshot
+    value = await manifest(session=session, user=user, principal=principal)
+    tree = _knowledge_tree(value, project_id, tree_version)
+    return await load_knowledge_universe_snapshot(session, principal, tree)
+
+
+def _knowledge_tree(value: UniverseManifestOut, project_id: str, tree_version: str) -> UniverseTreeOut:
+    tree = next((item for item in value.trees if item.project_id == project_id), None)
+    if tree is None:
+        if value.status in {"stale", "building", "failed"}:
+            raise ConflictError("The knowledge snapshot is unavailable; refresh the universe")
+        raise NotFoundError("Knowledge project is unavailable")
+    if tree.tree_version != tree_version:
+        raise ConflictError("The knowledge snapshot changed; refresh the universe")
+    return tree
+
+
+@router.get("/knowledge/cluster", response_model=UniverseKnowledgePageOut)
+async def knowledge_cluster(
+    project_id: str = Query(min_length=1, max_length=128),
+    tree_version: str = Query(min_length=1, max_length=128),
+    node_id: str = Query(min_length=1, max_length=128),
+    limit: int = Query(default=24, ge=1, le=50),
+    cursor: str | None = Query(default=None, max_length=2048),
+    related_to: str | None = Query(default=None, min_length=1, max_length=128),
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
+) -> UniverseKnowledgePageOut:
+    snapshot = await _knowledge_snapshot(session, user, principal, project_id, tree_version)
+    return await knowledge_universe_page(
+        session, snapshot, node_id=node_id, limit=limit, cursor=cursor, related_to=related_to,
+    )
+
+
+@router.get("/knowledge/units/{unit_id}", response_model=UniverseKnowledgeDetailOut)
+async def knowledge_unit(
+    unit_id: str = Path(min_length=1, max_length=128),
+    project_id: str = Query(min_length=1, max_length=128),
+    tree_version: str = Query(min_length=1, max_length=128),
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
+) -> UniverseKnowledgeDetailOut:
+    snapshot = await _knowledge_snapshot(session, user, principal, project_id, tree_version)
+    return await knowledge_universe_detail(session, snapshot, unit_id)
+
+
+@router.post("/knowledge/resolve", response_model=UniverseKnowledgeResolveOut)
+async def knowledge_resolve(
+    body: UniverseKnowledgeResolveIn,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
+) -> UniverseKnowledgeResolveOut:
+    if not body.references:
+        return UniverseKnowledgeResolveOut(matches=[])
+    value = await manifest(session=session, user=user, principal=principal)
+    matches = []
+    if not value.trees:
+        for snapshot in await load_source_universe_snapshots(session, principal):
+            matches.extend(await resolve_knowledge_universe_references(session, snapshot, body.references))
+    for tree in value.trees:
+        snapshot = await load_knowledge_universe_snapshot(session, principal, tree)
+        matches.extend(await resolve_knowledge_universe_references(session, snapshot, body.references))
+    return UniverseKnowledgeResolveOut(matches=matches)
 
 
 @router.post("/expand", response_model=UniverseGraphPatchOut)

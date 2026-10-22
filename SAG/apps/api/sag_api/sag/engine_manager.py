@@ -284,10 +284,20 @@ class EngineManager:
 
                 headers = {"api-key": api_key} if api_key else {}
                 try:
+                    per_request_timeout = httpx.Timeout(
+                        min(timeout, 15.0),
+                        connect=min(timeout, 10.0),
+                    )
+                    pool_limits = httpx.Limits(
+                        max_connections=20,
+                        max_keepalive_connections=10,
+                        keepalive_expiry=4.0,
+                    )
                     self._search_unit_qdrant_client = httpx.AsyncClient(
                         base_url=url,
                         headers=headers,
-                        timeout=timeout,
+                        timeout=per_request_timeout,
+                        limits=pool_limits,
                     )
                 except httpx.InvalidURL:
                     raise SearchIndexUnavailable(
@@ -335,7 +345,7 @@ class EngineManager:
         slot = await self._slot(source_config_id, source)
         return slot.engine.resources.vector
 
-    async def get_sag_embedding(self, source_config_id: str, source: Source | None = None) -> Any:
+    async def get_sag_embedding(self, source_config_id: str = "__knowledge__", source: Source | None = None) -> Any:
         """0.8.2 起 embedding 经引擎注入(替代 get_embedding_client)。"""
         slot = await self._slot(source_config_id, source)
         return slot.engine.resources.embedding
@@ -544,7 +554,7 @@ class EngineManager:
         return build_engine_config(self._settings, overrides=overrides)
 
     def _configure_embedding_request_dimensions(self, engine: DataEngine) -> None:
-        """Apply the narrow provider workaround after schema initialization.
+        """Apply the narrow provider workaround after schema initialization and attach shared cache.
 
         zleap-sag 0.12.0 shares ``EmbeddingConfig.dimensions`` between vector
         schema creation and the OpenAI-compatible request body. SiliconFlow's
@@ -552,11 +562,68 @@ class EngineManager:
         optional request parameter. Keep the configured 1024 for schema setup,
         then omit it from only this verified incompatible request path.
         """
+        res = getattr(engine, "_resources", None)
+        if res is None:
+            try:
+                res = getattr(engine, "resources", None)
+            except Exception:
+                res = None
+        emb = getattr(res, "embedding", None)
+        if emb is not None:
+            if getattr(emb, "max_tokens", 512) <= 512:
+                emb.max_tokens = 8192
+            for attr_name in ("_inner", "client", "_client", "_delegate"):
+                inner_emb = getattr(emb, attr_name, None)
+                if inner_emb is not None and getattr(inner_emb, "max_tokens", 512) <= 512:
+                    inner_emb.max_tokens = 8192
+        if emb is not None and not getattr(emb, "_sag_shared_cache_wrapped", False):
+            from sag_api.services.search_index_service import (
+                get_cached_text_embedding,
+                put_cached_text_embedding,
+            )
+
+            orig_generate = emb.generate
+            orig_batch_generate = emb.batch_generate
+
+            async def _cached_generate(text: str) -> list[float]:
+                cached = get_cached_text_embedding(text)
+                if cached is not None:
+                    return cached
+                vec = await orig_generate(text)
+                if vec:
+                    put_cached_text_embedding(text, vec)
+                return vec
+
+            async def _cached_batch_generate(texts: list[str]) -> list[list[float]]:
+                if not texts:
+                    return []
+                results: list[list[float] | None] = [None] * len(texts)
+                missing_indices: list[int] = []
+                missing_texts: list[str] = []
+                for idx, txt in enumerate(texts):
+                    cached = get_cached_text_embedding(txt)
+                    if cached is not None:
+                        results[idx] = cached
+                    else:
+                        missing_indices.append(idx)
+                        missing_texts.append(txt)
+                if missing_texts:
+                    fetched = await orig_batch_generate(missing_texts)
+                    for m_idx, txt, vec in zip(missing_indices, missing_texts, fetched, strict=True):
+                        if vec:
+                            put_cached_text_embedding(txt, vec)
+                        results[m_idx] = vec
+                return [vec or [] for vec in results]
+
+            emb.generate = _cached_generate
+            emb.batch_generate = _cached_batch_generate
+            emb._sag_shared_cache_wrapped = True
+
         if self._settings.embedding_dimensions is not None:
             return
         hostname = (urlparse(self._settings.effective_embedding_base_url or "").hostname or "").lower()
         model = self._settings.embedding_model.strip().lower()
-        if hostname != "api.siliconflow.cn" or model != "baai/bge-m3":
+        if hostname not in ("api.siliconflow.com", "api.siliconflow.cn") or model != "baai/bge-m3":
             return
         engine.resources.embedding.dimensions = None
 
@@ -596,6 +663,7 @@ class EngineManager:
         from sqlalchemy.exc import IntegrityError, SQLAlchemyError
         from zleap.sag.db import DataSource
 
+        source_config_id = source_config_id.strip()
         effective_engine = engine
         if effective_engine is None:
             slot = await self._slot(source_config_id, source)
@@ -645,6 +713,7 @@ class EngineManager:
             await session.execute(text("PRAGMA busy_timeout=30000"))
 
     async def _slot(self, source_config_id: str, source: Source | None = None) -> _Slot:
+        source_config_id = source_config_id.strip()
         slot = self._slots.get(source_config_id)
         if slot is not None and not slot.closing:
             slot.last_used = time.monotonic()
@@ -667,6 +736,7 @@ class EngineManager:
                         await self._ensure_engine_schema(engine)
                         self._configure_embedding_request_dimensions(engine)
                         await engine.start()
+                        self._configure_embedding_request_dimensions(engine)
                         await self._configure_sqlite_document_store(engine)
                     try:
                         await self._ensure_source_config(source_config_id, source, engine)
@@ -920,6 +990,7 @@ class EngineManager:
         max_concurrency: int | None = None,
         document_title: str | None = None,
         original_path: str | None = None,
+        document_version_id: str | None = None,
     ) -> ProcessOutcome:
         """独立处理一篇文档；同源文档可并行，chunk 完成即保存断点。"""
 
@@ -964,8 +1035,11 @@ class EngineManager:
                         max_entities_per_event=(
                             8 if self._settings.document_extraction_profile == "concise" else 20
                         ),
+                        write_event_entity_vectors=self._settings.document_write_event_entity_vectors,
                         enable_strict_filtering=self._settings.document_strict_filtering,
                         event_entity_attempts=self._settings.document_event_entity_attempts,
+                        extraction_profile=self._settings.document_extraction_profile,
+                        document_version_id=document_version_id,
                     )
                     if self._settings.sag_relational_provider in (None, "sqlite"):
                         async with self._sqlite_document_mutation_lock:

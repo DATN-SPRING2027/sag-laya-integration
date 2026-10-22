@@ -256,7 +256,6 @@ export function KnowledgeConfigForm() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="zh">{t("chinese")}</SelectItem>
                   <SelectItem value="en">{t("english")}</SelectItem>
                 </SelectContent>
               </Select>

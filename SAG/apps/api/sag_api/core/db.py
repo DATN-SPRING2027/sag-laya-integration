@@ -6,6 +6,7 @@ import os
 from collections.abc import AsyncIterator
 
 from sqlalchemy import event, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -28,11 +29,23 @@ def _ensure_sqlite_dir(url: str) -> None:
 
 _ensure_sqlite_dir(settings.database_url)
 
+_engine_url = make_url(settings.database_url)
+_connect_args: dict[str, object] = {}
+if _engine_url.drivername == "postgresql+asyncpg":
+    _query = dict(_engine_url.query)
+    _search_path = _query.pop("search_path", None)
+    if _search_path is not None:
+        if not isinstance(_search_path, str) or not _search_path.strip():
+            raise ValueError("PostgreSQL search_path must be a non-empty string.")
+        _engine_url = _engine_url.set(query=_query)
+        _connect_args["server_settings"] = {"search_path": _search_path}
+
 engine: AsyncEngine = create_async_engine(
-    settings.database_url,
+    _engine_url,
     echo=False,
     future=True,
     pool_pre_ping=True,
+    connect_args=_connect_args,
 )
 
 # Session-level PostgreSQL advisory locks span Qdrant network I/O. Keep these
@@ -40,13 +53,14 @@ engine: AsyncEngine = create_async_engine(
 # cannot consume the connections reserved for normal API traffic.
 if engine.dialect.name == "postgresql":
     publish_lock_engine: AsyncEngine = create_async_engine(
-        settings.database_url,
+        _engine_url,
         echo=False,
         future=True,
         pool_pre_ping=True,
         pool_size=4,
         max_overflow=0,
         pool_timeout=1.0,
+        connect_args=_connect_args,
     )
 else:
     publish_lock_engine = engine
@@ -91,6 +105,7 @@ _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
         "parser_status": "VARCHAR(16)",
         "fallback_from": "VARCHAR(16)",
         "fallback_reason": "TEXT",
+        "vector_identity_json": "JSON",
         "tenant_id": "VARCHAR(64) NOT NULL DEFAULT 'tenant_continuum_default'",
         "project_id": "VARCHAR(64)",
         "owner_id": "VARCHAR(256)",
@@ -165,7 +180,7 @@ async def _ensure_indexes() -> None:
     async with engine.begin() as conn:
         for ddl in _INDEX_UPGRADES:
             table = ddl.split(" ON ", 1)[1].split(" ", 1)[0]
-            table_exists = await conn.run_sync(lambda sync_conn: sa_inspect(sync_conn).has_table(table))
+            table_exists = await conn.run_sync(lambda sync_conn, table=table: sa_inspect(sync_conn).has_table(table))
             if not table_exists:
                 continue
             await conn.exec_driver_sql(ddl)

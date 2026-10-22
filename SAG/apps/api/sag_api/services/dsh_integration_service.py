@@ -136,7 +136,7 @@ async def update_default_source(
 ) -> DshIntegrationState:
     """Persist a selected source after confirming that it exists, or clear it."""
     if source_id is not None and await session.get(Source, source_id) is None:
-        raise NotFoundError("信源不存在")
+        raise NotFoundError("Source not found")
 
     async with _state_write_lock():
         row = await _get_or_create_row(session)
@@ -187,7 +187,7 @@ def _connection_payload(state: DshIntegrationState) -> dict[str, object]:
 
     return {
         "schemaVersion": 1,
-        "name": "SAG 知识库",
+        "name": "SAG Knowledge Base",
         "apiUrl": f"{settings.dsh_public_url}/api/v1",
         "mcpUrl": f"{settings.dsh_public_url}/mcp/",
         "accessToken": state.token,

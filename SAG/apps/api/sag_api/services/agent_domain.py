@@ -26,7 +26,7 @@ from sag_api.generation import build_agent_messages, build_prompt_preview
 from sag_api.generation.prompt import estimate_tokens
 from sag_api.services.source_service import get_authorized_source_ids, search_source_candidates
 
-_DEFAULT_TITLES = {"新会话", "New chat"}
+_DEFAULT_TITLES = {"New chat", "Cuộc trò chuyện mới"}
 _KNOWLEDGE_TOOL_NAMES = frozenset({"search_context", "get_entity"})
 THREAD_PAGE_DEFAULT = 6
 THREAD_PAGE_MAX = 100
@@ -86,7 +86,7 @@ def _encode_message_cursor(thread_id: str, message: Message) -> str:
 
 def _decode_message_cursor(thread_id: str, value: str) -> tuple[datetime, str]:
     def invalid() -> ValidationError:
-        return ValidationError("消息游标无效", code=ErrorCode.INVALID_CURSOR)
+        return ValidationError("Invalid message cursor", code=ErrorCode.INVALID_CURSOR)
 
     if not value or len(value) > MESSAGE_CURSOR_MAX_LENGTH or value.count(".") != 1:
         raise invalid()
@@ -142,7 +142,7 @@ async def list_agents(session: AsyncSession, *, owner_key: str) -> list[Agent]:
 async def get_agent(session: AsyncSession, agent_id: str, *, owner_key: str, write: bool = False) -> Agent:
     agent = await session.get(Agent, agent_id)
     if agent is None or (agent.owner_key != owner_key and (write or not agent.is_default)):
-        raise NotFoundError("Agent 不存在")
+        raise NotFoundError("Agent not found")
     return agent
 
 
@@ -151,7 +151,7 @@ async def create_agent(
 ) -> Agent:
     name = name.strip()
     if not name:
-        raise ValidationError("Agent 名称不能为空")
+        raise ValidationError("Agent name cannot be empty")
     agent = Agent(owner_key=owner_key, name=name, avatar=avatar or name[:1], persona=persona or {})
     session.add(agent)
     await session.commit()
@@ -180,7 +180,7 @@ async def update_agent(
     return agent
 
 
-_DEFAULT_GREETING = "我在。上传资料到知识库，或直接问我任何问题。"
+_DEFAULT_GREETING = "I am ready. Upload documents to the knowledge base, or ask me any question."
 _DEFAULT_PERSONA = {"greeting": _DEFAULT_GREETING, "system_prompt": ""}
 
 
@@ -234,10 +234,10 @@ async def add_binding(
     config = config or {}
     if target_type == BindingTargetType.SOURCE:
         if await session.get(Source, target_id) is None:
-            raise NotFoundError("信源不存在")
+            raise NotFoundError("Source not found")
     elif target_type == BindingTargetType.MCP_SERVER:
         if not (config.get("url") or config.get("command")):
-            raise ValidationError("MCP server 需提供 url 或 command")
+            raise ValidationError("MCP server requires url or command")
         target_id = target_id or (config.get("name") or config.get("url") or "mcp")
     exists = await session.scalar(
         select(AgentBinding).where(
@@ -247,7 +247,7 @@ async def add_binding(
         )
     )
     if exists is not None:
-        raise ConflictError("已绑定该目标")
+        raise ConflictError("Target already bound")
     binding = AgentBinding(agent_id=agent.id, target_type=target_type, target_id=target_id, config=config)
     session.add(binding)
     await session.commit()
@@ -258,7 +258,7 @@ async def add_binding(
 async def remove_binding(session: AsyncSession, agent: Agent, binding_id: str) -> None:
     binding = await session.get(AgentBinding, binding_id)
     if binding is None or binding.agent_id != agent.id:
-        raise NotFoundError("绑定不存在")
+        raise NotFoundError("Binding not found")
     await session.delete(binding)
     await session.commit()
 
@@ -356,9 +356,9 @@ async def update_thread(
     return thread
 
 
-async def create_thread(session: AsyncSession, agent: Agent, title: str = "新会话", *, owner_key: str) -> Thread:
+async def create_thread(session: AsyncSession, agent: Agent, title: str = "New chat", *, owner_key: str) -> Thread:
     await get_agent(session, agent.id, owner_key=owner_key)
-    thread = Thread(agent_id=agent.id, owner_key=owner_key, title=title or "新会话")
+    thread = Thread(agent_id=agent.id, owner_key=owner_key, title=title or "New chat")
     session.add(thread)
     await session.commit()
     await session.refresh(thread)
@@ -368,7 +368,7 @@ async def create_thread(session: AsyncSession, agent: Agent, title: str = "新�
 async def get_thread(session: AsyncSession, agent_id: str, thread_id: str, *, owner_key: str) -> Thread:
     thread = await session.get(Thread, thread_id)
     if thread is None or thread.agent_id != agent_id or thread.owner_key != owner_key:
-        raise NotFoundError("会话不存在")
+        raise NotFoundError("Thread not found")
     return thread
 
 
@@ -392,7 +392,7 @@ async def list_messages_page(
     """
     if limit < 1 or limit > MESSAGE_PAGE_MAX:
         raise ValidationError(
-            f"消息页大小必须在 1 到 {MESSAGE_PAGE_MAX} 之间",
+            f"Message page limit must be between 1 and {MESSAGE_PAGE_MAX}",
             code=ErrorCode.INVALID_PAGE_LIMIT,
         )
 
@@ -552,21 +552,23 @@ async def compress_history(history: list[dict[str, str]], *, llm=None, budget_to
         return recent
 
     if llm is not None and getattr(llm, "configured", False):
-        transcript = "\n".join(f"{'用户' if m['role'] == 'user' else '助手'}：{m['content']}" for m in older)[:12000]
+        transcript = "\n".join(f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}" for m in older)[:12000]
         try:
             summary = await llm.complete(
                 [
                     {
                         "role": "system",
                         "content": (
-                            "把以下对话压缩为要点摘要（≤400字）：保留事实、结论、数字、人物称呼与未决事项；不要评论。"
+                            "Summarize the following conversation into key bullet points (<=400 words) "
+                            "in the same language used in the conversation: preserve facts, conclusions, "
+                            "numbers, names, and open items; do not add commentary."
                         ),
                     },
                     {"role": "user", "content": transcript},
                 ]
             )
             return [
-                {"role": "user", "content": f"（此前对话摘要，供参考）\n{summary.strip()}"},
+                {"role": "user", "content": f"(Summary of earlier conversation for reference)\n{summary.strip()}"},
                 *recent,
             ]
         except Exception:  # noqa: BLE001
@@ -643,7 +645,7 @@ async def prepare_ask(
     for aid in attachments or []:
         path = attachment_path(aid, owner_key=owner_key)
         if path is None:
-            raise ValidationError(f"附件不存在或已过期：{aid}")
+            raise ValidationError(f"Attachment not found or expired: {aid}")
         ext = aid.rsplit(".", 1)[-1].lower()
         media_type = {
             "png": "image/png",
@@ -663,7 +665,7 @@ async def prepare_ask(
     )
     session.add(user_msg)
     if thread.title in _DEFAULT_TITLES:
-        thread.title = query[:40] or "图片对话"
+        thread.title = query[:40] or "Image chat"
     await session.commit()
     await session.refresh(user_msg)
 
@@ -693,7 +695,7 @@ async def delete_message(
     thread = await get_thread(session, agent_id, thread_id, owner_key=owner_key)
     message = await session.get(Message, message_id)
     if message is None or message.thread_id != thread.id:
-        raise NotFoundError("消息不存在")
+        raise NotFoundError("Message not found")
     await session.delete(message)
     await session.commit()
 

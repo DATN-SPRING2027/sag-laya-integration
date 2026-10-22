@@ -48,7 +48,7 @@ class BindingOut(BaseModel):
 
 
 class ThreadCreate(BaseModel):
-    title: str = "新会话"
+    title: str = "New chat"
 
 
 class ThreadUpdate(BaseModel):
@@ -106,7 +106,7 @@ class AskRequest(BaseModel):
     @model_validator(mode="after")
     def require_text_or_attachment(self):
         if not self.query.strip() and not self.attachments:
-            raise ValueError("问题或图片至少提供一项")
+            raise ValueError("Provide at least a question or an image attachment")
         return self
 
     @property
@@ -121,4 +121,4 @@ class AskRequest(BaseModel):
 
 
 class ToolRejection(BaseModel):
-    reason: str = Field(default="用户拒绝执行", max_length=500)
+    reason: str = Field(default="User rejected tool execution", max_length=500)
