@@ -8,6 +8,7 @@ import {
 } from "./agent-run-activity";
 import type { AgentEvent, AgentRunOutcome } from "./sse";
 import { clientErrorMessage } from "../i18n/client-errors";
+import { activationFromCitations } from "./universe-events";
 import type {
   Citation,
   Message,
@@ -869,6 +870,18 @@ export class ConversationRuntime {
               ? event.payload.prompt_preview
               : message.promptPreview,
         }));
+      }
+      const answerMessage = messages.find((message) => message.id === operation.assistantMessageId);
+      const answerCitations = answerMessage?.citations ?? [];
+      if (answerCitations.some((citation) => citation.kind !== "external" && citation.source_id && citation.chunk_id)) {
+        const query = messages.find((message) => message.id === operation.userMessageId)?.content ?? "";
+        const activation = activationFromCitations(query, answerCitations, answerMessage?.universeActivation);
+        messages = updateMessage(messages, operation.assistantMessageId, (message) => ({ ...message, universeActivation: activation }));
+        try {
+          this.callbacks.onUniverseActivation?.(activation);
+        } catch {
+          // Universe projection must not interrupt a completed answer.
+        }
       }
     } else if (event.type === "tool.completed") {
       const citations = citationsFromArtifacts(event.payload.artifacts);

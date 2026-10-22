@@ -28,12 +28,26 @@ from sag_api.enums import SearchStrategy, normalize_search_strategy
 _DEFAULT_LLM_PROVIDER = get_model_provider("openai")
 
 
+def _resolve_default_env_file() -> Path:
+    """Resolve the repository dotenv without depending on the process cwd."""
+    module_path = Path(__file__).resolve()
+    for parent in module_path.parents:
+        if (parent / "compose.yaml").is_file():
+            return parent / ".env"
+    # Installed/container builds receive configuration through process env.
+    # Still allow a deployment-local dotenv in the working directory.
+    return Path.cwd() / ".env"
+
+
+_DEFAULT_ENV_FILE = _resolve_default_env_file()
+
+
 class Settings(BaseSettings):
     _active_data_dir: str | None = PrivateAttr(default=None)
 
     model_config = SettingsConfigDict(
         env_prefix="SAG_",
-        env_file=".env",
+        env_file=_DEFAULT_ENV_FILE,
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
@@ -82,19 +96,20 @@ class Settings(BaseSettings):
     data_dir: str = "./.data/engine"  # OCTX、上传文件和运行时状态
     upload_dir: str = "./.data/uploads"  # 上传原始文件落盘
     max_upload_mb: int = 25  # 单文件上传上限
-    job_concurrency: int = 2  # 后台处理并发
+    job_concurrency: int = 4  # 后台处理并发
     knowledge_worker_enabled: bool = True
-    knowledge_concurrency: int = Field(default=2, ge=1, le=16)
+    knowledge_concurrency: int = Field(default=4, ge=1, le=16)
     knowledge_queue_capacity: int = Field(default=256, ge=1, le=10000)
     knowledge_daily_tokens: int = Field(default=100000, ge=0)
     # Optional independent OpenAI-compatible E2 endpoint; empty = E0/E1 only.
     knowledge_e2_url: str = ""
     knowledge_e2_api_key: str = ""
     knowledge_e2_model: str = ""
-    document_extract_concurrency: int = Field(default=30, ge=1, le=50)  # 单文档 chunk 抽取并发
+    document_extract_concurrency: int = Field(default=6, ge=1, le=50)  # 单文档 chunk 抽取并发
     document_chunk_max_tokens: int = Field(default=1_000, ge=100, le=100_000)
     document_chunk_mode: Literal["standard", "heading_strict"] = "standard"
-    document_extraction_profile: Literal["standard", "concise"] = "standard"
+    document_extraction_profile: Literal["standard", "concise"] = "concise"
+    document_write_event_entity_vectors: bool = False
     document_event_entity_attempts: int = Field(default=2, ge=1, le=3)
     # 上传文档已有独立的知识型过滤要求；默认关闭上游基于标题/摘要的严格过滤，
     # 避免无摘要或标题缺失的书籍正文被误判为噪音。
@@ -144,7 +159,7 @@ class Settings(BaseSettings):
     # ── zleap-sag 后端选择 ─────────────────────────────────────────────
     sag_vector_provider: Literal["es", "pgvector", "qdrant", "oceanbase"] = "qdrant"
     sag_relational_provider: Literal["sqlite", "postgres", "mysql", "oceanbase"] = "postgres"
-    sag_language: Literal["zh", "en"] = "zh"
+    sag_language: Literal["en", "zh"] = "en"
 
     # PostgreSQL 元数据连接字段
     sag_pg_host: str = "localhost"
@@ -184,7 +199,7 @@ class Settings(BaseSettings):
     # Per-engine embedding HTTP concurrency. llama.cpp --parallel 1 cannot
     # absorb the zleap default of 8; queued batches hit the client timeout
     # and the indexer rolls the whole document back.
-    embedding_concurrency: int = Field(default=8, ge=1, le=64)
+    embedding_concurrency: int = Field(default=6, ge=1, le=64)
     embedding_timeout: int = Field(default=60, ge=5, le=600)
 
     # ── 文档解析（进入 zleap-sag 前统一转为 Markdown）─────────────────
@@ -222,10 +237,9 @@ class Settings(BaseSettings):
     # Diversity knobs are retrieval quality parameters, not answerability/confidence thresholds.
     search_mmr_diversity_weight: float = Field(default=0.5, ge=0.0, le=1.0)
     search_near_duplicate_similarity: float = Field(default=0.98, ge=0.9, le=1.0)
-    # 中文连续查询默认进行查询侧分词；可关闭以回退到原有正则词项行为。
-    search_chinese_segmentation_enabled: bool = True
+    search_chinese_segmentation_enabled: bool = False
     # 精确模式（multi）含查询侧 LLM 往返；超时/失败/空结果自动回退快速模式（vector）。
-    search_source_timeout: float = 12.0
+    search_source_timeout: float = 25.0
     search_fallback_vector: bool = True
 
     # ── 检索评测 ────────────────────────────────────────────────────────
@@ -260,7 +274,25 @@ class Settings(BaseSettings):
     history_load_limit: int = Field(default=200, ge=1, le=1000)
     decision_provider: Literal["siliconflow", "disabled"] = "siliconflow"
     decision_model: str = Field(default="Kev-4b", min_length=1, max_length=200)
+    siliconflow_base_url: str = "https://api.siliconflow.com/v1"
     siliconflow_api_key: str | None = None
+
+    @field_validator("siliconflow_base_url")
+    @classmethod
+    def _validate_siliconflow_base_url(cls, value: str) -> str:
+        normalized = value.strip().rstrip("/")
+        parsed = urlsplit(normalized)
+        if (
+            parsed.scheme.lower() != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path != "/v1"
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("siliconflow_base_url must be an HTTPS /v1 base URL without credentials")
+        return normalized
 
     @model_validator(mode="before")
     @classmethod
@@ -303,6 +335,11 @@ class Settings(BaseSettings):
         # 兼容升级前的环境变量；公开 API 已不再接受 atomic。
         return normalize_search_strategy(value) if isinstance(value, str) else value
 
+    @field_validator("sag_language", mode="before")
+    @classmethod
+    def _normalize_sag_language(cls, value: object) -> str:
+        return "en"
+
     @field_validator("timezone")
     @classmethod
     def _validate_timezone(cls, value: str) -> str:
@@ -310,7 +347,7 @@ class Settings(BaseSettings):
         try:
             ZoneInfo(normalized)
         except (ZoneInfoNotFoundError, ValueError) as error:
-            raise ValueError("timezone 必须是有效的 IANA 时区") from error
+            raise ValueError("timezone must be a valid IANA timezone") from error
         return normalized
 
     @field_validator("principal_assertion_issuer")
@@ -368,18 +405,18 @@ class Settings(BaseSettings):
         raw = value.strip()
         parsed = urlsplit(raw)
         if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
-            raise ValueError("dsh_public_url 必须是绝对 HTTP(S) URL")
+            raise ValueError("dsh_public_url must be an absolute HTTP(S) URL")
         if parsed.username is not None or parsed.password is not None:
-            raise ValueError("dsh_public_url 不允许包含用户凭证")
+            raise ValueError("dsh_public_url must not contain credentials")
         if parsed.query or parsed.fragment:
-            raise ValueError("dsh_public_url 不允许包含 query 或 fragment")
+            raise ValueError("dsh_public_url must not contain query or fragment")
         path = parsed.path.rstrip("/")
         if "//" in path:
-            raise ValueError("dsh_public_url 路径不允许包含连续斜杠")
+            raise ValueError("dsh_public_url path must not contain consecutive slashes")
         try:
             port = parsed.port
         except ValueError as error:
-            raise ValueError("dsh_public_url 端口无效") from error
+            raise ValueError("dsh_public_url port is invalid") from error
         hostname = parsed.hostname.lower()
         host = f"[{hostname}]" if ":" in hostname else hostname
         authority = f"{host}:{port}" if port is not None else host

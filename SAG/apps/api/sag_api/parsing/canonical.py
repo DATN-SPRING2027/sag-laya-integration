@@ -104,6 +104,7 @@ def extract_canonical_blocks(
     version_id: str,
     page_from: int = 1,
     page_to: int = 1,
+    document_title: str | None = None,
 ) -> list[ExtractedBlock]:
     """Phân tích văn bản (Markdown hoặc plain text) thành danh sách các CanonicalBlock có cấu trúc.
     
@@ -118,6 +119,48 @@ def extract_canonical_blocks(
     lines = normalized_content.splitlines()
     blocks: list[ExtractedBlock] = []
     current_section_stack: list[tuple[int, str]] = []  # [(level, heading_text)]
+    root_raw_title: str | None = None
+    first_non_empty = next((i for i, ln in enumerate(lines[:5]) if ln.strip()), None)
+    if first_non_empty is not None and lines[first_non_empty].strip() == "---":
+        fm_meta: dict[str, str] = {}
+        for f_idx in range(first_non_empty + 1, min(len(lines), first_non_empty + 30)):
+            s_ln = lines[f_idx].strip()
+            if s_ln == "---":
+                doc_id = fm_meta.get("document_id")
+                title = fm_meta.get("title")
+                status = fm_meta.get("status")
+                if doc_id or title:
+                    parts = [p for p in (title, f"[{doc_id}]" if doc_id else None, f"(Status: {status})" if status else None) if p]
+                    current_section_stack = [(0, " ".join(parts))]
+                    root_raw_title = title
+                break
+            if ":" in s_ln:
+                k, _, v = s_ln.partition(":")
+                fm_meta[k.strip().lower()] = v.strip().strip('"').strip("'")
+    else:
+        head_chunk = "\n".join(lines[:30])
+        doc_id_m = re.search(r"\*\*Document ID\*\*\s*\|\s*([A-Za-z0-9_-]+)", head_chunk, re.IGNORECASE)
+        if doc_id_m:
+            doc_id = doc_id_m.group(1).strip()
+            status_m = re.search(r"\*\*Status\*\*\s*\|\s*([A-Za-z0-9 _-]+?)\s*\|", head_chunk, re.IGNORECASE)
+            status = status_m.group(1).strip() if status_m else None
+            for ln in lines[:10]:
+                s_ln = ln.strip()
+                if not s_ln or s_ln.startswith("|") or s_ln.startswith("*") or s_ln.startswith("#"):
+                    continue
+                root_raw_title = normalize_text(s_ln)
+                break
+            parts = [p for p in (root_raw_title, f"[{doc_id}]", f"(Status: {status})" if status else None) if p]
+            current_section_stack = [(0, " ".join(parts))]
+    has_h1 = any(
+        (m := _HEADING_RE.match(ln.strip())) and len(m.group(1)) == 1
+        for ln in lines
+    )
+    if not current_section_stack and not has_h1 and document_title and document_title.strip():
+        clean_doc_title = normalize_text(document_title.strip())
+        if clean_doc_title:
+            current_section_stack = [(1, clean_doc_title)]
+            root_raw_title = clean_doc_title
     ordinal = 0
     current_page = page_from
 
@@ -185,7 +228,8 @@ def extract_canonical_blocks(
             # Điều chỉnh stack phân cấp tiêu đề
             while current_section_stack and current_section_stack[-1][0] >= level:
                 current_section_stack.pop()
-            current_section_stack.append((level, heading_title))
+            if not (root_raw_title and level == 1 and heading_title.lower() == root_raw_title.lower()):
+                current_section_stack.append((level, heading_title))
 
             section_path = " > ".join(h for _, h in current_section_stack)
             chash = compute_content_hash(heading_title)
@@ -276,10 +320,36 @@ def extract_canonical_blocks(
         while idx < total_lines:
             curr = lines[idx]
             curr_stripped = curr.strip()
-            # Dừng paragraph khi gặp dòng trống, page break, heading, code block, hoặc table
+            if not curr_stripped:
+                # Coalesce PDF/OCR-extracted table cells split by whitespace-only lines
+                last_stripped = para_lines[-1].strip()
+                if len(para_lines) < 45 and len(last_stripped) <= 56:
+                    peek_idx = idx + 1
+                    while peek_idx < min(total_lines, idx + 8) and not lines[peek_idx].strip():
+                        peek_idx += 1
+                    if peek_idx < total_lines:
+                        peek_line = lines[peek_idx]
+                        peek_stripped = peek_line.strip()
+                        if (
+                            len(peek_stripped) <= 56
+                            and not _PAGE_MARKER_RE.match(peek_stripped)
+                            and not peek_stripped.startswith("```")
+                            and not _HEADING_RE.match(peek_stripped)
+                            and not _TABLE_ROW_RE.match(peek_line)
+                            and not _LIST_ITEM_RE.match(peek_stripped)
+                            and (
+                                any(ch.isdigit() or ch in "$%()" for ch in (last_stripped + peek_stripped))
+                                or len(last_stripped) <= 32
+                                or len(peek_stripped) <= 32
+                            )
+                        ):
+                            para_lines.append(peek_stripped)
+                            idx = peek_idx + 1
+                            continue
+                break
+            # Dừng paragraph khi gặp page break, heading, code block, hoặc table
             if (
-                not curr_stripped
-                or _PAGE_MARKER_RE.match(curr_stripped)
+                _PAGE_MARKER_RE.match(curr_stripped)
                 or curr_stripped.startswith("```")
                 or _HEADING_RE.match(curr_stripped)
                 or _TABLE_ROW_RE.match(curr)
@@ -312,4 +382,3 @@ def extract_canonical_blocks(
         ordinal += 1
 
     return blocks
-

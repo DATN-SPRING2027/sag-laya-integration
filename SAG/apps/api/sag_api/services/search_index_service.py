@@ -34,6 +34,25 @@ from sag_api.db.models.routing_rag import (
 
 log = get_logger("sag.search_index")
 
+# Bounded LRU cache mapping sha256(text) -> dense vector for batch reuse between SearchUnits and KnowledgeUnits
+_SHARED_TEXT_EMBEDDING_CACHE: dict[str, list[float]] = {}
+_SHARED_TEXT_EMBEDDING_CACHE_MAX = 4096
+
+
+def get_cached_text_embedding(text: str) -> list[float] | None:
+    key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    vec = _SHARED_TEXT_EMBEDDING_CACHE.get(key)
+    return list(vec) if vec is not None else None
+
+
+def put_cached_text_embedding(text: str, vector: Sequence[float]) -> None:
+    key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if len(_SHARED_TEXT_EMBEDDING_CACHE) >= _SHARED_TEXT_EMBEDDING_CACHE_MAX and key not in _SHARED_TEXT_EMBEDDING_CACHE:
+        oldest_key = next(iter(_SHARED_TEXT_EMBEDDING_CACHE))
+        _SHARED_TEXT_EMBEDDING_CACHE.pop(oldest_key, None)
+    _SHARED_TEXT_EMBEDDING_CACHE[key] = [float(x) for x in vector]
+
+
 
 def generate_search_unit_id(document_version_id: str, ordinal: int) -> str:
     """Generate deterministic UUIDv5 for SearchUnit based on document_version_id and ordinal."""
@@ -45,14 +64,22 @@ def generate_search_unit_point_id(collection_name: str, unit_id: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"sag:qdrant:{collection_name}:{unit_id}"))
 
 
-COMMON_STOPWORDS = {
-    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with",
-    "by", "from", "up", "about", "into", "over", "after", "is", "are", "was", "were",
-    "be", "been", "being", "have", "has", "had", "do", "does", "did", "can", "could",
-    "this", "that", "these", "those", "it", "its", "as",
-    "là", "và", "của", "cho", "với", "trong", "được", "có", "đã", "đang", "sẽ",
-    "các", "những", "một", "này", "đó", "tại", "về", "từ", "theo", "khi",
-}
+COMMON_STOPWORDS: frozenset[str] = frozenset(
+    {
+        # English function words & question particles
+        "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with",
+        "by", "from", "up", "about", "into", "over", "after", "is", "are", "was", "were",
+        "be", "been", "being", "have", "has", "had", "do", "does", "did", "can", "could",
+        "this", "that", "these", "those", "it", "its", "as",
+        "what", "when", "where", "who", "whom", "whose", "which", "why", "how",
+        # Vietnamese function words, prepositions, conjunctions & question particles
+        "là", "và", "của", "cho", "với", "trong", "được", "có", "đã", "đang", "sẽ",
+        "các", "những", "một", "này", "đó", "tại", "về", "từ", "theo", "khi", "như",
+        "bởi", "vì", "nếu", "thì", "mà", "để", "đến", "tới", "ra", "vào", "lên", "xuống",
+        "cũng", "vẫn", "đều", "chỉ", "rất", "quá", "lắm", "rồi", "hay", "hoặc", "nhưng",
+        "gì", "nào", "ai", "đâu", "sao", "thế", "bao", "nhiêu", "không", "chưa", "phải",
+    }
+)
 
 
 def compute_sparse_bm25_vector(
@@ -69,12 +96,25 @@ def compute_sparse_bm25_vector(
     import re
     from collections import Counter
 
-    tokens = re.findall(r"\w+", text.lower())
+    # Normalize thousand-separated numbers (1,577 -> 1577) and compound abbreviations (PP&E -> ppe)
+    cleaned_text = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", text.lower())
+    cleaned_text = re.sub(r"\bpp(?:\s*&\s*|n)e\b", "ppe ppne property plant equipment", cleaned_text)
+    cleaned_text = re.sub(r"\bshee\s+t\b", "sheet", cleaned_text)
+    cleaned_text = re.sub(r"\bflow\s+s\b", "flows", cleaned_text)
+    tokens = re.findall(r"\w+", cleaned_text)
     if not tokens:
         return {"indices": [], "values": []}
 
+    # Expand glued alphanumeric tokens (e.g. fy2018 -> fy2018, 2018) so years/codes match either form
+    expanded_tokens: list[str] = list(tokens)
+    for tok in tokens:
+        if tok.isalnum() and not tok.isalpha() and not tok.isdigit() and len(tok) >= 3:
+            for sub in re.findall(r"[a-z]+|\d{2,}", tok):
+                if len(sub) >= 2:
+                    expanded_tokens.append(sub)
+
     doc_len = len(tokens)
-    counts = Counter(tokens)
+    counts = Counter(expanded_tokens)
     sparse_map: dict[int, float] = {}
 
     for word, tf in counts.items():
@@ -116,7 +156,9 @@ PAYLOAD_INDEX_FIELDS = [
     ("valid_from_ts", "integer"),
     ("valid_to_ts", "integer"),
     ("primary_node_a", "keyword"),
+    ("tree_version_a", "keyword"),
     ("primary_node_b", "keyword"),
+    ("tree_version_b", "keyword"),
     ("secondary_node_ids_a", "keyword"),
     ("secondary_node_ids_b", "keyword"),
 ]
@@ -176,9 +218,11 @@ async def ensure_qdrant_collection_and_indexes(
         log.warning("Could not ensure Qdrant collection %s: %s", collection_name, sanitize_error_message(exc))
 
     # 2. Pre-provision payload indexes for fast filtering; fail stage if index creation fails
-    for field_name, field_schema in PAYLOAD_INDEX_FIELDS:
+    import asyncio
+
+    async def _create_payload_index(field_name: str, field_schema: str) -> None:
         idx_res = await qdrant_client.put(
-            f"/collections/{collection_name}/index",
+            f"/collections/{collection_name}/index?wait=true",
             json={
                 "field_name": field_name,
                 "field_schema": field_schema,
@@ -191,6 +235,10 @@ async def ensure_qdrant_collection_and_indexes(
                     f"Failed to create Qdrant payload index '{field_name}' ({field_schema}): "
                     f"HTTP {idx_res.status_code} - {idx_res.text}"
                 )
+
+    await asyncio.gather(
+        *(_create_payload_index(fname, fschema) for fname, fschema in PAYLOAD_INDEX_FIELDS)
+    )
 
 
 def build_search_units_from_blocks(
@@ -230,7 +278,7 @@ def build_search_units_from_blocks(
             token_count=current_tokens,
             page_from=first.page_from,
             page_to=last.page_to,
-            section_path=first.section_path,
+            section_path=last.section_path or first.section_path,
         )
         unit._text_content = combined_text
         units.append(unit)
@@ -241,34 +289,82 @@ def build_search_units_from_blocks(
         words = block.normalized_text.split()
         block_tokens = max(1, len(words))
 
-        # Natural boundary: new heading or table triggers new unit if group non-empty
-        is_boundary = block.block_type in {"heading", "table"} and current_group
+        # Natural boundary: new heading triggers a new unit once the current group has body content
+        has_body_in_group = any(b.block_type != "heading" for b in current_group)
+        is_boundary = block.block_type == "heading" and has_body_in_group
         is_overflow = (current_tokens + block_tokens) > max_tokens_per_unit
 
         if is_boundary or is_overflow:
             flush_group()
 
         if block_tokens > max_tokens_per_unit:
-            # Oversized single block (> max_tokens_per_unit): chunk into sub-units
-            for i in range(0, len(words), max_tokens_per_unit):
-                chunk_words = words[i : i + max_tokens_per_unit]
-                chunk_text = " ".join(chunk_words)
-                chunk_hash = hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()
-                ordinal = len(units)
-                unit = SearchUnit(
-                    id=generate_search_unit_id(document_version_id, ordinal),
-                    document_version_id=document_version_id,
-                    block_from_id=block.id,
-                    block_to_id=block.id,
-                    security_partition_id=security_partition_id,
-                    content_hash=chunk_hash,
-                    token_count=len(chunk_words),
-                    page_from=block.page_from,
-                    page_to=block.page_to,
-                    section_path=block.section_path,
-                )
-                unit._text_content = chunk_text
-                units.append(unit)
+            # Oversized single block (> max_tokens_per_unit): preserve line/table structure and propagate table headers
+            lines = block.normalized_text.splitlines()
+            if len(lines) > 1:
+                table_header_lines: list[str] = []
+                body_start = 0
+                if block.block_type == "table" or (lines[0].strip().startswith("|") and lines[0].strip().endswith("|")):
+                    table_header_lines = [lines[0]]
+                    body_start = 1
+                    if len(lines) > 1 and set(lines[1].strip()) <= {"|", "-", ":", " "}:
+                        table_header_lines.append(lines[1])
+                        body_start = 2
+                header_tokens = sum(len(hl.split()) for hl in table_header_lines)
+                effective_budget = max(64, max_tokens_per_unit - header_tokens)
+                sub_chunks: list[str] = []
+                cur_lines: list[str] = []
+                cur_toks = 0
+                for ln in lines[body_start:]:
+                    ln_toks = max(1, len(ln.split()))
+                    if cur_lines and (cur_toks + ln_toks) > effective_budget:
+                        prefix = (table_header_lines if table_header_lines else [])
+                        sub_chunks.append("\n".join([*prefix, *cur_lines]))
+                        cur_lines = [ln]
+                        cur_toks = ln_toks
+                    else:
+                        cur_lines.append(ln)
+                        cur_toks += ln_toks
+                if cur_lines:
+                    prefix = (table_header_lines if table_header_lines else [])
+                    sub_chunks.append("\n".join([*prefix, *cur_lines]))
+                for chunk_text in sub_chunks:
+                    chunk_words_count = max(1, len(chunk_text.split()))
+                    chunk_hash = hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()
+                    ordinal = len(units)
+                    unit = SearchUnit(
+                        id=generate_search_unit_id(document_version_id, ordinal),
+                        document_version_id=document_version_id,
+                        block_from_id=block.id,
+                        block_to_id=block.id,
+                        security_partition_id=security_partition_id,
+                        content_hash=chunk_hash,
+                        token_count=chunk_words_count,
+                        page_from=block.page_from,
+                        page_to=block.page_to,
+                        section_path=block.section_path,
+                    )
+                    unit._text_content = chunk_text
+                    units.append(unit)
+            else:
+                for i in range(0, len(words), max_tokens_per_unit):
+                    chunk_words = words[i : i + max_tokens_per_unit]
+                    chunk_text = " ".join(chunk_words)
+                    chunk_hash = hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()
+                    ordinal = len(units)
+                    unit = SearchUnit(
+                        id=generate_search_unit_id(document_version_id, ordinal),
+                        document_version_id=document_version_id,
+                        block_from_id=block.id,
+                        block_to_id=block.id,
+                        security_partition_id=security_partition_id,
+                        content_hash=chunk_hash,
+                        token_count=len(chunk_words),
+                        page_from=block.page_from,
+                        page_to=block.page_to,
+                        section_path=block.section_path,
+                    )
+                    unit._text_content = chunk_text
+                    units.append(unit)
             current_section = block.section_path
             continue
 
@@ -376,6 +472,7 @@ async def index_search_units_to_qdrant(
         return 0
 
     texts = []
+    contextual_texts = []
     for u in units:
         t = getattr(u, "_text_content", None)
         if not t and blocks_by_id:
@@ -383,9 +480,33 @@ async def index_search_units_to_qdrant(
             b2 = blocks_by_id.get(u.block_to_id)
             if b1 and b2:
                 t = b1.normalized_text if b1.id == b2.id else f"{b1.normalized_text}\n\n{b2.normalized_text}"
-        texts.append(t or u.section_path or u.content_hash)
+        raw_t = t or u.section_path or u.content_hash
+        texts.append(raw_t)
+        sec_path = (u.section_path or "").strip()
+        ctx_t = f"{sec_path}\n\n{raw_t}" if sec_path and sec_path not in raw_t else raw_t
+        contextual_texts.append(ctx_t)
 
-    vectors = await compute_unit_embeddings(embedder, texts)
+    # Single-Brain Unified Batch Embedding: when using a real batch embedder, pre-batch
+    # any individual CanonicalBlock texts alongside SearchUnit contextual texts in 1 HTTP call
+    # so KnowledgeWorker gets a 0ms cache hit with 0 extra network calls.
+    if hasattr(embedder, "batch_generate") and blocks_by_id:
+        extra_block_texts: list[str] = []
+        seen_texts = set(contextual_texts)
+        for blk in blocks_by_id.values():
+            bt = (blk.normalized_text or "").strip()
+            if blk.block_type != "heading" and bt and bt not in seen_texts and get_cached_text_embedding(bt) is None:
+                seen_texts.add(bt)
+                extra_block_texts.append(blk.normalized_text)
+        combined_batch = list(contextual_texts) + extra_block_texts
+        all_vectors = await compute_unit_embeddings(embedder, combined_batch)
+        for txt, vec in zip(combined_batch, all_vectors, strict=True):
+            put_cached_text_embedding(txt, vec)
+        vectors = all_vectors[: len(contextual_texts)]
+    else:
+        vectors = await compute_unit_embeddings(embedder, contextual_texts)
+        if hasattr(embedder, "batch_generate"):
+            for txt, vec in zip(contextual_texts, vectors, strict=True):
+                put_cached_text_embedding(txt, vec)
     vector_dim = len(vectors[0]) if vectors and len(vectors[0]) > 0 else 1536
 
     # 1. Ensure collection exists and payload indexes are created
@@ -394,19 +515,19 @@ async def index_search_units_to_qdrant(
     # 2. Calculate corpus statistics across units for true BM25 Robertson-Spärck Jones IDF
     import re
     from collections import Counter
-    total_docs = len(texts)
+    total_docs = len(contextual_texts)
     doc_lens = []
     corpus_doc_freqs: Counter[str] = Counter()
-    for text in texts:
-        t_tokens = set(re.findall(r"\w+", text.lower()))
+    for ctx_text in contextual_texts:
+        t_tokens = set(re.findall(r"\w+", ctx_text.lower()))
         for tok in t_tokens:
             corpus_doc_freqs[tok] += 1
-        doc_lens.append(len(re.findall(r"\w+", text.lower())))
+        doc_lens.append(len(re.findall(r"\w+", ctx_text.lower())))
     avg_len = float(sum(doc_lens) / total_docs) if total_docs > 0 else 256.0
 
     # 3. Build points with both dense and sparse representations
     points = []
-    for unit, vec, text in zip(units, vectors, texts, strict=True):
+    for unit, vec, text, ctx_text in zip(units, vectors, texts, contextual_texts, strict=True):
         point_id = generate_search_unit_point_id(collection_name, unit.id)
         b_start = blocks_by_id.get(unit.block_from_id) if blocks_by_id else None
         raw_anchor = b_start.source_anchor if b_start and b_start.source_anchor else None
@@ -427,7 +548,7 @@ async def index_search_units_to_qdrant(
             source_anchor=s_anchor,
         )
         sparse_vec = compute_sparse_bm25_vector(
-            text,
+            ctx_text,
             avg_doc_len=avg_len,
             corpus_doc_freqs=dict(corpus_doc_freqs),
             total_corpus_docs=max(1, total_docs),
@@ -759,11 +880,30 @@ async def run_search_indexing_stage(
         await session.execute(
             select(Document.id).where(Document.id == document_version.document_id).with_for_update()
         )
-        await resolve_temporal_supersedes(
+        temporal_info = await resolve_temporal_supersedes(
             session,
             current_version=document_version,
             document_id=document_version.document_id,
         )
+        superseded_version_id = temporal_info.get("supersedes_id") if isinstance(temporal_info, dict) else None
+        if (
+            qdrant_client is not None
+            and isinstance(temporal_info, dict)
+            and temporal_info.get("action") == "SUPERSEDED"
+            and superseded_version_id
+        ):
+            try:
+                await delete_search_units_from_qdrant(
+                    qdrant_client,
+                    collection_name,
+                    document_version_id=str(superseded_version_id),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to prune superseded version %s from Qdrant: %s",
+                    superseded_version_id,
+                    exc,
+                )
         document_version.search_status = "SEARCH_READY"
         document_version.search_ready_at = datetime.now(UTC)
     else:

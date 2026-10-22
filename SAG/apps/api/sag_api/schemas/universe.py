@@ -64,9 +64,10 @@ class UniverseTreeNodeOut(BaseModel):
 
 
 class UniverseTreeOut(BaseModel):
+    projection: Literal["routing", "source"] = "routing"
     project_id: str
     tree_version: str
-    search_epoch: int = Field(ge=1)
+    search_epoch: int | None = Field(ge=1)
     node_count: int = Field(ge=0)
     unit_count: int = Field(ge=0)
     source_count: int = Field(ge=0)
@@ -83,6 +84,82 @@ class UniverseManifestOut(BaseModel):
     trees: list[UniverseTreeOut] = Field(default_factory=list)
     counts: dict[str, int] = Field(default_factory=dict)
     policy: UniversePolicyOut
+
+
+class UniverseKnowledgeUnitOut(BaseModel):
+    id: str
+    label: str
+    preview: str
+    source_id: str
+    source_name: str
+    document_id: str
+    document_version_id: str
+    document_name: str
+    version_no: int
+    block_id: str
+    heading: str
+    page_from: int
+    page_to: int
+    anchor: str
+
+
+class UniverseKnowledgeEdgeOut(BaseModel):
+    source: str
+    target: str
+    weight: float
+    kind: Literal["similarity"] = "similarity"
+
+
+class UniverseKnowledgePageOut(BaseModel):
+    project_id: str
+    tree_version: str
+    node_id: str
+    scope_key: str
+    units: list[UniverseKnowledgeUnitOut]
+    edges: list[UniverseKnowledgeEdgeOut]
+    total: int
+    next_cursor: str | None = None
+
+
+class UniverseKnowledgeEvidenceOut(BaseModel):
+    id: str
+    tier: str
+    kind: str
+    quote: str
+    confidence: float
+    candidate: bool
+    start: int
+    end: int
+
+
+class UniverseKnowledgeDetailOut(UniverseKnowledgeUnitOut):
+    project_id: str
+    tree_version: str
+    scope_key: str
+    content: str
+    evidence: list[UniverseKnowledgeEvidenceOut]
+
+
+class UniverseKnowledgeReferenceIn(BaseModel):
+    source_id: str = Field(min_length=1, max_length=128)
+    document_version_id: str | None = Field(default=None, max_length=128)
+    search_unit_id: str | None = Field(default=None, max_length=128)
+    block_id: str | None = Field(default=None, max_length=128)
+
+
+class UniverseKnowledgeResolveIn(BaseModel):
+    references: list[UniverseKnowledgeReferenceIn] = Field(max_length=100)
+
+
+class UniverseKnowledgeMatchOut(BaseModel):
+    project_id: str
+    tree_version: str
+    node_id: str
+    unit_ids: list[str]
+
+
+class UniverseKnowledgeResolveOut(BaseModel):
+    matches: list[UniverseKnowledgeMatchOut]
 
 
 class UniverseRelationOut(BaseModel):

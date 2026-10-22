@@ -72,10 +72,11 @@ export const UniverseScene = React.forwardRef<UniverseSceneHandle, UniverseScene
   ) {
     const locale = useLocale();
     const t = useTranslations("UniverseScene");
+    const knowledgeText = useTranslations("KnowledgeUniverse.knowledge");
     const text = React.useMemo<UniverseSceneText>(() => ({
       locale,
-      aria: t("aria"),
-      keyboardInstructions: t("keyboardInstructions"),
+      aria: strategy === "knowledge" ? knowledgeText("title") : t("aria"),
+      keyboardInstructions: strategy === "knowledge" ? knowledgeText("keyboardHint") : t("keyboardInstructions"),
       keyboardStatus: (label, index, total) => t("keyboardStatus", {
         label,
         index,
@@ -102,6 +103,8 @@ export const UniverseScene = React.forwardRef<UniverseSceneHandle, UniverseScene
       actionLabels?.exploreMore,
       actionLabels?.viewDetails,
       locale,
+      strategy,
+      knowledgeText,
       t,
     ]);
     const keyboardInstructionsId = React.useId();

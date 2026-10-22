@@ -435,6 +435,8 @@ export interface SourceGraphResponse {
 
 export interface Section {
   chunk_id: string | null;
+  search_unit_id?: string | null;
+  document_version_id?: string | null;
   heading: string;
   content: string;
   score: number;
@@ -531,9 +533,10 @@ export interface UniverseTreeNode {
 }
 
 export interface UniverseTree {
+  projection?: "routing" | "source";
   project_id: string;
   tree_version: string;
-  search_epoch: number;
+  search_epoch: number | null;
   node_count: number;
   unit_count: number;
   source_count: number;
@@ -544,6 +547,72 @@ export interface UniverseTreeRoute {
   project_id: string;
   tree_version: string;
   node_ids: string[];
+}
+
+export interface UniverseKnowledgeUnit {
+  id: string;
+  label: string;
+  preview: string;
+  source_id: string;
+  source_name: string;
+  document_id: string;
+  document_version_id: string;
+  document_name: string;
+  version_no: number;
+  block_id: string;
+  heading: string;
+  page_from: number;
+  page_to: number;
+  anchor: string;
+}
+
+export interface UniverseKnowledgeEdge {
+  source: string;
+  target: string;
+  weight: number;
+  kind: "similarity";
+}
+
+export interface UniverseKnowledgePage {
+  project_id: string;
+  tree_version: string;
+  node_id: string;
+  scope_key: string;
+  units: UniverseKnowledgeUnit[];
+  edges: UniverseKnowledgeEdge[];
+  total: number;
+  next_cursor: string | null;
+}
+
+export interface UniverseKnowledgeDetail extends UniverseKnowledgeUnit {
+  project_id: string;
+  tree_version: string;
+  scope_key: string;
+  content: string;
+  evidence: Array<{
+    id: string;
+    tier: string;
+    kind: string;
+    quote: string;
+    confidence: number;
+    candidate: boolean;
+    start: number;
+    end: number;
+  }>;
+}
+
+export interface UniverseKnowledgeReference {
+  source_id: string;
+  document_version_id?: string | null;
+  search_unit_id?: string | null;
+  block_id?: string | null;
+}
+
+export interface UniverseKnowledgeMatch {
+  project_id: string;
+  tree_version: string;
+  node_id: string;
+  unit_ids: string[];
 }
 
 export interface UniversePolicy {
@@ -617,6 +686,7 @@ export interface UniverseActivation {
   relations: UniverseRelation[];
   source_hits?: SearchSourceHit[];
   tree_routes?: UniverseTreeRoute[];
+  evidence_refs?: UniverseKnowledgeReference[];
 }
 
 export interface UniversePatchNode {

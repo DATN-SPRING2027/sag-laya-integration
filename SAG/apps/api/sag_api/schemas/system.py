@@ -73,7 +73,12 @@ class ModelConfigUpdate(BaseModel):
 
     search_strategy: SearchStrategy | None = None
     search_top_k: int | None = Field(default=None, ge=1, le=50)
-    sag_language: Literal["zh", "en"] | None = None
+    sag_language: Literal["en", "zh"] | None = None
+
+    @field_validator("sag_language", mode="before")
+    @classmethod
+    def normalize_sag_language(cls, value: str | None) -> str | None:
+        return "en" if value is not None else None
 
     @field_validator(
         "document_parser",

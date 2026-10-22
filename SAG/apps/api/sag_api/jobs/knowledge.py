@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import uuid
+from collections.abc import Sequence
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 
@@ -35,6 +37,49 @@ from sag_api.services.knowledge_service import (
 )
 
 log = logging.getLogger(__name__)
+
+
+async def _embed_blocks(embed, non_heading_blocks: Sequence[tuple[str, str]]) -> dict[str, list[float]]:
+    if not non_heading_blocks:
+        return {}
+    texts = [text for _, text in non_heading_blocks]
+    if hasattr(embed, "batch_generate"):
+        from sag_api.services.search_index_service import (
+            get_cached_text_embedding,
+            put_cached_text_embedding,
+        )
+
+        cached_by_idx: dict[int, list[float]] = {}
+        missing_indices: list[int] = []
+        missing_texts: list[str] = []
+        for idx, t in enumerate(texts):
+            cached = get_cached_text_embedding(t)
+            if cached is not None:
+                cached_by_idx[idx] = cached
+            else:
+                missing_indices.append(idx)
+                missing_texts.append(t)
+        if missing_texts:
+            fetched = await embed.batch_generate(missing_texts)
+            for idx, txt, vec in zip(missing_indices, missing_texts, fetched, strict=True):
+                vec_f = [float(v) for v in vec]
+                put_cached_text_embedding(txt, vec_f)
+                cached_by_idx[idx] = vec_f
+        vecs = [cached_by_idx[i] for i in range(len(texts))]
+    elif hasattr(embed, "generate"):
+        vecs = [await embed.generate(t) for t in texts]
+    elif hasattr(embed, "embed_documents"):
+        res = embed.embed_documents(texts)
+        vecs = await res if inspect.isawaitable(res) else res
+    elif callable(embed):
+        res = embed(texts)
+        vecs = await res if inspect.isawaitable(res) else res
+    else:
+        return {}
+    return {
+        block_id: [float(v) for v in vec]
+        for (block_id, _), vec in zip(non_heading_blocks, vecs, strict=True)
+    }
 
 
 class QueuePolicy(BaseModel):
@@ -295,20 +340,23 @@ async def llm_enrich(unit: KnowledgeUnit, settings, policy: QueuePolicy) -> tupl
         "start, end (exact character offsets), block_id and confidence in [0,1]. Entities require label; "
         "aliases require alias,label; relations require subject,predicate,object. Do not infer facts without quotes."
     )
+    request_body: dict[str, object] = {
+        "model": settings.knowledge_e2_model,
+        "temperature": 0,
+        "max_tokens": policy.max_output_tokens,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+        ],
+    }
+    if "qwen" in str(settings.knowledge_e2_model or "").casefold():
+        request_body["enable_thinking"] = False
     async with httpx.AsyncClient(timeout=policy.timeout_seconds) as client:
         response = await client.post(
             settings.knowledge_e2_url.rstrip("/") + "/chat/completions",
             headers={"Authorization": "Bearer " + settings.knowledge_e2_api_key},
-            json={
-                "model": settings.knowledge_e2_model,
-                "temperature": 0,
-                "max_tokens": policy.max_output_tokens,
-                "response_format": {"type": "json_object"},
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
-                ],
-            },
+            json=request_body,
         )
         response.raise_for_status()
         data = response.json()
@@ -326,6 +374,7 @@ class KnowledgeWorker:
         config: KnowledgeConfig = KnowledgeConfig(),
         policy: QueuePolicy | None = None,
         enrich=None,
+        embed=None,
         job_queue=None,
     ):
         self.sessions, self.settings, self.config = session_factory, settings, config
@@ -335,6 +384,7 @@ class KnowledgeWorker:
             daily_tokens=settings.knowledge_daily_tokens,
         )
         self.enrich = enrich
+        self.embed = embed
         self.job_queue = job_queue
         self.task = None
         self.running: set[asyncio.Task] = set()
@@ -441,7 +491,7 @@ class KnowledgeWorker:
             job_id, token = job.id, job.lease_token
         try:
             async with asyncio.timeout(self.policy.timeout_seconds):
-                result, extractor = None, None
+                result, extractor, dense_by_block_id = None, None, None
                 if job.kind == "E2":
                     async with self.sessions() as session:
                         # Revalidate before sending source text, then again under the commit fence.
@@ -449,6 +499,28 @@ class KnowledgeWorker:
                     result, extractor = await (
                         self.enrich(unit) if self.enrich else llm_enrich(unit, self.settings, self.policy)
                     )
+                elif job.kind == "FOUNDATION":
+                    embedder = self.embed
+                    if embedder is None and getattr(self.settings, "embedding_api_key", None):
+                        try:
+                            from sag_api.sag.engine_manager import EngineManager
+
+                            embedder = await EngineManager(self.settings).get_sag_embedding()
+                            self.embed = embedder
+                        except Exception as error:  # noqa: BLE001
+                            log.warning("Fallback knowledge embedder unavailable: %s", error)
+                    if embedder is not None:
+                        async with self.sessions() as session:
+                            _, blocks, _, actual = await version_input(session, job.document_version_id, self.config)
+                            if actual != job.input_checksum:
+                                raise ValueError("Stale foundation input")
+                            non_heading_blocks = [
+                                (b.id, b.normalized_text)
+                                for b in blocks
+                                if b.block_type != "heading" and b.normalized_text.strip()
+                            ]
+                        if non_heading_blocks:
+                            dense_by_block_id = await _embed_blocks(embedder, non_heading_blocks)
                 async with self.sessions() as session:
                     current = await session.scalar(
                         select(KnowledgeJob).where(KnowledgeJob.id == job_id).with_for_update()
@@ -459,7 +531,30 @@ class KnowledgeWorker:
                         _, _, _, actual = await version_input(session, current.document_version_id, self.config)
                         if actual != current.input_checksum:
                             raise ValueError("Stale foundation input")
-                        await rebuild_knowledge_version(session, current.document_version_id, self.config)
+                        rebuilt_units = await rebuild_knowledge_version(
+                            session,
+                            current.document_version_id,
+                            self.config,
+                            dense_by_block_id=dense_by_block_id,
+                        )
+                        if rebuilt_units:
+                            from sag_api.services.knowledge_service import persist_graph
+
+                            p_id = rebuilt_units[0].project_id
+                            t_id = rebuilt_units[0].tenant_id
+                            project_units = list(
+                                (
+                                    await session.scalars(
+                                        select(KnowledgeUnit).where(
+                                            KnowledgeUnit.tenant_id == t_id,
+                                            KnowledgeUnit.project_id == p_id,
+                                            KnowledgeUnit.is_current.is_(True),
+                                        )
+                                    )
+                                ).all()
+                            )
+                            if len(project_units) >= 2:
+                                await persist_graph(session, project_units, self.config)
                     else:
                         await apply_e2(session, current, result, extractor_version=extractor, config=self.config)
                         current.result_json, current.extractor_version = result, extractor

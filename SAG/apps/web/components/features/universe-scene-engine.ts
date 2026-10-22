@@ -2331,6 +2331,11 @@ export class UniverseForceSceneEngine {
       // The retained camera is applied immediately after this delivery. Any
       // automatic framing here would race it and make the restored graph jump.
       this.didInitialFocus = true;
+    } else if (!this.paused && this.strategy === "knowledge" && topologyChanged && !this.lockedId) {
+      this.didInitialFocus = true;
+      const group = sceneNodes.find((node) => node.kind !== "source")?.sourceId;
+      if (group) this.focusSource(group);
+      else this.focusOverview();
     } else if (
       !this.paused
       && this.strategy === "accumulation"
@@ -3022,7 +3027,8 @@ export class UniverseForceSceneEngine {
       const aspect = Math.max(0.4, this.host.clientWidth / Math.max(1, this.host.clientHeight));
       const distanceY = size.y / Math.max(0.01, 2 * halfFov);
       const distanceX = size.x / Math.max(0.01, 2 * halfFov * aspect);
-      const distance = Math.max(150, distanceX, distanceY, size.z * 1.32) * 0.9;
+      const distance = Math.max(150, distanceX, distanceY, size.z * 1.32)
+        * (this.strategy === "knowledge" ? 1.2 : 0.9);
       this.moveCamera(center, distance, 620);
       return;
     }
@@ -4132,7 +4138,7 @@ export class UniverseForceSceneEngine {
         && !this.lockedId
         && !this.selectedId
         && node.id === (this.keyboardFocusedId ?? this.hoveredId);
-      this.setObjectOpacity(node, opacity, node.id === anchorId || overviewSourceHovered);
+      this.setObjectOpacity(node, opacity, node.id === anchorId || overviewSourceHovered || Boolean(node.sceneNode.searchMatch));
     });
     this.labels.forEach((label) => {
       if (label.kind !== "node") return;
@@ -5637,8 +5643,11 @@ export class UniverseForceSceneEngine {
         this.labelLayer.appendChild(element);
       }
       element.dataset.universeNodeId = node.id;
+      element.dataset.knowledgeMatch = node.sceneNode.searchMatch ? "result" : node.sceneNode.routeMatch ? "route" : "";
       element.disabled = this.timelineIsBusy();
-      element.setAttribute("aria-label", this.text.exploreSource(node.sceneNode.label));
+      element.setAttribute("aria-label", node.sceneNode.kindLabel
+        ? `${node.sceneNode.kindLabel}: ${node.sceneNode.label}`
+        : this.text.exploreSource(node.sceneNode.label));
       element.style.setProperty(
         "--nebula-color",
         `#${this.sourceVisualColor(node.sourceId).getHexString()}`,
@@ -5650,9 +5659,9 @@ export class UniverseForceSceneEngine {
       const title = element.querySelector("strong") as HTMLElement;
       title.textContent = node.sceneNode.label;
       const meta = element.querySelector("small") as HTMLElement;
-      meta.textContent = node.sceneNode.statsReady
+      meta.textContent = node.sceneNode.statsLabel ?? (node.sceneNode.statsReady
         ? this.text.sourceStats(node.sceneNode.eventCount, node.sceneNode.entityCount)
-        : this.text.sourceStatsBuilding(node.sceneNode.eventCount);
+        : this.text.sourceStatsBuilding(node.sceneNode.eventCount));
       nextLabels.push({
         nodeId: node.id,
         kind: "source",
@@ -5719,6 +5728,7 @@ export class UniverseForceSceneEngine {
         );
       });
       element.dataset.kind = node.kind;
+      element.dataset.knowledgeMatch = node.sceneNode.searchMatch ? "result" : "";
       if (node.kind === "entity") {
         element.style.setProperty(
           "--universe-node-accent",
@@ -5735,12 +5745,14 @@ export class UniverseForceSceneEngine {
       element.dataset.compact = String(node.kind === "entity" && !locked);
       primary.setAttribute(
         "aria-label",
-        this.text.exploreNode(nodeKind, node.sceneNode.label),
+        node.sceneNode.kindLabel
+          ? `${node.sceneNode.kindLabel}: ${node.sceneNode.label}`
+          : this.text.exploreNode(nodeKind, node.sceneNode.label),
       );
       const eyebrowText = primary.querySelector(
         ".sag-universe-node-label__eyebrow > span:last-child",
       ) as HTMLElement;
-      eyebrowText.textContent = `${this.text.kind(nodeKind)} · ${node.sceneNode.category}`;
+      eyebrowText.textContent = `${node.sceneNode.kindLabel ?? this.text.kind(nodeKind)} · ${node.sceneNode.category}`;
       const title = primary.querySelector("strong") as HTMLElement;
       title.textContent = node.sceneNode.label;
       title.removeAttribute("title");
@@ -5767,11 +5779,11 @@ export class UniverseForceSceneEngine {
         && !this.lockedId
         && !this.selectedId;
       exploreHint.hidden = !hintVisible;
-      exploreHint.textContent = node.sceneNode.canExploreMore
+      exploreHint.textContent = node.sceneNode.progressLabel ?? (node.sceneNode.canExploreMore
         ? this.text.continueExploring(relatedProgress, relatedTotal)
         : typeof relatedTotal === "number" && relatedProgress >= relatedTotal
           ? this.text.explorationComplete(relatedProgress, relatedTotal)
-          : this.text.explorationProgress(relatedProgress, relatedTotal);
+          : this.text.explorationProgress(relatedProgress, relatedTotal));
       const actions = element.querySelector<HTMLElement>("[data-universe-node-actions]");
       if (actions) actions.hidden = !locked;
       const viewDetailsAction = this.text.viewDetailsAction ?? "View details";
@@ -5936,6 +5948,10 @@ export class UniverseForceSceneEngine {
       8,
       hostRect,
     );
+    const knowledgeOverlays = this.strategy === "knowledge"
+      ? ["[data-universe-navigation='true']", "[data-universe-pagination='true']", "[data-universe-browser='true']"]
+        .map((selector) => this.relativeOverlayRect(selector, 8, hostRect))
+      : [];
     let visibleEventLabels = 0;
     let visibleEntityLabels = 0;
     // Flight speed scales the complete card as one object. Internal content
@@ -5959,6 +5975,7 @@ export class UniverseForceSceneEngine {
     const labelSourceId = labelFocusId
       ? this.nodes.get(labelFocusId)?.sourceId ?? this.visualSourceId
       : this.visualSourceId;
+    const knowledgeCards: Array<{ left: number; right: number; top: number; bottom: number }> = [];
     this.labels.forEach((label) => {
       const node = this.nodes.get(label.nodeId);
       if (!node || !Number.isFinite(node.x) || !Number.isFinite(node.y) || !Number.isFinite(node.z)) {
@@ -6031,11 +6048,11 @@ export class UniverseForceSceneEngine {
         screen.y,
         height - screen.y,
       );
-      const edgePresence = label.kind === "node" && !requiredFocusCard
+      const edgePresence = label.kind === "node" && !requiredFocusCard && this.strategy !== "knowledge"
         ? THREE.MathUtils.smoothstep(edgeDistance, 64, 184)
         : 1;
       visibleOpacity *= edgePresence;
-      const blurAllowed = !mobile && !this.reducedMotion;
+      const blurAllowed = !mobile && !this.reducedMotion && this.strategy !== "knowledge";
       const edgeBlur = blurAllowed
         ? (1 - edgePresence) * CARD_DEPTH_BLUR_CSS
         : 0;
@@ -6112,6 +6129,8 @@ export class UniverseForceSceneEngine {
       const sourceInfoGap = 8;
       const baseLabelWidth = label.kind === "source"
         ? sourceBeaconSize
+        : this.strategy === "knowledge"
+          ? locked ? mobile ? 224 : 280 : mobile ? 210 : 260
         : locked
           ? mobile ? 224 : 264
         : compact
@@ -6121,6 +6140,8 @@ export class UniverseForceSceneEngine {
           : expanded ? 252 : 232;
       const baseLabelHeight = label.kind === "source"
         ? sourceBeaconSize
+        : this.strategy === "knowledge"
+          ? locked ? 170 : mobile ? 108 : 118
         : locked
           ? mobile ? 112 : 126
         : compact
@@ -6205,6 +6226,15 @@ export class UniverseForceSceneEngine {
           "top",
         ),
       ];
+      if (this.strategy === "knowledge") {
+        // Corner anchors keep a small corpus readable on laptop-sized viewports.
+        for (const direction of [-1, 1]) {
+          nodeCandidates.push(
+            makeRect(screen.x + labelGap, screen.y + (direction < 0 ? -labelHeight - labelGap : labelGap), labelWidth, labelHeight, "right"),
+            makeRect(screen.x - labelWidth - labelGap, screen.y + (direction < 0 ? -labelHeight - labelGap : labelGap), labelWidth, labelHeight, "left"),
+          );
+        }
+      }
       const candidates: LabelRect[] = label.kind === "source"
         ? sourceHovered
           ? [
@@ -6242,6 +6272,7 @@ export class UniverseForceSceneEngine {
         panelRect,
         summaryRect,
         progressRect,
+        ...knowledgeOverlays,
       ].some((overlay) => overlay
         ? rect.left < overlay.right
           && rect.right > overlay.left
@@ -6252,7 +6283,7 @@ export class UniverseForceSceneEngine {
         rect.left >= 10
         && rect.right <= width - 10
         && rect.top >= 58
-        && rect.bottom <= height - 42;
+        && rect.bottom <= height - (this.strategy === "knowledge" ? 115 : 42);
       const clampedCandidates = label.kind === "node"
         ? candidates.map((candidate) => {
             const maxLeft = Math.max(10, width - labelWidth - 10);
@@ -6267,7 +6298,10 @@ export class UniverseForceSceneEngine {
           })
         : [];
       const isOpenPlacement = (candidate: LabelRect) =>
-        insideViewport(candidate) && !overlapsFixedOverlay(candidate);
+        insideViewport(candidate) && !overlapsFixedOverlay(candidate)
+        && (this.strategy !== "knowledge" || !knowledgeCards.some((occupied) =>
+          candidate.left < occupied.right + 10 && candidate.right > occupied.left - 10
+          && candidate.top < occupied.bottom + 10 && candidate.bottom > occupied.top - 10));
       const naturalRect = candidates.find(isOpenPlacement);
       // Ordinary cards in both modes share the same lifecycle: if no natural
       // placement remains, dissolve back to the star instead of teleporting to
@@ -6287,11 +6321,12 @@ export class UniverseForceSceneEngine {
         label.element.style.transform = "translate3d(-9999px, -9999px, 0)";
         return;
       }
+      if (this.strategy === "knowledge" && label.kind === "node") knowledgeCards.push(rect);
       label.element.hidden = false;
       label.element.style.display = "flex";
       label.element.dataset.side = rect.side;
       label.element.dataset.hovered = String(sourceHovered);
-      label.element.dataset.highlighted = String(emphasized || this.sourceHits.some(
+      label.element.dataset.highlighted = String(emphasized || node.sceneNode.searchMatch || node.sceneNode.routeMatch || this.sourceHits.some(
         (hit) => hit.source_id === node.sourceId,
       ));
       const baseLabelOpacity = visibleOpacity * (
@@ -6362,7 +6397,7 @@ export class UniverseForceSceneEngine {
   }
 
   private miniPanelRect(hostRect?: DOMRectReadOnly) {
-    return this.relativeOverlayRect("[data-mini-workspace='true']", 10, hostRect);
+    return this.relativeOverlayRect("[data-universe-detail-panel='true'], [data-mini-workspace='true']", 10, hostRect);
   }
 
   private relativeOverlayRect(
@@ -6387,8 +6422,8 @@ export class UniverseForceSceneEngine {
     const height = Math.max(1, this.host.clientHeight);
     let left = 24;
     let right = width - 72;
-    let top = 68;
-    let bottom = height - 54;
+    let top = this.strategy === "knowledge" ? (width < 768 ? 185 : 165) : 68;
+    let bottom = height - (this.strategy === "knowledge" ? 120 : 54);
     const panels = [panelRect]
       .filter((panel): panel is NonNullable<typeof panel> => panel !== null);
     panels.forEach((panel) => {
@@ -6484,6 +6519,30 @@ export class UniverseForceSceneEngine {
       : 32;
     if (!force && elapsed < 24) return;
     this.lastVisualLodAt = now;
+    if (this.strategy === "knowledge") {
+      const group = [...this.nodes.values()].find((node) => node.kind !== "source")?.sourceId ?? null;
+      const mix = group ? 1 : 0;
+      const changed = this.visualSourceId !== group || this.visualDetailMix !== mix;
+      this.visualSourceId = group;
+      this.latchedDetailSourceId = group;
+      this.reportedViewSourceId = group;
+      this.visualDetailMix = mix;
+      this.visualDetailTarget = mix;
+      this.host.dataset.universeVisualMode = group ? "detail" : "overview";
+      this.host.dataset.universeDetailSource = group ?? "";
+      this.host.dataset.universeDetailMix = String(mix);
+      this.sourceNodeList.forEach((node) => node.object?.traverse((child) => {
+        if (child.userData.hitArea) child.visible = node.sourceId !== group;
+      }));
+      if (changed || force) {
+        this.updateNodeMorphScales(now, true);
+        this.updateSourceAuraOpacities();
+        this.updateNebulaAlphas();
+        this.updateNebulaMotionState();
+        if (refresh) this.rebuildLabels();
+      }
+      return;
+    }
     if (this.strategy === "accumulation") {
       this.latchedDetailSourceId = null;
       this.visualSourceId = null;

@@ -14,7 +14,6 @@ import {
 } from "@/components/ui/sheet";
 import { useIsMobile } from "@/hooks/use-mobile";
 import {
-  useUniverseEntityCategories,
   useUniverseViewPreferences,
 } from "@/lib/universe-view-preferences";
 import { cn } from "@/lib/utils";
@@ -26,8 +25,8 @@ export function UniverseViewSettingsDrawer({
 }) {
   const t = useTranslations("GraphSettings");
   const common = useTranslations("Common");
+  const knowledgeText = useTranslations("KnowledgeUniverse.knowledge");
   const mobile = useIsMobile();
-  const entityCategories = useUniverseEntityCategories();
   const { preferences, updatePreferences, resetPreferences } =
     useUniverseViewPreferences();
 
@@ -48,7 +47,7 @@ export function UniverseViewSettingsDrawer({
         <SheetHeader className="shrink-0 border-b border-border/70 px-5 py-4 pr-12 text-left">
           <SheetTitle className="text-base">{t("drawer.title")}</SheetTitle>
           <SheetDescription className="text-xs leading-5">
-            {t("drawer.description")}
+            {knowledgeText("settings.description")}
           </SheetDescription>
         </SheetHeader>
         <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-4 sm:p-5">
@@ -56,7 +55,6 @@ export function UniverseViewSettingsDrawer({
             preferences={preferences}
             onChange={updatePreferences}
             onReset={resetPreferences}
-            entityCategories={entityCategories}
             compact
             isMobile={mobile}
           />

@@ -49,9 +49,7 @@ def _field_name(field: str | None) -> str:
     return "_sag_id" if field == "_id" else str(field)
 
 
-def _filter_to_qdrant(expression: Filter | None) -> dict[str, Any] | None:
-    if expression is None:
-        return None
+def _filter_condition_to_qdrant(expression: Filter) -> dict[str, Any]:
     op = expression.operator
     if op == "eq":
         return {"key": _field_name(expression.field), "match": {"value": _json_value(expression.value)}}
@@ -62,9 +60,20 @@ def _filter_to_qdrant(expression: Filter | None) -> dict[str, Any] | None:
         }
     if op == "range":
         return {"key": _field_name(expression.field), "range": _json_value(expression.value)}
+    if op in {"and", "or", "not", "exists"}:
+        return _filter_to_qdrant(expression)
+    raise ValueError(f"Unsupported filter operator: {op!r}")
+
+
+def _filter_to_qdrant(expression: Filter | None) -> dict[str, Any] | None:
+    if expression is None:
+        return None
+    op = expression.operator
     if op == "exists":
         return {"must_not": [{"is_empty": {"key": _field_name(expression.field)}}]}
-    children = [item for child in expression.children if (item := _filter_to_qdrant(child))]
+    if op in {"eq", "in", "range"}:
+        return {"must": [_filter_condition_to_qdrant(expression)]}
+    children = [_filter_condition_to_qdrant(child) for child in expression.children]
     if op == "and":
         return {"must": children}
     if op == "or":
@@ -109,6 +118,8 @@ class QdrantVectorStore:
         self._storage_mode = storage_mode
         self._embedding_dimensions = embedding_dimensions
         self._client: httpx.AsyncClient | None = None
+        self._payload_index_lock = asyncio.Lock()
+        self._payload_indexes_ready: set[str] = set()
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -180,6 +191,58 @@ class QdrantVectorStore:
                 diffs.append(f"{name}.{field}: distance is not cosine")
         if diffs:
             raise StorageSchemaMismatchError(f"Qdrant collection {name} schema mismatch", diffs=diffs)
+        await self._ensure_payload_indexes(name, info=info)
+
+    @staticmethod
+    def _payload_index_schemas(name: str) -> dict[str, str]:
+        from zleap.sag.core.storage.index_schemas import INDEX_SCHEMAS
+
+        schema = INDEX_SCHEMAS.get(name)
+        if schema is None:
+            return {}
+        fields: dict[str, str] = {}
+        for field in schema.keyword_fields + schema.text_keyword_fields + schema.array_fields:
+            fields[field] = "keyword"
+        for field in schema.bool_fields:
+            fields[field] = "bool"
+        for field in schema.datetime_fields:
+            fields[field] = "datetime"
+        for field in schema.int_fields:
+            fields[field] = "integer"
+        return fields
+
+    async def _ensure_payload_indexes(
+        self,
+        name: str,
+        *,
+        info: dict[str, Any] | None = None,
+    ) -> None:
+        expected = self._payload_index_schemas(name)
+        if not expected or name in self._payload_indexes_ready:
+            return
+        async with self._payload_index_lock:
+            if name in self._payload_indexes_ready:
+                return
+            collection_info = info or await self._collection_info(name)
+            if collection_info is None:
+                return
+            actual = collection_info.get("payload_schema") or {}
+            for field, field_schema in expected.items():
+                existing = actual.get(field)
+                if isinstance(existing, dict):
+                    actual_schema = existing.get("data_type")
+                    if actual_schema and actual_schema != field_schema:
+                        raise StorageSchemaMismatchError(
+                            f"Qdrant collection {name} payload index mismatch",
+                            diffs=[f"{field}: {actual_schema} != {field_schema}"],
+                        )
+                    continue
+                await self._request(
+                    "PUT",
+                    self._path(name, "/index?wait=true"),
+                    json={"field_name": field, "field_schema": field_schema},
+                )
+            self._payload_indexes_ready.add(name)
 
     async def create_schema_object(self, name: str, dimensions: int) -> None:
         from zleap.sag.core.storage.index_schemas import INDEX_SCHEMAS
@@ -196,6 +259,7 @@ class QdrantVectorStore:
                 "on_disk_payload": True,
             },
         )
+        await self._ensure_payload_indexes(name)
 
     async def _vector_dimensions(self, collection: str) -> dict[str, int]:
         info = await self._collection_info(collection)
@@ -285,6 +349,8 @@ class QdrantVectorStore:
         limit: int,
         include_vectors: bool,
     ) -> list[VectorRecord]:
+        if filters is not None:
+            await self._ensure_payload_indexes(collection)
         records: list[VectorRecord] = []
         offset: str | None = None
         while len(records) < limit:
@@ -310,6 +376,8 @@ class QdrantVectorStore:
     async def query(self, collection: str, request: VectorQuery) -> list[VectorHit]:
         if request.text:
             raise StorageError("Qdrant provider does not support lexical search")
+        if request.filters is not None:
+            await self._ensure_payload_indexes(collection)
         if request.vector is not None:
             body: dict[str, Any] = {
                 "query": [float(value) for value in request.vector],

@@ -108,12 +108,14 @@ QUICK_SETUP_302 = {
     "document_extraction_profile": "standard",
     "search_strategy": "multi_es_fast",
     "search_top_k": 8,
-    "sag_language": "zh",
+    "sag_language": "en",
 }
 
 _LEGACY_302_BASE_URLS = {
     "https://api.302.ai": "https://api.302ai.cn",
     "https://api.302.ai/v1": "https://api.302ai.cn/v1",
+    "https://api.siliconflow.cn": "https://api.siliconflow.com",
+    "https://api.siliconflow.cn/v1": "https://api.siliconflow.com/v1",
 }
 _OFFICIAL_MINERU_BASE_URL = "https://mineru.net/api/v4"
 
@@ -194,7 +196,9 @@ def _normalize_overrides(overrides: dict) -> dict:
         log.warning("旧检索策略 atomic 已迁移为精确模式 multi")
     elif strategy is not None and strategy not in SEARCH_STRATEGIES:
         normalized.pop("search_strategy", None)
-        log.warning("忽略非法的持久化检索策略：%s", strategy)
+        log.warning("Ignored invalid persisted search strategy: %s", strategy)
+    if "sag_language" in normalized:
+        normalized["sag_language"] = "en"
     return normalized
 
 

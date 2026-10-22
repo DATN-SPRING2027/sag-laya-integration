@@ -13,6 +13,8 @@ from urllib.parse import quote
 
 import httpx
 
+from sag_api.services.search_index_service import COMMON_STOPWORDS
+
 
 class SearchIndexUnavailable(RuntimeError):
     """A sanitized failure while reading the canonical search index."""
@@ -27,19 +29,69 @@ class SearchUnitHit:
 
 _TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
 _TRANSIENT_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+_SPARSE_QUERY_STOPWORDS = COMMON_STOPWORDS
+_QUERY_FRAMING_STOPWORDS = frozenset(
+    {
+        "assume", "utilizing", "shown", "following", "question", "answer", "response",
+        "relying", "details", "give", "discuss", "discusses", "reference", "looking",
+        "based", "according", "provide", "provided", "information", "please", "state",
+        "tell", "explain", "describe", "whether",
+    }
+)
 
 
 def build_sparse_query_vector(query: str) -> dict[str, list[int] | list[float]]:
     """Encode query terms with Phase 2C's tokenizer and stable MD5 buckets.
 
-    Qdrant applies the collection IDF modifier. Query term weights therefore
-    encode frequency only; they do not invent a query-local corpus statistic.
+    Uses sub-linear query TF and alphanumeric/entity boosting so repeated framing words
+    never drown out discriminative entity, numeric, or domain anchors.
     """
-    counts = Counter(_TOKEN_PATTERN.findall(query.lower()))
+    normalized_q = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", query)
+    normalized_q = re.sub(
+        r"\bpp(?:\s*&\s*|n)e\b",
+        "ppe ppne property plant equipment",
+        normalized_q,
+        flags=re.IGNORECASE,
+    )
+    orig_tokens = _TOKEN_PATTERN.findall(normalized_q)
+    proper_tokens = {
+        tok.lower()
+        for idx, tok in enumerate(orig_tokens)
+        if idx > 0 and any(ch.isupper() for ch in tok) and len(tok) >= 2
+    }
+    raw_tokens = [tok.lower() for tok in orig_tokens]
+    filtered_tokens = [t for t in raw_tokens if t not in _SPARSE_QUERY_STOPWORDS]
+    active_tokens = filtered_tokens if filtered_tokens else raw_tokens
+
+    # Expand glued alphanumeric identifiers (e.g. fy2018 -> fy2018, 2018) and standard abbreviations
+    expanded_tokens: list[str] = list(active_tokens)
+    for tok in active_tokens:
+        if tok in ("ppne", "ppe"):
+            expanded_tokens.extend(["ppe", "ppne", "property", "plant", "equipment"])
+        elif tok.isalnum() and not tok.isalpha() and not tok.isdigit() and len(tok) >= 3:
+            for sub in re.findall(r"[a-z]+|\d{2,}", tok):
+                if len(sub) >= 2 and sub not in _SPARSE_QUERY_STOPWORDS:
+                    expanded_tokens.append(sub)
+
+    counts = Counter(expanded_tokens)
+    is_long_query = len(active_tokens) >= 6
     sparse: dict[int, float] = {}
     for token, frequency in counts.items():
+        # Sub-linear TF saturation prevents repeated corpus-title words from dominating
+        base_tf = 1.0 + 0.35 * math.log(frequency) if frequency > 1 else 1.0
+        if is_long_query and token in _QUERY_FRAMING_STOPWORDS:
+            weight = base_tf * 0.2
+        elif is_long_query and (any(ch.isdigit() for ch in token) or token in proper_tokens):
+            weight = base_tf * 2.2
+        else:
+            weight = base_tf
+
         token_id = int(hashlib.md5(token.encode("utf-8")).hexdigest()[:8], 16) % 1_000_000
-        sparse[token_id] = max(sparse.get(token_id, 0.0), float(frequency))
+        sparse[token_id] = max(sparse.get(token_id, 0.0), round(float(weight), 4))
+        if len(token) >= 5 and token.endswith("s") and not token.endswith("ss"):
+            stem = token[:-1]
+            stem_id = int(hashlib.md5(stem.encode("utf-8")).hexdigest()[:8], 16) % 1_000_000
+            sparse[stem_id] = max(sparse.get(stem_id, 0.0), round(float(weight) * 0.6, 4))
     indices = sorted(sparse)
     return {"indices": indices, "values": [sparse[index] for index in indices]}
 
@@ -87,6 +139,22 @@ class SearchUnitQdrantStore:
         self._client = client
         self._max_retries = max(0, min(max_retries, 3))
 
+    @staticmethod
+    def _parse_points(points: list[Any]) -> list[SearchUnitHit]:
+        hits: list[SearchUnitHit] = []
+        for point in points:
+            if not isinstance(point, dict) or not isinstance(point.get("payload"), dict):
+                raise SearchIndexUnavailable("Search index returned an invalid point")
+            try:
+                score = float(point["score"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise SearchIndexUnavailable("Search index returned an invalid score") from error
+            point_id = point.get("id")
+            if not isinstance(point_id, (str, int)) or not math.isfinite(score):
+                raise SearchIndexUnavailable("Search index returned an invalid point")
+            hits.append(SearchUnitHit(str(point_id), score, point["payload"]))
+        return hits
+
     async def search(
         self,
         collection: str,
@@ -115,19 +183,55 @@ class SearchUnitQdrantStore:
         points = (data.get("result") or {}).get("points")
         if not isinstance(points, list):
             raise SearchIndexUnavailable("Search index returned an invalid query response")
-        hits: list[SearchUnitHit] = []
-        for point in points:
-            if not isinstance(point, dict) or not isinstance(point.get("payload"), dict):
-                raise SearchIndexUnavailable("Search index returned an invalid point")
-            try:
-                score = float(point["score"])
-            except (KeyError, TypeError, ValueError) as error:
-                raise SearchIndexUnavailable("Search index returned an invalid score") from error
-            point_id = point.get("id")
-            if not isinstance(point_id, (str, int)) or not math.isfinite(score):
-                raise SearchIndexUnavailable("Search index returned an invalid point")
-            hits.append(SearchUnitHit(str(point_id), score, point["payload"]))
-        return hits
+        return self._parse_points(points)
+
+    async def search_batch(
+        self,
+        collection: str,
+        *,
+        searches: list[dict[str, Any]],
+    ) -> list[list[SearchUnitHit]]:
+        """Execute multiple vector/sparse sub-queries in a single Qdrant HTTP round-trip."""
+        if not searches:
+            return []
+        active_indices: list[int] = []
+        active_bodies: list[dict[str, Any]] = []
+        for idx, spec in enumerate(searches):
+            limit = int(spec.get("limit") or 0)
+            vector_name = str(spec.get("vector_name") or "")
+            query = spec.get("query")
+            search_filter = spec.get("search_filter")
+            if limit <= 0:
+                continue
+            if vector_name == "bm25_sparse" and (
+                not isinstance(query, dict) or not query.get("indices") or not query.get("values")
+            ):
+                continue
+            active_indices.append(idx)
+            active_bodies.append(
+                {
+                    "query": query,
+                    "using": vector_name,
+                    "filter": search_filter,
+                    "limit": limit,
+                    "with_payload": True,
+                    "with_vector": False,
+                }
+            )
+        results: list[list[SearchUnitHit]] = [[] for _ in searches]
+        if not active_bodies:
+            return results
+        path = f"/collections/{quote(collection, safe='')}/points/query/batch"
+        data = await self._request("POST", path, json={"searches": active_bodies})
+        batch_result = data.get("result")
+        if not isinstance(batch_result, list) or len(batch_result) != len(active_bodies):
+            raise SearchIndexUnavailable("Search index returned an invalid batch query response")
+        for idx, item in zip(active_indices, batch_result, strict=True):
+            points = (item or {}).get("points") if isinstance(item, dict) else None
+            if not isinstance(points, list):
+                raise SearchIndexUnavailable("Search index returned an invalid query response")
+            results[idx] = self._parse_points(points)
+        return results
 
     async def get_point(self, collection: str, point_id: str) -> SearchUnitHit | None:
         path = f"/collections/{quote(collection, safe='')}/points/{quote(point_id, safe='')}"

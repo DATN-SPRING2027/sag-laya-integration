@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from pathlib import Path
 from typing import Sequence
 
 from sqlalchemy import delete, select, update
@@ -109,14 +110,27 @@ async def parse_and_persist_document_content(
     run_id: str | None = None,
     page_from: int = 1,
     page_to: int = 1,
+    document_title: str | None = None,
 ) -> list[CanonicalBlock]:
     """Hàm hợp nhất trích xuất canonical blocks từ nội dung và lưu trữ vào database."""
     try:
+        resolved_title = document_title
+        if not resolved_title:
+            from sag_api.db.models import Document, DocumentVersion
+
+            ver = await session.get(DocumentVersion, document_version_id)
+            if ver and ver.document_id:
+                doc = await session.get(Document, ver.document_id)
+                if doc and doc.filename:
+                    stem = Path(doc.filename).stem.replace("_", " ").strip()
+                    if stem:
+                        resolved_title = stem
         blocks = extract_canonical_blocks(
             content,
             version_id=document_version_id,
             page_from=page_from,
             page_to=page_to,
+            document_title=resolved_title,
         )
         return await persist_canonical_blocks(
             session,

@@ -1,4 +1,5 @@
 import type {
+  Citation,
   SearchResponse,
   UniverseActivation,
   UniverseActivationNode,
@@ -53,17 +54,21 @@ export interface UniverseDetailTarget {
   navigation?: UniverseDetailTimelineNavigation;
 }
 
-export interface UniverseAskTarget extends UniverseDetailTarget {
+export interface UniverseAskTarget {
+  kind: "event" | "entity" | "unit";
+  id: string;
+  source_id: string;
   request_id: number;
   label: string;
   prompt: string;
 }
 
 interface UniverseAskNode {
-  kind: "event" | "entity";
+  kind: "event" | "entity" | "unit";
   rawId: string;
   sourceId: string;
   label: string;
+  prompt?: string;
 }
 
 let pendingUniverseDetail: UniverseDetailTarget | null = null;
@@ -174,6 +179,7 @@ export function dispatchUniverseActivation(
     relations: activation.relations,
     source_hits: activation.source_hits,
     tree_routes: activation.tree_routes,
+    evidence_refs: activation.evidence_refs,
   };
   window.dispatchEvent(new CustomEvent(UNIVERSE_ACTIVATE_EVENT, { detail }));
   return detail.epoch ?? universeEpoch;
@@ -266,6 +272,31 @@ export function activationFromSearch(response: SearchResponse): UniverseActivati
     ),
     source_hits: response.source_hits,
     tree_routes: treeRoutes,
+    evidence_refs: response.sections.flatMap((section) => section.source_id ? [{
+      source_id: section.source_id,
+      document_version_id: section.document_version_id,
+      search_unit_id: section.search_unit_id,
+      block_id: section.chunk_id,
+    }] : []),
+  };
+}
+
+export function activationFromCitations(
+  query: string,
+  citations: Citation[],
+  previous?: UniverseActivation,
+): UniverseActivation {
+  return {
+    ...previous,
+    origin: "assistant",
+    query,
+    nodes: previous?.nodes ?? [],
+    relations: previous?.relations ?? [],
+    evidence_refs: citations.flatMap((citation) =>
+      citation.kind !== "external" && citation.source_id && citation.chunk_id
+        ? [{ source_id: citation.source_id, block_id: citation.chunk_id }]
+        : [],
+    ),
   };
 }
 
@@ -315,9 +346,9 @@ export function dispatchUniverseAsk(node: UniverseAskNode) {
     id: node.rawId,
     source_id: node.sourceId,
     label: node.label,
-    prompt: node.kind === "entity"
+    prompt: node.prompt ?? (node.kind === "entity"
       ? clientErrorMessage("askEntity", { label: node.label })
-      : clientErrorMessage("askEvent", { label: node.label }),
+      : clientErrorMessage("askEvent", { label: node.label })),
   };
   pendingUniverseAsk = detail;
   window.dispatchEvent(new CustomEvent<UniverseAskTarget>(UNIVERSE_ASK_EVENT, { detail }));

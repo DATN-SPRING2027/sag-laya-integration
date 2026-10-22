@@ -175,9 +175,19 @@ def apply_litellm_completion_policy(
         normalized["extra_body"] = extra_body
 
     thinking = _thinking_override(normalized.get("extra_body"))
-    if "reasoning_effort" not in normalized:
-        if thinking is False or (thinking is None and "qwen" in model.casefold()):
+    if thinking is False or (thinking is None and "qwen" in model.casefold()):
+        if "reasoning_effort" not in normalized:
             normalized["reasoning_effort"] = "none"
+        base_url = str(
+            normalized.get("api_base")
+            or normalized.get("base_url")
+            or settings.llm_base_url
+            or ""
+        ).casefold()
+        if "qwen" in model.casefold() and "siliconflow" in base_url:
+            extra_body = dict(normalized.get("extra_body") or {})
+            extra_body.setdefault("enable_thinking", False)
+            normalized["extra_body"] = extra_body
 
     if "reasoning_effort" in normalized and _is_openai_route(model, settings):
         _with_allowed_openai_param(normalized, "reasoning_effort")
@@ -207,6 +217,7 @@ def install_litellm_policy(settings: Settings) -> Any:
     cache = StructuredOutputCapabilityCache()
 
     async def sag_acompletion(*args: Any, **kwargs: Any) -> Any:
+        kwargs = apply_litellm_completion_policy(settings, kwargs)
         if settings.llm_structured_output_mode != "auto" or not _json_schema_request(
             kwargs
         ):

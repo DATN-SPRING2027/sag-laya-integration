@@ -259,6 +259,8 @@ async def reprocess_document(
     values: dict = {
         "status": DocumentStatus.PENDING,
         "error": None,
+        "error_layer": None,
+        "error_stage": None,
     }
     if restart_from_scratch:
         values.update(
@@ -597,7 +599,12 @@ async def resume_document(
         document,
         job,
         expected_document_status=DocumentStatus.PAUSED,
-        document_values={"status": resumed_status, "error": None},
+        document_values={
+            "status": resumed_status,
+            "error": None,
+            "error_layer": None,
+            "error_stage": None,
+        },
         expected_job_status=JobStatus.PAUSED,
         job_values={
             "payload": resumed_payload,

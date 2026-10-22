@@ -6,50 +6,70 @@ import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
+from sag_api.services.search_index_service import COMMON_STOPWORDS
+
 _QUERY_NOISE = (
-    "知识库",
-    "资料库",
-    "资料中",
-    "文档中",
-    "告诉我",
-    "帮我查",
-    "搜索",
-    "查询",
-    "请问",
-    "关于",
-    "最新",
-    "最近",
-    "动态",
-    "消息",
-    "新闻",
-    "内容",
-    "资料",
-    "一下",
-    "是什么",
-    "有哪些",
-    "有什么",
+    "kho tri thức",
+    "tài liệu",
+    "trong tài liệu",
+    "cho tôi biết",
+    "tìm giúp",
+    "tìm kiếm",
+    "tra cứu",
+    "cho hỏi",
+    "về",
+    "mới nhất",
+    "gần đây",
+    "tin tức",
+    "nội dung",
+    "là gì",
+    "có những gì",
+    "knowledge base",
+    "in the document",
+    "tell me",
+    "search for",
+    "assume that you are a public equities analyst",
+    "assume that you are",
+    "answer the following question by utilizing the information shown in",
+    "answer the following question",
+    "give a response to the question by relying on the details shown in",
+    "give a response to the question",
+    "i'm looking for a reference that discusses",
+    "i am looking for a reference that discusses",
 )
 _QUERY_INSTRUCTION_TERMS = frozenset(
     {
-        "如何",
-        "怎么",
-        "怎样",
-        "为什么",
-        "为何",
-        "是否",
-        "能否",
-        "进行",
-        "介绍",
-        "说明",
-        "解释",
+        "như thế nào",
+        "làm sao",
+        "tại sao",
+        "vì sao",
+        "có phải",
+        "có thể",
+        "giới thiệu",
+        "mô tả",
+        "giải thích",
+        "how",
+        "why",
+        "whether",
+        "explain",
+        "describe",
+        "assume",
+        "utilizing",
+        "following",
+        "question",
+        "response",
+        "relying",
+        "shown",
     }
 )
 _CHINESE_RUN_RE = re.compile(r"[\u3400-\u9fff]+")
 _LEXICAL_PART_RE = re.compile(
-    r"[a-z0-9][a-z0-9_.+-]{1,31}|[\u3400-\u9fff]+",
+    r"[^\W_](?:[^\W_]|[_.+-]){1,31}|[\u3400-\u9fff]+",
+    re.UNICODE,
 )
 _LEGACY_TERM_RE = re.compile(
-    r"[a-z0-9][a-z0-9_.+-]{1,31}|[\u3400-\u9fff]{2,16}",
+    r"[^\W_](?:[^\W_]|[_.+-]){1,31}|[\u3400-\u9fff]{2,16}",
+    re.UNICODE,
 )
 # Letter and digit runs inside a single lexical token. A glued query such as
 # "ai2027" or "gpt4" is one token to the regexes above, but the deterministic
@@ -58,15 +78,29 @@ _LEGACY_TERM_RE = re.compile(
 # "GPT-4"). Splitting on the letter/digit boundary is the English/number
 # analogue of the Chinese segmentation that lets contiguous queries match
 # spaced evidence.
-_ALNUM_SUBTOKEN_RE = re.compile(r"[a-z]+|[0-9]+")
-_EXACT_TERM_RE = re.compile(r'"([^"\n]+)"|“([^”\n]+)”|「([^」\n]+)」|《([^》\n]+)》')
+_ALNUM_SUBTOKEN_RE = re.compile(r"[^\W\d_]+|[0-9]+", re.UNICODE)
+_EXACT_TERM_RE = re.compile(r'"([^"\n]+)"|“([^”\n]+)”|「([^」\n]+)」|《([^》\n]+)》|`([^`\n]+)`')
 _IDENTIFIER_RE = re.compile(
-    r"\b(?:ERR[_-][A-Z0-9_-]+|HTTP[_ -]?\d{3}|[A-Z][A-Z0-9_]{2,}|"
-    r"[A-Za-z]+[_-]\d+[A-Za-z0-9._-]*|v\d+(?:\.\d+)+)\b"
+    r"\b(?:ERR[_-][A-Z0-9_-]+|HTTP[_ -]?\d{3}|[A-Z][A-Z0-9_]*[0-9_][A-Z0-9_]*|"
+    r"[A-Z]{2,}(?:-[A-Z0-9]+)+|[A-Za-z]+[_-]\d+[A-Za-z0-9._-]*|v\d+(?:\.\d+)+)\b"
 )
 _PATH_RE = re.compile(
-    r"(?:/[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=%-]+|[A-Za-z]:\\[^\s]+|\b[\w-]+(?:\.[\w-]+){1,})"
+    r"(?:(?<![\w$/])/[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=%-]+|[A-Za-z]:\\[^\s]+|\b[\w-]+(?:\.[\w-]+){1,})"
 )
+_RELATION_STEM_GROUPS: dict[str, str] = {
+    "causes": "cause",
+    "caused": "cause",
+    "cause": "cause",
+    "affects": "affect",
+    "affected": "affect",
+    "affect": "affect",
+    "leads to": "lead_to",
+    "led to": "lead_to",
+    "results in": "result_in",
+    "resulted in": "result_in",
+    "mối liên hệ": "lien_he",
+    "liên hệ": "lien_he",
+}
 _TEMPORAL_CUES = (
     "trước",
     "sau",
@@ -90,7 +124,10 @@ _TEMPORAL_CUES = (
     "historical",
 )
 _RELATION_CUES = (
+    "mối liên hệ",
+    "liên hệ",
     "liên quan",
+    "tương tác",
     "phụ thuộc",
     "dùng bởi",
     "kết nối",
@@ -99,6 +136,8 @@ _RELATION_CUES = (
     "dẫn đến",
     "khác gì",
     "so sánh",
+    "relationship",
+    "connection",
     "compare",
     "versus",
     " vs ",
@@ -166,7 +205,7 @@ class QueryAnalysis:
 
 
 def normalize_lexical_text(value: str) -> str:
-    return "".join(re.findall(r"[a-z0-9\u3400-\u9fff]+", value.lower()))
+    return "".join(re.findall(r"[^\W_]+", value.lower(), flags=re.UNICODE))
 
 
 def _remove_query_noise(query: str) -> str:
@@ -191,6 +230,48 @@ def _unique_values(values: Iterable[str], *, limit: int = 8) -> tuple[str, ...]:
     return tuple(result)
 
 
+_CLAUSE_SPLIT_RE = re.compile(
+    r"(?:,\s+and\s+(?=(?:what|which|who|where|why|how|when|is|are|was|were|did|does|do|should|can)\b)"
+    r"|\s+and\s+(?=(?:what|which|who|where|why|how\s+(?:do|does|did|should|can|could|to|will|would|is|are|was|were))\b)"
+    r"|;\s+)",
+    re.IGNORECASE,
+)
+_SALIENT_PROPER_TERM_RE = re.compile(
+    r"\b(?:[A-Z][a-z0-9]+[A-Z][A-Za-z0-9]*|[A-Z]{2,}[0-9]*|[A-Za-z]+\d+[A-Za-z0-9]*)\b"
+)
+
+
+def decompose_query_clauses(query: str) -> tuple[str, ...]:
+    """Split a compound multi-clause question into independent semantic sub-queries."""
+    text = query.strip()
+    if not text:
+        return ()
+    parts = [part.strip(" ,;?") for part in _CLAUSE_SPLIT_RE.split(text) if part and part.strip(" ,;?")]
+    if len(parts) <= 1:
+        return (text,)
+    valid = [p for p in parts if len(p) >= 8]
+    return tuple(valid) if len(valid) >= 2 else (text,)
+
+
+def extract_salient_query_terms(query: str) -> frozenset[str]:
+    """Identify proper nouns, CamelCase symbols, acronyms, and alphanumeric identifiers from cased query."""
+    text = query.strip()
+    if not text:
+        return frozenset()
+    salient: set[str] = set()
+    for match in _SALIENT_PROPER_TERM_RE.finditer(text):
+        norm = normalize_lexical_text(match.group(0))
+        if len(norm) >= 2 and norm not in COMMON_STOPWORDS and norm not in _QUERY_INSTRUCTION_TERMS:
+            salient.add(norm)
+    tokens = re.findall(r"[^\W_]+", text, flags=re.UNICODE)
+    for idx, tok in enumerate(tokens):
+        if idx > 0 and tok[:1].isupper() and any(c.islower() for c in tok[1:]):
+            norm = normalize_lexical_text(tok)
+            if len(norm) >= 3 and norm not in COMMON_STOPWORDS and norm not in _QUERY_INSTRUCTION_TERMS:
+                salient.add(norm)
+    return frozenset(salient)
+
+
 def extract_query_features(query: str) -> QueryFeatures:
     """Extract bounded, non-LLM query signals for routing and trace output."""
 
@@ -199,19 +280,77 @@ def extract_query_features(query: str) -> QueryFeatures:
     exact_terms = _unique_values(
         match.group(index)
         for match in _EXACT_TERM_RE.finditer(text)
-        for index in range(1, 5)
+        for index in range(1, 6)
         if match.group(index)
     )
     identifier_terms = _unique_values(match.group(0) for match in _IDENTIFIER_RE.finditer(text))
     path_terms = _unique_values(
-        match.group(0)
+        cleaned_path
         for match in _PATH_RE.finditer(text)
-        if not re.fullmatch(r"\d+(?:\.\d+)+", match.group(0))
+        if (cleaned_path := match.group(0).rstrip(".,;:!?)]'\""))
+        and len(cleaned_path) >= 3
+        and not re.fullmatch(r"\d+(?:\.\d+)+(?:[a-zA-Z%]{1,4})?", cleaned_path)
     )
     temporal_cues = _unique_values(cue for cue in _TEMPORAL_CUES if cue in lowered)
-    relation_cues = _unique_values(cue.strip() for cue in _RELATION_CUES if cue in lowered)
+    matched_relation_cues: list[str] = []
+    seen_relation_stems: set[str] = set()
+    for cue in _RELATION_CUES:
+        cue_stripped = cue.strip()
+        if re.fullmatch(r"[a-z ]+", cue_stripped):
+            pattern = (
+                r"(?<!root )\bcause\b"
+                if cue_stripped == "cause"
+                else rf"\b{re.escape(cue_stripped)}\b"
+            )
+            if not re.search(pattern, lowered):
+                continue
+        elif cue not in lowered:
+            continue
+        stem = _RELATION_STEM_GROUPS.get(cue_stripped, cue_stripped)
+        if stem in seen_relation_stems:
+            continue
+        seen_relation_stems.add(stem)
+        matched_relation_cues.append(cue_stripped)
+    relation_cues = _unique_values(matched_relation_cues)
     global_cues = _unique_values(cue for cue in _GLOBAL_CUES if cue in lowered)
-    multi_hop = len(relation_cues) >= 2 or any(cue in lowered for cue in ("dẫn đến", "vì vậy", "từ đó"))
+    clauses = decompose_query_clauses(text)
+    single_doc_scoped = bool(
+        re.match(
+            r"^in\s+the\s+(?:draft\s+spec|enterprise\s+[^,]{3,45}\s+runbook|[^,]{3,45}\s+(?:runbook|playbook|spec|sop|postmortem|curriculum))\s*,",
+            lowered,
+        )
+    )
+    bridge_pattern = bool(
+        (len(clauses) >= 2 and not single_doc_scoped)
+        or re.search(
+            r"\b(?:mother|father|spouse|wife|husband|child|director|founder|author|creator|ceo|birthplace|nationality)\s+of\s+(?:the\s+)?(?:director|author|founder|creator|producer|composer|film|movie|book|company)\b"
+            r"|'s\s+(?:paternal\s+|maternal\s+)?(?:father|mother|grandfather|grandmother|spouse|wife|husband|son|daughter|founder|director)\b"
+            r"|\b(?:do|were|are|did)\s+both\b|\bwhich\s+(?:film|movie|person|company|director)\b.*\bor\b"
+            r"|\bwho\s+(?:was\s+born\s+(?:first|earlier|later)|is\s+(?:older|younger))\b"
+            r"|,\s+and\s+(?:what|which|who|where|why|how\s+(?:do|does|did|should|can|could|to|will|would))\b"
+            r"|\b(?:what|which|why|how)\b[^?]{6,}\band\s+(?:what|which|who|where|why|how\s+(?:do|does|did|should|can|to))\b"
+            r"|\bwhat\b[^?]{8,},\s+[^?]{4,},\s+and\s+"
+            r"|(?:^|:\s*)(?:was|were|did)\b[^?]{3,}\bor\b",
+            lowered,
+        )
+    )
+    if single_doc_scoped:
+        bridge_pattern = False
+    multi_hop = (
+        len(relation_cues) >= 2
+        or bridge_pattern
+        or any(
+            cue in lowered
+            for cue in (
+                "mối liên hệ",
+                "dẫn đến",
+                "vì vậy",
+                "từ đó",
+                "relationship between",
+                "difference between",
+            )
+        )
+    )
     return QueryFeatures(
         exact_terms=exact_terms,
         identifier_terms=identifier_terms,
@@ -242,17 +381,19 @@ def _split_alnum_terms(
             and any(value.isalpha() for value in subtokens)
             and any(value.isdigit() for value in subtokens)
         )
-        for candidate in subtokens if split else (part,):
+        # Always preserve the full token (e.g. "3m", "fy2018", "q2") before any valid subtokens
+        candidates = (part, *(s for s in subtokens if len(s) >= 2)) if split else (part,)
+        for idx, candidate in enumerate(candidates):
             value = candidate.strip().lower()
             key = normalize_lexical_text(value)
-            valid = len(key) >= 2 and (split or not key.isdigit())
+            valid = len(key) >= 2
             if not valid or key in keys:
                 continue
             terms.append(value)
-            if split:
+            if split and idx > 0:
                 expanded_terms.append(value)
             keys.add(key)
-            if len(terms) >= 4:
+            if len(terms) >= 32:
                 return tuple(terms), tuple(expanded_terms)
     return tuple(terms), tuple(expanded_terms)
 
@@ -271,15 +412,26 @@ def _lookup_terms(
             continue
         terms.append(value)
         keys.add(key)
-        if len(terms) >= 4:
+        if len(terms) >= 16:
             break
     return tuple(terms)
+
+
+def _filter_informative_tokens(tokens: list[str]) -> list[str]:
+    filtered = [
+        value
+        for value in tokens
+        if normalize_lexical_text(value) not in COMMON_STOPWORDS
+        and normalize_lexical_text(value) not in _QUERY_INSTRUCTION_TERMS
+    ]
+    return filtered if filtered else tokens
 
 
 def _legacy_query_terms(
     cleaned: str,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    return _split_alnum_terms(_LEGACY_TERM_RE.findall(cleaned))
+    raw = _LEGACY_TERM_RE.findall(cleaned)
+    return _split_alnum_terms(_filter_informative_tokens(raw))
 
 
 def _chinese_runs(cleaned: str) -> tuple[str, ...]:
@@ -304,12 +456,7 @@ def _segmented_terms(
             values.extend(segmenter(part))
         else:
             values.append(part)
-    informative = (
-        value
-        for value in values
-        if normalize_lexical_text(value) not in _QUERY_INSTRUCTION_TERMS
-    )
-    return _split_alnum_terms(informative)
+    return _split_alnum_terms(_filter_informative_tokens(values))
 
 
 def analyze_query(

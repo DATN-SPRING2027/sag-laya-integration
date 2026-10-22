@@ -9,6 +9,7 @@ import re
 import uuid
 from bisect import bisect_left
 from collections import Counter, defaultdict
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -28,6 +29,7 @@ from sag_api.db.models import (
     KnowledgeQueueControl,
     KnowledgeUnit,
     KnowledgeUnitEdge,
+    Source,
     SourceProjectMapping,
     SourceSnapshot,
 )
@@ -51,11 +53,27 @@ class KnowledgeConfig(BaseModel):
 
 
 SIGNAL_WEIGHTS = {"semantic": 0.4, "lexical": 0.2, "entity": 0.15, "structure": 0.1, "temporal": 0.1, "citation": 0.05}
+_UPPER_CHAR = (
+    r"A-ZÀ-ÖØ-ÞĀĂĄĆĈĊČĎĐĒĔĖĘĚĜĞĠĢĤĦĨĪĬĮİĲĴĶĹĻĽĿŁŃŅŇŊŌŎŐŒŔŖŘŚŜŞŠŢŤŦ"
+    r"ŨŪŬŮŰŲŴŶŸŹŻŽƠƯẠẢẤẦẨẪẬẮẰẲẴẶẸẺẼẾỀỂỄỆỈỊỌỎỐỒỔỖỘỚỜỞỠỢỤỦỨỪỬỮỰỲỴỶỸ"
+)
+_LOWER_CHAR = (
+    r"a-zß-öø-ÿāăąćĉċčďđēĕėęěĝğġģĥħĩīĭįıĳĵķĸĺļľŀłńņňŉŋōŏőœŕŗřśŝşšţťŧ"
+    r"ũūŭůűųŵŷźżžơưạảấầẩẫậắằẳẵặẹẻẽếềểễệỉịọỏốồổỗộớờởỡợụủứừửữựỳỵỷỹ"
+)
+_WORD_CONT = _UPPER_CHAR + _LOWER_CHAR + r"0-9_-"
 _ENTITY_RE = re.compile(
     r"https?://[^\s<>\]\)]+|[\w.+-]+@[\w.-]+\.\w+|\b(?:\d{1,3}\.){3}\d{1,3}\b|"
     r"\b[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}\b|\b\d{4}-\d{2}-\d{2}\b|"
-    r"\b(?:v?\d+\.\d+(?:\.\d+)?|[A-Z][A-Z0-9_]+(?:-\d+)?)\b|/[\w./{}-]+"
+    rf"\b[{_UPPER_CHAR}][{_WORD_CONT}]*(?:\s+[{_UPPER_CHAR}][{_WORD_CONT}]*)+\b|"
+    r"\b(?:v?\d+\.\d+(?:\.\d+)?|[A-Z][A-Z0-9_]+(?:-\d+)?)\b|/[\w./{}-]+|"
+    r"\b\d+(?:\.\d+)?\s*(?:%|(?:percent|ms|seconds|minutes|hours|days|answers|tokens|chunks|units)\b)"
 )
+_ENTITY_LEADING_STOP_RE = re.compile(
+    r"^(?:(?:The|A|An|In|On|At|By|For|With|From|Before|After|If|When|While|Every|Each|All|Both|This|That|These|Those|"
+    r"Theo|Tại|Trong|Các|Những|Một|Khi|Nếu|Về|Từ|Do|Để|Với)\s+)+"
+)
+_SENTENCE_SPLIT_RE = re.compile(r"(?:[^.!?\n]|\d+\.\d+)+(?:[.!?](?!\d)|$)")
 
 
 def checksum(value: object) -> str:
@@ -102,15 +120,29 @@ def _fact(
     }
 
 
-def extract_e0_e1(block: CanonicalBlock, config: KnowledgeConfig) -> tuple[list[dict], dict]:
+def extract_e0_e1(
+    block: CanonicalBlock,
+    config: KnowledgeConfig = KnowledgeConfig(),
+    *,
+    dense: Sequence[float] | None = None,
+    extra_entities: Sequence[str] = (),
+) -> tuple[list[dict], dict]:
     text, anchor = block.normalized_text, (block.source_anchor or "").strip() or f"block-{block.ordinal}"
     facts: list[dict] = []
     for match in _ENTITY_RE.finditer(text):
+        m_start, m_end = match.span()
+        span_text = text[m_start:m_end]
+        stop_m = _ENTITY_LEADING_STOP_RE.match(span_text)
+        if stop_m:
+            m_start += len(stop_m.group(0))
+            span_text = text[m_start:m_end]
+            if " " not in span_text and not re.fullmatch(r"[A-Z][A-Z0-9_]+(?:-\d+)?", span_text):
+                continue
         facts.append(
             {
                 "tier": "E0",
                 "extractor_version": "e0-lexer-v1",
-                **_fact("entity", text, *match.span(), block.id, anchor, 0.95, label=match[0]),
+                **_fact("entity", text, m_start, m_end, block.id, anchor, 0.95, label=span_text),
             }
         )
     for alias, label in config.aliases:
@@ -124,15 +156,23 @@ def extract_e0_e1(block: CanonicalBlock, config: KnowledgeConfig) -> tuple[list[
                     **_fact("alias", text, *match.span(), block.id, anchor, 0.9, label=label, alias=match[0]),
                 }
             )
-    # Keep code/table boundaries; narrative statements retain exact character spans.
-    pattern = r"[^\n]+" if block.block_type in {"code", "table", "list"} else r"[^.!?\n]+(?:[.!?]|$)"
-    for match in re.finditer(pattern, text):
+    # Keep code/table boundaries; narrative statements retain exact character spans without splitting decimals.
+    sentence_spans: list[tuple[int, int]] = []
+    claim_matches = (
+        re.finditer(r"[^\n]+", text)
+        if block.block_type in {"code", "table", "list"}
+        else _SENTENCE_SPLIT_RE.finditer(text)
+    )
+    for match in claim_matches:
+        s_start, s_end = match.span()
+        if match[0].strip():
+            sentence_spans.append((s_start, s_end))
         if match[0].strip() and len(match[0].strip()) >= 12:
             facts.append(
                 {
                     "tier": "E0",
                     "extractor_version": "e0-statements-v1",
-                    **_fact("claim", text, *match.span(), block.id, anchor, 0.55),
+                    **_fact("claim", text, s_start, s_end, block.id, anchor, 0.55),
                 }
             )
     # Bounded lightweight E1 candidates, as allowed by the dependency-pattern tier.
@@ -144,27 +184,67 @@ def extract_e0_e1(block: CanonicalBlock, config: KnowledgeConfig) -> tuple[list[
                 **_fact("entity", text, *match.span(1), block.id, anchor, 0.7, label=match[1]),
             }
         )
+    if extra_entities:
+        seen_spans = {(f["start"], f["end"]) for f in facts if f["kind"] in {"entity", "alias"}}
+        for raw_name in extra_entities:
+            label = str(raw_name or "").strip()
+            if len(label) < 2 or len(label) > 120:
+                continue
+            for match in re.finditer(r"(?<!\w)" + re.escape(label) + r"(?!\w)", text, re.IGNORECASE):
+                span = match.span()
+                if span in seen_spans:
+                    continue
+                seen_spans.add(span)
+                facts.append(
+                    {
+                        "tier": "E1",
+                        "extractor_version": "e1-sag-engine-bridge-v1",
+                        **_fact("entity", text, *span, block.id, anchor, 0.88, label=label),
+                    }
+                )
     facts = facts[: config.max_evidence_per_unit]
-    labels = sorted({str(f["label"]) for f in facts if f["kind"] in {"entity", "alias"}})
-    if len(labels) >= 2 and len(facts) < config.max_evidence_per_unit:
-        facts.append(
-            {
-                "tier": "E1",
-                "extractor_version": "e1-domain-patterns-v1",
-                **_fact(
-                    "relation",
-                    text,
-                    0,
-                    len(text),
-                    block.id,
-                    anchor,
-                    0.4,
-                    subject=labels[0],
-                    predicate="CO_OCCURS",
-                    object=labels[1],
-                ),
-            }
-        )
+    entity_facts = sorted(
+        (f for f in facts if f["kind"] in {"entity", "alias"}),
+        key=lambda f: (f["start"], f["end"]),
+    )
+    labels = sorted({str(f["label"]) for f in entity_facts})
+    seen_relations: set[tuple[str, str]] = set()
+    for s_start, s_end in sentence_spans or [(0, len(text))]:
+        s_labels: list[str] = []
+        for ef in entity_facts:
+            if ef["start"] >= s_start and ef["end"] <= s_end:
+                lbl = str(ef["label"])
+                if lbl not in s_labels:
+                    s_labels.append(lbl)
+        for idx in range(len(s_labels) - 1):
+            if len(facts) >= config.max_evidence_per_unit:
+                break
+            subj, obj = s_labels[idx], s_labels[idx + 1]
+            pair_key = (subj, obj)
+            if pair_key in seen_relations:
+                continue
+            seen_relations.add(pair_key)
+            facts.append(
+                {
+                    "tier": "E1",
+                    "extractor_version": "e1-domain-patterns-v1",
+                    **_fact(
+                        "relation",
+                        text,
+                        s_start,
+                        s_end,
+                        block.id,
+                        anchor,
+                        0.4,
+                        subject=subj,
+                        predicate="CO_OCCURS",
+                        object=obj,
+                    ),
+                }
+            )
+    dense_list = [float(v) for v in dense] if dense else []
+    if any(not math.isfinite(v) for v in dense_list):
+        raise ValueError("Knowledge dense features must be finite")
     tokens = terms(block.section_path + " " + text)
     sparse = sorted(tokens.items(), key=lambda item: (-item[1], item[0]))[: config.max_terms]
     confidence = max((f["confidence"] for f in facts if f["kind"] in {"entity", "alias"}), default=0.55)
@@ -172,8 +252,8 @@ def extract_e0_e1(block: CanonicalBlock, config: KnowledgeConfig) -> tuple[list[
     hard = bool(re.search(r"contradict|supersed|thay thế|trái ngược", text, re.IGNORECASE))
     return facts, {
         # Foundation stage: Dense embeddings for Knowledge Unit are deferred to dedicated
-        # embedder follow-up; signals are calibrated and renormalized via fuse_signals().
-        "dense": [],
+        # embedder follow-up when not provided; signals are calibrated and renormalized via fuse_signals().
+        "dense": dense_list,
         "sparse": sparse,
         "entities": labels,
         "citations": sorted(set(re.findall(r"https?://[^\s<>\]\)]+", text))),
@@ -284,12 +364,86 @@ async def version_input(session: AsyncSession, version_id: str, config: Knowledg
     return version, blocks, provenance, digest
 
 
+async def _load_sag_engine_entities(session: AsyncSession, document_id: str) -> tuple[str, ...]:
+    """Harvest LLM-extracted entities from sag-engine (LightRAG Dual-Level Bridging)."""
+    document = await session.get(Document, document_id)
+    if not document:
+        return ()
+    sag_source_id = getattr(document, "sag_source_id", None)
+    clean_source_id = str(sag_source_id).strip() if sag_source_id else ""
+    sag_config_id = ""
+    if not clean_source_id and document.source_id:
+        src_obj = await session.get(Source, document.source_id)
+        if src_obj and src_obj.sag_source_config_id:
+            sag_config_id = str(src_obj.sag_source_config_id).strip()
+    if not clean_source_id and not sag_config_id:
+        return ()
+    try:
+        from zleap.sag.db.models import Entity, EventEntity, SourceEvent
+
+        collected: set[str] = set()
+        async with session.begin_nested():
+            scope_clause = (
+                (SourceEvent.source_id == clean_source_id)
+                if clean_source_id
+                else (SourceEvent.data_source_id == sag_config_id)
+            )
+            rows = (
+                await session.scalars(
+                    select(Entity.name)
+                    .join(EventEntity, EventEntity.entity_id == Entity.id)
+                    .join(SourceEvent, SourceEvent.id == EventEntity.event_id)
+                    .where(
+                        scope_clause,
+                        SourceEvent.status.is_(None) | (SourceEvent.status != "DELETED"),
+                    )
+                    .distinct()
+                )
+            ).all()
+            for name in rows:
+                if isinstance(name, str) and 2 <= len(name.strip()) <= 120:
+                    collected.add(name.strip())
+
+            # Also harvest raw_entities from SourceEvent.extra_data (captures type=law/task/metric)
+            extra_rows = (
+                await session.scalars(
+                    select(SourceEvent.extra_data).where(
+                        scope_clause,
+                        SourceEvent.status.is_(None) | (SourceEvent.status != "DELETED"),
+                    )
+                )
+            ).all()
+            for extra in extra_rows:
+                if not isinstance(extra, dict):
+                    continue
+                raw_ents = (extra.get("raw_entities") or {}).get("entities") or []
+                if isinstance(raw_ents, list):
+                    for item in raw_ents:
+                        if isinstance(item, dict):
+                            ename = str(item.get("name") or "").strip()
+                            if 2 <= len(ename) <= 120:
+                                collected.add(ename)
+        return tuple(sorted(collected))
+    except Exception:  # noqa: BLE001 - optional sag-engine tables may be absent in isolated tests
+        return ()
+
+
 async def rebuild_knowledge_version(
-    session: AsyncSession, version_id: str, config: KnowledgeConfig = KnowledgeConfig()
+    session: AsyncSession,
+    version_id: str,
+    config: KnowledgeConfig = KnowledgeConfig(),
+    *,
+    dense_by_block_id: Mapping[str, Sequence[float]] | None = None,
+    extra_entities: Sequence[str] | None = None,
 ) -> list[KnowledgeUnit]:
     # Serialize knowledge work on its own row, rather than a long-held ingestion/readiness row.
     await knowledge_lock(session, "version:" + version_id)
     version, blocks, base, digest = await version_input(session, version_id, config)
+    bridged_entities = (
+        tuple(extra_entities)
+        if extra_entities is not None
+        else await _load_sag_engine_entities(session, base["document_id"])
+    )
     existing = {
         u.id: u
         for u in (
@@ -314,6 +468,13 @@ async def rebuild_knowledge_version(
         }
         input_hash = checksum({"version_input": digest, "block_id": block.id})
         unit = existing.get(unit_id)
+        if dense_by_block_id is not None:
+            dense_vec = [float(v) for v in dense_by_block_id.get(block.id, ())]
+        elif unit is not None and isinstance(unit.features_json, dict) and unit.features_json.get("dense"):
+            dense_vec = [float(v) for v in unit.features_json.get("dense", ())]
+        else:
+            dense_vec = None
+        facts, features = extract_e0_e1(block, config, dense=dense_vec, extra_entities=bridged_entities)
         if (
             unit
             and unit.input_checksum == input_hash
@@ -325,12 +486,12 @@ async def rebuild_knowledge_version(
             and unit.text == block.normalized_text
             and unit.content_hash == block.content_hash
             and unit.provenance_json == provenance
+            and unit.features_json == features
             and unit.checksum == await unit_checksum(session, unit)
         ):
             unit.is_current = True
             units.append(unit)
             continue
-        facts, features = extract_e0_e1(block, config)
         unit = unit or KnowledgeUnit(id=unit_id)
         unit.document_version_id, unit.tenant_id, unit.project_id = version_id, base["tenant_id"], base["project_id"]
         unit.source_id, unit.security_partition_id = base["source_id"], base["security_partition_id"]
@@ -428,7 +589,7 @@ def _quantile(values: list[float], fraction: float) -> float:
     return ordered[low] + (ordered[high] - ordered[low]) * (offset - low)
 
 
-def graph_payload(units: list[KnowledgeUnit], config: KnowledgeConfig) -> dict:
+def graph_payload(units: list[KnowledgeUnit], config: KnowledgeConfig = KnowledgeConfig()) -> dict:
     scopes = {(u.tenant_id, u.project_id) for u in units}
     if len(scopes) != 1 or len({u.id for u in units}) != len(units):
         raise ValueError("Graph input requires unique Knowledge Units in one tenant/project")
@@ -516,8 +677,17 @@ def graph_payload(units: list[KnowledgeUnit], config: KnowledgeConfig) -> dict:
             ap, bp = a.provenance_json, b.provenance_json
             af, bf = a.features_json, b.features_json
             ea, eb = set(af["entities"]), set(bf["entities"])
-            weights = {e: math.log(1 + len(rows) / entity_df[e]) for e in sorted(ea | eb)}
-            entity = math.fsum(weights[e] for e in sorted(ea & eb)) / math.fsum(weights.values()) if weights else None
+            if ea and eb:
+                weights = {e: math.log(1 + len(rows) / entity_df[e]) for e in sorted(ea | eb)}
+                jaccard_ent = math.fsum(weights[e] for e in sorted(ea & eb)) / math.fsum(weights.values())
+                shared_ents = ea & eb
+                if shared_ents:
+                    max_idf = max(weights[e] for e in shared_ents) / max(1.0, math.log(1 + len(rows)))
+                    entity = min(1.0, 0.45 * jaccard_ent + 0.55 * min(1.0, max_idf))
+                else:
+                    entity = 0.0
+            else:
+                entity = None
             same_doc = ap["document_id"] == bp["document_id"]
             structure = (
                 0.85
@@ -552,10 +722,25 @@ def graph_payload(units: list[KnowledgeUnit], config: KnowledgeConfig) -> dict:
                     }
                 )
         degree: Counter = Counter()
+        same_doc_degree: Counter = Counter()
+        max_same_doc_degree = max(1, config.max_degree // 2)
         for edge in sorted(candidates, key=lambda e: (-e["weight"], e["source"], e["target"])):
-            if degree[edge["source"]] < config.max_degree and degree[edge["target"]] < config.max_degree:
-                output.append(edge)
-                degree.update((edge["source"], edge["target"]))
+            u_src, u_tgt = edge["source"], edge["target"]
+            if degree[u_src] >= config.max_degree or degree[u_tgt] >= config.max_degree:
+                continue
+            is_same_doc = (
+                unit_map[u_src].provenance_json.get("document_id")
+                == unit_map[u_tgt].provenance_json.get("document_id")
+            )
+            if is_same_doc and (
+                same_doc_degree[u_src] >= max_same_doc_degree
+                or same_doc_degree[u_tgt] >= max_same_doc_degree
+            ):
+                continue
+            output.append(edge)
+            degree.update((u_src, u_tgt))
+            if is_same_doc:
+                same_doc_degree.update((u_src, u_tgt))
     tenant, project = next(iter(scopes))
     return {
         "contract": "knowledge-graph.v1",

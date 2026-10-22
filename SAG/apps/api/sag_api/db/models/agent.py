@@ -40,7 +40,7 @@ class Thread(IDMixin, TimestampMixin, Base):
 
     owner_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id", ondelete="CASCADE"), index=True)
-    title: Mapped[str] = mapped_column(String(300), default="新会话")
+    title: Mapped[str] = mapped_column(String(300), default="New chat")
     archived: Mapped[bool] = mapped_column(default=False, index=True)
 
 

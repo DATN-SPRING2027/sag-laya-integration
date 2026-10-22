@@ -1,0 +1,1270 @@
+{
+  "benchmark_suite": "Dataset/Project1 Official Enterprise RAG-001..RAG-030",
+  "timestamp_utc": "2026-10-21T16:10:10.023745+00:00",
+  "corpus": {
+    "total_formal_documents": 22,
+    "markdown_documents": 12,
+    "docx_documents": 10,
+    "total_canonical_blocks": 218,
+    "total_search_units": 110,
+    "total_knowledge_units": 130,
+    "ingest_and_search_index_seconds": 55.04,
+    "knowledge_worker_seconds": 2.44,
+    "knowledge_worker_extra_embed_http_calls": 0,
+    "total_pipeline_seconds": 57.48
+  },
+  "retrieval_metrics": {
+    "total_cases": 30,
+    "hit_at_1": 0.8667,
+    "hit_at_1_count": "26/30",
+    "hit_at_3": 1.0,
+    "hit_at_3_count": "30/30",
+    "hit_at_6": 1.0,
+    "hit_at_6_count": "30/30",
+    "mean_gold_recall_at_6": 0.9833,
+    "mrr": 0.9222,
+    "superseded_violation_rate": 0.0,
+    "superseded_violations_count": 0,
+    "evidence_sufficiency_rate": 1.0,
+    "citation_rate": 0.9667
+  },
+  "latency_metrics_ms": {
+    "cold_retrieval_p50_ms": 756.03,
+    "cold_retrieval_p95_ms": 1087.74,
+    "cold_retrieval_mean_ms": 812.41,
+    "warm_engine_p50_ms": 243.89,
+    "warm_engine_p95_ms": 268.06,
+    "warm_engine_mean_ms": 246.54,
+    "llm_synthesis_p50_ms": 23651.53,
+    "llm_synthesis_p95_ms": 40065.04,
+    "llm_synthesis_mean_ms": 23940.93
+  },
+  "document_ingestion_breakdown": [],
+  "cases": [
+    {
+      "case_id": "RAG-001",
+      "query": "How long must checkout idempotency keys be retained?",
+      "expected": "At least 72 hours; the same key and request hash returns the original cached result.",
+      "tags": [
+        "latest_version",
+        "conflict",
+        "citation"
+      ],
+      "gold_document_ids": [
+        "DOC-PAY-ADR-003",
+        "DOC-ARCH-PLAT-001"
+      ],
+      "must_not_cite": [
+        "DOC-PAY-ADR-001"
+      ],
+      "retrieved_document_ids": [
+        "DOC-PAY-ADR-003",
+        "DOC-ARCH-PLAT-001",
+        "DOC-CHKO-API-002",
+        "DOC-CART-SPEC-005"
+      ],
+      "hit_at_1": true,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 1.0,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 1846.31,
+      "warm_engine_ms": 288.06,
+      "stage_latencies_ms": {
+        "auth_scope": 162.85,
+        "tree_route": 32.05,
+        "candidate_retrieval": 1265.96,
+        "rank_fusion": 3.71,
+        "diversity_selection": 14.54,
+        "total_retrieval": 1840.6
+      },
+      "llm_answer": "The checkout idempotency keys must be retained for at least 72 hours. This is specified in the **Commerce Platform Architecture Overview** document under \"Core Architecture Invariants\" [2], which states that mutating external HTTP requests must include a durable Idempotency-Key retained for at least 72 hours. Additionally, the **Reference Table** in the same document [4] explicitly lists the Checkout service domain's isolation mechanism as \"Durable idempotency key (72h TTL)\" (Time To Live), reinforcing the 72-hour retention requirement. \n\nBoth references agree on the 72-hour duration, and the documents are active/Approved. No conflicting or supplementary information is provided in the evidence.",
+      "llm_ms": 23651.53,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-002",
+      "query": "What is the current refund window for Meridian Outfitters?",
+      "expected": "A return request may be opened within 30 calendar days of delivery, subject to warehouse inspection.",
+      "tags": [
+        "conflict",
+        "current_policy"
+      ],
+      "gold_document_ids": [
+        "DOC-ORD-POL-005"
+      ],
+      "must_not_cite": [
+        "DOC-PAY-ADR-001"
+      ],
+      "retrieved_document_ids": [
+        "DOC-ORD-POL-005",
+        "DOC-ORG-MEETING-2026-10-09",
+        "DOC-SEC-CLASS-002",
+        "DOC-QA-CHECKOUT-017",
+        "DOC-REL-RUN-009",
+        "DOC-INT-MERIDIAN-001"
+      ],
+      "hit_at_1": true,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 1.0,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 781.83,
+      "warm_engine_ms": 255.07,
+      "stage_latencies_ms": {
+        "auth_scope": 27.66,
+        "tree_route": 8.01,
+        "candidate_retrieval": 695.79,
+        "rank_fusion": 1.74,
+        "diversity_selection": 14.1,
+        "total_retrieval": 781.3
+      },
+      "llm_answer": "The current refund window for Meridian Outfitters is 30 calendar days from the documented carrier delivery date, as stated in the \"Meridian Return Window\" section of the Refund and Cancellation Policy [DOC-ORD-POL-005] (Status: Approved). This applies to customer return requests, which are subject to merchant warehouse inspection. [3]",
+      "llm_ms": 21969.23,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-003",
+      "query": "How are repeated payment webhooks handled after a worker restart?",
+      "expected": "Verify provider event ID in unique inbox within an atomic transaction; acknowledge replay without repeating side effects.",
+      "tags": [
+        "multi_document",
+        "incident",
+        "deduplication"
+      ],
+      "gold_document_ids": [
+        "DOC-PAY-ADR-003",
+        "DOC-PAY-RCA-006"
+      ],
+      "must_not_cite": [
+        "DOC-PAY-ADR-001"
+      ],
+      "retrieved_document_ids": [
+        "DOC-PAY-RCA-006",
+        "DOC-PAY-ADR-003",
+        "DOC-CHKO-API-002",
+        "DOC-ORD-SOP-004",
+        "DOC-QA-CHECKOUT-017"
+      ],
+      "hit_at_1": true,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 1.0,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 752.54,
+      "warm_engine_ms": 240.28,
+      "stage_latencies_ms": {
+        "auth_scope": 17.01,
+        "tree_route": 5.19,
+        "candidate_retrieval": 694.58,
+        "rank_fusion": 1.46,
+        "diversity_selection": 13.04,
+        "total_retrieval": 752.22
+      },
+      "llm_answer": "Repeated payment webhooks are handled through a deduplication protocol outlined in [2]. Upon receipt of a PulsePay webhook, the system verifies the HMAC-SHA256 signature, inserts the `(merchant_id, provider_event_id)` pair into a unique inbox table within a database transaction, and applies state transitions. If a webhook is a replay (e.g., due to a worker restart), it is acknowledged with HTTP 200 without executing any side effects, ensuring no duplicate processing. This mechanism prevents duplicates even if the worker restarts, as the event is already recorded in the inbox. \n\nThe incident in [1] highlights a scenario where a worker restart caused a duplicate fulfillment dispatch in staging, but the deduplication protocol (as described in [2]) is designed to avoid such issues by tracking processed events.",
+      "llm_ms": 42214.5,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-004",
+      "query": "What does the checkout order submission endpoint return after a provider timeout?",
+      "expected": "HTTP 202 Accepted with pending reconciliation reference; do not spawn a new session for uncertain retry.",
+      "tags": [
+        "docx_table",
+        "api_contract"
+      ],
+      "gold_document_ids": [
+        "DOC-CHKO-API-002"
+      ],
+      "must_not_cite": [],
+      "retrieved_document_ids": [
+        "DOC-CHKO-API-002",
+        "DOC-CART-SPEC-005",
+        "DOC-PAY-RCA-006",
+        "DOC-PAY-ADR-003"
+      ],
+      "hit_at_1": true,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 1.0,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 746.16,
+      "warm_engine_ms": 235.13,
+      "stage_latencies_ms": {
+        "auth_scope": 15.78,
+        "tree_route": 4.12,
+        "candidate_retrieval": 695.2,
+        "rank_fusion": 1.14,
+        "diversity_selection": 11.32,
+        "total_retrieval": 745.89
+      },
+      "llm_answer": "The checkout order submission endpoint returns HTTP 202 Accepted with a pending reconciliation reference when an upstream payment provider timeout occurs. This is explicitly stated in the documentation [1]. Clients are instructed to poll the reconciliation endpoint using exponential backoff rather than creating a new checkout session. \n\n[1] Checkout API Contract [DOC-CHKO-API-002] (Status: Approved) > Order Submission & Provider Handshake",
+      "llm_ms": 23716.16,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-005",
+      "query": "Can product catalog copy be automatically translated in v1?",
+      "expected": "Automated machine translation of catalog copy is not approved in the v1 PRD.",
+      "tags": [
+        "answerability",
+        "calibrated_abstention"
+      ],
+      "gold_document_ids": [
+        "DOC-CAT-PRD-004"
+      ],
+      "must_not_cite": [],
+      "retrieved_document_ids": [
+        "DOC-CAT-PRD-004",
+        "DOC-CART-SPEC-005",
+        "DOC-SRCH-STRATEGY-003",
+        "DOC-INT-MERIDIAN-001",
+        "DOC-CHKO-API-002"
+      ],
+      "hit_at_1": true,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 1.0,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 749.42,
+      "warm_engine_ms": 234.89,
+      "stage_latencies_ms": {
+        "auth_scope": 11.38,
+        "tree_route": 3.2,
+        "candidate_retrieval": 699.67,
+        "rank_fusion": 1.3,
+        "diversity_selection": 10.82,
+        "total_retrieval": 749.12
+      },
+      "llm_answer": "No, product catalog copy cannot be automatically translated in v1. Automated multi-lingual machine translation of catalog copy is explicitly stated as **NOT approved** for v1 in the \"Unresolved & Out of Scope\" section of the Catalog and Merchandising Requirements document. Additionally, search synonym dictionaries are required to **not alter** the catalog source text [1].",
+      "llm_ms": 19692.79,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-006",
+      "query": "What sample catalog size and delivery date did Meridian agree to?",
+      "expected": "A 2,000-row sample catalog file by 14 October 2026.",
+      "tags": [
+        "cross_document",
+        "date"
+      ],
+      "gold_document_ids": [
+        "DOC-ORG-MEETING-2026-10-09"
+      ],
+      "must_not_cite": [],
+      "retrieved_document_ids": [
+        "DOC-ORG-MEETING-2026-10-09",
+        "DOC-ORD-POL-005",
+        "DOC-CAT-PRD-004",
+        "DOC-INT-MERIDIAN-001",
+        "DOC-ORG-CHARTER-001",
+        "DOC-CHKO-RCA-008"
+      ],
+      "hit_at_1": true,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 1.0,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 739.34,
+      "warm_engine_ms": 232.01,
+      "stage_latencies_ms": {
+        "auth_scope": 12.76,
+        "tree_route": 3.97,
+        "candidate_retrieval": 690.33,
+        "rank_fusion": 1.35,
+        "diversity_selection": 10.36,
+        "total_retrieval": 739.02
+      },
+      "llm_answer": "Meridian agreed to deliver a 2,000-row sample catalog file by 14 October 2026. [1]",
+      "llm_ms": 17699.91,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-007",
+      "query": "List Meridian Outfitters approved internal search synonyms.",
+      "expected": "Specific synonym dictionary entries are not detailed in the general strategy; abstain from fabricating values.",
+      "tags": [
+        "missing_detail",
+        "calibrated_abstention"
+      ],
+      "gold_document_ids": [
+        "DOC-SRCH-STRATEGY-003"
+      ],
+      "must_not_cite": [],
+      "retrieved_document_ids": [
+        "DOC-CAT-PRD-004",
+        "DOC-CHKO-API-002",
+        "DOC-SRCH-STRATEGY-003",
+        "DOC-REL-RUN-009",
+        "DOC-QA-CHECKOUT-017",
+        "DOC-INT-MERIDIAN-001"
+      ],
+      "hit_at_1": false,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 0.3333,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 1087.74,
+      "warm_engine_ms": 239.89,
+      "stage_latencies_ms": {
+        "auth_scope": 10.1,
+        "tree_route": 3.24,
+        "candidate_retrieval": 1042.12,
+        "rank_fusion": 1.52,
+        "diversity_selection": 9.19,
+        "total_retrieval": 1087.46
+      },
+      "llm_answer": "The provided evidence does not explicitly list approved internal search synonyms for Meridian Outfitters. While [DOC-CAT-PRD-004] (Approved) mentions restrictions on altering catalog source text via synonym dictionaries, it does not provide a specific list of approved synonyms. No other approved document contains relevant information about internal search synonyms. Further details would require access to the synonym dictionaries referenced in [DOC-CAT-PRD-004], which are not included in the evidence. \n\n[Missing evidence: Explicit list of approved synonyms for Meridian Outfitters in internal search contexts.]",
+      "llm_ms": 29179.9,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-008",
+      "query": "What is the critical rollback threshold for checkout 5xx errors?",
+      "expected": "Checkout HTTP 5xx rate exceeding 1.5% over a 5-minute rolling window triggers immediate rollback.",
+      "tags": [
+        "runbook",
+        "threshold"
+      ],
+      "gold_document_ids": [
+        "DOC-REL-RUN-009"
+      ],
+      "must_not_cite": [],
+      "retrieved_document_ids": [
+        "DOC-REL-RUN-009",
+        "DOC-PAY-ADR-003",
+        "DOC-CHKO-RCA-008",
+        "DOC-CHKO-API-002"
+      ],
+      "hit_at_1": true,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 1.0,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 898.66,
+      "warm_engine_ms": 243.89,
+      "stage_latencies_ms": {
+        "auth_scope": 11.81,
+        "tree_route": 3.56,
+        "candidate_retrieval": 846.7,
+        "rank_fusion": 1.39,
+        "diversity_selection": 10.98,
+        "total_retrieval": 898.34
+      },
+      "llm_answer": "The critical rollback threshold for checkout 5xx errors is **> 1.5% for 5 minutes**, as specified in the Commerce Release and Rollback Runbook [DOC-REL-RUN-009] (Status: Approved) > Reference Table. This threshold triggers a rollback action by disabling the feature flag and paging SRE. \n\n[1]",
+      "llm_ms": 26870.1,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-009",
+      "query": "How is Available to Promise (ATP) stock calculated?",
+      "expected": "ATP = Physical On-Hand - Allocated Reserves - Safety Buffer.",
+      "tags": [
+        "formula",
+        "inventory"
+      ],
+      "gold_document_ids": [
+        "DOC-INV-STD-003"
+      ],
+      "must_not_cite": [],
+      "retrieved_document_ids": [
+        "DOC-CHKO-API-002",
+        "DOC-INV-STD-003",
+        "DOC-INT-PULSEPAY-002",
+        "DOC-CAT-PRD-004",
+        "DOC-PAY-ADR-003",
+        "DOC-CART-SPEC-005"
+      ],
+      "hit_at_1": false,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 0.5,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 755.1,
+      "warm_engine_ms": 230.1,
+      "stage_latencies_ms": {
+        "auth_scope": 12.32,
+        "tree_route": 3.1,
+        "candidate_retrieval": 708.72,
+        "rank_fusion": 0.99,
+        "diversity_selection": 9.08,
+        "total_retrieval": 754.79
+      },
+      "llm_answer": "Available to Promise (ATP) stock is calculated using the formula:  \n**ATP = Physical On-Hand - Allocated Reserves - Safety Buffer**.  \n\nThis definition is specified in the *Safety Stock Rules* section of the **Inventory Reservation and Safety Stock Standard** document [DOC-INV-STD-003]. The safety buffer represents a configurable minimum safety stock per SKU category to mitigate warehouse inventory discrepancies.  \n\nNo other evidence provides additional details on ATP calculation.",
+      "llm_ms": 11984.11,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-010",
+      "query": "When is customer self-service order cancellation prohibited?",
+      "expected": "Once an order enters PACKED state, customer cancellation is disabled and returns must be used.",
+      "tags": [
+        "state_machine",
+        "order_lifecycle"
+      ],
+      "gold_document_ids": [
+        "DOC-ORD-SOP-004"
+      ],
+      "must_not_cite": [],
+      "retrieved_document_ids": [
+        "DOC-ORD-POL-005",
+        "DOC-CHKO-API-002",
+        "DOC-ORD-SOP-004"
+      ],
+      "hit_at_1": false,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 0.3333,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 747.7,
+      "warm_engine_ms": 264.89,
+      "stage_latencies_ms": {
+        "auth_scope": 15.24,
+        "tree_route": 4.09,
+        "candidate_retrieval": 692.78,
+        "rank_fusion": 2.0,
+        "diversity_selection": 12.38,
+        "total_retrieval": 747.38
+      },
+      "llm_answer": "Customer self-service order cancellation is prohibited when the order transitions to the **PACKED** or **SHIPPED** state. \n\n- **PACKED**: Cancellation is locked, and the customer must use the standard return RMA flow [5].  \n- **SHIPPED**: Cancellation is not permitted, as the order has already been dispatched [3].  \n\nThese restrictions apply because the system disables self-service cancellation once warehouse packing begins (PACKED state) and entirely prohibits it for SHIPPED orders.",
+      "llm_ms": 26272.22,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-011",
+      "query": "What is the default evaluation priority order for promotion rules in cart?",
+      "expected": "Catalog Price Rules -> Item Tier Discounts -> Cart Order Coupons -> Free Shipping.",
+      "tags": [
+        "promotion",
+        "cart_rules"
+      ],
+      "gold_document_ids": [
+        "DOC-CART-SPEC-005"
+      ],
+      "must_not_cite": [],
+      "retrieved_document_ids": [
+        "DOC-CART-SPEC-005",
+        "DOC-CHKO-API-002",
+        "DOC-ARCH-PLAT-001"
+      ],
+      "hit_at_1": true,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 1.0,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 774.12,
+      "warm_engine_ms": 247.83,
+      "stage_latencies_ms": {
+        "auth_scope": 17.41,
+        "tree_route": 6.97,
+        "candidate_retrieval": 703.0,
+        "rank_fusion": 1.9,
+        "diversity_selection": 16.17,
+        "total_retrieval": 773.67
+      },
+      "llm_answer": "The default evaluation priority order for promotion rules in the cart is: **Catalog Price Rules** → **Item Tier Discounts** → **Cart Order Coupons** → **Free Shipping**. This order is explicitly defined in [1]. \n\nAdditionally, the reference table in [2] confirms the evaluation order numbers for each promotion type:  \n1. **Catalog Rule** (Catalog Price Rules)  \n2. **Item Quantity Tier** (Item Tier Discounts)  \n3. **Cart Coupon Code** (Cart Order Coupons)  \n4. **Shipping Discount** (Free Shipping).  \n\nCoupon codes do not stack by default unless the 'allow_stacking' flag is explicitly configured, as noted in [1].",
+      "llm_ms": 40065.04,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-012",
+      "query": "How is Gross Merchandise Value (GMV) defined in analytics?",
+      "expected": "Sum of all captured order totals excluding refunded or voided transactions.",
+      "tags": [
+        "analytics_metric",
+        "data_dictionary"
+      ],
+      "gold_document_ids": [
+        "DOC-DATA-DICT-008"
+      ],
+      "must_not_cite": [],
+      "retrieved_document_ids": [
+        "DOC-DATA-DICT-008",
+        "DOC-SRCH-STRATEGY-003",
+        "DOC-CAT-PRD-004"
+      ],
+      "hit_at_1": true,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 1.0,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 734.56,
+      "warm_engine_ms": 252.61,
+      "stage_latencies_ms": {
+        "auth_scope": 13.3,
+        "tree_route": 3.69,
+        "candidate_retrieval": 686.62,
+        "rank_fusion": 1.43,
+        "diversity_selection": 4.69,
+        "total_retrieval": 734.27
+      },
+      "llm_answer": "Gross Merchandise Value (GMV) is defined as \"the sum of all captured order totals excluding refunded or voided transactions\" according to the Data Pipeline and Analytics Data Dictionary [DOC-DATA-DICT-008] (Status: Approved). [1]",
+      "llm_ms": 15122.13,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-013",
+      "query": "What is the maximum retry window and attempt count for transient payment provider errors?",
+      "expected": "Maximum 5 retry attempts over 20 minutes with exponential backoff and full jitter.",
+      "tags": [
+        "retry_policy",
+        "payments"
+      ],
+      "gold_document_ids": [
+        "DOC-PAY-ADR-003"
+      ],
+      "must_not_cite": [
+        "DOC-PAY-ADR-001"
+      ],
+      "retrieved_document_ids": [
+        "DOC-PAY-ADR-003",
+        "DOC-INT-PULSEPAY-002",
+        "DOC-CHKO-API-002",
+        "DOC-PAY-RCA-006"
+      ],
+      "hit_at_1": true,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 1.0,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 789.47,
+      "warm_engine_ms": 258.22,
+      "stage_latencies_ms": {
+        "auth_scope": 17.12,
+        "tree_route": 3.6,
+        "candidate_retrieval": 695.68,
+        "rank_fusion": 4.0,
+        "diversity_selection": 24.76,
+        "total_retrieval": 788.96
+      },
+      "llm_answer": "The maximum retry window for transient payment provider errors is **20 minutes** with a maximum of **5 retry attempts**, using exponential backoff with full jitter. This is specified in the Provider Retry Policy section of ADR-003 [1]. \n\n[1] ADR-003: Payment Orchestration and Idempotency [DOC-PAY-ADR-003] (Status: Approved) > Provider Retry Policy",
+      "llm_ms": 39016.6,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-014",
+      "query": "What header must PulsePay include to verify webhook signature authenticity?",
+      "expected": "X-PulsePay-Signature containing HMAC-SHA256 signature.",
+      "tags": [
+        "security",
+        "webhook"
+      ],
+      "gold_document_ids": [
+        "DOC-INT-PULSEPAY-002"
+      ],
+      "must_not_cite": [],
+      "retrieved_document_ids": [
+        "DOC-PAY-ADR-003",
+        "DOC-INT-PULSEPAY-002",
+        "DOC-CHKO-API-002",
+        "DOC-ORD-POL-005",
+        "DOC-PAY-RCA-006"
+      ],
+      "hit_at_1": false,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 0.5,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 765.98,
+      "warm_engine_ms": 261.16,
+      "stage_latencies_ms": {
+        "auth_scope": 15.13,
+        "tree_route": 4.14,
+        "candidate_retrieval": 694.35,
+        "rank_fusion": 3.41,
+        "diversity_selection": 18.0,
+        "total_retrieval": 765.5
+      },
+      "llm_answer": "The header that PulsePay must include to verify webhook signature authenticity is **'X-PulsePay-Signature'**, which contains an HMAC-SHA256 signature. This is explicitly stated in the Partner Webhook Specification [1]. \n\n[1] PulsePay delivers JSON events via HTTPS POST with header 'X-PulsePay-Signature' containing HMAC-SHA256 signature.",
+      "llm_ms": 23257.93,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-015",
+      "query": "What was the root cause of false-positive HTTP 409 idempotency conflict errors in checkout?",
+      "expected": "Floating point rounding discrepancies in cart tax totals prior to payload hashing; resolved by using integer minor currency units.",
+      "tags": [
+        "incident_rca",
+        "idempotency"
+      ],
+      "gold_document_ids": [
+        "DOC-CHKO-RCA-008"
+      ],
+      "must_not_cite": [],
+      "retrieved_document_ids": [
+        "DOC-CHKO-RCA-008",
+        "DOC-PAY-ADR-003",
+        "DOC-CHKO-API-002",
+        "DOC-PAY-RCA-006",
+        "DOC-QA-CHECKOUT-017"
+      ],
+      "hit_at_1": true,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 1.0,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 755.95,
+      "warm_engine_ms": 249.61,
+      "stage_latencies_ms": {
+        "auth_scope": 15.2,
+        "tree_route": 3.76,
+        "candidate_retrieval": 697.7,
+        "rank_fusion": 1.67,
+        "diversity_selection": 12.38,
+        "total_retrieval": 755.55
+      },
+      "llm_answer": "The root cause of the false-positive HTTP 409 idempotency conflict errors in checkout was **floating point rounding discrepancies in total cart tax computations** during automated stress testing, as identified in the incident analysis [1]. These discrepancies led to inconsistent payload hashes, triggering unintended 409 Conflict responses despite valid idempotency keys. \n\n[1] Incident RCA: Checkout Idempotency Key Conflict [DOC-CHKO-RCA-008] (Status: Approved) > Incident Description",
+      "llm_ms": 25451.85,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-016",
+      "query": "What are the required CSV columns for bulk catalog upload?",
+      "expected": "merchant_sku, product_name, currency, category, and price.",
+      "tags": [
+        "catalog",
+        "import_spec"
+      ],
+      "gold_document_ids": [
+        "DOC-CAT-PRD-004"
+      ],
+      "must_not_cite": [],
+      "retrieved_document_ids": [
+        "DOC-CAT-PRD-004",
+        "DOC-INT-MERIDIAN-001",
+        "DOC-PLAT-MIG-010"
+      ],
+      "hit_at_1": true,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 1.0,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 759.99,
+      "warm_engine_ms": 234.83,
+      "stage_latencies_ms": {
+        "auth_scope": 13.66,
+        "tree_route": 5.23,
+        "candidate_retrieval": 710.18,
+        "rank_fusion": 1.29,
+        "diversity_selection": 10.33,
+        "total_retrieval": 759.69
+      },
+      "llm_answer": "The required CSV columns for bulk catalog upload are **merchant_sku**, **product_name**, **currency**, **category**, and **price**. These fields are explicitly listed as mandatory in the Catalog and Merchandising Requirements document [DOC-CAT-PRD-004].",
+      "llm_ms": 14350.65,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-017",
+      "query": "Can search synonym expansions cross merchant tenant boundaries?",
+      "expected": "No, synonym expansions operate strictly within merchant tenant boundaries and must never cross tenants.",
+      "tags": [
+        "multi_tenant",
+        "search_isolation"
+      ],
+      "gold_document_ids": [
+        "DOC-SRCH-STRATEGY-003",
+        "DOC-SRCH-STD-005"
+      ],
+      "must_not_cite": [],
+      "retrieved_document_ids": [
+        "DOC-SRCH-STRATEGY-003",
+        "DOC-CAT-PRD-004",
+        "DOC-ARCH-PLAT-001",
+        "DOC-SRCH-STD-005",
+        "DOC-CHKO-API-002"
+      ],
+      "hit_at_1": true,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 1.0,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 744.82,
+      "warm_engine_ms": 238.86,
+      "stage_latencies_ms": {
+        "auth_scope": 11.99,
+        "tree_route": 3.22,
+        "candidate_retrieval": 691.18,
+        "rank_fusion": 1.39,
+        "diversity_selection": 9.88,
+        "total_retrieval": 744.52
+      },
+      "llm_answer": "No, search synonym expansions are strictly confined within merchant tenant boundaries. According to [1], synonym expansions \"operate within tenant boundaries and must never bleed across merchants.\" Additionally, [4] states that Search & Discovery executes \"tenant-isolated queries\" with merchant access filters applied. [6] explicitly reinforces this by specifying that synonyms for one merchant (e.g., Meridian Outfitters) \"must not expand queries for any other merchant tenant on the shared cluster.\" These documents collectively confirm tenant isolation for synonym expansions.",
+      "llm_ms": 24342.64,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-018",
+      "query": "What is the retention period for fact_orders table in analytics?",
+      "expected": "7 years for regulatory compliance.",
+      "tags": [
+        "retention",
+        "compliance"
+      ],
+      "gold_document_ids": [
+        "DOC-DATA-DICT-008"
+      ],
+      "must_not_cite": [],
+      "retrieved_document_ids": [
+        "DOC-DATA-DICT-008",
+        "DOC-CHKO-API-002",
+        "DOC-CART-SPEC-005",
+        "DOC-ORD-SOP-004"
+      ],
+      "hit_at_1": true,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 1.0,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 764.04,
+      "warm_engine_ms": 253.49,
+      "stage_latencies_ms": {
+        "auth_scope": 17.78,
+        "tree_route": 3.27,
+        "candidate_retrieval": 693.39,
+        "rank_fusion": 1.69,
+        "diversity_selection": 21.57,
+        "total_retrieval": 763.63
+      },
+      "llm_answer": "The retention period for the **fact_orders** table in analytics is **7 years (regulatory)**, as specified in the **Data Pipeline and Analytics Data Dictionary** document [1]. \n\n[1] Data Pipeline and Analytics Data Dictionary [DOC-DATA-DICT-008] (Status: Approved) > Reference Table",
+      "llm_ms": 15896.76,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-019",
+      "query": "What happens if a checkout session tax quote times out?",
+      "expected": "System transitions to graceful fallback mode using fallback shipping and tax configuration.",
+      "tags": [
+        "api_error",
+        "fallback"
+      ],
+      "gold_document_ids": [
+        "DOC-CHKO-API-002"
+      ],
+      "must_not_cite": [],
+      "retrieved_document_ids": [
+        "DOC-CHKO-API-002",
+        "DOC-CART-SPEC-005",
+        "DOC-CHKO-RCA-008"
+      ],
+      "hit_at_1": true,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 1.0,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 785.51,
+      "warm_engine_ms": 257.94,
+      "stage_latencies_ms": {
+        "auth_scope": 18.06,
+        "tree_route": 5.41,
+        "candidate_retrieval": 714.56,
+        "rank_fusion": 2.16,
+        "diversity_selection": 19.39,
+        "total_retrieval": 785.08
+      },
+      "llm_answer": "The provided evidence does not explicitly address the consequences of a checkout session tax quote timeout. However, based on related information:  \n- If a checkout session expires (e.g., due to inactivity), inventory reservations are automatically released back to available stock per [6].  \n- Payment provider timeouts result in HTTP 202 Accepted with a pending reconciliation reference, but this pertains to payment authorization, not tax quotes [4].  \n\nNo specific guidance is available for tax quote timeouts. The evidence lacks direct details on this scenario.",
+      "llm_ms": 22667.12,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-020",
+      "query": "How long are inventory holds reserved during active checkout sessions?",
+      "expected": "Durable 15-minute TTL during active checkout session.",
+      "tags": [
+        "ttl",
+        "inventory_reservation"
+      ],
+      "gold_document_ids": [
+        "DOC-INV-STD-003"
+      ],
+      "must_not_cite": [],
+      "retrieved_document_ids": [
+        "DOC-INV-STD-003",
+        "DOC-CHKO-API-002",
+        "DOC-CART-SPEC-005",
+        "DOC-QA-CHECKOUT-017",
+        "DOC-ORD-SOP-004",
+        "DOC-ORG-CHARTER-001"
+      ],
+      "hit_at_1": true,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 1.0,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 752.03,
+      "warm_engine_ms": 247.11,
+      "stage_latencies_ms": {
+        "auth_scope": 15.83,
+        "tree_route": 5.23,
+        "candidate_retrieval": 693.94,
+        "rank_fusion": 1.59,
+        "diversity_selection": 13.46,
+        "total_retrieval": 751.32
+      },
+      "llm_answer": "Inventory holds during active checkout sessions are reserved for a strict 15-minute time-to-live (TTL) as per the Inventory Reservation and Safety Stock Standard [DOC-INV-STD-003] (Status: Approved). If the checkout session expires or payment fails, the reservation is automatically released back to available stock. \n\n[Citation: document=DOC-INV-STD-003; name=Inventory_Reservation_and_Safety_Stock_Standard.docx; version=ver-doc-inv-std-003; search_unit=8d911fcc-5cc2-5772-a7de-5e02c19f688a; blocks=cc79b3d8-a1e6-50be-986d-1d5d890193f0-96495457-dff6-5e02-9e",
+      "llm_ms": 21726.13,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-021",
+      "query": "Who is the executive sponsor for Northstar Commerce Systems?",
+      "expected": "Avery Chen (M-001), Executive Sponsor.",
+      "tags": [
+        "leadership",
+        "charter"
+      ],
+      "gold_document_ids": [
+        "DOC-ORG-CHARTER-001"
+      ],
+      "must_not_cite": [],
+      "retrieved_document_ids": [
+        "DOC-ORG-CHARTER-001",
+        "DOC-ARCH-PLAT-001",
+        "DOC-REL-RUN-009"
+      ],
+      "hit_at_1": true,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 1.0,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 760.94,
+      "warm_engine_ms": 248.23,
+      "stage_latencies_ms": {
+        "auth_scope": 15.42,
+        "tree_route": 5.17,
+        "candidate_retrieval": 691.56,
+        "rank_fusion": 1.79,
+        "diversity_selection": 18.06,
+        "total_retrieval": 760.56
+      },
+      "llm_answer": "The provided evidence does not explicitly state the name of the executive sponsor for Northstar Commerce Systems. The closest relevant information is the `owner_id` field in the Northstar Company and Product Charter (DOC-ORG-CHARTER-001), which is labeled as \"M-001\" [3]. However, this identifier does not correspond to a named individual or role in the given documents. Further clarification or additional documentation linking \"M-001\" to a specific executive sponsor would be required to answer this question definitively.",
+      "llm_ms": 24674.29,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-022",
+      "query": "What database partitioning strategy is adopted for zero-downtime multi-tenant tables?",
+      "expected": "Expand/contract pattern adding nullable columns or safe defaults before application deployment.",
+      "tags": [
+        "database",
+        "migrations"
+      ],
+      "gold_document_ids": [
+        "DOC-PLAT-MIG-010"
+      ],
+      "must_not_cite": [],
+      "retrieved_document_ids": [
+        "DOC-PLAT-MIG-010",
+        "DOC-ARCH-PLAT-001",
+        "DOC-SRCH-STD-005",
+        "DOC-REL-RUN-009",
+        "DOC-PAY-ADR-003"
+      ],
+      "hit_at_1": true,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 1.0,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 780.28,
+      "warm_engine_ms": 268.06,
+      "stage_latencies_ms": {
+        "auth_scope": 16.58,
+        "tree_route": 4.22,
+        "candidate_retrieval": 693.05,
+        "rank_fusion": 2.96,
+        "diversity_selection": 24.05,
+        "total_retrieval": 779.71
+      },
+      "llm_answer": "The provided evidence does not explicitly specify the database partitioning strategy adopted for zero-downtime multi-tenant tables. While [1] mentions \"zero-downtime multi-tenant partition rollouts\" in the context of PostgreSQL schema migration, it does not detail the exact partitioning method (e.g., horizontal/vertical partitioning, sharding, etc.). Other documents focus on migration techniques (expand/contract pattern in [6]) and architectural invariants (e.g., tenant isolation rules in [2]), but none describe the partitioning strategy. Further clarification or documentation would be required to identify the specific approach. \n\n[Citation: No direct evidence in the provided documents specifies the partitioning strategy. The closest reference is [1], which only mentions \"partition rollouts\" without elaboration.]",
+      "llm_ms": 24800.82,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-023",
+      "query": "What is the maximum allowed search latency p95 under launch SLA?",
+      "expected": "Strictly below 300ms at 100 queries per second for a 50,000-SKU index.",
+      "tags": [
+        "sla",
+        "latency"
+      ],
+      "gold_document_ids": [
+        "DOC-SRCH-STRATEGY-003",
+        "DOC-ORG-CHARTER-001"
+      ],
+      "must_not_cite": [],
+      "retrieved_document_ids": [
+        "DOC-ORG-CHARTER-001",
+        "DOC-SRCH-STRATEGY-003",
+        "DOC-PAY-ADR-003",
+        "DOC-CAT-PRD-004"
+      ],
+      "hit_at_1": true,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 1.0,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 767.24,
+      "warm_engine_ms": 246.6,
+      "stage_latencies_ms": {
+        "auth_scope": 19.27,
+        "tree_route": 6.15,
+        "candidate_retrieval": 699.18,
+        "rank_fusion": 1.77,
+        "diversity_selection": 13.88,
+        "total_retrieval": 766.81
+      },
+      "llm_answer": "[ERROR: ReadTimeout]",
+      "llm_ms": 0.0,
+      "has_citation": false,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-024",
+      "query": "What is the policy regarding storing credit card PAN or CVV in Northstar systems?",
+      "expected": "Strictly prohibited; only provider tokens, authorization codes, and minimal transaction metadata may be stored.",
+      "tags": [
+        "security",
+        "pci_dss"
+      ],
+      "gold_document_ids": [
+        "DOC-PAY-ADR-003",
+        "DOC-SEC-CLASS-002"
+      ],
+      "must_not_cite": [],
+      "retrieved_document_ids": [
+        "DOC-PAY-ADR-003",
+        "DOC-ORG-CHARTER-001"
+      ],
+      "hit_at_1": true,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 0.5,
+      "reciprocal_rank": 1.0,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 756.03,
+      "warm_engine_ms": 237.95,
+      "stage_latencies_ms": {
+        "auth_scope": 12.85,
+        "tree_route": 3.89,
+        "candidate_retrieval": 703.68,
+        "rank_fusion": 1.18,
+        "diversity_selection": 11.31,
+        "total_retrieval": 755.6
+      },
+      "llm_answer": "The policy regarding storing credit card PAN or CVV in Northstar systems prohibits their storage. Only provider payment tokens, authorization codes, and minimal transaction metadata are persisted, as explicitly stated in [1].",
+      "llm_ms": 13494.15,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-025",
+      "query": "How does the checkout endpoint handle identical idempotency key with different payload body?",
+      "expected": "Returns HTTP 409 IDEMPOTENCY_CONFLICT with structured error details.",
+      "tags": [
+        "api_contract",
+        "conflict"
+      ],
+      "gold_document_ids": [
+        "DOC-CHKO-API-002",
+        "DOC-PAY-ADR-003"
+      ],
+      "must_not_cite": [],
+      "retrieved_document_ids": [
+        "DOC-CHKO-API-002",
+        "DOC-CHKO-RCA-008",
+        "DOC-PAY-ADR-003",
+        "DOC-QA-CHECKOUT-017"
+      ],
+      "hit_at_1": true,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 1.0,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 860.09,
+      "warm_engine_ms": 245.21,
+      "stage_latencies_ms": {
+        "auth_scope": 14.51,
+        "tree_route": 3.36,
+        "candidate_retrieval": 801.53,
+        "rank_fusion": 1.45,
+        "diversity_selection": 15.88,
+        "total_retrieval": 859.72
+      },
+      "llm_answer": "The checkout endpoint handles identical idempotency keys with different payload bodies by returning an HTTP 409 IDEMPOTENCY_CONFLICT status. This occurs because the system verifies both the idempotency key and the payload content. If the key matches but the payload differs, the endpoint detects the conflict and rejects the request to prevent unintended modifications or duplicates [1]. \n\nThis behavior is explicitly documented in the **Checkout API Contract** (DOC-CHKO-API-002) under the \"Checkout Session Lifecycle\" section, which states that submitting the same key with a mutated payload results in a 409 response [1]. Additionally, the **Reference Table** in the same document lists 409 Conflict as a key error condition for the `/api/v1/checkout/sessions` endpoint [4]. \n\nThe payload is processed by standardizing tax calculations to integer minor currency units before hashing for idempotency checks [2], ensuring that even minor differences in",
+      "llm_ms": 33169.9,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-026",
+      "query": "What carrier events transition an order to DELIVERED?",
+      "expected": "Logistics carrier shipment status tracking webhook events ingested via webhook.",
+      "tags": [
+        "logistics",
+        "tracking"
+      ],
+      "gold_document_ids": [
+        "DOC-ORD-SOP-004"
+      ],
+      "must_not_cite": [],
+      "retrieved_document_ids": [
+        "DOC-ORD-SOP-004",
+        "DOC-PAY-RCA-006",
+        "DOC-CHKO-API-002",
+        "DOC-INT-PULSEPAY-002"
+      ],
+      "hit_at_1": true,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 1.0,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 744.0,
+      "warm_engine_ms": 243.84,
+      "stage_latencies_ms": {
+        "auth_scope": 11.88,
+        "tree_route": 3.38,
+        "candidate_retrieval": 693.45,
+        "rank_fusion": 1.44,
+        "diversity_selection": 11.9,
+        "total_retrieval": 743.69
+      },
+      "llm_answer": "The order transitions to **DELIVERED** after moving through the **SHIPPED** state, as outlined in the Order Lifecycle States section of the Customer Order Lifecycle and Fulfillment SOP [DOC-ORD-SOP-004] (Status: Approved). However, the provided evidence does not explicitly specify the exact **carrier events** (e.g., delivery confirmation, signature capture, etc.) that trigger this transition. The SOP focuses on state progression and cancellation rules but does not detail carrier-specific event types or their direct linkage to the DELIVERED state. \n\nTo answer this question fully, additional documentation defining carrier event types and their integration with order state transitions would be required.",
+      "llm_ms": 23801.2,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-027",
+      "query": "What is the canary deployment traffic rollout progression for Meridian Outfitters?",
+      "expected": "Internal synthetic test merchants at 0% for 30 min, then Meridian at 5%, 25%, 50%, and 100% over 2 hours.",
+      "tags": [
+        "canary",
+        "release"
+      ],
+      "gold_document_ids": [
+        "DOC-REL-RUN-009"
+      ],
+      "must_not_cite": [],
+      "retrieved_document_ids": [
+        "DOC-REL-RUN-009",
+        "DOC-ORD-POL-005",
+        "DOC-ORG-MEETING-2026-10-09",
+        "DOC-ORG-CHARTER-001",
+        "DOC-SRCH-STD-005"
+      ],
+      "hit_at_1": true,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 1.0,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 762.6,
+      "warm_engine_ms": 240.69,
+      "stage_latencies_ms": {
+        "auth_scope": 14.03,
+        "tree_route": 3.64,
+        "candidate_retrieval": 704.49,
+        "rank_fusion": 1.74,
+        "diversity_selection": 14.03,
+        "total_retrieval": 761.98
+      },
+      "llm_answer": "The canary deployment traffic rollout progression for Meridian Outfitters is as follows:  \n* Stage 1: Internal synthetic test merchants with 0% live customer traffic for 30 minutes observation.  \n* Stage 2: Meridian Outfitters pilot tenant at 5% traffic allocation, expanding to 25%, 50%, and 100% over 2 hours.  \nContinuous monitoring of p95 latency, 5xx error rate, and payment pending queue age is required during the rollout.  \n\n[Citation: [1]]",
+      "llm_ms": 29775.03,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-028",
+      "query": "What data classification tier is assigned to security RCAs and vulnerability reports?",
+      "expected": "Level 3 - Restricted, accessible only to GRP-SECURITY and GRP-LEADERS.",
+      "tags": [
+        "acl",
+        "security_tier"
+      ],
+      "gold_document_ids": [
+        "DOC-SEC-CLASS-002"
+      ],
+      "must_not_cite": [],
+      "retrieved_document_ids": [
+        "DOC-SEC-CLASS-002",
+        "DOC-DATA-DICT-008",
+        "DOC-QA-CHECKOUT-017",
+        "DOC-CAT-PRD-004",
+        "DOC-SRCH-STRATEGY-003"
+      ],
+      "hit_at_1": true,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 1.0,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 738.35,
+      "warm_engine_ms": 229.15,
+      "stage_latencies_ms": {
+        "auth_scope": 14.62,
+        "tree_route": 3.14,
+        "candidate_retrieval": 685.86,
+        "rank_fusion": 1.46,
+        "diversity_selection": 10.85,
+        "total_retrieval": 737.76
+      },
+      "llm_answer": "The data classification tier assigned to security RCAs (Root Cause Analyses) and vulnerability reports is **Restricted**. This is explicitly stated in the Reference Table of [1] and further detailed in the Data Classification Levels section of [2], which categorizes these items under Level 3 - Restricted. \n\n- **[1]** lists \"Security Audits & RCAs\" as **Restricted** with authorized access groups GRP-SECURITY and GRP-LEADERS.  \n- **[2]** explicitly states that **Restricted** includes \"security assessments, incident root-cause analyses, payment architecture, and vulnerability reports.\"  \n\nNo other evidence provides conflicting or additional classification details for these specific data categories.",
+      "llm_ms": 23087.34,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-029",
+      "query": "What is the default TTL for anonymous guest carts?",
+      "expected": "Anonymous carts expire after 7 days of inactivity; authenticated customer carts persist for 30 days.",
+      "tags": [
+        "cart",
+        "ttl"
+      ],
+      "gold_document_ids": [
+        "DOC-CART-SPEC-005"
+      ],
+      "must_not_cite": [],
+      "retrieved_document_ids": [
+        "DOC-CART-SPEC-005",
+        "DOC-CHKO-API-002",
+        "DOC-ARCH-PLAT-001"
+      ],
+      "hit_at_1": true,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 1.0,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 743.95,
+      "warm_engine_ms": 241.82,
+      "stage_latencies_ms": {
+        "auth_scope": 10.36,
+        "tree_route": 3.86,
+        "candidate_retrieval": 692.39,
+        "rank_fusion": 1.23,
+        "diversity_selection": 12.31,
+        "total_retrieval": 743.68
+      },
+      "llm_answer": "The default TTL for anonymous guest carts is **7 days of inactivity**, as stated in [1]. Authenticated user carts persist for 30 days. Note that the term \"TTL\" is not explicitly used in the document, but the expiration period for anonymous carts is defined as 7 days.",
+      "llm_ms": 23273.23,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    },
+    {
+      "case_id": "RAG-030",
+      "query": "What date is set for the final release readiness review in October 2026?",
+      "expected": "16 October 2026.",
+      "tags": [
+        "milestone",
+        "release_date"
+      ],
+      "gold_document_ids": [
+        "DOC-ORG-MEETING-2026-10-09"
+      ],
+      "must_not_cite": [],
+      "retrieved_document_ids": [
+        "DOC-ORG-MEETING-2026-10-09",
+        "DOC-QA-CHECKOUT-017",
+        "DOC-SRCH-STRATEGY-003",
+        "DOC-REL-RUN-009"
+      ],
+      "hit_at_1": true,
+      "hit_at_3": true,
+      "hit_at_6": true,
+      "gold_recall_at_6": 1.0,
+      "reciprocal_rank": 1.0,
+      "superseded_violation": false,
+      "evidence_pack_status": "sufficient",
+      "cold_retrieval_ms": 727.61,
+      "warm_engine_ms": 228.66,
+      "stage_latencies_ms": {
+        "auth_scope": 12.51,
+        "tree_route": 2.89,
+        "candidate_retrieval": 689.12,
+        "rank_fusion": 1.09,
+        "diversity_selection": 7.33,
+        "total_retrieval": 727.34
+      },
+      "llm_answer": "The final release readiness review in October 2026 is set for **16 October 2026**. This is explicitly stated in the \"Next Milestone Gate\" section of the approved document [1]. \n\n[1] Pilot Weekly Decisions and Actions — 9 October [DOC-ORG-MEETING-2026-10-09] (Status: Approved) > Next Milestone Gate; anchor=h2-9.",
+      "llm_ms": 13063.73,
+      "has_citation": true,
+      "cited_superseded_in_text": false
+    }
+  ]
+}

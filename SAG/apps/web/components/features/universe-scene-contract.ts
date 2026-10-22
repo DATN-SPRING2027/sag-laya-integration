@@ -2,7 +2,7 @@ import type { SearchSourceHit, UniversePolicy } from "@/lib/types";
 import type { UniverseViewPreferences } from "@/lib/universe-view-preferences";
 
 export type UniverseSceneNodeKind = "source" | "event" | "entity";
-export type UniverseSceneStrategy = "exploration" | "accumulation";
+export type UniverseSceneStrategy = "exploration" | "accumulation" | "knowledge";
 
 export interface UniverseSceneNode {
   id: string;
@@ -10,6 +10,12 @@ export interface UniverseSceneNode {
   rawId: string;
   sourceId: string;
   label: string;
+  /** Domain text overrides the legacy source/event/entity visual archetypes. */
+  kindLabel?: string;
+  statsLabel?: string;
+  progressLabel?: string;
+  searchMatch?: boolean;
+  routeMatch?: boolean;
   description: string;
   category: string;
   radius: number;

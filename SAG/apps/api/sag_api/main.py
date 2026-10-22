@@ -66,6 +66,11 @@ async def lifespan(app: FastAPI):
         async with principal_assertion_lifespan():
             await runtime.start(app)
             knowledge_worker.job_queue = app.state.job_queue
+            if getattr(app.state, "engine_manager", None) is not None and knowledge_worker.embed is None:
+                try:
+                    knowledge_worker.embed = await app.state.engine_manager.get_sag_embedding()
+                except Exception as error:  # noqa: BLE001
+                    log.warning("Failed to initialize knowledge worker embedder: %s", error)
             if settings.knowledge_worker_enabled:
                 await knowledge_worker.start()
             yield
@@ -88,7 +93,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title=f"{PRODUCT_NAME} API",
         version=__version__,
-        summary="开源知识库平台 · 从信息源到知识问答",
+        summary="Open-source Knowledge Platform · From Sources to Knowledge Q&A",
         lifespan=lifespan,
     )
 

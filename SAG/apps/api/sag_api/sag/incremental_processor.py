@@ -29,6 +29,7 @@ zleap 职责(0.8.2 已内置,不再由 SAG 实现):实体数契约
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Awaitable, Callable
 from hashlib import sha256
 from pathlib import Path
@@ -37,15 +38,20 @@ from typing import Any
 from zleap.sag import DataEngine
 from zleap.sag.pipeline import (
     CancellationToken,
+    ChunkItem,
     ChunkOptions,
+    ChunkSet,
     ChunkSetRef,
+    ChunkStats,
     DocumentSource,
     ExtractionExecutionOptions,
     ExtractionLimits,
     ExtractionOptions,
     FileSource,
     IndexOptions,
+    RelatedEventContextOptions,
     SourceDescriptor,
+    SourceReference,
     SourceType,
     WriteStatus,
 )
@@ -61,16 +67,12 @@ StageCallback = Callable[[str], Awaitable[None]]
 
 log = get_logger("sag.incremental")
 
+def detect_document_language(text: str, configured: str | None = None) -> str:
+    """Resolve extraction prompt language. Chinese ('zh') is disabled to prevent language drift."""
+    return "en"
+
+
 _KNOWLEDGE_EVENT_REQUIREMENTS = {
-    "zh": (
-        '对于书籍、报告、论文等非新闻文档，"事项"也包括可独立理解的观点、事实、定义、\n'
-        "机制、因果关系、论证和结论，不要求必须包含日期、人物动作或新闻事件。\n"
-        "只有目录、页眉页脚、广告、乱码、纯链接，或确实与文档主题无关的片段才可返回空结果；\n"
-        "正文只要包含可复用的知识，就至少保留一个有效的顶级事项。\n"
-        '每个实体必须严格使用 {"type":"实体类型","name":"实体名称","description":"作用说明"}；\n'
-        "禁止把实体类型写成字段名，例如不能输出\n"
-        '{"location":"中东","name":"中东","description":"地区"}。'
-    ),
     "en": (
         'For books, reports, papers, and other non-news documents, an "event" also includes\n'
         "independently understandable viewpoints, facts, definitions, mechanisms, causal\n"
@@ -79,8 +81,12 @@ _KNOWLEDGE_EVENT_REQUIREMENTS = {
         "Only tables of contents, headers, footers, advertisements, corrupted text, standalone links,\n"
         "or fragments genuinely unrelated to the document topic may return an empty result. Retain at\n"
         "least one valid top-level event whenever the main text contains reusable knowledge.\n"
+        "Keep each event's content concise (1 to 3 factual sentences preserving exact numbers, metrics,\n"
+        "and identifiers) rather than copying the entire chunk verbatim.\n"
         "Every entity must strictly use\n"
         '{"type":"entity type","name":"entity name","description":"role description"}.\n'
+        "Valid entity types are: person, organization, location, topic, product, time, event, other "
+        "(use 'topic' or 'other' for laws, regulations, tasks, metrics, or concepts).\n"
         "Do not use an entity type as a field name. For example, do not output\n"
         '{"location":"Middle East","name":"Middle East","description":"region"}.'
     ),
@@ -101,8 +107,11 @@ class IncrementalDocumentProcessor:
         chunk_mode: str = "standard",
         document_title: str | None = None,
         max_entities_per_event: int = 20,
+        write_event_entity_vectors: bool = False,
         enable_strict_filtering: bool = False,
         event_entity_attempts: int = 2,
+        extraction_profile: str = "concise",
+        document_version_id: str | None = None,
     ) -> None:
         self._engine = engine
         self._source_config_id = source_config_id
@@ -111,6 +120,10 @@ class IncrementalDocumentProcessor:
         self._chunk_mode = chunk_mode if chunk_mode in {"standard", "heading_strict"} else "standard"
         self._document_title = (document_title or "").strip()
         self._max_entities_per_event = max(1, min(20, max_entities_per_event))
+        self._write_event_entity_vectors = bool(write_event_entity_vectors)
+        self._extraction_profile = extraction_profile if extraction_profile in {"standard", "concise"} else "concise"
+        self._document_version_id = document_version_id
+        self._detected_language: str | None = None
 
         # 0.8.2 已内置契约与修复重试,以下 0.7.1 参数仅保留接口兼容:
         # - enable_strict_filtering → zleap 无对应开关(REQ 待对齐),忽略并记录;
@@ -118,6 +131,24 @@ class IncrementalDocumentProcessor:
         if enable_strict_filtering:
             log.warning("0.8.2 无严格过滤开关,忽略 enable_strict_filtering(REQ 待对齐)")
         self._event_entity_attempts = max(1, min(3, event_entity_attempts))
+
+    async def _sample_language(self, path: str | Path | None) -> None:
+        if path is not None:
+            file_path = Path(path)
+            try:
+                if file_path.is_file():
+                    def _read_head() -> str:
+                        with file_path.open("r", encoding="utf-8", errors="ignore") as f:
+                            return f.read(4096)
+
+                    sample = await asyncio.to_thread(_read_head)
+                    if sample.strip():
+                        self._detected_language = detect_document_language(sample)
+                        return
+            except Exception:  # noqa: BLE001
+                pass
+        if self._document_title:
+            self._detected_language = detect_document_language(self._document_title)
 
     # ── 主流程 ────────────────────────────────────────────────────────────
     async def process(
@@ -131,6 +162,7 @@ class IncrementalDocumentProcessor:
         original_path: str | Path | None = None,
     ) -> ProcessOutcome:
         current = checkpoint.model_copy(deep=True)
+        await self._sample_language(path)
 
         # 阶段 1:解析 → 切块 → 落库(仅在断点尚未建立时)
         if not current.chunk_ids:
@@ -168,6 +200,161 @@ class IncrementalDocumentProcessor:
             paused=paused,
         )
 
+    async def _ingest_from_canonical_search_units(
+        self,
+        current: ProcessCheckpoint,
+        descriptor: SourceDescriptor,
+        on_checkpoint: CheckpointCallback,
+    ) -> bool:
+        """Reuse canonical SearchUnits from Phase 2C so the document is never chunked twice."""
+        if not self._document_version_id or not hasattr(self._engine, "_index"):
+            return False
+        relational = getattr(getattr(self._engine, "resources", None), "relational", None)
+        if relational is None or not callable(getattr(relational, "session_factory", None)):
+            return False
+
+        from sqlalchemy import select
+        from sag_api.db.models.routing_rag import CanonicalBlock, SearchUnit
+
+        session_factory = relational.session_factory()
+        async with session_factory() as session:
+            blocks = list(
+                (
+                    await session.scalars(
+                        select(CanonicalBlock)
+                        .where(CanonicalBlock.document_version_id == self._document_version_id)
+                        .order_by(CanonicalBlock.ordinal)
+                    )
+                ).all()
+            )
+            units = list(
+                (
+                    await session.scalars(
+                        select(SearchUnit).where(
+                            SearchUnit.document_version_id == self._document_version_id
+                        )
+                    )
+                ).all()
+            )
+        if not blocks or not units:
+            return False
+
+        block_index_by_id = {b.id: idx for idx, b in enumerate(blocks)}
+        units.sort(key=lambda u: block_index_by_id.get(u.block_from_id, 0))
+
+        chunk_items: list[ChunkItem] = []
+        for idx, unit in enumerate(units):
+            start_idx = block_index_by_id.get(unit.block_from_id, 0)
+            end_idx = block_index_by_id.get(unit.block_to_id, start_idx)
+            unit_blocks = blocks[start_idx : end_idx + 1]
+            combined_text = "\n\n".join(b.normalized_text for b in unit_blocks if b.normalized_text).strip()
+            if not combined_text:
+                continue
+            heading = (unit.section_path or self._document_title or f"Section {idx + 1}").strip()[:500]
+            rank = len(chunk_items)
+            chunk_items.append(
+                ChunkItem(
+                    client_key=f"chunk-{rank}",
+                    rank=rank,
+                    heading=heading,
+                    content=combined_text,
+                    raw_content=combined_text,
+                    chunk_type="TEXT",
+                    references=(
+                        SourceReference(
+                            reference_type="block",
+                            key=str(unit.id),
+                            order=rank,
+                            metadata={},
+                        ),
+                    ),
+                    sections=(),
+                    token_count=unit.token_count,
+                    metadata={
+                        "search_unit_id": str(unit.id),
+                        "section_path": unit.section_path or "",
+                    },
+                )
+            )
+
+        if not chunk_items:
+            return False
+
+        index_descriptor = descriptor.model_copy(
+            update={"data_source_id": self._source_config_id}
+        )
+        if getattr(self._engine, "_components", None) is None and callable(
+            getattr(self._engine, "_ensure_source", None)
+        ):
+            self._engine._data_source_id = self._source_config_id
+            await self._engine._ensure_source()
+
+        source_version = sha256(
+            "\n".join(u.content_hash for u in units).encode("utf-8")
+        ).hexdigest()[:32]
+        chunk_version = sha256(
+            f"canonical-search-units:{self._document_version_id}:{len(chunk_items)}".encode("utf-8")
+        ).hexdigest()[:32]
+
+        chunk_set_input = ChunkSet(
+            descriptor=index_descriptor,
+            source_version=source_version,
+            chunk_version=chunk_version,
+            chunks=tuple(chunk_items),
+            units=(),
+            stats=ChunkStats(
+                input_units=len(blocks),
+                chunk_count=len(chunk_items),
+                token_count=sum(item.token_count or 0 for item in chunk_items),
+            ),
+            metadata={"chunker_implementation": "canonical_search_units_v1"},
+        )
+        chunk_set = await self._engine._index(
+            chunk_set_input,
+            index_descriptor,
+            IndexOptions(
+                embedding_batch_size=100,
+                vector_batch_size=500,
+            ),
+        )
+        current.source_id = chunk_set.source_id
+        current.chunk_ids = list(chunk_set.chunk_ids)
+        current.generation_id = chunk_set.generation_id
+        current.chunk_version = chunk_set.chunk_version
+        current.source_version = chunk_set.source_version
+        current.processed_chunk_ids = []
+        current.event_count = 0
+        current.event_ids = []
+        current.eventless_chunk_ids = []
+        current.token_usage = 0
+        if current.source_id:
+            try:
+                from sqlalchemy import update
+                from sag_api.db.models import Document
+
+                async with session_factory() as session:
+                    ver = await session.get(
+                        __import__("sag_api.db.models", fromlist=["DocumentVersion"]).DocumentVersion,
+                        self._document_version_id,
+                    )
+                    if ver and ver.document_id:
+                        await session.execute(
+                            update(Document)
+                            .where(Document.id == ver.document_id, Document.sag_source_id.is_(None))
+                            .values(sag_source_id=str(current.source_id))
+                        )
+                        await session.commit()
+            except Exception:  # noqa: BLE001
+                pass
+        await on_checkpoint(current.model_copy(deep=True))
+        log.info(
+            "Reused canonical SearchUnits for SAG index source_config_id=%s source_id=%s chunks=%d",
+            self._source_config_id,
+            current.source_id,
+            len(current.chunk_ids),
+        )
+        return True
+
     async def _ingest(
         self,
         current: ProcessCheckpoint,
@@ -181,8 +368,14 @@ class IncrementalDocumentProcessor:
             source_type=SourceType.ARTICLE,
             title=self._document_title or None,
         )
+        is_spreadsheet = original_path is not None and Path(original_path).suffix.lower() in {".xls", ".xlsx"}
+        if not is_spreadsheet and await self._ingest_from_canonical_search_units(
+            current, descriptor, on_checkpoint
+        ):
+            return
+
         source: str | DocumentSource = str(path)
-        if original_path is not None and Path(original_path).suffix.lower() in {".xls", ".xlsx"}:
+        if is_spreadsheet and original_path is not None:
             original = Path(original_path)
             # Canonical Markdown alone cannot recover merged cells or record boundaries.
             content = await asyncio.to_thread(Path(path).read_text, encoding="utf-8")
@@ -202,7 +395,10 @@ class IncrementalDocumentProcessor:
                 strategy="standard" if isinstance(source, DocumentSource) else self._chunk_mode,  # type: ignore[arg-type]
                 max_tokens=self._chunk_max_tokens,
             ),
-            index_options=IndexOptions(),
+            index_options=IndexOptions(
+                embedding_batch_size=100,
+                vector_batch_size=500,
+            ),
         )
         current.source_id = chunk_set.source_id
         current.chunk_ids = list(chunk_set.chunk_ids)
@@ -214,6 +410,25 @@ class IncrementalDocumentProcessor:
         current.event_ids = []
         current.eventless_chunk_ids = []
         current.token_usage = 0
+        if current.source_id:
+            try:
+                from sqlalchemy import update
+                from sag_api.db.models import Document
+
+                async with session_factory() as session:
+                    ver = await session.get(
+                        __import__("sag_api.db.models", fromlist=["DocumentVersion"]).DocumentVersion,
+                        self._document_version_id,
+                    )
+                    if ver and ver.document_id:
+                        await session.execute(
+                            update(Document)
+                            .where(Document.id == ver.document_id, Document.sag_source_id.is_(None))
+                            .values(sag_source_id=str(current.source_id))
+                        )
+                        await session.commit()
+            except Exception:  # noqa: BLE001
+                pass
         await on_checkpoint(current.model_copy(deep=True))
         log.info(
             "文档切片完成 source_config_id=%s source_id=%s chunks=%d generation=%s",
@@ -250,21 +465,48 @@ class IncrementalDocumentProcessor:
         on_checkpoint: CheckpointCallback,
     ) -> tuple[bool, Any]:
         """整批抽取;暂停由 CancellationToken + 后台轮询驱动,进度经 observer 透出。"""
-        prompt_language = getattr(getattr(self._engine.resources, "prompts", None), "language", None)
-        requirements = _KNOWLEDGE_EVENT_REQUIREMENTS.get(prompt_language)
-        if requirements is None:
-            raise RuntimeError(f"不支持的抽取提示词语言: {prompt_language!r}")
+        prompt_manager = getattr(self._engine.resources, "prompts", None)
+        prompt_language = "en"
+        if (
+            prompt_manager is not None
+            and getattr(prompt_manager, "language", None) != "en"
+            and hasattr(prompt_manager, "templates")
+            and hasattr(prompt_manager, "template_data")
+            and hasattr(prompt_manager, "load_templates")
+        ):
+            prompt_manager.language = "en"
+            prompt_manager.templates.clear()
+            prompt_manager.template_data.clear()
+            prompt_manager.load_templates()
+        requirements = _KNOWLEDGE_EVENT_REQUIREMENTS["en"]
 
+        is_concise = self._extraction_profile == "concise"
+        concise_rule = (
+            "Extract at most 3 high-signal events per chunk and at most 8 core entities per event; "
+            "keep event content brief (1-2 sentences) and entity descriptions concise (under 15 words)."
+        )
+        rules = (requirements, concise_rule) if is_concise else (requirements,)
         options = ExtractionOptions(
             source_type="article",
-            contract="rich",
+            contract="minimal" if is_concise else "rich",
+            max_retries=self._event_entity_attempts,
+            # Keep (20, 1, 20) so zleap.sag's ExtractionPromptComposer preserves few-shot JSON examples
             limits=ExtractionLimits(
                 max_events_per_chunk=20,
                 min_entities_per_event=1,
-                max_entities_per_event=self._max_entities_per_event,
+                max_entities_per_event=20,
             ),
-            execution=ExtractionExecutionOptions(max_concurrency=self._max_concurrency),
-            guidance_rules=(requirements,),
+            related_events=RelatedEventContextOptions(
+                enabled=not is_concise,
+            ),
+            execution=ExtractionExecutionOptions(
+                max_concurrency=self._max_concurrency,
+                embedding_batch_size=100,
+                vector_batch_size=500,
+                write_entity_vectors=self._write_event_entity_vectors,
+                write_event_entity_vectors=self._write_event_entity_vectors,
+            ),
+            guidance_rules=rules,
         )
         cancellation = CancellationToken()
 

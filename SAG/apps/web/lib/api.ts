@@ -34,6 +34,10 @@ import type {
   UniverseGraphPatch,
   UniverseTimelineSlice,
   UniverseNodeDetail,
+  UniverseKnowledgePage,
+  UniverseKnowledgeDetail,
+  UniverseKnowledgeReference,
+  UniverseKnowledgeMatch,
   BackgroundJob,
   ExplorationDetail,
   ExplorationSession,
@@ -951,8 +955,33 @@ export const api = {
     }),
 
   // 知识宇宙：统计轮廓 + 原子时间线与显式探索
-  universeManifest: () =>
-    request<UniverseManifest>("/api/v1/universe/manifest"),
+  universeManifest: (signal?: AbortSignal) =>
+    request<UniverseManifest>("/api/v1/universe/manifest", { signal }),
+  universeKnowledgeOverview: (signal?: AbortSignal) =>
+    request<UniverseManifest>("/api/v1/universe/knowledge/overview", { signal }),
+  universeKnowledgeCluster: (
+    params: { project_id: string; tree_version: string; node_id: string; limit?: number; cursor?: string; related_to?: string },
+    signal?: AbortSignal,
+  ) => {
+    const query = new URLSearchParams();
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined) query.set(key, String(value));
+    });
+    return request<UniverseKnowledgePage>(`/api/v1/universe/knowledge/cluster?${query}`, { signal });
+  },
+  universeKnowledgeUnit: (
+    id: string,
+    projectId: string,
+    treeVersion: string,
+    signal?: AbortSignal,
+  ) => request<UniverseKnowledgeDetail>(
+    `/api/v1/universe/knowledge/units/${encodeURIComponent(id)}?${new URLSearchParams({ project_id: projectId, tree_version: treeVersion })}`,
+    { signal },
+  ),
+  universeKnowledgeResolve: (references: UniverseKnowledgeReference[], signal?: AbortSignal) =>
+    request<{ matches: UniverseKnowledgeMatch[] }>("/api/v1/universe/knowledge/resolve", {
+      method: "POST", body: JSON.stringify({ references }), signal,
+    }),
   universeNode: (
     kind: "event" | "entity",
     id: string,

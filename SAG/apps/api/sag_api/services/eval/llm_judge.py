@@ -50,13 +50,13 @@ def _clip(text: str, limit: int = _EXCERPT_LIMIT) -> str:
 def _format_sections(sections: list[RetrievedSection]) -> str:
     trimmed = sections[:_MAX_SECTIONS_PER_SIDE]
     if not trimmed:
-        return "(空)"
+        return "(empty)"
     lines: list[str] = []
     for index, section in enumerate(trimmed, 1):
-        heading = _clip(section.heading, 120) or "(无标题)"
+        heading = _clip(section.heading, 120) or "(Untitled)"
         content = _clip(section.content)
         score = f"{float(section.score or 0.0):.3f}"
-        lines.append(f"[{index}] score={score} 标题:{heading}\n    片段:{content}")
+        lines.append(f"[{index}] score={score} Heading: {heading}\n    Excerpt: {content}")
     return "\n".join(lines)
 
 
@@ -67,18 +67,19 @@ def build_pairwise_prompt(
     b_label: str,
     b_sections: list[RetrievedSection],
 ) -> list[dict[str, str]]:
-    """构造 pairwise judge 用的 chat messages。"""
+    """Build chat messages for the pairwise retrieval judge."""
 
     system = (
-        "你是检索结果评审。给定一个用户问题和两组检索证据,判断哪一组更能支撑对问题的准确回答。"
-        "只看证据本身;不要引入外部知识。"
-        "只用 JSON 输出:{\"winner\": \"A\" | \"B\" | \"tie\", \"reason\": \"一句话说明\"}。"
-        "偏向覆盖度更高、更贴题、噪声更少的一组;两组均无法作答时选 tie。"
+        "You are a retrieval quality evaluator. Given a user question and two sets of retrieved evidence, "
+        "determine which set better supports an accurate answer to the question. "
+        "Evaluate only the provided evidence; do not introduce external knowledge. "
+        'Output strictly in JSON: {"winner": "A" | "B" | "tie", "reason": "One-sentence explanation"}. '
+        "Prefer higher coverage, stronger relevance, and less noise; choose tie if neither set can answer."
     )
     user = (
-        f"问题:{query.strip()}\n\n"
-        f"=== 结果 A(策略:{a_label}) ===\n{_format_sections(a_sections)}\n\n"
-        f"=== 结果 B(策略:{b_label}) ===\n{_format_sections(b_sections)}\n"
+        f"Question: {query.strip()}\n\n"
+        f"=== Result A (strategy: {a_label}) ===\n{_format_sections(a_sections)}\n\n"
+        f"=== Result B (strategy: {b_label}) ===\n{_format_sections(b_sections)}\n"
     )
     return [
         {"role": "system", "content": system},
@@ -87,17 +88,17 @@ def build_pairwise_prompt(
 
 
 def _parse_verdict(text: str) -> tuple[str, str]:
-    """从 LLM 原文里抽 winner/reason;失败一律回退到 tie 而不是抛。"""
+    """Extract winner/reason from raw LLM text; fallback to tie on parse error."""
     match = _JSON_RE.search(text or "")
     if not match:
-        return "tie", "judge 未返回可解析的 JSON"
+        return "tie", "judge did not return parseable JSON"
     try:
         data = json.loads(match.group(0))
     except json.JSONDecodeError:
-        return "tie", "judge 返回的 JSON 无法解析"
+        return "tie", "judge returned invalid JSON"
     raw_winner = str(data.get("winner", "")).strip().upper()
     winner = raw_winner if raw_winner in {"A", "B", "TIE"} else "TIE"
-    reason = str(data.get("reason", "") or "").strip() or "judge 未提供理由"
+    reason = str(data.get("reason", "") or "").strip() or "judge did not provide a reason"
     return winner.lower() if winner == "TIE" else winner, reason
 
 

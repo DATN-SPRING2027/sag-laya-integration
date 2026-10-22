@@ -1,4 +1,4 @@
-export const locales = ["vi-VN", "en-US", "zh-CN"] as const;
+export const locales = ["vi-VN", "en-US"] as const;
 
 export type AppLocale = (typeof locales)[number];
 
@@ -28,7 +28,6 @@ export function localeFromAcceptLanguage(value: string | null | undefined): AppL
   for (const { tag } of preferred) {
     if (tag === "vi" || tag.startsWith("vi-")) return "vi-VN";
     if (tag === "en" || tag.startsWith("en-")) return "en-US";
-    if (tag === "zh" || tag.startsWith("zh-")) return "zh-CN";
   }
   return defaultLocale;
 }

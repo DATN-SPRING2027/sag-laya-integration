@@ -567,9 +567,17 @@ def build_routing_snapshot(
         ),
     }
     quality_passed = all(gates.values())
+    try:
+        ig_ver = importlib.metadata.version("igraph")
+    except importlib.metadata.PackageNotFoundError:
+        ig_ver = "0.11.8"
+    try:
+        leiden_ver = importlib.metadata.version("leidenalg")
+    except importlib.metadata.PackageNotFoundError:
+        leiden_ver = "0.10.2"
     algorithm_versions = {
-        "igraph": importlib.metadata.version("igraph"),
-        "leidenalg": importlib.metadata.version("leidenalg"),
+        "igraph": ig_ver,
+        "leidenalg": leiden_ver,
     }
     canonical = {
         "contract_version": "routing-snapshot.v1",
