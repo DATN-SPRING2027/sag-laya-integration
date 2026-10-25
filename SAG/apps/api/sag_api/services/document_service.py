@@ -25,7 +25,7 @@ from sag_api.core.identity import (
 from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal as AssertionVerifiedPrincipal
 from sag_api.db.base import new_id
-from sag_api.db.models import Document, Job, Source
+from sag_api.db.models import Document, Job, Source, SourceProjectMapping
 from sag_api.db.models.routing_rag import (
     DocumentVersion,
     IngestionRun,
@@ -37,6 +37,7 @@ from sag_api.enums import ConnectorKind, DocumentStatus, JobStatus, JobType, Sou
 from sag_api.jobs import JobQueue
 from sag_api.jobs.scheduling import DELETE_PRIORITY, RESUME_PRIORITY, set_scheduler
 from sag_api.schemas.routing_rag import (
+    DocumentRevokeResponse,
     DocumentUploadResponse,
     DocumentVersionStatusResponse,
     StageProgressItem,
@@ -684,12 +685,24 @@ async def delete_document(
         ).all()
     )
 
+    has_indexed_versions = (
+        await session.scalar(
+            select(DocumentVersion.id)
+            .where(
+                DocumentVersion.document_id == document.id,
+                DocumentVersion.search_status.in_(("READY", "SEARCH_READY")),
+            )
+            .limit(1)
+        )
+    ) is not None
+
     # A document whose processor has never started cannot have written any
     # engine-side records. Delete it inside this request so it is never held up
     # by unrelated long-running ingestion or cleanup work.
     metadata_only = (
         document.status == DocumentStatus.PENDING
         and not document.sag_source_id
+        and not has_indexed_versions
         and not active_reprocess_jobs
         and all(
             active_job.status == JobStatus.QUEUED
@@ -922,35 +935,84 @@ async def get_or_create_project_source(
     session: AsyncSession,
     tenant_id: str,
     project_id: str,
+    *,
+    organization_id: str | None = None,
+    confirmed_by: str | None = None,
 ) -> Source:
-    """Ánh xạ (tenant_id, project_id) thành Source để ingestion worker sử dụng."""
+    """Ánh xạ (tenant_id, project_id) thành Source kèm SourceProjectMapping CONFIRMED (Phương án B)."""
     hash_digest = hashlib.sha256(f"{tenant_id}:{project_id}".encode()).hexdigest()[:32]
     config_id = f"tp_{hash_digest}"
     stmt = select(Source).where(Source.sag_source_config_id == config_id).limit(1)
     source = (await session.execute(stmt)).scalar_one_or_none()
-    if source is not None:
-        return source
+    if source is None:
+        source = Source(
+            name=f"Project {project_id}",
+            description=f"Auto-provisioned source for project {project_id} (tenant {tenant_id})",
+            source_type=SourceType.DOCUMENT,
+            connector_kind=ConnectorKind.FILE_UPLOAD,
+            sag_source_config_id=config_id,
+            config={
+                "is_project_source": True,
+                "tenant_id": tenant_id,
+                "project_id": project_id,
+            },
+        )
+        try:
+            async with session.begin_nested():
+                session.add(source)
+                await session.flush()
+        except IntegrityError:
+            source = (await session.execute(stmt)).scalar_one_or_none()
+            if source is None:
+                raise
 
-    source = Source(
-        name=f"Project {project_id}",
-        description=f"Auto-provisioned source for project {project_id} (tenant {tenant_id})",
-        source_type=SourceType.DOCUMENT,
-        connector_kind=ConnectorKind.FILE_UPLOAD,
-        sag_source_config_id=config_id,
-        config={
-            "is_project_source": True,
-            "tenant_id": tenant_id,
-            "project_id": project_id,
-        },
+    org_id = (organization_id or tenant_id).strip()
+    approver = (confirmed_by or "system:continuum-project-source").strip()
+    approval_ref = f"auto-project-source:{tenant_id}:{project_id}"
+    now_utc = datetime.now(UTC)
+
+    mapping_stmt = (
+        select(SourceProjectMapping)
+        .where(
+            SourceProjectMapping.source_id == source.id,
+            SourceProjectMapping.state.in_(("PENDING", "CONFIRMED")),
+        )
+        .limit(1)
     )
-    try:
-        async with session.begin_nested():
-            session.add(source)
-            await session.flush()
-    except IntegrityError:
-        source = (await session.execute(stmt)).scalar_one_or_none()
-        if source is None:
-            raise
+    mapping = (await session.execute(mapping_stmt)).scalar_one_or_none()
+    if mapping is None:
+        mapping = SourceProjectMapping(
+            source_id=source.id,
+            organization_id=org_id,
+            project_id=project_id,
+            state="CONFIRMED",
+            mapping_version=1,
+            confirmed_at=now_utc,
+            confirmed_by=approver,
+            approval_ref=approval_ref,
+        )
+        try:
+            async with session.begin_nested():
+                session.add(mapping)
+                await session.flush()
+        except IntegrityError:
+            mapping = (await session.execute(mapping_stmt)).scalar_one_or_none()
+            if mapping is None:
+                raise
+    elif (
+        mapping.state != "CONFIRMED"
+        or mapping.project_id != project_id
+        or (organization_id is not None and mapping.organization_id != org_id)
+    ):
+        mapping.state = "CONFIRMED"
+        mapping.organization_id = org_id
+        mapping.project_id = project_id
+        mapping.confirmed_at = mapping.confirmed_at or now_utc
+        mapping.confirmed_by = mapping.confirmed_by or approver
+        mapping.approval_ref = mapping.approval_ref or approval_ref
+        session.add(mapping)
+        await session.flush()
+
     return source
 
 
@@ -971,6 +1033,7 @@ async def handle_document_upload(
     research_task_id: str | None = None,
     job_queue: JobQueue | None = None,
     source_id: str | None = None,
+    organization_id: str | None = None,
 ) -> DocumentUploadResponse:
     """Process an upload request with strict ACL partition, idempotency, and versioning.
 
@@ -1041,7 +1104,13 @@ async def handle_document_upload(
         )
 
     if not source_id:
-        proj_source = await get_or_create_project_source(session, tenant_id, project_id)
+        proj_source = await get_or_create_project_source(
+            session,
+            tenant_id,
+            project_id,
+            organization_id=organization_id,
+            confirmed_by=owner_id,
+        )
         source_id = proj_source.id
 
     # Step 3: Attempt creation in transaction with serialization and retry on race conditions
@@ -1086,6 +1155,22 @@ async def handle_document_upload(
                     version_no = 1
                     supersedes_id = None
                 else:
+                    if not doc.is_active or doc.status in {
+                        DocumentStatus.DELETING,
+                        DocumentStatus.DELETE_FAILED,
+                    }:
+                        raise ConflictError(
+                            "Logical document is currently being revoked or deleted; retry after deletion completes",
+                            layer=ErrorLayer.CLIENT,
+                            stage=ErrorStage.UPLOAD,
+                            code="DOCUMENT_REVOKED_OR_DELETING",
+                            retryable=True,
+                        )
+                    if doc.status == DocumentStatus.FAILED:
+                        doc.status = DocumentStatus.PENDING
+                        doc.error = None
+                        doc.error_layer = None
+                        doc.error_stage = None
                     # Find latest version for this document under row lock
                     v_stmt = (
                         select(DocumentVersion)
@@ -1152,8 +1237,8 @@ async def handle_document_upload(
                         )
                         break
                     elif latest_ver:
-                        # Đóng khoảng hiệu lực của phiên bản cũ tại thời điểm phiên bản mới bắt đầu (Comment #13)
-                        latest_ver.valid_to = now_utc
+                        # Giữ hiệu lực của phiên bản cũ (valid_to) cho tới khi phiên bản mới đạt SEARCH_READY
+                        # trong resolve_temporal_supersedes; nếu phiên bản mới lỗi index/rollback thì v1 vẫn an toàn.
                         version_no = latest_ver.version_no + 1
                         supersedes_id = latest_ver.id
                     else:
@@ -1412,4 +1497,158 @@ async def get_document_version_status(
         current_stage=current_stage,
         stage_progress=stage_progress,
         error=err_info,
+    )
+
+
+async def revoke_project_document(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    project_id: str,
+    security_partition_id: str,
+    logical_source_id: str | None = None,
+    document_id: str | None = None,
+    revoked_by: str | None = None,
+    reason: str | None = None,
+    job_queue: JobQueue | None = None,
+) -> DocumentRevokeResponse:
+    """Thu hồi tài liệu cấp Project (KNOWLEDGE_SOURCE_REVOKED) an toàn và lũy đẳng.
+
+    1. Đóng ngay khoảng hiệu lực `valid_to = now_utc` của các phiên bản đang mở.
+    2. Đặt `Document.is_active = False` và `Document.status = DocumentStatus.DELETING`
+       để loại ngay lập tức khỏi truy xuất (`_load_current_ready_versions_checked`).
+    3. Gửi tín hiệu dừng (`pause_requested = True`) tới mọi job `PROCESS_DOCUMENT` đang chạy
+       và xếp hàng `DELETE_DOCUMENT` để dọn sạch điểm Qdrant, dữ liệu engine và bản ghi DB.
+    """
+    if not security_partition_id or not security_partition_id.strip():
+        raise ValidationError(
+            "X-Continuum-Security-Partition header is required to enforce data isolation"
+        )
+    cleaned_logical_id = logical_source_id.strip() if logical_source_id and logical_source_id.strip() else None
+    cleaned_doc_id = document_id.strip() if document_id and document_id.strip() else None
+    if not cleaned_logical_id and not cleaned_doc_id:
+        raise ValidationError(
+            "Either logical_source_id or document_id is required to revoke a project document"
+        )
+
+    stmt = select(Document).where(
+        Document.tenant_id == tenant_id,
+        Document.project_id == project_id,
+    )
+    if cleaned_doc_id and cleaned_logical_id:
+        stmt = stmt.where(
+            Document.id == cleaned_doc_id,
+            Document.logical_source_id == cleaned_logical_id,
+        )
+    elif cleaned_doc_id:
+        stmt = stmt.where(Document.id == cleaned_doc_id)
+    else:
+        stmt = stmt.where(Document.logical_source_id == cleaned_logical_id)
+
+    doc = (await session.execute(stmt.with_for_update())).scalar_one_or_none()
+    if doc is None:
+        resolved_doc_id = (
+            cleaned_doc_id
+            if cleaned_doc_id
+            else generate_doc_id(tenant_id, project_id, cleaned_logical_id or "")
+        )
+        return DocumentRevokeResponse(
+            document_id=resolved_doc_id,
+            project_id=project_id,
+            logical_source_id=cleaned_logical_id,
+            status="ALREADY_REVOKED",
+            delete_job_id=None,
+            revoked_version_count=0,
+        )
+
+    target_doc_id = doc.id
+    target_logical_id = doc.logical_source_id
+
+    v_stmt = (
+        select(DocumentVersion)
+        .where(DocumentVersion.document_id == target_doc_id)
+        .order_by(DocumentVersion.version_no.asc())
+        .with_for_update()
+    )
+    versions = list((await session.execute(v_stmt)).scalars().all())
+    for ver in versions:
+        bound_partition = (ver.metadata_json or {}).get("security_partition_id")
+        if bound_partition and bound_partition != security_partition_id:
+            raise ConflictError(
+                "Logical document already belongs to a different security partition",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+                code="DOCUMENT_PARTITION_MISMATCH",
+                retryable=False,
+            )
+
+    now_utc = datetime.now(UTC)
+    revoked_count = 0
+    for ver in versions:
+        ver_to = ver.valid_to
+        if ver_to is not None and ver_to.tzinfo is None:
+            ver_to = ver_to.replace(tzinfo=UTC)
+        if ver_to is None or ver_to > now_utc:
+            ver.valid_to = now_utc
+            revoked_count += 1
+        meta = dict(ver.metadata_json or {})
+        meta["revoked_at"] = now_utc.isoformat()
+        if revoked_by:
+            meta["revoked_by"] = revoked_by
+        if reason:
+            meta["revoke_reason"] = reason
+        ver.metadata_json = meta
+        session.add(ver)
+
+    if not doc.is_active or doc.status in {DocumentStatus.DELETING, DocumentStatus.DELETE_FAILED}:
+        doc.is_active = False
+        doc.status = DocumentStatus.DELETING
+        session.add(doc)
+        existing_delete_job = await session.scalar(
+            select(Job)
+            .where(
+                Job.source_id == doc.source_id,
+                Job.type == JobType.DELETE_DOCUMENT,
+            )
+            .order_by(Job.created_at.desc(), Job.id.desc())
+            .limit(1)
+        )
+        await session.commit()
+        return DocumentRevokeResponse(
+            document_id=target_doc_id,
+            project_id=project_id,
+            logical_source_id=target_logical_id,
+            status="ALREADY_REVOKED",
+            delete_job_id=existing_delete_job.id if existing_delete_job else None,
+            revoked_version_count=revoked_count,
+        )
+
+    source = await session.get(Source, doc.source_id) if doc.source_id else None
+    if source is None:
+        source = await get_or_create_project_source(session, tenant_id, project_id)
+        doc.source_id = source.id
+        session.add(doc)
+        await session.flush()
+
+    delete_job = await delete_document(
+        session,
+        source,
+        target_doc_id,
+        job_queue=job_queue,
+    )
+
+    current_doc = await session.get(Document, target_doc_id, populate_existing=True)
+    if current_doc is not None:
+        current_doc.is_active = False
+        current_doc.status = DocumentStatus.DELETING
+        session.add(current_doc)
+        await session.commit()
+
+    return DocumentRevokeResponse(
+        document_id=target_doc_id,
+        project_id=project_id,
+        logical_source_id=target_logical_id,
+        status="REVOKED",
+        delete_job_id=delete_job.id if delete_job else None,
+        revoked_version_count=revoked_count,
     )

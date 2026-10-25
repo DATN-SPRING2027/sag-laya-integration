@@ -337,6 +337,10 @@ async def _process_document_unlocked(
             if current_job.status == JobStatus.PAUSED or (current_job.payload or {}).get("pause_requested"):
                 scheduler_yield_reason = None
                 return True
+            current_doc = await control_session.get(Document, document.id)
+            if current_doc is None or not current_doc.is_active or current_doc.status in _DELETE_CONTROL_STATES:
+                scheduler_yield_reason = None
+                return True
         if job_queue is not None and job_queue.source_maintenance_requested(source.id):
             scheduler_yield_reason = SOURCE_MAINTENANCE
             return True
@@ -349,11 +353,12 @@ async def _process_document_unlocked(
 
     async def _pause_or_yield() -> None:
         """Chuyển tài liệu hiện tại sang PAUSED hoặc nhường lượt, dùng chung cho cả hai giai đoạn parse/extract."""
+        await session.rollback()
         await session.refresh(document)
+        if not document.is_active or document.status in _DELETE_CONTROL_STATES:
+            raise JobPaused()
         if scheduler_yield_reason == SOURCE_MAINTENANCE and document.status not in _CONTROL_TRANSITION_STATES:
             raise JobYielded(SOURCE_MAINTENANCE)
-        if document.status in _DELETE_CONTROL_STATES:
-            raise JobPaused()
         expected_status = document.status
         paused = await session.execute(
             update(Document)
@@ -488,6 +493,9 @@ async def _process_document_unlocked(
                 pipe_err_str = sanitize_error_message(pipe_err)
                 log.error("Phase 2 pipeline execution failed run_id=%s: %s", run_id, pipe_err_str)
                 await session.rollback()
+                await session.refresh(document)
+                if not document.is_active or document.status in _CONTROL_TRANSITION_STATES:
+                    await _pause_or_yield()
 
                 # Determine accurate error layer & stage
                 err_layer = ErrorLayer.API
@@ -576,7 +584,7 @@ async def _process_document_unlocked(
             await session.refresh(job)
         except Exception:
             pass
-        if document.status in _CONTROL_TRANSITION_STATES or document.status == DocumentStatus.PAUSED:
+        if not document.is_active or document.status in _CONTROL_TRANSITION_STATES or document.status == DocumentStatus.PAUSED:
             await _yield_after_document_transition_lost(session, document)
         layer, stage = _classify_document_failure(e, document.status)
         expected_status = document.status
@@ -658,7 +666,7 @@ async def _process_document_unlocked(
         raise
 
     await session.refresh(document)
-    if document.status in _DELETE_CONTROL_STATES:
+    if not document.is_active or document.status in _DELETE_CONTROL_STATES:
         raise JobPaused()
     if document.status == DocumentStatus.PAUSING:
         document.status = DocumentStatus.PAUSED
@@ -668,11 +676,13 @@ async def _process_document_unlocked(
         update(Document)
         .where(
             Document.id == document.id,
+            Document.is_active.is_(True),
             Document.status.in_(
                 [
                     DocumentStatus.PENDING,
                     DocumentStatus.LOADING,
                     DocumentStatus.EXTRACTING,
+                    DocumentStatus.READY,
                 ]
             ),
         )

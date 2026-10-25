@@ -676,14 +676,34 @@ async def run_search_indexing_stage(
     # Resolve authoritative tenant_id and doc from Document or IngestionRun
     from sag_api.db.models.document import Document
     from sag_api.db.models.routing_rag import IngestionRun
-    doc = await session.get(Document, document_version.document_id)
+    from sag_api.enums import DocumentStatus
+    from sag_api.jobs.control import JobPaused
+
+    doc_version_id = str(document_version.id)
+    doc_id = str(document_version.document_id)
+    doc = await session.get(Document, doc_id, populate_existing=True)
+    if doc is not None and (
+        not doc.is_active
+        or doc.status in {
+            DocumentStatus.DELETING,
+            DocumentStatus.DELETE_FAILED,
+            DocumentStatus.PAUSING,
+            DocumentStatus.PAUSED,
+        }
+    ):
+        await session.rollback()
+        raise JobPaused()
     if not tenant_id:
         if doc and doc.tenant_id:
             tenant_id = doc.tenant_id
-        elif run_id:
-            ing_run = await session.get(IngestionRun, run_id)
-            if ing_run and ing_run.tenant_id:
+    if run_id:
+        ing_run = await session.get(IngestionRun, run_id)
+        if ing_run is not None:
+            if not tenant_id and ing_run.tenant_id:
                 tenant_id = ing_run.tenant_id
+            if ing_run.started_at is None:
+                ing_run.started_at = start_time
+                session.add(ing_run)
     if not tenant_id:
         tenant_id = "tenant_default"
 
@@ -873,37 +893,55 @@ async def run_search_indexing_stage(
         # Strict fail-closed manifest verification: checksum must match
         manifest_verified = (qdrant_checksum == manifest_checksum)
 
+    temporal_info: dict[str, Any] | None = None
+    superseded_version_id: str | None = None
     if manifest_verified and units:
         from sag_api.services.dedup_and_temporal_service import resolve_temporal_supersedes
 
         # Serialize publication, while retaining the previous version if indexing fails.
-        await session.execute(
-            select(Document.id).where(Document.id == document_version.document_id).with_for_update()
-        )
+        locked_doc = (
+            await session.execute(
+                select(Document)
+                .where(Document.id == document_version.document_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if locked_doc is None or (
+            not locked_doc.is_active
+            or locked_doc.status in {
+                DocumentStatus.DELETING,
+                DocumentStatus.DELETE_FAILED,
+                DocumentStatus.PAUSING,
+                DocumentStatus.PAUSED,
+            }
+        ):
+            await session.rollback()
+            if qdrant_client is not None:
+                try:
+                    await delete_document_points_from_qdrant(
+                        qdrant_client,
+                        project_id=project_id,
+                        document_version_ids=[doc_version_id],
+                    )
+                except Exception as cleanup_exc:
+                    log.warning(
+                        "Failed to clean up Qdrant points for revoked/paused version %s: %s",
+                        doc_version_id,
+                        sanitize_error_message(cleanup_exc),
+                    )
+            raise JobPaused()
+
         temporal_info = await resolve_temporal_supersedes(
             session,
             current_version=document_version,
             document_id=document_version.document_id,
         )
-        superseded_version_id = temporal_info.get("supersedes_id") if isinstance(temporal_info, dict) else None
-        if (
-            qdrant_client is not None
-            and isinstance(temporal_info, dict)
-            and temporal_info.get("action") == "SUPERSEDED"
-            and superseded_version_id
-        ):
-            try:
-                await delete_search_units_from_qdrant(
-                    qdrant_client,
-                    collection_name,
-                    document_version_id=str(superseded_version_id),
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Failed to prune superseded version %s from Qdrant: %s",
-                    superseded_version_id,
-                    exc,
-                )
+        superseded_version_id = (
+            str(temporal_info.get("supersedes_id"))
+            if isinstance(temporal_info, dict) and temporal_info.get("supersedes_id")
+            else None
+        )
         document_version.search_status = "SEARCH_READY"
         document_version.search_ready_at = datetime.now(UTC)
     else:
@@ -934,6 +972,7 @@ async def run_search_indexing_stage(
             status="SUCCESS" if is_success else "FAILED",
             error_message=err_text,
             duration_ms=duration_ms,
+            created_at=datetime.now(UTC),
             metrics_json={
                 "search_unit_count": len(units),
                 "pg_count": pg_count,
@@ -952,15 +991,67 @@ async def run_search_indexing_stage(
         )
         session.add(stage_run)
 
-    if not manifest_verified:
-        err_msg = indexing_error or (
-            "Search indexing failed: manifest verification mismatch "
-            f"(units={len(units)}, pg={pg_count}, qdrant={qdrant_count}, "
-            f"qdrant_checksum={qdrant_checksum})"
-        )
-        raise RuntimeError(err_msg)
-
-    if not units:
+    if not manifest_verified or not units:
+        if qdrant_client is not None and indexed_count > 0:
+            try:
+                await delete_document_points_from_qdrant(
+                    qdrant_client,
+                    project_id=project_id,
+                    document_version_ids=[doc_version_id],
+                )
+            except Exception as cleanup_exc:
+                log.warning(
+                    "Failed to clean up partial Qdrant points for failed version %s: %s",
+                    doc_version_id,
+                    sanitize_error_message(cleanup_exc),
+                )
+        if not manifest_verified:
+            err_msg = indexing_error or (
+                "Search indexing failed: manifest verification mismatch "
+                f"(units={len(units)}, pg={pg_count}, qdrant={qdrant_count}, "
+                f"qdrant_checksum={qdrant_checksum})"
+            )
+            raise RuntimeError(err_msg)
         raise RuntimeError("EMPTY_INDEX: Document has no text content to index")
+
+    # Commit PostgreSQL SEARCH_READY and temporal supersede handoff BEFORE pruning superseded
+    # version points from Qdrant so a PostgreSQL rollback never leaves v1 without vectors.
+    try:
+        await session.commit()
+    except Exception as commit_exc:
+        await session.rollback()
+        if qdrant_client is not None:
+            try:
+                await delete_document_points_from_qdrant(
+                    qdrant_client,
+                    project_id=project_id,
+                    document_version_ids=[doc_version_id],
+                )
+            except Exception as cleanup_exc:
+                log.warning(
+                    "Failed to clean up Qdrant points after DB commit failure for version %s: %s",
+                    doc_version_id,
+                    sanitize_error_message(cleanup_exc),
+                )
+        raise commit_exc
+
+    if (
+        qdrant_client is not None
+        and isinstance(temporal_info, dict)
+        and temporal_info.get("action") == "SUPERSEDED"
+        and superseded_version_id
+    ):
+        try:
+            await delete_document_points_from_qdrant(
+                qdrant_client,
+                project_id=project_id,
+                document_version_ids=[str(superseded_version_id)],
+            )
+        except Exception as exc:
+            log.warning(
+                "Failed to prune superseded version %s from Qdrant: %s",
+                superseded_version_id,
+                sanitize_error_message(exc),
+            )
 
     return units
