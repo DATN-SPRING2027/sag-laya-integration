@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import random
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -126,7 +127,22 @@ class LLMClient:
         if self._settings.llm_base_url:
             request["api_base"] = self._settings.llm_base_url
         request = apply_litellm_completion_policy(self._settings, request)
-        return await _litellm_completion(**request)
+        for attempt in range(6):
+            try:
+                return await _litellm_completion(**request)
+            except Exception as exc:  # noqa: BLE001
+                is_rate_limit = (
+                    type(exc).__name__ == "RateLimitError"
+                    or getattr(exc, "status_code", None) == 429
+                    or "tpm limit" in str(exc).lower()
+                    or "rate limit" in str(exc).lower()
+                )
+                if is_rate_limit and attempt < 5:
+                    wait_s = round(10 * (attempt + 1) + random.uniform(1.5, 6.0), 1)
+                    log.warning("LLM rate limit in _create_completion (attempt %d/6), sleeping %ss: %s", attempt + 1, wait_s, exc)
+                    await asyncio.sleep(wait_s)
+                    continue
+                raise
 
     @staticmethod
     async def _close_stream(stream: Any) -> None:
@@ -149,93 +165,108 @@ class LLMClient:
         """
 
         self._ensure_configured()
-        tool_parts: dict[int, dict[str, str]] = {}
-        finish_reason: str | None = None
-        stream = None
-        try:
-            stream = await self._create_completion(
-                [message.to_model_dict() for message in request.messages],
-                tools=list(request.tools) or None,
-                tool_choice=request.tool_choice if request.tools else None,
-                stream=True,
-            )
-            async for chunk in stream:
-                cancellation.raise_if_cancelled()
-                raw_usage = _attr(chunk, "usage")
-                if raw_usage is not None:
-                    prompt_details = _attr(raw_usage, "prompt_tokens_details")
-                    completion_details = _attr(raw_usage, "completion_tokens_details")
-                    yield ModelChunk(
-                        usage=Usage(
-                            input_tokens=int(_attr(raw_usage, "prompt_tokens", 0) or 0),
-                            output_tokens=int(_attr(raw_usage, "completion_tokens", 0) or 0),
-                            cached_tokens=int(_attr(prompt_details, "cached_tokens", 0) or 0),
-                            reasoning_tokens=int(_attr(completion_details, "reasoning_tokens", 0) or 0),
+        for rate_attempt in range(6):
+            tool_parts: dict[int, dict[str, str]] = {}
+            finish_reason: str | None = None
+            stream = None
+            yielded_any = False
+            try:
+                stream = await self._create_completion(
+                    [message.to_model_dict() for message in request.messages],
+                    tools=list(request.tools) or None,
+                    tool_choice=request.tool_choice if request.tools else None,
+                    stream=True,
+                )
+                async for chunk in stream:
+                    cancellation.raise_if_cancelled()
+                    raw_usage = _attr(chunk, "usage")
+                    if raw_usage is not None:
+                        prompt_details = _attr(raw_usage, "prompt_tokens_details")
+                        completion_details = _attr(raw_usage, "completion_tokens_details")
+                        yield ModelChunk(
+                            usage=Usage(
+                                input_tokens=int(_attr(raw_usage, "prompt_tokens", 0) or 0),
+                                output_tokens=int(_attr(raw_usage, "completion_tokens", 0) or 0),
+                                cached_tokens=int(_attr(prompt_details, "cached_tokens", 0) or 0),
+                                reasoning_tokens=int(_attr(completion_details, "reasoning_tokens", 0) or 0),
+                            )
+                        )
+                    choices = _attr(chunk, "choices", []) or []
+                    if not choices:
+                        continue
+                    choice = choices[0]
+                    finish_reason = _attr(choice, "finish_reason") or finish_reason
+                    delta = _attr(choice, "delta", {})
+                    token = _attr(delta, "content")
+                    if token:
+                        yielded_any = True
+                        yield ModelChunk(text_delta=token)
+                    for fallback_index, tool_delta in enumerate(_attr(delta, "tool_calls") or []):
+                        index = _attr(tool_delta, "index")
+                        index = fallback_index if index is None else int(index)
+                        part = tool_parts.setdefault(index, {"id": "", "name": "", "arguments": ""})
+                        tool_id = _attr(tool_delta, "id")
+                        if tool_id:
+                            part["id"] += str(tool_id)
+                        function = _attr(tool_delta, "function")
+                        if function is not None:
+                            name = _attr(function, "name")
+                            arguments = _attr(function, "arguments")
+                            if name:
+                                part["name"] += str(name)
+                            if arguments:
+                                part["arguments"] += (
+                                    arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False)
+                                )
+
+                calls: list[RuntimeToolCall] = []
+                for index in sorted(tool_parts):
+                    part = tool_parts[index]
+                    raw_arguments = part["arguments"] or "{}"
+                    parse_error = None
+                    arguments: dict = {}
+                    try:
+                        candidate = json.loads(raw_arguments)
+                        if isinstance(candidate, dict):
+                            arguments = candidate
+                        else:
+                            parse_error = "tool arguments must decode to an object"
+                    except (json.JSONDecodeError, TypeError) as exc:
+                        parse_error = str(exc)
+                    calls.append(
+                        RuntimeToolCall(
+                            id=part["id"] or f"tool-{request.turn}-{index}",
+                            name=part["name"],
+                            arguments=arguments,
+                            raw_arguments=raw_arguments,
+                            parse_error=parse_error,
                         )
                     )
-                choices = _attr(chunk, "choices", []) or []
-                if not choices:
-                    continue
-                choice = choices[0]
-                finish_reason = _attr(choice, "finish_reason") or finish_reason
-                delta = _attr(choice, "delta", {})
-                token = _attr(delta, "content")
-                if token:
-                    yield ModelChunk(text_delta=token)
-                for fallback_index, tool_delta in enumerate(_attr(delta, "tool_calls") or []):
-                    index = _attr(tool_delta, "index")
-                    index = fallback_index if index is None else int(index)
-                    part = tool_parts.setdefault(index, {"id": "", "name": "", "arguments": ""})
-                    tool_id = _attr(tool_delta, "id")
-                    if tool_id:
-                        part["id"] += str(tool_id)
-                    function = _attr(tool_delta, "function")
-                    if function is not None:
-                        name = _attr(function, "name")
-                        arguments = _attr(function, "arguments")
-                        if name:
-                            part["name"] += str(name)
-                        if arguments:
-                            part["arguments"] += (
-                                arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False)
-                            )
-
-            calls: list[RuntimeToolCall] = []
-            for index in sorted(tool_parts):
-                part = tool_parts[index]
-                raw_arguments = part["arguments"] or "{}"
-                parse_error = None
-                arguments: dict = {}
-                try:
-                    candidate = json.loads(raw_arguments)
-                    if isinstance(candidate, dict):
-                        arguments = candidate
-                    else:
-                        parse_error = "tool arguments must decode to an object"
-                except (json.JSONDecodeError, TypeError) as exc:
-                    parse_error = str(exc)
-                calls.append(
-                    RuntimeToolCall(
-                        id=part["id"] or f"tool-{request.turn}-{index}",
-                        name=part["name"],
-                        arguments=arguments,
-                        raw_arguments=raw_arguments,
-                        parse_error=parse_error,
-                    )
+                if calls or finish_reason:
+                    yield ModelChunk(tool_calls=tuple(calls), finish_reason=finish_reason)
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                is_rate_limit = (
+                    type(e).__name__ == "RateLimitError"
+                    or getattr(e, "status_code", None) == 429
+                    or "tpm limit" in str(e).lower()
+                    or "rate limit" in str(e).lower()
                 )
-            if calls or finish_reason:
-                yield ModelChunk(tool_calls=tuple(calls), finish_reason=finish_reason)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001
-            log.warning("LLM 轮次流式调用失败：%s", e)
-            raise _classify_llm_error(e, stage=ErrorStage.GENERATE) from e
-        finally:
-            if stream is not None:
-                try:
-                    await self._close_stream(stream)
-                except Exception as e:  # noqa: BLE001
-                    log.debug("LLM 轮次流关闭失败：%s", e)
+                if is_rate_limit and not yielded_any and rate_attempt < 5:
+                    wait_s = round(10 * (rate_attempt + 1) + random.uniform(1.5, 6.0), 1)
+                    log.warning("LLM stream rate limit (attempt %d/6), sleeping %ss: %s", rate_attempt + 1, wait_s, e)
+                    await asyncio.sleep(wait_s)
+                    continue
+                log.warning("LLM 轮次流式调用失败：%s", e)
+                raise _classify_llm_error(e, stage=ErrorStage.GENERATE) from e
+            finally:
+                if stream is not None:
+                    try:
+                        await self._close_stream(stream)
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("LLM 轮次流关闭失败：%s", e)
 
     async def complete(self, messages: list[Message]) -> str:
         self._ensure_configured()

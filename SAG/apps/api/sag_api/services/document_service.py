@@ -688,10 +688,7 @@ async def delete_document(
     has_indexed_versions = (
         await session.scalar(
             select(DocumentVersion.id)
-            .where(
-                DocumentVersion.document_id == document.id,
-                DocumentVersion.search_status.in_(("READY", "SEARCH_READY")),
-            )
+            .where(DocumentVersion.document_id == document.id)
             .limit(1)
         )
     ) is not None
@@ -1070,6 +1067,7 @@ async def handle_document_upload(
                 retryable=False,
             )
         doc_ver = await session.get(DocumentVersion, existing_run.document_version_id)
+        bound_doc = await session.get(Document, doc_ver.document_id) if doc_ver else None
         if doc_ver:
             bound_partition = (doc_ver.metadata_json or {}).get("security_partition_id")
             if bound_partition != security_partition_id:
@@ -1080,7 +1078,6 @@ async def handle_document_upload(
                     code="IDEMPOTENCY_PARTITION_MISMATCH",
                     retryable=False,
                 )
-            bound_doc = await session.get(Document, doc_ver.document_id)
             if bound_doc and bound_doc.logical_source_id != logical_id:
                 raise ConflictError(
                     f"Idempotency key is already bound to logical source '{bound_doc.logical_source_id}'. "
@@ -1091,15 +1088,96 @@ async def handle_document_upload(
                     code="IDEMPOTENCY_IDENTITY_MISMATCH",
                     retryable=False,
                 )
+        if (
+            doc_ver is None
+            or bound_doc is None
+            or not bound_doc.is_active
+            or bound_doc.status in {DocumentStatus.DELETING, DocumentStatus.DELETE_FAILED}
+            or doc_ver.status == "REVOKED"
+            or doc_ver.search_status == "REVOKED"
+        ):
+            raise ConflictError(
+                "Logical document has been revoked or is currently being deleted",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+                code="DOCUMENT_REVOKED_OR_DELETING",
+                retryable=False,
+            )
+        if (
+            existing_run.status == "FAILED"
+            or doc_ver.search_status in {"FAILED", "INDEX_FAILED"}
+            or doc_ver.status == "FAILED"
+        ):
+            now_utc = datetime.now(UTC)
+            storage_path = _save_snapshot_file(payload_hash, original_filename, file_bytes)
+            bound_doc.storage_path = storage_path
+            if bound_doc.status == DocumentStatus.FAILED:
+                bound_doc.status = DocumentStatus.PENDING
+                bound_doc.error = None
+                bound_doc.error_layer = None
+                bound_doc.error_stage = None
+            doc_ver.status = "RECEIVED"
+            doc_ver.search_status = "PENDING"
+            doc_ver.search_ready_at = None
+            existing_run.status = "QUEUED" if job_queue is not None else "PENDING_DISPATCH"
+            existing_run.current_stage = "RECEIVE"
+            existing_run.attempt_count = (existing_run.attempt_count or 1) + 1
+            existing_run.error_layer = None
+            existing_run.error_stage = None
+            existing_run.error_code = None
+            existing_run.error_message = None
+            existing_run.started_at = now_utc
+            existing_run.completed_at = None
+            session.add_all([bound_doc, doc_ver, existing_run])
+            active_job = await session.scalar(
+                select(Job)
+                .where(
+                    Job.document_id == bound_doc.id,
+                    Job.type == JobType.PROCESS_DOCUMENT,
+                    Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]),
+                )
+                .limit(1)
+            )
+            retry_job: Job | None = None
+            if active_job is None:
+                retry_job = Job(
+                    type=JobType.PROCESS_DOCUMENT,
+                    source_id=bound_doc.source_id,
+                    document_id=bound_doc.id,
+                    status=JobStatus.QUEUED,
+                    payload={
+                        "run_id": existing_run.id,
+                        "document_version_id": doc_ver.id,
+                        "project_id": project_id,
+                        "tenant_id": tenant_id,
+                        "storage_path": storage_path,
+                    },
+                )
+                session.add(retry_job)
+            await session.commit()
+            if retry_job is not None and job_queue is not None:
+                await session.refresh(retry_job)
+                await _enqueue_persisted_job(job_queue, retry_job.id)
+            return DocumentUploadResponse(
+                document_id=doc_ver.document_id,
+                version_no=doc_ver.version_no,
+                version_id=doc_ver.id,
+                run_id=existing_run.id,
+                file_hash=payload_hash,
+                status=doc_ver.status,
+                search_status=doc_ver.search_status,
+                knowledge_status=doc_ver.knowledge_status,
+                is_duplicate=False,
+            )
         return DocumentUploadResponse(
-            document_id=doc_ver.document_id if doc_ver else "",
-            version_no=doc_ver.version_no if doc_ver else 1,
+            document_id=doc_ver.document_id,
+            version_no=doc_ver.version_no,
             version_id=existing_run.document_version_id,
             run_id=existing_run.id,
             file_hash=payload_hash,
-            status=doc_ver.status if doc_ver else "RECEIVED",
-            search_status=doc_ver.search_status if doc_ver else "PENDING",
-            knowledge_status=doc_ver.knowledge_status if doc_ver else "NOT_STARTED",
+            status=doc_ver.status,
+            search_status=doc_ver.search_status,
+            knowledge_status=doc_ver.knowledge_status,
             is_duplicate=True,
         )
 
@@ -1160,11 +1238,11 @@ async def handle_document_upload(
                         DocumentStatus.DELETE_FAILED,
                     }:
                         raise ConflictError(
-                            "Logical document is currently being revoked or deleted; retry after deletion completes",
+                            "Logical document has been revoked or is being deleted; upload rejected",
                             layer=ErrorLayer.CLIENT,
                             stage=ErrorStage.UPLOAD,
                             code="DOCUMENT_REVOKED_OR_DELETING",
-                            retryable=True,
+                            retryable=False,
                         )
                     if doc.status == DocumentStatus.FAILED:
                         doc.status = DocumentStatus.PENDING
@@ -1190,7 +1268,12 @@ async def handle_document_upload(
                             code="DOCUMENT_PARTITION_MISMATCH",
                             retryable=False,
                         )
-                    if latest_ver and latest_ver.file_hash == payload_hash:
+                    if (
+                        latest_ver
+                        and latest_ver.file_hash == payload_hash
+                        and latest_ver.status not in {"FAILED", "REVOKED"}
+                        and latest_ver.search_status not in {"FAILED", "INDEX_FAILED", "REVOKED"}
+                    ):
                         # Exact duplicate: Cùng hash + cùng source identity
                         # Duplicate policy: Do NOT parse again or schedule pipeline!
                         run_stmt = (
@@ -1552,6 +1635,24 @@ async def revoke_project_document(
             if cleaned_doc_id
             else generate_doc_id(tenant_id, project_id, cleaned_logical_id or "")
         )
+        if cleaned_logical_id:
+            source = await get_or_create_project_source(session, tenant_id, project_id)
+            tombstone = Document(
+                id=resolved_doc_id,
+                tenant_id=tenant_id,
+                project_id=project_id,
+                owner_id=revoked_by or "system:revoked",
+                logical_source_id=cleaned_logical_id,
+                source_id=source.id,
+                filename=cleaned_logical_id,
+                content_type="application/octet-stream",
+                size_bytes=0,
+                storage_path="",
+                status=DocumentStatus.DELETING,
+                is_active=False,
+            )
+            session.add(tombstone)
+            await session.commit()
         return DocumentRevokeResponse(
             document_id=resolved_doc_id,
             project_id=project_id,
@@ -1591,6 +1692,9 @@ async def revoke_project_document(
         if ver_to is None or ver_to > now_utc:
             ver.valid_to = now_utc
             revoked_count += 1
+        ver.status = "REVOKED"
+        ver.search_status = "REVOKED"
+        ver.search_ready_at = None
         meta = dict(ver.metadata_json or {})
         meta["revoked_at"] = now_utc.isoformat()
         if revoked_by:

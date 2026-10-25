@@ -431,7 +431,7 @@ async def test_version_replacement_v1_to_v2_and_rollback_consistency(sync_db):
         ready_after_v2_fail = await _load_current_ready_versions_checked(
             session, sources, principal
         )
-        assert list(ready_after_v2_fail.keys()) == [ver1.id]
+        assert list(ready_after_v2_fail.keys()) == [v1_res.version_id]
 
         # 4. Now run v2 indexing successfully -> v2 becomes SEARCH_READY, v1 is superseded & pruned
         await parse_and_persist_document_content(
@@ -582,8 +582,62 @@ async def test_project_document_revocation_post_ready_and_idempotency(sync_db, m
             job_queue=None,
         )
 
+        from sag_api.core.errors import ConflictError
+        from sag_api.db.models.routing_rag import CanonicalBlock, SearchUnit, SourceSnapshot
+
         assert len(qdrant_mock.points_for_version(col_name, ver.id)) == 0
-        assert await session.get(Document, up.document_id) is None
+        doc_tombstone = await session.get(Document, up.document_id, populate_existing=True)
+        assert doc_tombstone is not None
+        assert doc_tombstone.is_active is False
+        assert doc_tombstone.status == DocumentStatus.DELETING
+        assert (
+            await session.scalar(
+                select(SearchUnit.id).where(SearchUnit.document_version_id == ver.id)
+            )
+        ) is None
+        assert (
+            await session.scalar(
+                select(CanonicalBlock.id).where(CanonicalBlock.document_version_id == ver.id)
+            )
+        ) is None
+        assert (
+            await session.scalar(
+                select(SourceSnapshot.id).where(SourceSnapshot.document_version_id == ver.id)
+            )
+        ) is None
+
+        # Late/out-of-order upload with same Idempotency-Key or new Idempotency-Key is rejected
+        with pytest.raises(ConflictError) as exc_same_key:
+            await handle_document_upload(
+                session,
+                tenant_id=tenant_id,
+                project_id=project_id,
+                owner_id=principal.subject,
+                security_partition_id=project_id,
+                client_token="continuum:project_document:doc-revoke-canary:v1",
+                file_bytes=b"# Canary Document\n\nTemporary canary document for revocation verification.",
+                original_filename="canary.md",
+                content_type="text/markdown",
+                logical_source_id=logical_id,
+                organization_id=principal.organization_id,
+            )
+        assert exc_same_key.value.code == "DOCUMENT_REVOKED_OR_DELETING"
+
+        with pytest.raises(ConflictError) as exc_new_key:
+            await handle_document_upload(
+                session,
+                tenant_id=tenant_id,
+                project_id=project_id,
+                owner_id=principal.subject,
+                security_partition_id=project_id,
+                client_token="continuum:project_document:doc-revoke-canary:v2",
+                file_bytes=b"# Canary Document v2\n\nStale upload after revocation.",
+                original_filename="canary.md",
+                content_type="text/markdown",
+                logical_source_id=logical_id,
+                organization_id=principal.organization_id,
+            )
+        assert exc_new_key.value.code == "DOCUMENT_REVOKED_OR_DELETING"
 
         # Repeat revocation is idempotent (ALREADY_REVOKED)
         rev_again = await revoke_project_document(
@@ -818,3 +872,325 @@ async def test_v2_db_commit_failure_rolls_back_without_deleting_v1_qdrant_points
         )
         ready = await _load_current_ready_versions_checked(session, sources, principal)
         assert list(ready.keys()) == [v1_res.version_id]
+
+
+
+@pytest.mark.asyncio
+async def test_v2_worker_failure_preserves_v1_ready_and_same_idempotency_key_retries_v2(
+    sync_db, monkeypatch
+):
+    """Verify that when _process_document_unlocked fails on v2:
+    1. Document.status remains READY (because v1 is still SEARCH_READY) so v1 is never dropped from search.
+    2. v2 is marked status='FAILED', search_status='INDEX_FAILED', and IngestionRun.status='FAILED'.
+    3. Retrying handle_document_upload with the SAME Idempotency-Key re-queues v2 in-place (version_no=2)
+       without creating a v3 or returning a stale FAILED duplicate response.
+    """
+    from sag_api.core.errors import ApiError
+    from sag_api.db.models.routing_rag import IngestionRun
+    from sag_api.jobs.tasks import _process_document_unlocked
+
+    tenant_id = "6ad76c7d938f3bf53df7335e"
+    project_id = "6ad7759134bd88b3f2cc845b"
+    logical_id = "continuum:project_document:doc-v2-retry"
+    principal = _make_principal(
+        organization_id=tenant_id,
+        tenant_id=tenant_id,
+        project_ids={project_id},
+        partition_ids={project_id},
+    )
+    qdrant_mock = InMemoryQdrantMock()
+    transport = httpx.MockTransport(qdrant_mock.handle_request)
+    real_async_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: real_async_client(transport=transport, base_url="http://qdrant.local"),
+    )
+
+    async with sync_db() as session:
+        v1_res = await handle_document_upload(
+            session,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            owner_id=principal.subject,
+            security_partition_id=project_id,
+            client_token="continuum:project_document:doc-v2-retry:v1",
+            file_bytes=b"# Retry Spec v1\n\nStable v1 content that must remain searchable.",
+            original_filename="retry-spec.md",
+            content_type="text/markdown",
+            logical_source_id=logical_id,
+            organization_id=principal.organization_id,
+        )
+        doc = await session.get(Document, v1_res.document_id)
+        ver1 = await session.get(DocumentVersion, v1_res.version_id)
+        await parse_and_persist_document_content(
+            session,
+            ver1.id,
+            "# Retry Spec v1\n\nStable v1 content that must remain searchable.",
+            run_id=v1_res.run_id,
+        )
+        await run_dedup_and_temporal_stage(
+            session,
+            document_version=ver1,
+            document_id=doc.id,
+            project_id=project_id,
+            run_id=v1_res.run_id,
+        )
+        async with real_async_client(transport=transport, base_url="http://qdrant.local") as qclient:
+            await run_search_indexing_stage(
+                session,
+                project_id=project_id,
+                document_version=ver1,
+                security_partition_id=project_id,
+                tenant_id=tenant_id,
+                qdrant_client=qclient,
+                embedder=_fake_embedder,
+                run_id=v1_res.run_id,
+            )
+        doc.status = DocumentStatus.READY
+        await session.commit()
+
+        # Upload v2
+        v2_bytes = b"# Retry Spec v2\n\nUpdated v2 content that fails on first indexing attempt."
+        v2_res = await handle_document_upload(
+            session,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            owner_id=principal.subject,
+            security_partition_id=project_id,
+            client_token="continuum:project_document:doc-v2-retry:v2",
+            file_bytes=v2_bytes,
+            original_filename="retry-spec.md",
+            content_type="text/markdown",
+            logical_source_id=logical_id,
+            organization_id=principal.organization_id,
+        )
+        assert v2_res.version_no == 2
+
+        v2_job = await session.scalar(
+            select(Job)
+            .where(
+                Job.document_id == doc.id,
+                Job.type == JobType.PROCESS_DOCUMENT,
+                Job.payload["run_id"].as_string() == v2_res.run_id,
+            )
+            .limit(1)
+        )
+        assert v2_job is not None
+
+        qdrant_mock.corrupt_next_scroll_checksum = True
+        fake_engine_manager = SimpleNamespace(
+            get_sag_embedding=AsyncMock(return_value=_fake_embedder),
+            process_document=AsyncMock(
+                return_value=SimpleNamespace(
+                    paused=False, chunk_count=1, event_count=1, source_id="src-1", token_usage=10
+                )
+            ),
+        )
+        with pytest.raises(ApiError):
+            await _process_document_unlocked(
+                session,
+                v2_job,
+                engine_manager=fake_engine_manager,
+                job_queue=None,
+            )
+
+        await session.refresh(doc)
+        ver2 = await session.get(DocumentVersion, v2_res.version_id, populate_existing=True)
+        run2 = await session.get(IngestionRun, v2_res.run_id, populate_existing=True)
+        assert doc.status == DocumentStatus.READY
+        assert ver2 is not None and ver2.status == "FAILED"
+        assert ver2.search_status == "INDEX_FAILED"
+        assert run2 is not None and run2.status == "FAILED"
+
+        sources = await search_source_candidates(
+            session, principal=principal, include_project_sources=True
+        )
+        ready_after_v2_fail = await _load_current_ready_versions_checked(
+            session, sources, principal
+        )
+        assert list(ready_after_v2_fail.keys()) == [v1_res.version_id]
+
+        # Retry upload with the SAME Idempotency-Key ("continuum:project_document:doc-v2-retry:v2")
+        v2_retry = await handle_document_upload(
+            session,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            owner_id=principal.subject,
+            security_partition_id=project_id,
+            client_token="continuum:project_document:doc-v2-retry:v2",
+            file_bytes=v2_bytes,
+            original_filename="retry-spec.md",
+            content_type="text/markdown",
+            logical_source_id=logical_id,
+            organization_id=principal.organization_id,
+        )
+        assert v2_retry.version_no == 2
+        assert v2_retry.version_id == v2_res.version_id
+        assert v2_retry.run_id == v2_res.run_id
+        assert v2_retry.is_duplicate is False
+        assert v2_retry.status == "RECEIVED"
+        assert v2_retry.search_status == "PENDING"
+
+        await session.refresh(run2)
+        assert run2.attempt_count == 2
+        assert run2.status in {"QUEUED", "PENDING_DISPATCH"}
+
+
+@pytest.mark.asyncio
+async def test_http_bff_auth_upload_status_revoke_and_tombstone_anti_resurrection(
+    sync_db, monkeypatch
+):
+    """Verify over real FastAPI HTTP routes:
+    1. POST /api/v1/projects/{project_id}/documents/upload accepts X-SAG-BFF-Service-Token + Continuum headers
+       and returns version_id + version_no.
+    2. Rejects missing/invalid service token (401) and mismatched tenant/project/partition headers (403/422).
+    3. GET /api/v1/projects/{project_id}/documents/{document_id}/versions/{version_no}/status works with BFF token
+       and enforces project isolation.
+    4. POST /api/v1/projects/{project_id}/documents/revoke creates a tombstone even if called before upload
+       (out-of-order REVOKED before APPROVED), blocking subsequent upload with 409 DOCUMENT_REVOKED_OR_DELETING.
+    """
+    from fastapi import FastAPI, Request
+    from fastapi.responses import JSONResponse
+
+    from sag_api.api.v1.documents import project_router
+    from sag_api.core.config import settings
+    from sag_api.core.db import get_session
+    from sag_api.core.errors import ApiError
+
+    monkeypatch.setattr(settings, "bff_service_token", "test-bff-secret-token")
+
+    app = FastAPI()
+
+    @app.exception_handler(ApiError)
+    async def _handle_api_error(request: Request, exc: ApiError) -> JSONResponse:
+        return JSONResponse(status_code=exc.status_code, content=exc.to_envelope())
+
+    app.include_router(project_router, prefix="/api/v1")
+    app.state.job_queue = None
+
+    async def _override_get_session():
+        async with sync_db() as s:
+            yield s
+
+    app.dependency_overrides[get_session] = _override_get_session
+
+    tenant_id = "6ad76c7d938f3bf53df7335e"
+    project_id = "6ad7759134bd88b3f2cc845b"
+    bff_headers = {
+        "X-SAG-BFF-Service-Token": "test-bff-secret-token",
+        "X-Continuum-Organization-Id": tenant_id,
+        "X-Continuum-Tenant-Id": tenant_id,
+        "X-Continuum-Project-Id": project_id,
+        "X-Continuum-Security-Partition": project_id,
+        "X-Continuum-User-Id": "user-manager",
+    }
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://sag.test") as client:
+        # 1. Reject missing/invalid token
+        unauth_res = await client.post(
+            f"/api/v1/projects/{project_id}/documents/upload",
+            headers={"Idempotency-Key": "continuum:project_document:http-1:v1"},
+            data={"logical_source_id": "continuum:project_document:http-1"},
+            files={"file": ("doc.md", b"# HTTP Test\n\nContent", "text/markdown")},
+        )
+        assert unauth_res.status_code == 403
+
+        bad_tok_res = await client.post(
+            f"/api/v1/projects/{project_id}/documents/upload",
+            headers={
+                **bff_headers,
+                "X-SAG-BFF-Service-Token": "wrong-token",
+                "Idempotency-Key": "continuum:project_document:http-1:v1",
+            },
+            data={"logical_source_id": "continuum:project_document:http-1"},
+            files={"file": ("doc.md", b"# HTTP Test\n\nContent", "text/markdown")},
+        )
+        assert bad_tok_res.status_code == 403
+
+        # 2. Reject mismatched project or tenant header
+        bad_proj_res = await client.post(
+            f"/api/v1/projects/{project_id}/documents/upload",
+            headers={
+                **bff_headers,
+                "X-Continuum-Project-Id": "other-proj",
+                "Idempotency-Key": "continuum:project_document:http-1:v1",
+            },
+            data={"logical_source_id": "continuum:project_document:http-1"},
+            files={"file": ("doc.md", b"# HTTP Test\n\nContent", "text/markdown")},
+        )
+        assert bad_proj_res.status_code == 403
+
+        bad_tenant_res = await client.post(
+            f"/api/v1/projects/{project_id}/documents/upload",
+            headers={
+                **bff_headers,
+                "X-Continuum-Tenant-Id": "other-tenant",
+                "Idempotency-Key": "continuum:project_document:http-1:v1",
+            },
+            data={"logical_source_id": "continuum:project_document:http-1"},
+            files={"file": ("doc.md", b"# HTTP Test\n\nContent", "text/markdown")},
+        )
+        assert bad_tenant_res.status_code == 403
+
+        # 3. Valid upload over HTTP with BFF service token
+        up_res = await client.post(
+            f"/api/v1/projects/{project_id}/documents/upload",
+            headers={**bff_headers, "Idempotency-Key": "continuum:project_document:http-1:v1"},
+            data={"logical_source_id": "continuum:project_document:http-1"},
+            files={"file": ("doc.md", b"# HTTP Test\n\nContent", "text/markdown")},
+        )
+        assert up_res.status_code == 201
+        up_json = up_res.json()
+        assert up_json["version_no"] == 1
+        assert up_json["version_id"]
+        assert up_json["document_id"]
+        assert up_json["run_id"]
+        assert up_json["is_duplicate"] is False
+
+        doc_id = up_json["document_id"]
+
+        # 4. Query status over HTTP
+        st_res = await client.get(
+            f"/api/v1/projects/{project_id}/documents/{doc_id}/versions/1/status",
+            headers=bff_headers,
+        )
+        assert st_res.status_code == 200
+        st_json = st_res.json()
+        assert st_json["document_id"] == doc_id
+        assert st_json["version_no"] == 1
+        assert st_json["search_ready"] is False
+
+        # Cross-project status query fails closed with 404
+        other_headers = {
+            **bff_headers,
+            "X-Continuum-Project-Id": "other-project-id",
+            "X-Continuum-Security-Partition": "other-project-id",
+        }
+        cross_st_res = await client.get(
+            f"/api/v1/projects/other-project-id/documents/{doc_id}/versions/1/status",
+            headers=other_headers,
+        )
+        assert cross_st_res.status_code == 404
+
+        # 5. Out-of-order pre-revocation tombstone blocks subsequent late APPROVED upload
+        pre_rev_res = await client.post(
+            f"/api/v1/projects/{project_id}/documents/revoke",
+            headers=bff_headers,
+            json={
+                "logical_source_id": "continuum:project_document:pre-revoked-doc",
+                "reason": "Revoked before delayed upload arrived",
+            },
+        )
+        assert pre_rev_res.status_code == 200
+        assert pre_rev_res.json()["status"] == "ALREADY_REVOKED"
+
+        late_up_res = await client.post(
+            f"/api/v1/projects/{project_id}/documents/upload",
+            headers={**bff_headers, "Idempotency-Key": "continuum:project_document:pre-revoked-doc:v1"},
+            data={"logical_source_id": "continuum:project_document:pre-revoked-doc"},
+            files={"file": ("late.md", b"# Late Upload\n\nShould be rejected", "text/markdown")},
+        )
+        assert late_up_res.status_code == 409
+        assert late_up_res.json()["error"]["code"] == "DOCUMENT_REVOKED_OR_DELETING"

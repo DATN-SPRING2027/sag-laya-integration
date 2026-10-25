@@ -23,6 +23,7 @@ from sag_api.generation import build_citations
 from sag_api.sag import RetrievedSection, SourceGraphInfo
 from sag_api.services.evidence_service import (
     build_tool_evidence_pack,
+    extract_explicit_doc_filenames,
     has_traceable_locator,
 )
 from sag_api.tools.base import Tool, ToolContext, ToolMeta, ToolResult
@@ -109,6 +110,12 @@ def _format_sections(sections: list, offset: int = 0, events: list | None = None
             continue
         heading = getattr(s, "heading", None) or "Đoạn"
         blocks.append(f"[{i}] {heading}\n{locator}\n{getattr(s, 'content', '')}")
+    first_idx = 1 + offset
+    blocks.append(
+        "[QUY TẮC TRÍCH DẪN & TỪ CHỐI BẮT BUỘC / MANDATORY CITATION & ABSTENTION RULE]\n"
+        f"- Nếu các đoạn bằng chứng ở trên CÓ chứa thông tin để trả lời câu hỏi: BẮT BUỘC đặt ký hiệu trích dẫn dạng [{first_idx}] (số thứ tự đoạn bằng chứng trong ngoặc vuông) ngay sau mỗi câu hoặc mỗi ý lấy từ đoạn tương ứng. Mọi câu trả lời thiếu ký hiệu [n] sẽ bị hệ thống loại bỏ.\n"
+        "- Nếu các đoạn bằng chứng ở trên KHÔNG chứa thông tin trực tiếp trả lời câu hỏi của người dùng (hoặc câu hỏi hỏi về bảng/thuộc tính/dự án/chủ đề không xuất hiện trong bằng chứng): TUYỆT ĐỐI KHÔNG đặt bất kỳ ký hiệu số trong ngoặc vuông nào, không suy đoán từ thông tin gián tiếp, và hãy từ chối trả lời bằng cách nêu rõ kho tri thức của dự án hiện tại không có thông tin này."
+    )
     return "\n\n".join(blocks)
 
 
@@ -143,13 +150,19 @@ class SearchContextTool(Tool):
         from sag_api.services.query_strategy_planner import plan_query
         from sag_api.services.search_unit_retrieval_service import retrieve_search_unit_sections
 
+        user_query = getattr(ctx, "user_query", "") or ""
+        explicit_docs = extract_explicit_doc_filenames(user_query)
+        retrieval_query = f"{query} {user_query}".strip() if (user_query and user_query.lower() not in query.lower()) else query
+        effective_pack_query = f"{query} {user_query}".strip() if user_query else query
+        has_doc_filter = bool(explicit_docs or extract_explicit_doc_filenames(query))
+        retrieval_limit = max(limit, 32) if has_doc_filter else limit
         outcome = await retrieve_search_unit_sections(
             ctx.engine_manager,
             ctx.sources,
-            query,
+            retrieval_query,
             principal=ctx.principal,
-            top_k=limit,
-            query_strategy_plan=plan_query(query),
+            top_k=retrieval_limit,
+            query_strategy_plan=plan_query(retrieval_query),
         )
         routing_trace = outcome.stats.get("routing")
         sections = [
@@ -184,7 +197,7 @@ class SearchContextTool(Tool):
 
         packed = build_tool_evidence_pack(
             sections,
-            query=query,
+            query=effective_pack_query,
             render=render,
             context_budget_tokens=ctx.evidence_token_budget,
         )

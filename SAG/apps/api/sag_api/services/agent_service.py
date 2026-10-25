@@ -122,6 +122,17 @@ _RESEARCH_TOOL = re.compile(
 # Numeric knowledge markers are plain ``[n]``. A numeric Markdown link label
 # (``[n](https://...)``) is an external link and must not be stripped.
 _CITATION_REFERENCE = re.compile(r"\[(\d+)](?!\()")
+_ABSTENTION_OUTPUT_RE = re.compile(
+    r"(?:(?:is|are) not (?:explicitly |directly )?(?:specified|detailed|mentioned|stated|documented|included|present|found|covered)(?:\s+in\b|[.,;])|"
+    r"does not (?:explicitly |directly )?(?:specify|detail|mention|state|document|describe|include|contain)\b|"
+    r"there is no (?:direct |explicit )?(?:mention|reference|evidence|information) (?:of|to|about) .{1,80} in the (?:provided|given|current)|"
+    r"(?:\*\*)?không được đề cập(?:\s+cụ thể)?(?:\*\*)?\s+trong\s+(?:kho tri thức|tài liệu)|"
+    r"(?:\*\*)?không chứa thông tin(?:\*\*)?\s+về|"
+    r"(?:\*\*)?không có thông tin(?:\s+cụ thể)?(?:\*\*)?\s+về\s+.{1,80}\s+trong\s+(?:kho tri thức|tài liệu)|"
+    r"kho tri thức.{0,40}không có (?:thông tin|đủ căn cứ)|"
+    r"chưa có căn cứ xác minh)",
+    re.IGNORECASE,
+)
 _ANSWER_URL = re.compile(r"https?://[^\s<>\"'`，。；：！？、（）【】《》]+", re.IGNORECASE)
 _MAX_EXTERNAL_CITATIONS = 12
 _URL_TRAILING_PUNCTUATION = ".,;:!?)]}，。；：！？、"
@@ -721,6 +732,7 @@ async def generate_stream(
         principal=principal,
         persona=agent.persona or {},
         agent=agent,
+        user_query=plan.query,
     )
 
     try:
@@ -750,7 +762,7 @@ async def generate_stream(
                     "Kết nối Internet đã tắt trong lượt này; chỉ được dùng kho tri thức cục bộ đã gắn và các công cụ hệ thống cần thiết. "
                     "Không gọi hoặc tuyên bố đã sử dụng trang web, MCP hay nguồn tìm kiếm bên ngoài khác. Việc tắt Internet không có nghĩa là lượt nào cũng phải tìm kiếm; "
                     "chỉ khi câu trả lời phụ thuộc vào dữ kiện tri thức thì bắt buộc gọi search_context trước, chỉ trả lời dựa trên bằng chứng nguyên văn do công cụ trả về "
-                    "và giữ trích dẫn; nếu bằng chứng chưa đủ, hãy nói rõ kho tri thức không có đủ căn cứ và không bổ sung bằng kiến thức riêng của mô hình."
+                    "và BẮT BUỘC gắn trích dẫn dạng [1], [2] ngay sau mỗi thông tin lấy từ bằng chứng; nếu bằng chứng không trực tiếp trả lời câu hỏi, TUYỆT ĐỐI KHÔNG gắn bất kỳ ký hiệu [n] nào, không suy đoán từ thông tin gián tiếp và hãy nói rõ kho tri thức không có đủ căn cứ."
                 )
                 if "search_context" not in names:
                     offline_rule = (
@@ -958,7 +970,8 @@ async def generate_stream(
                     )
                     has_external_claim = any(citation.get("claim_level") == "claim" for citation in external_citations)
                     requires_grounded_answer = local_grounding_required or host_context.search_context_called
-                    if (
+                    explicit_abstention = bool(requires_grounded_answer and _ABSTENTION_OUTPUT_RE.search(canonical_answer))
+                    if explicit_abstention or (
                         requires_grounded_answer
                         and not has_internal_claim
                         and (local_evidence_required or not has_external_claim)

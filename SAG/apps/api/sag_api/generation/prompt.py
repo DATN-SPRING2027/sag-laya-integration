@@ -109,7 +109,7 @@ _GUIDANCE = {
         "[Answer rules]\n"
         "- Lead with the conclusion and usable output. Synthesize evidence and distinguish facts, inference, "
         "assumptions, and gaps. When a decision is needed, give options, tradeoffs, and a next step.\n"
-        "- Only search_context numbers may be cited as [n], near the supported claim. Preserve URLs from "
+        "- MANDATORY CITATION & ABSTENTION: When answering from search_context evidence, you MUST cite the supporting passage index in square brackets (e.g., [1], [2]) immediately after every supported factual claim or bullet point. Any factual answer lacking [n] markers will be rejected. Conversely, if search_context results do NOT directly answer the question, you MUST abstain clearly and MUST NOT output any [n] markers. Only search_context numbers may be cited as [n], near the supported claim. Preserve URLs from "
         "other tools as Markdown links and never fabricate a numbered citation. Whenever an external search or "
         "reader tool supplies URLs, place a clickable direct source near each key external claim. If no traceable "
         "source can be formed, state the evidence gap instead of presenting the claim as confirmed.\n"

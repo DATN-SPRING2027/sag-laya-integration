@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
@@ -63,10 +64,39 @@ def has_traceable_locator(section: RetrievedSection) -> bool:
     )
 
 
+_EXPLICIT_DOC_FILENAME_RE = re.compile(r"\b([\w\-]+\.(?:md|docx|pdf))\b", re.IGNORECASE)
+_NON_TARGET_DOC_FILENAMES = frozenset({
+    "agents.md",
+    "ai_workflow.md",
+    "decision-register.md",
+    "adr-002-persistence-and-source-of-truth-ownership.md",
+})
+
+
+def extract_explicit_doc_filenames(query: str) -> tuple[str, ...]:
+    if not query:
+        return ()
+    found = dict.fromkeys(
+        m.lower()
+        for m in _EXPLICIT_DOC_FILENAME_RE.findall(query)
+        if m.lower() not in _NON_TARGET_DOC_FILENAMES
+    )
+    return tuple(found)
+
+
+_GENERIC_TECH_NOISE = frozenset({
+    "datn_fe", "datn_be", "datn-fe", "datn-be", "datn",
+    "next.js", "node.js", "nest.js", "three.js", "draw.io", "socket.io", "react.js", "vue.js",
+})
+
 def _query_anchor_terms(query: str) -> tuple[str, ...]:
     features = extract_query_features(query)
-    raw_terms = (*features.exact_terms, *features.identifier_terms, *features.path_terms)
-    normalized = dict.fromkeys(value for term in raw_terms if (value := normalize_lexical_text(term)))
+    raw_terms = (*features.identifier_terms, *features.path_terms)
+    normalized = dict.fromkeys(
+        value
+        for term in raw_terms
+        if (value := normalize_lexical_text(term)) and value not in _GENERIC_TECH_NOISE
+    )
     return tuple(normalized)
 
 
@@ -79,7 +109,7 @@ def _sections_cover_query_anchors(required_terms: tuple[str, ...], sections: lis
             for section in sections
         )
     )
-    return all(term in evidence_text for term in required_terms)
+    return any(term in evidence_text for term in required_terms)
 
 
 def _section_contains_query_anchor(required_terms: tuple[str, ...], section: RetrievedSection) -> bool:
@@ -105,10 +135,26 @@ def build_tool_evidence_pack(
     eligible = [section for section in sections if has_traceable_locator(section)]
     if not eligible:
         return ToolEvidencePack([], "(No traceable evidence available to answer.)", "weak", "weak_evidence", 0)
+    explicit_docs = extract_explicit_doc_filenames(query)
+    if explicit_docs:
+        doc_matching = [
+            section
+            for section in eligible
+            if (section.document_name or "").strip().lower() in explicit_docs
+        ]
+        if not doc_matching:
+            return ToolEvidencePack(
+                [],
+                "(Evidence does not contain the specified document in the current project scope; unable to answer.)",
+                "weak",
+                "weak_evidence",
+                0,
+            )
+        eligible = doc_matching[:6]
     required_terms = _query_anchor_terms(query)
     if required_terms:
-        eligible = [section for section in eligible if _section_contains_query_anchor(required_terms, section)]
-        if not eligible or not _sections_cover_query_anchors(required_terms, eligible):
+        anchor_hits = [section for section in eligible if _section_contains_query_anchor(required_terms, section)]
+        if not anchor_hits or not _sections_cover_query_anchors(required_terms, anchor_hits):
             return ToolEvidencePack(
                 [],
                 "(Evidence does not contain the exact identifier from the question; unable to answer.)",
@@ -116,7 +162,10 @@ def build_tool_evidence_pack(
                 "weak_evidence",
                 0,
             )
+        non_anchor_hits = [section for section in eligible if not _section_contains_query_anchor(required_terms, section)]
+        eligible = [*anchor_hits, *non_anchor_hits]
 
+    eligible = eligible[:6]
     context_budget = (
         max(0, int(settings.llm_context_window))
         if context_budget_tokens is None

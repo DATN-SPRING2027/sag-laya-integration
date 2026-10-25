@@ -550,7 +550,7 @@ async def upload_document_version(
     x_continuum_user_id: str | None = Header(None, alias="X-Continuum-User-Id"),
     x_continuum_security_partition: str | None = Header(None, alias="X-Continuum-Security-Partition"),
     x_continuum_tenant_id: str | None = Header(None, alias="X-Continuum-Tenant-Id"),
-    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_project_bff_principal),
     session: AsyncSession = Depends(get_session),
     job_queue: JobQueue | None = Depends(get_job_queue),
 ) -> DocumentUploadResponse:
