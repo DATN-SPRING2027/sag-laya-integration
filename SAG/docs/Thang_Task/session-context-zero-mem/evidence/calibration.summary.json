@@ -1,0 +1,633 @@
+{
+  "schema_version": 1,
+  "scope": "calibration synthetic only; no holdout model/retrieval/answer execution",
+  "rollout_allowed": false,
+  "measurement_local_dates": [
+    "2026-10-26",
+    "2026-10-27"
+  ],
+  "raw_report_sha256": "5a838e8d947be3d86f0fd4491720b2f78fecb6c67517440a3cfbfbaeff02a0f3",
+  "initial_attempt_report_sha256": "4dfedd574e8bb2c9c27518c6c2f178c001fd833effc75a3650e38fde678c8d81",
+  "corpus_sha256": "e79086add159443889b73dd4068cb6584e97a031d1349d41b8394ad37e168248",
+  "locked_profile": "balanced",
+  "profile": {
+    "main_limit": 4,
+    "bridge_limit": 2,
+    "local_limit": 1,
+    "max_messages": 16,
+    "max_codepoints": 16000,
+    "beam": 4,
+    "steps": 20,
+    "damping": 0.6,
+    "rho": 0.6
+  },
+  "hierarchy": {
+    "window_turns": 4,
+    "episode_windows": 4,
+    "local_radius": 1,
+    "gap_seconds": 1800
+  },
+  "model_id": "BAAI/bge-m3@5617a9f61b028005a4858fdac845db406aefb181|Davlan/xlm-roberta-base-wikiann-ner@642b9a14e71df124c43c67e47703a91341576dfb|raw-chunk-mean:384",
+  "dependency_versions": {
+    "litellm": "1.102.0",
+    "sentence-transformers": "5.7.0",
+    "transformers": "5.17.0",
+    "torch": "2.14.0"
+  },
+  "config": {
+    "llm_provider": "openai",
+    "llm_model": "Qwen/Qwen3-8B",
+    "llm_context_window": 128000,
+    "llm_max_tokens": 4096,
+    "llm_temperature": 0.3,
+    "llm_max_retries": 2,
+    "llm_timeout_ms": 120000
+  },
+  "source_sha256": {
+    "graph.py": "9c5643bf3e8c083d8adfaa7a605e0ecdc020037a7e75163ef3789285edfa5d8a",
+    "selection.py": "c8713e8b4308fe3b5b09a93562b2395ef7ff702552825b56b4dea99fe9f687df",
+    "hierarchy.py": "1a67f3bb6c6aeb5f521c0db9483f2303885d639ec3d9da3e038cc1448a4099ee",
+    "reader.py": "a4b5f86300f29c34d795a98b6c0eb92b8319bb83c527c32971b0b28129347e91",
+    "scope.py": "79039f80c7fd3d795108d689b11abe3c49ff24d53ca2273df8b0b3174bc0b968",
+    "budget.py": "a89969b6414cd290241f23e0531f13d031438d038e9fb589effe612ef782769d",
+    "types.py": "f5ad6a0bf22a72ee5962833012fd088d14fab1d4bcac61e6e395d338f8b84091",
+    "calibrate_session_context.py": "f5486e57e325c449578ada3b6d3b2bbd660e1ff90e0700e146c6814187973f69",
+    "eval_session_context.py": "82f47c8f51e7aa845f5979b888fd5f71a92f1f2a46ba9d116f9d1ee23e13ab04",
+    "session_context_calibration.py": "ce8a73c8c73eb3d8e57df08040d82e2218488fffcfe0078fc8c9f5e0978cbf7c",
+    "agent_domain.py": "61854012964e8d6a536763f40c955e0638ebeb3f60c286d7b980fe1df4b747fc",
+    "agent_service.py": "350d8aa40047ab5d4cf48410ab379d007c9561c8e0cd1be3b297bfbcaef6c86b",
+    "llm.py": "950975d26148b6592289964896c1a2918b61edd3bbb91bc083a9f70f881d2726",
+    "prompt.py": "66a8e0cb778353b4e50f8eb8a8abad6c92006cfc6d42751815ac079c14280dc1"
+  },
+  "source_note": "Post-measurement guards require profiles/hierarchy/extra-body/dependency versions/case IDs and retrieval/replay/generation hashes. Historical v2 recorded eight matching source hashes but lacks agent_domain/agent_service/llm/prompt hashes; final header captures these and files match unchanged Git 5db4464. Raw historical metadata was not backfilled; new guard rejects that incomplete legacy header. Guard/checkpoint hardening did not rerun provider answers.",
+  "execution_status": "completed",
+  "completed_replays": 72,
+  "preserved_replays": 61,
+  "resumed_replays": 11,
+  "excluded_resource_blocked_attempts": 11,
+  "comparisons": [
+    {
+      "group": "normal",
+      "web_enabled": false,
+      "iteration": 0,
+      "long_only": false,
+      "baseline_tokens": 94226,
+      "candidate_tokens": 23307,
+      "reduction": 0.7526478891176533,
+      "pairs": 10,
+      "baseline_literal": 0.0,
+      "candidate_literal": 0.0
+    },
+    {
+      "group": "normal",
+      "web_enabled": false,
+      "iteration": 0,
+      "long_only": true,
+      "baseline_tokens": 80230,
+      "candidate_tokens": 16941,
+      "reduction": 0.7888445718559143,
+      "pairs": 6,
+      "baseline_literal": 0.0,
+      "candidate_literal": 0.0
+    },
+    {
+      "group": "normal",
+      "web_enabled": false,
+      "iteration": 1,
+      "long_only": false,
+      "baseline_tokens": 94226,
+      "candidate_tokens": 23465,
+      "reduction": 0.7509710695561734,
+      "pairs": 10,
+      "baseline_literal": 0.0,
+      "candidate_literal": 0.0
+    },
+    {
+      "group": "normal",
+      "web_enabled": false,
+      "iteration": 1,
+      "long_only": true,
+      "baseline_tokens": 80230,
+      "candidate_tokens": 17139,
+      "reduction": 0.7863766670821388,
+      "pairs": 6,
+      "baseline_literal": 0.0,
+      "candidate_literal": 0.0
+    },
+    {
+      "group": "normal",
+      "web_enabled": true,
+      "iteration": 0,
+      "long_only": false,
+      "baseline_tokens": 98047,
+      "candidate_tokens": 27006,
+      "reduction": 0.7245606698828113,
+      "pairs": 10,
+      "baseline_literal": 0.5,
+      "candidate_literal": 0.9
+    },
+    {
+      "group": "normal",
+      "web_enabled": true,
+      "iteration": 0,
+      "long_only": true,
+      "baseline_tokens": 82550,
+      "candidate_tokens": 19173,
+      "reduction": 0.767740763173834,
+      "pairs": 6,
+      "baseline_literal": 0.3333333333333333,
+      "candidate_literal": 0.8333333333333334
+    },
+    {
+      "group": "normal",
+      "web_enabled": true,
+      "iteration": 1,
+      "long_only": false,
+      "baseline_tokens": 98047,
+      "candidate_tokens": 27072,
+      "reduction": 0.7238875233306475,
+      "pairs": 10,
+      "baseline_literal": 0.5,
+      "candidate_literal": 0.9
+    },
+    {
+      "group": "normal",
+      "web_enabled": true,
+      "iteration": 1,
+      "long_only": true,
+      "baseline_tokens": 82550,
+      "candidate_tokens": 19239,
+      "reduction": 0.7669412477286492,
+      "pairs": 6,
+      "baseline_literal": 0.3333333333333333,
+      "candidate_literal": 0.8333333333333334
+    },
+    {
+      "group": "full_session",
+      "web_enabled": false,
+      "iteration": 0,
+      "long_only": false,
+      "baseline_tokens": 28514,
+      "candidate_tokens": 15435,
+      "reduction": 0.4586869607911903,
+      "pairs": 2,
+      "baseline_literal": 0.0,
+      "candidate_literal": 0.0
+    },
+    {
+      "group": "full_session",
+      "web_enabled": false,
+      "iteration": 0,
+      "long_only": true,
+      "baseline_tokens": 28514,
+      "candidate_tokens": 15435,
+      "reduction": 0.4586869607911903,
+      "pairs": 2,
+      "baseline_literal": 0.0,
+      "candidate_literal": 0.0
+    },
+    {
+      "group": "full_session",
+      "web_enabled": false,
+      "iteration": 1,
+      "long_only": false,
+      "baseline_tokens": 28514,
+      "candidate_tokens": 19002,
+      "reduction": 0.3335905169390475,
+      "pairs": 2,
+      "baseline_literal": 0.0,
+      "candidate_literal": 0.0
+    },
+    {
+      "group": "full_session",
+      "web_enabled": false,
+      "iteration": 1,
+      "long_only": true,
+      "baseline_tokens": 28514,
+      "candidate_tokens": 19002,
+      "reduction": 0.3335905169390475,
+      "pairs": 2,
+      "baseline_literal": 0.0,
+      "candidate_literal": 0.0
+    },
+    {
+      "group": "full_session",
+      "web_enabled": true,
+      "iteration": 0,
+      "long_only": false,
+      "baseline_tokens": 29290,
+      "candidate_tokens": 7290,
+      "reduction": 0.7511095937179925,
+      "pairs": 2,
+      "baseline_literal": 0.6666666666666666,
+      "candidate_literal": 1.0
+    },
+    {
+      "group": "full_session",
+      "web_enabled": true,
+      "iteration": 0,
+      "long_only": true,
+      "baseline_tokens": 29290,
+      "candidate_tokens": 7290,
+      "reduction": 0.7511095937179925,
+      "pairs": 2,
+      "baseline_literal": 0.6666666666666666,
+      "candidate_literal": 1.0
+    },
+    {
+      "group": "full_session",
+      "web_enabled": true,
+      "iteration": 1,
+      "long_only": false,
+      "baseline_tokens": 29290,
+      "candidate_tokens": 7273,
+      "reduction": 0.7516899965858654,
+      "pairs": 2,
+      "baseline_literal": 0.6666666666666666,
+      "candidate_literal": 1.0
+    },
+    {
+      "group": "full_session",
+      "web_enabled": true,
+      "iteration": 1,
+      "long_only": true,
+      "baseline_tokens": 29290,
+      "candidate_tokens": 7273,
+      "reduction": 0.7516899965858654,
+      "pairs": 2,
+      "baseline_literal": 0.6666666666666666,
+      "candidate_literal": 1.0
+    }
+  ],
+  "semantic_review": [
+    {
+      "group": "normal",
+      "web_enabled": false,
+      "variant": "paired_legacy",
+      "iteration": 0,
+      "n": 10,
+      "correct": 1
+    },
+    {
+      "group": "normal",
+      "web_enabled": false,
+      "variant": "candidate",
+      "iteration": 0,
+      "n": 10,
+      "correct": 1
+    },
+    {
+      "group": "normal",
+      "web_enabled": false,
+      "variant": "candidate",
+      "iteration": 1,
+      "n": 10,
+      "correct": 1
+    },
+    {
+      "group": "normal",
+      "web_enabled": true,
+      "variant": "paired_legacy",
+      "iteration": 0,
+      "n": 10,
+      "correct": 5
+    },
+    {
+      "group": "normal",
+      "web_enabled": true,
+      "variant": "candidate",
+      "iteration": 0,
+      "n": 10,
+      "correct": 9
+    },
+    {
+      "group": "normal",
+      "web_enabled": true,
+      "variant": "candidate",
+      "iteration": 1,
+      "n": 10,
+      "correct": 9
+    },
+    {
+      "group": "full_session",
+      "web_enabled": false,
+      "variant": "paired_legacy",
+      "iteration": 0,
+      "n": 2,
+      "correct": 0
+    },
+    {
+      "group": "full_session",
+      "web_enabled": false,
+      "variant": "candidate",
+      "iteration": 0,
+      "n": 2,
+      "correct": 0
+    },
+    {
+      "group": "full_session",
+      "web_enabled": false,
+      "variant": "candidate",
+      "iteration": 1,
+      "n": 2,
+      "correct": 0
+    },
+    {
+      "group": "full_session",
+      "web_enabled": true,
+      "variant": "paired_legacy",
+      "iteration": 0,
+      "n": 2,
+      "correct": 0
+    },
+    {
+      "group": "full_session",
+      "web_enabled": true,
+      "variant": "candidate",
+      "iteration": 0,
+      "n": 2,
+      "correct": 2
+    },
+    {
+      "group": "full_session",
+      "web_enabled": true,
+      "variant": "candidate",
+      "iteration": 1,
+      "n": 2,
+      "correct": 2
+    }
+  ],
+  "quality_regressions": [
+    {
+      "case_id": "calibration-compression-middle",
+      "iteration": 0,
+      "web_enabled": true,
+      "baseline_quality": 1,
+      "candidate_quality": 0
+    },
+    {
+      "case_id": "calibration-compression-middle",
+      "iteration": 1,
+      "web_enabled": true,
+      "baseline_quality": 1,
+      "candidate_quality": 0
+    }
+  ],
+  "reviewer": "assistant manual inspection; single unblinded review, not independent human evaluation",
+  "rubric": {
+    "2": "correct grounded answer or correct unknown abstention",
+    "1": "abstention/incomplete, incorrect if gold answer exists",
+    "0": "unrelated echo or unsupported content"
+  },
+  "selection_latency_seconds": {
+    "warm_p50": 0.554,
+    "warm_p95": 0.687,
+    "cold_p50_excluding_load": 46.8915,
+    "cold_p95_excluding_load": 80.407,
+    "model_load": 14.703
+  },
+  "max_sweep_work_units": 15518675,
+  "cold_context_inference": {
+    "encoder_calls": 109,
+    "encoder_tokens": 131064,
+    "ner_calls": 109,
+    "ner_tokens": 131064
+  },
+  "initial_execution_inference": {
+    "encoder_calls": 157,
+    "encoder_tokens": 133224,
+    "ner_calls": 157,
+    "ner_tokens": 133224
+  },
+  "resume_query_only_inference": {
+    "encoder_calls": 48,
+    "encoder_tokens": 2160,
+    "ner_calls": 48,
+    "ner_tokens": 2160
+  },
+  "feature_cases": [
+    {
+      "case_id": "calibration-recent",
+      "reused_feature_artifact": false,
+      "cold_feature_ms": 4672.0,
+      "feature_usage": {
+        "encoder_calls": 1,
+        "encoder_tokens": 1019,
+        "ner_calls": 1,
+        "ner_tokens": 1019
+      },
+      "logical_chunks": 16,
+      "unique_chunks": 16,
+      "current_case_ms": 6062.0,
+      "work_units": 848106
+    },
+    {
+      "case_id": "calibration-old-within-window",
+      "reused_feature_artifact": false,
+      "cold_feature_ms": 31641.0,
+      "feature_usage": {
+        "encoder_calls": 8,
+        "encoder_tokens": 8074,
+        "ner_calls": 8,
+        "ner_tokens": 8074
+      },
+      "logical_chunks": 120,
+      "unique_chunks": 120,
+      "current_case_ms": 34094.0,
+      "work_units": 6350536
+    },
+    {
+      "case_id": "calibration-outside-window",
+      "reused_feature_artifact": false,
+      "cold_feature_ms": 66172.0,
+      "feature_usage": {
+        "encoder_calls": 15,
+        "encoder_tokens": 16239,
+        "ner_calls": 15,
+        "ner_tokens": 16239
+      },
+      "logical_chunks": 240,
+      "unique_chunks": 240,
+      "current_case_ms": 69484.0,
+      "work_units": 12691792
+    },
+    {
+      "case_id": "calibration-changed-outside-window",
+      "reused_feature_artifact": false,
+      "cold_feature_ms": 65672.0,
+      "feature_usage": {
+        "encoder_calls": 15,
+        "encoder_tokens": 16194,
+        "ner_calls": 15,
+        "ner_tokens": 16194
+      },
+      "logical_chunks": 240,
+      "unique_chunks": 240,
+      "current_case_ms": 69172.0,
+      "work_units": 12693329
+    },
+    {
+      "case_id": "calibration-followup",
+      "reused_feature_artifact": false,
+      "cold_feature_ms": 10922.0,
+      "feature_usage": {
+        "encoder_calls": 3,
+        "encoder_tokens": 2527,
+        "ner_calls": 3,
+        "ner_tokens": 2527
+      },
+      "logical_chunks": 40,
+      "unique_chunks": 40,
+      "current_case_ms": 12375.0,
+      "work_units": 2117293
+    },
+    {
+      "case_id": "calibration-mixed-language",
+      "reused_feature_artifact": false,
+      "cold_feature_ms": 32032.0,
+      "feature_usage": {
+        "encoder_calls": 8,
+        "encoder_tokens": 8084,
+        "ner_calls": 8,
+        "ner_tokens": 8084
+      },
+      "logical_chunks": 120,
+      "unique_chunks": 120,
+      "current_case_ms": 34532.0,
+      "work_units": 6349989
+    },
+    {
+      "case_id": "calibration-compression-early",
+      "reused_feature_artifact": false,
+      "cold_feature_ms": 77640.0,
+      "feature_usage": {
+        "encoder_calls": 13,
+        "encoder_tokens": 19686,
+        "ner_calls": 13,
+        "ner_tokens": 19686
+      },
+      "logical_chunks": 1433,
+      "unique_chunks": 201,
+      "current_case_ms": 80562.0,
+      "work_units": 15518675
+    },
+    {
+      "case_id": "calibration-compression-middle",
+      "reused_feature_artifact": false,
+      "cold_feature_ms": 79844.0,
+      "feature_usage": {
+        "encoder_calls": 13,
+        "encoder_tokens": 19685,
+        "ner_calls": 13,
+        "ner_tokens": 19685
+      },
+      "logical_chunks": 1433,
+      "unique_chunks": 201,
+      "current_case_ms": 82812.0,
+      "work_units": 15517609
+    },
+    {
+      "case_id": "calibration-unknown",
+      "reused_feature_artifact": false,
+      "cold_feature_ms": 6750.0,
+      "feature_usage": {
+        "encoder_calls": 2,
+        "encoder_tokens": 1609,
+        "ner_calls": 2,
+        "ner_tokens": 1609
+      },
+      "logical_chunks": 24,
+      "unique_chunks": 24,
+      "current_case_ms": 8172.0,
+      "work_units": 1276033
+    },
+    {
+      "case_id": "calibration-all-decisions-window",
+      "reused_feature_artifact": false,
+      "cold_feature_ms": 66391.0,
+      "feature_usage": {
+        "encoder_calls": 15,
+        "encoder_tokens": 16123,
+        "ner_calls": 15,
+        "ner_tokens": 16123
+      },
+      "logical_chunks": 240,
+      "unique_chunks": 240,
+      "current_case_ms": 70094.0,
+      "work_units": 12697208
+    },
+    {
+      "case_id": "calibration-all-decisions-compression",
+      "reused_feature_artifact": false,
+      "cold_feature_ms": 60625.0,
+      "feature_usage": {
+        "encoder_calls": 13,
+        "encoder_tokens": 19511,
+        "ner_calls": 13,
+        "ner_tokens": 19511
+      },
+      "logical_chunks": 1419,
+      "unique_chunks": 201,
+      "current_case_ms": 64062.0,
+      "work_units": 15457715
+    },
+    {
+      "case_id": "calibration-proposed-not-approved",
+      "reused_feature_artifact": false,
+      "cold_feature_ms": 7344.0,
+      "feature_usage": {
+        "encoder_calls": 3,
+        "encoder_tokens": 2313,
+        "ner_calls": 3,
+        "ner_tokens": 2313
+      },
+      "logical_chunks": 36,
+      "unique_chunks": 36,
+      "current_case_ms": 9204.0,
+      "work_units": 1910531
+    }
+  ],
+  "cumulative_provider_accounting": {
+    "logical_calls": 94,
+    "accounting_complete": true,
+    "input_tokens": 394817,
+    "output_tokens": 8847,
+    "known_input_tokens": 394817,
+    "known_output_tokens": 8847,
+    "monetary_cost": null,
+    "price_status": "unverified",
+    "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
+    "stream_usage_aggregation": "last cumulative snapshot, not sum"
+  },
+  "reserved_estimated_tokens": 2317032,
+  "experiment_caps": {
+    "cumulative_calls": 128,
+    "replay_seconds": 1200,
+    "cumulative_estimated_tokens": 4000000
+  },
+  "failed_attempt_paid_tokens": 3737,
+  "preflight": {
+    "logical_calls": 1,
+    "input_tokens": 15,
+    "output_tokens": 22
+  },
+  "price_reference": {
+    "currency": "USD",
+    "input_per_million": 0.06,
+    "output_per_million": 0.06,
+    "source": "https://www.siliconflow.com/models/qwen3-8b",
+    "kind": "uncached public-list estimate; not invoice; CPU not included",
+    "invoice_cost": null
+  },
+  "provider_cost_reference_including_preflight": 0.024222059999999997,
+  "limitations": [
+    "synthetic repeated filler; chunk reuse helps cold build",
+    "non-randomized replay ordering and unequal repetition counts",
+    "default grounding still rejects session-only answers",
+    "compression-middle answer echoes filler despite correct evidence",
+    "full-session T8 not implemented",
+    "NER fine-tune license unverified",
+    "SDK-internal HTTP retries and invoice discounts not certified",
+    "historical initial report lacks four generation source hashes; final hashes match unchanged Git files, but no retroactive run-time hash certification"
+  ]
+}

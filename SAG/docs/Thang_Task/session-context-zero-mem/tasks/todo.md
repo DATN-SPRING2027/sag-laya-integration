@@ -1,6 +1,6 @@
 # Checklist: Context session v1
 
-Trạng thái: yêu cầu sản phẩm đã chốt; T1 baseline, T2 hợp đồng nội bộ, T3a reader/hierarchy và T3b selector offline đã thực hiện theo yêu cầu Thang. Chưa tích hợp/đạt nghiệm thu runtime. Theo [plan](plan.md), [SPEC](../SPEC.md), [BASELINE](../BASELINE.md), [CONTRACT](../CONTRACT.md), [READER-HIERARCHY](../READER-HIERARCHY.md) và [GRAPH-SELECTION](../GRAPH-SELECTION.md).
+Trạng thái: T1–T3b prototype và T4 measurement/numeric contract đã thực hiện theo yêu cầu Thang. Chưa tích hợp/đạt nghiệm thu runtime; T4 rollout gate vẫn NO-GO. Theo [plan](plan.md), [SPEC](../SPEC.md), [CALIBRATION](../CALIBRATION.md) và các tài liệu liên kết cùng task.
 
 ## Chuẩn bị đã làm
 
@@ -20,7 +20,7 @@ Trạng thái: yêu cầu sản phẩm đã chốt; T1 baseline, T2 hợp đồn
 - [x] T2: Hợp đồng nội bộ snapshot, typed evidence/coverage/budget và dependency/ACL validators/tests; xem [CONTRACT](../CONTRACT.md). Chưa có production caller hoặc durable fence.
 - [x] T3a: Fixture reader/hierarchy, phân trang toàn snapshot, không last-N; structural tests và work budget. Chưa SQL adapter/semantic segmentation/production integration.
 - [x] T3b: Graph/fusion/closure prototype, pinned local encoder/NER smoke và offline tests. Quality calibration và NER production-license review vẫn còn trước rollout.
-- [ ] T4: Calibration; chốt budgets/thresholds trước holdout.
+- [x] T4 measurement/contract: calibration và numeric gates khóa trước holdout; xem [CALIBRATION](../CALIBRATION.md). **Không phải acceptance PASS**: filler-echo regression/default grounding/NER license chưa đóng; rollout vẫn NO-GO.
 - [ ] T5: DB PR/migrations/rollback riêng nếu cần persistence mới.
 - [ ] T6a: Backfill chat cũ, incremental chat mới, restart/resume.
 - [ ] T6b: Delete/revoke/concurrency/generation fences.

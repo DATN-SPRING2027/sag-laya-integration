@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "policy_id": "session-context-calibration-v1-20261027",
+  "status": "locked_for_verification_not_promoted",
+  "rollout_allowed": false,
+  "holdout_executed": false,
+  "selected_profile": "balanced",
+  "selection_caps": {
+    "main_limit": 4,
+    "bridge_limit": 2,
+    "local_limit": 1,
+    "max_messages": 16,
+    "max_codepoints": 16000,
+    "beam": 4,
+    "steps": 20,
+    "damping": 0.6,
+    "rho": 0.6
+  },
+  "hierarchy": {
+    "window_turns": 4,
+    "episode_windows": 4,
+    "local_radius": 1,
+    "gap_seconds": 1800
+  },
+  "feature_pipeline": {
+    "model_id": "BAAI/bge-m3@5617a9f61b028005a4858fdac845db406aefb181|Davlan/xlm-roberta-base-wikiann-ner@642b9a14e71df124c43c67e47703a91341576dfb|raw-chunk-mean:384",
+    "batch_size": 16,
+    "chunk_reuse": "exact per-call only",
+    "cpu_threads": 4
+  },
+  "normal_ceiling": {
+    "model_input_tokens": 8192,
+    "output_reserve_tokens": 4096,
+    "total_model_tokens": 12288,
+    "model_attempts": 1,
+    "required_sdk_internal_retries": 0,
+    "index_work_units": 16000000,
+    "retrieval_seconds": 5,
+    "request_seconds": 60
+  },
+  "cold_index_job_ceiling": {
+    "work_units": 32000000,
+    "seconds": 180,
+    "on_exhaustion": "indexing/partial with checkpoint; never last-N success"
+  },
+  "full_session_ceiling_for_T8_validation": {
+    "model_attempts": 12,
+    "total_model_tokens": 262144,
+    "seconds": 360,
+    "status": "provisional maximum ceiling; unvalidated until T8/T9",
+    "on_exhaustion": "partial; no complete-coverage claim"
+  },
+  "quality_gates": {
+    "normal_raw_gold_evidence_recall": 1.0,
+    "per_case_quality_regressions": 0,
+    "old_information_quality": "strict improvement over paired baseline",
+    "long_normal_total_llm_token_reduction_min": 0.5,
+    "unknown_usage_or_failed_replays": "cost gate cannot pass",
+    "scope_provenance_violations": 0,
+    "full_session_missing_or_wrong_decisions": 0,
+    "license_grant_required": true,
+    "holdout_before_rollout": true
+  },
+  "observed_gates": {
+    "raw_gold_evidence_normal": "PASS 9/9",
+    "long_normal_token_reduction": "PASS ~76.7%",
+    "per_case_quality_regressions": "FAIL compression-middle abstention to filler echo",
+    "default_grounding": "NOT_READY session evidence integration required",
+    "full_session": "NOT_READY T8 coverage/synthesis required",
+    "license": "UNVERIFIED_NO_GO",
+    "holdout": "NOT_EXECUTED"
+  },
+  "enforcement_note": "Ceilings are a locked design contract, not active production config. T6/T7/T8 must enforce and validate them; no baseline Settings were changed."
+}

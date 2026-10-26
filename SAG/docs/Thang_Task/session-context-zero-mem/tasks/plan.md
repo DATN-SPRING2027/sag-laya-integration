@@ -2,7 +2,9 @@
 
 **T1/T2 đã thực hiện theo yêu cầu Thang:** baseline ở [BASELINE](../BASELINE.md); hợp đồng nội bộ và validators/tests ở [CONTRACT](../CONTRACT.md). Thiết kế tổng thể cần review cùng [SPEC](../SPEC.md). Không mở rộng thành thay retrieval tài liệu hay chat chéo session.
 
-**T3a/T3b đã thực hiện:** reader/hierarchy tại [READER-HIERARCHY](../READER-HIERARCHY.md), graph/fusion/closure prototype offline và learned-model smoke tại [GRAPH-SELECTION](../GRAPH-SELECTION.md). T4–T9 chưa triển khai.
+**T3a/T3b đã thực hiện:** reader/hierarchy tại [READER-HIERARCHY](../READER-HIERARCHY.md), graph/fusion/closure prototype offline và learned-model smoke tại [GRAPH-SELECTION](../GRAPH-SELECTION.md).
+
+**T4 đã hoàn tất phép đo:** [CALIBRATION](../CALIBRATION.md), [numeric contract](../CALIBRATION-POLICY.json) và [license audit](../NER-LICENSE-AUDIT.md). Contract đã khóa cho bước kiểm chứng tiếp; acceptance/rollout chưa đạt. T5–T9 còn lại.
 
 ## Thứ tự và phụ thuộc
 
@@ -57,6 +59,8 @@ Tách thành T3a và T3b, không gom quá 5 files mỗi phần:
 - Verify: replay calibration, kiểm tổng chi phí kể cả non-stream/retries/encoder và sensitivity; không xem holdout để chỉnh ngưỡng.
 - Files: harness T1, fixtures calibration và báo cáo metrics trong `.data/`; decision update tại task docs.
 - Dependencies: T1–T3. Checkpoint: không tích hợp/bật mode mới khi budget/threshold chưa chốt.
+
+- Kết quả T4: calibration-only sweep +72 successful paired replays; profile balanced khóa trước provider answers; scalar ceilings và gates đã version. NO-GO rollout vì regression filler echo/default grounding/license; không chạy holdout. Harness resume giữ61 completed rows và cộng dồn calls/reservations, không dùng resource-blocked0-token rows để chứng minh savings. Files thực hiện: calibration CLI, pure metrics, tests, keyword history_override trong harness T1, optional batching/reuse của graph encoder, optional Torch pin; chỉ fixture/replay lane.
 
 T1 phát hiện default knowledge-only trả no-answer cho câu hỏi history khi không có Sources; T2 phải chốt typed evidence/grounding cho session, không chỉ retrieval history. Corpus baseline và holdout chưa phải bằng chứng production ACL.
 

@@ -88,4 +88,6 @@ Test smoke được version trong test_session_context_selection.py, dùng dữ 
 
 Nhánh thực hiện `feat/Thang-session-context-graph-be-api` từ main cập nhật `7772270` + prerequisites T1–T3a. Thang đã yêu cầu push tiếp vào **PR #38**, head remote `feat/Thang-session-context-reader-be-api`; update phải fast-forward, không force-push/merge/approve. PR target main vẫn gồm T1–T3b.
 
-Không DB schema/model/index/migration hoặc dữ liệu thật, không env/public API/FE change. Optional extra là thay đổi dependency cấu hình duy nhất; mặc định app giữ nguyên. Rollback riêng commit T3b bỏ modules/tests/optional extra, không data migration. Model cache research ngoài Git không cần drop dữ liệu ứng dụng. T4 calibration/ngưỡng số và T5–T9 còn lại; xem [researchtask](researchtask.md).
+Checkpoint sau T3b: [T4 calibration](CALIBRATION.md) bổ sung optional bounded batching/per-call exact chunk reuse và pin Torch trong extra; serial path giữ nguyên. Profile384/batch16 khác smoke128 ở đây và được đo riêng. Numeric contract đã khóa, nhưng regression/default grounding và [NER license audit](NER-LICENSE-AUDIT.md) chưa đạt rollout gate.
+
+Không DB schema/model/index/migration hoặc dữ liệu thật, không env/public API/FE change. Optional extra là thay đổi dependency cấu hình duy nhất; mặc định app giữ nguyên. Rollback riêng commit T3b bỏ modules/tests/optional extra, không data migration. Model cache research ngoài Git không cần drop dữ liệu ứng dụng. T4 measurement/ngưỡng số đã có ở checkpoint trên; các rollout gates và T5–T9 còn lại; xem [researchtask](researchtask.md).

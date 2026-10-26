@@ -1,0 +1,32 @@
+{
+  "model": {
+    "url": "https://huggingface.co/api/models/Davlan/xlm-roberta-base-wikiann-ner/revision/642b9a14e71df124c43c67e47703a91341576dfb",
+    "sha256": "7ae7e4aaa46a5e29a89270c1b67276c563ed872a9a2ee24346c5149fb1114eab",
+    "revision": "642b9a14e71df124c43c67e47703a91341576dfb",
+    "license": null,
+    "license_files": []
+  },
+  "discussions": {
+    "url": "https://huggingface.co/api/models/Davlan/xlm-roberta-base-wikiann-ner/discussions",
+    "sha256": "e37b9d2a589072b26b0f097193aa48bb332d3248520f5f410acf0568b159c03d",
+    "discussions": [
+      {
+        "num": 2,
+        "title": "Adding `safetensors` variant of this model",
+        "status": "merged"
+      },
+      {
+        "num": 1,
+        "title": "Add TF weights",
+        "status": "merged"
+      }
+    ]
+  },
+  "base": {
+    "url": "https://huggingface.co/api/models/FacebookAI/xlm-roberta-base",
+    "sha256": "4d375584d52bf95db9bf8e68bb3fa2c340d64ef414567ec9a705faf6ad00daf5",
+    "revision": "e73636d4f797dec63c3081bb6ed5c7b0bb3f2089",
+    "license": "mit",
+    "license_files": []
+  }
+}

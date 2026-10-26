@@ -10,7 +10,9 @@ Tài liệu cùng task: [nghiên cứu hiện trạng](researchtask.md), [kế h
 
 **T3a đã thực hiện:** [reader/hierarchy offline](READER-HIERARCHY.md), pinned fixture keyset pages và turn/window/temporal episode/local views có nguyên văn provenance. Không coi temporal grouping là semantic episode segmentation hoặc production reader.
 
-**T3b đã thực hiện:** [graph/fusion/closure offline](GRAPH-SELECTION.md), optional learned encoder/NER revisions ghim và synthetic model smoke. Chưa có product thresholds, model quality/license rollout acceptance hoặc T4–T9; không coi là tái lập nguyên vẹn paper.
+**T3b đã thực hiện:** [graph/fusion/closure offline](GRAPH-SELECTION.md), optional learned encoder/NER revisions ghim và synthetic model smoke; không coi là tái lập nguyên vẹn paper. Numeric contract của T4 và các rollout gaps được cập nhật bên dưới.
+
+**T4 đã đo và khóa contract kiểm chứng:** [calibration](CALIBRATION.md), [numeric policy](CALIBRATION-POLICY.json) và [license audit](NER-LICENSE-AUDIT.md). Balanced giữ9/9 raw evidence normal; web-enabled answers5/10→9/10 và long-normal tokens giảm~76,7%. **Chưa đạt rollout gate**: compression-middle bị filler echo, default grounding chưa nhận session evidence, license fine-tune chưa xác minh. T5–T9 và holdout còn lại; không dùng điểm trung bình để bỏ qua regression.
 
 ## 1. Mục tiêu và quyết định đã xác nhận
 
