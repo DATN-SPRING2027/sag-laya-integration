@@ -63,15 +63,42 @@ _LOWER_CHAR = (
 )
 _WORD_CONT = _UPPER_CHAR + _LOWER_CHAR + r"0-9_-"
 _ENTITY_RE = re.compile(
-    r"https?://[^\s<>\]\)]+|[\w.+-]+@[\w.-]+\.\w+|\b(?:\d{1,3}\.){3}\d{1,3}\b|"
-    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}\b|\b\d{4}-\d{2}-\d{2}\b|"
-    rf"\b[{_UPPER_CHAR}][{_WORD_CONT}]*(?:\s+[{_UPPER_CHAR}][{_WORD_CONT}]*)+\b|"
-    r"\b(?:v?\d+\.\d+(?:\.\d+)?|[A-Z][A-Z0-9_]+(?:-\d+)?)\b|/[\w./{}-]+|"
-    r"\b\d+(?:\.\d+)?\s*(?:%|(?:percent|ms|seconds|minutes|hours|days|answers|tokens|chunks|units)\b)"
+    r"(?:https?|[a-z][a-z0-9+.-]*):\/\/[^\s<>\]\)]*[^\s<>\]\).,;:!?]|[\w.+-]+@[\w.-]+\.\w+|\b(?:\d{1,3}\.){3}\d{1,3}\b|"
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}\b|\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}[-/]\d{1,2}[-/]\d{4}\b|"
+    r"\b\d{1,4}/\d{4}/[A-ZĐa-zđ0-9-]+\b|"
+    r"\b(?:(?i:ngày)[ \t]+\d{1,2}[ \t]+)?(?i:tháng)[ \t]+\d{1,2}(?:[ \t]+(?i:năm)[ \t]+\d{4})?\b|"
+    rf"\b(?i:Dự án|Phiên bản|Điều|Khoản|Mục|Chương)[ \t]+[{_UPPER_CHAR}0-9](?:[.{_WORD_CONT}]*[{_WORD_CONT}])?\b|"
+    rf"\b[{_UPPER_CHAR}][{_WORD_CONT}]*(?:[ \t]+(?:(?i:tàng|hải|án|sự|đẳng|học|viện|phủ|tỉnh|thành|phố|quận|huyện|thị|trấn|sông|vịnh|đảo|mũi|núi|hồ|cảng|đường|de|von|van)[ \t]+)?[{_UPPER_CHAR}][{_WORD_CONT}]*)+\b|"
+    rf"(?<=[{_LOWER_CHAR},(\[\"'«][ \t])\b[{_UPPER_CHAR}][{_LOWER_CHAR}][{_WORD_CONT}]{{1,}}\b|"
+    rf"(?<=\()[{_UPPER_CHAR}][{_WORD_CONT}]{{1,}}(?=\))|"
+    r"\b(?:v?\d+\.\d+(?:\.\d+)?|[A-Z][A-Z0-9_]+(?:-[A-Z0-9]+)*)\b|(?<![\w$])/(?:[\w.{}-]+/)+[\w{}-]*|"
+    r"\b\d+(?:\.\d+)?[ \t]*(?:%|(?:percent|ms|seconds|minutes|hours|days|answers|tokens|chunks|units|"
+    r"ngày|giờ|phút|giây|tuần|tháng|năm|điểm|câu|lần)\b(?![ \t]*\d))"
 )
 _ENTITY_LEADING_STOP_RE = re.compile(
-    r"^(?:(?:The|A|An|In|On|At|By|For|With|From|Before|After|If|When|While|Every|Each|All|Both|This|That|These|Those|"
-    r"Theo|Tại|Trong|Các|Những|Một|Khi|Nếu|Về|Từ|Do|Để|Với)\s+)+"
+    r"^(?:(?i:The|A|An|In|On|At|By|For|With|From|Before|After|During|Since|Until|Under|Over|Between|Through|Within|Without|If|When|While|Every|Each|All|Both|This|That|These|Those|"
+    r"Theo|Tại|Trong|Các|Những|Một|Khi|Nếu|Về|Từ|Do|Để|Với|Vào|Ở|Là|Và|Hoặc|Nhưng|Tuy|Vì|Nên|Của|Cho)[ \t]+)+"
+)
+_VI_COMPOUND_TAIL_RE = re.compile(
+    rf"^.*\b(?i:tàng|hải|án|sự|đẳng|học|viện|phủ|tỉnh|thành|phố|quận|huyện|thị|trấn|sông|vịnh|đảo|mũi|núi|hồ|cảng|đường)[ \t]+([{_UPPER_CHAR}][{_WORD_CONT}]{{3,}}(?:[ \t]+[{_UPPER_CHAR}][{_WORD_CONT}]+)*)$"
+)
+_SINGLE_WORD_STOP_ENTITIES = frozenset(
+    {
+        "the", "this", "that", "these", "those", "there", "their", "they", "them", "then",
+        "when", "where", "which", "while", "what", "who", "whom", "whose", "why", "how",
+        "here", "have", "has", "had", "will", "would", "could", "should", "must", "shall",
+        "may", "might", "can", "each", "every", "some", "many", "most", "more", "other",
+        "another", "such", "only", "also", "even", "still", "both", "either", "neither",
+        "after", "before", "during", "since", "until", "under", "over", "between", "through",
+        "within", "without", "against", "among", "around", "because", "although", "though",
+        "however", "therefore", "moreover", "furthermore", "meanwhile", "otherwise", "instead",
+        "ngoài", "trong", "trên", "dưới", "giữa", "trước", "sau", "khi", "nếu", "vì", "do",
+        "để", "với", "từ", "về", "theo", "tại", "các", "những", "một", "mỗi", "mọi", "nhiều",
+        "nhưng", "hoặc", "cùng", "cũng", "được", "không", "chỉ", "còn", "đang", "đã", "sẽ",
+        "này", "đó", "đây", "ấy", "ông", "bà", "cô", "anh", "chị", "họ", "nó", "tôi", "chúng",
+        "phim", "bộ", "cuộc", "chiếc", "người", "năm", "tháng", "ngày", "quý", "mùa", "tập",
+        "phần", "loạt", "chương", "điều", "khoản", "mục", "luật", "nghị", "thông", "văn",
+    }
 )
 _SENTENCE_SPLIT_RE = re.compile(r"(?:[^.!?\n]|\d+\.\d+)+(?:[.!?](?!\d)|$)")
 
@@ -136,8 +163,13 @@ def extract_e0_e1(
         if stop_m:
             m_start += len(stop_m.group(0))
             span_text = text[m_start:m_end]
-            if " " not in span_text and not re.fullmatch(r"[A-Z][A-Z0-9_]+(?:-\d+)?", span_text):
+            if " " not in span_text and not re.fullmatch(r"[A-Z][A-Z0-9_]+(?:-[A-Z0-9]+)*", span_text):
                 continue
+        if " " not in span_text and (
+            span_text.casefold() in _SINGLE_WORD_STOP_ENTITIES
+            or span_text.casefold() in COMMON_STOPWORDS
+        ):
+            continue
         facts.append(
             {
                 "tier": "E0",
@@ -145,6 +177,23 @@ def extract_e0_e1(
                 **_fact("entity", text, m_start, m_end, block.id, anchor, 0.95, label=span_text),
             }
         )
+        tail_m = _VI_COMPOUND_TAIL_RE.match(span_text)
+        if tail_m:
+            t_rel_start, t_rel_end = tail_m.span(1)
+            t_start, t_end = m_start + t_rel_start, m_start + t_rel_end
+            t_label = text[t_start:t_end]
+            if (
+                t_label != span_text
+                and t_label.casefold() not in _SINGLE_WORD_STOP_ENTITIES
+                and t_label.casefold() not in COMMON_STOPWORDS
+            ):
+                facts.append(
+                    {
+                        "tier": "E0",
+                        "extractor_version": "e0-lexer-v1",
+                        **_fact("entity", text, t_start, t_end, block.id, anchor, 0.92, label=t_label),
+                    }
+                )
     for alias, label in config.aliases:
         if not alias.strip() or not label.strip():
             raise ValueError("Alias dictionary requires non-empty labels")
@@ -184,15 +233,26 @@ def extract_e0_e1(
                 **_fact("entity", text, *match.span(1), block.id, anchor, 0.7, label=match[1]),
             }
         )
-    if extra_entities:
+    heading_entities: list[str] = []
+    if block.section_path:
+        for h_match in re.finditer(rf"\b[{_UPPER_CHAR}][{_WORD_CONT}]{{4,}}\b", block.section_path):
+            h_tok = h_match.group(0)
+            if (
+                h_tok.casefold() not in _SINGLE_WORD_STOP_ENTITIES
+                and h_tok.casefold() not in COMMON_STOPWORDS
+                and h_tok not in heading_entities
+            ):
+                heading_entities.append(h_tok)
+    combined_extra = tuple(dict.fromkeys([*extra_entities, *heading_entities]))
+    if combined_extra:
         seen_spans = {(f["start"], f["end"]) for f in facts if f["kind"] in {"entity", "alias"}}
-        for raw_name in extra_entities:
+        for raw_name in combined_extra:
             label = str(raw_name or "").strip()
             if len(label) < 2 or len(label) > 120:
                 continue
             for match in re.finditer(r"(?<!\w)" + re.escape(label) + r"(?!\w)", text, re.IGNORECASE):
                 span = match.span()
-                if span in seen_spans:
+                if span in seen_spans or any(s <= span[0] and span[1] <= e for s, e in seen_spans):
                     continue
                 seen_spans.add(span)
                 facts.append(
@@ -248,7 +308,20 @@ def extract_e0_e1(
     tokens = terms(block.section_path + " " + text)
     sparse = sorted(tokens.items(), key=lambda item: (-item[1], item[0]))[: config.max_terms]
     confidence = max((f["confidence"] for f in facts if f["kind"] in {"entity", "alias"}), default=0.55)
-    importance = min(1.0, 0.25 + 0.1 * len(labels) + (0.25 if block.block_type in {"code", "table"} else 0))
+    causal = bool(
+        re.search(
+            r"\b(?:because|therefore|due to|must|shall|abstain|vì|do đó|nếu|phải|từ chối|bắt buộc)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+    importance = min(
+        1.0,
+        0.25
+        + 0.1 * len(labels)
+        + (0.25 if block.block_type in {"code", "table"} else 0)
+        + (0.25 if causal else 0),
+    )
     hard = bool(re.search(r"contradict|supersed|thay thế|trái ngược", text, re.IGNORECASE))
     return facts, {
         # Foundation stage: Dense embeddings for Knowledge Unit are deferred to dedicated
@@ -256,7 +329,7 @@ def extract_e0_e1(
         "dense": dense_list,
         "sparse": sparse,
         "entities": labels,
-        "citations": sorted(set(re.findall(r"https?://[^\s<>\]\)]+", text))),
+        "citations": sorted(set(re.findall(r"(?:https?|[a-z][a-z0-9+.-]*):\/\/[^\s<>\]\)]*[^\s<>\]\).,;:!?]", text))),
         "local_confidence": confidence,
         "importance": importance,
         "e2_reason": "semantic_relation"
@@ -264,7 +337,7 @@ def extract_e0_e1(
         else (
             "low_confidence_important"
             if confidence < config.e2_low_confidence and importance >= config.e2_importance_min
-            else None
+            else ("causal_constraint" if causal and importance >= config.e2_importance_min else None)
         ),
     }
 
@@ -600,16 +673,24 @@ def graph_payload(units: list[KnowledgeUnit], config: KnowledgeConfig = Knowledg
         partitions[unit.security_partition_id].append(unit)
     output, calibrations = [], {}
     for partition, rows in sorted(partitions.items()):
+        def _norm_ent(raw_e: str) -> str:
+            return re.sub(r"[\s_-]+", " ", str(raw_e).casefold()).strip()
+
         unit_map = {u.id: u for u in rows}
         token_counts = {u.id: terms(u.text + " " + u.provenance_json["section_path"]) for u in rows}
         df = Counter(t for counts in token_counts.values() for t in counts)
-        entity_df = Counter(e for u in rows for e in u.features_json["entities"])
+        norm_ents_by_unit = {
+            u.id: {_norm_ent(e) for e in u.features_json["entities"] if _norm_ent(e)} for u in rows
+        }
+        entity_df = Counter(e for ents in norm_ents_by_unit.values() for e in ents)
         avg_len = sum(sum(c.values()) for c in token_counts.values()) / len(rows) or 1
         postings: dict[tuple, list[str]] = defaultdict(list)
         for unit in rows:
             features, provenance = unit.features_json, unit.provenance_json
             keys = [("term", t) for t in sorted(token_counts[unit.id], key=lambda t: (df[t], t))[: config.max_terms]]
-            keys += [("entity", e) for e in features["entities"]] + [("citation", c) for c in features["citations"]]
+            keys += [("entity", e) for e in sorted(norm_ents_by_unit[unit.id])] + [
+                ("citation", c) for c in features["citations"]
+            ]
             keys += [
                 ("section", unit.document_version_id, provenance["section_path"]),
                 ("document", provenance["document_id"]),
@@ -676,7 +757,7 @@ def graph_payload(units: list[KnowledgeUnit], config: KnowledgeConfig = Knowledg
             a, b = unit_map[left], unit_map[right]
             ap, bp = a.provenance_json, b.provenance_json
             af, bf = a.features_json, b.features_json
-            ea, eb = set(af["entities"]), set(bf["entities"])
+            ea, eb = norm_ents_by_unit[left], norm_ents_by_unit[right]
             if ea and eb:
                 weights = {e: math.log(1 + len(rows) / entity_df[e]) for e in sorted(ea | eb)}
                 jaccard_ent = math.fsum(weights[e] for e in sorted(ea & eb)) / math.fsum(weights.values())
