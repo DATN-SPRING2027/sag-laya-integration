@@ -293,3 +293,7 @@ Index cache riêng thread/owner/scope/model, feature raw hash, cache entity offs
 ### NER runtime replacement
 
 Review độc lập kiểm pinned OpenMed278M revisionf253fd..., card/API Apache2, base XLMR MIT, source hashes và phạm vi VI/PII; không suy English quality từ backbone. Giữ limitation dataset license metadata unknown. Chọn drop-in này thay vì cài GLiNER đòi Transformers<5.17. Weights cache HF ngoài Git; mapping explicit PER/ORG/LOC bỏ nhóm PII khác và giữ offsets, model fingerprint version hóa. Mapping test RED→GREEN; actual model smoke không sửa PER/LOC expectations vẫnPASS1/16deselected22.35s. T4 model/config/report gốc giữ nguyên; T7/T9 phải đo candidate mới trước holdout. License/attribution và hạn chế tại MODEL-LICENSES.md.
+
+### T7a — Transport, tokenizer và packing
+
+13 actual-SDK/MockTransport tests PASS3.75s, cancellation with partial usage RED→unknown-final accounting, redirects disabledexplicitly. New pure packing3tests PASS2.57s: inert role distinction/querylast/quote authority/atomic dependencies. Full offline229passed2deselected18.17s trên working candidate với integration đang triển khai; không paid model replays/holdout. Qwen tokenizers cachedpinnedb968826d... cầnconfig.json ngoài tokenizerfiles. Model/transport/packing primitives commitriêng5implementation/config/tests. RUNTIME.md xác định optional API mode, additive terminal metadata, visible partial text và OFF/SHADOW/ON contract cho T7/T8; integration/final acceptance chưa được coi hoàn tất.
