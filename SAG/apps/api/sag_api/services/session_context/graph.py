@@ -122,6 +122,65 @@ class LocalFeatureEncoder:
         return TextFeatures(text_hash(text), self.model_id, vector,
                             tuple(sorted(mentions, key=lambda e: (e.start, e.end, e.label))))
 
+    def featurize_many(self, texts: tuple[str, ...], *, batch_size: int,
+                       budget: BudgetState, deduplicate: bool = False) -> tuple[TextFeatures, ...]:
+        """Bounded inference batches over raw chunks, with optional per-call reuse.
+
+        Calls count physical batch invocations; token counts sum unpadded inputs.
+        The serial featurize path remains available for equivalence checking.
+        Reuse is exact text only and is discarded on return, never across scopes.
+        """
+        require(isinstance(texts, tuple) and all(isinstance(text, str) for text in texts), "feature_texts")
+        require(type(batch_size) is int and 1 <= batch_size <= 32, "feature_batch")
+        require(type(deduplicate) is bool, "feature_deduplicate")
+        chunks = []
+        for index, text in enumerate(texts):
+            budget.consume_index_units(1 + len(text))
+            chunks.extend((index, start, text[start:start + self.chunk_codepoints])
+                          for start in range(0, max(1, len(text)), self.chunk_codepoints))
+        vectors = [[] for _ in texts]
+        mentions = [set() for _ in texts]
+        dimension = self.encoder.get_embedding_dimension()
+        requests = [chunk for _, _, chunk in chunks]
+        if deduplicate:
+            requests = list(dict.fromkeys(requests))
+        encoded_results, detected_results = [], []
+        for offset in range(0, len(requests), batch_size):
+            budget.consume_index_units(batch_size)
+            inputs = requests[offset:offset + batch_size]
+            encoder_counts = [len(self.encoder.tokenizer(text, truncation=False)["input_ids"]) for text in inputs]
+            ner_counts = [len(self.ner.tokenizer(text, truncation=False)["input_ids"]) for text in inputs]
+            require(all(count <= self.encoder.max_seq_length for count in encoder_counts)
+                    and all(count <= 512 for count in ner_counts), "feature_chunk_too_long")
+            budget.consume_index_units(sum(encoder_counts) + sum(ner_counts) + dimension * len(inputs) + 2)
+            self.encoder_calls += 1
+            self.encoder_tokens += sum(encoder_counts)
+            encoded = self.encoder.encode(inputs, batch_size=len(inputs), normalize_embeddings=True,
+                                          show_progress_bar=False)
+            budget.consume_index_units(0)
+            self.ner_calls += 1
+            self.ner_tokens += sum(ner_counts)
+            detected = self.ner(inputs, batch_size=len(inputs))
+            budget.consume_index_units(0)
+            for vector, entities in zip(encoded, detected, strict=True):
+                encoded_results.append(tuple(float(v) for v in vector))
+                detected_results.append(tuple(EntityMention(int(e["start"]), int(e["end"]), e["entity_group"])
+                                              for e in entities))
+        request_indices = {text: i for i, text in enumerate(requests)} if deduplicate else {}
+        for position, (index, start, text) in enumerate(chunks):
+            result_index = request_indices[text] if deduplicate else position
+            budget.consume_index_units(dimension + len(detected_results[result_index]))
+            vectors[index].append(encoded_results[result_index])
+            for entity in detected_results[result_index]:
+                mentions[index].add(EntityMention(start + entity.start, start + entity.end, entity.label))
+        result = []
+        for text, parts, entities in zip(texts, vectors, mentions, strict=True):
+            budget.consume_index_units(len(parts) * dimension)
+            vector = tuple(math.fsum(values) / len(parts) for values in zip(*parts, strict=True))
+            result.append(TextFeatures(text_hash(text), self.model_id, vector,
+                                       tuple(sorted(entities, key=lambda e: (e.start, e.end, e.label)))))
+        return tuple(result)
+
 
 @dataclass(frozen=True, slots=True)
 class TraceGraph:

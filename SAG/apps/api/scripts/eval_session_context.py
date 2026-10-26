@@ -100,7 +100,7 @@ def score_answer(case, answer):
     }
 
 
-async def replay_case(case, client, ledger, *, web_enabled):
+async def replay_case(case, client, ledger, *, web_enabled, history_override=None):
     messages = expand_case(case)
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -127,7 +127,14 @@ async def replay_case(case, client, ledger, *, web_enabled):
             await session.commit()
             ledger.stage = "compression"
             plan = await agent_domain.prepare_ask(session, agent=agent, thread=thread, query=case["query"],
-                                                 principal=principal, owner_key="synthetic-owner", llm=client)
+                                                 principal=principal, owner_key="synthetic-owner",
+                                                 llm=client if history_override is None else None)
+            if history_override is not None:
+                # Benchmark-only candidate seam: same prompt/runtime/tool policy,
+                # selected history replaces legacy context without a compression LLM call.
+                selected = agent_domain.build_ask_context(agent=agent, query=case["query"], history=history_override)
+                selected.user_message_id = plan.user_message_id
+                plan = selected
         initial_history = "\n".join(str(m["content"]) for m in plan.messages[1:-1])
         gold_items = case["gold_items"]
         result["loaded_message_count"] = min(len(messages), settings.history_load_limit)

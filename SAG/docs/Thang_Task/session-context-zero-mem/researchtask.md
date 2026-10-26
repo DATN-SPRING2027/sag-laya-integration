@@ -2,6 +2,7 @@
 
 Ngày: 2026-10-26. Record gồm nghiên cứu/đặc tả ban đầu, T1 baseline, T2 hợp đồng, T3a reader/hierarchy và T3b selector offline theo yêu cầu Thang. Chưa tích hợp/đạt nghiệm thu runtime.
 
+
 ## Nguồn và mức độ bằng chứng
 
 - User decisions D1–D7: [SPEC](SPEC.md), từ hội thoại trực tiếp với Thang; bản ghi phỏng vấn giữ tại workspace `phong-van/2026-10-26-sag-session-context-zero-mem.md` ngoài repo.
@@ -224,3 +225,27 @@ Thang sau đó yêu cầu hoàn tất T3b rồi push trực tiếp PR #38. Autho
 - Ruff targeted toàn package session_context + 2 tests mới PASS. Ruff toàn repo vẫn 124 findings cũ, không file mới bị finding. No install mới cần cho run vì packages đã có; không có typecheck/build command riêng trong pyproject. Không chạy holdout, live answer generation, backfill hay chat thật.
 - Review correctness: dense fallback khi không anchor, positive min-max/flat ties, both-view execution, centroid-zero guard, closure/reference/dedup/atomic caps và exact snapshot checks; readability: chỉ hai modules theo task, optional load rõ; architecture: reuse T2/T3a và stopwords hiện có, không financial rewrites cho chat; security: content hash/model/scope gate, no credentials/raw logs, no implicit legacy provenance; performance: finite PPR/beam/work/index caps, dimensions trước inference, tránh hash lại dependency text mỗi edge, không last-N. Local sync model calls/lookup scans vẫn có chi phí và không preempt giữa một inference; không claim production scalability.
 - Sai khác paper và giới hạn temporal route/exact entity/PPR context/raw chunk mean được công bố. Codepoint packing chưa là final token fitter; cache/provenance persistence/DB fences/production model quality/license/thresholds thuộc T4–T9. Rollback riêng commit T3b, không data migration. `.serena/`, `.data/` và HF weights giữ ngoài commit. Final commit/PR head verification được ghi trong handoff.
+
+## T4 — Thiết kế phép đo trước thực hiện
+
+Thang yêu cầu đo chất lượng/chi phí, chốt ngưỡng và xác minh license NER. Nhánh mới `feat/Thang-session-context-calibration-be-api` từ main đã fetch/pull (`7772270`) + prerequisites T1–T3b (`5db4464`); PR38 vẫn OPEN. Giữ `.serena/`, không có production integration/DB change. Đọc rules, README/API, BASELINE, contracts và các hàm replay/selector/accounting trước coding.
+
+Corpus calibration cố định 12 ca: 10 normal, 2 full-session. Ba ca >525k codepoints, còn lại 4k–63k. Không mở rộng/tuning holdout. NER đã kiểm pinned repository API, card/tree và 2 closed discussions: không khai license, không có LICENSE/COPYING, discussions chỉ thêm TF/safetensors; base XLM-R MIT không đủ chứng minh quyền fine-tune. Ghi kết luận license audit là UNVERIFIED/NO-GO rollout nếu không tìm thấy grant từ chủ model, không tự suy MIT hoặc liên hệ tác giả khi chưa được yêu cầu gửi tin.
+
+Phạm vi dự kiến: calibration CLI mới + pure metrics module + tests; mở rộng replay T1 bằng keyword history_override (default None giữ behavior), không sửa app. Candidate dựng history từ selected raw refs qua T2, prepare_ask llm=None tránh compression call rồi build lại plan bằng history override; giữ agent/model/tools/grounding/runtime như baseline. Không bypass document-only gate để làm score đẹp. Baseline T1 historical và paired legacy hiện tại báo riêng; source/config drift phải được ghi.
+
+Pre-registration: features BGE/NER pinned, raw chunks 384 codepoints (khác smoke128 phải ghi); CPU threads4 chỉ trong harness; không cache chunk/bỏ filler để giả cold cost. Cold bao gồm feature build; warm reuse đúng features cùng scope trong RAM, vẫn encode query thật. Sweep structural profiles compact/balanced/wide (main 2/4/6, bridge1/2/3, local1/1/2, max messages8/16/24, codepoints8000/16000/24000, beam2/4/6, PPR16/20/24, rho/damping0.6; hierarchy window4/episode4/radius1/gap1800). Chọn profile nhỏ nhất giữ đủ gold evidence trên normal calibration, không dùng answers để chọn profile. Sweep maxwork100M/case và 1800s whole experiment là giới hạn đo, không phải product default.
+
+Sau khóa profile mới gọi answer provider cùng Settings hiện tại và 2 web profiles; warm candidate lặp 2 lượt cho normal, full-session chẩn đoán riêng vì T8 chưa triển khai. Global max96 logical LLM calls/1200s generation/2M estimated tokens; không chạy chat thật. Mỗi replay báo provider usage, missing/failure/retries, model TTFT/duration và full ledger. CPU encoder/NER tokens/calls và cold/warm duration riêng, không coi zero encoder cost.
+
+Ngưỡng chất lượng dự kiến để review dựa trên baseline: không giảm semantic correctness từng normal case so paired baseline, old-evidence recall phải tăng so T1, gold raw evidence normal100% trên regression corpus; no scope/hash/provenance violations. Mục tiêu token normal dài (>=120 messages) giảm ít nhất50% mean input+output so paired baseline, generation1 call/query, compression0; unknown usage không được pass cost gate. Latency cold/warm là measured gates sau sweep, không đoán SLA. Không đạt thì khóa NO-GO và defect list, không hạ ngưỡng theo output.
+
+Chốt numeric contract trước holdout, không đồng nghĩa production readiness; full-session call/quality gates chỉ provisional envelope tới T8/T9. Pricing đúng provider/account chưa có primary source thì monetary cost unknown, báo tokens thay vì tuyên bố tiết kiệm tiền. T4 report phải phân biệt completed measurement với acceptance PASS/FAIL và license gate.
+
+### T4 — Điều chỉnh profiling trước khi khóa profile/answer replay
+
+Pilot serial ghi 120 messages ~51s; batch16 không reuse ghi ~28s, nhưng ba case dài có 1419–1433 chunks mà chỉ 201 chunks khác nhau. Dừng các pilot trước provider replay, giữ artifacts đã hoàn tất; CPU của phần bị dừng không được coi miễn phí hoặc tính vào chi phí steady-state. Không có answer/gold-score tuning trong bước tối ưu inference này.
+
+Thêm `LocalFeatureEncoder.featurize_many` với batching16 và optional exact chunk reuse **chỉ trong một call**, default reuse=False; không cache liên scope/case, không bỏ message/filler khỏi graph. Mọi raw chunk được materialize lại đủ offsets và mean vectors, work vẫn tính copy/aggregation. Kiểm RED/GREEN cho batch offsets/counts và reuse không mất raw messages. Final calibration v2 dùng reuse=True; report phải nêu hit ratios vì synthetic repetitive filler làm cold timing thuận lợi hơn dữ liệu thật. Source hash graph khác nên không trộn feature cache pilot vào final. Thêm pin Torch2.14.0 vào optional extra vì harness import trực tiếp để ghim threads4, cùng version đang đo; phạm vi thực tế 6 implementation/config/test files, không default runtime dependency mới.
+
+Đã xác minh giá công khai chính chủ tại https://www.siliconflow.com/models/qwen3-8b và https://www.siliconflow.com/en/pricing : USD0.06/M input và output. Provider host thực là api.siliconflow.com. Chỉ tính uncached public-list reference, không coi là account invoice hoặc tính CPU bằng0. Preflight riêng: 1 logical call, 15 input/22 output tokens, một observed deployment attempt, usage đủ; không gộp call này vào paired cohort để làm savings đẹp.
