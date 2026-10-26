@@ -18,7 +18,6 @@ from sag_api.db.models.knowledge_quality import (
     KnowledgeQualityAssessment,
     KnowledgeQueryDemandDaily,
 )
-from sag_api.db.models.research import ResearchTask
 from sag_api.db.models.octx import (
     OctxAsset,
     OctxDocumentBinding,
@@ -28,6 +27,7 @@ from sag_api.db.models.octx import (
     OctxSourceBinding,
     OctxTransfer,
 )
+from sag_api.db.models.research import ResearchTask
 from sag_api.db.models.routing_rag import (
     CanonicalBlock,
     DocumentVersion,
@@ -41,6 +41,7 @@ from sag_api.db.models.routing_rag import (
     TreeRoutingProfile,
     TreeSnapshotLease,
 )
+from sag_api.db.models.session_context import SessionContextIndex, SessionMessageProvenance
 from sag_api.db.models.setting import Setting
 from sag_api.db.models.source import Source
 from sag_api.db.models.source_project_mapping import SourceProjectMapping
@@ -87,6 +88,8 @@ __all__ = [
     "ResearchTask",
     "SearchUnit",
     "Setting",
+    "SessionContextIndex",
+    "SessionMessageProvenance",
     "Source",
     "SourceProjectMapping",
     "SourceSnapshot",

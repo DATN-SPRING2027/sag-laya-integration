@@ -1,0 +1,9 @@
+# Session context persistence (T5)
+
+Hai bảng dẫn xuất mới nằm ở models/session_context.py; migrations/0007_session_context.sql và .down.sql. Raw messages/threads và owner authority không đổi. session_context_indexes tách theo thread+owner+scope+model; generation/snapshot digest/state/checkpoint/features JSON chỉ là cache dựng lại được. session_message_provenance ràng buộc Message FK cascade, raw hash, immutable partition, Source IDs và dependency hashes. Default origin unknown; không suy provenance từ citation rỗng.
+
+Apply migration0007 sau0006 trước khi bật/session jobs. Không gọi create_all để upgrade database đang có. OFF giữ legacy, không cần đọc bảng mới. Rollback: tắt flag, dừng jobs/readers, chạy down; không mất raw chat. Mất bảng provenance làm assistant messages không có authority xuyên nguồn cho recall, phải dựng lại an toàn hoặc giữ unknown. Không tự chạy migration trên dữ liệu thật.
+
+FK message delete cascade provenance, thread delete cascade cả hai bảng; message delete không tự sửa JSON features của index. T6 bắt buộc re-read raw snapshot, prune IDs/hash và fence publish; không được tin cache như nguồn dữ liệu. Unique constraint không thay concurrency CAS. JSON updates dùng reassignment để ORM ghi thay đổi. Không thêm PII category mới, namespace Qdrant hoặc cross-database FK.
+
+Kiểm chứng: 7 disposable SQLite tests với FK enforcement, restart session/checkpoint, uniqueness/check constraints, message/thread cascade, model/scope isolation và rollback giữ raw messages. Full offline trước đó180 passed2deselected (gồm initial schema test và2 grounding characterization); focused mở rộng7passed1.40s. Ruff targeted PASS. SQL PostgreSQL up/down được chạy riêng bằng disposable PGlite; đây không chứng minh production PostgreSQL đa tiến trình/concurrency, môi trường không có daemon Docker/server PG. Xem researchtask cho bằng chứng cuối.
