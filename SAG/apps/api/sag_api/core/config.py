@@ -272,6 +272,8 @@ class Settings(BaseSettings):
     history_keep_recent: int = 8  # 历史压缩时原文保留的最近消息数
     # 只装载最近有界窗口；更旧对话应进入滚动摘要，不做全表回放。
     history_load_limit: int = Field(default=200, ge=1, le=1000)
+    # Opt-in thread memory. OFF preserves legacy; SHADOW adds no generation calls.
+    session_context_mode: Literal["off", "shadow", "on"] = "off"
     decision_provider: Literal["siliconflow", "disabled"] = "siliconflow"
     decision_model: str = Field(default="Kev-4b", min_length=1, max_length=200)
     siliconflow_base_url: str = "https://api.siliconflow.com/v1"

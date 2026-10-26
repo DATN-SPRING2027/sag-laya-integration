@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
 import hmac
 import json
+import logging
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -18,13 +21,16 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sag_api.branding import DEFAULT_AGENT_AVATAR, DEFAULT_AGENT_NAME
 from sag_api.core.config import settings
 from sag_api.core.error_taxonomy import ErrorCode
-from sag_api.core.errors import ConflictError, NotFoundError, ValidationError
+from sag_api.core.errors import ConflictError, NotFoundError, ServiceUnavailableError, ValidationError
 from sag_api.core.principal_assertion import VerifiedPrincipal
 from sag_api.db.models import Agent, AgentBinding, Message, Source, Thread
 from sag_api.enums import BindingTargetType, MessageRole, MessageStatus
 from sag_api.generation import build_agent_messages, build_prompt_preview
 from sag_api.generation.prompt import estimate_tokens
 from sag_api.services.source_service import get_authorized_source_ids, search_source_candidates
+
+if TYPE_CHECKING:
+    from sag_api.services.session_context.runtime import SessionContext
 
 _DEFAULT_TITLES = {"New chat", "Cuộc trò chuyện mới"}
 _KNOWLEDGE_TOOL_NAMES = frozenset({"search_context", "get_entity"})
@@ -418,6 +424,10 @@ async def list_messages_page(
 
 
 def _message_source_ids(message: Message) -> set[str] | None:
+    if isinstance(message.steps, list) and any(
+        isinstance(step, dict) and step.get("name") == "session_context" for step in message.steps
+    ):
+        return None  # Session answers require transitive provenance validation.
     citations = message.citations if message.citations is not None else []
     if not isinstance(citations, list):
         return None
@@ -465,7 +475,23 @@ async def filter_messages_for_scope(
     *,
     principal: VerifiedPrincipal,
     requested_source_ids: list[str] | None = None,
+    owner_key: str | None = None,
 ) -> list[Message]:
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from sag_api.services.session_context.types import ContextContractError
+    memory_ids = set()
+    memory_rows = [message for message in messages if isinstance(message.steps, list)
+                   and any(isinstance(step, dict) and step.get("name") == "session_context"
+                           for step in message.steps)]
+    if memory_rows and owner_key is not None:
+        from sag_api.services.session_context.runtime import visible_memory_ids
+        try:
+            async with session.begin_nested():
+                memory_ids = await visible_memory_ids(session, memory_rows, principal=principal,
+                    owner_key=owner_key, requested_source_ids=requested_source_ids)
+        except (SQLAlchemyError, ContextContractError, NotFoundError):
+            memory_ids = set()
     provenance = [
         (message, _message_source_ids(message) if message.role == MessageRole.ASSISTANT else None)
         for message in messages
@@ -483,7 +509,8 @@ async def filter_messages_for_scope(
         if message.role != MessageRole.ASSISTANT:
             visible.append(message)
             continue
-        can_read = cited_source_ids is not None and cited_source_ids.issubset(authorized)
+        can_read = (message.id in memory_ids) if message in memory_rows else (
+            cited_source_ids is not None and cited_source_ids.issubset(authorized))
         # Preserve conversation roles without changing the persisted ORM row.
         # Frozen prompts can embed earlier revoked answers, even for a currently
         # authorized answer; omit those snapshots from every assistant history read.
@@ -498,7 +525,8 @@ async def filter_messages_for_scope(
             ),
             citations=message.citations if can_read else [],
             attachments=(getattr(message, "attachments", None) or []) if can_read else [],
-            steps=(getattr(message, "steps", None) or []) if can_read else [],
+            steps=[step for step in (getattr(message, "steps", None) or [])
+                   if not isinstance(step, dict) or step.get("name") != "session_context"] if can_read else [],
             prompt_preview="",
             status=(getattr(message, "status", None) or MessageStatus.OK) if can_read else MessageStatus.OK,
             error=getattr(message, "error", None) if can_read else None,
@@ -513,6 +541,7 @@ async def _history(
     *,
     principal: VerifiedPrincipal,
     requested_source_ids: list[str] | None,
+    owner_key: str | None = None,
 ) -> list[dict[str, str]]:
     rows = await session.execute(
         select(Message)
@@ -529,6 +558,7 @@ async def _history(
         list(reversed(rows.scalars().all())),
         principal=principal,
         requested_source_ids=requested_source_ids,
+        owner_key=owner_key,
     )
     return [{"role": m.role.value, "content": m.content} for m in messages]
 
@@ -597,6 +627,7 @@ class AskPlan:
     prompt_preview: str = ""
     source_ids: list[str] | None = None  # @范围：限定循环内检索工具可见的信源
     user_message_id: str | None = None
+    session_context: SessionContext | None = None
 
 
 def build_ask_context(
@@ -636,6 +667,8 @@ async def prepare_ask(
     principal: VerifiedPrincipal,
     owner_key: str,
     llm=None,
+    context_mode: str | None = None,
+    context_deadline: float | None = None,
 ) -> AskPlan:
     """落库用户消息（含图片附件 meta）、解析历史（超上下文阈值时主动压缩），组装计划。"""
     from sag_api.api.v1.attachments import attachment_path
@@ -669,12 +702,42 @@ async def prepare_ask(
     await session.commit()
     await session.refresh(user_msg)
 
+    if settings.session_context_mode != "off" and not resolved:
+        from sag_api.services.session_context.budget import BudgetExceeded
+        from sag_api.services.session_context.runtime import prepare_context, select_mode
+        from sag_api.services.session_context.types import SessionKey, require
+        mode = select_mode(query, context_mode)
+        context = None
+        try:
+            optional_deadline = (
+                (time.monotonic() + 5) if settings.session_context_mode == "shadow" else context_deadline
+            )
+            async with asyncio.timeout_at(optional_deadline):
+                context = await prepare_context(session, key=SessionKey(owner_key, agent.id, thread.id),
+                    principal=principal, user_message=user_msg, query=query, requested_source_ids=source_ids,
+                    mode=mode, deadline=optional_deadline)
+        except (ServiceUnavailableError, BudgetExceeded, TimeoutError) as error:
+            if settings.session_context_mode != "shadow":
+                raise ServiceUnavailableError(
+                    "Chưa hoàn tất context cho cuộc chat trong giới hạn lượt này. Vui lòng thử lại.",
+                    code="session_context_not_ready", retryable=True) from error
+            await get_thread(session, agent.id, thread.id, owner_key=owner_key)
+            require(principal.issued_at <= time.time() < principal.expires_at, "principal_expired")
+            logging.getLogger(__name__).warning("session context shadow unavailable type=%s", type(error).__name__)
+        if settings.session_context_mode == "on":
+            messages = context.messages(agent, query)
+            return AskPlan(query=query, messages=messages, prompt_preview=build_prompt_preview(messages),
+                source_ids=source_ids, user_message_id=user_msg.id, session_context=context)
+    elif settings.session_context_mode == "on" and resolved:
+        raise ValidationError("Context session hiện chỉ hỗ trợ câu hỏi văn bản.", code="session_context_text_only")
+
     history = await _history(
         session,
         thread.id,
         exclude_id=user_msg.id,
         principal=principal,
         requested_source_ids=source_ids,
+        owner_key=owner_key,
     )
     # 历史预算 = 上下文窗口的 40%（其余留给工具轮/回答）
     history = await compress_history(history, llm=llm, budget_tokens=int(settings.llm_context_window * 0.4))
@@ -696,6 +759,9 @@ async def delete_message(
     message = await session.get(Message, message_id)
     if message is None or message.thread_id != thread.id:
         raise NotFoundError("Message not found")
+    if settings.session_context_mode != "off":
+        from sag_api.services.session_context.storage import invalidate
+        await invalidate(session, thread.id)
     await session.delete(message)
     await session.commit()
 
@@ -710,6 +776,8 @@ async def persist_answer(
     *,
     status: MessageStatus = MessageStatus.OK,
     error: dict | None = None,
+    session_context: SessionContext | None = None,
+    principal: VerifiedPrincipal | None = None,
 ) -> str:
     """写入一条 assistant 消息。失败/取消时 answer 传部分已生成文本（可为 ""），
     并附带结构化 error {code, message, retryable, details}。"""
@@ -725,6 +793,15 @@ async def persist_answer(
             error=error,
         )
         session.add(message)
+        if session_context is not None:
+            await session.flush()
+            if status == MessageStatus.OK:
+                from sag_api.services.session_context.types import require
+                tool_sources = _message_source_ids(message)
+                require(tool_sources is not None and principal is not None, "tool_provenance_unknown")
+                await session_context.capture(session, message, principal=principal, tool_source_ids=tool_sources)
+            message.steps = [*(steps or []), {"kind": "context", "name": "session_context",
+                                              "details": session_context.metadata()}]
         await session.commit()
         await session.refresh(message)
         return message.id

@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+
 from sag_api.services.session_context.model import ModelTokenCounter
 
 

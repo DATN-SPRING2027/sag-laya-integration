@@ -17,3 +17,47 @@ Existing POST /api/v1/agents/{agent}/threads/{thread}/ask gains optional context
 Existing terminal event payload gains optional session_context (mode,state,reason,eligible,visited,evidence refs/hash/offsets) and session_accounting (calls/usage/accounting completeness, no raw prompts/keys). Original output/citations/answer_status remain. Session quotes are not forged document citations; source/span provenance is separate metadata. Existing clients can ignore additive metadata; full partial output must include a visible natural-language prefix and missing-coverage counts, so clients do not need to interpret a new SSE event to see incompleteness. No claim of browser/FE-BE acceptance until exercised.
 
 Runtime integration/coverage implementation and final results are recorded in researchtask and updated here when complete. Feature remains OFF; numeric thresholds unchanged from CALIBRATION-POLICY; new NER needs calibration and holdout before rollout. PostgreSQL shared row locks/fresh scope checks protect input/publication; SQLite/WASM tests alone cannot certify server multi-process behavior.
+
+## Existing tool-assisted requests
+
+The T4 one-attempt normal ceiling was measured on memory-only synthetic questions, with no document Sources. Applying it to existing search_context requests would break the native tool-call/result/answer protocol, which needs at least two model turns. Preserve that capability with an explicit tool_assisted budget profile when document/research tools are enabled (or an explicit time-only tool request): maxmin(7,configured agent_max_steps+1) attempts, eachinput8192/output4096, total12288*attempts, request60s. Seven follows deployed legacy six agent turns plus its finalization turn; no retry/redirect and no cloud decision-router call in this lane. Keep4096 input room for a tool result before it arrives; preserve native tool-call/result groups.
+
+This additional workload ceiling is recorded before its protocol test and before holdout; it does not lower T4 quality/token-savings gates or claim measured savings for document/web-assisted requests. Pure memory-only normal queries retain one attempt/12288total; exhaustive full-session retains12/262144/360. Enabling tools is not an authorization grant: existing Source filters/principal/mappings and document citation gate stay mandatory, explicit @Source still requires search_context. Deployment remains OFF pending the complete validation gates; actual retrieval backend acceptance is separate from a retrieval-tool test double.
+
+## Lifecycle and full-session behavior
+
+Every text ask stores current-user provenance, reads authorized full raw history and reuses only hash/model/scope-matching features. Encoder weights are process-local singletons; inference is serialized, user feature dictionaries are request-local. Missing checkpoints resume from the last committed batch. Delete invalidates the derived generation in the same transaction while enabled; raw reread/hash validation also rejects stale/deleted rows after OFF rollback. Unknown legacy assistant authority stays excluded. The trusted single-project SAG-session owner can recover legacy user statements; general assertion membership is never guessed.
+
+Before model input and final persistence, resolve current owner/project/partition/Source dependencies again. Shared PostgreSQL locks on Thread, selected Messages/provenance, index and used Source/mappings live through publication and are bounded by the shared request deadline. No distributed first-insert lease is claimed: conflicting jobs can fail closed and resume. Authorized history strips internal context markers and all frozen prompt previews; revocation hides answers whose transitive original dependencies are no longer available.
+
+Full-session skips graph retrieval caps and scans the complete eligible pinned snapshot in ordered batches. Each batch includes whole dependency closure and one prior-message overlap. Only validated map outputs mark coverage visited; intermediate items retain original role/order/timestamps/exact quotes. Reduce can use only already-validated support pairs. It never truncates intermediate items to pretend completeness. Budget exhaustion returns an explicit partial result where publication can still be validated; deadline/unknown-accounting/auth failures can terminate the run. Cancellation uses the existing native runtime handle and stores an empty CANCELLED answer, never a successful complete answer. Up to8192 validated support pairs are allowed for full output, versus128 normal, bounded by provider output/call/work caps.
+
+Simple greetings, complete arithmetic, clarification and explicit current-time requests retain existing narrow direct-intent behavior; unknown factual questions still require evidence. Time comes from the native get_time tool. All memory JSON is buffered and decoded before user-visible answer deltas; malformed references become UNKNOWN. Exact quote membership does not establish semantic correctness, which is measured separately.
+
+## Backfill and rollback operations
+
+From SAG/apps/api, run the job with private token files outside Git:
+
+```powershell
+.venv/Scripts/python.exe scripts/backfill_session_context.py --agent-id <agent> --thread-id <thread> --token-file <private-token-file>
+# Add --assertion-file <private-signed-assertion-file> for the existing assertion auth mode.
+# Add --apply only to build the derived index after the dry run is reviewed.
+```
+
+The job uses the same verified user/principal/owner functions as HTTP; there is no arbitrary owner/project option. Default dry run writes nothing. Apply uses180seconds/32Mwork units, clipped to token expiry; rerun resumes committed checkpoints. It emits counts/state, never token values/raw messages/errors. No real-chat backfill was run in this task.
+
+Rollback order: set SAG_SESSION_CONTEXT_MODE=off, stop jobs and drain active requests, retain raw chat and migrations initially; run0007 down only after readers have stopped. Source-aware history continues to hide session answers without valid provenance, including if tables were removed; a savepoint prevents a missing derived table from aborting the outer history transaction. Re-enable only after rebuilding verified metadata and passing the gates.
+
+```mermaid
+flowchart LR
+  A[Verified thread ask] --> B[Full authorized raw snapshot]
+  B --> C{Mode}
+  C -->|normal| D[Hash-bound index and graph fusion]
+  D --> E[Atomic evidence and native tool groups]
+  C -->|full session| F[Ordered maps with coverage ledger]
+  F --> G[Validated bounded reduction]
+  E --> H[Revalidate scope and provenance]
+  G --> H
+  H --> I[Persist answer and transitive dependencies]
+  I --> J[Existing SSE output with visible partial status]
+```

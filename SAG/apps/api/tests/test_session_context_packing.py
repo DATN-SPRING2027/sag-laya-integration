@@ -45,3 +45,26 @@ def test_dependency_group_is_never_partially_retained_to_fit_tokens():
     assert kept == ()
     assert "confirm BLUE" not in str(fitted) and "propose RED" not in str(fitted)
     assert fitted[-1] == messages[-1]
+
+
+def test_prompt_order_metadata_does_not_count_rows_outside_selected_authorized_evidence():
+    from datetime import UTC, datetime, timedelta
+
+    from sag_api.services.session_context.packing import evidence_block
+
+    at = datetime(2026, 1, 1, tzinfo=UTC)
+    records = {
+        "denied": SimpleNamespace(created_at=at),
+        "u": SimpleNamespace(created_at=at + timedelta(seconds=1)),
+        "a": SimpleNamespace(created_at=at + timedelta(seconds=2)),
+    }
+    payload = json.loads(evidence_block(evidence(), records=records).split("\n", 1)[1])
+    assert [item["order"] for item in payload] == [0, 1]
+    assert "denied" not in str(payload)
+
+
+def test_multiple_exact_quotes_can_support_several_items_from_one_message():
+    raw=json.dumps({"answer":"I confirm BLUE","supports":[{"id":"S1","quote":"I confirm"},
+                                                         {"id":"S1","quote":"BLUE"}]})
+    answer,supports=decode_memory_answer(raw,evidence()[:1])
+    assert answer=="I confirm BLUE" and len(supports)==2

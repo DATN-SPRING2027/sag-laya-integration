@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -92,6 +92,7 @@ class MessagePageOut(BaseModel):
 
 
 class AskRequest(BaseModel):
+    context_mode: Literal["normal", "full_session"] | None = None
     query: str = Field(default="", max_length=4000)
     # 图片附件 id 列表（≤4，经 POST /attachments 上传）
     attachments: list[str] = Field(default_factory=list, max_length=4)

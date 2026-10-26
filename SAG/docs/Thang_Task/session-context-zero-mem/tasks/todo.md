@@ -1,6 +1,6 @@
 # Checklist: Context session v1
 
-Trạng thái: T1–T3b prototype và T4 measurement/numeric contract đã thực hiện theo yêu cầu Thang. Chưa tích hợp/đạt nghiệm thu runtime; T4 rollout gate vẫn NO-GO. Theo [plan](plan.md), [SPEC](../SPEC.md), [CALIBRATION](../CALIBRATION.md) và các tài liệu liên kết cùng task.
+Trạng thái: T1–T3b prototype và T4 measurement/numeric contract đã thực hiện theo yêu cầu Thang. T5–T8 đã tích hợp và kiểm thử offline; T9 đang kiểm chứng provider/holdout. Rollout vẫn NO-GO đến khi đủ gates. Theo [plan](plan.md), [SPEC](../SPEC.md), [CALIBRATION](../CALIBRATION.md) và các tài liệu liên kết cùng task.
 
 ## Chuẩn bị đã làm
 
@@ -21,11 +21,11 @@ Trạng thái: T1–T3b prototype và T4 measurement/numeric contract đã thự
 - [x] T3a: Fixture reader/hierarchy, phân trang toàn snapshot, không last-N; structural tests và work budget. Chưa SQL adapter/semantic segmentation/production integration.
 - [x] T3b: Graph/fusion/closure prototype, pinned local encoder/NER smoke và offline tests. Quality calibration và NER production-license review vẫn còn trước rollout.
 - [x] T4 measurement/contract: calibration và numeric gates khóa trước holdout; xem [CALIBRATION](../CALIBRATION.md). **Không phải acceptance PASS**: filler-echo regression/default grounding/NER license chưa đóng; rollout vẫn NO-GO.
-- [ ] T5: DB PR/migrations/rollback riêng nếu cần persistence mới.
-- [ ] T6a: Backfill chat cũ, incremental chat mới, restart/resume.
-- [ ] T6b: Delete/revoke/concurrency/generation fences.
-- [ ] T7: Normal-mode thread ask, prompt groups, feature flag, legacy OFF.
-- [ ] T8: Full-session bounded synthesis, coverage ledger, partial/cancel behavior.
+- [x] T5: Schema/migrations0007/down riêng, SQLiteFK và PostgreSQLWASM up/down; chưa push/PR/serverPGconcurrency acceptance.
+- [x] T6a: Backfill chat cũ, incremental chat mới, restart/resume.
+- [x] T6b: Delete/revoke/generation fences và request leases; serverPG đa tiến trình còn là gate riêng.
+- [x] T7: Normal-mode thread ask, prompt groups, feature flag, legacy OFF.
+- [x] T8: Full-session bounded synthesis, coverage ledger, native partial/cancel; browser hiển thị thật còn cần acceptance.
 - [ ] T9: Holdout + provider/integration/lifecycle/rollback verification.
 
 ## Điều kiện nghiệm thu bắt buộc

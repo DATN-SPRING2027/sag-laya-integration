@@ -291,6 +291,8 @@ def _fit_agent_context(
     *,
     context_window_tokens: int,
     reserved_output_tokens: int,
+    token_counter=None,
+    required_indices=frozenset(),
 ) -> tuple[list[dict[str, Any]], int]:
     """Fit a runtime turn plus schemas and two output reservations in context.
 
@@ -305,14 +307,17 @@ def _fit_agent_context(
     context_window = max(0, int(context_window_tokens))
     output_reserve = max(0, min(context_window, int(reserved_output_tokens)))
     input_budget = max(0, context_window - output_reserve)
-    required = {index for index, message in enumerate(normalized) if message.get("role") == "system"}
+    count = _runtime_input_tokens if token_counter is None else token_counter.count
+    required = {
+        index for index, message in enumerate(normalized) if message.get("role") == "system"
+    } | set(required_indices)
     latest_user = next(
         (index for index in range(len(normalized) - 1, -1, -1) if normalized[index].get("role") == "user"),
         None,
     )
     if latest_user is not None:
         required.add(latest_user)
-    if _runtime_input_tokens([normalized[index] for index in sorted(required)], tool_schemas) > input_budget:
+    if count([normalized[index] for index in sorted(required)], tool_schemas) > input_budget:
         raise ValueError("system instructions and current query exceed the configured model context budget")
 
     units: list[list[int]] = []
@@ -347,11 +352,11 @@ def _fit_agent_context(
     for unit in reversed(units):
         candidate_indices = sorted(selected | set(unit))
         candidate_messages = [normalized[item] for item in candidate_indices]
-        if _runtime_input_tokens(candidate_messages, tool_schemas) <= input_budget:
+        if count(candidate_messages, tool_schemas) <= input_budget:
             selected.update(unit)
 
     fitted = [normalized[index] for index in sorted(selected)]
-    used_tokens = _runtime_input_tokens(fitted, tool_schemas)
+    used_tokens = count(fitted, tool_schemas)
     remaining = max(0, context_window - output_reserve - used_tokens - output_reserve)
     return fitted, remaining
 
@@ -474,7 +479,9 @@ def _enabled_tool_names(agent, *, has_sources: bool = False, knowledge_only: boo
     return list(dict.fromkeys([*_ALWAYS_TOOLS, *knowledge_tools, *_WEB_TOOLS, *configured]))
 
 
-def _adapt_tool(host_tool, host_context: HostToolContext, citations: list[dict]) -> AgentTool:
+def _adapt_tool(
+    host_tool, host_context: HostToolContext, citations: list[dict], *, memory=None, principal=None,
+) -> AgentTool:
     async def execute(
         arguments: Mapping[str, Any],
         context,
@@ -485,6 +492,11 @@ def _adapt_tool(host_tool, host_context: HostToolContext, citations: list[dict])
             host_context.search_context_no_answer_reason = None
         host_context.citation_offset = max(host_context.citation_offset, _citation_number_high_water(citations))
         result = await host_tool.invoke(dict(arguments), host_context)
+        if memory is not None:
+            source_ids = {citation["source_id"] for citation in result.citations
+                          if isinstance(citation, Mapping) and isinstance(citation.get("source_id"), str)}
+            await memory.lock_sources(source_ids, principal)
+            memory.tool_source_ids.update(source_ids)
         if host_tool.meta.name == "search_context":
             reason = result.data.get("no_answer_reason")
             host_context.search_context_no_answer_reason = str(reason) if reason else None
@@ -674,7 +686,7 @@ def _stream_event(event: RuntimeEvent, *, payload: Mapping[str, Any] | None = No
     return AgentStreamEvent(type=event.type.value, data=data)
 
 
-async def generate_stream(
+async def _generate_stream(
     session_factory: async_sessionmaker,
     *,
     plan: AskPlan,
@@ -697,6 +709,8 @@ async def generate_stream(
         await active_runtime.start()
 
     citations = list(plan.citations)
+    memory = plan.session_context
+    capture_kwargs = {"session_context": memory, "principal": principal} if memory is not None else {}
     local_evidence_required = knowledge_only or bool(plan.source_ids)
     external_references: list[dict[str, Any]] = []
     external_reference_urls: set[str] = set()
@@ -707,14 +721,15 @@ async def generate_stream(
     terminal = False
 
     async with session_factory() as session:
-        sources = await resolve_sources(
+        sources = [] if memory is not None and memory.selection.mode == "full_session" else await resolve_sources(
             session,
             agent,
             plan.source_ids,
             principal=principal,
             include_project_sources=True,
         )
-        mcp_specs = [] if knowledge_only else await resolve_mcp_specs(session, agent)
+        mcp_specs = [] if knowledge_only or (memory is not None and memory.selection.mode == "full_session") \
+            else await resolve_mcp_specs(session, agent)
     host_context = HostToolContext(
         engine_manager=engine_manager,
         sources=sources,
@@ -722,6 +737,8 @@ async def generate_stream(
         persona=agent.persona or {},
         agent=agent,
     )
+    if memory is not None:
+        await memory.lock_sources({source.id for source in sources}, principal)
 
     try:
         async with open_agent_mcp_tools(mcp_specs) as mcp_bundle:
@@ -732,7 +749,15 @@ async def generate_stream(
             )
             host_tools = [tool_registry.get(name) for name in names if tool_registry.has(name)]
             host_tools.extend(mcp_bundle.tools)
-            tools = tuple(_adapt_tool(tool, host_context, citations) for tool in host_tools)
+            if memory is not None and memory.selection.mode == "full_session":
+                host_tools = []
+            tools = tuple(_adapt_tool(tool, host_context, citations, memory=memory, principal=principal)
+                          for tool in host_tools)
+            if memory is not None and memory.selection.mode == "normal" and (
+                any(_tool_supports_research(tool) for tool in tools)
+                or _TIME_ONLY_INTENT.fullmatch(" ".join(plan.query.strip().split()))
+            ):
+                memory.enable_tool_budget(settings.agent_max_steps)
             scene_notes: list[str] = []
             if "search_context" in names:
                 scene_notes.append(
@@ -774,18 +799,38 @@ async def generate_stream(
                     + ", ".join(source.name for source in sources)
                     + ". Nếu câu hỏi liên quan đến tài liệu, trước tiên phải gọi search_context và chỉ trả lời dựa trên bằng chứng được trả về."
                 )
+            if memory is not None:
+                scene_notes.append(
+                    "Bằng chứng SESSION_EVIDENCE_JSON đã được kiểm tra quyền cho cuộc chat này. "
+                    "Có thể dùng trực tiếp để trả lời về lời nói/quyết định trong cuộc chat, kể cả khi tắt Internet; "
+                    "không coi đó là bằng chứng tài liệu bên ngoài. Giữ đúng JSON answer/supports "
+                    "và trích nguyên văn quote từ evidence. Nếu không có căn cứ, answer là UNKNOWN."
+                )
             run_messages = _append_current_scene(list(plan.messages), scene_notes)
             # Freeze the actual initial input before the runtime appends model
             # output and tool-result messages. This is the only content the UI
             # may describe as the model's starting context.
             frozen_prompt_preview = build_prompt_preview(run_messages)
-            initial_tool_choice = await _initial_tool_choice(
+            initial_tool_choice = "auto" if memory is not None else await _initial_tool_choice(
                 plan.query,
                 tools,
                 knowledge_only=knowledge_only,
                 scoped=bool(plan.source_ids),
             )
-            local_grounding_required = (
+            if memory is not None and memory.selection.mode == "normal" and plan.source_ids \
+                    and any(tool.spec.name == "search_context" for tool in tools):
+                initial_tool_choice = _named_tool_choice("search_context")
+            normalized_query = " ".join(plan.query.strip().split())
+            direct_memory_intent = (
+                memory is not None and memory.selection.mode == "normal" and not plan.source_ids
+                and any(pattern.fullmatch(normalized_query) for pattern in (
+                    _DIRECT_INTENT, _CLARIFICATION_FIRST_INTENT, _SIMPLE_ARITHMETIC, _TIME_ONLY_INTENT))
+            )
+            if direct_memory_intent:
+                initial_tool_choice = (_named_tool_choice("get_time")
+                    if _TIME_ONLY_INTENT.fullmatch(normalized_query) and any(t.spec.name == "get_time" for t in tools)
+                    else "none")
+            local_grounding_required = (memory is not None and not direct_memory_intent) or (
                 local_evidence_required
                 and initial_tool_choice != "none"
                 and not _TIME_ONLY_INTENT.fullmatch(" ".join(plan.query.strip().split()))
@@ -796,12 +841,28 @@ async def generate_stream(
             tool_schemas = [tool.spec.to_model_schema() for tool in tools]
 
             def transform_context(messages, _runtime_context):
-                fitted, evidence_budget = _fit_agent_context(
-                    messages,
-                    tool_schemas,
-                    context_window_tokens=settings.llm_context_window,
-                    reserved_output_tokens=settings.llm_max_tokens,
-                )
+                if memory is not None:
+                    if memory.selection.mode == "full_session":
+                        return [_runtime_message_dict(item) for item in messages]
+                    from sag_api.services.session_context.packing import PREFIX, evidence_block
+                    normalized = [_runtime_message_dict(item) for item in messages]
+                    frames = frozenset(index for index, item in enumerate(normalized)
+                        if item.get("role") == "user" and str(item.get("content", "")).startswith(PREFIX))
+                    for index in frames:
+                        normalized[index] = {**normalized[index], "content": evidence_block(())}
+                    fitted, _ = _fit_agent_context(normalized, tool_schemas,
+                        context_window_tokens=memory.budget.limits.context_window_tokens,
+                        reserved_output_tokens=memory.budget.limits.output_reserve_tokens,
+                        token_counter=memory.counter, required_indices=frames)
+                    fitted = memory.fit(fitted, tool_schemas)
+                    evidence_budget = max(0, memory.input_limit - memory.counter.count(fitted, tool_schemas))
+                else:
+                    fitted, evidence_budget = _fit_agent_context(
+                        messages,
+                        tool_schemas,
+                        context_window_tokens=settings.llm_context_window,
+                        reserved_output_tokens=settings.llm_max_tokens,
+                    )
                 host_context.evidence_token_budget = evidence_budget
                 visible_citations = {
                     int(number)
@@ -930,7 +991,7 @@ async def generate_stream(
                     delta = payload.get("delta")
                     if isinstance(delta, str):
                         partial_answer.append(delta)
-                    if local_grounding_required or host_context.search_context_called:
+                    if memory is not None or local_grounding_required or host_context.search_context_called:
                         # Keep unvalidated knowledge claims private until the
                         # terminal citation/provenance gate selects the answer.
                         continue
@@ -943,8 +1004,19 @@ async def generate_stream(
                     else:
                         trace.append({"kind": "answer", "step": event.turn, "ms": duration})
                 elif event.type == EventType.RUN_COMPLETED:
+                    raw_output = str(payload.get("output") or "")
+                    memory_supports = []
+                    if memory is not None:
+                        from sag_api.services.session_context.packing import decode_memory_answer
+                        await memory.revalidate(memory.lease_session, principal)
+                        raw_output, memory_supports = decode_memory_answer(
+                            raw_output, memory.resolved, original=memory.original,
+                            max_supports=8192 if memory.selection.mode == "full_session" else 128,
+                        )
+                        if memory.selection.mode == "full_session" and memory.first_model_messages:
+                            frozen_prompt_preview = build_prompt_preview(memory.first_model_messages)
                     canonical_answer, internal_citations = _finalize_answer_citations(
-                        str(payload.get("output") or ""),
+                        raw_output,
                         citations,
                     )
                     answer_status = "answered"
@@ -952,7 +1024,7 @@ async def generate_stream(
                     has_internal_claim = any(citation.get("claim_level") == "claim" for citation in internal_citations)
                     external_start = _citation_number_high_water(internal_citations) + 1
                     external_citations = _build_external_citations(
-                        str(payload.get("output") or ""),
+                        raw_output,
                         external_references,
                         start_n=external_start,
                     )
@@ -962,8 +1034,15 @@ async def generate_stream(
                         requires_grounded_answer
                         and not has_internal_claim
                         and (local_evidence_required or not has_external_claim)
+                        and not (memory is not None and memory_supports
+                                 and (not plan.source_ids or memory.selection.mode == "full_session"))
                     ):
-                        canonical_answer = empty_response or no_answer_text()
+                        canonical_answer = "UNKNOWN" if memory is not None else empty_response or no_answer_text()
+                        if memory is not None and memory.selection.mode == "full_session" \
+                                and memory.selection.state != "ready":
+                            canonical_answer = (
+                                "Kết quả chưa đầy đủ: chưa thể xác nhận bao phủ toàn bộ lịch sử.\n\nUNKNOWN"
+                            )
                         internal_citations = []
                         external_citations = []
                         answer_status = "no_answer"
@@ -978,6 +1057,7 @@ async def generate_stream(
                             canonical_citations,
                             steps=trace,
                             prompt_preview=frozen_prompt_preview,
+                            **capture_kwargs,
                         )
                     output_payload = {
                         **payload,
@@ -987,6 +1067,7 @@ async def generate_stream(
                         "answer_status": answer_status,
                         "no_answer_reason": no_answer_reason,
                         "prompt_preview": frozen_prompt_preview,
+                        **({"session_context": memory.metadata()} if memory is not None else {}),
                     }
                     terminal = True
                 elif event.type in (EventType.RUN_FAILED, EventType.RUN_CANCELLED):
@@ -999,6 +1080,10 @@ async def generate_stream(
                     if host_context.search_context_called or local_grounding_required:
                         canonical_answer = ""
                         internal_citations = []
+                    if memory is not None:
+                        from dataclasses import replace
+                        memory.selection = replace(memory.selection, state="partial",
+                            reason="cancelled" if event.type == EventType.RUN_CANCELLED else "generation_failed")
                     error_payload = payload.get("error") if isinstance(payload, Mapping) else None
                     status = (
                         MessageStatus.CANCELLED
@@ -1016,6 +1101,7 @@ async def generate_stream(
                             prompt_preview=frozen_prompt_preview,
                             status=status,
                             error=dict(error_payload) if isinstance(error_payload, Mapping) else None,
+                            **capture_kwargs,
                         )
                     output_payload = {
                         **payload,
@@ -1025,7 +1111,7 @@ async def generate_stream(
                     }
                     terminal = True
 
-                if event.type == EventType.RUN_COMPLETED and requires_grounded_answer:
+                if event.type == EventType.RUN_COMPLETED and (memory is not None or requires_grounded_answer):
                     delta_data = {
                         "type": EventType.MESSAGE_DELTA.value,
                         "run_id": event.run_id,
@@ -1044,3 +1130,81 @@ async def generate_stream(
             await handle.result()
         if owns_runtime:
             await active_runtime.stop()
+
+
+async def generate_stream(
+    session_factory,
+    *,
+    plan: AskPlan,
+    agent,
+    thread_id,
+    engine_manager,
+    llm,
+    tool_registry,
+    runtime=None,
+    knowledge_only=False,
+    principal=None,
+):
+    """Keep legacy callers unchanged; thread memory holds a validated evidence lease."""
+    if plan.session_context is None:
+        async for event in _generate_stream(
+            session_factory,
+            plan=plan,
+            agent=agent,
+            thread_id=thread_id,
+            engine_manager=engine_manager,
+            llm=llm,
+            tool_registry=tool_registry,
+            runtime=runtime,
+            knowledge_only=knowledge_only,
+            principal=principal,
+        ):
+            yield event
+        return
+    from sag_api.services.session_context.model import BudgetedLLM
+
+    context = plan.session_context
+    async with context.lease(session_factory, principal) as lease_session:
+
+        async def validate():
+            await context.revalidate(lease_session, principal)
+            await context.lock_sources(context.tool_source_ids, principal)
+            context.note_dispatch()
+
+        bounded = BudgetedLLM(llm._settings, budget=context.budget, counter=context.counter, before_dispatch=validate)
+        context.active_model = bounded
+        provider = bounded
+        if context.selection.mode == "full_session":
+            from sag_api.services.session_context.aggregate import FullSessionModel
+
+            provider = FullSessionModel(context, bounded, plan.query)
+        async for event in _generate_stream(
+            session_factory,
+            plan=plan,
+            agent=agent,
+            thread_id=thread_id,
+            engine_manager=engine_manager,
+            llm=provider,
+            tool_registry=tool_registry,
+            runtime=runtime,
+            knowledge_only=knowledge_only,
+            principal=principal,
+        ):
+            if event.type in {"run.completed", "run.failed", "run.cancelled"}:
+                event.data["payload"]["session_accounting"] = bounded.accounting()
+                ledger = bounded.accounting()
+                if ledger["accounting_complete"]:
+                    usage = dict(event.data["payload"].get("usage") or {})
+                    usage.update(
+                        requests=ledger["logical_calls"],
+                        input_tokens=ledger["input_tokens"],
+                        output_tokens=ledger["output_tokens"],
+                        total_tokens=ledger["input_tokens"] + ledger["output_tokens"],
+                    )
+                    event.data["payload"]["usage"] = usage
+                event.data["payload"]["session_context"] = (
+                    context.metadata()
+                    if event.type == "run.completed"
+                    else {"mode": context.selection.mode, "state": "partial", "reason": context.selection.reason}
+                )
+            yield event

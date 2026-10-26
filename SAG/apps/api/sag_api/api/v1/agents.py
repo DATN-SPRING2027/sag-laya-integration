@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, Query
@@ -8,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
 from sag_agent import AgentRuntime, EventType, RunHandle
+from sag_api.core.config import settings
 from sag_api.core.conversation_ownership import get_conversation_owner
 from sag_api.core.db import SessionLocal, get_session
 from sag_api.core.deps import (
@@ -18,7 +21,7 @@ from sag_api.core.deps import (
     get_tool_registry,
 )
 from sag_api.core.error_taxonomy import ErrorCode
-from sag_api.core.errors import ConfigurationError, ConflictError, NotFoundError
+from sag_api.core.errors import ConfigurationError, ConflictError, NotFoundError, ServiceUnavailableError
 from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal, require_project_read_principal
 from sag_api.db.models import User
@@ -243,6 +246,7 @@ async def messages(
         session,
         page.items,
         principal=principal,
+        owner_key=owner_key,
     )
     return MessagePageOut(
         items=[MessageOut.model_validate(message) for message in visible_messages],
@@ -363,21 +367,33 @@ async def ask(
     tool_registry: ToolRegistry = Depends(get_tool_registry),
     agent_runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> EventSourceResponse:
-    agent = await svc.get_agent(session, agent_id, owner_key=owner_key)
-    thread = await svc.get_thread(session, agent.id, thread_id, owner_key=owner_key)
-    if not llm.configured:
-        raise ConfigurationError("尚未配置 LLM，无法生成回答")
-    plan = await svc.prepare_ask(
-        session,
-        agent=agent,
-        thread=thread,
-        query=body.query,
-        attachments=body.attachments,
-        source_ids=body.source_ids,
-        principal=principal,
-        owner_key=owner_key,
-        llm=llm,
-    )
+    deadline = None
+    if settings.session_context_mode == "on":
+        from sag_api.services.session_context.runtime import select_mode
+        seconds = 360 if select_mode(body.query, body.context_mode) == "full_session" else 60
+        deadline = time.monotonic() + min(seconds, max(0, principal.expires_at - time.time()))
+    try:
+        async with asyncio.timeout_at(deadline):
+            agent = await svc.get_agent(session, agent_id, owner_key=owner_key)
+            thread = await svc.get_thread(session, agent.id, thread_id, owner_key=owner_key)
+            if not llm.configured:
+                raise ConfigurationError("尚未配置 LLM，无法生成回答")
+            plan = await svc.prepare_ask(
+                session,
+                agent=agent,
+                thread=thread,
+                query=body.query,
+                attachments=body.attachments,
+                source_ids=body.source_ids,
+                principal=principal,
+                owner_key=owner_key,
+                llm=llm,
+                context_mode=body.context_mode,
+                context_deadline=deadline,
+            )
+    except TimeoutError as error:
+        raise ServiceUnavailableError("Chưa hoàn tất context trong giới hạn lượt này. Vui lòng thử lại.",
+            code="session_context_not_ready",retryable=True) from error
     web_enabled = body.effective_web_enabled
 
     async def event_gen():
