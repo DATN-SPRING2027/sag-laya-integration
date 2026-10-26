@@ -2,13 +2,15 @@
 
 Ngày: 2026-10-26. Chủ yêu cầu: Thang.
 
-**Trạng thái:** yêu cầu sản phẩm đã được Thang xác nhận; thiết kế selector là bản đề xuất để review. T1 corpus/replay baseline đã thực hiện theo yêu cầu tiếp theo của Thang, xem [BASELINE](BASELINE.md). Selector mới chưa triển khai, chưa đạt nghiệm thu sản phẩm/runtime.
+**Trạng thái:** yêu cầu sản phẩm đã được Thang xác nhận; T1 baseline, T2 contracts, T3a reader/hierarchy và T3b selector prototype offline đã thực hiện. Thiết kế cần review; chưa tích hợp hoặc đạt nghiệm thu sản phẩm/runtime. Baseline tại [BASELINE](BASELINE.md).
 
 Tài liệu cùng task: [nghiên cứu hiện trạng](researchtask.md), [kế hoạch](tasks/plan.md), [checklist](tasks/todo.md).
 
-**T2 đã thực hiện:** [hợp đồng evidence/scope/provenance/budget](CONTRACT.md) và validators/tests nội bộ. Chưa nối selector hoặc grounding vào runtime; T3–T9 vẫn còn. Full-session không được báo hoàn tất khi còn lịch sử thiếu provenance; partition stamp gốc không được suy từ project hiện tại.
+**T2 đã thực hiện:** [hợp đồng evidence/scope/provenance/budget](CONTRACT.md) và validators/tests nội bộ. Chưa nối selector hoặc grounding vào runtime. Full-session không được báo hoàn tất khi còn lịch sử thiếu provenance; partition stamp gốc không được suy từ project hiện tại.
 
-**T3a đã thực hiện:** [reader/hierarchy offline](READER-HIERARCHY.md), pinned fixture keyset pages và turn/window/temporal episode/local views có nguyên văn provenance. T3b retrieval/graph và T4–T9 vẫn còn; không coi temporal grouping là semantic episode segmentation hoặc production reader.
+**T3a đã thực hiện:** [reader/hierarchy offline](READER-HIERARCHY.md), pinned fixture keyset pages và turn/window/temporal episode/local views có nguyên văn provenance. Không coi temporal grouping là semantic episode segmentation hoặc production reader.
+
+**T3b đã thực hiện:** [graph/fusion/closure offline](GRAPH-SELECTION.md), optional learned encoder/NER revisions ghim và synthetic model smoke. Chưa có product thresholds, model quality/license rollout acceptance hoặc T4–T9; không coi là tái lập nguyên vẹn paper.
 
 ## 1. Mục tiêu và quyết định đã xác nhận
 

@@ -58,7 +58,7 @@ Tests mới: `tests/test_session_context_reader.py`, `tests/test_session_context
 
 12 ca **calibration** của corpus T1 được expand để kiểm mỗi message có turn và mọi gold quote quay về raw. Đây là kiểm giữ dữ liệu cấu trúc; không chạy query retrieval, không đánh giá answer accuracy/recall, không tuning hoặc chạy holdout. Assistant fixture được khai báo synthetic, không dùng fixture metadata để suy provenance chat thật.
 
-Nhánh `feat/Thang-session-context-reader-be-api` có phụ thuộc local T1 `f82eb78` và T2 `eb822bc`, origin/main vẫn `7772270` lúc bắt đầu. Không thêm schema/migration, env/config, dependency, public API hay thay đổi FE. Rollback riêng commit T3a; không data rollback. T3b còn graph/selection/fusion/closure và nghiên cứu encoder/NER.
+Nhánh `feat/Thang-session-context-reader-be-api` có phụ thuộc local T1 `f82eb78` và T2 `eb822bc`, origin/main vẫn `7772270` lúc bắt đầu. Không thêm schema/migration, env/config, dependency, public API hay thay đổi FE trong T3a. Rollback riêng commit T3a; không data rollback. T3b sau đó đã thực hiện tại [GRAPH-SELECTION](GRAPH-SELECTION.md), gồm graph/selection/fusion/closure và optional encoder/NER smoke.
 
 Lệnh từ `SAG/apps/api`:
 

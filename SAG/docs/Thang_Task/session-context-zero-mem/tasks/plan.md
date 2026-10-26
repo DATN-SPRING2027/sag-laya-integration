@@ -2,7 +2,7 @@
 
 **T1/T2 đã thực hiện theo yêu cầu Thang:** baseline ở [BASELINE](../BASELINE.md); hợp đồng nội bộ và validators/tests ở [CONTRACT](../CONTRACT.md). Thiết kế tổng thể cần review cùng [SPEC](../SPEC.md). Không mở rộng thành thay retrieval tài liệu hay chat chéo session.
 
-**T3a đã thực hiện:** fixture reader/hierarchy và structural tests ở [READER-HIERARCHY](../READER-HIERARCHY.md). T3b retrieval/graph và T4–T9 chưa triển khai.
+**T3a/T3b đã thực hiện:** reader/hierarchy tại [READER-HIERARCHY](../READER-HIERARCHY.md), graph/fusion/closure prototype offline và learned-model smoke tại [GRAPH-SELECTION](../GRAPH-SELECTION.md). T4–T9 chưa triển khai.
 
 ## Thứ tự và phụ thuộc
 
@@ -47,7 +47,7 @@ Thực hiện tuần tự; task lớn phải tách thành PR nhỏ trước khi 
 Tách thành T3a và T3b, không gom quá 5 files mỗi phần:
 
 - **T3a đã thực hiện:** `services/session_context/reader.py`, `hierarchy.py`, `tests/test_session_context_reader.py`, `tests/test_session_context_hierarchy.py`. Fixture-only pinned keyset reader, T2 prefilter, temporal views, spans/ID/coverage và work metering; kiểm 431 messages và calibration corpus. Chưa là SQL/durable reader hoặc semantic episode segmentation; không chạy retrieval/answer evaluation/holdout.
-- **T3b:** graph retrieval + fusion/closure; files đề xuất `services/session_context/graph.py`, `selection.py` và 2 test files. Verify golden ranking/closure có bridge, query nối, không entity anchor và boundaries.
+- **T3b đã thực hiện:** `services/session_context/graph.py`, `selection.py`, 2 test files và optional extra tại `pyproject.toml` (5 files implementation/config/tests). Graph + PPR, lexical/dense hierarchy, normalized fusion, graph/local/dependency closure và caps. 33 offline cases, actual encoder/NER smoke riêng; sai khác paper/quality/license/production gaps ghi trong GRAPH-SELECTION. Không chạy holdout hoặc live answer generation.
 - Prototype dùng fixture store; chưa biến thành runtime memory ephemeral không bền. Encoder/NER phải nghiên cứu API/model/version và dependency trước khi cài; ghi sai khác nếu đổi so với phương pháp tham chiếu.
 - Dependencies: T2, T3b sau T3a. Không dùng LLM để tạo memory summaries trong normal selection.
 
