@@ -25,7 +25,7 @@ Trạng thái: T1–T3b prototype và T4 measurement/numeric contract đã thự
 - [x] T6a: Backfill chat cũ, incremental chat mới, restart/resume.
 - [x] T6b: Delete/revoke/generation fences và request leases; serverPG đa tiến trình còn là gate riêng.
 - [x] T7: Normal-mode thread ask, prompt groups, feature flag, legacy OFF.
-- [x] T8: Full-session bounded synthesis, coverage ledger, native partial/cancel; browser hiển thị thật còn cần acceptance.
+- [x] T8: Full-session bounded synthesis, coverage ledger, native partial/cancel; browser fixture livepartial/reload đã kiểm chứng (evidence/browser).
 - [ ] T9: Holdout + provider/integration/lifecycle/rollback verification.
 
 ## Điều kiện nghiệm thu bắt buộc
@@ -38,7 +38,7 @@ Trạng thái: T1–T3b prototype và T4 measurement/numeric contract đã thự
 - [ ] Mọi model request/retry/compression/synthesis được tính usage; unknown khác zero.
 - [ ] Không giảm chất lượng theo ngưỡng ghim trước holdout; cải thiện nhớ thông tin cũ.
 - [ ] Savings normal session dài được đo; full-session có báo cáo riêng.
-- [ ] Client thật hiển thị giới hạn/partial theo contract đã duyệt.
+- [x] Client SAG thật hiển thị partial/live/reload qua API/provider thật, không mock HTTP; Continuum embed riêng chưa chứng nhận.
 - [ ] Không thay retrieval/ingestion tài liệu hoặc BE identity ngoài scope.
 
 ## Handoff triển khai sau này

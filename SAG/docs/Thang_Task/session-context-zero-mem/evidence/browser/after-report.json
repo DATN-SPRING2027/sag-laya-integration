@@ -1,0 +1,15 @@
+{
+  "consoleErrors": [],
+  "exceptions": [],
+  "failedRequests": [],
+  "httpErrors": [],
+  "screenshots": [
+    "partial-390.png",
+    "partial-768.png",
+    "partial-1280.png",
+    "partial-1440.png"
+  ],
+  "visiblePartial": true,
+  "visibleFact": true,
+  "partialAfterReload": true
+}

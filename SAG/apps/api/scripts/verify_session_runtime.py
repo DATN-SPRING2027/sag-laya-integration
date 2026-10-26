@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -16,12 +17,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 import eval_session_context as baseline
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from sag_api.core.config import settings
 from sag_api.core.principal_assertion import VerifiedPrincipal
 from sag_api.db.base import Base
-from sag_api.db.models import Agent, Message, Thread
+from sag_api.db.models import Agent, Message, SessionContextIndex, Thread
 from sag_api.enums import MessageRole
 from sag_api.generation.llm import LLMClient, _attr
 from sag_api.sag import EngineManager
@@ -35,6 +37,8 @@ from sag_api.services.session_context.scope import resolve_scope
 from sag_api.services.session_context.storage import record_provenance
 from sag_api.services.session_context.types import SessionKey
 from sag_api.tools import registry
+
+INDEX_TEMPLATES = {}  # Standalone synthetic harness only, never an application cache.
 
 
 async def candidate(case, *, web_enabled):
@@ -90,11 +94,23 @@ async def candidate(case, *, web_enabled):
             await session.commit()
             cold = time.monotonic()
             if case["group"] == "normal":
-                encoder = await asyncio.to_thread(configured_encoder)
-                work = BudgetState(BudgetLimits(12288, 4096, 1, 12288, 32000000, time.monotonic() + 180))
-                async with asyncio.timeout(180):
-                    await sync_index(session, scope=scope, encoder=encoder, budget=work)
-                result["cold_index_work_units"] = work.index_units
+                template = INDEX_TEMPLATES.get(case["id"])
+                result["index_template_reused"] = template is not None
+                if template is not None:
+                    session.add(SessionContextIndex(**copy.deepcopy(template)))
+                    await session.commit()
+                    result["cold_index_work_units"] = 0
+                else:
+                    encoder = await asyncio.to_thread(configured_encoder)
+                    work = BudgetState(BudgetLimits(12288, 4096, 1, 12288, 32000000, time.monotonic() + 180))
+                    async with asyncio.timeout(180):
+                        await sync_index(session, scope=scope, encoder=encoder, budget=work)
+                    result["cold_index_work_units"] = work.index_units
+                    row = await session.scalar(select(SessionContextIndex))
+                    INDEX_TEMPLATES[case["id"]] = {
+                        attribute.key: copy.deepcopy(getattr(row, attribute.key))
+                        for attribute in row.__mapper__.column_attrs
+                    }
             result["cold_index_ms"] = round((time.monotonic() - cold) * 1000, 2)
             warm = time.monotonic()
             plan = await agent_domain.prepare_ask(
@@ -184,6 +200,7 @@ async def run(args):
         try:
             response = await original(finite, **kwargs)
             if not kwargs.get("stream"):
+                record["synthetic_output"] = _attr(_attr(response, "choices")[0], "message").content
                 ledger.usage(record, _attr(response, "usage"))
                 record["status"] = "completed"
                 return response
@@ -191,6 +208,11 @@ async def run(args):
             async def stream():
                 try:
                     async for chunk in response:
+                        choices = _attr(chunk, "choices") or []
+                        if choices:
+                            text = _attr(_attr(choices[0], "delta"), "content")
+                            if isinstance(text, str):
+                                record["synthetic_output"] = record.get("synthetic_output", "") + text
                         ledger.usage(record, _attr(chunk, "usage"))
                         yield chunk
                     record["status"] = "completed"
@@ -214,7 +236,7 @@ async def run(args):
     with ledger.capture_deployments(), patch.object(model, "session_completion", observed):
         for case in cases:
             for web in (False, True):
-                for variant in ("legacy", "runtime"):
+                for variant in ("legacy", "runtime") if args.variants == "both" else (args.variants,):
                     key = (case["id"], web, variant)
                     if any((row["case_id"], row["web_enabled"], row["variant"]) == key for row in report["results"]):
                         continue
@@ -253,6 +275,7 @@ if __name__ == "__main__":
     parser.add_argument("--live", action="store_true", required=True)
     parser.add_argument("--split", choices=("calibration", "holdout"), required=True)
     parser.add_argument("--case", action="append")
+    parser.add_argument("--variants", choices=("both", "legacy", "runtime"), default="both")
     parser.add_argument("--output", required=True)
     parser.add_argument("--max-calls", type=int, default=180)
     parser.add_argument("--max-seconds", type=float, default=2400)

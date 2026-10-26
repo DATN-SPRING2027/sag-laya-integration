@@ -6,6 +6,7 @@ boundaries are doubled; authentication dependencies are never overridden.
 """
 
 import json
+from datetime import datetime
 
 import httpx
 import pytest
@@ -104,6 +105,40 @@ async def test_http_explicit_full_mode_serializes_visible_partial_and_persists_i
     async with factory() as session:
         saved = await session.get(Message, terminal["message_id"])
         assert saved.content == terminal["output"]
+
+
+@pytest.mark.asyncio
+async def test_http_sanitized_memory_delta_retains_complete_agent_event_envelope(session_http):
+    """Match native FE parseFrame's checks, including the terminal replacement delta."""
+    client, _, _ = session_http
+    response = await client.post(PATH, json={"query": QUERY, "context_mode": "full_session", "web_enabled": False})
+    assert response.status_code == 200
+    events = []
+    for frame in response.text.replace("\r\n", "\n").split("\n\n"):
+        lines = frame.splitlines()
+        data = [line.removeprefix("data:").lstrip() for line in lines if line.startswith("data:")]
+        if not data:
+            continue
+        event = json.loads("\n".join(data))
+        wire_types = [line.removeprefix("event:").strip() for line in lines if line.startswith("event:")]
+        assert isinstance(event, dict)
+        assert type(event.get("version")) in (int, float), event.get("type")
+        assert isinstance(event.get("type"), str)
+        assert isinstance(event.get("run_id"), str) and event["run_id"]
+        assert type(event.get("sequence")) in (int, float)
+        assert isinstance(event.get("payload"), dict)
+        assert wire_types == [event["type"]]
+        # The canonical runtime envelope also retains these fields even though
+        # today's FE parser does not yet enforce them.
+        assert isinstance(event.get("timestamp"), str)
+        assert datetime.fromisoformat(event["timestamp"]).tzinfo is not None
+        assert type(event.get("turn")) is int
+        events.append(event)
+    deltas = [event for event in events if event["type"] == "message.delta"]
+    assert any("chưa đầy đủ" in event["payload"].get("delta", "").casefold() for event in deltas)
+    assert events[-1]["type"] == "run.completed"
+    assert len({event["run_id"] for event in events}) == 1
+    assert [event["sequence"] for event in events] == sorted({event["sequence"] for event in events})
 
 
 @pytest.mark.asyncio

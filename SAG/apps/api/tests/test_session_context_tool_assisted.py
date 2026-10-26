@@ -185,3 +185,44 @@ async def test_context_on_can_answer_time_only_query_from_actual_native_system_t
     terminal = next(event.data["payload"] for event in events if event.type == "run.completed")
     assert len(requests) == 2 and observed_time
     assert terminal["answer_status"] == "answered" and terminal["output"] == observed_time[0]
+
+
+@pytest.mark.asyncio
+async def test_actual_time_tool_alone_does_not_expand_non_time_memory_budget(storage_db, monkeypatch):
+    factory, scope = storage_db
+    monkeypatch.setattr(settings, "session_context_mode", "on")
+    monkeypatch.setattr(context_runtime, "configured_encoder", lambda: Encoder())
+    monkeypatch.setattr(context_runtime, "ModelTokenCounter", lambda *args, **kwargs: Counter())
+    query = "Which dashboard code did I confirm?"
+    async with factory() as session:
+        session.add(raw("fact", content="I confirm dashboard code BLUE-472."))
+        await session.commit()
+        agent, thread = await session.get(Agent, "agent"), await session.get(Thread, "thread")
+        plan = await prepare_ask(session, agent=agent, thread=thread, query=query,
+                                 principal=principal(scope), owner_key="owner")
+    requests = []
+
+    async def completion(config, **request):
+        requests.append(request)
+        frame = next(message["content"] for message in request["messages"]
+                     if str(message.get("content", "")).startswith("SESSION_EVIDENCE_JSON\n"))
+        item = next(item for item in json.loads(frame.split("\n", 1)[1]) if "BLUE-472" in item["text"])
+
+        async def chunks():
+            output = json.dumps({"answer": "BLUE-472", "supports": [{"id": item["id"], "quote": "BLUE-472"}]})
+            yield {"choices": [{"delta": {"content": output}, "finish_reason": "stop"}],
+                   "usage": {"prompt_tokens": 40, "completion_tokens": 20}}
+        return chunks()
+
+    monkeypatch.setattr(model_module, "session_completion", completion)
+    registry = ToolRegistry()
+    registry.register(GetTimeTool())  # Use the real description, which mentions "truy vấn".
+    config = Settings(_env_file=None, llm_api_key="offline-test", llm_model="Qwen/Qwen3-8B")
+    events = [event async for event in generate_stream(factory, plan=plan, agent=agent, thread_id="thread",
+        engine_manager=EngineManager(config), llm=LLMClient(config), tool_registry=registry,
+        knowledge_only=True, principal=principal(scope))]
+    terminal = next(event.data["payload"] for event in events if event.type == "run.completed")
+    assert terminal["output"] == "BLUE-472" and len(requests) == 1
+    assert plan.session_context.budget.limits.max_calls == 1
+    assert plan.session_context.budget.limits.max_total_tokens == 12288
+    assert terminal["session_context"]["budget_profile"] == "memory"

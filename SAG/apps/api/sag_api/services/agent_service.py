@@ -754,7 +754,7 @@ async def _generate_stream(
             tools = tuple(_adapt_tool(tool, host_context, citations, memory=memory, principal=principal)
                           for tool in host_tools)
             if memory is not None and memory.selection.mode == "normal" and (
-                any(_tool_supports_research(tool) for tool in tools)
+                any(tool.spec.name != "get_time" and _tool_supports_research(tool) for tool in tools)
                 or _TIME_ONLY_INTENT.fullmatch(" ".join(plan.query.strip().split()))
             ):
                 memory.enable_tool_budget(settings.agent_max_steps)
@@ -1113,6 +1113,7 @@ async def _generate_stream(
 
                 if event.type == EventType.RUN_COMPLETED and (memory is not None or requires_grounded_answer):
                     delta_data = {
+                        **event.to_dict(),
                         "type": EventType.MESSAGE_DELTA.value,
                         "run_id": event.run_id,
                         "sequence": event.sequence,
