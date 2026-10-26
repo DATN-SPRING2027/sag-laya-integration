@@ -1,6 +1,6 @@
 # Checklist: Context session v1
 
-Trạng thái: yêu cầu sản phẩm đã chốt; T1 baseline và T2 hợp đồng nội bộ đã thực hiện theo yêu cầu Thang. Selector mới chưa implementation. Theo [plan](plan.md), [SPEC](../SPEC.md), [BASELINE](../BASELINE.md) và [CONTRACT](../CONTRACT.md).
+Trạng thái: yêu cầu sản phẩm đã chốt; T1 baseline, T2 hợp đồng nội bộ và T3a reader/hierarchy offline đã thực hiện theo yêu cầu Thang. Selector retrieval mới chưa implementation. Theo [plan](plan.md), [SPEC](../SPEC.md), [BASELINE](../BASELINE.md), [CONTRACT](../CONTRACT.md) và [READER-HIERARCHY](../READER-HIERARCHY.md).
 
 ## Chuẩn bị đã làm
 
@@ -18,7 +18,7 @@ Trạng thái: yêu cầu sản phẩm đã chốt; T1 baseline và T2 hợp đ�
 - [x] T0: Thang cho phép phạm vi T1 baseline sau khi chốt yêu cầu. Thiết kế selector/DB/API ở T2 trở đi vẫn cần review, chưa coi là đã duyệt.
 - [x] T1: Version corpus/gold; observer compression/generation, usage missing và observed deployment failures; chạy 24 replay calibration qua provider thật. Giới hạn SDK retry/billing visibility và giá tiền chưa xác minh được ghi rõ trong BASELINE.
 - [x] T2: Hợp đồng nội bộ snapshot, typed evidence/coverage/budget và dependency/ACL validators/tests; xem [CONTRACT](../CONTRACT.md). Chưa có production caller hoặc durable fence.
-- [ ] T3a: Reader/hierarchy, phân trang không giới hạn phạm vi nhớ.
+- [x] T3a: Fixture reader/hierarchy, phân trang toàn snapshot, không last-N; structural tests và work budget. Chưa SQL adapter/semantic segmentation/production integration.
 - [ ] T3b: Graph/fusion/closure, model NER/encoder được xác minh.
 - [ ] T4: Calibration; chốt budgets/thresholds trước holdout.
 - [ ] T5: DB PR/migrations/rollback riêng nếu cần persistence mới.

@@ -8,6 +8,8 @@ Tài liệu cùng task: [nghiên cứu hiện trạng](researchtask.md), [kế h
 
 **T2 đã thực hiện:** [hợp đồng evidence/scope/provenance/budget](CONTRACT.md) và validators/tests nội bộ. Chưa nối selector hoặc grounding vào runtime; T3–T9 vẫn còn. Full-session không được báo hoàn tất khi còn lịch sử thiếu provenance; partition stamp gốc không được suy từ project hiện tại.
 
+**T3a đã thực hiện:** [reader/hierarchy offline](READER-HIERARCHY.md), pinned fixture keyset pages và turn/window/temporal episode/local views có nguyên văn provenance. T3b retrieval/graph và T4–T9 vẫn còn; không coi temporal grouping là semantic episode segmentation hoặc production reader.
+
 ## 1. Mục tiêu và quyết định đã xác nhận
 
 Xây bộ chọn context từ toàn bộ lịch sử của **một thread chat**. Mọi message gốc đã lưu và được phép đọc đều thuộc phạm vi có thể truy xuất, kể cả message rất cũ. Mỗi lần gọi model chỉ nhận bằng chứng cần thiết và vừa ngân sách. Không cam kết model đọc tất cả lịch sử trong mọi lượt hoặc recall tuyệt đối.
