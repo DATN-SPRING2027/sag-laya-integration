@@ -1,0 +1,581 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-10-26T10:31:55.904334+00:00",
+  "git_revision": "77722700fa8ed83112bff6640213b12d0235c11c",
+  "scope": "synthetic disposable SQLite, real prepare_ask/generate_stream; no document sources",
+  "python_version": "3.11.15",
+  "dependency_versions": {
+    "litellm": "1.102.0",
+    "sqlalchemy": "2.0.54",
+    "aiosqlite": "0.22.1"
+  },
+  "config": {
+    "llm_provider": "openai",
+    "llm_model": "Qwen/Qwen3-8B",
+    "llm_context_window": 128000,
+    "llm_max_tokens": 4096,
+    "llm_max_retries": 2,
+    "llm_timeout_ms": 120000,
+    "llm_temperature": 0.3,
+    "history_load_limit": 200,
+    "history_keep_recent": 8,
+    "agent_max_steps": 6
+  },
+  "source_sha256": {
+    "scripts\\eval_session_context.py": "24fb9b3d2e8f3b17afc780a71f559c5f754985188125dc20bae7aead15173056",
+    "sag_api\\services\\agent_domain.py": "61854012964e8d6a536763f40c955e0638ebeb3f60c286d7b980fe1df4b747fc",
+    "sag_api\\services\\agent_service.py": "350d8aa40047ab5d4cf48410ab379d007c9561c8e0cd1be3b297bfbcaef6c86b",
+    "sag_api\\generation\\llm.py": "950975d26148b6592289964896c1a2918b61edd3bbb91bc083a9f70f881d2726",
+    "sag_api\\generation\\prompt.py": "66a8e0cb778353b4e50f8eb8a8abad6c92006cfc6d42751815ac079c14280dc1",
+    "sag_api\\services\\eval\\session_context_accounting.py": "6c4e053f39fcc13851a663edac3f1ab2cff3101b22e2a245f52684898f233ee6"
+  },
+  "llm_extra_body_sha256": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+  "resource_caps": {
+    "logical_calls": 64,
+    "seconds": 1200.0,
+    "worst_case_estimated_tokens": 2000000
+  },
+  "requested_replays": 24,
+  "execution_status": "completed",
+  "holdout_executed": false,
+  "manifest": {
+    "corpus_sha256": "e79086add159443889b73dd4068cb6584e97a031d1349d41b8394ad37e168248",
+    "expansion_sha256": "4d6bcb28f1b7a5130ff83422de6902e8214302e4570729343ac8ec584cc01a72",
+    "cases": [
+      {
+        "id": "calibration-recent",
+        "split": "calibration",
+        "group": "normal",
+        "messages": 16,
+        "estimated_history_tokens": 998
+      },
+      {
+        "id": "calibration-old-within-window",
+        "split": "calibration",
+        "group": "normal",
+        "messages": 120,
+        "estimated_history_tokens": 7865
+      },
+      {
+        "id": "calibration-outside-window",
+        "split": "calibration",
+        "group": "normal",
+        "messages": 240,
+        "estimated_history_tokens": 13200
+      },
+      {
+        "id": "calibration-changed-outside-window",
+        "split": "calibration",
+        "group": "normal",
+        "messages": 240,
+        "estimated_history_tokens": 13200
+      },
+      {
+        "id": "calibration-followup",
+        "split": "calibration",
+        "group": "normal",
+        "messages": 40,
+        "estimated_history_tokens": 2475
+      },
+      {
+        "id": "calibration-mixed-language",
+        "split": "calibration",
+        "group": "normal",
+        "messages": 120,
+        "estimated_history_tokens": 7875
+      },
+      {
+        "id": "calibration-compression-early",
+        "split": "calibration",
+        "group": "normal",
+        "messages": 180,
+        "estimated_history_tokens": 132996
+      },
+      {
+        "id": "calibration-compression-middle",
+        "split": "calibration",
+        "group": "normal",
+        "messages": 180,
+        "estimated_history_tokens": 132995
+      },
+      {
+        "id": "calibration-unknown",
+        "split": "calibration",
+        "group": "normal",
+        "messages": 24,
+        "estimated_history_tokens": 1584
+      },
+      {
+        "id": "calibration-all-decisions-window",
+        "split": "calibration",
+        "group": "full_session",
+        "messages": 240,
+        "estimated_history_tokens": 13082
+      },
+      {
+        "id": "calibration-all-decisions-compression",
+        "split": "calibration",
+        "group": "full_session",
+        "messages": 180,
+        "estimated_history_tokens": 131523
+      },
+      {
+        "id": "calibration-proposed-not-approved",
+        "split": "calibration",
+        "group": "normal",
+        "messages": 36,
+        "estimated_history_tokens": 2268
+      }
+    ]
+  },
+  "measurement_corpus_sha256": "88713a65188bda9f1fa28eb7e339d479a0d4650e2bb2eae53d8207257bd92f20",
+  "measurement_report_sha256": "105e3e493399096f9fee6750acbb04250db4b6202a5c9e1513cf7bca3f480db5",
+  "metadata_correction": {
+    "reason": "approval distinction is a specific recall question, not an exhaustive full-session request",
+    "changes": [
+      {
+        "case_id": "calibration-proposed-not-approved",
+        "web_enabled": false,
+        "from": "full_session",
+        "to": "normal"
+      },
+      {
+        "case_id": "calibration-proposed-not-approved",
+        "web_enabled": true,
+        "from": "full_session",
+        "to": "normal"
+      }
+    ],
+    "model_calls_repeated": 0,
+    "expanded_messages_unchanged": true,
+    "queries_unchanged": true
+  },
+  "summaries": [
+    {
+      "group": "normal",
+      "web_enabled": false,
+      "n": 10,
+      "mean_literal_item_recall": 0.0,
+      "p50_ms": 12937.0,
+      "p95_ms": 65172.0,
+      "small_sample": true
+    },
+    {
+      "group": "normal",
+      "web_enabled": true,
+      "n": 10,
+      "mean_literal_item_recall": 0.5,
+      "p50_ms": 14437.5,
+      "p95_ms": 127453.0,
+      "small_sample": true
+    },
+    {
+      "group": "full_session",
+      "web_enabled": false,
+      "n": 2,
+      "mean_literal_item_recall": 0.0,
+      "p50_ms": 33453.5,
+      "p95_ms": 46469.0,
+      "small_sample": true
+    },
+    {
+      "group": "full_session",
+      "web_enabled": true,
+      "n": 2,
+      "mean_literal_item_recall": 0.6666666666666666,
+      "p50_ms": 23375.0,
+      "p95_ms": 28235.0,
+      "small_sample": true
+    }
+  ],
+  "settings_source": "Settings/dotenv; production database overrides not loaded",
+  "accounting": {
+    "logical_calls": 30,
+    "accounting_complete": true,
+    "input_tokens": 246898,
+    "output_tokens": 3191,
+    "known_input_tokens": 246898,
+    "known_output_tokens": 3191,
+    "monetary_cost": null,
+    "price_status": "unverified",
+    "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
+    "stream_usage_aggregation": "last cumulative snapshot, not sum"
+  },
+  "stage_totals": {
+    "compression": {
+      "calls": 6,
+      "input_tokens": 19800,
+      "output_tokens": 2606,
+      "provider_duration_ms": 230577.0
+    },
+    "generation": {
+      "calls": 24,
+      "input_tokens": 227098,
+      "output_tokens": 585,
+      "provider_duration_ms": 328487.0
+    }
+  },
+  "replay_duration_sum_ms": 566953.0,
+  "replays": [
+    {
+      "case_id": "calibration-recent",
+      "group": "normal",
+      "web_enabled": false,
+      "status": "run.completed",
+      "answer_status": "no_answer",
+      "literal_item_recall": 0.0,
+      "gold_verbatim_in_initial_context": 1,
+      "gold_items_with_evidence": 1,
+      "compression_called": false,
+      "duration_ms": 11062.0,
+      "logical_calls": 1,
+      "input_tokens": 2458,
+      "output_tokens": 18
+    },
+    {
+      "case_id": "calibration-recent",
+      "group": "normal",
+      "web_enabled": true,
+      "status": "run.completed",
+      "answer_status": "answered",
+      "literal_item_recall": 1.0,
+      "gold_verbatim_in_initial_context": 1,
+      "gold_items_with_evidence": 1,
+      "compression_called": false,
+      "duration_ms": 2157.0,
+      "logical_calls": 1,
+      "input_tokens": 2841,
+      "output_tokens": 18
+    },
+    {
+      "case_id": "calibration-old-within-window",
+      "group": "normal",
+      "web_enabled": false,
+      "status": "run.completed",
+      "answer_status": "no_answer",
+      "literal_item_recall": 0.0,
+      "gold_verbatim_in_initial_context": 1,
+      "gold_items_with_evidence": 1,
+      "compression_called": false,
+      "duration_ms": 14812.0,
+      "logical_calls": 1,
+      "input_tokens": 10803,
+      "output_tokens": 1
+    },
+    {
+      "case_id": "calibration-old-within-window",
+      "group": "normal",
+      "web_enabled": true,
+      "status": "run.completed",
+      "answer_status": "answered",
+      "literal_item_recall": 0.0,
+      "gold_verbatim_in_initial_context": 1,
+      "gold_items_with_evidence": 1,
+      "compression_called": false,
+      "duration_ms": 14297.0,
+      "logical_calls": 1,
+      "input_tokens": 11186,
+      "output_tokens": 1
+    },
+    {
+      "case_id": "calibration-outside-window",
+      "group": "normal",
+      "web_enabled": false,
+      "status": "run.completed",
+      "answer_status": "no_answer",
+      "literal_item_recall": 0.0,
+      "gold_verbatim_in_initial_context": 0,
+      "gold_items_with_evidence": 1,
+      "compression_called": false,
+      "duration_ms": 34141.0,
+      "logical_calls": 1,
+      "input_tokens": 17394,
+      "output_tokens": 31
+    },
+    {
+      "case_id": "calibration-outside-window",
+      "group": "normal",
+      "web_enabled": true,
+      "status": "run.completed",
+      "answer_status": "answered",
+      "literal_item_recall": 0.0,
+      "gold_verbatim_in_initial_context": 0,
+      "gold_items_with_evidence": 1,
+      "compression_called": false,
+      "duration_ms": 24781.0,
+      "logical_calls": 1,
+      "input_tokens": 17777,
+      "output_tokens": 55
+    },
+    {
+      "case_id": "calibration-changed-outside-window",
+      "group": "normal",
+      "web_enabled": false,
+      "status": "run.completed",
+      "answer_status": "no_answer",
+      "literal_item_recall": 0.0,
+      "gold_verbatim_in_initial_context": 0,
+      "gold_items_with_evidence": 1,
+      "compression_called": false,
+      "duration_ms": 28906.0,
+      "logical_calls": 1,
+      "input_tokens": 17397,
+      "output_tokens": 1
+    },
+    {
+      "case_id": "calibration-changed-outside-window",
+      "group": "normal",
+      "web_enabled": true,
+      "status": "run.completed",
+      "answer_status": "answered",
+      "literal_item_recall": 0.0,
+      "gold_verbatim_in_initial_context": 0,
+      "gold_items_with_evidence": 1,
+      "compression_called": false,
+      "duration_ms": 14578.0,
+      "logical_calls": 1,
+      "input_tokens": 17780,
+      "output_tokens": 1
+    },
+    {
+      "case_id": "calibration-followup",
+      "group": "normal",
+      "web_enabled": false,
+      "status": "run.completed",
+      "answer_status": "no_answer",
+      "literal_item_recall": 0.0,
+      "gold_verbatim_in_initial_context": 1,
+      "gold_items_with_evidence": 1,
+      "compression_called": false,
+      "duration_ms": 9797.0,
+      "logical_calls": 1,
+      "input_tokens": 4258,
+      "output_tokens": 11
+    },
+    {
+      "case_id": "calibration-followup",
+      "group": "normal",
+      "web_enabled": true,
+      "status": "run.completed",
+      "answer_status": "answered",
+      "literal_item_recall": 1.0,
+      "gold_verbatim_in_initial_context": 1,
+      "gold_items_with_evidence": 1,
+      "compression_called": false,
+      "duration_ms": 5438.0,
+      "logical_calls": 1,
+      "input_tokens": 4641,
+      "output_tokens": 16
+    },
+    {
+      "case_id": "calibration-mixed-language",
+      "group": "normal",
+      "web_enabled": false,
+      "status": "run.completed",
+      "answer_status": "no_answer",
+      "literal_item_recall": 0.0,
+      "gold_verbatim_in_initial_context": 1,
+      "gold_items_with_evidence": 1,
+      "compression_called": false,
+      "duration_ms": 5906.0,
+      "logical_calls": 1,
+      "input_tokens": 10804,
+      "output_tokens": 18
+    },
+    {
+      "case_id": "calibration-mixed-language",
+      "group": "normal",
+      "web_enabled": true,
+      "status": "run.completed",
+      "answer_status": "answered",
+      "literal_item_recall": 1.0,
+      "gold_verbatim_in_initial_context": 1,
+      "gold_items_with_evidence": 1,
+      "compression_called": false,
+      "duration_ms": 17015.0,
+      "logical_calls": 1,
+      "input_tokens": 11187,
+      "output_tokens": 18
+    },
+    {
+      "case_id": "calibration-compression-early",
+      "group": "normal",
+      "web_enabled": false,
+      "status": "run.completed",
+      "answer_status": "no_answer",
+      "literal_item_recall": 0.0,
+      "gold_verbatim_in_initial_context": 1,
+      "gold_items_with_evidence": 1,
+      "compression_called": true,
+      "duration_ms": 65172.0,
+      "logical_calls": 2,
+      "input_tokens": 11462,
+      "output_tokens": 460
+    },
+    {
+      "case_id": "calibration-compression-early",
+      "group": "normal",
+      "web_enabled": true,
+      "status": "run.completed",
+      "answer_status": "answered",
+      "literal_item_recall": 1.0,
+      "gold_verbatim_in_initial_context": 1,
+      "gold_items_with_evidence": 1,
+      "compression_called": true,
+      "duration_ms": 21266.0,
+      "logical_calls": 2,
+      "input_tokens": 11840,
+      "output_tokens": 455
+    },
+    {
+      "case_id": "calibration-compression-middle",
+      "group": "normal",
+      "web_enabled": false,
+      "status": "run.completed",
+      "answer_status": "no_answer",
+      "literal_item_recall": 0.0,
+      "gold_verbatim_in_initial_context": 0,
+      "gold_items_with_evidence": 1,
+      "compression_called": true,
+      "duration_ms": 33359.0,
+      "logical_calls": 2,
+      "input_tokens": 11449,
+      "output_tokens": 432
+    },
+    {
+      "case_id": "calibration-compression-middle",
+      "group": "normal",
+      "web_enabled": true,
+      "status": "run.completed",
+      "answer_status": "answered",
+      "literal_item_recall": 0.0,
+      "gold_verbatim_in_initial_context": 0,
+      "gold_items_with_evidence": 1,
+      "compression_called": true,
+      "duration_ms": 127453.0,
+      "logical_calls": 2,
+      "input_tokens": 11825,
+      "output_tokens": 435
+    },
+    {
+      "case_id": "calibration-unknown",
+      "group": "normal",
+      "web_enabled": false,
+      "status": "run.completed",
+      "answer_status": "no_answer",
+      "literal_item_recall": 0.0,
+      "gold_verbatim_in_initial_context": 0,
+      "gold_items_with_evidence": 0,
+      "compression_called": false,
+      "duration_ms": 3282.0,
+      "logical_calls": 1,
+      "input_tokens": 3162,
+      "output_tokens": 32
+    },
+    {
+      "case_id": "calibration-unknown",
+      "group": "normal",
+      "web_enabled": true,
+      "status": "run.completed",
+      "answer_status": "answered",
+      "literal_item_recall": 1.0,
+      "gold_verbatim_in_initial_context": 0,
+      "gold_items_with_evidence": 0,
+      "compression_called": false,
+      "duration_ms": 3515.0,
+      "logical_calls": 1,
+      "input_tokens": 3545,
+      "output_tokens": 1
+    },
+    {
+      "case_id": "calibration-all-decisions-window",
+      "group": "full_session",
+      "web_enabled": false,
+      "status": "run.completed",
+      "answer_status": "no_answer",
+      "literal_item_recall": 0.0,
+      "gold_verbatim_in_initial_context": 2,
+      "gold_items_with_evidence": 3,
+      "compression_called": false,
+      "duration_ms": 20438.0,
+      "logical_calls": 1,
+      "input_tokens": 17275,
+      "output_tokens": 46
+    },
+    {
+      "case_id": "calibration-all-decisions-window",
+      "group": "full_session",
+      "web_enabled": true,
+      "status": "run.completed",
+      "answer_status": "answered",
+      "literal_item_recall": 0.6666666666666666,
+      "gold_verbatim_in_initial_context": 2,
+      "gold_items_with_evidence": 3,
+      "compression_called": false,
+      "duration_ms": 18515.0,
+      "logical_calls": 1,
+      "input_tokens": 17658,
+      "output_tokens": 46
+    },
+    {
+      "case_id": "calibration-all-decisions-compression",
+      "group": "full_session",
+      "web_enabled": false,
+      "status": "run.completed",
+      "answer_status": "no_answer",
+      "literal_item_recall": 0.0,
+      "gold_verbatim_in_initial_context": 2,
+      "gold_items_with_evidence": 3,
+      "compression_called": true,
+      "duration_ms": 46469.0,
+      "logical_calls": 2,
+      "input_tokens": 10680,
+      "output_tokens": 512
+    },
+    {
+      "case_id": "calibration-all-decisions-compression",
+      "group": "full_session",
+      "web_enabled": true,
+      "status": "run.completed",
+      "answer_status": "answered",
+      "literal_item_recall": 0.6666666666666666,
+      "gold_verbatim_in_initial_context": 2,
+      "gold_items_with_evidence": 3,
+      "compression_called": true,
+      "duration_ms": 28235.0,
+      "logical_calls": 2,
+      "input_tokens": 11063,
+      "output_tokens": 531
+    },
+    {
+      "case_id": "calibration-proposed-not-approved",
+      "group": "normal",
+      "web_enabled": false,
+      "status": "run.completed",
+      "answer_status": "no_answer",
+      "literal_item_recall": 0.0,
+      "gold_verbatim_in_initial_context": 1,
+      "gold_items_with_evidence": 1,
+      "compression_called": false,
+      "duration_ms": 7593.0,
+      "logical_calls": 1,
+      "input_tokens": 4015,
+      "output_tokens": 15
+    },
+    {
+      "case_id": "calibration-proposed-not-approved",
+      "group": "normal",
+      "web_enabled": true,
+      "status": "run.completed",
+      "answer_status": "answered",
+      "literal_item_recall": 0.0,
+      "gold_verbatim_in_initial_context": 1,
+      "gold_items_with_evidence": 1,
+      "compression_called": false,
+      "duration_ms": 8766.0,
+      "logical_calls": 1,
+      "input_tokens": 4398,
+      "output_tokens": 37
+    }
+  ]
+}

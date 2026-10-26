@@ -90,8 +90,9 @@ def _classify_llm_error(e: Exception, *, stage: ErrorStage) -> ApiError:
 
 
 class LLMClient:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, include_stream_usage: bool = False) -> None:
         self._settings = settings
+        self._include_stream_usage = include_stream_usage
 
     @property
     def configured(self) -> bool:
@@ -119,6 +120,8 @@ class LLMClient:
             "max_tokens": self._settings.llm_max_tokens,
             "stream": stream,
         }
+        if stream and self._include_stream_usage:
+            request["stream_options"] = {"include_usage": True}
         if tools:
             request["tools"] = tools
             if tool_choice is not None:
