@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { activationFromCitations, activationFromSearch } from "./universe-events";
-import { knowledgeClusterKey, knowledgeClusterTrail, projectKnowledgeUniverse } from "./universe-knowledge-projection";
+import {
+  groupUnitsByDocument,
+  knowledgeClusterKey,
+  knowledgeClusterTrail,
+  projectKnowledgeUniverse,
+} from "./universe-knowledge-projection";
 import type { SearchResponse, UniverseKnowledgeUnit, UniverseTree } from "./types";
 
 const cluster = { project_id: "project", tree_version: "tree-version", node_id: "leaf" };
@@ -71,6 +76,54 @@ describe("knowledge universe projection", () => {
     expect(knowledgeClusterTrail([tree], cluster).map((item) => item.id)).toEqual(["root", "leaf"]);
     tree.nodes[0].parent_id = "leaf";
     expect(knowledgeClusterTrail([tree], cluster)).toHaveLength(2);
+  });
+
+  it("clusters multi-document neurons into distinct Document Ganglia and highlights E2 & cross-document axons", () => {
+    const multiDocUnits: UniverseKnowledgeUnit[] = [
+      {
+        ...units[0],
+        id: "u-doc1",
+        document_id: "doc-1",
+        document_name: "policy.md",
+        neural_tier: "E2",
+        importance: 0.85,
+        cross_doc_synapse_count: 1,
+      },
+      {
+        ...units[1],
+        id: "u-doc2",
+        document_id: "doc-2",
+        document_name: "procedure.md",
+        neural_tier: "E0_E1",
+        importance: 0.45,
+        cross_doc_synapse_count: 1,
+      },
+    ];
+    const groups = groupUnitsByDocument(multiDocUnits, [
+      { source: "u-doc1", target: "u-doc2", weight: 0.65, kind: "similarity", cross_document: true },
+    ]);
+    expect(groups).toHaveLength(2);
+    expect(groups[0].e2_count).toBe(1);
+    expect(groups[0].cross_doc_synapse_count).toBe(1);
+
+    const data = projectKnowledgeUniverse({
+      clusters: [{ ref: cluster, node, label: node.label, stats: "2 neurons · 2 docs" }],
+      active: cluster,
+      units: multiDocUnits,
+      edges: [{ source: "u-doc1", target: "u-doc2", weight: 0.65, kind: "similarity", cross_document: true }],
+      matches: [],
+      routedNodes: new Set(),
+      unitKind: "Knowledge unit",
+      clusterKind: "Knowledge cluster",
+      relatedHint: "Explore related knowledge",
+      epoch: 1,
+    });
+    const n1 = data.nodes.find((n) => n.rawId === "u-doc1")!;
+    const n2 = data.nodes.find((n) => n.rawId === "u-doc2")!;
+    expect(n1.radius).toBeGreaterThan(n2.radius);
+    expect(n1.category).toContain("E2 Pyramidal");
+    expect(n1.category).toContain("⇄1");
+    expect(data.links[0].presentationOpacity).toBeGreaterThan(1);
   });
 });
 

@@ -295,3 +295,95 @@ async def test_knowledge_http_routes_read_data_without_publishing(knowledge_db, 
         assert resolved.json()["matches"][0]["unit_ids"] == ["u1"]
     publisher.assert_not_called()
     assert not session.new and not session.dirty and not session.deleted
+
+
+@pytest.mark.asyncio
+async def test_neural_cortex_cross_document_synapses_and_e2_tier(knowledge_db):
+    session, snapshot = knowledge_db
+    now = datetime.now(UTC)
+    session.add(Document(
+        id="document-2", tenant_id="tenant", project_id="project", source_id="source",
+        filename="architecture-v2.md", storage_path="unused-2", is_active=True,
+    ))
+    session.add(DocumentVersion(
+        id="version-2", document_id="document-2", version_no=2, file_hash="hash-2",
+        valid_from=now - timedelta(days=1), valid_to=now + timedelta(days=1),
+        search_status="SEARCH_READY", search_ready_at=now, knowledge_status="DATA_READY",
+    ))
+    text_u3 = "Project Alpha requires causal constraint verification."
+    session.add(CanonicalBlock(
+        id="block-u3", document_version_id="version-2", ordinal=0,
+        block_type="paragraph", page_from=5, page_to=5, section_path="Architecture",
+        source_anchor="anchor-u3", normalized_text=text_u3, content_hash="hash-u3",
+    ))
+    u1 = await session.get(KnowledgeUnit, "u1")
+    u1.features_json = {
+        "entities": ["Project Alpha", "Retrieval"],
+        "importance": 0.75,
+        "local_confidence": 0.88,
+        "e2_reason": None,
+        "citations": [],
+    }
+    u1.checksum = await unit_checksum(session, u1)
+
+    u3 = KnowledgeUnit(
+        id="u3", document_version_id="version-2", tenant_id="tenant", project_id="project",
+        source_id="source", security_partition_id="public", ordinal=0,
+        text=text_u3, content_hash="hash-u3", input_checksum="input-u3", checksum="pending",
+        is_current=True,
+        provenance_json=dict(
+            tenant_id="tenant", project_id="project", source_id="source", document_id="document-2",
+            document_version_id="version-2", security_partition_id="public", evidence_block_ids=["block-u3"],
+        ),
+        features_json={
+            "entities": ["project_alpha", "Verification"],
+            "importance": 0.92,
+            "local_confidence": 0.94,
+            "e2_reason": "causal_constraint",
+            "citations": [],
+        },
+        valid_from=now - timedelta(days=1), valid_to=now + timedelta(days=1),
+    )
+    session.add(u3)
+    session.add(KnowledgeEvidence(
+        id="evidence-u3", unit_id="u3", tier="E2", kind="relation", extractor_version="e2-llm-v1",
+        confidence=0.94,
+        payload_json=dict(
+            quote="Project Alpha", start=0, end=len("Project Alpha"),
+            evidence_block_ids=["block-u3"], candidate=False,
+            subject="Project Alpha", predicate="REQUIRES", object="Verification",
+        ),
+    ))
+    await session.flush()
+    u3.checksum = await unit_checksum(session, u3)
+    await session.commit()
+
+    snapshot.scopes.add(("source", "version-2", "public"))
+    snapshot.members["leaf"].add("u3")
+    snapshot.edges.append(("u1", "u3", 0.84))
+
+    page = await knowledge_universe_page(session, snapshot, node_id="leaf", limit=10)
+    units_by_id = {u.id: u for u in page.units}
+    assert units_by_id["u3"].neural_tier == "E2"
+    assert units_by_id["u3"].e2_reason == "causal_constraint"
+    assert units_by_id["u3"].cross_doc_synapse_count == 1
+    assert units_by_id["u1"].cross_doc_synapse_count == 1
+
+    cross_edges = [e for e in page.edges if e.cross_document]
+    assert len(cross_edges) == 1
+    assert cross_edges[0].source_document_name == "notes.md"
+    assert cross_edges[0].target_document_name == "architecture-v2.md"
+    assert cross_edges[0].shared_entities == ["Project Alpha"]
+    assert cross_edges[0].signals["entity"] is not None and cross_edges[0].signals["entity"] > 0
+
+    detail_u3 = await knowledge_universe_detail(session, snapshot, "u3")
+    assert detail_u3.neural_tier == "E2"
+    assert detail_u3.evidence[0].subject == "Project Alpha"
+    assert detail_u3.evidence[0].predicate == "REQUIRES"
+    assert detail_u3.evidence[0].object == "Verification"
+    assert len(detail_u3.synapses) == 1
+    assert detail_u3.synapses[0].cross_document is True
+    assert detail_u3.synapses[0].target_unit_id == "u1"
+    assert detail_u3.synapses[0].target_document_name == "notes.md"
+    assert detail_u3.synapses[0].shared_entities == ["project_alpha"]
+    assert not session.new and not session.dirty and not session.deleted

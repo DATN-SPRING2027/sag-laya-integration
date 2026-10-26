@@ -12,6 +12,7 @@ import {
 } from "@/components/features/chat/conversation-provider";
 import { ConversationPanel } from "@/components/features/chat/conversation-panel";
 import { PetHeadAvatar } from "@/components/features/pet-head-avatar";
+import { UNIVERSE_ASK_EVENT, takePendingUniverseAsk, type UniverseAskTarget } from "@/lib/universe-events";
 
 /** 对话主入口；会话数据与迷你问答共享，仅保留完整工作台外壳。 */
 export default function ChatPage() {
@@ -24,12 +25,14 @@ export default function ChatPage() {
   const routeThreadId =
     (Array.isArray(id) ? id[0] : id) ?? pathname.match(/^\/chat\/([^/]+)/)?.[1] ?? null;
   const [sessionId, setSessionId] = React.useState<string | null>(null);
+  const [answerDraft, setAnswerDraft] = React.useState<{ id: number; text: string } | null>(null);
   const preferredDraftRef = React.useRef<string | null>(null);
   const session = useConversationSession(sessionId);
 
   React.useEffect(() => {
     if (routeThreadId) {
       preferredDraftRef.current = null;
+      setAnswerDraft(null);
       setSessionId(runtime.forThread(routeThreadId, { activate: true }));
       return;
     }
@@ -46,6 +49,7 @@ export default function ChatPage() {
 
   React.useEffect(() => {
     const onNewChat = () => {
+      setAnswerDraft(null);
       const next = runtime.createDraft({ activate: true });
       preferredDraftRef.current = next;
       setSessionId(next);
@@ -54,6 +58,23 @@ export default function ChatPage() {
     window.addEventListener("sag:new-chat", onNewChat);
     return () => window.removeEventListener("sag:new-chat", onNewChat);
   }, [router, runtime]);
+
+  React.useEffect(() => {
+    const openAsk = (target: UniverseAskTarget) => {
+      const next = runtime.createDraft({ activate: true });
+      preferredDraftRef.current = next;
+      setSessionId(next);
+      setAnswerDraft({ id: target.request_id, text: target.prompt });
+    };
+    const pending = takePendingUniverseAsk();
+    if (pending) openAsk(pending);
+    const onAsk = (event: Event) => {
+      takePendingUniverseAsk();
+      openAsk((event as CustomEvent<UniverseAskTarget>).detail);
+    };
+    window.addEventListener(UNIVERSE_ASK_EVENT, onAsk);
+    return () => window.removeEventListener(UNIVERSE_ASK_EVENT, onAsk);
+  }, [runtime]);
 
   React.useEffect(() => {
     const threadId = session?.threadId;
@@ -93,6 +114,7 @@ export default function ChatPage() {
         ]}
         emptyHint={agent.persona?.greeting || t("emptyHint")}
         placeholder={t("placeholder", { name: agent.name })}
+        draftPrompt={answerDraft}
       />
     </div>
   );

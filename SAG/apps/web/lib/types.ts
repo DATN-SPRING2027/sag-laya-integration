@@ -530,6 +530,8 @@ export interface UniverseTreeNode {
   is_leaf: boolean;
   unit_count: number;
   source_count: number;
+  document_count?: number;
+  top_entities?: string[];
 }
 
 export interface UniverseTree {
@@ -537,6 +539,10 @@ export interface UniverseTree {
   project_id: string;
   tree_version: string;
   search_epoch: number | null;
+  active_slot?: string | null;
+  routing_recall_at_k?: number | null;
+  escape_win_rate?: number | null;
+  acl_blackhole_rate?: number | null;
   node_count: number;
   unit_count: number;
   source_count: number;
@@ -564,6 +570,14 @@ export interface UniverseKnowledgeUnit {
   page_from: number;
   page_to: number;
   anchor: string;
+  neural_tier?: "E0_E1" | "E2";
+  importance?: number;
+  local_confidence?: number;
+  e2_reason?: string | null;
+  entities?: string[];
+  evidence_count?: number;
+  cross_doc_synapse_count?: number;
+  checksum?: string;
 }
 
 export interface UniverseKnowledgeEdge {
@@ -571,6 +585,13 @@ export interface UniverseKnowledgeEdge {
   target: string;
   weight: number;
   kind: "similarity";
+  cross_document?: boolean;
+  source_document_id?: string | null;
+  target_document_id?: string | null;
+  source_document_name?: string | null;
+  target_document_name?: string | null;
+  shared_entities?: string[];
+  signals?: Record<string, number | null>;
 }
 
 export interface UniverseKnowledgePage {
@@ -582,6 +603,24 @@ export interface UniverseKnowledgePage {
   edges: UniverseKnowledgeEdge[];
   total: number;
   next_cursor: string | null;
+}
+
+export interface UniverseKnowledgeSynapse {
+  target_unit_id: string;
+  target_node_id?: string | null;
+  target_label: string;
+  target_preview: string;
+  target_heading: string;
+  target_document_id: string;
+  target_document_name: string;
+  target_source_id: string;
+  target_source_name: string;
+  target_page_from: number;
+  target_neural_tier?: "E0_E1" | "E2";
+  weight: number;
+  cross_document?: boolean;
+  shared_entities?: string[];
+  signals?: Record<string, number | null>;
 }
 
 export interface UniverseKnowledgeDetail extends UniverseKnowledgeUnit {
@@ -598,7 +637,13 @@ export interface UniverseKnowledgeDetail extends UniverseKnowledgeUnit {
     candidate: boolean;
     start: number;
     end: number;
+    label?: string | null;
+    subject?: string | null;
+    predicate?: string | null;
+    object?: string | null;
+    extractor_version?: string;
   }>;
+  synapses?: UniverseKnowledgeSynapse[];
 }
 
 export interface UniverseKnowledgeReference {

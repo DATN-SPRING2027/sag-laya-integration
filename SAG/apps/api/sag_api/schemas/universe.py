@@ -61,6 +61,8 @@ class UniverseTreeNodeOut(BaseModel):
     is_leaf: bool
     unit_count: int = Field(ge=0)
     source_count: int = Field(ge=0)
+    document_count: int = Field(default=0, ge=0)
+    top_entities: list[str] = Field(default_factory=list)
 
 
 class UniverseTreeOut(BaseModel):
@@ -68,6 +70,10 @@ class UniverseTreeOut(BaseModel):
     project_id: str
     tree_version: str
     search_epoch: int | None = Field(ge=1)
+    active_slot: str | None = None
+    routing_recall_at_k: float | None = None
+    escape_win_rate: float | None = None
+    acl_blackhole_rate: float | None = None
     node_count: int = Field(ge=0)
     unit_count: int = Field(ge=0)
     source_count: int = Field(ge=0)
@@ -101,6 +107,14 @@ class UniverseKnowledgeUnitOut(BaseModel):
     page_from: int
     page_to: int
     anchor: str
+    neural_tier: Literal["E0_E1", "E2"] = "E0_E1"
+    importance: float = 0.0
+    local_confidence: float = 0.0
+    e2_reason: str | None = None
+    entities: list[str] = Field(default_factory=list)
+    evidence_count: int = 0
+    cross_doc_synapse_count: int = 0
+    checksum: str = ""
 
 
 class UniverseKnowledgeEdgeOut(BaseModel):
@@ -108,6 +122,13 @@ class UniverseKnowledgeEdgeOut(BaseModel):
     target: str
     weight: float
     kind: Literal["similarity"] = "similarity"
+    cross_document: bool = False
+    source_document_id: str | None = None
+    target_document_id: str | None = None
+    source_document_name: str | None = None
+    target_document_name: str | None = None
+    shared_entities: list[str] = Field(default_factory=list)
+    signals: dict[str, float | None] = Field(default_factory=dict)
 
 
 class UniverseKnowledgePageOut(BaseModel):
@@ -130,6 +151,29 @@ class UniverseKnowledgeEvidenceOut(BaseModel):
     candidate: bool
     start: int
     end: int
+    label: str | None = None
+    subject: str | None = None
+    predicate: str | None = None
+    object: str | None = None
+    extractor_version: str = ""
+
+
+class UniverseKnowledgeSynapseOut(BaseModel):
+    target_unit_id: str
+    target_node_id: str | None = None
+    target_label: str
+    target_preview: str
+    target_heading: str
+    target_document_id: str
+    target_document_name: str
+    target_source_id: str
+    target_source_name: str
+    target_page_from: int
+    target_neural_tier: Literal["E0_E1", "E2"] = "E0_E1"
+    weight: float
+    cross_document: bool = False
+    shared_entities: list[str] = Field(default_factory=list)
+    signals: dict[str, float | None] = Field(default_factory=dict)
 
 
 class UniverseKnowledgeDetailOut(UniverseKnowledgeUnitOut):
@@ -138,6 +182,7 @@ class UniverseKnowledgeDetailOut(UniverseKnowledgeUnitOut):
     scope_key: str
     content: str
     evidence: list[UniverseKnowledgeEvidenceOut]
+    synapses: list[UniverseKnowledgeSynapseOut] = Field(default_factory=list)
 
 
 class UniverseKnowledgeReferenceIn(BaseModel):
