@@ -233,6 +233,7 @@ def _unique_values(values: Iterable[str], *, limit: int = 8) -> tuple[str, ...]:
 _CLAUSE_SPLIT_RE = re.compile(
     r"(?:,\s+and\s+(?=(?:what|which|who|where|why|how|when|is|are|was|were|did|does|do|should|can)\b)"
     r"|\s+and\s+(?=(?:what|which|who|where|why|how\s+(?:do|does|did|should|can|could|to|will|would|is|are|was|were))\b)"
+    r"|,\s*và\s+(?=(?:ai|cái\s+gì|gì|ở\s+đâu|đâu|khi\s+nào|như\s+thế\s+nào|bao\s+nhiêu|nào|có\s+phải|là)\b)"
     r"|;\s+)",
     re.IGNORECASE,
 )
@@ -330,7 +331,15 @@ def extract_query_features(query: str) -> QueryFeatures:
             r"|,\s+and\s+(?:what|which|who|where|why|how\s+(?:do|does|did|should|can|could|to|will|would))\b"
             r"|\b(?:what|which|why|how)\b[^?]{6,}\band\s+(?:what|which|who|where|why|how\s+(?:do|does|did|should|can|to))\b"
             r"|\bwhat\b[^?]{8,},\s+[^?]{4,},\s+and\s+"
-            r"|(?:^|:\s*)(?:was|were|did)\b[^?]{3,}\bor\b",
+            r"|(?:^|:\s*)(?:was|were|did)\b[^?]{3,}\bor\b"
+            r"|\b(?:dân số|diện tích|thủ đô|tên|năm|ai|ở đâu|bao nhiêu)\b[^?]{2,80}\b(?:nơi|tại nơi|mà tại đó)\b[^?]{2,80}\b(?:tọa lạc|đặt trụ sở|sinh ra|thành lập|nằm ở|diễn ra)\b"
+            r"|\b(?:ai|người nào|diễn viên nào|cầu thủ nào|đạo diễn nào|tác giả nào|ca sĩ nào|công ty nào)\s+là\b[^?]{4,90}\b(?:cũng|đồng thời)\s+(?:đóng vai|tham gia|đạo diễn|sáng lập|viết|sản xuất|thi đấu|chơi)\b"
+            r"|\b(?:ai|người nào)\s+là\s+(?:luật sư|bác sĩ|người đại diện|huấn luyện viên|đạo diễn|nhà sản xuất|tác giả|người sáng lập|vợ|chồng|cha|mẹ|con)[^?]{2,50}\bcho\s+một\s+(?:người|phụ nữ|đàn ông|công ty|tổ chức|nhóm|đội)\b"
+            r"|\b(?:nữ\s+|nam\s+)?(?:diễn viên|đạo diễn|ca sĩ|nhà văn|nhà soạn nhạc|cầu thủ|vận động viên|chính trị gia|nhà khoa học)\b[^?]{3,80}\b(?:tốt nghiệp|sinh ra|học tại|giành được giải)[^?]{3,80}\b(?:đóng vai|tham gia|đạo diễn|viết|sáng tác|phát hành)\b"
+            r"|^(?:tên gọi|được\s+(?:đổi tên|thành lập|ra mắt|phát hành|xây dựng|sáng lập)|sinh\s+(?:năm|ra\s+tại))[^,?]{4,70},\s*(?:chiếc\s+xe|bộ\s+phim|cuốn\s+sách|bài\s+hát|công\s+ty|thành\s+phố|quốc\s+gia|người|ai|tác\s+phẩm)\s+nào\b"
+            r"|\b(?:trong\s+hai\b|cả\s+hai\s+đều\b|[^?]{3,60}\bhay\s+(?:là\s+)?[a-zà-ỹ0-9]{2,})"
+            r"|\b(?:mẹ|cha|bố|vợ|chồng|con|đạo diễn|người sáng lập|nhà sáng lập|tác giả|quê hương|nơi sinh|quốc tịch|tên nhân vật)\s+của\b[^?]{2,110}\b(?:trong\s+(?:phim|bộ phim|cuộc đua|tác phẩm|vở)|đạo diễn|tác giả|người sáng lập|người chiến thắng|giải thưởng)\b"
+            r"|\b(?:một|những)\s+(?:thị trấn|thành phố|quận|huyện|tỉnh|tiểu bang|quốc gia|bảo tàng|trường|đại học|công ty|bộ phim|người|nhân vật)\s+(?:ở|tại)\b[^?]{3,80},\s*có\s+(?:một|nhiều|các)\b",
             lowered,
         )
     )

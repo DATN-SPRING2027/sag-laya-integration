@@ -788,6 +788,10 @@ _ARTIFACT_CODE_RE = re.compile(
     r"\b(pr|sup|int|inc|eng|adr|des|rlt|sec|ops|fin|leg|rfc|bug|iss|tkt|ticket)[\s_#-]+(\d{2,6}[a-z0-9]*)\b",
     re.IGNORECASE,
 )
+_INTERNAL_URI_SLUG_RE = re.compile(
+    r"(?:[a-z][a-z0-9+.-]*:\/\/|(?<!https:)(?<!http:)\/\/)[^\s<>\]\)`\"']+\/([a-z0-9][a-z0-9_-]{5,120})",
+    re.IGNORECASE,
+)
 
 
 def _extract_artifact_codes(text: str) -> set[str]:
@@ -801,6 +805,17 @@ def _extract_artifact_codes(text: str) -> set[str]:
             prefix = "tkt"
         codes.add(f"{prefix} {num}")
     return codes
+
+
+def _extract_uri_slugs(text: str) -> set[str]:
+    if not text:
+        return set()
+    slugs: set[str] = set()
+    for match in _INTERNAL_URI_SLUG_RE.finditer(text):
+        slug_norm = re.sub(r"[\s_-]+", " ", match.group(1).lower()).strip()
+        if " " in slug_norm and len(slug_norm) >= 8:
+            slugs.add(slug_norm)
+    return slugs
 
 
 @dataclass(frozen=True, slots=True)
@@ -903,17 +918,24 @@ async def _get_or_build_scope_knowledge_index(
             else (ents_val if isinstance(ents_val, (list, tuple)) else [])
         )
         artifact_codes = _extract_artifact_codes(f"{sec_path_str}\n{ku_text or ''}")
+        uri_slugs = _extract_uri_slugs(ku_text or "")
         for raw_e in ents_iter:
             artifact_codes.update(_extract_artifact_codes(str(raw_e)))
+            uri_slugs.update(_extract_uri_slugs(str(raw_e)))
         raw_ents = tuple(
             dict.fromkeys(
-                [*(str(e).strip() for e in ents_iter if str(e).strip()), *sorted(artifact_codes)]
+                [
+                    *(str(e).strip() for e in ents_iter if str(e).strip()),
+                    *sorted(artifact_codes),
+                    *sorted(uri_slugs),
+                ]
             )
         )
         norm_ents = frozenset(
             {
                 *(re.sub(r"[\s_-]+", " ", e.lower()) for e in raw_ents),
                 *artifact_codes,
+                *uri_slugs,
             }
         )
         compact = _CompactKU(
@@ -1151,11 +1173,13 @@ async def _expand_multi_hop_sections(
     current_versions: dict[str, _ReadyVersion],
     existing_unit_ids: set[str],
     sources: list[SearchableSource],
+    existing_pool_scores: dict[str, float] | None = None,
     limit: int = 8,
 ) -> list[RetrievedSection]:
     """HippoRAG 2 associative passage expansion over ACL-scoped KnowledgeUnitEdge + Artifact Bridges."""
     if not seed_sections or not current_versions:
         return []
+    pool_scores = existing_pool_scores or {}
     seed_ranges: list[tuple[str, int, int, float]] = []
     ordered_seeds = sorted(seed_sections, key=lambda s: -float(s.score or 0.0))
     top_anchor_score = max((float(s.score or 0.5) for s in ordered_seeds[:1]), default=0.5)
@@ -1192,7 +1216,7 @@ async def _expand_multi_hop_sections(
                         seed_ku_scores[ku.id] = max(seed_ku_scores.get(ku.id, 0.0), s_score)
                         if idx_r < 2 or s_score >= 0.85 * max_seed_score:
                             for ent in ku.entities_raw:
-                                ent_clean = re.sub(r"[\s_-]+", " ", ent.lower())
+                                ent_clean = re.sub(r"[\s_-]+", " ", ent.lower()).strip()
                                 if len(ent_clean) < 3:
                                     continue
                                 if re.fullmatch(r"\d+(?:\.\d+)?%?(?:\s*[a-z]{1,6})?", ent_clean):
@@ -1201,11 +1225,21 @@ async def _expand_multi_hop_sections(
                                     " " not in ent_clean
                                     and not any(c.isdigit() for c in ent_clean)
                                     and not any(c.isupper() for c in ent[1:])
-                                    and len(ent_clean) < 7
+                                    and len(ent_clean) < 6
                                 ):
                                     continue
                                 top_seed_entities[ent_clean] = max(
                                     top_seed_entities.get(ent_clean, 0.0), s_score
+                                )
+                    elif idx_r == 0:
+                        # Harvest explicit cross-reference codes and URI slugs from sibling sections of the #1 seed doc
+                        doc_ref_score = s_score * 0.88
+                        for ent_norm in ku.entities_norm:
+                            if _ARTIFACT_CODE_RE.fullmatch(ent_norm) or (
+                                ent_norm.count(" ") >= 2 and len(ent_norm) >= 12
+                            ):
+                                top_seed_entities[ent_norm] = max(
+                                    top_seed_entities.get(ent_norm, 0.0), doc_ref_score
                                 )
             if not seed_ku_scores:
                 return []
@@ -1239,7 +1273,7 @@ async def _expand_multi_hop_sections(
                         continue
                     for ku in ku_list:
                         for b_ent in top_seed_entities:
-                            if (" " in b_ent or any(c.isdigit() for c in b_ent)) and b_ent in ku.entities_norm:
+                            if (" " in b_ent or any(c.isdigit() for c in b_ent) or len(b_ent) >= 6) and b_ent in ku.entities_norm:
                                 ent_doc_versions[b_ent].add(v_id)
                             else:
                                 pat = path_patterns.get(b_ent)
@@ -1254,7 +1288,9 @@ async def _expand_multi_hop_sections(
                 specific_seed_entities = {
                     b_ent: b_score
                     for b_ent, b_score in top_seed_entities.items()
-                    if 1 <= len(ent_doc_versions.get(b_ent, ())) <= max_bridge_df
+                    if 1
+                    <= len(ent_doc_versions.get(b_ent, ()))
+                    <= (max_bridge_df if (" " in b_ent or any(c.isdigit() for c in b_ent)) else 1)
                 }
                 if specific_seed_entities:
                     candidate_ver_ids = {
@@ -1271,7 +1307,7 @@ async def _expand_multi_hop_sections(
                             path_matched = False
                             for b_ent, b_score in specific_seed_entities.items():
                                 ent_hit = (
-                                    (" " in b_ent or any(c.isdigit() for c in b_ent))
+                                    (" " in b_ent or any(c.isdigit() for c in b_ent) or len(b_ent) >= 6)
                                     and b_ent in ku.entities_norm
                                 )
                                 pat = path_patterns.get(b_ent)
@@ -1285,8 +1321,13 @@ async def _expand_multi_hop_sections(
                                 if ent_hit or path_hit:
                                     matched_scores.append(b_score)
                             if matched_scores:
+                                is_roster_section = ku.sec_path_norm.endswith(
+                                    ("> ownership", "> change log", "> changelog", "> approvers", "> reviewers")
+                                )
+                                if not path_matched and is_roster_section:
+                                    continue
                                 best_b = max(matched_scores)
-                                mult = 0.88 if path_matched else min(0.88, 0.78 + 0.06 * (len(matched_scores) - 1))
+                                mult = 0.88 if path_matched else min(0.75, 0.70 + 0.03 * (len(matched_scores) - 1))
                                 neighbor_scores[ku.id] = max(neighbor_scores.get(ku.id, 0.0), best_b * mult)
 
             # Bounded 2-hop propagation over canonical artifact codes (e.g. Confluence -> PR-19422 -> SUP-18510)
@@ -1356,9 +1397,21 @@ async def _expand_multi_hop_sections(
                             }
                         )
                     )
-                ver_candidates.sort(key=lambda s: (-s.score, s.chunk_id or ""))
+                ver_candidates.sort(
+                    key=lambda s: (
+                        -s.score,
+                        -pool_scores.get(str(s.search_unit_id or s.chunk_id or ""), 0.0),
+                        s.chunk_id or "",
+                    )
+                )
                 expanded.extend(ver_candidates[:2])
-            expanded.sort(key=lambda s: (-s.score, s.chunk_id or ""))
+            expanded.sort(
+                key=lambda s: (
+                    -s.score,
+                    -pool_scores.get(str(s.search_unit_id or s.chunk_id or ""), 0.0),
+                    s.chunk_id or "",
+                )
+            )
             return expanded[:limit]
     except Exception as error:  # noqa: BLE001 - associative expansion is best-effort within ACL bounds
         log.warning("multi-hop knowledge graph expansion skipped error_type=%s", type(error).__name__)
@@ -2068,6 +2121,11 @@ async def retrieve_search_unit_sections(
                 for s in list(seed_pool)[:2]
                 if (s.search_unit_id or s.chunk_id)
             }
+            existing_pool_scores = {
+                str(s.search_unit_id or s.chunk_id or ""): float(s.score or 0.0)
+                for s in initial_pool
+                if (s.search_unit_id or s.chunk_id)
+            }
             t_graph_start = time.perf_counter()
             expanded_sections = await _expand_multi_hop_sections(
                 seed_sections=list(seed_pool),
@@ -2075,6 +2133,7 @@ async def retrieve_search_unit_sections(
                 current_versions=current_versions,
                 existing_unit_ids=existing_ids,
                 sources=sources,
+                existing_pool_scores=existing_pool_scores,
                 limit=max(8, requested_limit * 2),
             )
             t_graph_expansion_ms = round((time.perf_counter() - t_graph_start) * 1000, 2)
@@ -2097,6 +2156,7 @@ async def retrieve_search_unit_sections(
                     exp_match = expanded_by_id.get(f_id)
                     if exp_match is not None:
                         seen_exp_ids.add(f_id)
+                        exp_score = float(exp_match.score or 0.0)
                         is_cross_doc_multi_hop = (
                             (
                                 effective_plan.primary_strategy.value == "MULTI_HOP"
@@ -2105,14 +2165,16 @@ async def retrieve_search_unit_sections(
                             and bool(seed_doc_ids)
                             and str(f_sec.document_id or "") not in seed_doc_ids
                         )
-                        bonus = 0.12 if is_cross_doc_multi_hop else 0.0
-                        raw_boost = max(float(f_sec.score or 0.0), float(exp_match.score or 0.0) + bonus)
+                        is_strong_bridge = exp_score >= 0.76 * top_seed_score
+                        bonus = 0.08 if (is_cross_doc_multi_hop and is_strong_bridge) else 0.0
+                        raw_boost = max(float(f_sec.score or 0.0), exp_score + bonus)
                         boosted_score = max(float(f_sec.score or 0.0), min(hop2_cap, raw_boost))
                         boosted_fused.append(f_sec.model_copy(update={"score": round(boosted_score, 6)}))
                     else:
                         boosted_fused.append(f_sec)
+                unconfirmed_cap = min(hop2_cap, max(0.05, top_seed_score * 0.82))
                 new_expanded = [
-                    s.model_copy(update={"score": round(min(hop2_cap, float(s.score or 0.0)), 6)})
+                    s.model_copy(update={"score": round(min(unconfirmed_cap, float(s.score or 0.0)), 6)})
                     for s in expanded_sections
                     if str(s.search_unit_id or s.chunk_id or "") not in seen_exp_ids
                 ]

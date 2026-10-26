@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import and_, func, or_, select, tuple_
+from sqlalchemy import and_, case, func, or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.config import settings
@@ -19,6 +20,7 @@ from sag_api.db.models import (
     DocumentVersion,
     KnowledgeEvidence,
     KnowledgeUnit,
+    KnowledgeUnitEdge,
     ProjectSearchState,
     Source,
     SourceProjectMapping,
@@ -32,12 +34,17 @@ from sag_api.schemas.universe import (
     UniverseKnowledgeMatchOut,
     UniverseKnowledgePageOut,
     UniverseKnowledgeReferenceIn,
+    UniverseKnowledgeSynapseOut,
     UniverseKnowledgeUnitOut,
     UniverseTreeOut,
 )
-from sag_api.services.knowledge_service import checksum, unit_checksum
+from sag_api.services.knowledge_service import _cosine, checksum, terms, unit_checksum
 from sag_api.services.search_unit_retrieval_service import _load_current_ready_versions
 from sag_api.services.tree_publish_service import PublishVerificationError, _checksum_manifest
+
+
+def _norm_ent(raw_e: str) -> str:
+    return re.sub(r"[\s_-]+", " ", str(raw_e).casefold()).strip()
 
 
 @dataclass
@@ -261,15 +268,23 @@ async def load_source_universe_snapshots(
             {(value.source_id, key, value.partition_id) for key, value in current.items()}, {}, [], [],
         )
         inventory = _unit_query(snapshot, None).subquery()
-        counts = (await session.execute(select(inventory.c.source_id, func.count())
-                                       .group_by(inventory.c.source_id).order_by(inventory.c.source_id))).all()
+        counts = (await session.execute(
+            select(
+                inventory.c.source_id,
+                func.count(),
+                func.count(func.distinct(inventory.c.document_version_id)),
+            )
+            .group_by(inventory.c.source_id)
+            .order_by(inventory.c.source_id)
+        )).all()
         names = {source.id: source.name for source in sources}
         nodes = [dict(id=f"source:{source}", label=names[source], depth=0, is_leaf=True,
-                      unit_count=count, source_count=1) for source, count in counts]
+                      unit_count=count, source_count=1, document_count=doc_count)
+                 for source, count, doc_count in counts]
         # Revalidate the presentation model; these groups carry no routing membership or edges.
         tree = UniverseTreeOut.model_validate({**tree.model_dump(), "nodes": nodes,
                                               "node_count": len(counts), "source_count": len(counts),
-                                              "unit_count": sum(count for _, count in counts)})
+                                              "unit_count": sum(count for _, count, _ in counts)})
         snapshot.tree = tree
         snapshot.members = {node.id: set() for node in tree.nodes}
         if tree.nodes:
@@ -277,17 +292,162 @@ async def load_source_universe_snapshots(
     return snapshots
 
 
-async def _present_units(session: AsyncSession, rows) -> list[UniverseKnowledgeUnitOut]:
+def _extract_shared_entities_and_signals(
+    unit_a: KnowledgeUnit,
+    doc_a: Document,
+    unit_b: KnowledgeUnit,
+    doc_b: Document,
+    persisted_signals: dict[str, Any] | None = None,
+) -> tuple[bool, list[str], dict[str, float | None]]:
+    cross_document = doc_a.id != doc_b.id
+    features_a = unit_a.features_json if isinstance(unit_a.features_json, dict) else {}
+    features_b = unit_b.features_json if isinstance(unit_b.features_json, dict) else {}
+    raw_ents_a = [str(e).strip() for e in (features_a.get("entities") or []) if isinstance(e, str) and str(e).strip()]
+    raw_ents_b = [str(e).strip() for e in (features_b.get("entities") or []) if isinstance(e, str) and str(e).strip()]
+    norm_to_display_a: dict[str, str] = {}
+    for ent in raw_ents_a:
+        norm = _norm_ent(ent)
+        if norm and norm not in norm_to_display_a:
+            norm_to_display_a[norm] = ent
+    norm_b = {_norm_ent(ent) for ent in raw_ents_b if _norm_ent(ent)}
+    shared_norms = sorted(set(norm_to_display_a) & norm_b)
+    shared_entities = [norm_to_display_a[norm] for norm in shared_norms]
+
+    if isinstance(persisted_signals, dict) and isinstance(persisted_signals.get("signals"), dict):
+        raw_sig = persisted_signals["signals"]
+        signals: dict[str, float | None] = {
+            key: (float(val) if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val) else None)
+            for key, val in raw_sig.items()
+        }
+        return cross_document, shared_entities, signals
+
+    dense_a = features_a.get("dense") if isinstance(features_a.get("dense"), list) else []
+    dense_b = features_b.get("dense") if isinstance(features_b.get("dense"), list) else []
+    semantic = _cosine(dense_a, dense_b)
+    union_norms = set(norm_to_display_a) | norm_b
+    entity_score = (len(shared_norms) / len(union_norms)) if union_norms else None
+    tokens_a = terms(unit_a.text)
+    tokens_b = terms(unit_b.text)
+    common_tokens = set(tokens_a) & set(tokens_b)
+    all_tokens = set(tokens_a) | set(tokens_b)
+    lexical = (len(common_tokens) / len(all_tokens)) if all_tokens else 0.0
+    prov_a = unit_a.provenance_json if isinstance(unit_a.provenance_json, dict) else {}
+    prov_b = unit_b.provenance_json if isinstance(unit_b.provenance_json, dict) else {}
+    same_doc = not cross_document
+    structure = (
+        0.85
+        if same_doc and prov_a.get("section_path") == prov_b.get("section_path")
+        else 0.65
+        if same_doc and abs(unit_a.ordinal - unit_b.ordinal) <= 2
+        else 0.45
+        if same_doc
+        else 0.25
+        if unit_a.source_id == unit_b.source_id
+        else 0.0
+    )
+    citations_a = set(features_a.get("citations") or [])
+    citations_b = set(features_b.get("citations") or [])
+    citation = (0.7 if (citations_a & citations_b) else 0.0) if (citations_a or citations_b) else None
+    return cross_document, shared_entities, {
+        "semantic": round(semantic, 4) if semantic is not None else None,
+        "entity": round(entity_score, 4) if entity_score is not None else None,
+        "lexical": round(lexical, 4),
+        "structure": round(structure, 4),
+        "citation": citation,
+    }
+
+
+async def _load_persisted_edge_signals(
+    session: AsyncSession,
+    pairs: list[tuple[str, str]],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    if not pairs:
+        return {}
+    canonical_pairs = sorted({(min(a, b), max(a, b)) for a, b in pairs})
+    rows = (
+        await session.execute(
+            select(
+                KnowledgeUnitEdge.source_unit_id,
+                KnowledgeUnitEdge.target_unit_id,
+                KnowledgeUnitEdge.signals_json,
+            ).where(
+                tuple_(KnowledgeUnitEdge.source_unit_id, KnowledgeUnitEdge.target_unit_id).in_(canonical_pairs)
+            )
+        )
+    ).all()
+    by_pair: dict[tuple[str, str], dict[str, Any]] = {}
+    for src, tgt, sig_json in rows:
+        if isinstance(sig_json, dict):
+            by_pair[(src, tgt)] = sig_json
+            by_pair[(tgt, src)] = sig_json
+    return by_pair
+
+
+async def _present_units(
+    session: AsyncSession,
+    rows,
+    snapshot: KnowledgeUniverseSnapshot | None = None,
+) -> list[UniverseKnowledgeUnitOut]:
+    if not rows:
+        return []
     block_ids = set()
-    for unit, _document, _version, _source in rows:
+    unit_ids = []
+    doc_by_unit: dict[str, str] = {}
+    for unit, document, _version, _source in rows:
         ids = unit.provenance_json.get("evidence_block_ids")
         if not isinstance(ids, list) or len(ids) != 1 or not isinstance(ids[0], str):
             raise ServiceUnavailableError("Knowledge unit has no canonical evidence locator")
         block_ids.add(ids[0])
+        unit_ids.append(unit.id)
+        doc_by_unit[unit.id] = document.id
     blocks = {
         block.id: block
         for block in (await session.scalars(select(CanonicalBlock).where(CanonicalBlock.id.in_(block_ids)))).all()
     }
+    evidence_stats = {
+        uid: (int(cnt or 0), bool(has_e2))
+        for uid, cnt, has_e2 in (
+            await session.execute(
+                select(
+                    KnowledgeEvidence.unit_id,
+                    func.count(KnowledgeEvidence.id),
+                    func.max(case((KnowledgeEvidence.tier == "E2", 1), else_=0)),
+                )
+                .where(KnowledgeEvidence.unit_id.in_(unit_ids))
+                .group_by(KnowledgeEvidence.unit_id)
+            )
+        ).all()
+    }
+    cross_doc_counts: dict[str, int] = {uid: 0 for uid in unit_ids}
+    if snapshot is not None and snapshot.edges:
+        unit_id_set = set(unit_ids)
+        neighbor_ids_by_unit: dict[str, set[str]] = {uid: set() for uid in unit_ids}
+        missing_neighbor_ids: set[str] = set()
+        for src, tgt, _w in snapshot.edges:
+            if src in unit_id_set:
+                neighbor_ids_by_unit[src].add(tgt)
+                if tgt not in doc_by_unit:
+                    missing_neighbor_ids.add(tgt)
+            if tgt in unit_id_set:
+                neighbor_ids_by_unit[tgt].add(src)
+                if src not in doc_by_unit:
+                    missing_neighbor_ids.add(src)
+        if missing_neighbor_ids:
+            neighbor_doc_rows = (
+                await session.execute(
+                    select(KnowledgeUnit.id, DocumentVersion.document_id)
+                    .join(DocumentVersion, DocumentVersion.id == KnowledgeUnit.document_version_id)
+                    .where(KnowledgeUnit.id.in_(missing_neighbor_ids))
+                )
+            ).all()
+            for n_uid, n_doc_id in neighbor_doc_rows:
+                doc_by_unit[n_uid] = n_doc_id
+        for uid, n_ids in neighbor_ids_by_unit.items():
+            own_doc = doc_by_unit.get(uid)
+            cross_doc_counts[uid] = sum(
+                1 for n_id in n_ids if doc_by_unit.get(n_id) and doc_by_unit.get(n_id) != own_doc
+            )
+
     output = []
     for unit, document, version, source in rows:
         provenance = unit.provenance_json
@@ -310,6 +470,17 @@ async def _present_units(session: AsyncSession, rows) -> list[UniverseKnowledgeU
             raise ServiceUnavailableError("Knowledge evidence failed canonical scope validation")
         heading = block.section_path or document.filename
         text = " ".join(unit.text.split())
+        features = unit.features_json if isinstance(unit.features_json, dict) else {}
+        ev_count, has_e2 = evidence_stats.get(unit.id, (0, False))
+        e2_reason = features.get("e2_reason") if isinstance(features.get("e2_reason"), str) else None
+        is_e2 = bool(has_e2 or features.get("e2_enriched") or e2_reason)
+        entities = [
+            str(ent).strip()
+            for ent in (features.get("entities") or [])
+            if isinstance(ent, str) and str(ent).strip()
+        ]
+        importance = float(features.get("importance") or 0.0)
+        local_confidence = float(features.get("local_confidence") or 0.0)
         output.append(
             UniverseKnowledgeUnitOut(
                 id=unit.id,
@@ -326,6 +497,14 @@ async def _present_units(session: AsyncSession, rows) -> list[UniverseKnowledgeU
                 page_from=block.page_from,
                 page_to=block.page_to,
                 anchor=(block.source_anchor or provenance.get("source_anchor") or f"block-{block.ordinal}"),
+                neural_tier="E2" if is_e2 else "E0_E1",
+                importance=round(importance, 4) if math.isfinite(importance) else 0.0,
+                local_confidence=round(local_confidence, 4) if math.isfinite(local_confidence) else 0.0,
+                e2_reason=e2_reason,
+                entities=entities[:12],
+                evidence_count=ev_count,
+                cross_doc_synapse_count=cross_doc_counts.get(unit.id, 0),
+                checksum=unit.checksum or "",
             )
         )
     return output
@@ -359,6 +538,7 @@ async def knowledge_universe_page(
         raise NotFoundError("Knowledge cluster is unavailable")
     source_mode = snapshot.tree.projection == "source"
     ids = None if source_mode else snapshot.members[node_id]
+    anchor = None
     if related_to:
         if not source_mode and related_to not in snapshot.unit_ids:
             raise NotFoundError("Knowledge unit is unavailable")
@@ -384,15 +564,50 @@ async def knowledge_universe_page(
     ).all()
     has_more = len(rows) > limit
     rows = rows[:limit]
-    units = await _present_units(session, rows)
+    units = await _present_units(session, rows, snapshot)
     visible = {unit.id for unit in units}
     if related_to:
         visible.add(related_to)
-    edges = [
-        UniverseKnowledgeEdgeOut(source=source, target=target, weight=weight)
+    visible_triples = [
+        (source, target, weight)
         for source, target, weight in snapshot.edges
         if source in visible and target in visible
     ][:settings.universe_edge_budget_desktop]
+    row_by_id = {r[0].id: r for r in rows}
+    if anchor is not None:
+        row_by_id[anchor[0].id] = anchor
+    persisted_signals = await _load_persisted_edge_signals(
+        session,
+        [(source, target) for source, target, _weight in visible_triples],
+    )
+    edges = []
+    for source, target, weight in visible_triples:
+        src_row = row_by_id.get(source)
+        tgt_row = row_by_id.get(target)
+        if src_row is not None and tgt_row is not None:
+            cross_doc, shared_ents, sigs = _extract_shared_entities_and_signals(
+                src_row[0],
+                src_row[1],
+                tgt_row[0],
+                tgt_row[1],
+                persisted_signals.get((source, target)),
+            )
+            edges.append(
+                UniverseKnowledgeEdgeOut(
+                    source=source,
+                    target=target,
+                    weight=weight,
+                    cross_document=cross_doc,
+                    source_document_id=src_row[1].id,
+                    target_document_id=tgt_row[1].id,
+                    source_document_name=src_row[1].filename,
+                    target_document_name=tgt_row[1].filename,
+                    shared_entities=shared_ents,
+                    signals=sigs,
+                )
+            )
+        else:
+            edges.append(UniverseKnowledgeEdgeOut(source=source, target=target, weight=weight))
     return UniverseKnowledgePageOut(
         project_id=snapshot.tree.project_id,
         tree_version=snapshot.tree.tree_version,
@@ -418,7 +633,7 @@ async def knowledge_universe_detail(
     unit = row[0]
     if unit.checksum != await unit_checksum(session, unit):
         raise ServiceUnavailableError("Knowledge unit evidence checksum mismatch")
-    presented = (await _present_units(session, [row]))[0]
+    presented = (await _present_units(session, [row], snapshot))[0]
     facts = (await session.scalars(
         select(KnowledgeEvidence).where(KnowledgeEvidence.unit_id == unit.id).order_by(KnowledgeEvidence.id)
     )).all()
@@ -437,11 +652,80 @@ async def knowledge_universe_detail(
         evidence.append(UniverseKnowledgeEvidenceOut(
             id=fact.id, tier=fact.tier, kind=fact.kind, quote=quote, confidence=fact.confidence,
             candidate=payload.get("candidate") is not False, start=start, end=end,
+            label=payload.get("label") if isinstance(payload.get("label"), str) else None,
+            subject=payload.get("subject") if isinstance(payload.get("subject"), str) else None,
+            predicate=payload.get("predicate") if isinstance(payload.get("predicate"), str) else None,
+            object=payload.get("object") if isinstance(payload.get("object"), str) else None,
+            extractor_version=fact.extractor_version or "",
         ))
+
+    synapses: list[UniverseKnowledgeSynapseOut] = []
+    if snapshot.edges and snapshot.tree.projection != "source":
+        neighbor_weights: dict[str, float] = {}
+        for src, tgt, weight in snapshot.edges:
+            if src == unit.id and tgt in snapshot.unit_ids:
+                neighbor_weights[tgt] = max(neighbor_weights.get(tgt, 0.0), float(weight))
+            elif tgt == unit.id and src in snapshot.unit_ids:
+                neighbor_weights[src] = max(neighbor_weights.get(src, 0.0), float(weight))
+        if neighbor_weights:
+            top_neighbor_ids = {
+                nid
+                for nid, _w in sorted(neighbor_weights.items(), key=lambda item: (-item[1], item[0]))[:24]
+            }
+            neighbor_rows = (await session.execute(_unit_query(snapshot, top_neighbor_ids))).all()
+            if neighbor_rows:
+                neighbor_presented = {
+                    item.id: item
+                    for item in await _present_units(session, neighbor_rows, snapshot)
+                }
+                persisted_signals = await _load_persisted_edge_signals(
+                    session,
+                    [(unit.id, r[0].id) for r in neighbor_rows],
+                )
+                leaf_node_ids = [n.id for n in snapshot.tree.nodes if n.is_leaf]
+                all_node_ids = leaf_node_ids + [n.id for n in snapshot.tree.nodes if not n.is_leaf]
+                for n_row in neighbor_rows:
+                    n_unit, n_doc, _n_ver, _n_src = n_row
+                    n_pres = neighbor_presented.get(n_unit.id)
+                    if n_pres is None:
+                        continue
+                    cross_doc, shared_ents, sigs = _extract_shared_entities_and_signals(
+                        unit,
+                        row[1],
+                        n_unit,
+                        n_doc,
+                        persisted_signals.get((unit.id, n_unit.id)),
+                    )
+                    target_node_id = next(
+                        (nid for nid in all_node_ids if n_unit.id in snapshot.members.get(nid, set())),
+                        None,
+                    )
+                    synapses.append(
+                        UniverseKnowledgeSynapseOut(
+                            target_unit_id=n_unit.id,
+                            target_node_id=target_node_id,
+                            target_label=n_pres.label,
+                            target_preview=n_pres.preview,
+                            target_heading=n_pres.heading,
+                            target_document_id=n_pres.document_id,
+                            target_document_name=n_pres.document_name,
+                            target_source_id=n_pres.source_id,
+                            target_source_name=n_pres.source_name,
+                            target_page_from=n_pres.page_from,
+                            target_neural_tier=n_pres.neural_tier,
+                            weight=round(neighbor_weights[n_unit.id], 4),
+                            cross_document=cross_doc,
+                            shared_entities=shared_ents,
+                            signals=sigs,
+                        )
+                    )
+                synapses.sort(key=lambda s: (not s.cross_document, -s.weight, s.target_unit_id))
+                synapses = synapses[:16]
+
     return UniverseKnowledgeDetailOut(
         **presented.model_dump(), project_id=snapshot.tree.project_id,
         tree_version=snapshot.tree.tree_version, scope_key=snapshot.scope_key,
-        content=unit.text, evidence=evidence,
+        content=unit.text, evidence=evidence, synapses=synapses,
     )
 
 

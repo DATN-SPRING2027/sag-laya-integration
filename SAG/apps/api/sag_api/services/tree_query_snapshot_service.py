@@ -30,6 +30,7 @@ from sag_api.services.query_routing_service import (
 from sag_api.services.query_routing_service import (
     RoutingSnapshot as QueryRoutingSnapshot,
 )
+from sag_api.services.search_index_service import COMMON_STOPWORDS
 from sag_api.services.tree_publish_service import _database_now, _scoped_profile_checksum
 
 _TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
@@ -41,7 +42,11 @@ _AGGREGATED_SCOPE_NODE_CACHE_MAX = 128
 
 
 def _query_signal_scores(query: str, profile: dict[str, Any]) -> dict[str, float]:
-    query_terms = set(_TOKEN_PATTERN.findall(query.casefold()))
+    raw_query_terms = set(_TOKEN_PATTERN.findall(query.casefold()))
+    informative_terms = {
+        t for t in raw_query_terms if t not in COMMON_STOPWORDS and (len(t) >= 2 or t.isdigit())
+    }
+    query_terms = informative_terms or raw_query_terms
     sparse = profile.get("sparse")
     weights: list[tuple[str, float]] = []
     if isinstance(sparse, list):
@@ -56,17 +61,38 @@ def _query_signal_scores(query: str, profile: dict[str, Any]) -> dict[str, float
                 and float(item[1]) >= 0.0
             ):
                 weights.append((item[0].casefold(), float(item[1])))
-    total = math.fsum(weight for _term, weight in weights)
-    sparse_score = (
-        min(1.0, math.fsum(weight for term, weight in weights if term in query_terms) / total)
-        if total > 0.0
-        else 0.0
-    )
+    weight_map: dict[str, float] = {}
+    for term, weight in weights:
+        weight_map[term] = weight_map.get(term, 0.0) + weight
+    matched_terms = [t for t in query_terms if t in weight_map and weight_map[t] > 0.0]
+    if matched_terms and query_terms and weights:
+        query_cov = len(matched_terms) / len(query_terms)
+        matched_mass = math.fsum(weight_map[t] for t in matched_terms)
+        top_k_weights = sorted(weight_map.values(), reverse=True)[: max(1, len(query_terms))]
+        top_k_mass = math.fsum(top_k_weights)
+        weight_conc = min(1.0, matched_mass / top_k_mass) if top_k_mass > 0.0 else 0.0
+        sparse_score = min(1.0, 0.65 * query_cov + 0.35 * weight_conc)
+    else:
+        sparse_score = 0.0
     scores = {"sparse": sparse_score}
     entities = profile.get("entities")
     if isinstance(entities, list) and all(isinstance(entity, str) for entity in entities):
         folded_query = query.casefold()
-        scores["entity"] = 1.0 if any(entity.casefold() in folded_query for entity in entities) else 0.0
+        if any(entity.strip() and entity.casefold() in folded_query for entity in entities):
+            scores["entity"] = 1.0
+        else:
+            best_overlap = 0.0
+            for entity in entities:
+                ent_tokens = {
+                    t
+                    for t in _TOKEN_PATTERN.findall(entity.casefold())
+                    if t not in COMMON_STOPWORDS and (len(t) >= 2 or t.isdigit())
+                }
+                if len(ent_tokens) >= 2 and query_terms:
+                    overlap = len(ent_tokens & query_terms) / len(ent_tokens)
+                    if overlap >= 0.5 and overlap > best_overlap:
+                        best_overlap = overlap
+            scores["entity"] = round(0.85 * best_overlap, 4) if best_overlap > 0.0 else 0.0
     return scores
 
 

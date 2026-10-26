@@ -284,6 +284,7 @@ def _score_term_sequence(
     heading: str,
     phrase: str,
     term_weights: dict[str, float],
+    raw_heading: str = "",
 ) -> float:
     if not text or not terms:
         return 0.0
@@ -302,6 +303,20 @@ def _score_term_sequence(
         if (phrase and len(phrase) >= 2 and phrase in heading)
         else _adjacent_proximity_score(terms, heading)
     )
+    if raw_heading and terms:
+        # Check if the specific clause/article title (after "Điều X." or last separator) is 100% matched
+        # in the query and contains the query's highest-IDF distinguishing term.
+        clause_title = re.split(r"(?i:\bđiều\s+\d+[a-z]?[.:]\s*|\bsection\s+\d+[.:]\s*|\s+-\s+|\s+>\s+)", raw_heading)[-1].strip()
+        title_terms = [
+            normalize_lexical_text(w)
+            for w in re.findall(r"[^\W_]+", clause_title.lower(), flags=re.UNICODE)
+        ]
+        title_informative = [t for t in title_terms if len(t) >= 2 and t not in _LEXICAL_STOPWORDS]
+        if len(title_informative) >= 2 and set(title_informative) <= set(terms):
+            max_w = max((term_weights.get(t, 1.0) for t in terms), default=1.0)
+            if any(term_weights.get(t, 1.0) >= 0.62 * max_w for t in title_informative):
+                cov_head = max(cov_head, 0.96)
+                prox_head = 1.0
     return min(
         1.0,
         0.50 * cov_text + 0.22 * cov_head + 0.18 * prox_text + 0.10 * prox_head,
@@ -533,6 +548,7 @@ def rerank_sections(
             heading=head_norm,
             phrase=effective.normalized_phrase,
             term_weights=term_weights,
+            raw_heading=section.heading or "",
         )
         clause_best = (
             max(
@@ -543,6 +559,7 @@ def rerank_sections(
                         heading=head_norm,
                         phrase="",
                         term_weights=term_weights,
+                        raw_heading=section.heading or "",
                     )
                     for ct in clause_term_lists
                 ),
@@ -557,6 +574,13 @@ def rerank_sections(
             0.92 * clause_best,
         )
 
+    top_lexical_score = max(lexical_scores.values(), default=0.0)
+    interaction_lex_ranks: dict[tuple[str, str], int] = {
+        k: idx
+        for idx, (k, _val) in enumerate(
+            sorted(lexical_scores.items(), key=lambda item: (-item[1], item[0]))
+        )
+    }
     active_retrievers = int(bool(semantic_ranks)) + int(bool(lexical_ranks))
     ideal_rrf_score = active_retrievers / (_RRF_K + 1)
     ranked: list[tuple[float, int, int, int, tuple[str, str], RetrievedSection]] = []
@@ -570,6 +594,13 @@ def rerank_sections(
         raw = semantic_scores.get(key, 0.0)
         relative_semantic_score = raw / top_semantic_score if top_semantic_score > 0 else 0.0
         lexical_score = lexical_scores[key]
+        if (
+            lex_eff is not None
+            and top_lexical_score >= 0.65
+            and lexical_score >= 0.95 * top_lexical_score
+            and interaction_lex_ranks.get(key, 99) <= 1
+        ):
+            lex_eff = min(lex_eff, interaction_lex_ranks[key])
         exact = key in exact_keys
         lexical_match = lexical_rank is not None
         if _is_boilerplate(section) and not lexical_match and lexical_score < 0.35:
@@ -805,8 +836,10 @@ def select_diverse_sections(
     ordered_docs: list[str] = []
     doc_best_idx: dict[str, int] = {}
     doc_best_score: dict[str, float] = {}
+    doc_chunk_counts: dict[str, int] = {}
     for idx, sec in enumerate(unique):
         d_key = doc_key(sec)
+        doc_chunk_counts[d_key] = doc_chunk_counts.get(d_key, 0) + 1
         if d_key not in doc_best_idx:
             ordered_docs.append(d_key)
             doc_best_idx[d_key] = idx
@@ -817,13 +850,13 @@ def select_diverse_sections(
     if ordered_docs:
         admitted_docs.add(ordered_docs[0])
         if features.multi_hop:
-            max_initial_docs = min(limit, 4 if len(required) < 3 else limit)
+            max_initial_docs = limit
             for rank_d, d_key in enumerate(ordered_docs[1:], start=1):
                 if len(admitted_docs) >= max_initial_docs:
                     break
                 if rank_d < 3 and doc_best_score[d_key] >= 0.68 * top_doc_score:
                     admitted_docs.add(d_key)
-                elif doc_best_score[d_key] >= 0.75 * top_doc_score:
+                elif doc_best_score[d_key] >= 0.72 * top_doc_score:
                     admitted_docs.add(d_key)
         else:
             second_threshold = 0.80 if diversity_weight is not None else 0.94
@@ -832,6 +865,7 @@ def select_diverse_sections(
             if len(ordered_docs) >= 3 and doc_best_score[ordered_docs[2]] >= 0.96 * top_doc_score:
                 admitted_docs.add(ordered_docs[2])
 
+    initial_admitted_docs = set(admitted_docs)
     for d_key in ordered_docs:
         if len(selected_indices) >= limit:
             break
@@ -850,20 +884,44 @@ def select_diverse_sections(
         remaining = [
             index
             for index in range(len(unique))
-            if index not in selected_indices and doc_key(unique[index]) in admitted_docs
+            if index not in selected_indices
+            and doc_key(unique[index]) in admitted_docs
+            and (
+                doc_key(unique[index]) in initial_admitted_docs
+                or index == doc_best_idx.get(doc_key(unique[index]))
+            )
         ]
         if not remaining:
+            all_initial_single_chunk = all(
+                doc_chunk_counts.get(d, 0) <= 1 for d in initial_admitted_docs
+            )
+            eff_floor = (
+                0.40
+                if (diversity_weight is None and all_initial_single_chunk)
+                else fallback_doc_floor
+            )
             next_doc = next(
                 (
                     d_key
                     for d_key in ordered_docs
                     if d_key not in admitted_docs
-                    and doc_best_score.get(d_key, 0.0) >= fallback_doc_floor * top_doc_score
+                    and doc_best_score.get(d_key, 0.0) >= eff_floor * top_doc_score
                 ),
                 None,
             )
             if next_doc is not None:
                 admitted_docs.add(next_doc)
+                remaining = [
+                    index
+                    for index in range(len(unique))
+                    if index not in selected_indices
+                    and doc_key(unique[index]) in admitted_docs
+                    and (
+                        doc_key(unique[index]) in initial_admitted_docs
+                        or index == doc_best_idx.get(doc_key(unique[index]))
+                    )
+                ]
+            else:
                 remaining = [
                     index
                     for index in range(len(unique))

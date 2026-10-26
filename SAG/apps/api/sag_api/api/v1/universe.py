@@ -151,6 +151,9 @@ async def manifest(
                     TreeManifest.status,
                     TreeManifest.checksum,
                     TreeManifest.node_count,
+                    TreeManifest.routing_recall_at_k,
+                    TreeManifest.escape_win_rate,
+                    TreeManifest.acl_blackhole_rate,
                 )
             )
             .where(tuple_(TreeManifest.project_id, TreeManifest.tree_version).in_(active_versions))
@@ -337,6 +340,7 @@ async def manifest(
                     "is_leaf": profile.is_leaf,
                     "unit_count": 0,
                     "sources": set(),
+                    "documents": set(),
                     "entities": Counter(),
                     "terms": defaultdict(float),
                 },
@@ -347,6 +351,7 @@ async def manifest(
         for row in records:
             node = nodes[row.node_id]
             node["sources"].add(row.source_id)
+            node["documents"].add(row.document_version_id)
             source_ids_by_project[project_id].add(row.source_id)
             # The legacy incremental-tree writer uses this pair for empty profiles.
             is_empty_profile_placeholder = (
@@ -387,9 +392,13 @@ async def manifest(
             terms = node["terms"]
             readable_entities = [value for value in entities if any(char.isalpha() for char in value)]
             readable_terms = [value for value in terms if len(value) > 2 and any(char.isalpha() for char in value)]
+            top_entities = sorted(
+                readable_entities,
+                key=lambda value: (-entities[value], value.casefold(), value),
+            )[:6]
             label = (
-                min(readable_entities, key=lambda value: (-entities[value], value.casefold(), value))
-                if readable_entities
+                top_entities[0]
+                if top_entities
                 else " · ".join(sorted(readable_terms, key=lambda value: (-terms[value], value.casefold()))[:3])
                 if readable_terms
                 else ""
@@ -403,14 +412,20 @@ async def manifest(
                     "is_leaf": node["is_leaf"],
                     "unit_count": node["unit_count"],
                     "source_count": len(node["sources"]),
+                    "document_count": len(node["documents"]),
+                    "top_entities": top_entities,
                 }
             )
-        state = active[project_id][0]
+        state, record = active[project_id]
         trees.append(
             {
                 "project_id": project_id,
                 "tree_version": tree_version,
                 "search_epoch": state.active_search_epoch,
+                "active_slot": state.active_routing_slot,
+                "routing_recall_at_k": record.routing_recall_at_k,
+                "escape_win_rate": record.escape_win_rate,
+                "acl_blackhole_rate": record.acl_blackhole_rate,
                 "node_count": len(output_nodes),
                 "unit_count": sum(node["unit_count"] for node in output_nodes if node["is_leaf"]),
                 "source_count": len(source_ids_by_project[project_id]),

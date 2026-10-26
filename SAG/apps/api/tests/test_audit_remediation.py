@@ -1,7 +1,6 @@
 import hashlib
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -15,7 +14,6 @@ from sag_api.db.models import (
     Document,
     DocumentVersion,
     IngestionRun,
-    KnowledgeEvidence,
     KnowledgeUnit,
     SearchUnit,
     Source,
@@ -306,8 +304,6 @@ async def test_task4_knowledge_worker_embeds_dense_vectors(remediation_db):
 @pytest.mark.asyncio
 async def test_task5_paused_and_failed_documents_excluded_from_retrieval_scope(remediation_db):
     from sag_api.services.search_unit_retrieval_service import (
-        SearchableSource,
-        VerifiedPrincipal,
         _load_current_ready_versions_checked,
     )
 
@@ -880,7 +876,7 @@ def test_cognitive_upgrades_clause_decomposition_artifact_bridge_and_entropy_adm
         extract_query_features,
         extract_salient_query_terms,
     )
-    from sag_api.services.retrieval_service import rerank_sections, select_diverse_sections
+    from sag_api.services.retrieval_service import select_diverse_sections
     from sag_api.services.search_unit_retrieval_service import _extract_artifact_codes
 
     # 1. Clause decomposition, salient proper nouns, and dispute multi-hop detection
@@ -998,6 +994,262 @@ def test_cognitive_upgrades_clause_decomposition_artifact_bridge_and_entropy_adm
     assert {s.document_id for s in mh_selected} == {"mh-doc-1", "mh-doc-2", "mh-doc-3", "mh-doc-4"}
 
 
+def test_system_bottleneck_bug_fixes_e0_routing_and_multihop_diversity() -> None:
+    """Verify fixes for slash-entity pollution, Vietnamese E0/E1, Tree Routing margins, and 5-doc Multi-Hop diversity."""
+    from sag_api.sag import RetrievedSection
+    from sag_api.services.query_routing_service import (
+        GroupRoutingSnapshot,
+        NodeProfile,
+        route_snapshot,
+        scope_fingerprint,
+    )
+    from sag_api.services.retrieval_service import select_diverse_sections
+    from sag_api.services.search_unit_retrieval_service import _extract_uri_slugs
+    from sag_api.services.tree_query_snapshot_service import _query_signal_scores
+
+    # 1. E0/E1: Slash words ("Support/CS", "timeouts/5xx") must NOT produce fake "/CS" or "/5xx" entities,
+    # while real paths ("/v1/chat/completions"), scheme URIs, Vietnamese dates/units/labels are extracted.
+    en_slash_block = _make_block(
+        "Escalation",
+        "Support/CS escalates timeouts/5xx on /v1/chat/completions via confluence://support/playbook/dedicated-throughput-slo-escalation.",
+        0,
+    )
+    _, en_slash_features = extract_e0_e1(en_slash_block)
+    assert "/CS" not in en_slash_features["entities"]
+    assert "/5xx" not in en_slash_features["entities"]
+    assert "/v1/chat/completions" in en_slash_features["entities"]
+    assert "confluence://support/playbook/dedicated-throughput-slo-escalation" in en_slash_features["entities"]
+    assert _extract_uri_slugs(en_slash_block.normalized_text) == {"dedicated throughput slo escalation"}
+
+    vn_block = _make_block(
+        "Quy chế",
+        "Ngày 19-10-2026, theo 15/2026/NĐ-CP và Điều 5, Dự án A kiểm tra 120 câu trong 30 ngày vì phải từ chối nếu lỗi.",
+        1,
+    )
+    _, vn_features = extract_e0_e1(vn_block)
+    assert "19-10-2026" in vn_features["entities"]
+    assert "15/2026/NĐ-CP" in vn_features["entities"]
+    assert "Điều 5" in vn_features["entities"]
+    assert "Dự án A" in vn_features["entities"]
+    assert "120 câu" in vn_features["entities"]
+    assert "30 ngày" in vn_features["entities"]
+    assert vn_features["e2_reason"] == "causal_constraint"
+
+    # Low-confidence important block (no E0 entities, but has causal/constraint keywords -> importance=0.50)
+    low_conf_block = _make_block(
+        "Quy định",
+        "nếu tỷ lệ câu trả lời thiếu bằng chứng vượt ngưỡng thì hệ thống bắt buộc phải từ chối trả lời ngay.",
+        2,
+    )
+    _, low_conf_features = extract_e0_e1(low_conf_block)
+    assert low_conf_features["local_confidence"] == pytest.approx(0.55)
+    assert low_conf_features["importance"] >= 0.50
+    assert low_conf_features["e2_reason"] == "low_confidence_important"
+
+    # 2. Tree Routing: _query_signal_scores strips stopwords and produces decisive margin (>= 0.18)
+    branch_a_profile = {
+        "sparse": [["bằng", 5.0], ["chứng", 5.0], ["cổng", 4.0], ["điểm", 4.0], ["từ", 3.0], ["chối", 3.0]],
+        "entities": ["0.75", "Cổng Bằng Chứng"],
+    }
+    branch_b_profile = {
+        "sparse": [["phiên", 4.0], ["bản", 4.0], ["lưu", 3.0], ["mã", 3.0], ["băm", 3.0]],
+        "entities": ["Sổ Cái Bằng Chứng", "SHA-256"],
+    }
+    q_vn = "Khi điểm bằng chứng của Cổng Bằng Chứng dưới bao nhiêu thì phải từ chối?"
+    sig_a = _query_signal_scores(q_vn, branch_a_profile)
+    sig_b = _query_signal_scores(q_vn, branch_b_profile)
+    fp = scope_fingerprint(
+        {
+            "project_id": "proj-1",
+            "source_ids": ["src-1"],
+            "document_version_ids": ["ver-1"],
+            "tenant_id": "tenant-1",
+            "partition_id": "part-1",
+        }
+    )
+    common_node = dict(
+        project_id="proj-1",
+        source_ids=("src-1",),
+        document_version_ids=("ver-1",),
+        tenant_id="tenant-1",
+        partition_id="part-1",
+        tree_version="tree-1",
+        scope_fingerprint=fp,
+    )
+    snap = GroupRoutingSnapshot(
+        snapshot_id="snap-1",
+        captured_at=datetime.now(UTC),
+        project_id="proj-1",
+        source_ids=("src-1",),
+        document_version_ids=("ver-1",),
+        tenant_id="tenant-1",
+        partition_id="part-1",
+        scope_fingerprint=fp,
+        tree_version="tree-1",
+        tree_config_version="v1",
+        routing_slot="SLOT_A",
+        search_epoch=1,
+        manifest_status="ACTIVE",
+        manifest_checksum="a" * 64,
+        manifest_verified=True,
+        profiles=(
+            NodeProfile(
+                node_id="root",
+                parent_id=None,
+                is_leaf=False,
+                accessible_unit_count=5,
+                signal_scores={"sparse": 0.6, "entity": 1.0},
+                **common_node,
+            ),
+            NodeProfile(
+                node_id="branch-a",
+                parent_id="root",
+                is_leaf=True,
+                accessible_unit_count=3,
+                signal_scores=sig_a,
+                **common_node,
+            ),
+            NodeProfile(
+                node_id="branch-b",
+                parent_id="root",
+                is_leaf=True,
+                accessible_unit_count=2,
+                signal_scores=sig_b,
+                **common_node,
+            ),
+        ),
+    )
+    decision = route_snapshot(snap)
+    assert decision.routed is True
+    assert decision.broad_route is False
+    assert decision.reason_code == "ROUTE_DESCENDED"
+    assert decision.selected_nodes == ("branch-a",)
+
+    # 3. Multi-Hop Diversity: 5 distinct qualifying docs each get 1 slot when limit=5
+    mh5_sections = [
+        RetrievedSection(
+            chunk_id="d1-c1",
+            document_id="doc-1",
+            document_name="d1.md",
+            heading="H1",
+            content="Primary ticket outbreak.",
+            score=0.80,
+            rank=0,
+            source_id="src-1",
+        ),
+        RetrievedSection(
+            chunk_id="d1-c2",
+            document_id="doc-1",
+            document_name="d1.md",
+            heading="H1-b",
+            content="Second chunk of primary ticket.",
+            score=0.79,
+            rank=1,
+            source_id="src-1",
+        ),
+        RetrievedSection(
+            chunk_id="d2-c1",
+            document_id="doc-2",
+            document_name="d2.md",
+            heading="H2",
+            content="Second doc in chain.",
+            score=0.75,
+            rank=2,
+            source_id="src-1",
+        ),
+        RetrievedSection(
+            chunk_id="d3-c1",
+            document_id="doc-3",
+            document_name="d3.md",
+            heading="H3",
+            content="Third doc in chain.",
+            score=0.70,
+            rank=3,
+            source_id="src-1",
+        ),
+        RetrievedSection(
+            chunk_id="d4-c1",
+            document_id="doc-4",
+            document_name="d4.md",
+            heading="H4",
+            content="Fourth doc in chain.",
+            score=0.65,
+            rank=4,
+            source_id="src-1",
+        ),
+        RetrievedSection(
+            chunk_id="d5-c1",
+            document_id="doc-5",
+            document_name="d5.md",
+            heading="H5",
+            content="Fifth doc in chain.",
+            score=0.60,
+            rank=5,
+            source_id="src-1",
+        ),
+    ]
+    mh5_selected, _ = select_diverse_sections(
+        "Why was the outage triggered, and how did the PR fix the ticket?",
+        mh5_sections,
+        limit=5,
+    )
+    assert [s.document_id for s in mh5_selected] == ["doc-1", "doc-2", "doc-3", "doc-4", "doc-5"]
 
 
+def test_vietnamese_entity_lexer_multihop_and_e2_span_alignment() -> None:
+    """Verify Vietnamese entity extraction, newline boundary safety, multi-hop detection, and E2 span alignment."""
+    from sag_api.jobs.knowledge import _align_e2_spans
+    from sag_api.services.query_analysis import extract_query_features
 
+    # 1. Newline boundary safety + Vietnamese full date + compound proper nouns + single-word mid-sentence proper nouns
+    vi_block = _make_block(
+        "Bảo tàng Hàng hải Penobscot",
+        (
+            "Bảo tàng Hàng hải Penobscot\n\n"
+            "Bảo tàng Hàng hải Penobscot là một bảo tàng ở Searsport, Maine, nằm ở đầu Vịnh Penobscot. "
+            "Sự kiện diễn ra vào ngày 18 tháng 12 năm 2015 tại Tòa án Quân sự Nürnberg."
+        ),
+        0,
+    )
+    _, vi_features = extract_e0_e1(vi_block)
+    ents = set(vi_features["entities"])
+    # Must never glue across \n\n
+    assert all("\n" not in e for e in ents)
+    # Must extract compound and single-word proper nouns
+    assert "Bảo tàng Hàng hải Penobscot" in ents
+    assert "Searsport" in ents
+    assert "Maine" in ents
+    assert "Vịnh Penobscot" in ents
+    assert "Tòa án Quân sự Nürnberg" in ents
+    assert "Nürnberg" in ents
+    # Must extract full Vietnamese date instead of broken "18 tháng" / "12 năm"
+    assert "ngày 18 tháng 12 năm 2015" in ents
+    assert "18 tháng" not in ents
+    assert "12 năm" not in ents
+
+    # 2. Vietnamese multi-hop query feature detection
+    mh_q1 = "Nơi sinh của người chiến thắng giải thưởng của Hiệp hội Phê bình Phim Los Angeles cho Nữ diễn viên phụ xuất sắc nhất năm 2001 là ở đâu?"
+    mh_q2 = "Một thị trấn ở Quận Waldo, Maine, có một bảo tàng mở cửa hàng ngày từ tháng 5 đến tháng 10 tên là gì?"
+    assert extract_query_features(mh_q1).multi_hop is True
+    assert extract_query_features(mh_q2).multi_hop is True
+
+    # 3. E2 verbatim quote span alignment
+    raw_text = "Theo Điều 13 Thông tư 36/2014/TT-NHNN, trường hợp khẩn cấp phải báo cáo Ngân hàng Nhà nước."
+    aligned = _align_e2_spans(
+        {
+            "entities": [
+                {"quote": "Thông tư 36/2014/TT-NHNN", "start": 0, "end": 5, "confidence": 0.9, "label": "Thông tư 36/2014/TT-NHNN"},
+            ],
+            "claims": [
+                {"quote": "Non-existent quote", "start": 0, "end": 10, "confidence": 0.9},
+            ],
+            "aliases": [],
+            "relations": [],
+        },
+        raw_text,
+        "blk-1",
+    )
+    assert len(aligned["entities"]) == 1
+    assert len(aligned["claims"]) == 0
+    ent_span = aligned["entities"][0]
+    assert raw_text[ent_span["start"] : ent_span["end"]] == "Thông tư 36/2014/TT-NHNN"
