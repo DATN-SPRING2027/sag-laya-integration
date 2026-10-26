@@ -42,6 +42,7 @@ from sag_api.db.models.routing_rag import (
     TreeSnapshotLease,
 )
 from sag_api.db.models.setting import Setting
+from sag_api.db.models.session_context import SessionContextIndex, SessionMessageProvenance
 from sag_api.db.models.source import Source
 from sag_api.db.models.source_project_mapping import SourceProjectMapping
 from sag_api.db.models.universe import (
@@ -87,6 +88,8 @@ __all__ = [
     "ResearchTask",
     "SearchUnit",
     "Setting",
+    "SessionContextIndex",
+    "SessionMessageProvenance",
     "Source",
     "SourceProjectMapping",
     "SourceSnapshot",
