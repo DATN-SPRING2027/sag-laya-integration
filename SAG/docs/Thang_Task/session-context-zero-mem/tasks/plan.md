@@ -1,6 +1,6 @@
 # Kế hoạch đề xuất: Context session v1
 
-**T1 đã thực hiện theo yêu cầu Thang:** corpus, observer, replay và calibration provider thật. Kết quả/giới hạn ở [BASELINE](../BASELINE.md). Selector T2–T9 chưa triển khai; thiết kế cần review cùng [SPEC](../SPEC.md). Không mở rộng thành thay retrieval tài liệu hay chat chéo session.
+**T1/T2 đã thực hiện theo yêu cầu Thang:** baseline ở [BASELINE](../BASELINE.md); hợp đồng nội bộ và validators/tests ở [CONTRACT](../CONTRACT.md). Selector T3–T9 chưa triển khai; thiết kế cần review cùng [SPEC](../SPEC.md). Không mở rộng thành thay retrieval tài liệu hay chat chéo session.
 
 ## Thứ tự và phụ thuộc
 
@@ -35,10 +35,10 @@ Thực hiện tuần tự; task lớn phải tách thành PR nhỏ trước khi 
 
 ## T2 — Hợp đồng context, snapshot và provenance
 
-- Acceptance: định nghĩa typed selection/coverage/budget; source/message dependency đóng bắc cầu; xác minh authorized snapshot trước traversal và trước model output.
+- Acceptance: định nghĩa typed selection/coverage/budget; source/message dependency đóng bắc cầu; cung cấp validator cho authorized snapshot trước traversal/use/output. Production caller và durable fence thuộc T5–T8.
 - Verify: test cross-owner/thread/project, revoke, missing legacy provenance và snapshot mutation; phân biệt trạng thái unsupported/partial/indexing.
-- Files đề xuất: `services/session_context/types.py`, `services/session_context/scope.py`, `tests/test_session_context_scope.py`, SPEC.
-- Dependencies: T1. Scope: 4 files. DB field cần thiết chỉ đề xuất ở bước này, chưa áp schema.
+- Files đã thực hiện: `services/session_context/types.py`, `scope.py`, `budget.py`, `tests/test_session_context_scope.py`; hợp đồng tại CONTRACT và đồng bộ docs cùng task.
+- Dependencies: T1 (local `f82eb78`, chưa có trên origin/main lúc bắt đầu T2). Scope implementation: 4 files. DB field cần thiết chỉ đề xuất ở bước này, chưa áp schema.
 
 ## T3 — Prototype selector không gọi generative LLM
 

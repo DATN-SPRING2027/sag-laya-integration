@@ -126,3 +126,42 @@ Các file dự kiến mới: `services/eval/session_context_accounting.py`, `scr
 - Ngưỡng nghiệm thu T4, giá tiền provider đúng account, production effective Settings và repeated cold/warm measurements chưa được chốt/đo. Baseline dùng Settings/dotenv, không nạp database overrides production.
 
 Full offline suite cuối: 43 passed, 1 deselected trong 14,87 giây; 12 tests chuyên biệt đều pass. Sáu source hashes, corpus hash, sửa metadata không thay facts/queries, 23 relative links và whitespace/diff check đã xác minh. Final commit được ghi ở handoff. T1 đã có baseline có thể sử dụng để bắt đầu T2; chưa đánh dấu giải pháp session-memory v1 đạt nghiệm thu.
+
+## T2 — Bắt đầu hợp đồng evidence/provenance/scope/budget
+
+Thang yêu cầu tiếp tục T2. Nhánh mới `feat/Thang-session-context-contract-be-api` tạo từ main đã fetch/pull (`7772270`), sau đó `cherry-pick --ff f82eb78` làm phụ thuộc cục bộ. T1 chưa nằm trên origin/main tại lúc bắt đầu; không coi phụ thuộc này đã được review/merge. Giữ nguyên nhánh T1 và `.serena/`.
+
+### Nghiên cứu và ranh giới đã xác minh
+
+- `get_thread()` kiểm owner_key/agent_id trước khi trả thread. `get_conversation_owner()` và VerifiedPrincipal hiện có là nguồn identity; các DTO T2 không tự xác thực JWT hoặc cấp quyền.
+- `get_authorized_source_ids()` nhận danh sách ID cần kiểm, batch lookup đúng principal/mapping; không dùng search candidate limit làm whitelist toàn bộ Source quyền đọc.
+- `filter_messages_for_scope()` hiện chỉ đọc citations/steps từng message; cần metadata dependency xuyên lượt riêng. Không dùng citations rỗng để kết luận assistant legacy source-free.
+- Message/Thread hiện chưa có durable generation hay dependency ledger. T2 chỉ định nghĩa token snapshot và hợp đồng đọc lại; T5/T6 mới xử lý persistence/mutation fences.
+- T1 cho thấy session history phải có kind riêng `user_statement`/`assistant_statement`; không nhận là canonical document evidence hoặc tự thay grounding gate hiện tại.
+
+### Thiết kế T2 trước khi coding
+
+Thêm types.py (immutable identity/scope/message refs/span/snapshot/selection/coverage), scope.py (reuse get_thread và Source resolver; kiểm scope/version; dependency closure không đệ quy; kiểm lại trước use/output), budget.py (limits hữu hạn, reserve/settle mỗi attempt, unknown usage không miễn phí), và tests/test_session_context_scope.py. Không thêm public API, production caller, model/SQL schema/config hoặc selector.
+
+Snapshot digest phải thay đổi khi content, role/status, source/dependency metadata, thứ tự hoặc scope đổi; generation là token do trusted storage adapter cung cấp trong tương lai, không giả có durable field sẵn. Span theo Unicode codepoint trên nguyên văn, content hash theo UTF-8. Scope fingerprint có owner/agent/thread, issuer/subject/org/tenant, projects/partitions, Source whitelist và @ filter; bỏ token_id để không vô hiệu cache chỉ do refresh cùng quyền.
+
+Unknown legacy provenance, dependency thiếu/xóa, Source revoke, cycle, hash mismatch, owner/thread/project khác và expired principal đều fail closed. Evidence assistant vẫn là phát biểu lịch sử, không tự là sự thật bên ngoài. Lời user chưa xác nhận đề xuất của assistant không được typed contract tự nâng thành approval.
+
+Coverage ledger phân biệt ready/partial/indexing/unsupported; full-session ready yêu cầu duyệt hết eligible IDs do trusted prefilter xác định, không phải top-k tự khai đủ. Traversal coverage không phải semantic recall. Budget không có số default sản phẩm; T4 chốt giá trị sau đo. Reserve token/call/output trước khi gọi; mỗi retry là attempt riêng; settle unknown giữ reservation và chặn call mới. Deadline/cancel/index-work dùng cùng request budget.
+
+### Test matrix và phạm vi nghiệm thu T2
+
+Tests contract/pure helper + disposable SQLite cho ownership adapter: user history không có Source vẫn có thể là session statement; assistant thiếu dependency metadata bị loại; transitive source revoke qua nhiều assistant; cache/fingerprint đổi; snapshot mutate/delete; Unicode spans; cycle/deep chain; full-session coverage; partial/indexing states; budget calls/tokens/deadline/index/unknown usage/duplicate settlement/cancel.
+
+Kết quả offline sẽ chỉ chứng minh invariant và adapter seam. Chưa gọi provider, chưa tích hợp vào ask/output gate, chưa chứng minh production TOCTOU/deletion/ACL: caller tương lai phải refresh quyền và snapshot ngay trước model/output. Việc validate snapshot ở T2 không tạo transaction/fence bền thay T5/T6.
+
+### T2 — Kết quả và review
+
+- Thực hiện 4 file implementation/test đúng phạm vi; thêm [CONTRACT](CONTRACT.md), đồng bộ SPEC/plan/todo. Immutable DTO, hash/spans, authority scope resolver, leaf-first dependency authorization, snapshot validation và request budget tách khỏi production flow.
+- Dấu partition gốc bắt buộc: kiểm source cho thấy owner key chỉ thêm projects với issuer `continuum-sag-session`; không suy partition từ owner key hay principal hiện tại. Unknown legacy được loại khỏi evidence và chặn full-session ready. Không tự gán provenance khi đọc.
+- TDD ban đầu import module chưa tồn tại fail; sau implementation test bổ sung bắt được source-filter widening và reservation cross-request. Đã sửa invariant filter và gắn UUID budget vào reservation. Test bổ sung full-session còn unknown legacy cũng fail trước sửa và pass sau sửa; không đổi kỳ vọng để che lỗi.
+- Full offline: `.venv/Scripts/python.exe -m pytest -m "not ai_smoke" -q --tb=short` từ `SAG/apps/api`: **92 passed, 1 deselected**, 21,97 giây; 49 ca mới thuộc `test_session_context_scope.py`. Không live provider call, không đọc lịch sử người dùng thật. SQLite disposable kiểm ownership thật, Source resolver là double kiểm adapter seam; không gọi đó là production ACL acceptance.
+- Ruff targeted: `.venv/Scripts/python.exe -m ruff check sag_api/services/session_context tests/test_session_context_scope.py`: PASS. Ruff toàn `sag_api sag_agent tests`: 124 lỗi tồn tại từ T1 ở các file không thay đổi; không claim toàn repo lint green.
+- Self-review 5 trục: correctness kiểm expiry/filter/hash/status/cycle/deletion/closure/coverage; readability tách types/scope/budget; architecture tái sử dụng ownership/Source resolver, không thêm endpoint; security không log nội dung/credential, provenance fail closed; performance leaf-first không đệ quy, không last-N, fingerprint partition tính một lần mỗi prefilter. Helper vẫn nhận mapping trong bộ nhớ; adapter phân trang/index-work metering và fencing phải làm T3/T5/T6, không coi là đã phục vụ session lớn production.
+- Không thêm dependency, public API, env/config, DB schema/model/collection/index hoặc migration; rollback riêng commit T2, không data rollback. Giữ `.serena/` ngoài commit. Không push, approve hoặc merge.
+- T2 phụ thuộc local T1 `f82eb78`; origin/main lúc bắt đầu vẫn `7772270`. Handoff nêu commit T2 riêng; chưa coi T1 được merge. Các giới hạn production grounding, durable provenance/generation, async cancellation, hidden SDK retries, tokenizer chính xác và monetary cost được ghi rõ trong CONTRACT. T3 là bước tiếp theo, chưa nghiệm thu giải pháp memory v1.

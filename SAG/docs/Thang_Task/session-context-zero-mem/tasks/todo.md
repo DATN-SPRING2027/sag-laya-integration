@@ -1,6 +1,6 @@
 # Checklist: Context session v1
 
-Trạng thái: yêu cầu sản phẩm đã chốt; T1 baseline được Thang yêu cầu và đã thực hiện. Selector mới chưa implementation. Theo [plan](plan.md), [SPEC](../SPEC.md) và [BASELINE](../BASELINE.md).
+Trạng thái: yêu cầu sản phẩm đã chốt; T1 baseline và T2 hợp đồng nội bộ đã thực hiện theo yêu cầu Thang. Selector mới chưa implementation. Theo [plan](plan.md), [SPEC](../SPEC.md), [BASELINE](../BASELINE.md) và [CONTRACT](../CONTRACT.md).
 
 ## Chuẩn bị đã làm
 
@@ -17,7 +17,7 @@ Trạng thái: yêu cầu sản phẩm đã chốt; T1 baseline được Thang y
 
 - [x] T0: Thang cho phép phạm vi T1 baseline sau khi chốt yêu cầu. Thiết kế selector/DB/API ở T2 trở đi vẫn cần review, chưa coi là đã duyệt.
 - [x] T1: Version corpus/gold; observer compression/generation, usage missing và observed deployment failures; chạy 24 replay calibration qua provider thật. Giới hạn SDK retry/billing visibility và giá tiền chưa xác minh được ghi rõ trong BASELINE.
-- [ ] T2: Chốt snapshot, typed evidence/coverage/budget và dependency/ACL contracts.
+- [x] T2: Hợp đồng nội bộ snapshot, typed evidence/coverage/budget và dependency/ACL validators/tests; xem [CONTRACT](../CONTRACT.md). Chưa có production caller hoặc durable fence.
 - [ ] T3a: Reader/hierarchy, phân trang không giới hạn phạm vi nhớ.
 - [ ] T3b: Graph/fusion/closure, model NER/encoder được xác minh.
 - [ ] T4: Calibration; chốt budgets/thresholds trước holdout.
