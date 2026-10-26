@@ -38,3 +38,19 @@ class DocumentVersionStatusResponse(BaseModel):
     current_stage: str
     stage_progress: dict[str, StageProgressItem] = Field(default_factory=dict)
     error: dict[str, Any] | None = None
+
+
+class DocumentRevokeRequest(BaseModel):
+    logical_source_id: str | None = None
+    document_id: str | None = None
+    revoked_by_user_id: str | None = None
+    reason: str | None = None
+
+
+class DocumentRevokeResponse(BaseModel):
+    document_id: str
+    project_id: str
+    logical_source_id: str | None = None
+    status: str
+    delete_job_id: str | None = None
+    revoked_version_count: int = 0

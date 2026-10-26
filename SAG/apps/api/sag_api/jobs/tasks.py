@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.config import settings
@@ -337,6 +337,10 @@ async def _process_document_unlocked(
             if current_job.status == JobStatus.PAUSED or (current_job.payload or {}).get("pause_requested"):
                 scheduler_yield_reason = None
                 return True
+            current_doc = await control_session.get(Document, document.id)
+            if current_doc is None or not current_doc.is_active or current_doc.status in _DELETE_CONTROL_STATES:
+                scheduler_yield_reason = None
+                return True
         if job_queue is not None and job_queue.source_maintenance_requested(source.id):
             scheduler_yield_reason = SOURCE_MAINTENANCE
             return True
@@ -349,11 +353,12 @@ async def _process_document_unlocked(
 
     async def _pause_or_yield() -> None:
         """Chuyển tài liệu hiện tại sang PAUSED hoặc nhường lượt, dùng chung cho cả hai giai đoạn parse/extract."""
+        await session.rollback()
         await session.refresh(document)
+        if not document.is_active or document.status in _DELETE_CONTROL_STATES:
+            raise JobPaused()
         if scheduler_yield_reason == SOURCE_MAINTENANCE and document.status not in _CONTROL_TRANSITION_STATES:
             raise JobYielded(SOURCE_MAINTENANCE)
-        if document.status in _DELETE_CONTROL_STATES:
-            raise JobPaused()
         expected_status = document.status
         paused = await session.execute(
             update(Document)
@@ -488,6 +493,9 @@ async def _process_document_unlocked(
                 pipe_err_str = sanitize_error_message(pipe_err)
                 log.error("Phase 2 pipeline execution failed run_id=%s: %s", run_id, pipe_err_str)
                 await session.rollback()
+                await session.refresh(document)
+                if not document.is_active or document.status in _CONTROL_TRANSITION_STATES:
+                    await _pause_or_yield()
 
                 # Determine accurate error layer & stage
                 err_layer = ErrorLayer.API
@@ -541,6 +549,7 @@ async def _process_document_unlocked(
 
                     doc_ver = await session.get(DocumentVersion, ing_run.document_version_id)
                     if doc_ver:
+                        doc_ver.status = "FAILED"
                         doc_ver.search_status = "INDEX_FAILED"
                         doc_ver.search_ready_at = None
                         session.add(doc_ver)
@@ -553,19 +562,39 @@ async def _process_document_unlocked(
                     stage=err_stage,
                 ) from pipe_err
 
-        outcome = await engine_manager.process_document(
-            source.sag_source_config_id,
-            str(prepared.path) if prepared is not None else None,
-            source=source,
-            on_stage=on_stage,
-            checkpoint=checkpoint,
-            on_checkpoint=on_checkpoint,
-            should_pause=should_pause,
-            max_concurrency=settings.document_extract_concurrency,
-            document_title=Path(document.filename).stem.strip(),
-            original_path=target_storage_path if prepared is not None else None,
-            document_version_id=doc_ver.id if (run_id and "doc_ver" in locals() and doc_ver is not None) else None,
-        )
+        is_project_source = isinstance(source.config, dict) and bool(source.config.get("is_project_source"))
+        if is_project_source and run_id and "doc_ver" in locals() and doc_ver is not None:
+            from sqlalchemy import func
+
+            from sag_api.db.models.routing_rag import SearchUnit
+            from sag_api.sag.dto import ProcessOutcome
+
+            su_count = (
+                await session.scalar(
+                    select(func.count(SearchUnit.id)).where(SearchUnit.document_version_id == doc_ver.id)
+                )
+            ) or 0
+            outcome = ProcessOutcome(
+                source_id=str(document.id),
+                chunk_count=int(su_count),
+                event_count=0,
+                token_usage=0,
+                paused=False,
+            )
+        else:
+            outcome = await engine_manager.process_document(
+                source.sag_source_config_id,
+                str(prepared.path) if prepared is not None else None,
+                source=source,
+                on_stage=on_stage,
+                checkpoint=checkpoint,
+                on_checkpoint=on_checkpoint,
+                should_pause=should_pause,
+                max_concurrency=settings.document_extract_concurrency,
+                document_title=Path(document.filename).stem.strip(),
+                original_path=target_storage_path if prepared is not None else None,
+                document_version_id=doc_ver.id if (run_id and "doc_ver" in locals() and doc_ver is not None) else None,
+            )
         if outcome.paused:
             await _pause_or_yield()
     except (JobPaused, JobYielded):
@@ -576,7 +605,7 @@ async def _process_document_unlocked(
             await session.refresh(job)
         except Exception:
             pass
-        if document.status in _CONTROL_TRANSITION_STATES or document.status == DocumentStatus.PAUSED:
+        if not document.is_active or document.status in _CONTROL_TRANSITION_STATES or document.status == DocumentStatus.PAUSED:
             await _yield_after_document_transition_lost(session, document)
         layer, stage = _classify_document_failure(e, document.status)
         expected_status = document.status
@@ -605,7 +634,20 @@ async def _process_document_unlocked(
                 if ver_chk and ver_chk.search_status == "SEARCH_READY":
                     is_search_ready = True
 
-        doc_target_status = DocumentStatus.READY if is_search_ready else DocumentStatus.FAILED
+        has_any_ready_version = is_search_ready
+        if not has_any_ready_version:
+            active_ready_ver = await session.scalar(
+                select(DocumentVersion.id)
+                .where(
+                    DocumentVersion.document_id == document.id,
+                    DocumentVersion.search_status.in_(("READY", "SEARCH_READY")),
+                    DocumentVersion.valid_to > datetime.now(UTC),
+                )
+                .limit(1)
+            )
+            has_any_ready_version = active_ready_ver is not None
+
+        doc_target_status = DocumentStatus.READY if has_any_ready_version else DocumentStatus.FAILED
 
         failed = await session.execute(
             update(Document)
@@ -658,7 +700,7 @@ async def _process_document_unlocked(
         raise
 
     await session.refresh(document)
-    if document.status in _DELETE_CONTROL_STATES:
+    if not document.is_active or document.status in _DELETE_CONTROL_STATES:
         raise JobPaused()
     if document.status == DocumentStatus.PAUSING:
         document.status = DocumentStatus.PAUSED
@@ -668,11 +710,13 @@ async def _process_document_unlocked(
         update(Document)
         .where(
             Document.id == document.id,
+            Document.is_active.is_(True),
             Document.status.in_(
                 [
                     DocumentStatus.PENDING,
                     DocumentStatus.LOADING,
                     DocumentStatus.EXTRACTING,
+                    DocumentStatus.READY,
                 ]
             ),
         )
@@ -794,14 +838,15 @@ async def _process_document_unlocked(
                                 sanitize_error_message(kb_err),
                             )
 
-                    from sag_api.services.universe_tree_service import enqueue_tree_rebuild_for_version
+                    if not is_project_source:
+                        from sag_api.services.universe_tree_service import enqueue_tree_rebuild_for_version
 
-                    await enqueue_tree_rebuild_for_version(
-                        session,
-                        job_queue,
-                        ingestion_run.document_version_id,
-                        reason="document_search_ready",
-                    )
+                        await enqueue_tree_rebuild_for_version(
+                            session,
+                            job_queue,
+                            ingestion_run.document_version_id,
+                            reason="document_search_ready",
+                        )
             except Exception as tree_err:  # noqa: BLE001 - tree scheduling must not fail document ingestion
                 await session.rollback()
                 log.warning(
@@ -849,14 +894,24 @@ async def _delete_document_task_unlocked(
             source=source,
         )
 
-    # Phase 2 Cleanup: Delete Qdrant points for all document versions belonging to this document
-    from sqlalchemy import select
-    from sag_api.db.models.routing_rag import DocumentVersion
-    version_ids = (
-        await session.execute(
-            select(DocumentVersion.id).where(DocumentVersion.document_id == document.id)
-        )
-    ).scalars().all()
+    # Phase 2 Cleanup: Delete Qdrant points and PostgreSQL search units for all document versions
+    from sqlalchemy import delete, or_, select
+
+    from sag_api.db.models.routing_rag import (
+        CanonicalBlock,
+        DocumentVersion,
+        KnowledgeGraphEdge,
+        SearchUnit,
+        SourceSnapshot,
+        TreeRoutingProfile,
+    )
+    version_ids = list(
+        (
+            await session.execute(
+                select(DocumentVersion.id).where(DocumentVersion.document_id == document.id)
+            )
+        ).scalars().all()
+    )
     if version_ids and document.project_id:
         qdrant_url = getattr(settings, "sag_qdrant_url", "http://localhost:6333").rstrip("/")
         qdrant_headers = {}
@@ -874,25 +929,92 @@ async def _delete_document_task_unlocked(
             log.error("Failed to delete Qdrant points on document deletion %s: %s", document.id, qdel_err)
             raise RuntimeError(f"Qdrant cleanup failed during document deletion: {qdel_err}") from qdel_err
 
+    snapshot_paths: list[str] = []
+    if version_ids:
+        snapshot_paths = [
+            uri
+            for uri in (
+                await session.scalars(
+                    select(SourceSnapshot.storage_uri).where(
+                        SourceSnapshot.document_version_id.in_(version_ids)
+                    )
+                )
+            ).all()
+            if isinstance(uri, str) and uri.strip()
+        ]
+        unit_ids = list(
+            (
+                await session.scalars(
+                    select(SearchUnit.id).where(SearchUnit.document_version_id.in_(version_ids))
+                )
+            ).all()
+        )
+        if unit_ids:
+            await session.execute(
+                delete(KnowledgeGraphEdge).where(
+                    or_(
+                        KnowledgeGraphEdge.source_unit_id.in_(unit_ids),
+                        KnowledgeGraphEdge.target_unit_id.in_(unit_ids),
+                    )
+                )
+            )
+        await session.execute(
+            delete(SearchUnit).where(SearchUnit.document_version_id.in_(version_ids))
+        )
+        await session.execute(
+            delete(CanonicalBlock).where(CanonicalBlock.document_version_id.in_(version_ids))
+        )
+        await session.execute(
+            delete(TreeRoutingProfile).where(TreeRoutingProfile.document_version_id.in_(version_ids))
+        )
+        await session.execute(
+            delete(SourceSnapshot).where(SourceSnapshot.document_version_id.in_(version_ids))
+        )
+
     path = document.storage_path
+    retain_revoked_tombstone = not document.is_active and bool(document.logical_source_id)
     job.payload = {**(job.payload or {}), "target_document_id": document.id}
     job.document_id = None
     await session.flush()
-    await session.delete(document)
+    if retain_revoked_tombstone:
+        now_utc = datetime.now(UTC)
+        document.is_active = False
+        document.status = DocumentStatus.DELETING
+        document.chunk_count = 0
+        document.event_count = 0
+        document.storage_path = ""
+        document.sag_source_id = None
+        document.error = None
+        session.add(document)
+        if version_ids:
+            await session.execute(
+                update(DocumentVersion)
+                .where(DocumentVersion.id.in_(version_ids))
+                .values(
+                    status="REVOKED",
+                    search_status="REVOKED",
+                    search_ready_at=None,
+                    valid_to=now_utc,
+                )
+            )
+    else:
+        await session.delete(document)
     await session.flush()
     from sag_api.services.document_service import _refresh_source_counts
 
     await _refresh_source_counts(session, source)
     await session.commit()
-    if path:
+    all_cleanup_paths = [p for p in [path, *snapshot_paths] if p]
+    if all_cleanup_paths:
         from sag_api.parsing.service import parsed_sidecar_paths
 
-        for candidate in [path, *parsed_sidecar_paths(path)]:
-            try:
-                if os.path.exists(candidate):
-                    os.remove(candidate)
-            except OSError:
-                pass
+        for base_candidate in all_cleanup_paths:
+            for candidate in [base_candidate, *parsed_sidecar_paths(base_candidate)]:
+                try:
+                    if os.path.exists(candidate):
+                        os.remove(candidate)
+                except OSError:
+                    pass
     if job_queue is not None:
         from sag_api.services.universe_service import schedule_universe_refresh
 

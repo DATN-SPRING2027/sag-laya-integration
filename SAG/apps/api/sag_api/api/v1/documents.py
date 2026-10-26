@@ -49,6 +49,8 @@ from sag_api.schemas.common import Ok
 from sag_api.schemas.document import DocumentOut, IngestRequest
 from sag_api.schemas.job import JobOut
 from sag_api.schemas.routing_rag import (
+    DocumentRevokeRequest,
+    DocumentRevokeResponse,
     DocumentUploadResponse,
     DocumentVersionStatusResponse,
 )
@@ -61,6 +63,7 @@ from sag_api.services.document_service import (
     pause_document,
     reprocess_document,
     resume_document,
+    revoke_project_document,
 )
 from sag_api.services.source_operation_service import source_document_mutation
 from sag_api.services.source_service import (
@@ -547,7 +550,7 @@ async def upload_document_version(
     x_continuum_user_id: str | None = Header(None, alias="X-Continuum-User-Id"),
     x_continuum_security_partition: str | None = Header(None, alias="X-Continuum-Security-Partition"),
     x_continuum_tenant_id: str | None = Header(None, alias="X-Continuum-Tenant-Id"),
-    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_project_bff_principal),
     session: AsyncSession = Depends(get_session),
     job_queue: JobQueue | None = Depends(get_job_queue),
 ) -> DocumentUploadResponse:
@@ -602,6 +605,7 @@ async def upload_document_version(
         logical_source_id=logical_source_id,
         source_published_at=source_published_at,
         job_queue=job_queue,
+        organization_id=principal.organization_id or tenant_id,
     )
 
     if result.is_duplicate:
@@ -639,4 +643,107 @@ async def query_document_version_status(
             allowed_projects=principal.allowed_project_ids,
             allowed_partitions=principal.allowed_partition_ids,
         ),
+    )
+
+
+
+@project_router.post(
+    "/revoke",
+    response_model=DocumentRevokeResponse,
+    summary="Revoke a project document and remove its search/knowledge footprint",
+)
+async def revoke_project_document_endpoint(
+    project_id: str,
+    body: DocumentRevokeRequest,
+    x_continuum_user_id: str | None = Header(None, alias="X-Continuum-User-Id"),
+    x_continuum_security_partition: str | None = Header(None, alias="X-Continuum-Security-Partition"),
+    x_continuum_tenant_id: str | None = Header(None, alias="X-Continuum-Tenant-Id"),
+    principal: VerifiedPrincipal = Depends(require_project_bff_principal),
+    session: AsyncSession = Depends(get_session),
+    job_queue: JobQueue | None = Depends(get_job_queue),
+) -> DocumentRevokeResponse:
+    if project_id not in principal.allowed_project_ids:
+        raise ForbiddenError(
+            f"Principal '{principal.subject}' is not authorized to access project '{project_id}'"
+        )
+    if x_continuum_user_id and x_continuum_user_id != principal.subject:
+        raise ForbiddenError("X-Continuum-User-Id does not match the signed principal")
+    if not principal.tenant_id:
+        raise ForbiddenError("The signed principal assertion has no tenant scope")
+    if x_continuum_tenant_id and x_continuum_tenant_id != principal.tenant_id:
+        raise ForbiddenError("X-Continuum-Tenant-Id does not match the signed principal")
+
+    partition = x_continuum_security_partition
+    if not partition or not partition.strip():
+        if len(principal.allowed_partition_ids) == 1:
+            partition = next(iter(principal.allowed_partition_ids))
+        else:
+            raise ValidationError(
+                "X-Continuum-Security-Partition header is required to enforce data isolation"
+            )
+    if partition not in principal.allowed_partition_ids:
+        raise ForbiddenError(
+            f"Principal '{principal.subject}' is not authorized for security partition '{partition}'"
+        )
+
+    return await revoke_project_document(
+        session,
+        tenant_id=principal.tenant_id,
+        project_id=project_id,
+        security_partition_id=partition,
+        logical_source_id=body.logical_source_id,
+        document_id=body.document_id,
+        revoked_by=body.revoked_by_user_id or principal.subject,
+        reason=body.reason,
+        job_queue=job_queue,
+    )
+
+
+@project_router.delete(
+    "/{document_id}",
+    response_model=DocumentRevokeResponse,
+    summary="Delete/revoke a project document by document_id",
+)
+async def delete_project_document_endpoint(
+    project_id: str,
+    document_id: str,
+    x_continuum_user_id: str | None = Header(None, alias="X-Continuum-User-Id"),
+    x_continuum_security_partition: str | None = Header(None, alias="X-Continuum-Security-Partition"),
+    x_continuum_tenant_id: str | None = Header(None, alias="X-Continuum-Tenant-Id"),
+    principal: VerifiedPrincipal = Depends(require_project_bff_principal),
+    session: AsyncSession = Depends(get_session),
+    job_queue: JobQueue | None = Depends(get_job_queue),
+) -> DocumentRevokeResponse:
+    if project_id not in principal.allowed_project_ids:
+        raise ForbiddenError(
+            f"Principal '{principal.subject}' is not authorized to access project '{project_id}'"
+        )
+    if x_continuum_user_id and x_continuum_user_id != principal.subject:
+        raise ForbiddenError("X-Continuum-User-Id does not match the signed principal")
+    if not principal.tenant_id:
+        raise ForbiddenError("The signed principal assertion has no tenant scope")
+    if x_continuum_tenant_id and x_continuum_tenant_id != principal.tenant_id:
+        raise ForbiddenError("X-Continuum-Tenant-Id does not match the signed principal")
+
+    partition = x_continuum_security_partition
+    if not partition or not partition.strip():
+        if len(principal.allowed_partition_ids) == 1:
+            partition = next(iter(principal.allowed_partition_ids))
+        else:
+            raise ValidationError(
+                "X-Continuum-Security-Partition header is required to enforce data isolation"
+            )
+    if partition not in principal.allowed_partition_ids:
+        raise ForbiddenError(
+            f"Principal '{principal.subject}' is not authorized for security partition '{partition}'"
+        )
+
+    return await revoke_project_document(
+        session,
+        tenant_id=principal.tenant_id,
+        project_id=project_id,
+        security_partition_id=partition,
+        document_id=document_id,
+        revoked_by=principal.subject,
+        job_queue=job_queue,
     )

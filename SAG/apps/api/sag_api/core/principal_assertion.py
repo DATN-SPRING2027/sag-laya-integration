@@ -446,6 +446,16 @@ async def require_project_read_principal(request: Request) -> VerifiedPrincipal:
     ):
         raise ForbiddenError("Continuum SAG session has no valid Project scope")
 
+    for header_name, expected_val in (
+        ("X-Continuum-Organization-Id", organization_id),
+        ("X-Continuum-Tenant-Id", tenant_id),
+        ("X-Continuum-Project-Id", project_id),
+        ("X-Continuum-Security-Partition", partition_id),
+    ):
+        hdr_vals = request.headers.getlist(header_name)
+        if len(hdr_vals) > 1 or (len(hdr_vals) == 1 and hdr_vals[0].strip() != expected_val):
+            raise ForbiddenError(f"{header_name} does not match the signed Continuum session")
+
     principal = VerifiedPrincipal(
         subject=subject,
         organization_id=organization_id,
@@ -497,6 +507,22 @@ async def require_project_bff_principal(request: Request) -> VerifiedPrincipal:
         "X-Continuum-Security-Partition",
         max_length=64,
     )
+    tenant_headers = request.headers.getlist("X-Continuum-Tenant-Id")
+    if len(tenant_headers) > 1:
+        raise ForbiddenError("Invalid Continuum service context")
+    if len(tenant_headers) == 1:
+        tenant_header = tenant_headers[0]
+        if not tenant_header or tenant_header != tenant_header.strip() or tenant_header != organization_id:
+            raise ForbiddenError("Continuum tenant scope does not match the organization scope")
+    if request.headers.getlist("authorization"):
+        session_principal = await require_project_read_principal(request)
+        if (
+            session_principal.organization_id != organization_id
+            or project_id not in session_principal.allowed_project_ids
+            or partition_id not in session_principal.allowed_partition_ids
+        ):
+            raise ForbiddenError("Bearer session scope does not match the Continuum service scope")
+
     route_project_id = request.path_params.get("project_id")
     if project_id != route_project_id or partition_id != project_id:
         raise ForbiddenError("Continuum service scope does not match the requested Project")

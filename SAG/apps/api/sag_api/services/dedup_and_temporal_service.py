@@ -15,7 +15,7 @@ import hashlib
 import re
 import uuid
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import desc, inspect, or_, select
@@ -319,6 +319,8 @@ async def resolve_temporal_supersedes(
     if active_at_start is not None:
         # Normal newer or mid-timeline version: current supersedes active_at_start
         orig_active_valid_to = active_at_start.valid_to or max_valid_to
+        if v_from and cur_start <= v_from:
+            cur_start = v_from + timedelta(microseconds=1)
         current_version.supersedes_id = active_at_start.id
         current_version.valid_from = cur_start
         current_version.valid_to = orig_active_valid_to
@@ -404,7 +406,7 @@ async def resolve_temporal_supersedes(
         if v_from < c_from and v_to > c_from:
             v.valid_to = c_from
             session.add(v)
-        elif c_from <= v_from < c_to:
+        elif c_from < v_from < c_to and v_to > v_from:
             current_version.valid_to = v_from
 
     # Enrichment freezes validity/lineage; changed predecessors/successors need a new knowledge input.
