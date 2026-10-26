@@ -366,7 +366,7 @@ async def create_thread(session: AsyncSession, agent: Agent, title: str = "New c
 
 
 async def get_thread(session: AsyncSession, agent_id: str, thread_id: str, *, owner_key: str) -> Thread:
-    thread = await session.get(Thread, thread_id)
+    thread = await session.get(Thread, thread_id, populate_existing=True)
     if thread is None or thread.agent_id != agent_id or thread.owner_key != owner_key:
         raise NotFoundError("Thread not found")
     return thread
