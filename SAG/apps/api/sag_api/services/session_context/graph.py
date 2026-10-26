@@ -14,7 +14,7 @@ from sag_api.services.session_context.scope import _check_time, eligible_message
 from sag_api.services.session_context.types import SessionScope, require
 
 ENCODER = ("BAAI/bge-m3", "5617a9f61b028005a4858fdac845db406aefb181")
-NER = ("Davlan/xlm-roberta-base-wikiann-ner", "642b9a14e71df124c43c67e47703a91341576dfb")
+NER = ("OpenMed/OpenMed-PII-Vietnamese-BigMed-Large-278M-v1", "f253fd932f0508be1eac3d1323e41bc3efe2ef70")
 
 
 def text_hash(text: str) -> str:
@@ -30,6 +30,15 @@ class EntityMention:
     def __post_init__(self):
         require(type(self.start) is int and type(self.end) is int and 0 <= self.start < self.end, "entity_offsets")
         require(isinstance(self.label, str) and bool(self.label.strip()), "entity_label")
+
+
+def observed_mentions(entities, *, offset=0) -> tuple[EntityMention, ...]:
+    """Declared label mapping; detected secrets do not become graph entities."""
+    labels = {"PER": "PER", "ORG": "ORG", "LOC": "LOC", "FIRSTNAME": "PER", "MIDDLENAME": "PER",
+              "LASTNAME": "PER", "ORGANIZATION": "ORG", "CITY": "LOC", "COUNTY": "LOC", "STATE": "LOC",
+              "STREET": "LOC"}
+    return tuple(EntityMention(offset + int(e["start"]), offset + int(e["end"]), labels[e["entity_group"]])
+                 for e in entities if e["entity_group"] in labels)
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,7 +100,8 @@ class LocalFeatureEncoder:
         self.ner = pipeline("token-classification", model=model, tokenizer=tokenizer,
                             aggregation_strategy="simple", device="cpu")
         self.chunk_codepoints = chunk_codepoints
-        self.model_id = f"{ENCODER[0]}@{ENCODER[1]}|{NER[0]}@{NER[1]}|raw-chunk-mean:{chunk_codepoints}"
+        self.model_id = (f"{ENCODER[0]}@{ENCODER[1]}|{NER[0]}@{NER[1]}|raw-chunk-mean:{chunk_codepoints}"
+                         "|entities-PER-ORG-LOC-v1")
         self.encoder_calls = self.encoder_tokens = self.ner_calls = self.ner_tokens = 0
         budget.consume_index_units(0)
 
@@ -113,9 +123,7 @@ class LocalFeatureEncoder:
             budget.consume_index_units(0)
             self.ner_calls += 1
             self.ner_tokens += ner_tokens
-            for entity in self.ner(chunk):
-                mentions.add(EntityMention(start + int(entity["start"]), start + int(entity["end"]),
-                                           entity["entity_group"]))
+            mentions.update(observed_mentions(self.ner(chunk), offset=start))
             budget.consume_index_units(0)
         budget.consume_index_units(sum(len(vector) for vector in vectors))
         vector = tuple(math.fsum(values) / len(vectors) for values in zip(*vectors, strict=True))
@@ -164,8 +172,7 @@ class LocalFeatureEncoder:
             budget.consume_index_units(0)
             for vector, entities in zip(encoded, detected, strict=True):
                 encoded_results.append(tuple(float(v) for v in vector))
-                detected_results.append(tuple(EntityMention(int(e["start"]), int(e["end"]), e["entity_group"])
-                                              for e in entities))
+                detected_results.append(observed_mentions(entities))
         request_indices = {text: i for i, text in enumerate(requests)} if deduplicate else {}
         for position, (index, start, text) in enumerate(chunks):
             result_index = request_indices[text] if deduplicate else position

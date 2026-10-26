@@ -151,3 +151,11 @@ def test_overlong_chunk_is_rejected_before_inference_instead_of_truncated():
     with pytest.raises(ContextContractError, match="chunk_too_long"):
         encoder.featurize("a" * 15, budget=work())
     assert encoder.encoder_calls == encoder.ner_calls == 0
+
+
+def test_pinned_pii_ner_maps_only_named_entities_with_original_offsets():
+    from sag_api.services.session_context.graph import observed_mentions
+    entities=[{"start":2,"end":6,"entity_group":"FIRSTNAME"},
+              {"start":9,"end":12,"entity_group":"CITY"},
+              {"start":15,"end":20,"entity_group":"PASSWORD"}]
+    assert observed_mentions(entities,offset=10)==(EntityMention(12,16,"PER"),EntityMention(19,22,"LOC"))

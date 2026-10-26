@@ -17,3 +17,5 @@ API response hashes ghi trong `evidence/ner-license-audit.json` để truy nguy�
 Gate trước rollout: cần grant/terms rõ ràng từ chủ fine-tune áp dụng đúng artifact/version và rà các nghĩa vụ tương ứng; hoặc chọn model NER có provenance/license rõ rồi chạy lại calibration với revision đó. Không lấy license từ dự án bên thứ ba sử dụng model, hoặc từ model cùng tác giả nhưng khác tên, để cấp quyền cho model này.
 
 T4 vẫn đo prototype và ghi số liệu riêng. Kết quả chất lượng tốt không tự đóng license gate. Việc gửi yêu cầu xác nhận cho chủ model và phê duyệt sử dụng/redistribution là bước riêng; audit này không giả đã có văn bản chấp thuận.
+
+Runtime follow-up: chọn model khác có publisher Apache-2.0 declaration, xem [MODEL-LICENSES](MODEL-LICENSES.md). Kết luận Davlan ở trên không thay đổi; các số T4 vẫn thuộc model cũ, runtime candidate mới phải calibration/holdout lại.
