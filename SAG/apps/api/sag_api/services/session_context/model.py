@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 
 import httpx
 from openai import AsyncOpenAI
@@ -73,7 +74,9 @@ class ModelTokenCounter:
             messages, tools=tools or None, tokenize=True, add_generation_prompt=True, **self.template_kwargs
         )
         # Explicit headroom for provider framing; usage still settles the reservation.
-        return len(tokens) + 256
+        input_ids = tokens["input_ids"] if isinstance(tokens, Mapping) else tokens
+        require(isinstance(input_ids, list) and all(type(value) is int for value in input_ids), "tokenizer_shape")
+        return len(input_ids) + 256
 
 
 class BudgetedLLM(LLMClient):
