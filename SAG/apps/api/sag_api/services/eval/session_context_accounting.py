@@ -94,6 +94,11 @@ class CallLedger:
     ) -> None:
         record["status"] = status
         record["in_flight"] = False
+        if status != "completed":
+            record["input_tokens"] = None
+            record["output_tokens"] = None
+            record["cached_tokens"] = None
+            record["reasoning_tokens"] = None
         if error_type is not None:
             record["error_type"] = error_type
         if duration_ms is not None:
@@ -226,16 +231,24 @@ class TrackedLLM(LLMClient):
 
     async def _observed_stream(self, stream, record, started):
         token = _ACTIVE.set((self.ledger, record))
+        last_usage = None
         try:
             async with asyncio.timeout(max(0, self.ledger.deadline - time.monotonic())):
                 async for chunk in stream:
-                    self.ledger.usage(record, _attr(chunk, "usage"))
+                    chunk_usage = _attr(chunk, "usage")
+                    if chunk_usage is not None:
+                        record["usage_snapshots"] += 1
+                        last_usage = chunk_usage
                     choices = _attr(chunk, "choices", []) or []
                     if record["ttft_ms"] is None and any(
                         _attr(_attr(choice, "delta", {}), "content") for choice in choices
                     ):
                         record["ttft_ms"] = round((time.monotonic() - started) * 1000, 3)
                     yield chunk
+            if last_usage is not None:
+                snapshots = record["usage_snapshots"]
+                self.ledger.usage(record, last_usage)
+                record["usage_snapshots"] = snapshots
             self.ledger.settle(
                 record,
                 status="completed",

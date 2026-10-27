@@ -335,3 +335,218 @@ def test_validation_corpus_loads_and_locks_manifest(monkeypatch):
     manifest = harness.build_runtime_manifest(args, cases)
     assert manifest["split"] == "validation"
     assert len(manifest["case_ids"]) == 12
+
+
+def test_strict_evidence_recall_helpers_score_raw_and_fitted_and_reject_malformed_schema():
+    from scripts.eval_session_context import (
+        expand_case,
+        score_fitted_evidence_messages,
+        score_selected_evidence,
+    )
+
+    case = {
+        "id": "unit-ev-score",
+        "split": "validation",
+        "language": "vi",
+        "group": "normal",
+        "scenario": "long_session_retention",
+        "message_count": 10,
+        "filler_repeat": 1,
+        "facts": [
+            {"at": 2, "role": "user", "content": "Chốt mã định tuyến KRONOS-418."},
+            {"at": 6, "role": "user", "content": "Chốt cổng dự phòng PAY-SIGMA-79."},
+        ],
+        "query": "Nêu mã định tuyến và cổng dự phòng.",
+        "gold_items": [
+            {"id": "routing", "aliases": ["KRONOS-418"], "evidence": [{"at": 2, "quote": "KRONOS-418"}]},
+            {"id": "gateway", "aliases": ["PAY-SIGMA-79"], "evidence": [{"at": 6, "quote": "PAY-SIGMA-79"}]},
+        ],
+    }
+    expanded = expand_case(case)
+    raw_full = [
+        {"message_id": expanded[2]["id"], "kind": "user_statement", "text": expanded[2]["content"]},
+        {"message_id": expanded[6]["id"], "kind": "user_statement", "text": expanded[6]["content"]},
+    ]
+    scored_full = score_selected_evidence(case, expanded, raw_full)
+    assert scored_full["item_evidence_recall"] == 1.0
+    assert scored_full["covered_evidence_items"] == ["routing", "gateway"]
+
+    raw_half = [raw_full[0]]
+    scored_half = score_selected_evidence(case, expanded, raw_half)
+    assert scored_half["item_evidence_recall"] == 0.5
+    assert scored_half["covered_evidence_items"] == ["routing"]
+    assert scored_half["uncovered_evidence_items"] == ["gateway"]
+
+    fitted_msg = "SESSION_EVIDENCE_JSON\n" + json.dumps(
+        [
+            {
+                "id": "S1",
+                "kind": "user_statement",
+                "message_id": expanded[2]["id"],
+                "start": 0,
+                "end": len(expanded[2]["content"]),
+                "text": expanded[2]["content"],
+            }
+        ],
+        ensure_ascii=False,
+    )
+    scored_fitted = score_fitted_evidence_messages(case, expanded, [fitted_msg])
+    assert scored_fitted["item_evidence_recall"] == 0.5
+
+    for bad_raw in (
+        None,
+        "not-a-list",
+        [{"message_id": expanded[2]["id"], "kind": "user_statement", "quote": "KRONOS-418"}],
+        [{"message_id": "", "kind": "user_statement", "text": "KRONOS-418"}],
+        [{"message_id": expanded[2]["id"], "kind": "invalid_kind", "text": "KRONOS-418"}],
+    ):
+        with pytest.raises(ValueError):
+            score_selected_evidence(case, expanded, bad_raw)
+
+    for bad_fitted in (
+        None,
+        ["NOT_EVIDENCE_HEADER\n[]"],
+        ["SESSION_EVIDENCE_JSON\n{bad json"],
+        ["SESSION_EVIDENCE_JSON\n[{\"id\": \"S1\"}]"],
+    ):
+        with pytest.raises(ValueError):
+            score_fitted_evidence_messages(case, expanded, bad_fitted)
+
+
+@pytest.mark.asyncio
+async def test_dispatched_fitted_prompt_captures_post_fit_dropped_evidence_and_links_sha256(
+    tmp_path, monkeypatch
+):
+    import test_session_context_storage as storage_fixtures
+    from test_session_context_runtime import Counter, Encoder, principal
+    from test_session_context_storage import raw
+
+    from sag_api.core.config import Settings
+    from sag_api.db.models import Agent
+    from sag_api.services.session_context import model as model_module
+    from sag_api.services.session_context.model import BudgetedLLM
+    from sag_api.services.session_context.runtime import prepare_context
+    from scripts.eval_session_context import score_fitted_evidence_messages, score_selected_evidence
+
+    async for factory, scope in storage_fixtures.storage_db.__wrapped__():
+        async with factory() as session:
+            m1 = raw("m-fit-1", content="Chốt mã định tuyến KRONOS-418.", ordinal=1)
+            m2 = raw("m-fit-2", content="Chốt cổng dự phòng PAY-SIGMA-79. " + ("chi tiết bổ sung " * 120), ordinal=2)
+            user = raw("m-fit-q", content="Nêu mã định tuyến và cổng dự phòng.", ordinal=3)
+            session.add_all([m1, m2, user])
+            await session.commit()
+            await session.refresh(user)
+            ctx = await prepare_context(
+                session,
+                key=scope.key,
+                principal=principal(scope),
+                user_message=user,
+                query=user.content,
+                mode="normal",
+                encoder=Encoder(),
+                counter=Counter(),
+            )
+            agent = await session.get(Agent, "agent")
+
+        case = {
+            "gold_items": [
+                {"id": "routing", "evidence": [{"at": 0, "quote": "KRONOS-418"}]},
+                {"id": "gateway", "evidence": [{"at": 1, "quote": "PAY-SIGMA-79"}]},
+            ]
+        }
+        expanded = [
+            {"id": "m-fit-1", "role": "user", "content": m1.content},
+            {"id": "m-fit-2", "role": "user", "content": m2.content},
+        ]
+        raw_selected = [
+            {"message_id": item.span.ref.message_id, "kind": item.kind, "text": item.text}
+            for item in ctx.original
+        ]
+        assert score_selected_evidence(case, expanded, raw_selected)["item_evidence_recall"] == 1.0
+
+        # Force fit() with a tight input limit so only the shorter evidence item fits.
+        from dataclasses import replace
+
+        base_messages = ctx.messages(agent, "Nêu mã định tuyến và cổng dự phòng.")
+        full_tokens = ctx.counter.count(base_messages, None)
+        ctx.budget.limits = replace(
+            ctx.budget.limits,
+            context_window_tokens=ctx.budget.limits.output_reserve_tokens + full_tokens - 50,
+        )
+        fitted_messages = ctx.fit(base_messages, None)
+
+        async def fake_completion(finite, **kwargs):
+            return {
+                "choices": [{"message": {"content": "KRONOS-418"}}],
+                "usage": {"prompt_tokens": 50, "completion_tokens": 5},
+            }
+
+        monkeypatch.setattr(model_module, "session_completion", fake_completion)
+        client = BudgetedLLM(
+            Settings(_env_file=None, llm_api_key="offline-test"),
+            budget=ctx.budget,
+            counter=ctx.counter,
+            on_dispatch=ctx.note_dispatch,
+        )
+        await client._create_completion(fitted_messages)
+
+        assert len(ctx.dispatched_calls) == 1
+        assert ctx.dispatched_calls[0]["messages_sha256"] == client.calls[0]["messages_sha256"]
+        assert ctx.dispatched_evidence_messages
+        fitted_score = score_fitted_evidence_messages(case, expanded, ctx.dispatched_evidence_messages)
+        assert fitted_score["item_evidence_recall"] == 0.5
+        assert fitted_score["covered_evidence_items"] == ["routing"]
+        assert fitted_score["uncovered_evidence_items"] == ["gateway"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_stream_in_tracked_llm_keeps_unknown_usage(monkeypatch):
+    import asyncio
+
+    from sag_api.core.config import Settings
+    from sag_api.generation import llm as llm_module
+    from sag_api.services.eval.session_context_accounting import CallLedger, TrackedLLM
+
+    async def fake_litellm(**kwargs):
+        async def gen():
+            yield {
+                "choices": [{"delta": {"content": "partial"}}],
+                "usage": {"prompt_tokens": 42, "completion_tokens": 3},
+            }
+            raise asyncio.CancelledError()
+
+        return gen()
+
+    monkeypatch.setattr(llm_module, "_litellm_completion", fake_litellm)
+    ledger = CallLedger(max_calls=5, max_seconds=30)
+    client = TrackedLLM(Settings(_env_file=None, llm_api_key="offline-test", llm_model="offline"), ledger)
+    stream = await client._create_completion([{"role": "user", "content": "hi"}], stream=True)
+    with pytest.raises(asyncio.CancelledError):
+        async for _ in stream:
+            pass
+    assert len(ledger.calls) == 1
+    call = ledger.calls[0]
+    assert call["status"] == "cancelled"
+    assert call["in_flight"] is False
+    assert call["usage_snapshots"] == 1
+    assert call["input_tokens"] is None
+    assert call["output_tokens"] is None
+    assert ledger.report()["accounting_complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_experiment_wall_time_deadline_cuts_off_active_candidate_replay(resume_run, monkeypatch):
+    import asyncio
+
+    run = resume_run
+    run.args.max_seconds = 0.05
+
+    async def slow_candidate(case, *, web_enabled):
+        deadline = run.harness._EXPERIMENT_DEADLINE.get()
+        assert deadline is not None
+        async with asyncio.timeout_at(deadline):
+            await asyncio.sleep(5)
+
+    monkeypatch.setattr(run.harness, "candidate", slow_candidate)
+    with pytest.raises(TimeoutError):
+        await run.harness.run(run.args)

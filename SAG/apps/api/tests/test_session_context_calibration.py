@@ -260,3 +260,119 @@ async def test_calibration_live_resume_rejects_changed_or_missing_provider_endpo
     monkeypatch.setattr(harness.settings, "llm_base_url", "")
     with pytest.raises(ValueError, match="explicit.*SAG_LLM_BASE_URL|resume"):
         await harness.live_replay([], {}, args, dict(base_report))
+
+
+@pytest.mark.asyncio
+async def test_calibration_crash_mid_dispatch_persists_in_flight_to_disk_and_blocks_resume(
+    monkeypatch, tmp_path
+):
+    from types import SimpleNamespace
+
+    from sag_api.services.eval.session_context_calibration import provider_route_sha256, validate_resume
+    from scripts import calibrate_session_context as harness
+
+    monkeypatch.setattr(harness.settings, "llm_base_url", "https://provider-a.invalid/v1")
+    route_a = provider_route_sha256(harness.settings)
+    base_report = {
+        "corpus_sha256": "corpus",
+        "config": {},
+        "provider_route_sha256": route_a,
+        "locked_profile": "balanced",
+        "profiles": {},
+        "hierarchy": {},
+        "llm_extra_body_sha256": "body",
+        "case_ids": ["case"],
+        "dependency_versions": {"litellm": "same"},
+        "source_sha256": {
+            name: "same"
+            for name in (
+                "graph.py",
+                "selection.py",
+                "hierarchy.py",
+                "reader.py",
+                "scope.py",
+                "budget.py",
+                "types.py",
+                "eval_session_context.py",
+                "agent_domain.py",
+                "agent_service.py",
+                "llm.py",
+                "prompt.py",
+            )
+        },
+        "results": [],
+    }
+    crash_output = tmp_path / "calibration-crash.json"
+
+    async def crashing_replay(case, client, ledger, **kwargs):
+        record = ledger.begin(stream=True, estimated_input=25, max_output=50, retries=1)
+        ledger.observe_attempt(record)
+        raise RuntimeError("simulated process crash mid-dispatch")
+
+    monkeypatch.setattr(harness, "replay_case", crashing_replay)
+    args = SimpleNamespace(
+        resume_provider_from=None,
+        max_calls=4,
+        max_estimated_tokens=10000,
+        max_seconds=600,
+        output=crash_output,
+    )
+    with pytest.raises(RuntimeError, match="simulated process crash mid-dispatch"):
+        await harness.live_replay(
+            [{"id": "case", "group": "normal"}], {"case": {"balanced": []}}, args, dict(base_report)
+        )
+
+    persisted = json.loads(crash_output.read_text(encoding="utf-8"))
+    assert persisted.get("in_flight_replay") == {
+        "case_id": "case",
+        "web_enabled": False,
+        "variant": "paired_legacy",
+        "iteration": 0,
+    }
+    assert persisted["reserved_tokens"] == (25 + 50) * 2
+    assert len(persisted["accounting"]["calls"]) == 1
+    assert persisted["accounting"]["calls"][0]["status"] == "started"
+    assert persisted["accounting"]["calls"][0]["in_flight"] is True
+
+    with pytest.raises(ValueError, match="in-flight"):
+        validate_resume(persisted, base_report)
+
+    resumed_args = SimpleNamespace(
+        resume_provider_from=crash_output,
+        max_calls=4,
+        max_estimated_tokens=10000,
+        max_seconds=600,
+        output=tmp_path / "calibration-resumed.json",
+    )
+    with pytest.raises(ValueError, match="in-flight"):
+        await harness.live_replay(
+            [{"id": "case", "group": "normal"}], {"case": {"balanced": []}}, resumed_args, dict(base_report)
+        )
+
+
+@pytest.mark.asyncio
+async def test_calibration_rejects_sdk_env_base_url_when_sag_llm_base_url_is_empty(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from sag_api.services.eval.session_context_calibration import provider_route_sha256
+    from scripts import calibrate_session_context as harness
+
+    monkeypatch.setattr(harness.settings, "llm_base_url", "")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://sdk-env-route.invalid/v1")
+    with pytest.raises(ValueError, match="explicit SAG_LLM_BASE_URL"):
+        provider_route_sha256(harness.settings)
+
+    args = SimpleNamespace(
+        resume_provider_from=None,
+        max_calls=4,
+        max_estimated_tokens=10000,
+        max_seconds=600,
+        output=tmp_path / "env-rejected.json",
+    )
+    with pytest.raises(ValueError, match="explicit SAG_LLM_BASE_URL"):
+        await harness.live_replay(
+            [{"id": "case", "group": "normal"}],
+            {"case": {"balanced": []}},
+            args,
+            {"locked_profile": "balanced", "results": []},
+        )

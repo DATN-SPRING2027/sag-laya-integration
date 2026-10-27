@@ -14,7 +14,9 @@ import importlib.metadata
 import json
 import logging
 import math
+import os
 import time
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -45,9 +47,12 @@ from sag_api.services.session_context.types import SessionKey
 from sag_api.tools import registry
 
 INDEX_TEMPLATES = {}  # Standalone synthetic harness only, never an application cache.
+_EXPERIMENT_DEADLINE: ContextVar[float | None] = ContextVar("verify_runtime_experiment_deadline", default=None)
 
 
-async def candidate(case, *, web_enabled):
+async def candidate(case, *, web_enabled, deadline: float | None = None):
+    if deadline is None:
+        deadline = _EXPERIMENT_DEADLINE.get()
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     factory = async_sessionmaker(engine, expire_on_commit=False)
     principal = VerifiedPrincipal(
@@ -60,6 +65,7 @@ async def candidate(case, *, web_enabled):
         0,
         2_000_000_000,
     )
+    expanded = baseline.expand_case(case)
     result = {
         "case_id": case["id"],
         "group": case["group"],
@@ -74,7 +80,10 @@ async def candidate(case, *, web_enabled):
         "status": "no_terminal_event",
     }
     started = time.monotonic()
+    plan = None
     try:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("experiment wall-time budget exhausted")
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
         async with factory() as session:
@@ -88,7 +97,7 @@ async def candidate(case, *, web_enabled):
                 principal=principal,
                 candidate_source_ids=frozenset(),
             )
-            for item in baseline.expand_case(case):
+            for item in expanded:
                 message = Message(
                     id=item["id"],
                     thread_id=thread.id,
@@ -115,10 +124,15 @@ async def candidate(case, *, web_enabled):
                     result["cold_index_work_units"] = 0
                     result["index_state"] = "ready"
                 else:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError("experiment wall-time budget exhausted")
+                    cold_deadline = (
+                        min(time.monotonic() + 180, deadline) if deadline is not None else time.monotonic() + 180
+                    )
                     encoder = await asyncio.to_thread(configured_encoder)
-                    work = BudgetState(BudgetLimits(12288, 4096, 1, 12288, 32000000, time.monotonic() + 180))
+                    work = BudgetState(BudgetLimits(12288, 4096, 1, 12288, 32000000, cold_deadline))
                     try:
-                        async with asyncio.timeout(180):
+                        async with asyncio.timeout_at(cold_deadline):
                             await sync_index(session, scope=scope, encoder=encoder, budget=work)
                     finally:
                         result["cold_index_work_units"] = work.index_units
@@ -130,17 +144,33 @@ async def candidate(case, *, web_enabled):
                                 for attribute in row.__mapper__.column_attrs
                             }
             result["cold_index_ms"] = round((time.monotonic() - cold) * 1000, 2)
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("experiment wall-time budget exhausted")
             warm = time.monotonic()
-            plan = await agent_domain.prepare_ask(
-                session,
-                agent=agent,
-                thread=thread,
-                query=case["query"],
-                principal=principal,
-                owner_key=thread.owner_key,
-                llm=LLMClient(settings),
-                context_mode=case["group"],
-            )
+            if deadline is not None:
+                async with asyncio.timeout_at(deadline):
+                    plan = await agent_domain.prepare_ask(
+                        session,
+                        agent=agent,
+                        thread=thread,
+                        query=case["query"],
+                        principal=principal,
+                        owner_key=thread.owner_key,
+                        llm=LLMClient(settings),
+                        context_mode=case["group"],
+                        context_deadline=deadline,
+                    )
+            else:
+                plan = await agent_domain.prepare_ask(
+                    session,
+                    agent=agent,
+                    thread=thread,
+                    query=case["query"],
+                    principal=principal,
+                    owner_key=thread.owner_key,
+                    llm=LLMClient(settings),
+                    context_mode=case["group"],
+                )
             result["prepare_ms"] = round((time.monotonic() - warm) * 1000, 2)
             if plan.session_context is not None:
                 result["raw_selected_evidence"] = [
@@ -151,38 +181,73 @@ async def candidate(case, *, web_enabled):
                     }
                     for item in plan.session_context.original
                 ]
-                result["fitted_evidence_messages"] = [
+                result["pre_fit_evidence_messages"] = [
                     str(message.get("content", ""))
                     for message in plan.messages
                     if str(message.get("content", "")).startswith("SESSION_EVIDENCE_JSON")
                 ]
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("experiment wall-time budget exhausted")
         gen_started = time.monotonic()
-        async for event in agent_service.generate_stream(
-            factory,
-            plan=plan,
-            agent=agent,
-            thread_id=thread.id,
-            engine_manager=EngineManager(settings),
-            llm=LLMClient(settings),
-            tool_registry=registry,
-            knowledge_only=not web_enabled,
-            principal=principal,
-        ):
-            if event.type in {"run.completed", "run.failed", "run.cancelled"}:
-                payload = event.data["payload"]
-                result.update(
-                    status=event.type,
-                    answer=str(payload.get("output") or ""),
-                    answer_status=payload.get("answer_status"),
-                    accounting=payload.get("session_accounting"),
-                    context=payload.get("session_context"),
-                    error_code=(payload.get("error") or {}).get("code"),
-                )
+
+        async def _consume_generation():
+            async for event in agent_service.generate_stream(
+                factory,
+                plan=plan,
+                agent=agent,
+                thread_id=thread.id,
+                engine_manager=EngineManager(settings),
+                llm=LLMClient(settings),
+                tool_registry=registry,
+                knowledge_only=not web_enabled,
+                principal=principal,
+            ):
+                if event.type in {"run.completed", "run.failed", "run.cancelled"}:
+                    payload = event.data["payload"]
+                    result.update(
+                        status=event.type,
+                        answer=str(payload.get("output") or ""),
+                        answer_status=payload.get("answer_status"),
+                        accounting=payload.get("session_accounting"),
+                        context=payload.get("session_context"),
+                        error_code=(payload.get("error") or {}).get("code"),
+                    )
+
+        if deadline is not None:
+            async with asyncio.timeout_at(deadline):
+                await _consume_generation()
+        else:
+            await _consume_generation()
         result["generation_ms"] = round((time.monotonic() - gen_started) * 1000, 2)
         result.update(baseline.score_answer(case, result.get("answer", "")))
     except Exception as error:
         result.update(status="error", error_type=type(error).__name__)
     finally:
+        if plan is not None and plan.session_context is not None:
+            result["actual_fitted_evidence"] = [
+                {
+                    "message_id": item.span.ref.message_id,
+                    "kind": item.kind,
+                    "text": item.text,
+                }
+                for item in plan.session_context.dispatched_evidence
+            ]
+            result["actual_fitted_evidence_messages"] = list(plan.session_context.dispatched_evidence_messages)
+            result["fitted_evidence_messages"] = list(plan.session_context.dispatched_evidence_messages)
+            result["dispatched_prompt_calls"] = copy.deepcopy(plan.session_context.dispatched_calls)
+            if case.get("group") == "normal":
+                raw_score = baseline.score_selected_evidence(case, expanded, result["raw_selected_evidence"])
+                result["raw_gold_evidence_recall"] = raw_score["item_evidence_recall"]
+                result["raw_gold_evidence_metrics"] = raw_score
+                if result["actual_fitted_evidence_messages"]:
+                    fitted_score = baseline.score_fitted_evidence_messages(
+                        case, expanded, result["actual_fitted_evidence_messages"]
+                    )
+                    result["fitted_gold_evidence_recall"] = fitted_score["item_evidence_recall"]
+                    result["fitted_gold_evidence_metrics"] = fitted_score
+                else:
+                    result["fitted_gold_evidence_recall"] = None
+                    result["fitted_gold_evidence_metrics"] = None
         await engine.dispose()
     result["duration_ms"] = round((time.monotonic() - started) * 1000, 2)
     return result
@@ -535,15 +600,23 @@ async def run(args):
         }
     output.parent.mkdir(parents=True, exist_ok=True)
     ledger.deadline = started + max(0.0, args.max_seconds - spent)
+    deadline_token = _EXPERIMENT_DEADLINE.set(ledger.deadline)
     counter = model.ModelTokenCounter(settings.llm_model, template_kwargs={"enable_thinking": False})
     original = model.session_completion
 
     def save():
         report["elapsed_seconds"] = max(spent, spent + time.monotonic() - started)
+        report["replay_duration_seconds"] = round(
+            sum(float(row.get("duration_ms") or 0.0) for row in report["results"]) / 1000.0,
+            3,
+        )
         report["experiment_accounting"] = ledger.report()
         report["reserved_tokens"] = ledger.reserved_tokens
         tmp = output.with_suffix(output.suffix + ".tmp")
-        tmp.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        with tmp.open("w", encoding="utf-8") as handle:
+            json.dump(report, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
         tmp.replace(output)
 
     ledger.on_change = save
@@ -554,6 +627,9 @@ async def run(args):
             estimated_input=counter.count(kwargs["messages"], kwargs.get("tools")),
             max_output=finite.llm_max_tokens,
         )
+        record["messages_sha256"] = hashlib.sha256(
+            json.dumps(kwargs["messages"], ensure_ascii=False, sort_keys=True).encode()
+        ).hexdigest()
         ledger.observe_attempt(record)
         try:
             response = await original(finite, **kwargs)
@@ -564,6 +640,7 @@ async def run(args):
                 return response
 
             async def stream():
+                last_usage = None
                 try:
                     async for chunk in response:
                         choices = _attr(chunk, "choices") or []
@@ -571,17 +648,33 @@ async def run(args):
                             text = _attr(_attr(choices[0], "delta"), "content")
                             if isinstance(text, str):
                                 record["synthetic_output"] = record.get("synthetic_output", "") + text
-                        ledger.usage(record, _attr(chunk, "usage"))
+                        chunk_usage = _attr(chunk, "usage")
+                        if chunk_usage is not None:
+                            record["usage_snapshots"] += 1
+                            last_usage = chunk_usage
                         yield chunk
+                    if last_usage is not None:
+                        snapshots = record["usage_snapshots"]
+                        ledger.usage(record, last_usage)
+                        record["usage_snapshots"] = snapshots
                     ledger.settle(record, status="completed")
+                except BaseException as stream_error:
+                    status = (
+                        "cancelled"
+                        if isinstance(stream_error, (asyncio.CancelledError, GeneratorExit))
+                        else "failed"
+                    )
+                    ledger.settle(record, status=status, error_type=type(stream_error).__name__)
+                    raise
                 finally:
-                    if record["status"] != "completed":
-                        ledger.settle(record, status="failed")
+                    if record["status"] == "started":
+                        ledger.settle(record, status="cancelled")
                     await response.aclose()
 
             return stream()
         except BaseException as error:
-            ledger.settle(record, status="failed", error_type=type(error).__name__)
+            status = "cancelled" if isinstance(error, asyncio.CancelledError) else "failed"
+            ledger.settle(record, status=status, error_type=type(error).__name__)
             raise
 
     executed_any = False
@@ -614,6 +707,7 @@ async def run(args):
                         result = await baseline.replay_case(case, client, ledger, web_enabled=web)
                         result["variant"] = variant
                     else:
+                        _EXPERIMENT_DEADLINE.set(ledger.deadline)
                         result = await candidate(case, web_enabled=web)
                     report.pop("in_flight_replay", None)
                     report["results"].append(result)
@@ -636,6 +730,7 @@ async def run(args):
                     )
     if executed_any or not output.exists():
         save()
+    _EXPERIMENT_DEADLINE.reset(deadline_token)
 
 
 if __name__ == "__main__":

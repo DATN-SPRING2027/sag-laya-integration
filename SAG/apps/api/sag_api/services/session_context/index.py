@@ -163,11 +163,15 @@ async def sync_index(
         await session.commit()
 
     chunk_cache = {}
-    for start in range(0, len(pending), batch_size):
-        batch = pending[start : start + batch_size]
+    while pending:
+        batch = pending[:batch_size]
         encoded = await asyncio.to_thread(
             _encode, encoder, tuple(message.content for message in batch), budget, chunk_cache
         )
+        if expected_dim is None and encoded:
+            expected_dim = len(encoded[0].vector)
+            if any(len(existing.vector) != expected_dim for existing in features.values()):
+                features = {k: v for k, v in features.items() if len(v.vector) == expected_dim}
         for message, feature in zip(batch, encoded, strict=True):
             require(
                 feature.model_id == encoder.model_id
@@ -177,6 +181,7 @@ async def sync_index(
             )
             features[message.message_id] = feature
         await checkpoint("indexing")
+        pending = [message for message in history.messages if message.message_id not in features]
     current = await read_records(session, scope=scope, budget=budget, exclude_id=exclude_id)
     require(make_snapshot(scope, current, generation="basis").history_digest == basis, "index_snapshot_changed")
     await checkpoint("ready")

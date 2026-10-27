@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from collections.abc import Mapping
 
 import httpx
@@ -106,8 +108,21 @@ class BudgetedLLM(LLMClient):
             await self.before_dispatch()
         reservation = self.budget.reserve_call(input_tokens=self.counter.count(messages, tools))
         if self.on_dispatch is not None:
-            self.on_dispatch()
+            try:
+                self.on_dispatch(messages=messages)
+            except TypeError:
+                self.on_dispatch()
+        messages_sha256 = hashlib.sha256(
+            json.dumps(
+                [dict(m) if isinstance(m, Mapping) else m for m in messages],
+                sort_keys=True,
+                ensure_ascii=False,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
         record = {
+            "call_index": len(self.calls) + 1,
+            "messages_sha256": messages_sha256,
             "status": "started",
             "input_tokens": None,
             "output_tokens": None,

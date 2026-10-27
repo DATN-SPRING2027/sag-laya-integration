@@ -605,5 +605,121 @@ không hoạt động, không dùng DB người dùng để thay thế. F2/F3 v�
     2. **`SAG/apps/api/sag_api/services/session_context/model.py:92` & `aggregate.py:107` (`F2-BUG-2`)**: Ở `val-full-session-timeline-en` (`web=False` và `web=True`, `240` messages), `_batches()` gom toàn bộ `240` messages (`~29,874` input tokens, sát trần `input_limit=30000`) vào một lệnh `llm.complete` non-streaming duy nhất, trong khi `BudgetedLLM.__init__` (`model.py:92`) ép trần `llm_timeout_ms = min(settings.llm_timeout_ms, 60000)` (`60s`). Cả hai lượt gọi đều bị `APITimeoutError` ở `~61.34s` / `~61.81s` (`status="run.failed"`, `error_code="generation_failed"`, `accounting_complete=False`).
 - **Quyết định nghiệm thu**:
   - **4 Finding `[P2]`**: **PASS (ĐÃ ĐÓNG BẰNG REGRESSION TESTS)**.
-  - **F3 (`normal` mode quality & cold-index latency)**: **PASS trong phạm vi validation (`20/20` đúng, `0` timeout cold-index, giảm `89.43%` token long-normal)**.
+  - **F3 (`normal` mode quality & cold-index latency)**: **PASS trong phạm vi validation (`20/20` đúng, `0` timeout cold-index, giảm `89.43%` token long-normal)** (Lưu ý đính chính ở mục tiếp theo: corpus validation đã được xem nên chỉ có giá trị chẩn đoán, và `fitted_evidence_messages` trong `v2` được chụp từ `plan.messages` trước `memory.fit`, nên F3 semantic/cold-index vẫn là **NOT PROVEN / NO-GO** cho HEAD mới cho tới đợt validation kín mới).
   - **F2 (`full_session` mode) & Overall Rollout Gate**: **FAIL (`NO-GO`)**. Giữ `SAG_SESSION_CONTEXT_MODE=off`.
+
+---
+
+## T9 Post-Validation Remediation & Offline Verification Plan (2026-10-27)
+
+### 1. Snapshot Git & Hiện trạng Đã Xác minh Trước Khi Sửa
+
+- **Nhánh**: `feat/Thang-session-context-runtime-be-api` (PR `#40`, base `origin/main` = `77722700fa8ed83112bff6640213b12d0235c11c`).
+- **Remote PR head**: `7c893940f8f1cbb397e687ff18f50489cc8f2a62`.
+- **Local HEAD trước khi sửa**: `6852d623e1ee83149615075a7020f7dba8c69150` (sau các commit `34d3e498bb30224a09546a5651a88fdb5b65571b`, `8be038981b2e2fc73dacb4d52af8f227c78be193`, `6852d623e1ee83149615075a7020f7dba8c69150`).
+- **Working tree trước khi sửa**: `git status --short` báo `M VERIFICATION.md` và `M reviews/2026-10-27-independent/REVIEW.md` nhưng `git diff HEAD` và `git diff --ignore-space-at-eol` đều rỗng (`0` byte khác biệt); `git ls-files --eol` xác nhận chỉ là chênh lệch line-ending `i/lf w/crlf` từ thao tác append trước đó. Thư mục `.serena/` untracked được giữ nguyên.
+- **Ràng buộc thực thi**: Hoàn toàn offline, **không gọi provider/model trả phí**, **không sửa/xóa các artifact lịch sử hay `v1`/`v2`/semantic-review/summary đã commit**, giữ `SAG_SESSION_CONTEXT_MODE=off` và rollout `NO-GO`.
+
+### 2. Phân tích Root Cause & Thiết kế Sửa Đổi Theo Từng Hạng Mục
+
+1. **Mục 2.1 — Bất nhất `raw_gold_evidence_recall` (`0.0` ở per-row vs `1.0` ở gate summary) & Báo cáo Đính chính Mới**:
+   - **Root cause**: Trong `verify_session_runtime.py:146-153`, mỗi phần tử của `raw_selected_evidence` được lưu dưới dạng `{"message_id": item.span.ref.message_id, "kind": item.kind, "text": item.text}`. Tuy nhiên script tổng hợp `generate_validation_artifacts.py` lại đọc `x.get("quote", "")` trên các phần tử `dict` (dẫn tới `haystack = ""` và `raw_gold_evidence_recall = 0.0` ở từng dòng `paired_results` và `semantic-review.jsonl`), trong khi bảng `gate_matrix` gán cứng `"observed": 1.0`.
+   - **Hợp đồng ánh xạ ID trong fixture**: `expand_case(case)` (`eval_session_context.py:42-69`) sinh deterministic `message_id = sha256(f"{case['id']}:{idx}").hexdigest()[:32]` và role (`"user"` → `kind="user_statement"`, `"assistant"` → `kind="assistant_statement"`).
+   - **Giải pháp**:
+     - Xây dựng hàm thuần `score_selected_evidence(case, expanded_messages, selected_evidence)` trong `eval_session_context.py`: kiểm tra nghiêm ngặt cấu trúc đầu vào (nếu thiếu/malformed trả `None` hoặc ném `ValueError`, không ép về `0.0`/`1.0`), ánh xạ `evidence["at"]` sang đúng `message_id` và `kind` kỳ vọng từ `expanded_messages`, và chỉ tính hit khi tồn tại phần tử trong `selected_evidence` khớp đồng thời `(message_id, kind)` và `evidence["quote"] in item["text"]`.
+     - Tạo script độc lập `SAG/apps/api/scripts/recompute_f2_f3_validation_metrics.py` và sinh artifact đính chính mới `SAG/docs/Thang_Task/session-context-zero-mem/evidence/f2-f3-independent-validation.corrigendum.json` có liên kết SHA-256 tới `v1`, `v2`, `corpus`, `semantic-review.jsonl`, `summary.json`.
+
+2. **Mục 2.2 — Ghi nhận Fitted Prompt Thực tế Sau `memory.fit` Tại Boundary Dispatch**:
+   - **Root cause**: `verify_session_runtime.py:154-158` trích `fitted_evidence_messages` từ `plan.messages` ngay sau `prepare_ask`, trước khi `generate_stream` → `transform_context` → `memory.fit(fitted, tool_schemas)` chạy. Do đó `fitted_evidence_messages` trong `v2` chỉ là pre-fit message, nên trạng thái fitted prompt lịch sử trong `v2` phải được ghi nhận trung thực là `NOT PROVEN`.
+   - **Giải pháp**:
+     - Tại `SessionContext.commit_request_evidence(messages=())` (`runtime.py`) được gọi từ `BudgetedLLM._create_completion` (`model.py`) ngay trước khi gọi `session_completion`, ghi nhận `dispatched_evidence` (các `ResolvedEvidence` thực tế sau `fit` hoặc trong map batch), `dispatched_evidence_messages` (các message `SESSION_EVIDENCE_JSON` thực tế trong `request["messages"]`), và `dispatched_calls` (gồm `call_index`, `messages_sha256`, `evidence_messages_sha256`, danh sách `evidence` kèm `message_id`, `kind`, `text`).
+     - Trong `verify_session_runtime.py`, ghi rõ `raw_selected_evidence`, `actual_fitted_evidence`, `actual_fitted_evidence_messages`, `dispatched_calls`, `raw_gold_evidence_recall`, và `fitted_gold_evidence_recall` (tính trên `actual_fitted_evidence`).
+
+3. **Mục 3 — Crash/Resume Durability Trên Mọi Đường Provider (Runtime & Calibration)**:
+   - **Root cause**: `calibrate_session_context.py::live_replay` chỉ gọi `checkpoint()` sau khi `replay_case` hoàn tất, chưa gắn `ledger.on_change`, chưa lưu `in_flight_replay`, và khi resume lại lọc các dòng lỗi sang `excluded_attempts` để chạy lại mà không kiểm tra `in_flight`/`started` hay đối chiếu `reserved_tokens` trong `session_context_calibration.py::validate_resume`.
+   - **Giải pháp**:
+     - Cập nhật `calibrate_session_context.py` để bắt buộc `SAG_LLM_BASE_URL` tường minh (không nhận fallback từ `OPENAI_BASE_URL` khi `settings.llm_base_url` rỗng), gắn `ledger.on_change = save` để durable-checkpoint `in_flight_replay`, `calls` (`status="started"`, `in_flight=True`), full reservation (`estimated_input_tokens`, `max_output_tokens`, `configured_retries`), `reserved_tokens`, và `elapsed_seconds` trước mỗi provider dispatch và ngay khi settle.
+     - Cập nhật `session_context_calibration.py::validate_resume` để từ chối resume nếu còn `in_flight_replay`, còn bất kỳ call nào có `status == "started"` hoặc `in_flight == True`, thiếu trường reservation, sai tổng `reserved_tokens`, hoặc tổng `logical_calls` của `results + excluded_attempts` không khớp `len(accounting["calls"])` (kể cả khi `results == []` mà `calls` khác rỗng).
+
+4. **Mục 4 — Trần Thời Gian Lũy Kế Toàn Experiment (`max_seconds`)**:
+   - **Root cause**: `verify_session_runtime.py` và `calibrate_session_context.py` dùng `deadline = started + max(0.0, args.max_seconds - spent)` cho `ledger`, nhưng `candidate()` trong `verify_session_runtime.py` lại dùng `asyncio.timeout(180)` cố định cho cold-index và `prepare_ask` dùng `60s`/`360s` mà không cắt theo `ledger.deadline`; ngoài ra `replay_case` trong baseline/calibration chưa bị giới hạn bởi `ledger.deadline`.
+   - **Giải pháp**:
+     - Cắt mọi bước (cold-index `sync_index`, `prepare_ask(..., context_deadline=ledger.deadline)`, và toàn bộ `replay_case` / `candidate` qua `asyncio.timeout_at(ledger.deadline)`) theo `ledger.deadline`.
+     - Khi hết `ledger.deadline` giữa chừng, ghi nhận trạng thái timeout/partial và bảo toàn toàn bộ accounting/results đã có trên đĩa mà không ghi đè mất dữ liệu cũ và không chạy sang case tiếp theo.
+     - Báo cáo tách biệt `elapsed_seconds` (tổng wall-time lũy kế của toàn experiment, gồm cả cold-index, failure, resume) và `replay_duration_seconds` (tổng thời gian các lượt replay). Ghi rõ giới hạn: native CPU inference (PyTorch/ONNX trong thread/process cùng tiến trình) chỉ dừng hợp tác tại các điểm kiểm tra `check_deadline()` giữa các batch, không thể 강제 kill thread C++ tức thời ở giữa một batch đơn lẻ.
+
+5. **Mục 5 — Kiểm chứng Lại 4 Fix `[P2]` Cũ (`P2-A` .. `P2-D`)**:
+   - Rà soát toàn bộ caller paths và bổ sung test cho:
+     - `P2-A`: `SHADOW` gặp `OSError`/`ImportError` khi thiếu local tokenizer/model sẽ fallback legacy; `ON` trả `ServiceUnavailableError(code="session_context_not_ready")`; `ContextContractError` vẫn fail-closed.
+     - `P2-B`: Khi **tất cả** vector trong cache đều có cùng chiều sai (ví dụ toàn bộ là 3 chiều trong khi encoder công bố 2 chiều), `sync_index` phát hiện ngay nhờ `_encoder_dimension(encoder)` và rebuild từ raw message. Nếu custom encoder không công bố chiều (`_encoder_dimension(encoder) is None`), `sync_index` chỉ kiểm tra tính đồng nhất nội bộ và không thể biết chiều kỳ vọng của encoder (ghi rõ giới hạn này trong tài liệu và test).
+     - `P2-C`: Crash/resume trên cả runtime và calibration với kiểm tra file thực tế trên đĩa.
+     - `P2-D`: Khóa endpoint trên cả `calibrate_session_context.py::main` và `live_replay`, bao gồm trường hợp `settings.llm_base_url` rỗng/whitespace trong khi biến môi trường `OPENAI_BASE_URL` được đặt.
+
+6. **Mục 6 — Sửa `F2-A`: Map Batch Có Item Không Support (`aggregate.py`)**:
+   - **Root cause**: `_items()` (`aggregate.py:62-80`) ném `ValueError("invalid_map_support")` cho cả batch nếu có bất kỳ phần tử nào trong `items` thiếu `supports` hoặc có `supports` không hợp lệ, khiến toàn bộ các item hợp lệ trong cùng batch bị vứt bỏ (`visited=0`).
+   - **Giải pháp tổng quát**:
+     - Kiểm tra từng item trong `value["items"]` độc lập bằng `decode_memory_answer(..., evidence, original=original, max_supports=8192, allow_reference_only=True)`.
+     - Giữ lại các item có `supports` hợp lệ (không rỗng, ID thuộc batch `evidence` đã kiểm quyền, quote khớp nguyên văn).
+     - Loại bỏ mọi item có `supports` rỗng, ID lạ, quote sai, hoặc cấu trúc không hợp lệ (không bao giờ đưa claim thiếu căn cứ vào `extracted` hay câu trả lời cuối).
+     - Tách biệt `scanned` (các message ID đã chạy qua bước map để vòng lặp batch tiến lên) và `visited` (các message ID được công nhận độ bao phủ):
+       - Nếu toàn bộ item trong batch đều hợp lệ (`dropped_count == 0`): cộng toàn bộ `ids` của batch vào `visited`.
+       - Nếu có bất kỳ item nào trong batch bị loại (`dropped_count > 0`): đánh dấu `reason = reason or "map_not_ready"`, chỉ cộng các message ID thực sự có trong `supports` đã xác minh của các item hợp lệ (cùng bao đóng phụ thuộc `batch_evidence` của chúng) vào `visited` (để thỏa invariant `span.ref.message_id in selection.coverage.visited_ids` tại `scope.py:145` mà không làm giả `visited == eligible`), giữ `complete = False` và `selection.state = "partial"`.
+       - Nếu batch có `items` không rỗng nhưng tất cả đều bị loại (`len(valid_items) == 0` và `dropped_count > 0`): không cộng vào `visited`, đặt `reason = reason or "map_not_ready"`.
+
+7. **Mục 7 — Sửa `F2-B`: Map Lớn & Provider Timeout (`aggregate.py`, `model.py`)**:
+   - **Root cause**:
+     1. `aggregate_session` đặt mặc định `input_limit=30000`, gom toàn bộ 240 tin nhắn (~29,874 tokens) vào một map call duy nhất trong khi `BudgetedLLM` giới hạn timeout mỗi call ở `60,000 ms`.
+     2. `session_completion` (`model.py:42-50`) gọi `AsyncOpenAI` trực tiếp; khi xảy ra `openai.APITimeoutError` hoặc `openai.APIError` / `httpx.HTTPError`, ngoại lệ này không phải là `TimeoutError` hay `UpstreamError` của nội bộ, nên lọt qua `except (ValueError, UpstreamError, TimeoutError):` trong `aggregate.py:191, 242` và làm sập cả luồng `FullSessionModel.stream_turn` (`run.failed`).
+   - **Giải pháp tổng quát**:
+     1. Trong `model.py::session_completion`: chuyển đổi `openai.APITimeoutError` / `httpx.TimeoutException` thành `TimeoutError("Quá thời gian chờ phản hồi từ nhà cung cấp mô hình.")` và `openai.APIError` / `httpx.HTTPError` thành `UpstreamError("Lỗi kết nối nhà cung cấp mô hình.")` để đồng nhất hợp đồng lỗi tại biên provider.
+     2. Trong `aggregate.py::aggregate_session`: giảm `input_limit` mặc định của mỗi map batch xuống `8192` tokens (khớp với `normal_ceiling.model_input_tokens = 8192` trong policy, đồng thời tự động nới lên tối đa `min(input_limit_cap, context_window - output_reserve)` chỉ khi tổng lượng token của phiên vượt quá khả năng bao phủ của `max_calls - 1` map batches) và dành riêng 1 call dự phòng cho bước `reduce` khi có `extracted` items (nếu chạm `max_calls - 1` khi vẫn còn `remaining` messages thì dừng map với `reason = "calls"` để còn 1 call cho reduce hoặc fallback nguyên văn an toàn).
+
+### 3. Danh sách File Dự kiến Thay đổi & Ma trận Kiểm thử
+
+- **Production code**:
+  - `SAG/apps/api/sag_api/services/session_context/model.py`
+  - `SAG/apps/api/sag_api/services/session_context/runtime.py`
+  - `SAG/apps/api/sag_api/services/session_context/aggregate.py`
+  - `SAG/apps/api/sag_api/services/agent_domain.py`
+- **Evaluation / Harness code**:
+  - `SAG/apps/api/sag_api/services/eval/session_context_calibration.py`
+  - `SAG/apps/api/scripts/eval_session_context.py`
+  - `SAG/apps/api/scripts/verify_session_runtime.py`
+  - `SAG/apps/api/scripts/calibrate_session_context.py`
+  - `SAG/apps/api/scripts/recompute_f2_f3_validation_metrics.py` (mới)
+- **Tests**:
+  - `SAG/apps/api/tests/test_session_context_aggregate.py`
+  - `SAG/apps/api/tests/test_session_context_full_runtime.py`
+  - `SAG/apps/api/tests/test_session_context_runtime_resume.py`
+  - `SAG/apps/api/tests/test_session_context_calibration.py`
+  - `SAG/apps/api/tests/test_session_context_index.py`
+  - `SAG/apps/api/tests/test_session_context_runtime_security.py`
+- **Evidence & Documentation**:
+  - `SAG/docs/Thang_Task/session-context-zero-mem/evidence/f2-f3-independent-validation.corrigendum.json` (mới)
+  - `SAG/docs/Thang_Task/session-context-zero-mem/RUNTIME.md`
+  - `SAG/docs/Thang_Task/session-context-zero-mem/VERIFICATION.md`
+  - `SAG/docs/Thang_Task/session-context-zero-mem/reviews/2026-10-27-independent/REVIEW.md`
+  - `SAG/docs/Thang_Task/session-context-zero-mem/researchtask.md`
+
+
+### 4. Kết quả Thực thi, Kiểm chứng Offline & Phần Chưa Nghiệm thu (Post-Implementation Update — 27/10/2026)
+
+1. **Sự kiện đã xác minh (Verified Facts)**:
+   - Không có bất kỳ cuộc gọi provider/model trả phí nào được thực hiện trong lượt sửa lỗi này (`0` live calls).
+   - Toàn bộ file bằng chứng lịch sử (`v1`, `v2`, `f2-f3-independent-validation.semantic-review.jsonl`, `f2-f3-independent-validation.summary.json`, `session_context_validation_f2_f3.jsonl`, và các file calibration/holdout T9) được giữ nguyên 100%.
+   - Script `SAG/apps/api/scripts/recompute_f2_f3_validation_metrics.py` đã sinh báo cáo đính chính mới `SAG/docs/Thang_Task/session-context-zero-mem/evidence/f2-f3-independent-validation.corrigendum.json` với đầy đủ liên kết SHA-256:
+     - Xác minh `recomputed_raw_gold_evidence_recall = 1.0` (`38/38` gold items trên `20/20` lượt `normal` của `v2`) và `recomputed_pre_fit_evidence_messages_recall = 1.0` (`38/38`).
+     - Ghi nhận tường minh `fitted_gold_evidence_recall_post_memory_fit = "NOT PROVEN"` cho artifact `v2` lịch sử do `v2` lấy `plan.messages` trước `memory.fit`.
+   - `SessionContext.note_dispatch` và `BudgetedLLM._create_completion` nay ghi nhận chính xác `dispatched_evidence_messages` và `dispatched_calls` (kèm `messages_sha256` và `evidence_messages_sha256`) sau `memory.fit`.
+   - `aggregate.py` (`F2-A` & `F2-B`):
+     - `_items()` lọc từng item độc lập, giữ lại các item có `supports` hợp lệ, loại bỏ các item thiếu/sai `supports`, đánh dấu `batch_clean = False` (`reason = "map_not_ready"`), chỉ cộng các message có support hợp lệ vào `visited` và giữ `unverified_ids` để overlap 1-message của batch kế tiếp không đánh dấu nhầm message chưa xác minh.
+     - `aggregate_session()` giới hạn map batch nhiều tin nhắn (`len(ids) > 8`) ở `min(input_limit, 10240)` tokens (`<= 8` tin nhắn giữ nguyên `input_limit`), dành 1 call dự phòng cho `reduce` (`reserve_for_reduce = 1`) khi đã có `extracted` items và `max_calls > 1`, đồng thời bắt `(APIError, httpx.HTTPError, TimeoutError, UpstreamError, ValueError)` ở map/reduce (giữ nguyên hành vi ném `APIStatusError` trực tiếp tại `BudgetedLLM._create_completion` cho unit tests biên SDK).
+2. **Giả định & Giới hạn (Assumptions & Boundaries)**:
+   - Giả định giới hạn `min(input_limit, 10240)` tokens cho map batch có `> 8` tin nhắn giúp chia các phiên ~240 tin nhắn (~30.000 tokens) thành 3 map batches (~10.000 tokens/batch) để tránh chạm trần timeout `60s` của provider; giả định này đã được chứng minh về mặt cấu trúc/token-bound bằng regression test offline nhưng chưa chạy lại trên live provider.
+3. **Kết quả Kiểm thử Offline (Test Results)**:
+   - `ruff check` trên toàn bộ module/script/test `session_context`: **All checks passed**.
+   - `python -m compileall -q sag_api scripts tests`: **PASS**.
+   - Bộ regression tests cho `F2-A`, `F2-B`, post-`fit` prompt evidence, strict evidence scorer, calibration/runtime crash-resume durability, stream cancellation unknown usage, cumulative wall-time deadline, vector dimension healing (`index.py`), và `SHADOW`/`ON` tokenizer/encoder error handling: **PASS**.
+4. **Phần Chưa Nghiệm thu (Unaccepted / Open Items)**:
+   - **F2 (`full_session`) và F3 (`normal`) chưa được nghiệm thu semantic cuối cùng**: Đợt `v1`/`v2` trước đó là đợt chạy chẩn đoán (vượt trần 2.400s khi cộng gộp `v1 + v2 = 2.843,86s`, đổi hash `verify_session_runtime.py` giữa `v1` và `v2`, và bộ `session_context_validation_f2_f3.jsonl` đã được đọc). Để chốt nghiệm thu F2/F3 cần một bộ validation kín mới (fresh blind validation corpus) và một lần chạy live duy nhất không sửa code giữa chừng.
+   - Giữ nguyên `SAG_SESSION_CONTEXT_MODE=off` và khuyến nghị rollout **NO-GO**.

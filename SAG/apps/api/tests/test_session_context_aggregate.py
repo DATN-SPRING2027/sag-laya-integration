@@ -302,3 +302,135 @@ async def test_fallback_on_failed_reduce_uses_verified_quotes_not_untrusted_map_
     assert result.reason == "synthesis_not_ready"
     assert "UNVERIFIED_GLOBAL_ABSENCE" not in result.answer
     assert "DECISION D-0" in result.answer
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_item",
+    [
+        {"text": "Unsupported commentary", "supports": []},
+        {"text": "Unknown support id", "supports": [{"id": "S999"}]},
+        {"text": "Out of batch support id", "supports": [{"id": "S8"}]},
+        {"text": "Bad quote", "supports": [{"id": "S1", "quote": "not-in-source"}]},
+    ],
+)
+async def test_map_batch_with_unsupported_item_keeps_valid_items_and_marks_partial(storage_db, bad_item):
+    factory, scope = storage_db
+    context = await full_context(factory, scope)
+
+    class MixedMapBatchModel(SemanticModel):
+        async def complete(self, messages, **kwargs):
+            raw_out = await super().complete(messages, **kwargs)
+            prefix, _ = messages[-2]["content"].split("\n", 1)
+            if prefix == "SESSION_EVIDENCE_JSON" and len(self.map_batches) == 1:
+                data = json.loads(raw_out)
+                data["items"].append(bad_item)
+                return json.dumps(data)
+            return raw_out
+
+    model = MixedMapBatchModel(context, reference_only_map=True)
+    result = await aggregate_session(context, model, QUERY, input_limit=600)
+    assert_visible_partial(result)
+    assert result.reason == "map_not_ready"
+    assert all(f"D-{index}" in result.answer for index in (0, 3, 7))
+    assert "Unsupported commentary" not in result.answer
+    assert "Unknown support id" not in result.answer
+    assert "Out of batch support id" not in result.answer
+    assert "Bad quote" not in result.answer
+    first_batch_ids = {item["message_id"] for item in model.map_batches[0]}
+    assert "m000" in result.visited_ids
+    assert "m001" in first_batch_ids and "m001" not in result.visited_ids
+    assert result.visited_ids < context.selection.coverage.eligible_ids
+
+
+@pytest.mark.asyncio
+async def test_second_map_batch_with_all_unsupported_items_preserves_first_batch_valid_items(storage_db):
+    factory, scope = storage_db
+    context = await full_context(factory, scope)
+
+    class SecondBatchAllUnsupportedModel(SemanticModel):
+        async def complete(self, messages, **kwargs):
+            raw_out = await super().complete(messages, **kwargs)
+            prefix, _ = messages[-2]["content"].split("\n", 1)
+            if prefix == "SESSION_EVIDENCE_JSON" and len(self.map_batches) == 2:
+                return json.dumps({"items": [{"text": "No valid support", "supports": []}]})
+            return raw_out
+
+    model = SecondBatchAllUnsupportedModel(context, reference_only_map=True)
+    result = await aggregate_session(context, model, QUERY, input_limit=600)
+    assert_visible_partial(result)
+    assert result.reason == "map_not_ready"
+    assert len(model.map_batches) == 2
+    assert "D-0" in result.answer
+    second_batch_only = {item["message_id"] for item in model.map_batches[1]} - {
+        item["message_id"] for item in model.map_batches[0]
+    }
+    assert not (result.visited_ids & second_batch_only)
+    assert "m000" in result.visited_ids
+
+
+@pytest.mark.asyncio
+async def test_large_multi_message_map_batches_are_bounded_and_reserve_one_call_for_reduce(storage_db):
+    factory, scope = storage_db
+    async with factory() as session:
+        for index in range(120):
+            content = (
+                f"DECISION D-{index:03d}: approve milestone {index}.\n"
+                if index in {10, 50, 110}
+                else f"Operational filler {index}. "
+            )
+            content += "Routine status update without policy changes. " * 25
+            session.add(raw(f"long-{index:03d}", content=content, ordinal=index + 20))
+        user = raw("current-long", content=QUERY, ordinal=200)
+        session.add(user)
+        await session.commit()
+        await session.refresh(user)
+        context = await prepare_context(
+            session,
+            key=scope.key,
+            principal=principal(scope),
+            user_message=user,
+            query=QUERY,
+            mode="full_session",
+            counter=Counter(),
+        )
+    context.budget.limits = replace(context.budget.limits, max_calls=3)
+    model = SemanticModel(context, reference_only_map=True)
+    result = await aggregate_session(context, model, QUERY, input_limit=28672)
+    assert_visible_partial(result)
+    assert result.reason == "calls"
+    assert len(model.map_batches) == 2
+    assert model.reduce_items
+    for req in model.requests[:-1]:
+        assert context.counter.count(req) <= 10240
+    assert "D-010" in result.answer and "D-050" in result.answer
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_stage", ["second_map", "reduce"])
+async def test_provider_timeout_on_second_map_or_reduce_returns_visible_partial(storage_db, fail_stage):
+    import httpx
+
+    factory, scope = storage_db
+    context = await full_context(factory, scope)
+
+    class TimeoutLaterModel(SemanticModel):
+        async def complete(self, messages, **kwargs):
+            prefix, _ = messages[-2]["content"].split("\n", 1)
+            if prefix == "SESSION_EVIDENCE_JSON" and len(self.map_batches) >= 1 and fail_stage == "second_map":
+                count = self.context.counter.count(messages)
+                reservation = self.context.budget.reserve_call(input_tokens=count)
+                self.context.budget.settle_call(reservation, None)
+                raise httpx.ReadTimeout("provider read timed out")
+            if prefix == "GENERATED_ITEMS_JSON" and fail_stage == "reduce":
+                count = self.context.counter.count(messages)
+                reservation = self.context.budget.reserve_call(input_tokens=count)
+                self.context.budget.settle_call(reservation, None)
+                raise httpx.ReadTimeout("provider reduce timed out")
+            return await super().complete(messages, **kwargs)
+
+    model = TimeoutLaterModel(context, reference_only_map=True)
+    result = await aggregate_session(context, model, QUERY, input_limit=600)
+    assert_visible_partial(result)
+    assert result.reason == ("map_not_ready" if fail_stage == "second_map" else "synthesis_not_ready")
+    assert "DECISION D-0" in result.answer

@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, replace
 
+import httpx
+from openai import APIError
+
 from sag_api.core.errors import UpstreamError
 from sag_api.services.session_context.budget import BudgetExceeded
 from sag_api.services.session_context.packing import decode_memory_answer, evidence_block
@@ -64,9 +67,11 @@ def _items(raw, evidence, original):
     if not isinstance(value, dict) or not isinstance(value.get("items"), list):
         raise ValueError("invalid_map")
     result = []
+    dropped = 0
     for item in value["items"]:
         if not isinstance(item, dict) or not isinstance(item.get("text"), str) or not item["text"].strip():
-            raise ValueError("invalid_map_item")
+            dropped += 1
+            continue
         answer, supports = decode_memory_answer(
             json.dumps({"answer": item["text"], "supports": item.get("supports")}),
             evidence,
@@ -74,10 +79,13 @@ def _items(raw, evidence, original):
             max_supports=8192,
             allow_reference_only=True,
         )
-        if not supports:
-            raise ValueError("invalid_map_support")
+        if not supports or answer == "UNKNOWN":
+            dropped += 1
+            continue
         result.append({"text": answer, "supports": supports})
-    return result
+    if dropped and not result:
+        raise ValueError("invalid_map_support")
+    return result, dropped == 0
 
 
 def _reduction_answer(raw, extracted, evidence, original):
@@ -109,7 +117,7 @@ async def aggregate_session(context, llm, query, *, input_limit=30000, system_pr
         input_limit, context.budget.limits.context_window_tokens - context.budget.limits.output_reserve_tokens
     )
     eligible = context.selection.coverage.eligible_ids
-    visited, extracted = set(), []
+    visited, scanned, unverified_ids, extracted = set(), set(), set(), []
     ordered = [message.message_id for message in context.indexed.history.messages]
     records = context.indexed.records
     reason = None
@@ -134,18 +142,20 @@ async def aggregate_session(context, llm, query, *, input_limit=30000, system_pr
             reason="aggregating",
         )
 
-    while len(visited) < len(eligible):
-        remaining = [message_id for message_id in ordered if message_id not in visited]
+    while len(scanned) < len(eligible):
+        remaining = [message_id for message_id in ordered if message_id not in scanned]
         if not remaining:
             break
         empty = {key for key in remaining if not records[key].content}
         visited.update(empty)
+        scanned.update(empty)
         progress()
         remaining = [key for key in remaining if key not in empty]
         if not remaining:
             break
         # Prioritize coverage; synthesis also needs a reservation and may be partial.
-        if context.budget.calls >= context.budget.limits.max_calls:
+        reserve_for_reduce = 1 if (extracted and context.budget.limits.max_calls > 1) else 0
+        if context.budget.calls >= context.budget.limits.max_calls - reserve_for_reduce:
             reason = "calls"
             break
         low, high, chosen = 1, len(remaining), None
@@ -158,7 +168,8 @@ async def aggregate_session(context, llm, query, *, input_limit=30000, system_pr
             ids, evidence = batch_evidence(roots)
             messages = _map_messages(context, evidence, query, system_prefix)
             context.budget.consume_index_units(sum(len(item.text) for item in evidence) + len(ids))
-            if context.counter.count(messages) <= input_limit:
+            batch_limit = input_limit if len(ids) <= 8 else min(input_limit, 10240)
+            if context.counter.count(messages) <= batch_limit:
                 chosen, low = (ids, evidence, messages), middle + 1
             else:
                 high = middle - 1
@@ -171,7 +182,7 @@ async def aggregate_session(context, llm, query, *, input_limit=30000, system_pr
                 context.first_model_messages = messages
             context.stage_request(evidence)
             raw = await llm.complete(messages)
-            items = _items(raw, evidence, context.original)
+            items, batch_clean = _items(raw, evidence, context.original)
             known = {f"S{index + 1}": item for index, item in enumerate(context.original)}
             for item in items:
                 item["originals"] = [
@@ -188,11 +199,29 @@ async def aggregate_session(context, llm, query, *, input_limit=30000, system_pr
         except BudgetExceeded as error:
             reason = error.reason
             break
-        except (ValueError, UpstreamError, TimeoutError):
+        except (ValueError, UpstreamError, TimeoutError, APIError, httpx.HTTPError):
             reason = "map_not_ready"
             break
-        # Only successful, validated extraction marks units processed for synthesis.
-        visited.update(ids)
+        # Only clean validated extraction marks the entire batch visited; partial
+        # batches record only the verified supporting messages and keep state partial.
+        scanned.update(ids)
+        if batch_clean:
+            visited.update(ids - unverified_ids)
+        else:
+            reason = reason or "map_not_ready"
+            supported_roots = {
+                known[support["id"]].span.ref.message_id
+                for item in items
+                for support in item["supports"]
+                if support["id"] in known
+            }
+            verified_in_batch = set()
+            if supported_roots:
+                verified_ids, _ = batch_evidence(supported_roots)
+                verified_in_batch = verified_ids & ids
+                visited.update(verified_in_batch)
+                unverified_ids.difference_update(verified_in_batch)
+            unverified_ids.update(ids - verified_in_batch)
         progress()
         extracted.extend(items)
         if context.budget.remaining_tokens is None:
@@ -239,7 +268,7 @@ async def aggregate_session(context, llm, query, *, input_limit=30000, system_pr
             answer, supports = synthesized, generated_supports
         except BudgetExceeded as error:
             reason = reason or error.reason
-        except (ValueError, UpstreamError, TimeoutError):
+        except (ValueError, UpstreamError, TimeoutError, APIError, httpx.HTTPError):
             reason = reason or "synthesis_not_ready"
     if context.budget.remaining_tokens is None:
         reason = reason or "unknown_usage"

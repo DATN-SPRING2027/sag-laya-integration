@@ -324,3 +324,66 @@ async def test_corrupted_cached_vector_dimension_is_rebuilt_from_raw_message(sto
         reused = await sync_index(session, scope=scope, encoder=reuse_encoder, budget=work(), batch_size=2)
         assert reuse_encoder.calls == 0
         assert all(len(feature.vector) == 2 for feature in reused.features)
+
+
+@pytest.mark.asyncio
+async def test_all_cached_vectors_wrong_dimension_and_dimensionless_encoder_are_rebuilt(storage_db):
+    import hashlib
+
+    from sag_api.services.session_context.graph import TextFeatures
+
+    factory, scope = storage_db
+    async with factory() as session:
+        session.add_all(
+            [
+                raw("m1", content="First decision ORBIT-1", ordinal=1),
+                raw("m2", content="Second decision ORBIT-2", ordinal=2),
+            ]
+        )
+        await session.commit()
+        first = await sync_index(session, scope=scope, encoder=Encoder(), budget=work(), batch_size=2)
+        row = await session.get(SessionContextIndex, first.index_id)
+        row.features = {
+            mid: {**dict(feat), "vector": [1.0, 0.2, 0.3, 0.4]}
+            for mid, feat in row.features.items()
+        }
+        await session.commit()
+
+    async with factory() as session:
+        healed_encoder = Encoder()
+        healed = await sync_index(session, scope=scope, encoder=healed_encoder, budget=work(), batch_size=2)
+        assert healed_encoder.calls == 1
+        assert all(len(f.vector) == 2 for f in healed.features)
+        healed.views(scope=scope, budget=work())
+
+    class DimensionlessEncoder:
+        model_id = "dimensionless-test-model"
+        calls = 0
+
+        def featurize(self, text, *, budget):
+            self.calls += 1
+            return TextFeatures(
+                hashlib.sha256(text.encode()).hexdigest(),
+                self.model_id,
+                (1.0, 0.5),
+                (),
+            )
+
+        def featurize_many(self, texts, *, batch_size, budget, deduplicate=False, chunk_cache=None):
+            return tuple(self.featurize(t, budget=budget) for t in texts)
+
+    async with factory() as session:
+        dimless = DimensionlessEncoder()
+        idx1 = await sync_index(session, scope=scope, encoder=dimless, budget=work(), batch_size=2)
+        row = await session.get(SessionContextIndex, idx1.index_id)
+        corrupted = dict(row.features)
+        corrupted["m1"] = {**dict(corrupted["m1"]), "vector": [1.0, 0.5, 0.9]}
+        row.features = corrupted
+        session.add(raw("m3", content="Third decision ORBIT-3", ordinal=3))
+        await session.commit()
+
+    async with factory() as session:
+        dimless2 = DimensionlessEncoder()
+        idx2 = await sync_index(session, scope=scope, encoder=dimless2, budget=work(), batch_size=2)
+        assert all(len(f.vector) == 2 for f in idx2.features)
+        idx2.views(scope=scope, budget=work())

@@ -1,0 +1,451 @@
+{
+  "schema_version": 1,
+  "artifact_type": "corrigendum",
+  "diagnostic_only": true,
+  "final_acceptance_verdict": "FAIL",
+  "rollout_recommendation": "NO-GO (keep SAG_SESSION_CONTEXT_MODE=off)",
+  "source_artifacts_sha256": {
+    "SAG/apps/api/tests/fixtures/session_context_validation_f2_f3.jsonl": "4d54fb4853918da77aaafb6df2eba1c3869786a74dd7f5af7bd796a1b0265e80",
+    "SAG/docs/Thang_Task/session-context-zero-mem/evidence/f2-f3-independent-validation-runtime-v1.json": "8f640c9f7d342f42f384282005a7b731731691a77047678bab43a2c2e37739ce",
+    "SAG/docs/Thang_Task/session-context-zero-mem/evidence/f2-f3-independent-validation-runtime-v2.json": "58e0e602af62ec3ee81be64bce6f69563095e200f8ed36917e3a16bf95401bfb",
+    "SAG/docs/Thang_Task/session-context-zero-mem/evidence/f2-f3-independent-validation.semantic-review.jsonl": "2f6e07387e8166c4d3548f4d7ccd4d2cbcac17efb730afdbdd032ff7cea7c8d4",
+    "SAG/docs/Thang_Task/session-context-zero-mem/evidence/f2-f3-independent-validation.summary.json": "b62e987b9a4197ca4647e390edbe8bfc732f30b27183bf48306ae33eeca8e2e7"
+  },
+  "recomputation_script": {
+    "path": "SAG/apps/api/scripts/recompute_f2_f3_validation_metrics.py",
+    "sha256": "194045fdd8b3d1916f86a85fc00ca81cb3f69310c41b1e79f5e3833466a303a9",
+    "scoring_helpers": [
+      "scripts/eval_session_context.py::score_selected_evidence",
+      "scripts/eval_session_context.py::score_fitted_evidence_messages"
+    ]
+  },
+  "discrepancy_root_cause": {
+    "affected_fields": [
+      "f2-f3-independent-validation.semantic-review.jsonl::raw_gold_evidence_recall",
+      "f2-f3-independent-validation.summary.json::paired_results[*].raw_gold_evidence_recall",
+      "f2-f3-independent-validation.summary.json::gate_matrix.normal_raw_gold_evidence_recall",
+      "f2-f3-independent-validation.summary.json::gate_matrix.normal_fitted_gold_evidence_recall"
+    ],
+    "explanation": "scripts/verify_session_runtime.py stored candidate raw_selected_evidence as dicts with keys {'message_id', 'kind', 'text'}. The one-off summary generator read x.get('quote', '') instead of x['text'] when computing per-row raw_gold_evidence_recall, producing 0.0 for all 20 normal runtime rows while hardcoding observed=1.0 in gate_matrix.normal_raw_gold_evidence_recall. Additionally, fitted_evidence_messages in v2 was captured from plan.messages before memory.fit rather than from SessionContext.dispatched_evidence_messages at BudgetedLLM._create_completion."
+  },
+  "metric_definitions": {
+    "raw_gold_evidence_recall": {
+      "formula": "count(gold_items where all required evidence entries match an item in raw_selected_evidence with entry.message_id == expanded_messages[ev.at].id, entry.kind == f'{expanded_messages[ev.at].role}_statement', and ev.quote in entry.text) / count(gold_items with evidence)",
+      "recomputed_row_count": 20,
+      "recomputed_row_min": 1.0,
+      "recomputed_row_mean": 1.0,
+      "total_covered_gold_items": 38,
+      "total_gold_items": 38,
+      "status": "PROVEN_FROM_V2_RAW_SELECTED_EVIDENCE"
+    },
+    "pre_fit_gold_evidence_recall": {
+      "formula": "count(gold_items where all required evidence entries match an item parsed from pre-fit SESSION_EVIDENCE_JSON in plan.messages with entry.message_id == expanded_messages[ev.at].id, entry.kind == f'{expanded_messages[ev.at].role}_statement', and ev.quote in entry.text) / count(gold_items with evidence)",
+      "recomputed_row_count": 20,
+      "recomputed_row_min": 1.0,
+      "recomputed_row_mean": 1.0,
+      "total_covered_gold_items": 38,
+      "total_gold_items": 38,
+      "status": "PROVEN_PRE_FIT_ONLY"
+    },
+    "fitted_gold_evidence_recall_post_memory_fit": {
+      "formula": "count(gold_items where all required evidence entries match an item parsed from SessionContext.dispatched_evidence_messages captured at BudgetedLLM._create_completion after memory.fit) / count(gold_items with evidence)",
+      "observed": null,
+      "status": "NOT PROVEN",
+      "reason": "Historical v2 artifact captured plan.messages prior to agent_service.generate_stream -> memory.fit -> SessionContext.note_dispatch. Post-fit prompt capture is now implemented in SessionContext.note_dispatch and verify_session_runtime.py for future runs."
+    }
+  },
+  "experiment_governance_audit": {
+    "v1_elapsed_seconds": 1994.844000000001,
+    "v2_elapsed_seconds": 849.0160000000033,
+    "combined_v1_v2_elapsed_seconds": 2843.86,
+    "v1_replay_duration_seconds": 1975.612,
+    "v2_replay_duration_seconds": 834.501,
+    "combined_replay_duration_seconds": 2810.113,
+    "experiment_wall_time_cap_seconds": 2400.0,
+    "exceeded_experiment_wall_time_cap": true,
+    "source_hash_changed_between_v1_and_v2": true,
+    "v1_verify_session_runtime_sha256": "f6e080e1687f7775aad39b0c27c35ea7a121798969f9d8dac46cefbdc6272aac",
+    "v2_verify_session_runtime_sha256": "e874105a2111100ad8e48a14aab9566d670bf411d607f8ee3cf7d1f1797dd7d1",
+    "corpus_blindness_status": "EXPOSED_DIAGNOSTIC_CORPUS_NOT_REUSABLE_FOR_FINAL_ACCEPTANCE"
+  },
+  "normal_rows": [
+    {
+      "case_id": "val-bilingual-override-vi-en",
+      "web_enabled": false,
+      "historical_summary_raw_gold_evidence_recall": 0.0,
+      "historical_semantic_review_raw_gold_evidence_recall": 0.0,
+      "recomputed_raw_gold_evidence_recall": 1.0,
+      "raw_gold_evidence_numerator": 2,
+      "raw_gold_evidence_denominator": 2,
+      "raw_covered_evidence_items": [
+        "webhook-sig",
+        "webhook-retry"
+      ],
+      "raw_uncovered_evidence_items": [],
+      "recomputed_pre_fit_evidence_messages_recall": 1.0,
+      "pre_fit_evidence_numerator": 2,
+      "pre_fit_evidence_denominator": 2,
+      "post_fit_dispatched_evidence_recall": "NOT PROVEN",
+      "post_fit_dispatched_evidence_reason": "v2 recorded plan.messages before memory.fit rather than SessionContext.dispatched_evidence_messages at BudgetedLLM._create_completion"
+    },
+    {
+      "case_id": "val-bilingual-override-vi-en",
+      "web_enabled": true,
+      "historical_summary_raw_gold_evidence_recall": 0.0,
+      "historical_semantic_review_raw_gold_evidence_recall": 0.0,
+      "recomputed_raw_gold_evidence_recall": 1.0,
+      "raw_gold_evidence_numerator": 2,
+      "raw_gold_evidence_denominator": 2,
+      "raw_covered_evidence_items": [
+        "webhook-sig",
+        "webhook-retry"
+      ],
+      "raw_uncovered_evidence_items": [],
+      "recomputed_pre_fit_evidence_messages_recall": 1.0,
+      "pre_fit_evidence_numerator": 2,
+      "pre_fit_evidence_denominator": 2,
+      "post_fit_dispatched_evidence_recall": "NOT PROVEN",
+      "post_fit_dispatched_evidence_reason": "v2 recorded plan.messages before memory.fit rather than SessionContext.dispatched_evidence_messages at BudgetedLLM._create_completion"
+    },
+    {
+      "case_id": "val-decision-revision-vi",
+      "web_enabled": false,
+      "historical_summary_raw_gold_evidence_recall": 0.0,
+      "historical_semantic_review_raw_gold_evidence_recall": 0.0,
+      "recomputed_raw_gold_evidence_recall": 1.0,
+      "raw_gold_evidence_numerator": 2,
+      "raw_gold_evidence_denominator": 2,
+      "raw_covered_evidence_items": [
+        "active-gateway",
+        "active-limit"
+      ],
+      "raw_uncovered_evidence_items": [],
+      "recomputed_pre_fit_evidence_messages_recall": 1.0,
+      "pre_fit_evidence_numerator": 2,
+      "pre_fit_evidence_denominator": 2,
+      "post_fit_dispatched_evidence_recall": "NOT PROVEN",
+      "post_fit_dispatched_evidence_reason": "v2 recorded plan.messages before memory.fit rather than SessionContext.dispatched_evidence_messages at BudgetedLLM._create_completion"
+    },
+    {
+      "case_id": "val-decision-revision-vi",
+      "web_enabled": true,
+      "historical_summary_raw_gold_evidence_recall": 0.0,
+      "historical_semantic_review_raw_gold_evidence_recall": 0.0,
+      "recomputed_raw_gold_evidence_recall": 1.0,
+      "raw_gold_evidence_numerator": 2,
+      "raw_gold_evidence_denominator": 2,
+      "raw_covered_evidence_items": [
+        "active-gateway",
+        "active-limit"
+      ],
+      "raw_uncovered_evidence_items": [],
+      "recomputed_pre_fit_evidence_messages_recall": 1.0,
+      "pre_fit_evidence_numerator": 2,
+      "pre_fit_evidence_denominator": 2,
+      "post_fit_dispatched_evidence_recall": "NOT PROVEN",
+      "post_fit_dispatched_evidence_reason": "v2 recorded plan.messages before memory.fit rather than SessionContext.dispatched_evidence_messages at BudgetedLLM._create_completion"
+    },
+    {
+      "case_id": "val-dense-long-filler-vi",
+      "web_enabled": false,
+      "historical_summary_raw_gold_evidence_recall": 0.0,
+      "historical_semantic_review_raw_gold_evidence_recall": 0.0,
+      "recomputed_raw_gold_evidence_recall": 1.0,
+      "raw_gold_evidence_numerator": 2,
+      "raw_gold_evidence_denominator": 2,
+      "raw_covered_evidence_items": [
+        "audit-policy-code",
+        "audit-retention-months"
+      ],
+      "raw_uncovered_evidence_items": [],
+      "recomputed_pre_fit_evidence_messages_recall": 1.0,
+      "pre_fit_evidence_numerator": 2,
+      "pre_fit_evidence_denominator": 2,
+      "post_fit_dispatched_evidence_recall": "NOT PROVEN",
+      "post_fit_dispatched_evidence_reason": "v2 recorded plan.messages before memory.fit rather than SessionContext.dispatched_evidence_messages at BudgetedLLM._create_completion"
+    },
+    {
+      "case_id": "val-dense-long-filler-vi",
+      "web_enabled": true,
+      "historical_summary_raw_gold_evidence_recall": 0.0,
+      "historical_semantic_review_raw_gold_evidence_recall": 0.0,
+      "recomputed_raw_gold_evidence_recall": 1.0,
+      "raw_gold_evidence_numerator": 2,
+      "raw_gold_evidence_denominator": 2,
+      "raw_covered_evidence_items": [
+        "audit-policy-code",
+        "audit-retention-months"
+      ],
+      "raw_uncovered_evidence_items": [],
+      "recomputed_pre_fit_evidence_messages_recall": 1.0,
+      "pre_fit_evidence_numerator": 2,
+      "pre_fit_evidence_denominator": 2,
+      "post_fit_dispatched_evidence_recall": "NOT PROVEN",
+      "post_fit_dispatched_evidence_reason": "v2 recorded plan.messages before memory.fit rather than SessionContext.dispatched_evidence_messages at BudgetedLLM._create_completion"
+    },
+    {
+      "case_id": "val-entity-bridge-vi-en",
+      "web_enabled": false,
+      "historical_summary_raw_gold_evidence_recall": 0.0,
+      "historical_semantic_review_raw_gold_evidence_recall": 0.0,
+      "recomputed_raw_gold_evidence_recall": 1.0,
+      "raw_gold_evidence_numerator": 2,
+      "raw_gold_evidence_denominator": 2,
+      "raw_covered_evidence_items": [
+        "sentinel-owner",
+        "sentinel-port"
+      ],
+      "raw_uncovered_evidence_items": [],
+      "recomputed_pre_fit_evidence_messages_recall": 1.0,
+      "pre_fit_evidence_numerator": 2,
+      "pre_fit_evidence_denominator": 2,
+      "post_fit_dispatched_evidence_recall": "NOT PROVEN",
+      "post_fit_dispatched_evidence_reason": "v2 recorded plan.messages before memory.fit rather than SessionContext.dispatched_evidence_messages at BudgetedLLM._create_completion"
+    },
+    {
+      "case_id": "val-entity-bridge-vi-en",
+      "web_enabled": true,
+      "historical_summary_raw_gold_evidence_recall": 0.0,
+      "historical_semantic_review_raw_gold_evidence_recall": 0.0,
+      "recomputed_raw_gold_evidence_recall": 1.0,
+      "raw_gold_evidence_numerator": 2,
+      "raw_gold_evidence_denominator": 2,
+      "raw_covered_evidence_items": [
+        "sentinel-owner",
+        "sentinel-port"
+      ],
+      "raw_uncovered_evidence_items": [],
+      "recomputed_pre_fit_evidence_messages_recall": 1.0,
+      "pre_fit_evidence_numerator": 2,
+      "pre_fit_evidence_denominator": 2,
+      "post_fit_dispatched_evidence_recall": "NOT PROVEN",
+      "post_fit_dispatched_evidence_reason": "v2 recorded plan.messages before memory.fit rather than SessionContext.dispatched_evidence_messages at BudgetedLLM._create_completion"
+    },
+    {
+      "case_id": "val-multi-decision-abstention-vi",
+      "web_enabled": false,
+      "historical_summary_raw_gold_evidence_recall": 0.0,
+      "historical_semantic_review_raw_gold_evidence_recall": 0.0,
+      "recomputed_raw_gold_evidence_recall": 1.0,
+      "raw_gold_evidence_numerator": 2,
+      "raw_gold_evidence_denominator": 2,
+      "raw_covered_evidence_items": [
+        "backup-zone",
+        "integrity-schedule"
+      ],
+      "raw_uncovered_evidence_items": [],
+      "recomputed_pre_fit_evidence_messages_recall": 1.0,
+      "pre_fit_evidence_numerator": 2,
+      "pre_fit_evidence_denominator": 2,
+      "post_fit_dispatched_evidence_recall": "NOT PROVEN",
+      "post_fit_dispatched_evidence_reason": "v2 recorded plan.messages before memory.fit rather than SessionContext.dispatched_evidence_messages at BudgetedLLM._create_completion"
+    },
+    {
+      "case_id": "val-multi-decision-abstention-vi",
+      "web_enabled": true,
+      "historical_summary_raw_gold_evidence_recall": 0.0,
+      "historical_semantic_review_raw_gold_evidence_recall": 0.0,
+      "recomputed_raw_gold_evidence_recall": 1.0,
+      "raw_gold_evidence_numerator": 2,
+      "raw_gold_evidence_denominator": 2,
+      "raw_covered_evidence_items": [
+        "backup-zone",
+        "integrity-schedule"
+      ],
+      "raw_uncovered_evidence_items": [],
+      "recomputed_pre_fit_evidence_messages_recall": 1.0,
+      "pre_fit_evidence_numerator": 2,
+      "pre_fit_evidence_denominator": 2,
+      "post_fit_dispatched_evidence_recall": "NOT PROVEN",
+      "post_fit_dispatched_evidence_reason": "v2 recorded plan.messages before memory.fit rather than SessionContext.dispatched_evidence_messages at BudgetedLLM._create_completion"
+    },
+    {
+      "case_id": "val-negation-cancel-en",
+      "web_enabled": false,
+      "historical_summary_raw_gold_evidence_recall": 0.0,
+      "historical_semantic_review_raw_gold_evidence_recall": 0.0,
+      "recomputed_raw_gold_evidence_recall": 1.0,
+      "raw_gold_evidence_numerator": 2,
+      "raw_gold_evidence_denominator": 2,
+      "raw_covered_evidence_items": [
+        "approved-flag",
+        "revoked-status"
+      ],
+      "raw_uncovered_evidence_items": [],
+      "recomputed_pre_fit_evidence_messages_recall": 1.0,
+      "pre_fit_evidence_numerator": 2,
+      "pre_fit_evidence_denominator": 2,
+      "post_fit_dispatched_evidence_recall": "NOT PROVEN",
+      "post_fit_dispatched_evidence_reason": "v2 recorded plan.messages before memory.fit rather than SessionContext.dispatched_evidence_messages at BudgetedLLM._create_completion"
+    },
+    {
+      "case_id": "val-negation-cancel-en",
+      "web_enabled": true,
+      "historical_summary_raw_gold_evidence_recall": 0.0,
+      "historical_semantic_review_raw_gold_evidence_recall": 0.0,
+      "recomputed_raw_gold_evidence_recall": 1.0,
+      "raw_gold_evidence_numerator": 2,
+      "raw_gold_evidence_denominator": 2,
+      "raw_covered_evidence_items": [
+        "approved-flag",
+        "revoked-status"
+      ],
+      "raw_uncovered_evidence_items": [],
+      "recomputed_pre_fit_evidence_messages_recall": 1.0,
+      "pre_fit_evidence_numerator": 2,
+      "pre_fit_evidence_denominator": 2,
+      "post_fit_dispatched_evidence_recall": "NOT PROVEN",
+      "post_fit_dispatched_evidence_reason": "v2 recorded plan.messages before memory.fit rather than SessionContext.dispatched_evidence_messages at BudgetedLLM._create_completion"
+    },
+    {
+      "case_id": "val-old-retention-vi",
+      "web_enabled": false,
+      "historical_summary_raw_gold_evidence_recall": 0.0,
+      "historical_semantic_review_raw_gold_evidence_recall": 0.0,
+      "recomputed_raw_gold_evidence_recall": 1.0,
+      "raw_gold_evidence_numerator": 1,
+      "raw_gold_evidence_denominator": 1,
+      "raw_covered_evidence_items": [
+        "routing-key"
+      ],
+      "raw_uncovered_evidence_items": [],
+      "recomputed_pre_fit_evidence_messages_recall": 1.0,
+      "pre_fit_evidence_numerator": 1,
+      "pre_fit_evidence_denominator": 1,
+      "post_fit_dispatched_evidence_recall": "NOT PROVEN",
+      "post_fit_dispatched_evidence_reason": "v2 recorded plan.messages before memory.fit rather than SessionContext.dispatched_evidence_messages at BudgetedLLM._create_completion"
+    },
+    {
+      "case_id": "val-old-retention-vi",
+      "web_enabled": true,
+      "historical_summary_raw_gold_evidence_recall": 0.0,
+      "historical_semantic_review_raw_gold_evidence_recall": 0.0,
+      "recomputed_raw_gold_evidence_recall": 1.0,
+      "raw_gold_evidence_numerator": 1,
+      "raw_gold_evidence_denominator": 1,
+      "raw_covered_evidence_items": [
+        "routing-key"
+      ],
+      "raw_uncovered_evidence_items": [],
+      "recomputed_pre_fit_evidence_messages_recall": 1.0,
+      "pre_fit_evidence_numerator": 1,
+      "pre_fit_evidence_denominator": 1,
+      "post_fit_dispatched_evidence_recall": "NOT PROVEN",
+      "post_fit_dispatched_evidence_reason": "v2 recorded plan.messages before memory.fit rather than SessionContext.dispatched_evidence_messages at BudgetedLLM._create_completion"
+    },
+    {
+      "case_id": "val-recent-window-en",
+      "web_enabled": false,
+      "historical_summary_raw_gold_evidence_recall": 0.0,
+      "historical_semantic_review_raw_gold_evidence_recall": 0.0,
+      "recomputed_raw_gold_evidence_recall": 1.0,
+      "raw_gold_evidence_numerator": 2,
+      "raw_gold_evidence_denominator": 2,
+      "raw_covered_evidence_items": [
+        "dr-runbook",
+        "dr-rto"
+      ],
+      "raw_uncovered_evidence_items": [],
+      "recomputed_pre_fit_evidence_messages_recall": 1.0,
+      "pre_fit_evidence_numerator": 2,
+      "pre_fit_evidence_denominator": 2,
+      "post_fit_dispatched_evidence_recall": "NOT PROVEN",
+      "post_fit_dispatched_evidence_reason": "v2 recorded plan.messages before memory.fit rather than SessionContext.dispatched_evidence_messages at BudgetedLLM._create_completion"
+    },
+    {
+      "case_id": "val-recent-window-en",
+      "web_enabled": true,
+      "historical_summary_raw_gold_evidence_recall": 0.0,
+      "historical_semantic_review_raw_gold_evidence_recall": 0.0,
+      "recomputed_raw_gold_evidence_recall": 1.0,
+      "raw_gold_evidence_numerator": 2,
+      "raw_gold_evidence_denominator": 2,
+      "raw_covered_evidence_items": [
+        "dr-runbook",
+        "dr-rto"
+      ],
+      "raw_uncovered_evidence_items": [],
+      "recomputed_pre_fit_evidence_messages_recall": 1.0,
+      "pre_fit_evidence_numerator": 2,
+      "pre_fit_evidence_denominator": 2,
+      "post_fit_dispatched_evidence_recall": "NOT PROVEN",
+      "post_fit_dispatched_evidence_reason": "v2 recorded plan.messages before memory.fit rather than SessionContext.dispatched_evidence_messages at BudgetedLLM._create_completion"
+    },
+    {
+      "case_id": "val-temporal-evolution-en",
+      "web_enabled": false,
+      "historical_summary_raw_gold_evidence_recall": 0.0,
+      "historical_semantic_review_raw_gold_evidence_recall": 0.0,
+      "recomputed_raw_gold_evidence_recall": 1.0,
+      "raw_gold_evidence_numerator": 2,
+      "raw_gold_evidence_denominator": 2,
+      "raw_covered_evidence_items": [
+        "phase3-region",
+        "phase3-cap"
+      ],
+      "raw_uncovered_evidence_items": [],
+      "recomputed_pre_fit_evidence_messages_recall": 1.0,
+      "pre_fit_evidence_numerator": 2,
+      "pre_fit_evidence_denominator": 2,
+      "post_fit_dispatched_evidence_recall": "NOT PROVEN",
+      "post_fit_dispatched_evidence_reason": "v2 recorded plan.messages before memory.fit rather than SessionContext.dispatched_evidence_messages at BudgetedLLM._create_completion"
+    },
+    {
+      "case_id": "val-temporal-evolution-en",
+      "web_enabled": true,
+      "historical_summary_raw_gold_evidence_recall": 0.0,
+      "historical_semantic_review_raw_gold_evidence_recall": 0.0,
+      "recomputed_raw_gold_evidence_recall": 1.0,
+      "raw_gold_evidence_numerator": 2,
+      "raw_gold_evidence_denominator": 2,
+      "raw_covered_evidence_items": [
+        "phase3-region",
+        "phase3-cap"
+      ],
+      "raw_uncovered_evidence_items": [],
+      "recomputed_pre_fit_evidence_messages_recall": 1.0,
+      "pre_fit_evidence_numerator": 2,
+      "pre_fit_evidence_denominator": 2,
+      "post_fit_dispatched_evidence_recall": "NOT PROVEN",
+      "post_fit_dispatched_evidence_reason": "v2 recorded plan.messages before memory.fit rather than SessionContext.dispatched_evidence_messages at BudgetedLLM._create_completion"
+    },
+    {
+      "case_id": "val-unapproved-proposal-vi",
+      "web_enabled": false,
+      "historical_summary_raw_gold_evidence_recall": 0.0,
+      "historical_semantic_review_raw_gold_evidence_recall": 0.0,
+      "recomputed_raw_gold_evidence_recall": 1.0,
+      "raw_gold_evidence_numerator": 2,
+      "raw_gold_evidence_denominator": 2,
+      "raw_covered_evidence_items": [
+        "confirmed-vault",
+        "proposal-rejected"
+      ],
+      "raw_uncovered_evidence_items": [],
+      "recomputed_pre_fit_evidence_messages_recall": 1.0,
+      "pre_fit_evidence_numerator": 2,
+      "pre_fit_evidence_denominator": 2,
+      "post_fit_dispatched_evidence_recall": "NOT PROVEN",
+      "post_fit_dispatched_evidence_reason": "v2 recorded plan.messages before memory.fit rather than SessionContext.dispatched_evidence_messages at BudgetedLLM._create_completion"
+    },
+    {
+      "case_id": "val-unapproved-proposal-vi",
+      "web_enabled": true,
+      "historical_summary_raw_gold_evidence_recall": 0.0,
+      "historical_semantic_review_raw_gold_evidence_recall": 0.0,
+      "recomputed_raw_gold_evidence_recall": 1.0,
+      "raw_gold_evidence_numerator": 2,
+      "raw_gold_evidence_denominator": 2,
+      "raw_covered_evidence_items": [
+        "confirmed-vault",
+        "proposal-rejected"
+      ],
+      "raw_uncovered_evidence_items": [],
+      "recomputed_pre_fit_evidence_messages_recall": 1.0,
+      "pre_fit_evidence_numerator": 2,
+      "pre_fit_evidence_denominator": 2,
+      "post_fit_dispatched_evidence_recall": "NOT PROVEN",
+      "post_fit_dispatched_evidence_reason": "v2 recorded plan.messages before memory.fit rather than SessionContext.dispatched_evidence_messages at BudgetedLLM._create_completion"
+    }
+  ]
+}

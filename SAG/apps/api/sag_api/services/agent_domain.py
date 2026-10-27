@@ -726,13 +726,15 @@ async def prepare_ask(
         context = None
         try:
             optional_deadline = (
-                (time.monotonic() + 5) if settings.session_context_mode == "shadow" else context_deadline
+                min(time.monotonic() + 5, context_deadline or (time.monotonic() + 5))
+                if settings.session_context_mode == "shadow"
+                else context_deadline
             )
             async with asyncio.timeout_at(optional_deadline):
                 context = await prepare_context(session, key=SessionKey(owner_key, agent.id, thread.id),
                     principal=principal, user_message=user_msg, query=query, requested_source_ids=source_ids,
                     mode=mode, deadline=optional_deadline)
-        except (ServiceUnavailableError, BudgetExceeded, TimeoutError, OSError) as error:
+        except (ServiceUnavailableError, BudgetExceeded, TimeoutError, OSError, ImportError) as error:
             if settings.session_context_mode != "shadow":
                 raise ServiceUnavailableError(
                     "Chưa hoàn tất context cho cuộc chat trong giới hạn lượt này. Vui lòng thử lại.",

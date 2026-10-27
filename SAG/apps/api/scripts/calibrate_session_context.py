@@ -12,6 +12,7 @@ import hashlib
 import importlib.metadata
 import json
 import logging
+import os
 import statistics
 import subprocess
 import sys
@@ -54,11 +55,18 @@ def sha(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def save(path: Path, report: dict):
+def _persist_atomic(path: Path, report: dict):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(report, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
     temporary.replace(path)
+
+
+def save(path: Path, report: dict):
+    _persist_atomic(path, report)
 
 
 def usage(encoder):
@@ -245,19 +253,34 @@ def run_sweep(cases, args, report):
 
 async def live_replay(cases, contexts, args, report):
     previous = json.loads(args.resume_provider_from.read_text(encoding="utf-8")) if args.resume_provider_from else None
-    elapsed = (
+    replay_elapsed = (
         sum(row["duration_ms"] for row in previous["results"] + previous.get("excluded_attempts", [])) / 1000
         if previous
         else 0
     )
-    if elapsed >= 1200:
+    prior_wall_elapsed = float(previous.get("elapsed_seconds", replay_elapsed)) if previous else 0.0
+    sweep_elapsed = float(report.get("sweep_elapsed_seconds", 0.0) or 0.0)
+    elapsed = max(replay_elapsed, prior_wall_elapsed) + sweep_elapsed
+    max_total_seconds = float(getattr(args, "max_seconds", 1200) or 1200)
+    replay_cap_seconds = min(1200.0, max_total_seconds)
+    if elapsed >= replay_cap_seconds:
         raise ValueError("provider resume time budget exhausted")
     ledger = CallLedger(
         max_calls=args.max_calls,
-        max_seconds=1200 - elapsed,
+        max_seconds=replay_cap_seconds - elapsed,
         max_estimated_tokens=args.max_estimated_tokens,
     )
-    if previous or (settings.llm_base_url and settings.llm_base_url.strip()):
+    started = time.monotonic()
+    env_route_present = any(
+        bool(os.environ.get(env_key, "").strip())
+        for env_key in ("OPENAI_BASE_URL", "OPENAI_API_BASE", "LITELLM_BASE_URL")
+    )
+    if (
+        previous
+        or env_route_present
+        or "provider_route_sha256" in report
+        or (settings.llm_base_url and settings.llm_base_url.strip())
+    ):
         report["provider_route_sha256"] = provider_route_sha256(settings)
     if previous:
         validate_resume(previous, report)
@@ -275,14 +298,34 @@ async def live_replay(cases, contexts, args, report):
         report["prior_replay_seconds"] = elapsed
     report["provider_resource_caps"] = {
         "cumulative_calls": args.max_calls,
-        "replay_seconds": 1200,
+        "replay_seconds": replay_cap_seconds,
         "cumulative_estimated_tokens": args.max_estimated_tokens,
     }
+    output_path = Path(args.output) if getattr(args, "output", None) is not None else None
 
-    def checkpoint():
+    def _sync_report_state():
+        report["elapsed_seconds"] = round(max(elapsed, elapsed + time.monotonic() - started), 3)
+        report["replay_duration_seconds"] = round(
+            sum(
+                float(row.get("duration_ms") or 0.0)
+                for row in report.get("results", []) + report.get("excluded_attempts", [])
+            )
+            / 1000.0,
+            3,
+        )
         report["accounting"] = ledger.report()
         report["reserved_tokens"] = ledger.reserved_tokens
+
+    def _persist_in_flight():
+        _sync_report_state()
+        if output_path is not None:
+            _persist_atomic(output_path, report)
+
+    def checkpoint():
+        _sync_report_state()
         save(args.output, report)
+
+    ledger.on_change = _persist_in_flight
 
     completed = {
         (row["case_id"], row["web_enabled"], row["variant"], row["iteration"]) for row in report["results"]
@@ -296,13 +339,40 @@ async def live_replay(cases, contexts, args, report):
         for case in cases:
             for enabled in (False, True):
                 if (case["id"], enabled, "paired_legacy", 0) not in completed:
+                    if (
+                        len(ledger.calls) >= args.max_calls
+                        or ledger.reserved_tokens >= args.max_estimated_tokens
+                        or time.monotonic() >= ledger.deadline
+                    ):
+                        break
+                    report["in_flight_replay"] = {
+                        "case_id": case["id"],
+                        "web_enabled": enabled,
+                        "variant": "paired_legacy",
+                        "iteration": 0,
+                    }
+                    _persist_in_flight()
                     baseline = await replay_case(case, client, ledger, web_enabled=enabled)
                     baseline.update(variant="paired_legacy", iteration=0)
+                    report.pop("in_flight_replay", None)
                     report["results"].append(baseline)
                     checkpoint()
                 for iteration in range(2):
                     if (case["id"], enabled, "candidate", iteration) in completed:
                         continue
+                    if (
+                        len(ledger.calls) >= args.max_calls
+                        or ledger.reserved_tokens >= args.max_estimated_tokens
+                        or time.monotonic() >= ledger.deadline
+                    ):
+                        break
+                    report["in_flight_replay"] = {
+                        "case_id": case["id"],
+                        "web_enabled": enabled,
+                        "variant": "candidate",
+                        "iteration": iteration,
+                    }
+                    _persist_in_flight()
                     candidate = await replay_case(
                         case,
                         client,
@@ -317,14 +387,14 @@ async def live_replay(cases, contexts, args, report):
                             "normal_selector_only_T8_pending" if case["group"] == "full_session" else None
                         ),
                     )
+                    report.pop("in_flight_replay", None)
                     report["results"].append(candidate)
                     checkpoint()
                 print(
                     json.dumps({"phase": "provider_completed", "case_id": case["id"], "web_enabled": enabled}),
                     flush=True,
                 )
-    report["accounting"] = ledger.report()
-    report["reserved_tokens"] = ledger.reserved_tokens
+    _sync_report_state()
     report["execution_status"] = (
         "completed"
         if len(report["results"]) == len(cases) * 6

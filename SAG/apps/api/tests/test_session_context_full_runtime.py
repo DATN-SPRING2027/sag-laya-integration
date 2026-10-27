@@ -374,3 +374,85 @@ async def test_full_runtime_failed_second_map_persists_all_dispatched_evidence_i
         dep_ids = {ref["message_id"] for ref in provenance.dependencies}
         assert "b-5" in dep_ids
         assert "src-2" in set(provenance.source_ids)
+
+
+@pytest.mark.asyncio
+async def test_full_runtime_map_with_unsupported_item_keeps_valid_items_and_marks_partial(storage_db, monkeypatch):
+    from sag_api.db.models import SessionMessageProvenance
+
+    factory, scope = storage_db
+    agent, plan = await full_plan(factory, scope)
+
+    class MixedSupportBoundary(ProviderBoundary):
+        async def __call__(self, settings, **request):
+            response = await super().__call__(settings, **request)
+            prefix, _ = request["messages"][-2]["content"].split("\n", 1)
+            if prefix == "SESSION_EVIDENCE_JSON":
+                payload = json.loads(response["choices"][0]["message"]["content"])
+                payload["items"].append({"text": "Hallucinated unsupported item", "supports": []})
+                response["choices"][0]["message"]["content"] = json.dumps(payload)
+            return response
+
+    provider = MixedSupportBoundary()
+    monkeypatch.setattr(model_module, "session_completion", provider)
+    events = [event async for event in stream(factory, scope, agent, plan)]
+    terminal = next(event.data["payload"] for event in events if event.type == "run.completed")
+    assert terminal["session_context"]["state"] == "partial"
+    assert terminal["session_context"]["reason"] == "map_not_ready"
+    assert terminal["session_context"]["visited"] < terminal["session_context"]["eligible"]
+    assert terminal["answer_status"] == "answered"
+    assert "chưa đầy đủ" in terminal["output"][:160].casefold()
+    assert all(decision in terminal["output"] for decision in ("A-100", "Z-900"))
+    assert "Hallucinated unsupported item" not in terminal["output"]
+    async with factory() as session:
+        provenance = await session.get(SessionMessageProvenance, terminal["message_id"])
+        assert {ref["message_id"] for ref in provenance.dependencies} == {"first", "middle", "last", "current"}
+
+
+@pytest.mark.asyncio
+async def test_full_runtime_240_message_session_splits_bounded_map_batches_and_reserves_reduce(
+    storage_db, monkeypatch
+):
+    from sag_api.db.models import SessionMessageProvenance
+
+    factory, scope = storage_db
+    async with factory() as session:
+        for index in range(120):
+            content = (
+                f"DECISION T-{index:03d}: ship milestone {index}."
+                if index in {5, 55, 115}
+                else f"Routine timeline note {index}. " + ("operational update " * 30)
+            )
+            session.add(raw(f"t-{index:03d}", content=content, ordinal=index + 10))
+        user = raw("current-t", content=QUERY, ordinal=200)
+        session.add(user)
+        await session.commit()
+        await session.refresh(user)
+        context = await prepare_context(
+            session,
+            key=scope.key,
+            principal=principal(scope),
+            user_message=user,
+            query=QUERY,
+            mode="full_session",
+            counter=Counter(),
+        )
+        agent = await session.get(Agent, "agent")
+        plan = AskPlan(
+            query=QUERY, messages=context.messages(agent, QUERY), user_message_id=user.id, session_context=context
+        )
+
+    provider = ProviderBoundary()
+    monkeypatch.setattr(model_module, "session_completion", provider)
+    events = [event async for event in stream(factory, scope, agent, plan)]
+    terminal = next(event.data["payload"] for event in events if event.type == "run.completed")
+    assert terminal["session_context"]["state"] == "ready"
+    assert terminal["session_context"]["visited"] == terminal["session_context"]["eligible"] == 120
+    assert len(provider.requests) >= 3  # Multiple bounded map batches + 1 reduce
+    for req in provider.requests[:-1]:
+        assert context.counter.count(req["messages"]) <= 10240
+    assert all(code in terminal["output"] for code in ("T-005", "T-055", "T-115"))
+    async with factory() as session:
+        provenance = await session.get(SessionMessageProvenance, terminal["message_id"])
+        dep_ids = {ref["message_id"] for ref in provenance.dependencies}
+        assert {"t-005", "t-055", "t-115", "current-t"} <= dep_ids

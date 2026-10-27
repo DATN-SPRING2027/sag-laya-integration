@@ -157,7 +157,13 @@ def provider_route_sha256(cfg=None) -> str:
     return hashlib.sha256(json.dumps(descriptor, sort_keys=True).encode()).hexdigest()
 
 
+def _is_nonneg_int(value: object) -> bool:
+    return type(value) is int and value >= 0
+
+
 def validate_resume(previous: dict, current: dict) -> None:
+    if previous.get("in_flight_replay") is not None:
+        raise ValueError("provider resume cannot proceed: in-flight replay requires reconciliation")
     fields = (
         "corpus_sha256",
         "config",
@@ -194,3 +200,47 @@ def validate_resume(previous: dict, current: dict) -> None:
             or previous["source_sha256"][name] != current.get("source_sha256", {}).get(name)
         ):
             raise ValueError("provider resume source mismatch")
+    if "accounting" in previous or "results" in previous:
+        accounting = previous.get("accounting")
+        if not isinstance(accounting, dict) or not isinstance(accounting.get("calls"), list):
+            raise ValueError("provider resume accounting missing or malformed")
+        calls = accounting["calls"]
+        for call in calls:
+            if not isinstance(call, dict):
+                raise ValueError("provider resume call record must be an object")
+            if call.get("status") not in {"completed", "failed", "cancelled"} or call.get("in_flight") is True:
+                raise ValueError("provider resume cannot proceed: in-flight or started call requires reconciliation")
+            if not _is_nonneg_int(call.get("estimated_input_tokens")) or not _is_nonneg_int(
+                call.get("configured_retries")
+            ):
+                raise ValueError("provider resume call reservation metadata missing or invalid")
+            if "max_output_tokens" in call and not _is_nonneg_int(call["max_output_tokens"]):
+                raise ValueError("provider resume call max_output_tokens invalid")
+        expected_reserved = sum(
+            (call["estimated_input_tokens"] + call.get("max_output_tokens", settings.llm_max_tokens))
+            * (1 + call["configured_retries"])
+            for call in calls
+        )
+        if "reserved_tokens" in previous and (
+            not _is_nonneg_int(previous["reserved_tokens"]) or previous["reserved_tokens"] != expected_reserved
+        ):
+            raise ValueError("provider resume reserved_tokens mismatch")
+        if "results" in previous:
+            if not isinstance(previous["results"], list) or not isinstance(
+                previous.get("excluded_attempts", []), list
+            ):
+                raise ValueError("provider resume results list malformed")
+            all_rows = previous["results"] + previous.get("excluded_attempts", [])
+            rows_with_acc = [row["accounting"] for row in all_rows if isinstance(row, dict) and "accounting" in row]
+            for row_acc in rows_with_acc:
+                if not isinstance(row_acc, dict) or not isinstance(row_acc.get("calls"), list):
+                    raise ValueError("provider resume row accounting malformed")
+                for row_call in row_acc["calls"]:
+                    if (
+                        not isinstance(row_call, dict)
+                        or row_call.get("status") not in {"completed", "failed", "cancelled"}
+                        or row_call.get("in_flight") is True
+                    ):
+                        raise ValueError("provider resume row has unsettled call")
+            if rows_with_acc and sum(len(r["calls"]) for r in rows_with_acc) != len(calls):
+                raise ValueError("provider resume accounting call count does not match recorded rows")

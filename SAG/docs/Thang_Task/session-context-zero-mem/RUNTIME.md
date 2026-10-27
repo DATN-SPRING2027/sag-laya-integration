@@ -88,3 +88,19 @@ missing reservation fields and inconsistent totals are rejected before new work 
 report overwrite. Use a new experiment output rather than editing historical
 reports to make them resumable. No live provider evaluation was repeated for this
 contract change; existing quality/rollout NO-GO remains in force.
+
+
+## Post-validation F2 remediation & harness durability contract (2026-10-27)
+
+1. **Per-item map support validation (`aggregate.py`)**:
+   - `_items()` validates map output item-by-item against the current batch evidence. Valid supported items are retained even if the model emits an accompanying unsupported commentary/absence item (`supports: []`, unknown/out-of-batch ID, or invalid quote).
+   - Whenever any item in a map batch is dropped (`not batch_clean`), `reason` is set to `"map_not_ready"`, only verified supporting message IDs (and their dependency closure within the batch) are added to `visited`, unverified messages from that batch remain in `unverified_ids` so subsequent 1-message overlap does not mark them visited, and the overall result remains `complete=False` (`state="partial"`). If a map batch produces zero valid items and drops at least one invalid item, `_items()` raises `ValueError("invalid_map_support")` and preserves any valid items extracted from earlier batches.
+2. **Bounded multi-message map batches and reduce call reservation (`aggregate.py`)**:
+   - Multi-message map batches (`len(ids) > 8`) are bounded to `min(input_limit, 10240)` tokens (`<= 8` message batches retain `input_limit`) so 200+ message sessions split into multiple bounded map requests that complete well within the 60s per-call SDK timeout (`BudgetedLLM`).
+   - When `extracted` is non-empty and `max_calls > 1`, `aggregate_session` reserves 1 call (`reserve_for_reduce = 1`) for the reduction step rather than exhausting all calls on map batches.
+   - Provider/transport exceptions (`APIError`, `httpx.HTTPError`, `TimeoutError`, `UpstreamError`, `ValueError`) during map or reduce are caught in `aggregate_session` to return a safe visible partial result (`map_not_ready` / `synthesis_not_ready`) when known usage permits revalidation.
+3. **Post-`fit` dispatched prompt evidence & durable experiment resume (`runtime.py`, `model.py`, `verify_session_runtime.py`, `calibrate_session_context.py`, `session_context_accounting.py`)**:
+   - `SessionContext.note_dispatch` captures the actual post-`memory.fit` `SESSION_EVIDENCE_JSON` message(s), `messages_sha256`, and `fitted_evidence` at `BudgetedLLM._create_completion`.
+   - Both `verify_session_runtime.py` and `calibrate_session_context.py` durably checkpoint `in_flight_replay`, `status="started"`, `in_flight=True`, `reserved_tokens`, `elapsed_seconds`, and `replay_duration_seconds` to disk (`flush` + `os.fsync` + atomic `replace`) before every provider dispatch and upon settlement, and reject resume whenever an in-flight replay or unsettled call exists.
+   - Cancelled or failed streams in `TrackedLLM` and `verify_session_runtime.py` keep `input_tokens=None, output_tokens=None` rather than committing partial mid-stream usage snapshots.
+   - `SAG_SESSION_CONTEXT_MODE=off` and rollout `NO-GO` remain in force pending a fresh blind validation run.

@@ -345,3 +345,50 @@ async def test_missing_tokenizer_cache_shadow_falls_back_and_on_returns_service_
                 owner_key="owner",
             )
         assert exc_info.value.code == "session_context_not_ready"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("err_cls", [OSError, ImportError])
+async def test_encoder_or_tokenizer_import_oserror_in_shadow_and_on_keeps_acl_strict(
+    storage_db, monkeypatch, err_cls
+):
+    factory, scope = storage_db
+
+    def broken_encoder():
+        raise err_cls("local model weights or optional package missing")
+
+    monkeypatch.setattr(runtime, "configured_encoder", broken_encoder)
+    monkeypatch.setattr(runtime, "ModelTokenCounter", lambda *args, **kwargs: Counter())
+
+    monkeypatch.setattr(settings, "session_context_mode", "shadow")
+    async with factory() as session:
+        session.add(raw("fact-enc", content="Legacy history survives encoder load failure."))
+        await session.commit()
+        agent, thread = await session.get(Agent, "agent"), await session.get(Thread, "thread")
+        plan = await prepare_ask(
+            session,
+            agent=agent,
+            thread=thread,
+            query="Which code?",
+            principal=principal(scope),
+            owner_key="owner",
+        )
+        assert plan.session_context is None
+        assert any(
+            m.get("content") == "Legacy history survives encoder load failure."
+            for m in plan.messages
+        )
+
+    monkeypatch.setattr(settings, "session_context_mode", "on")
+    async with factory() as session:
+        agent, thread = await session.get(Agent, "agent"), await session.get(Thread, "thread")
+        with pytest.raises(ServiceUnavailableError) as exc_info:
+            await prepare_ask(
+                session,
+                agent=agent,
+                thread=thread,
+                query="Which code?",
+                principal=principal(scope),
+                owner_key="owner",
+            )
+        assert exc_info.value.code == "session_context_not_ready"

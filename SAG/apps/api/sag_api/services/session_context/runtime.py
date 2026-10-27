@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import time
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from threading import Lock
@@ -86,6 +89,8 @@ class SessionContext:
     budget_profile: str = "memory"
     tool_source_ids: set[str] = field(default_factory=set, repr=False)
     dispatched_evidence: dict[str, ResolvedEvidence] = field(default_factory=dict, repr=False)
+    dispatched_evidence_messages: list[str] = field(default_factory=list, repr=False)
+    dispatched_calls: list[dict] = field(default_factory=list, repr=False)
     request_evidence: tuple[ResolvedEvidence, ...] = field(default=(), repr=False)
 
     def enable_tool_budget(self, max_steps):
@@ -100,11 +105,43 @@ class SessionContext:
     def stage_request(self, evidence):
         self.request_evidence = tuple(evidence)
 
-    def note_dispatch(self, evidence=None):
+    def note_dispatch(self, evidence=None, *, messages=None):
+        from sag_api.services.session_context.packing import PREFIX
+
         items = self.request_evidence if evidence is None else tuple(evidence)
         if not items and self.selection.mode != "full_session":
             items = self.resolved
         self.dispatched_evidence.update((item.span.evidence_id, item) for item in items)
+        if messages is not None:
+            normalized_msgs = [dict(m) for m in messages if isinstance(m, Mapping)]
+            ev_msgs = [
+                str(m.get("content", ""))
+                for m in normalized_msgs
+                if str(m.get("content", "")).startswith(PREFIX)
+            ]
+            msg_sha = hashlib.sha256(
+                json.dumps(normalized_msgs, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+            ).hexdigest()
+            ev_sha = hashlib.sha256(
+                json.dumps(ev_msgs, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest()
+            self.dispatched_evidence_messages.extend(ev_msgs)
+            self.dispatched_calls.append(
+                {
+                    "call_index": len(self.dispatched_calls) + 1,
+                    "messages_sha256": msg_sha,
+                    "evidence_messages_sha256": ev_sha,
+                    "evidence_messages": list(ev_msgs),
+                    "fitted_evidence": [
+                        {
+                            "message_id": item.span.ref.message_id,
+                            "kind": item.kind,
+                            "text": item.text,
+                        }
+                        for item in items
+                    ],
+                }
+            )
 
     def messages(self, agent, query):
         if self.selection.mode == "full_session":
@@ -354,7 +391,11 @@ async def prepare_context(
         selection = ContextSelection(history.snapshot, mode, "partial", (), history.coverage, "not_aggregated")
         groups = tuple((message.message_id,) for message in history.messages)
     else:
-        encoder = encoder or await asyncio.to_thread(configured_encoder)
+        if encoder is None:
+            try:
+                encoder = await asyncio.to_thread(configured_encoder)
+            except (ImportError, OSError) as error:
+                raise ServiceUnavailableError("Mô hình context session chưa sẵn sàng trên máy chủ.") from error
         async with asyncio.timeout(max(0, deadline - time.monotonic())):
             indexed = await sync_index(session, scope=scope, encoder=encoder, budget=budget, exclude_id=user_message.id)
         retrieval = BudgetState(

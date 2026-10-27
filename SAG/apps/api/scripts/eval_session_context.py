@@ -110,6 +110,116 @@ def score_answer(case, answer):
     }
 
 
+def _validate_evidence_entries(entries, *, field_name: str) -> list[dict]:
+    if not isinstance(entries, (list, tuple)):
+        raise ValueError(f"{field_name} must be a list of evidence objects")
+    validated = []
+    for idx, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(f"{field_name}[{idx}] must be a dict")
+        for key in ("message_id", "kind", "text"):
+            if key not in entry or not isinstance(entry[key], str):
+                raise ValueError(f"{field_name}[{idx}] missing or invalid string field {key!r}")
+        if not entry["message_id"].strip():
+            raise ValueError(f"{field_name}[{idx}].message_id must be non-empty")
+        if entry["kind"] not in {"user_statement", "assistant_statement"}:
+            raise ValueError(f"{field_name}[{idx}].kind must be 'user_statement' or 'assistant_statement'")
+        validated.append(
+            {
+                "message_id": entry["message_id"],
+                "kind": entry["kind"],
+                "text": entry["text"],
+            }
+        )
+    return validated
+
+
+def parse_fitted_evidence_messages(evidence_messages) -> list[dict]:
+    if not isinstance(evidence_messages, (list, tuple)):
+        raise ValueError("evidence_messages must be a list of SESSION_EVIDENCE_JSON strings")
+    extracted: list[dict] = []
+    for msg_idx, raw_msg in enumerate(evidence_messages):
+        if isinstance(raw_msg, dict):
+            if "content" not in raw_msg or not isinstance(raw_msg["content"], str):
+                raise ValueError(f"evidence_messages[{msg_idx}] dict missing string 'content'")
+            content = raw_msg["content"]
+        elif isinstance(raw_msg, str):
+            content = raw_msg
+        else:
+            raise ValueError(f"evidence_messages[{msg_idx}] must be a string or message dict")
+        prefix = "SESSION_EVIDENCE_JSON\n"
+        if not content.startswith(prefix):
+            raise ValueError(f"evidence_messages[{msg_idx}] does not start with SESSION_EVIDENCE_JSON")
+        try:
+            payload = json.loads(content[len(prefix) :])
+        except json.JSONDecodeError as error:
+            raise ValueError(f"evidence_messages[{msg_idx}] contains invalid JSON") from error
+        if isinstance(payload, list):
+            items_payload = payload
+        elif isinstance(payload, dict) and isinstance(payload.get("items"), list):
+            items_payload = payload["items"]
+        else:
+            raise ValueError(f"evidence_messages[{msg_idx}] JSON must be a list of evidence items")
+        extracted.extend(_validate_evidence_entries(items_payload, field_name=f"evidence_messages[{msg_idx}]"))
+    return extracted
+
+
+def score_selected_evidence(
+    case: dict,
+    expanded_messages: list[dict],
+    selected_evidence,
+    *,
+    allowed_kinds: frozenset[str] = frozenset({"user_statement", "assistant_statement"}),
+) -> dict:
+    if not isinstance(case, dict) or "gold_items" not in case or not isinstance(case["gold_items"], list):
+        raise ValueError("case must contain a 'gold_items' list")
+    if not isinstance(expanded_messages, (list, tuple)) or not expanded_messages:
+        raise ValueError("expanded_messages must be a non-empty list")
+    entries = _validate_evidence_entries(selected_evidence, field_name="selected_evidence")
+    items = [item for item in case["gold_items"] if item.get("evidence")]
+    covered = []
+    for item in items:
+        item_ok = True
+        for ev in item["evidence"]:
+            if not isinstance(ev, dict) or "at" not in ev or "quote" not in ev:
+                raise ValueError("malformed gold evidence item")
+            at = ev["at"]
+            quote = ev["quote"]
+            if not isinstance(at, int) or not (0 <= at < len(expanded_messages)) or not isinstance(quote, str):
+                raise ValueError("gold evidence position/quote out of bounds")
+            expected_msg = expanded_messages[at]
+            expected_msg_id = expected_msg["id"]
+            expected_kind = f"{expected_msg['role']}_statement"
+            if not any(
+                entry["message_id"] == expected_msg_id
+                and entry["kind"] == expected_kind
+                and entry["kind"] in allowed_kinds
+                and quote in entry["text"]
+                for entry in entries
+            ):
+                item_ok = False
+                break
+        if item_ok:
+            covered.append(item["id"])
+    return {
+        "item_evidence_recall": len(covered) / len(items) if items else None,
+        "gold_evidence_items": len(items),
+        "covered_evidence_items": covered,
+        "uncovered_evidence_items": [item["id"] for item in items if item["id"] not in covered],
+    }
+
+
+def score_fitted_evidence_messages(
+    case: dict,
+    expanded_messages: list[dict],
+    evidence_messages,
+    *,
+    allowed_kinds: frozenset[str] = frozenset({"user_statement", "assistant_statement"}),
+) -> dict:
+    entries = parse_fitted_evidence_messages(evidence_messages)
+    return score_selected_evidence(case, expanded_messages, entries, allowed_kinds=allowed_kinds)
+
+
 async def replay_case(case, client, ledger, *, web_enabled, history_override=None):
     messages = expand_case(case)
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -159,15 +269,19 @@ async def replay_case(case, client, ledger, *, web_enabled, history_override=Non
             )
             await session.commit()
             ledger.stage = "compression"
-            plan = await agent_domain.prepare_ask(
-                session,
-                agent=agent,
-                thread=thread,
-                query=case["query"],
-                principal=principal,
-                owner_key="synthetic-owner",
-                llm=client if history_override is None else None,
-            )
+            if time.monotonic() >= ledger.deadline:
+                raise BaselineBudgetExceeded("benchmark resource limit reached")
+            async with asyncio.timeout_at(ledger.deadline):
+                plan = await agent_domain.prepare_ask(
+                    session,
+                    agent=agent,
+                    thread=thread,
+                    query=case["query"],
+                    principal=principal,
+                    owner_key="synthetic-owner",
+                    llm=client if history_override is None else None,
+                    context_deadline=ledger.deadline,
+                )
             if history_override is not None:
                 # Benchmark-only candidate seam: same prompt/runtime/tool policy,
                 # selected history replaces legacy context without a compression LLM call.
@@ -188,25 +302,28 @@ async def replay_case(case, client, ledger, *, web_enabled, history_override=Non
         result["gold_item_count"] = len(gold_items)
         ledger.stage = "generation"
         result["status"] = "no_terminal_event"
-        async for event in agent_service.generate_stream(
-            factory,
-            plan=plan,
-            agent=agent,
-            thread_id=thread.id,
-            engine_manager=EngineManager(settings),
-            llm=client,
-            tool_registry=registry,
-            knowledge_only=not web_enabled,
-            principal=principal,
-        ):
-            if event.type in {"run.completed", "run.failed", "run.cancelled"}:
-                result["status"] = event.type
-                payload = event.data["payload"]
-                result["answer"] = str(payload.get("output") or "")
-                result["answer_status"] = payload.get("answer_status")
-                result["runtime_usage"] = payload.get("usage")
-                if event.type != "run.completed":
-                    result["runtime_error_code"] = (payload.get("error") or {}).get("code")
+        if time.monotonic() >= ledger.deadline:
+            raise BaselineBudgetExceeded("benchmark resource limit reached")
+        async with asyncio.timeout_at(ledger.deadline):
+            async for event in agent_service.generate_stream(
+                factory,
+                plan=plan,
+                agent=agent,
+                thread_id=thread.id,
+                engine_manager=EngineManager(settings),
+                llm=client,
+                tool_registry=registry,
+                knowledge_only=not web_enabled,
+                principal=principal,
+            ):
+                if event.type in {"run.completed", "run.failed", "run.cancelled"}:
+                    result["status"] = event.type
+                    payload = event.data["payload"]
+                    result["answer"] = str(payload.get("output") or "")
+                    result["answer_status"] = payload.get("answer_status")
+                    result["runtime_usage"] = payload.get("usage")
+                    if event.type != "run.completed":
+                        result["runtime_error_code"] = (payload.get("error") or {}).get("code")
         result.update(score_answer(case, result.get("answer", "")))
         async with factory() as session:
             persisted = await session.scalars(select(Message).where(Message.thread_id == thread.id))
