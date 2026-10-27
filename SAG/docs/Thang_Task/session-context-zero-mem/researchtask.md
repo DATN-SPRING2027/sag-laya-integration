@@ -564,3 +564,46 @@ không hoạt động, không dùng DB người dùng để thay thế. F2/F3 v�
   - Bổ sung tham số `--corpus` và `split="validation"` cho `eval_session_context.py` và `verify_session_runtime.py`, đồng thời ghi thêm `raw_selected_evidence`, `generation_ms`, `history_message_count`, `long_normal` vào kết quả candidate để kiểm toán F2/F3 mà không sửa prompt production, selector, model orchestration hay `CALIBRATION-POLICY.json`.
   - Đóng băng code, manifest và gold rubric trước khi gọi live provider (`Qwen/Qwen3-8B` qua `https://api.siliconflow.com/v1`, giới hạn cứng: `<= 180` logical calls, `<= 4,000,000` token reservation, `<= 2,400s`).
   - Chấm từng câu trả lời và đối chiếu toàn bộ 8 quality gates trong `CALIBRATION-POLICY.json`.
+
+
+### 2. Kết quả kiểm chứng Phần 1 (4 Finding `[P2]`) trước khi chạy Provider
+
+- **RED trước khi sửa**: 7 regression tests mới trong `test_session_context_runtime_security.py`, `test_session_context_index.py`, `test_session_context_runtime_resume.py`, `test_session_context_calibration.py`, `test_session_context_runtime.py` đều **FAIL** (`7 failed, 61 passed`).
+- **GREEN sau khi sửa**:
+  - Focused suite: **`68 passed in 23.33s`**.
+  - Reproduction suite (`run_repros.py`): **`5 passed, 1 skipped in 20.94s`**.
+  - Full offline pytest suite (`pytest -q -m "not ai_smoke"` qua wrapper chặn `.env` thật, SQLite in-memory, `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, `SESSION_CONTEXT_NATIVE_PG_QA=0`): **`333 passed, 6 skipped, 2 deselected in 68.73s`**.
+  - Targeted `ruff check` (14 file Python sửa đổi) và `git diff --check`: **PASS (0 lỗi)**.
+  - Native PostgreSQL: **NOT RUN** trong lượt này do Docker Desktop Linux engine (`dockerDesktopLinuxEngine`) không chạy trên máy host.
+
+### 3. Kết quả Nghiệm thu Độc lập F2/F3 (Live Paired Validation)
+
+- **Artifacts được tạo và lưu giữ**:
+  - Corpus validation mới: `SAG/apps/api/tests/fixtures/session_context_validation_f2_f3.jsonl` (`sha256=4d54fb4853918da77aaafb6df2eba1c3869786a74dd7f5af7bd796a1b0265e80`).
+  - Raw report `v1`: [evidence/f2-f3-independent-validation-runtime-v1.json](evidence/f2-f3-independent-validation-runtime-v1.json) (`sha256=8f640c9f7d342f42f384282005a7b731731691a77047678bab43a2c2e37739ce`) — chạy trên commit `34d3e498`, hoàn tất **24/24 `legacy` (`baseline`) replays** (`39` logical calls, `546,302` input + `8,494` output tokens, `2,027,289` reserved tokens, `1,480.42s` thời gian chạy legacy) và đo cold-index trên 10 normal runtime cases (`0` runtime provider calls do lỗi truy cập thuộc tính `item.role` thay vì `item.kind` trên `ResolvedEvidence` trong `verify_session_runtime.py:153`).
+  - Raw report `v2`: [evidence/f2-f3-independent-validation-runtime-v2.json](evidence/f2-f3-independent-validation-runtime-v2.json) (`sha256=58e0e602af62ec3ee81be64bce6f69563095e200f8ed36917e3a16bf95401bfb`) — sau khi sửa `item.role` → `item.kind` trong harness (`commit 8be03898`), chạy `--variants runtime` trong phần ngân sách còn lại (`--max-calls 141 --max-seconds 900 --max-tokens 1972711`), hoàn tất **24 `runtime` (`candidate`) rows** (`24` logical calls, `112,226` known input + `1,262` known output tokens, `275,750` reserved tokens, `849.02s`).
+  - Semantic review: [evidence/f2-f3-independent-validation.semantic-review.jsonl](evidence/f2-f3-independent-validation.semantic-review.jsonl) (`sha256=2f6e07387e8166c4d3548f4d7ccd4d2cbcac17efb730afdbdd032ff7cea7c8d4`).
+  - Machine-readable summary & gate matrix: [evidence/f2-f3-independent-validation.summary.json](evidence/f2-f3-independent-validation.summary.json) (`sha256=b62e987b9a4197ca4647e390edbe8bfc732f30b27183bf48306ae33eeca8e2e7`).
+- **Tổng tài nguyên thí nghiệm lũy kế (`v1` + `v2`)**:
+  - Logical calls: **`63 / 180`** (`39` legacy + `24` runtime).
+  - Token reservation: **`2,303,039 / 4,000,000`** (`2,027,289` legacy + `275,750` runtime).
+  - Thời gian thực thi 48 paired replays (`24 legacy` + `24 runtime`): **`2,329.44s / 2,400s`** (nếu tính cả `495.19s` local CPU zero-provider-call của `v1` trước khi sửa `item.kind` trong harness thì tổng wall-clock là `2,843.86s`).
+- **Kết quả F3 (`normal` mode — 10 cases × 2 web profiles = 20 replays): `PASS` trong phạm vi tập validation**:
+  - `normal_raw_gold_evidence_recall`: **`1.0` (`20/20`)** — cả `raw_selected_evidence` và `fitted_evidence_messages` đều giữ đủ 100% gold quotes.
+  - Độ chính xác ngữ nghĩa (`semantically_correct`): **`20/20` (`100%`)** cho `runtime` (`10/10` `web=False`, `10/10` `web=True`), so với **`6/20` (`30%`)** của `legacy` (`0/10` `web=False`, `6/10` `web=True`).
+  - Không có ca `normal` nào trả `UNKNOWN` sai khi gold nằm trong fitted prompt (`0/20`), không có ca nào promote đề xuất chưa duyệt của assistant (`0/20`), không có ca nào khẳng định sai rằng thông tin không tồn tại trong toàn hội thoại (`0/20`), và `0` per-case regression trên `normal` (`0/20`).
+  - Độ trễ cold-index (`10/10` normal cases đạt `index_state="ready"`, `0` timeout so với trần `180,000 ms`):
+    - Lần đo `v2`: `min = 17,640 ms`, `p50 = 45,859.5 ms`, `p95 = 59,653.95 ms`, `max = 61,953.0 ms`.
+    - Lần đo `v1`: `min = 26,656 ms`, `p50 = 41,882.5 ms`, `p95 = 74,639.2 ms`, `max = 90,094.0 ms`.
+  - Giảm token trên 5 case `long-normal` (`val-old-retention-vi`, `val-decision-revision-vi`, `val-temporal-evolution-en`, `val-dense-long-filler-vi`, `val-multi-decision-abstention-vi`):
+    - `web=False`: Legacy `116,242` → Runtime `14,684` tokens (**giảm `87.37%`**, vượt ngưỡng `>= 50%`).
+    - `web=True`: Legacy `154,212` → Runtime `13,912` tokens (**giảm `90.98%`**, vượt ngưỡng `>= 50%`).
+    - Gộp 10 cặp `long-normal`: Legacy `270,454` → Runtime `28,596` tokens (**giảm `89.43%`**).
+- **Kết quả F2 (`full_session` mode — 2 cases × 2 web profiles = 4 replays): `FAIL` (`0/4` đạt)**:
+  - Phát hiện **2 bug production thật** trong nhánh `full_session` (được giữ nguyên theo quy tắc không sửa code production sau khi chạy validation để làm đẹp điểm):
+    1. **`SAG/apps/api/sag_api/services/session_context/aggregate.py:67-80, 191-193` (`F2-BUG-1`)**: Ở `val-full-session-decisions-vi` (`web=False` và `web=True`), bước map (`29,596` input tokens) đã trích xuất chính xác cả 4 quyết định của user kèm `supports` hợp lệ (`ARCH-HELIOS-01` `[S13]`, `750 triệu` `[S155]`, `Lan Anh` `[S155]`, bác bỏ `GPU-BOOST-88` `[S79]`), nhưng sinh thêm mục thứ 5 ghi chú việc không có mã hợp đồng pháp lý bên thứ ba với `"supports": []`. Hàm `_items()` tại `aggregate.py:77-78` ném `ValueError("invalid_map_support")` khi bất kỳ phần tử nào có `supports` rỗng, làm `aggregate_session` hủy toàn bộ map batch (`visited=0/220`, `reason="map_not_ready"`) và trả `UNKNOWN`. Vì `legacy` (`web=True`) trả lời đúng 2/4 mục (`750 triệu`, `Lan Anh`), việc `runtime` trả `UNKNOWN` ở `val-full-session-decisions-vi` (`web=True`) cũng tạo ra `1` `per_case_quality_regression`.
+    2. **`SAG/apps/api/sag_api/services/session_context/model.py:92` & `aggregate.py:107` (`F2-BUG-2`)**: Ở `val-full-session-timeline-en` (`web=False` và `web=True`, `240` messages), `_batches()` gom toàn bộ `240` messages (`~29,874` input tokens, sát trần `input_limit=30000`) vào một lệnh `llm.complete` non-streaming duy nhất, trong khi `BudgetedLLM.__init__` (`model.py:92`) ép trần `llm_timeout_ms = min(settings.llm_timeout_ms, 60000)` (`60s`). Cả hai lượt gọi đều bị `APITimeoutError` ở `~61.34s` / `~61.81s` (`status="run.failed"`, `error_code="generation_failed"`, `accounting_complete=False`).
+- **Quyết định nghiệm thu**:
+  - **4 Finding `[P2]`**: **PASS (ĐÃ ĐÓNG BẰNG REGRESSION TESTS)**.
+  - **F3 (`normal` mode quality & cold-index latency)**: **PASS trong phạm vi validation (`20/20` đúng, `0` timeout cold-index, giảm `89.43%` token long-normal)**.
+  - **F2 (`full_session` mode) & Overall Rollout Gate**: **FAIL (`NO-GO`)**. Giữ `SAG_SESSION_CONTEXT_MODE=off`.

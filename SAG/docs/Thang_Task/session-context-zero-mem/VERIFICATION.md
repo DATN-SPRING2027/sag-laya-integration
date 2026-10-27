@@ -62,3 +62,18 @@ Bốn longnormalcases/profile (địnhnghĩatrướclàmessage_count>200 hoặcf
 Token gate riêngholdoutlongnormal vượt50%; **qualitygateFAIL nên khôngđủđểrollout hoặcclaim tiếtkiệm tổngtiền**. Fullholdout riêng:legacy6calls/57849tokens, candidate17calls/389164tokens, candidatekhôngđạtyêucầuchấtlượng. Khôngtrộnfullvànormalđểclaimcostsavings. Oldinformationrecall cải thiệnởoutsidewindow/changed/followup nhưngzero-regressiongatevẫnFAIL.
 
 Kết luận:T9measurement/reviewđãthựchiện, **acceptanceFAIL/rolloutNO-GO**. Khôngđánhdấuproductcomplete; giữOFF, khôngrerunholdoutđểchọnđápántốt. Côngviệccảithiệnsemanticextractor/coldindexcầnvalidationmớiđộclập; holdoutnàyđãđượcđọckhôngcònlàtậpđểtuning.
+
+
+## Nghiệm thu độc lập F2/F3 trên tập Validation mới (27/10/2026)
+
+Sau khi đóng 4 finding `[P2]` mới (fallback `SHADOW` khi thiếu tokenizer cache, tự rebuild index khi sai chiều vector, durable reservation/in-flight checkpoint trước provider call và khóa `provider_route_sha256` khi resume calibration), đã chạy đợt nghiệm thu độc lập F2/F3 trên tập synthetic mới `tests/fixtures/session_context_validation_f2_f3.jsonl` (`split="validation"`, 12 cases: 10 `normal` gồm 5 `long-normal` + 2 `full_session`). Báo cáo chi tiết tại [f2-f3-independent-validation.summary.json](evidence/f2-f3-independent-validation.summary.json) và [f2-f3-independent-validation.semantic-review.jsonl](evidence/f2-f3-independent-validation.semantic-review.jsonl); raw reports tại [v1](evidence/f2-f3-independent-validation-runtime-v1.json) và [v2](evidence/f2-f3-independent-validation-runtime-v2.json).
+
+- **F3 (`normal` mode — 20/20 replays): PASS trong phạm vi validation**:
+  - `normal_raw_gold_evidence_recall = 1.0` (`20/20` giữ đủ gold trong cả `raw_selected_evidence` và `fitted_evidence_messages`).
+  - Độ chính xác ngữ nghĩa: `runtime` đạt **20/20 (100%)** (`10/10` web-off, `10/10` web-on) so với `legacy` **6/20 (30%)** (`0/10` web-off, `6/10` web-on). Không còn hiện tượng trả `UNKNOWN` sai khi gold nằm trong fitted prompt (`0/20`), không promote đề xuất chưa duyệt của assistant (`0/20`), `0` per-case regression trên `normal`.
+  - Cold-index: **10/10** normal cases đạt `ready` dưới trần `180s` (`v2`: `p50 = 45.86s`, `p95 = 59.65s`, `max = 61.95s`; `v1`: `p50 = 41.88s`, `p95 = 74.64s`, `max = 90.09s`, `0` timeout).
+  - Giảm token trên 5 case `long-normal`: web-off giảm **87,37%** (`116.242` → `14.684`), web-on giảm **90,98%** (`154.212` → `13.912`), tổng hợp giảm **89,43%**.
+- **F2 (`full_session` mode — 0/4 replays): FAIL**:
+  - `val-full-session-decisions-vi` (cả 2 web profiles): map trích xuất đúng cả 4 quyết định có `supports` hợp lệ nhưng kèm 1 dòng ghi chú không có mã hợp đồng pháp lý bên thứ ba với `supports: []`; `_items()` tại `aggregate.py:77–78` ném `ValueError("invalid_map_support")` hủy toàn bộ batch (`visited=0/220`, `reason="map_not_ready"`, trả `UNKNOWN`), tạo ra 1 per-case regression so với `legacy` web-on (`2/4`).
+  - `val-full-session-timeline-en` (cả 2 web profiles): `_batches()` tại `aggregate.py:107` gom `240` messages (`~29.874` input tokens) vào 1 call non-streaming trong khi `BudgetedLLM` (`model.py:92`) cắt `llm_timeout_ms <= 60000ms`, dẫn tới `APITimeoutError` ở `~61,3s–61,8s` (`status="run.failed"`, `accounting_complete=False`).
+- **Kết luận**: Giữ `SAG_SESSION_CONTEXT_MODE=off`, **rollout NO-GO** cho tới khi sửa 2 bug `full_session` (`aggregate.py:77–78` và `model.py:92` / `aggregate.py:107`) và xác nhận lại trên tập validation mới.

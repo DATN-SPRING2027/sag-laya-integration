@@ -201,3 +201,19 @@ endpoint SDK từ `OPENAI_BASE_URL` chưa được khóa khi Settings để tr�
   trình bày là kết quả mới. Không sửa lock code, DB models/migrations hoặc raw evidence.
 - Self-review cho hai finding: **PASS, bàn giao review**; không approve/merge PR.
   Giữ feature OFF và rollout **NO-GO** do F2/F3 chưa có live acceptance độc lập.
+
+
+## Sửa 4 Finding `[P2]` bổ sung và Nghiệm thu độc lập F2/F3 (Antigravity Argon, 27/10/2026)
+
+1. **Đóng 4 finding `[P2]` mới trên `feat/Thang-session-context-runtime-be-api`**:
+   - **SHADOW lỗi khi thiếu tokenizer cache** (`model.py:61`, `runtime.py:330`, `agent_domain.py:735`): Chuẩn hóa `(OSError, ImportError)` khi nạp tokenizer thành `ServiceUnavailableError("Mô hình context session chưa sẵn sàng trên máy chủ.")`; `SHADOW` fallback về legacy an toàn, `ON` trả `ServiceUnavailableError(code="session_context_not_ready")`, lỗi ACL/provenance (`ContextContractError`) vẫn fail-closed.
+   - **Cache vector sai kích thước không tự rebuild** (`index.py:115`, `graph.py`): Kiểm tra chiều vector (`_encoder_dimension(encoder)`) khi tái sử dụng `row.features` trong `sync_index`; tự động loại bỏ vector lệch chiều và encode lại từ raw message.
+   - **Crash giữa replay làm mất accounting và mở lại ngân sách khi resume** (`session_context_accounting.py`, `verify_session_runtime.py`): Ghi bền vững reservation và trạng thái `in_flight` (`status="started"`, `in_flight=True`, `in_flight_replay`) xuống đĩa trước mỗi provider dispatch (cả candidate `observed` và baseline `TrackedLLM`) và checkpoint ngay khi settle. `validate_runtime_resume` từ chối mọi report còn `in_flight_replay`, call `started`/`in_flight`, hoặc tổng call của `results` lệch `calls`.
+   - **Calibration resume chưa khóa provider endpoint** (`session_context_calibration.py:66`, `calibrate_session_context.py`): Bổ sung và bắt buộc khớp `provider_route_sha256` trong `validate_resume`.
+   - Kiểm chứng offline: RED `7 failed, 61 passed` → GREEN `68 passed`; full offline suite `333 passed, 6 skipped, 2 deselected`; `run_repros.py` `5 passed, 1 skipped`.
+2. **Nghiệm thu độc lập F2/F3 trên corpus synthetic mới (`session_context_validation_f2_f3.jsonl`)**:
+   - **F3 (`normal` mode — 20/20 replays): PASS trong phạm vi validation** (`20/20` đúng ngữ nghĩa so với legacy `6/20`, `normal_raw_gold_evidence_recall = 1.0`, `0` false `UNKNOWN`, `0` proposal promotion, `0` normal regression; cold-index `10/10 ready`, `max = 61,95s` ở `v2` và `90,09s` ở `v1` < `180s`; giảm `89,43%` tổng token trên 5 case `long-normal`).
+   - **F2 (`full_session` mode — 0/4 replays): FAIL** do 2 bug production mới phát hiện và được giữ nguyên bằng chứng không tự sửa:
+     - `aggregate.py:77–78, 191–193`: `_items()` ném `ValueError("invalid_map_support")` khi map trả kèm 1 item ghi chú vắng mặt có `supports: []`, hủy toàn bộ 4 quyết định hợp lệ đã trích xuất trong cùng batch (`val-full-session-decisions-vi`, `visited=0/220`, trả `UNKNOWN`).
+     - `model.py:92` & `aggregate.py:107`: `_batches()` đóng gói `~29.874` input tokens (`input_limit=30000`) vào một lệnh `llm.complete` trong khi `BudgetedLLM` giới hạn `llm_timeout_ms <= 60000ms`, gây `APITimeoutError` ở `~61,3s–61,8s` (`val-full-session-timeline-en`, `status="run.failed"`).
+   - **Kết luận**: Merge cho phần code/hợp đồng khi `SAG_SESSION_CONTEXT_MODE=off` sẵn sàng review; **Rollout `SAG_SESSION_CONTEXT_MODE=on` giữ nguyên `NO-GO`**.

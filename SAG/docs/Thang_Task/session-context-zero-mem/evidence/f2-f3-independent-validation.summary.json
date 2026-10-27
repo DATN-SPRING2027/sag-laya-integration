@@ -1,0 +1,3114 @@
+{
+  "schema_version": 1,
+  "validation_id": "f2-f3-independent-validation-20261027",
+  "rollout_allowed": false,
+  "overall_verdict": "FAIL",
+  "f3_normal_verdict": "PASS_WITHIN_VALIDATION_SCOPE",
+  "f2_full_session_verdict": "FAIL",
+  "status": "NO_GO_keep_SAG_SESSION_CONTEXT_MODE_off",
+  "corpus_path": "SAG/apps/api/tests/fixtures/session_context_validation_f2_f3.jsonl",
+  "corpus_sha256": "4d54fb4853918da77aaafb6df2eba1c3869786a74dd7f5af7bd796a1b0265e80",
+  "split": "validation",
+  "long_normal_definition": "group == 'normal' and (message_count > 200 or filler_repeat > 1)",
+  "long_normal_case_ids": [
+    "val-old-retention-vi",
+    "val-decision-revision-vi",
+    "val-temporal-evolution-en",
+    "val-dense-long-filler-vi",
+    "val-multi-decision-abstention-vi"
+  ],
+  "raw_reports": {
+    "f2-f3-independent-validation-runtime-v1.json": {
+      "sha256": "8f640c9f7d342f42f384282005a7b731731691a77047678bab43a2c2e37739ce",
+      "role": "Frozen paired legacy baseline (24/24 completed) + initial cold-index timing pass (10/10 normal ready, 0 runtime provider calls due to ResolvedEvidence.kind attribute bug in verify_session_runtime.py)",
+      "commit_head": "34d3e498bb30224a09546a5651a88fdb5b65571b",
+      "rows": 48,
+      "legacy_rows_completed": 24,
+      "runtime_provider_calls": 0,
+      "calls": 39,
+      "accounting_complete": true,
+      "known_input_tokens": 546302,
+      "known_output_tokens": 8494,
+      "reserved_tokens": 2027289,
+      "elapsed_seconds": 1994.844,
+      "legacy_only_duration_seconds": 1480.421,
+      "provider_route_sha256": "aef8d3372c6eb0ad0e38f875da5e333a9d548fd7129177ed7f218458909d8d59",
+      "source_sha256": {
+        "sag_api/services/session_context/aggregate.py": "d029a42a05050912655de7e03f2a1c90077db7dbe44c7603045581cdba916f36",
+        "sag_api/services/session_context/budget.py": "a89969b6414cd290241f23e0531f13d031438d038e9fb589effe612ef782769d",
+        "sag_api/services/session_context/graph.py": "53719e154a77aa565b3c2a7059f082f2c3f9d09e440741b25bfad8f58a5f4fe8",
+        "sag_api/services/session_context/hierarchy.py": "1a67f3bb6c6aeb5f521c0db9483f2303885d639ec3d9da3e038cc1448a4099ee",
+        "sag_api/services/session_context/index.py": "da387a82be536f4f7ca0334f45e9ec884d3b833d0ebbc142da9c4a93d2b94531",
+        "sag_api/services/session_context/model.py": "f072b029d650b7553d92ca91a77c3a9ceb0554f7f33235faa713a2f5c8490c88",
+        "sag_api/services/session_context/packing.py": "0a28fef226bb2feae83bc59598069a79c3e14b67b1c80c348fddea74cebd053d",
+        "sag_api/services/session_context/reader.py": "a4b5f86300f29c34d795a98b6c0eb92b8319bb83c527c32971b0b28129347e91",
+        "sag_api/services/session_context/runtime.py": "b40da2da2c20ee2df65f1dfd1b9fcc45bc684f9430721f86bc42ce93ac8c66b0",
+        "sag_api/services/session_context/scope.py": "79039f80c7fd3d795108d689b11abe3c49ff24d53ca2273df8b0b3174bc0b968",
+        "sag_api/services/session_context/selection.py": "c8713e8b4308fe3b5b09a93562b2395ef7ff702552825b56b4dea99fe9f687df",
+        "sag_api/services/session_context/storage.py": "16d0de7feeac05a0035960eee264bad4c9a12a2cfc6540439433526a9acc77cf",
+        "sag_api/services/session_context/types.py": "f5ad6a0bf22a72ee5962833012fd088d14fab1d4bcac61e6e395d338f8b84091",
+        "sag_api/core/litellm_policy.py": "fa6db3f1bd79b0952c831b239e8cfddd961a8ecfb59743c2e55887d050cfd67b",
+        "sag_api/core/model_providers.py": "08688fd93818413a76c3a32db9ac76946d99df47a49c8dae44dae3656093ae64",
+        "sag_api/services/agent_domain.py": "0ce132f42128bd67ba59c5abd42b2ee812882007863e3650f396ebf3d4d2130c",
+        "sag_api/services/agent_service.py": "f29dba824b2cf344f4f5689d35a7450c9f37d56fc1ac177265436696b3ada3f3",
+        "sag_api/generation/llm.py": "950975d26148b6592289964896c1a2918b61edd3bbb91bc083a9f70f881d2726",
+        "sag_api/generation/prompt.py": "66a8e0cb778353b4e50f8eb8a8abad6c92006cfc6d42751815ac079c14280dc1",
+        "sag_api/services/eval/session_context_accounting.py": "efb0abb68049d94fd8d54ab31611344b87668bdc7ad650111c6cd2a497c259be",
+        "scripts/eval_session_context.py": "6562a0d0380b31634732bcbbf5ebb3249b4230c1d21e95efd8807c8bb25a5eb4",
+        "scripts/verify_session_runtime.py": "f6e080e1687f7775aad39b0c27c35ea7a121798969f9d8dac46cefbdc6272aac"
+      }
+    },
+    "f2-f3-independent-validation-runtime-v2.json": {
+      "sha256": "58e0e602af62ec3ee81be64bce6f69563095e200f8ed36917e3a16bf95401bfb",
+      "role": "Candidate runtime replay (24 rows: 20/20 normal completed, 2/4 full_session completed with map_not_ready, 2/4 full_session failed with APITimeoutError at 60s cap)",
+      "commit_head": "8be038981b2e2fc73dacb4d52af8f227c78be193",
+      "rows": 24,
+      "calls": 24,
+      "accounting_complete": false,
+      "known_input_tokens": 112226,
+      "known_output_tokens": 1262,
+      "reserved_tokens": 275750,
+      "elapsed_seconds": 849.016,
+      "provider_route_sha256": "aef8d3372c6eb0ad0e38f875da5e333a9d548fd7129177ed7f218458909d8d59",
+      "source_sha256": {
+        "sag_api/services/session_context/aggregate.py": "d029a42a05050912655de7e03f2a1c90077db7dbe44c7603045581cdba916f36",
+        "sag_api/services/session_context/budget.py": "a89969b6414cd290241f23e0531f13d031438d038e9fb589effe612ef782769d",
+        "sag_api/services/session_context/graph.py": "53719e154a77aa565b3c2a7059f082f2c3f9d09e440741b25bfad8f58a5f4fe8",
+        "sag_api/services/session_context/hierarchy.py": "1a67f3bb6c6aeb5f521c0db9483f2303885d639ec3d9da3e038cc1448a4099ee",
+        "sag_api/services/session_context/index.py": "da387a82be536f4f7ca0334f45e9ec884d3b833d0ebbc142da9c4a93d2b94531",
+        "sag_api/services/session_context/model.py": "f072b029d650b7553d92ca91a77c3a9ceb0554f7f33235faa713a2f5c8490c88",
+        "sag_api/services/session_context/packing.py": "0a28fef226bb2feae83bc59598069a79c3e14b67b1c80c348fddea74cebd053d",
+        "sag_api/services/session_context/reader.py": "a4b5f86300f29c34d795a98b6c0eb92b8319bb83c527c32971b0b28129347e91",
+        "sag_api/services/session_context/runtime.py": "b40da2da2c20ee2df65f1dfd1b9fcc45bc684f9430721f86bc42ce93ac8c66b0",
+        "sag_api/services/session_context/scope.py": "79039f80c7fd3d795108d689b11abe3c49ff24d53ca2273df8b0b3174bc0b968",
+        "sag_api/services/session_context/selection.py": "c8713e8b4308fe3b5b09a93562b2395ef7ff702552825b56b4dea99fe9f687df",
+        "sag_api/services/session_context/storage.py": "16d0de7feeac05a0035960eee264bad4c9a12a2cfc6540439433526a9acc77cf",
+        "sag_api/services/session_context/types.py": "f5ad6a0bf22a72ee5962833012fd088d14fab1d4bcac61e6e395d338f8b84091",
+        "sag_api/core/litellm_policy.py": "fa6db3f1bd79b0952c831b239e8cfddd961a8ecfb59743c2e55887d050cfd67b",
+        "sag_api/core/model_providers.py": "08688fd93818413a76c3a32db9ac76946d99df47a49c8dae44dae3656093ae64",
+        "sag_api/services/agent_domain.py": "0ce132f42128bd67ba59c5abd42b2ee812882007863e3650f396ebf3d4d2130c",
+        "sag_api/services/agent_service.py": "f29dba824b2cf344f4f5689d35a7450c9f37d56fc1ac177265436696b3ada3f3",
+        "sag_api/generation/llm.py": "950975d26148b6592289964896c1a2918b61edd3bbb91bc083a9f70f881d2726",
+        "sag_api/generation/prompt.py": "66a8e0cb778353b4e50f8eb8a8abad6c92006cfc6d42751815ac079c14280dc1",
+        "sag_api/services/eval/session_context_accounting.py": "efb0abb68049d94fd8d54ab31611344b87668bdc7ad650111c6cd2a497c259be",
+        "scripts/eval_session_context.py": "6562a0d0380b31634732bcbbf5ebb3249b4230c1d21e95efd8807c8bb25a5eb4",
+        "scripts/verify_session_runtime.py": "e874105a2111100ad8e48a14aab9566d670bf411d607f8ee3cf7d1f1797dd7d1"
+      }
+    }
+  },
+  "cumulative_experiment_budget": {
+    "hard_ceilings": {
+      "max_logical_calls": 180,
+      "max_reserved_tokens": 4000000,
+      "max_seconds": 2400
+    },
+    "actual_usage": {
+      "logical_calls": 63,
+      "reserved_tokens": 2303039,
+      "known_input_tokens": 658528,
+      "known_output_tokens": 9756,
+      "paired_replay_seconds": 2329.437,
+      "wall_clock_including_v1_zero_call_harness_error_seconds": 2843.86
+    }
+  },
+  "semantic_review": {
+    "path": "SAG/docs/Thang_Task/session-context-zero-mem/evidence/f2-f3-independent-validation.semantic-review.jsonl",
+    "sha256": "2f6e07387e8166c4d3548f4d7ccd4d2cbcac17efb730afdbdd032ff7cea7c8d4",
+    "rows": 24,
+    "normal_rows": 20,
+    "normal_correct": 20,
+    "normal_baseline_correct": 6,
+    "full_session_rows": 4,
+    "full_session_correct": 0,
+    "full_session_baseline_correct": 0,
+    "total_correct": 20,
+    "total_baseline_correct": 6,
+    "per_case_quality_regressions": 1,
+    "false_absence_claims": 0,
+    "unapproved_proposal_promotions": 0
+  },
+  "latency_metrics_ms": {
+    "cold_index_v2_10_normal_cases": {
+      "count": 10,
+      "ready_count": 10,
+      "timeout_count": 0,
+      "ceiling_ms": 180000.0,
+      "min_ms": 17640.0,
+      "p50_ms": 45859.5,
+      "p95_ms": 59653.95,
+      "max_ms": 61953.0
+    },
+    "cold_index_v1_10_normal_cases": {
+      "count": 10,
+      "ready_count": 10,
+      "timeout_count": 0,
+      "ceiling_ms": 180000.0,
+      "min_ms": 26656.0,
+      "p50_ms": 41882.5,
+      "p95_ms": 74639.2,
+      "max_ms": 90094.0
+    },
+    "warm_prepare_v2_10_normal_cases": {
+      "count": 10,
+      "ceiling_ms": 5000.0,
+      "min_ms": 797.0,
+      "p50_ms": 1578.0,
+      "p95_ms": 1690.1,
+      "max_ms": 1718.0
+    },
+    "normal_generation_v2_20_replays": {
+      "count": 20,
+      "ceiling_ms": 60000.0,
+      "min_ms": 3547.0,
+      "p50_ms": 5383.0,
+      "p95_ms": 21983.45,
+      "max_ms": 22562.0
+    }
+  },
+  "long_normal_token_comparison": {
+    "case_ids": [
+      "val-old-retention-vi",
+      "val-decision-revision-vi",
+      "val-temporal-evolution-en",
+      "val-dense-long-filler-vi",
+      "val-multi-decision-abstention-vi"
+    ],
+    "web_off": {
+      "legacy_total_tokens": 116242,
+      "runtime_total_tokens": 14684,
+      "reduction_ratio": 0.8737
+    },
+    "web_on": {
+      "legacy_total_tokens": 154212,
+      "runtime_total_tokens": 13912,
+      "reduction_ratio": 0.9098
+    },
+    "combined_10_replays": {
+      "legacy_total_tokens": 270454,
+      "runtime_total_tokens": 28596,
+      "reduction_ratio": 0.8943
+    }
+  },
+  "gate_matrix": {
+    "normal_raw_gold_evidence_recall": {
+      "threshold": 1.0,
+      "observed": 1.0,
+      "verdict": "PASS",
+      "note": "20/20 normal replays retained 100% of gold evidence quotes in both raw_selected_evidence and fitted_evidence_messages."
+    },
+    "per_case_quality_regressions": {
+      "threshold": 0,
+      "observed_normal": 0,
+      "observed_full_session": 1,
+      "observed_total": 1,
+      "verdict": "FAIL",
+      "note": "Normal mode had 0/20 regressions (20/20 correct vs legacy 6/20). Full-session had 1 regression on val-full-session-decisions-vi (web=True) where legacy recalled 2/4 items and runtime returned UNKNOWN due to aggregate.py:77-78."
+    },
+    "old_information_quality": {
+      "threshold": "strict improvement over paired baseline",
+      "observed": "Normal old/long-session cases: runtime 10/10 (100%) vs legacy 2/10 (20%)",
+      "verdict": "PASS"
+    },
+    "long_normal_total_llm_token_reduction_min": {
+      "threshold": 0.5,
+      "observed_web_off": 0.8737,
+      "observed_web_on": 0.9098,
+      "observed_combined": 0.8943,
+      "verdict": "PASS_ON_LONG_NORMAL_SUBSET_ONLY",
+      "note": "Long-normal achieved 87.37% (web=False) and 90.98% (web=True) token reduction with 10/10 correct answers and complete usage, but overall experiment cost gate is blocked by failed full-session replays."
+    },
+    "unknown_usage_or_failed_replays": {
+      "threshold": "0 failed/unknown replays (cost gate cannot pass otherwise)",
+      "observed_normal_failed_or_unknown": 0,
+      "observed_full_session_failed_or_unknown": 2,
+      "verdict": "FAIL",
+      "note": "val-full-session-timeline-en (web=False, web=True) timed out at the 60s BudgetedLLM cap (model.py:92) on ~29,874-token map prompt (aggregate.py:107), leaving status=run.failed and accounting_complete=False."
+    },
+    "scope_provenance_violations": {
+      "threshold": 0,
+      "observed": 0,
+      "verdict": "PASS"
+    },
+    "full_session_missing_or_wrong_decisions": {
+      "threshold": 0,
+      "observed": 4,
+      "verdict": "FAIL",
+      "note": "0/4 full-session replays succeeded: val-full-session-decisions-vi (both web profiles) aborted map batch with ValueError('invalid_map_support') at aggregate.py:77-78; val-full-session-timeline-en (both web profiles) timed out at 60s cap in model.py:92 / aggregate.py:107."
+    },
+    "license_grant_required": {
+      "threshold": true,
+      "observed": "OpenMed Apache-2.0 publisher grant verified; underlying dataset rights unverified per MODEL-LICENSES.md",
+      "verdict": "UNVERIFIED_NO_GO"
+    }
+  },
+  "uncovered_production_bugs": [
+    {
+      "id": "F2-BUG-1",
+      "location": "SAG/apps/api/sag_api/services/session_context/aggregate.py:67-80, 191-193",
+      "summary": "All-or-nothing rejection in _items() when LLM includes an unsupported negative/absence note (supports: []) alongside valid supported decisions",
+      "evidence": "In val-full-session-decisions-vi (web=False & web=True), the map call extracted all 4 gold decisions with valid supports ([S13], [S79], [S155]) plus a 5th item noting no third-party legal contract code was mentioned with supports=[]. _items() raised ValueError('invalid_map_support'), causing aggregate_session to discard the entire batch (visited=0/220, reason=map_not_ready, answer=UNKNOWN)."
+    },
+    {
+      "id": "F2-BUG-2",
+      "location": "SAG/apps/api/sag_api/services/session_context/model.py:92 & SAG/apps/api/sag_api/services/session_context/aggregate.py:107",
+      "summary": "30,000-token map batch size vs 60,000ms per-call timeout cap in BudgetedLLM causes APITimeoutError on full-session English timeline",
+      "evidence": "In val-full-session-timeline-en (web=False & web=True, 240 messages), _batches() packed all 240 messages (~29,874 input tokens) into a single non-streaming llm.complete call (input_limit=30000), while BudgetedLLM.__init__ hard-capped llm_timeout_ms to min(settings.llm_timeout_ms, 60000). Both calls timed out at ~61.34s / ~61.81s (status=run.failed, error_code=generation_failed, accounting_complete=False)."
+    }
+  ],
+  "paired_results": [
+    {
+      "case_id": "val-old-retention-vi",
+      "web_enabled": false,
+      "group": "normal",
+      "scenario": "long_session_retention",
+      "history_message_count": 240,
+      "long_normal": true,
+      "status": "run.completed",
+      "answer": "KRONOS-418",
+      "answer_sha256": "061f72302f1dc776ffc2f7987ace8dd0e7574810ac77799f60d8386700cb7886",
+      "literal_item_recall": 1.0,
+      "baseline_literal_item_recall": 0.0,
+      "semantically_correct": true,
+      "baseline_semantically_correct": false,
+      "quality_ordinal": 2,
+      "baseline_quality_ordinal": 0,
+      "regression": false,
+      "raw_gold_evidence_recall": 0.0,
+      "fitted_gold_evidence_recall": 1.0,
+      "context": {
+        "mode": "normal",
+        "content_scope": "stored_text_only",
+        "budget_profile": "memory",
+        "state": "ready",
+        "reason": null,
+        "eligible": 240,
+        "visited": 5,
+        "evidence": [
+          {
+            "message_id": "30a969724457c53bd1ea9affecea4abc",
+            "content_hash": "421683fb9a457347cbb6fedca41a42338bc828865f977772f52eb3b9c82563a4",
+            "start": 0,
+            "end": 68
+          },
+          {
+            "message_id": "8a29c41eb43124fddf057754e4095a42",
+            "content_hash": "608b5f0827dd1743cc61f2b739a7309e5df0365bd692556be9904a4fa5197f59",
+            "start": 0,
+            "end": 39
+          },
+          {
+            "message_id": "4cbe85226340d7a740934993d1d4084f",
+            "content_hash": "db93281906d9de740283edabe7096565ba3ac590a9b7f43b9cc18ad29f844ec4",
+            "start": 0,
+            "end": 263
+          },
+          {
+            "message_id": "c19f699e52e1e6e42ccd0017658b054e",
+            "content_hash": "bf93c302295d1b5a7579de0965d026e08a0d545b49e52dce66e5566572ac4591",
+            "start": 0,
+            "end": 263
+          },
+          {
+            "message_id": "fc6f4529c6826b641cdaa762ce048337",
+            "content_hash": "d2927c22474e05e67a3a13a19b5a9c192cefce900923fde492013253e08154e7",
+            "start": 0,
+            "end": 263
+          }
+        ]
+      },
+      "accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 2302,
+        "output_tokens": 23,
+        "monetary_cost": null,
+        "calls": [
+          {
+            "status": "completed",
+            "input_tokens": 2302,
+            "output_tokens": 23,
+            "reserved_input_tokens": 2554,
+            "configured_retries": 0
+          }
+        ]
+      },
+      "baseline_accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 17379,
+        "output_tokens": 23,
+        "known_input_tokens": 17379,
+        "known_output_tokens": 23,
+        "monetary_cost": null,
+        "price_status": "unverified",
+        "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
+        "stream_usage_aggregation": "last cumulative snapshot, not sum",
+        "calls": [
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 17379,
+            "output_tokens": 23,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 16342,
+            "max_output_tokens": 4096,
+            "duration_ms": 18078.0,
+            "ttft_ms": 15937.0
+          }
+        ]
+      },
+      "prepare_ms": 2234.0,
+      "generation_ms": 4579.0,
+      "cold_index_ms": 56844.0,
+      "cold_index_work_units": 964919,
+      "index_template_reused": false
+    },
+    {
+      "case_id": "val-old-retention-vi",
+      "web_enabled": true,
+      "group": "normal",
+      "scenario": "long_session_retention",
+      "history_message_count": 240,
+      "long_normal": true,
+      "status": "run.completed",
+      "answer": "KRONOS-418",
+      "answer_sha256": "061f72302f1dc776ffc2f7987ace8dd0e7574810ac77799f60d8386700cb7886",
+      "literal_item_recall": 1.0,
+      "baseline_literal_item_recall": 0.0,
+      "semantically_correct": true,
+      "baseline_semantically_correct": false,
+      "quality_ordinal": 2,
+      "baseline_quality_ordinal": 0,
+      "regression": false,
+      "raw_gold_evidence_recall": 0.0,
+      "fitted_gold_evidence_recall": 1.0,
+      "context": {
+        "mode": "normal",
+        "content_scope": "stored_text_only",
+        "budget_profile": "tool_assisted",
+        "state": "ready",
+        "reason": null,
+        "eligible": 240,
+        "visited": 5,
+        "evidence": [
+          {
+            "message_id": "30a969724457c53bd1ea9affecea4abc",
+            "content_hash": "421683fb9a457347cbb6fedca41a42338bc828865f977772f52eb3b9c82563a4",
+            "start": 0,
+            "end": 68
+          },
+          {
+            "message_id": "8a29c41eb43124fddf057754e4095a42",
+            "content_hash": "608b5f0827dd1743cc61f2b739a7309e5df0365bd692556be9904a4fa5197f59",
+            "start": 0,
+            "end": 39
+          },
+          {
+            "message_id": "4cbe85226340d7a740934993d1d4084f",
+            "content_hash": "db93281906d9de740283edabe7096565ba3ac590a9b7f43b9cc18ad29f844ec4",
+            "start": 0,
+            "end": 263
+          },
+          {
+            "message_id": "c19f699e52e1e6e42ccd0017658b054e",
+            "content_hash": "bf93c302295d1b5a7579de0965d026e08a0d545b49e52dce66e5566572ac4591",
+            "start": 0,
+            "end": 263
+          },
+          {
+            "message_id": "fc6f4529c6826b641cdaa762ce048337",
+            "content_hash": "d2927c22474e05e67a3a13a19b5a9c192cefce900923fde492013253e08154e7",
+            "start": 0,
+            "end": 263
+          }
+        ]
+      },
+      "accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 2691,
+        "output_tokens": 23,
+        "monetary_cost": null,
+        "calls": [
+          {
+            "status": "completed",
+            "input_tokens": 2691,
+            "output_tokens": 23,
+            "reserved_input_tokens": 2935,
+            "configured_retries": 0
+          }
+        ]
+      },
+      "baseline_accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 17762,
+        "output_tokens": 23,
+        "known_input_tokens": 17762,
+        "known_output_tokens": 23,
+        "monetary_cost": null,
+        "price_status": "unverified",
+        "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
+        "stream_usage_aggregation": "last cumulative snapshot, not sum",
+        "calls": [
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 17762,
+            "output_tokens": 23,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 16678,
+            "max_output_tokens": 4096,
+            "duration_ms": 14609.0,
+            "ttft_ms": 13688.0
+          }
+        ]
+      },
+      "prepare_ms": 1625.0,
+      "generation_ms": 3547.0,
+      "cold_index_ms": 156.0,
+      "cold_index_work_units": 0,
+      "index_template_reused": true
+    },
+    {
+      "case_id": "val-recent-window-en",
+      "web_enabled": false,
+      "group": "normal",
+      "scenario": "recent_window",
+      "history_message_count": 90,
+      "long_normal": false,
+      "status": "run.completed",
+      "answer": "The runbook code finalized for disaster recovery is DR-904, and the RTO target is 15 minutes.",
+      "answer_sha256": "1037b4e56da838a5f3ff0bc943de70e6a813eef4e2fafa708cacaac03438caec",
+      "literal_item_recall": 1.0,
+      "baseline_literal_item_recall": 0.0,
+      "semantically_correct": true,
+      "baseline_semantically_correct": false,
+      "quality_ordinal": 2,
+      "baseline_quality_ordinal": 0,
+      "regression": false,
+      "raw_gold_evidence_recall": 0.0,
+      "fitted_gold_evidence_recall": 1.0,
+      "context": {
+        "mode": "normal",
+        "content_scope": "stored_text_only",
+        "budget_profile": "memory",
+        "state": "ready",
+        "reason": null,
+        "eligible": 90,
+        "visited": 5,
+        "evidence": [
+          {
+            "message_id": "7b8fb22e61e0f52a8f221fdf0edfa42b",
+            "content_hash": "1f97f293e58e3e935b93034486f7868ad2b7ac4af937ca9c96f388399b5955c4",
+            "start": 0,
+            "end": 81
+          },
+          {
+            "message_id": "07a1a21318f8df6fc017e2ac39089f9f",
+            "content_hash": "6c1eea171279057fbf382ca97ec704b78ffd2c16bfeac0d4ef9ecd826583ce8a",
+            "start": 0,
+            "end": 53
+          },
+          {
+            "message_id": "ed589620839662d1ec140cf79eecdb38",
+            "content_hash": "57a2f95bf7246f2f8c9678fb1632cd1b2a45814d554f720d1c4873e9a7bc14c0",
+            "start": 0,
+            "end": 263
+          },
+          {
+            "message_id": "e80500515d630a56785a1d1d14387430",
+            "content_hash": "6ca82f89c0f5013a7eda85ec5e952379445a66776b57a62d0fe0e49dea06f706",
+            "start": 0,
+            "end": 263
+          },
+          {
+            "message_id": "364dd6c05feceae8c1a3873d24ba00ac",
+            "content_hash": "a24c1cbc41933c82da11264258d713e2b541f2d1c5a94d6a7ab2f080678db315",
+            "start": 0,
+            "end": 263
+          }
+        ]
+      },
+      "accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 2289,
+        "output_tokens": 37,
+        "monetary_cost": null,
+        "calls": [
+          {
+            "status": "completed",
+            "input_tokens": 2289,
+            "output_tokens": 37,
+            "reserved_input_tokens": 2541,
+            "configured_retries": 0
+          }
+        ]
+      },
+      "baseline_accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 8308,
+        "output_tokens": 23,
+        "known_input_tokens": 8308,
+        "known_output_tokens": 23,
+        "monetary_cost": null,
+        "price_status": "unverified",
+        "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
+        "stream_usage_aggregation": "last cumulative snapshot, not sum",
+        "calls": [
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 8308,
+            "output_tokens": 23,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 7994,
+            "max_output_tokens": 4096,
+            "duration_ms": 101343.0,
+            "ttft_ms": 100625.0
+          }
+        ]
+      },
+      "prepare_ms": 1375.0,
+      "generation_ms": 10031.0,
+      "cold_index_ms": 17640.0,
+      "cold_index_work_units": 360321,
+      "index_template_reused": false
+    },
+    {
+      "case_id": "val-recent-window-en",
+      "web_enabled": true,
+      "group": "normal",
+      "scenario": "recent_window",
+      "history_message_count": 90,
+      "long_normal": false,
+      "status": "run.completed",
+      "answer": "The runbook code finalized for disaster recovery is DR-904, and the RTO target is 15 minutes.",
+      "answer_sha256": "1037b4e56da838a5f3ff0bc943de70e6a813eef4e2fafa708cacaac03438caec",
+      "literal_item_recall": 1.0,
+      "baseline_literal_item_recall": 0.0,
+      "semantically_correct": true,
+      "baseline_semantically_correct": false,
+      "quality_ordinal": 2,
+      "baseline_quality_ordinal": 0,
+      "regression": false,
+      "raw_gold_evidence_recall": 0.0,
+      "fitted_gold_evidence_recall": 1.0,
+      "context": {
+        "mode": "normal",
+        "content_scope": "stored_text_only",
+        "budget_profile": "tool_assisted",
+        "state": "ready",
+        "reason": null,
+        "eligible": 90,
+        "visited": 5,
+        "evidence": [
+          {
+            "message_id": "7b8fb22e61e0f52a8f221fdf0edfa42b",
+            "content_hash": "1f97f293e58e3e935b93034486f7868ad2b7ac4af937ca9c96f388399b5955c4",
+            "start": 0,
+            "end": 81
+          },
+          {
+            "message_id": "07a1a21318f8df6fc017e2ac39089f9f",
+            "content_hash": "6c1eea171279057fbf382ca97ec704b78ffd2c16bfeac0d4ef9ecd826583ce8a",
+            "start": 0,
+            "end": 53
+          },
+          {
+            "message_id": "ed589620839662d1ec140cf79eecdb38",
+            "content_hash": "57a2f95bf7246f2f8c9678fb1632cd1b2a45814d554f720d1c4873e9a7bc14c0",
+            "start": 0,
+            "end": 263
+          },
+          {
+            "message_id": "e80500515d630a56785a1d1d14387430",
+            "content_hash": "6ca82f89c0f5013a7eda85ec5e952379445a66776b57a62d0fe0e49dea06f706",
+            "start": 0,
+            "end": 263
+          },
+          {
+            "message_id": "364dd6c05feceae8c1a3873d24ba00ac",
+            "content_hash": "a24c1cbc41933c82da11264258d713e2b541f2d1c5a94d6a7ab2f080678db315",
+            "start": 0,
+            "end": 263
+          }
+        ]
+      },
+      "accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 2678,
+        "output_tokens": 37,
+        "monetary_cost": null,
+        "calls": [
+          {
+            "status": "completed",
+            "input_tokens": 2678,
+            "output_tokens": 37,
+            "reserved_input_tokens": 2922,
+            "configured_retries": 0
+          }
+        ]
+      },
+      "baseline_accounting": {
+        "logical_calls": 3,
+        "accounting_complete": true,
+        "input_tokens": 26356,
+        "output_tokens": 132,
+        "known_input_tokens": 26356,
+        "known_output_tokens": 132,
+        "monetary_cost": null,
+        "price_status": "unverified",
+        "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
+        "stream_usage_aggregation": "last cumulative snapshot, not sum",
+        "calls": [
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 8691,
+            "output_tokens": 21,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 8330,
+            "max_output_tokens": 4096,
+            "duration_ms": 28094.0,
+            "ttft_ms": null
+          },
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 8794,
+            "output_tokens": 40,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 8434,
+            "max_output_tokens": 4096,
+            "duration_ms": 9422.0,
+            "ttft_ms": null
+          },
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 8871,
+            "output_tokens": 71,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 8551,
+            "max_output_tokens": 4096,
+            "duration_ms": 9703.0,
+            "ttft_ms": 6562.0
+          }
+        ]
+      },
+      "prepare_ms": 797.0,
+      "generation_ms": 4109.0,
+      "cold_index_ms": 63.0,
+      "cold_index_work_units": 0,
+      "index_template_reused": true
+    },
+    {
+      "case_id": "val-decision-revision-vi",
+      "web_enabled": false,
+      "group": "normal",
+      "scenario": "decision_revision",
+      "history_message_count": 220,
+      "long_normal": true,
+      "status": "run.completed",
+      "answer": "Cổng thanh toán dự phòng chính thức hiện tại là PAY-SIGMA-79 với hạn mức 450 triệu.",
+      "answer_sha256": "821e147a4b19a4df48476bd1a5be050ce336b949e0d424f8c5857f4a8fd9e7eb",
+      "literal_item_recall": 1.0,
+      "baseline_literal_item_recall": 0.0,
+      "semantically_correct": true,
+      "baseline_semantically_correct": false,
+      "quality_ordinal": 2,
+      "baseline_quality_ordinal": 0,
+      "regression": false,
+      "raw_gold_evidence_recall": 0.0,
+      "fitted_gold_evidence_recall": 1.0,
+      "context": {
+        "mode": "normal",
+        "content_scope": "stored_text_only",
+        "budget_profile": "memory",
+        "state": "ready",
+        "reason": null,
+        "eligible": 220,
+        "visited": 5,
+        "evidence": [
+          {
+            "message_id": "e75b4dc4faeb8f8e0cba881081df2825",
+            "content_hash": "9eac2992ef39e0ac5aeb52aacddfb620105468e8a792896e7ee5e4c5ba929ac0",
+            "start": 0,
+            "end": 122
+          },
+          {
+            "message_id": "1384c505a177b2dbb709f232199018b2",
+            "content_hash": "9bda3cf9926402a7fe8a31c31c798ee9d27616158daa42869607b4292b2537e0",
+            "start": 0,
+            "end": 80
+          },
+          {
+            "message_id": "ff2000c7ea5a3a67f75af9d00aac915c",
+            "content_hash": "ec14228708224623ade07531304cea0ecf96d977d470a09c0695841b161d42b1",
+            "start": 0,
+            "end": 72
+          },
+          {
+            "message_id": "f65822363a57630d3893d64992191c42",
+            "content_hash": "a1a70cb6bb2eb1310b810c021619949f662ab30311b38145a352d101db940f9c",
+            "start": 0,
+            "end": 264
+          },
+          {
+            "message_id": "04ac5c1dbe501bd1937e2660b17b7f77",
+            "content_hash": "a60ebcaf2979f0ccab84a8df0786de691abdd9ad88a5d9b96b1c7f5aaa350427",
+            "start": 0,
+            "end": 263
+          }
+        ]
+      },
+      "accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 2285,
+        "output_tokens": 41,
+        "monetary_cost": null,
+        "calls": [
+          {
+            "status": "completed",
+            "input_tokens": 2285,
+            "output_tokens": 41,
+            "reserved_input_tokens": 2537,
+            "configured_retries": 0
+          }
+        ]
+      },
+      "baseline_accounting": {
+        "logical_calls": 2,
+        "accounting_complete": true,
+        "input_tokens": 34557,
+        "output_tokens": 47,
+        "known_input_tokens": 34557,
+        "known_output_tokens": 47,
+        "monetary_cost": null,
+        "price_status": "unverified",
+        "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
+        "stream_usage_aggregation": "last cumulative snapshot, not sum",
+        "calls": [
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 17227,
+            "output_tokens": 11,
+            "cached_tokens": 800,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 16207,
+            "max_output_tokens": 4096,
+            "duration_ms": 16718.0,
+            "ttft_ms": null
+          },
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 17330,
+            "output_tokens": 36,
+            "cached_tokens": 800,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 16310,
+            "max_output_tokens": 4096,
+            "duration_ms": 16719.0,
+            "ttft_ms": 12297.0
+          }
+        ]
+      },
+      "prepare_ms": 1734.0,
+      "generation_ms": 21953.0,
+      "cold_index_ms": 50625.0,
+      "cold_index_work_units": 883939,
+      "index_template_reused": false
+    },
+    {
+      "case_id": "val-decision-revision-vi",
+      "web_enabled": true,
+      "group": "normal",
+      "scenario": "decision_revision",
+      "history_message_count": 220,
+      "long_normal": true,
+      "status": "run.completed",
+      "answer": "Cổng thanh toán dự phòng chính thức hiện tại là PAY-SIGMA-79 với hạn mức 450 triệu.",
+      "answer_sha256": "821e147a4b19a4df48476bd1a5be050ce336b949e0d424f8c5857f4a8fd9e7eb",
+      "literal_item_recall": 1.0,
+      "baseline_literal_item_recall": 1.0,
+      "semantically_correct": true,
+      "baseline_semantically_correct": true,
+      "quality_ordinal": 2,
+      "baseline_quality_ordinal": 2,
+      "regression": false,
+      "raw_gold_evidence_recall": 0.0,
+      "fitted_gold_evidence_recall": 1.0,
+      "context": {
+        "mode": "normal",
+        "content_scope": "stored_text_only",
+        "budget_profile": "tool_assisted",
+        "state": "ready",
+        "reason": null,
+        "eligible": 220,
+        "visited": 5,
+        "evidence": [
+          {
+            "message_id": "e75b4dc4faeb8f8e0cba881081df2825",
+            "content_hash": "9eac2992ef39e0ac5aeb52aacddfb620105468e8a792896e7ee5e4c5ba929ac0",
+            "start": 0,
+            "end": 122
+          },
+          {
+            "message_id": "1384c505a177b2dbb709f232199018b2",
+            "content_hash": "9bda3cf9926402a7fe8a31c31c798ee9d27616158daa42869607b4292b2537e0",
+            "start": 0,
+            "end": 80
+          },
+          {
+            "message_id": "ff2000c7ea5a3a67f75af9d00aac915c",
+            "content_hash": "ec14228708224623ade07531304cea0ecf96d977d470a09c0695841b161d42b1",
+            "start": 0,
+            "end": 72
+          },
+          {
+            "message_id": "f65822363a57630d3893d64992191c42",
+            "content_hash": "a1a70cb6bb2eb1310b810c021619949f662ab30311b38145a352d101db940f9c",
+            "start": 0,
+            "end": 264
+          },
+          {
+            "message_id": "04ac5c1dbe501bd1937e2660b17b7f77",
+            "content_hash": "a60ebcaf2979f0ccab84a8df0786de691abdd9ad88a5d9b96b1c7f5aaa350427",
+            "start": 0,
+            "end": 263
+          }
+        ]
+      },
+      "accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 2674,
+        "output_tokens": 44,
+        "monetary_cost": null,
+        "calls": [
+          {
+            "status": "completed",
+            "input_tokens": 2674,
+            "output_tokens": 44,
+            "reserved_input_tokens": 2918,
+            "configured_retries": 0
+          }
+        ]
+      },
+      "baseline_accounting": {
+        "logical_calls": 2,
+        "accounting_complete": true,
+        "input_tokens": 35323,
+        "output_tokens": 47,
+        "known_input_tokens": 35323,
+        "known_output_tokens": 47,
+        "monetary_cost": null,
+        "price_status": "unverified",
+        "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
+        "stream_usage_aggregation": "last cumulative snapshot, not sum",
+        "calls": [
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 17610,
+            "output_tokens": 11,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 16543,
+            "max_output_tokens": 4096,
+            "duration_ms": 42422.0,
+            "ttft_ms": null
+          },
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 17713,
+            "output_tokens": 36,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 16646,
+            "max_output_tokens": 4096,
+            "duration_ms": 10547.0,
+            "ttft_ms": 8329.0
+          }
+        ]
+      },
+      "prepare_ms": 1250.0,
+      "generation_ms": 3844.0,
+      "cold_index_ms": 203.0,
+      "cold_index_work_units": 0,
+      "index_template_reused": true
+    },
+    {
+      "case_id": "val-negation-cancel-en",
+      "web_enabled": false,
+      "group": "normal",
+      "scenario": "explicit_negation",
+      "history_message_count": 160,
+      "long_normal": false,
+      "status": "run.completed",
+      "answer": "The feature flag that remains approved after the correction is CORE-LEDGER-3. The status of EXPERIMENT-SHADOW-7 is that it should be revoked immediately.",
+      "answer_sha256": "72c0b7ff58b9f147c90804386bd279be672731eef968ad1aee622b2ca5cc0d88",
+      "literal_item_recall": 1.0,
+      "baseline_literal_item_recall": 0.0,
+      "semantically_correct": true,
+      "baseline_semantically_correct": false,
+      "quality_ordinal": 2,
+      "baseline_quality_ordinal": 0,
+      "regression": false,
+      "raw_gold_evidence_recall": 0.0,
+      "fitted_gold_evidence_recall": 1.0,
+      "context": {
+        "mode": "normal",
+        "content_scope": "stored_text_only",
+        "budget_profile": "memory",
+        "state": "ready",
+        "reason": null,
+        "eligible": 160,
+        "visited": 5,
+        "evidence": [
+          {
+            "message_id": "3125c0fb5d21bb94326034c39081cb11",
+            "content_hash": "11b8f014b59c0e4df316e5d83aa238b9c240b3a9cb4fa5284a9a4059417407f4",
+            "start": 0,
+            "end": 106
+          },
+          {
+            "message_id": "b11e33be413244527c1a18417ab1477a",
+            "content_hash": "4ad6e1efa5134d05a28148045a19704c2ab45c41df34fdf4a4ee9f85bc6be259",
+            "start": 0,
+            "end": 102
+          },
+          {
+            "message_id": "5bce346f9c36044ee12fb9a9d2bf4c60",
+            "content_hash": "cc8c9295a267b4a1b07f7c30faec9ff6f301dd34dbd0d1b181822ab6cf4cb1f8",
+            "start": 0,
+            "end": 264
+          },
+          {
+            "message_id": "5ee823b21d9ec721cb301350d05c9121",
+            "content_hash": "25d6ba881c460f774b5b7a00f809aab53e4a9282c001cdc70b54c33a1e2fb312",
+            "start": 0,
+            "end": 264
+          },
+          {
+            "message_id": "d74ea78515fce8974c2012c6cea1b984",
+            "content_hash": "24ecadf2e22d711eccb1780473efde57c587349eef5781ff6277149ffc3500f3",
+            "start": 0,
+            "end": 263
+          }
+        ]
+      },
+      "accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 2316,
+        "output_tokens": 47,
+        "monetary_cost": null,
+        "calls": [
+          {
+            "status": "completed",
+            "input_tokens": 2316,
+            "output_tokens": 47,
+            "reserved_input_tokens": 2568,
+            "configured_retries": 0
+          }
+        ]
+      },
+      "baseline_accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 13987,
+        "output_tokens": 49,
+        "known_input_tokens": 13987,
+        "known_output_tokens": 49,
+        "monetary_cost": null,
+        "price_status": "unverified",
+        "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
+        "stream_usage_aggregation": "last cumulative snapshot, not sum",
+        "calls": [
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 13987,
+            "output_tokens": 49,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 13260,
+            "max_output_tokens": 4096,
+            "duration_ms": 14016.0,
+            "ttft_ms": 10735.0
+          }
+        ]
+      },
+      "prepare_ms": 1469.0,
+      "generation_ms": 4125.0,
+      "cold_index_ms": 34859.0,
+      "cold_index_work_units": 642613,
+      "index_template_reused": false
+    },
+    {
+      "case_id": "val-negation-cancel-en",
+      "web_enabled": true,
+      "group": "normal",
+      "scenario": "explicit_negation",
+      "history_message_count": 160,
+      "long_normal": false,
+      "status": "run.completed",
+      "answer": "The feature flag that remains approved after the correction is CORE-LEDGER-3. The status of EXPERIMENT-SHADOW-7 is that it should NOT be enabled and needs to be revoked immediately.",
+      "answer_sha256": "87eee212f1908c1cfb9e43392940b47e73021668d6408061eed5f0d5a533624d",
+      "literal_item_recall": 1.0,
+      "baseline_literal_item_recall": 1.0,
+      "semantically_correct": true,
+      "baseline_semantically_correct": true,
+      "quality_ordinal": 2,
+      "baseline_quality_ordinal": 2,
+      "regression": false,
+      "raw_gold_evidence_recall": 0.0,
+      "fitted_gold_evidence_recall": 1.0,
+      "context": {
+        "mode": "normal",
+        "content_scope": "stored_text_only",
+        "budget_profile": "tool_assisted",
+        "state": "ready",
+        "reason": null,
+        "eligible": 160,
+        "visited": 5,
+        "evidence": [
+          {
+            "message_id": "3125c0fb5d21bb94326034c39081cb11",
+            "content_hash": "11b8f014b59c0e4df316e5d83aa238b9c240b3a9cb4fa5284a9a4059417407f4",
+            "start": 0,
+            "end": 106
+          },
+          {
+            "message_id": "b11e33be413244527c1a18417ab1477a",
+            "content_hash": "4ad6e1efa5134d05a28148045a19704c2ab45c41df34fdf4a4ee9f85bc6be259",
+            "start": 0,
+            "end": 102
+          },
+          {
+            "message_id": "5bce346f9c36044ee12fb9a9d2bf4c60",
+            "content_hash": "cc8c9295a267b4a1b07f7c30faec9ff6f301dd34dbd0d1b181822ab6cf4cb1f8",
+            "start": 0,
+            "end": 264
+          },
+          {
+            "message_id": "5ee823b21d9ec721cb301350d05c9121",
+            "content_hash": "25d6ba881c460f774b5b7a00f809aab53e4a9282c001cdc70b54c33a1e2fb312",
+            "start": 0,
+            "end": 264
+          },
+          {
+            "message_id": "d74ea78515fce8974c2012c6cea1b984",
+            "content_hash": "24ecadf2e22d711eccb1780473efde57c587349eef5781ff6277149ffc3500f3",
+            "start": 0,
+            "end": 263
+          }
+        ]
+      },
+      "accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 2705,
+        "output_tokens": 52,
+        "monetary_cost": null,
+        "calls": [
+          {
+            "status": "completed",
+            "input_tokens": 2705,
+            "output_tokens": 52,
+            "reserved_input_tokens": 2949,
+            "configured_retries": 0
+          }
+        ]
+      },
+      "baseline_accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 14370,
+        "output_tokens": 37,
+        "known_input_tokens": 14370,
+        "known_output_tokens": 37,
+        "monetary_cost": null,
+        "price_status": "unverified",
+        "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
+        "stream_usage_aggregation": "last cumulative snapshot, not sum",
+        "calls": [
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 14370,
+            "output_tokens": 37,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 13596,
+            "max_output_tokens": 4096,
+            "duration_ms": 15734.0,
+            "ttft_ms": 13703.0
+          }
+        ]
+      },
+      "prepare_ms": 1656.0,
+      "generation_ms": 4344.0,
+      "cold_index_ms": 110.0,
+      "cold_index_work_units": 0,
+      "index_template_reused": true
+    },
+    {
+      "case_id": "val-unapproved-proposal-vi",
+      "web_enabled": false,
+      "group": "normal",
+      "scenario": "unapproved_assistant_proposal",
+      "history_message_count": 170,
+      "long_normal": false,
+      "status": "run.completed",
+      "answer": "Người dùng đã xác nhận duyệt kho lưu trữ chứng từ VAULT-208. Đề xuất VAULT-999-PRO của assistant không được duyệt và người dùng đã quyết định giữ nguyên VAULT-208.",
+      "answer_sha256": "2b095d397e0ea9c31993c6579b16f1ac8a477b6ea863230f6d4bfac77f61ff69",
+      "literal_item_recall": 0.5,
+      "baseline_literal_item_recall": 0.0,
+      "semantically_correct": true,
+      "baseline_semantically_correct": false,
+      "quality_ordinal": 2,
+      "baseline_quality_ordinal": 0,
+      "regression": false,
+      "raw_gold_evidence_recall": 0.0,
+      "fitted_gold_evidence_recall": 1.0,
+      "context": {
+        "mode": "normal",
+        "content_scope": "stored_text_only",
+        "budget_profile": "memory",
+        "state": "ready",
+        "reason": null,
+        "eligible": 170,
+        "visited": 5,
+        "evidence": [
+          {
+            "message_id": "07b4f207b092398a922f7cef5acf0295",
+            "content_hash": "e3f05e98bc1a32139d609571c24aa3eb2cbd6266939b7cf104d520d0f005efcc",
+            "start": 0,
+            "end": 58
+          },
+          {
+            "message_id": "081b5d1490adf5a6ee5ab760a65bb2be",
+            "content_hash": "d0fe6668eda6e77e67c234388f688149a557b95c4be957f8ff45e1f147ecb403",
+            "start": 0,
+            "end": 86
+          },
+          {
+            "message_id": "07c7d1f33f19d80f02b3aa4153abcc70",
+            "content_hash": "820c43f8c0a0ec2c0fd486dfa2278d5d3bd198cf2cea8d04f67b3cf5328780b8",
+            "start": 0,
+            "end": 70
+          },
+          {
+            "message_id": "b6b1ac648517587b7305fcbd86be264d",
+            "content_hash": "616658e1cc03cbc930c694159ee6377ab877d59b781e2c0f6f2a4950773349c2",
+            "start": 0,
+            "end": 263
+          },
+          {
+            "message_id": "787ab14de5ccbab8f61b0e9763e56b66",
+            "content_hash": "7a81f4da0d99c65789e61e1aeb1ff200aeb64683db034d2e79f1c127b9d479b2",
+            "start": 0,
+            "end": 263
+          }
+        ]
+      },
+      "accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 2258,
+        "output_tokens": 65,
+        "monetary_cost": null,
+        "calls": [
+          {
+            "status": "completed",
+            "input_tokens": 2258,
+            "output_tokens": 65,
+            "reserved_input_tokens": 2510,
+            "configured_retries": 0
+          }
+        ]
+      },
+      "baseline_accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 14750,
+        "output_tokens": 58,
+        "known_input_tokens": 14750,
+        "known_output_tokens": 58,
+        "monetary_cost": null,
+        "price_status": "unverified",
+        "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
+        "stream_usage_aggregation": "last cumulative snapshot, not sum",
+        "calls": [
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 14750,
+            "output_tokens": 58,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 13948,
+            "max_output_tokens": 4096,
+            "duration_ms": 6063.0,
+            "ttft_ms": 4672.0
+          }
+        ]
+      },
+      "prepare_ms": 1125.0,
+      "generation_ms": 5578.0,
+      "cold_index_ms": 37282.0,
+      "cold_index_work_units": 682083,
+      "index_template_reused": false
+    },
+    {
+      "case_id": "val-unapproved-proposal-vi",
+      "web_enabled": true,
+      "group": "normal",
+      "scenario": "unapproved_assistant_proposal",
+      "history_message_count": 170,
+      "long_normal": false,
+      "status": "run.completed",
+      "answer": "Người dùng đã xác nhận duyệt kho lưu trữ chứng từ VAULT-208. Đề xuất VAULT-999-PRO của assistant không được duyệt và người dùng yêu cầu giữ nguyên VAULT-208.",
+      "answer_sha256": "7d65b2dc035600dc674de1172a3cf6de82a09b8f0918b2d4e22344b55f5db71c",
+      "literal_item_recall": 0.5,
+      "baseline_literal_item_recall": 1.0,
+      "semantically_correct": true,
+      "baseline_semantically_correct": true,
+      "quality_ordinal": 2,
+      "baseline_quality_ordinal": 2,
+      "regression": false,
+      "raw_gold_evidence_recall": 0.0,
+      "fitted_gold_evidence_recall": 1.0,
+      "context": {
+        "mode": "normal",
+        "content_scope": "stored_text_only",
+        "budget_profile": "tool_assisted",
+        "state": "ready",
+        "reason": null,
+        "eligible": 170,
+        "visited": 5,
+        "evidence": [
+          {
+            "message_id": "07b4f207b092398a922f7cef5acf0295",
+            "content_hash": "e3f05e98bc1a32139d609571c24aa3eb2cbd6266939b7cf104d520d0f005efcc",
+            "start": 0,
+            "end": 58
+          },
+          {
+            "message_id": "081b5d1490adf5a6ee5ab760a65bb2be",
+            "content_hash": "d0fe6668eda6e77e67c234388f688149a557b95c4be957f8ff45e1f147ecb403",
+            "start": 0,
+            "end": 86
+          },
+          {
+            "message_id": "07c7d1f33f19d80f02b3aa4153abcc70",
+            "content_hash": "820c43f8c0a0ec2c0fd486dfa2278d5d3bd198cf2cea8d04f67b3cf5328780b8",
+            "start": 0,
+            "end": 70
+          },
+          {
+            "message_id": "b6b1ac648517587b7305fcbd86be264d",
+            "content_hash": "616658e1cc03cbc930c694159ee6377ab877d59b781e2c0f6f2a4950773349c2",
+            "start": 0,
+            "end": 263
+          },
+          {
+            "message_id": "787ab14de5ccbab8f61b0e9763e56b66",
+            "content_hash": "7a81f4da0d99c65789e61e1aeb1ff200aeb64683db034d2e79f1c127b9d479b2",
+            "start": 0,
+            "end": 263
+          }
+        ]
+      },
+      "accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 2647,
+        "output_tokens": 64,
+        "monetary_cost": null,
+        "calls": [
+          {
+            "status": "completed",
+            "input_tokens": 2647,
+            "output_tokens": 64,
+            "reserved_input_tokens": 2891,
+            "configured_retries": 0
+          }
+        ]
+      },
+      "baseline_accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 15133,
+        "output_tokens": 57,
+        "known_input_tokens": 15133,
+        "known_output_tokens": 57,
+        "monetary_cost": null,
+        "price_status": "unverified",
+        "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
+        "stream_usage_aggregation": "last cumulative snapshot, not sum",
+        "calls": [
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 15133,
+            "output_tokens": 57,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 14284,
+            "max_output_tokens": 4096,
+            "duration_ms": 13547.0,
+            "ttft_ms": 5906.0
+          }
+        ]
+      },
+      "prepare_ms": 1625.0,
+      "generation_ms": 5297.0,
+      "cold_index_ms": 110.0,
+      "cold_index_work_units": 0,
+      "index_template_reused": true
+    },
+    {
+      "case_id": "val-temporal-evolution-en",
+      "web_enabled": false,
+      "group": "normal",
+      "scenario": "temporal_state_evolution",
+      "history_message_count": 260,
+      "long_normal": true,
+      "status": "run.completed",
+      "answer": "Sau Final Phase 3 cutover, khu vực triển khai hoạt động là us-east-2 và giới hạn batch là 500.",
+      "answer_sha256": "399c81f52c2cc3bab4a02b0efdd46a02ea76ff4dd539de12da7ee2b35040de12",
+      "literal_item_recall": 1.0,
+      "baseline_literal_item_recall": 0.0,
+      "semantically_correct": true,
+      "baseline_semantically_correct": false,
+      "quality_ordinal": 2,
+      "baseline_quality_ordinal": 0,
+      "regression": false,
+      "raw_gold_evidence_recall": 0.0,
+      "fitted_gold_evidence_recall": 1.0,
+      "context": {
+        "mode": "normal",
+        "content_scope": "stored_text_only",
+        "budget_profile": "memory",
+        "state": "ready",
+        "reason": null,
+        "eligible": 260,
+        "visited": 5,
+        "evidence": [
+          {
+            "message_id": "0972e11389177ce0262dd2b7ce9e0969",
+            "content_hash": "3d47f64b37dfaef8c97a15c020c2ee7eb003e34a34f2046836a5b0df5c18231e",
+            "start": 0,
+            "end": 90
+          },
+          {
+            "message_id": "7c26456b5bdcecaccdf12711cea59d2e",
+            "content_hash": "9a933a08357cdec5a5706765fbd2a021395bd73a6927178aeff66c62c54a2bfa",
+            "start": 0,
+            "end": 88
+          },
+          {
+            "message_id": "405d1dc04c6a16cc7f1061aba8c36131",
+            "content_hash": "4ef7aa2c1e820337631ed27863fa99303fcf1795bc0ff09f341f4f4263ff3ccf",
+            "start": 0,
+            "end": 63
+          },
+          {
+            "message_id": "777990ba60a5c91ad497eb3c92da106f",
+            "content_hash": "bde148c569238a16e5f6f757a75e6b17cb842dc5681aedb393250ca0780f8dfc",
+            "start": 0,
+            "end": 264
+          },
+          {
+            "message_id": "5ada3c0fa6c674c590068ab95ac96820",
+            "content_hash": "031dfdfabe0008686534cac23090e9819dd0a057a7d901bbf803fd737f6ee9eb",
+            "start": 0,
+            "end": 263
+          }
+        ]
+      },
+      "accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 2242,
+        "output_tokens": 43,
+        "monetary_cost": null,
+        "calls": [
+          {
+            "status": "completed",
+            "input_tokens": 2242,
+            "output_tokens": 43,
+            "reserved_input_tokens": 2494,
+            "configured_retries": 0
+          }
+        ]
+      },
+      "baseline_accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 17288,
+        "output_tokens": 47,
+        "known_input_tokens": 17288,
+        "known_output_tokens": 47,
+        "monetary_cost": null,
+        "price_status": "unverified",
+        "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
+        "stream_usage_aggregation": "last cumulative snapshot, not sum",
+        "calls": [
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 17288,
+            "output_tokens": 47,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 16262,
+            "max_output_tokens": 4096,
+            "duration_ms": 35750.0,
+            "ttft_ms": 29031.0
+          }
+        ]
+      },
+      "prepare_ms": 2000.0,
+      "generation_ms": 22562.0,
+      "cold_index_ms": 61953.0,
+      "cold_index_work_units": 1045678,
+      "index_template_reused": false
+    },
+    {
+      "case_id": "val-temporal-evolution-en",
+      "web_enabled": true,
+      "group": "normal",
+      "scenario": "temporal_state_evolution",
+      "history_message_count": 260,
+      "long_normal": true,
+      "status": "run.completed",
+      "answer": "After the final Phase 3 cutover, the locked active deployment region is us-east-2 with a batch cap of 500.",
+      "answer_sha256": "c9b7f189cd5c879388aee37ef7b96a7b341c5aadb6ce4c170318db06195d86b4",
+      "literal_item_recall": 1.0,
+      "baseline_literal_item_recall": 1.0,
+      "semantically_correct": true,
+      "baseline_semantically_correct": true,
+      "quality_ordinal": 2,
+      "baseline_quality_ordinal": 2,
+      "regression": false,
+      "raw_gold_evidence_recall": 0.0,
+      "fitted_gold_evidence_recall": 1.0,
+      "context": {
+        "mode": "normal",
+        "content_scope": "stored_text_only",
+        "budget_profile": "tool_assisted",
+        "state": "ready",
+        "reason": null,
+        "eligible": 260,
+        "visited": 5,
+        "evidence": [
+          {
+            "message_id": "0972e11389177ce0262dd2b7ce9e0969",
+            "content_hash": "3d47f64b37dfaef8c97a15c020c2ee7eb003e34a34f2046836a5b0df5c18231e",
+            "start": 0,
+            "end": 90
+          },
+          {
+            "message_id": "7c26456b5bdcecaccdf12711cea59d2e",
+            "content_hash": "9a933a08357cdec5a5706765fbd2a021395bd73a6927178aeff66c62c54a2bfa",
+            "start": 0,
+            "end": 88
+          },
+          {
+            "message_id": "405d1dc04c6a16cc7f1061aba8c36131",
+            "content_hash": "4ef7aa2c1e820337631ed27863fa99303fcf1795bc0ff09f341f4f4263ff3ccf",
+            "start": 0,
+            "end": 63
+          },
+          {
+            "message_id": "777990ba60a5c91ad497eb3c92da106f",
+            "content_hash": "bde148c569238a16e5f6f757a75e6b17cb842dc5681aedb393250ca0780f8dfc",
+            "start": 0,
+            "end": 264
+          },
+          {
+            "message_id": "5ada3c0fa6c674c590068ab95ac96820",
+            "content_hash": "031dfdfabe0008686534cac23090e9819dd0a057a7d901bbf803fd737f6ee9eb",
+            "start": 0,
+            "end": 263
+          }
+        ]
+      },
+      "accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 2631,
+        "output_tokens": 41,
+        "monetary_cost": null,
+        "calls": [
+          {
+            "status": "completed",
+            "input_tokens": 2631,
+            "output_tokens": 41,
+            "reserved_input_tokens": 2875,
+            "configured_retries": 0
+          }
+        ]
+      },
+      "baseline_accounting": {
+        "logical_calls": 2,
+        "accounting_complete": true,
+        "input_tokens": 35445,
+        "output_tokens": 71,
+        "known_input_tokens": 35445,
+        "known_output_tokens": 71,
+        "monetary_cost": null,
+        "price_status": "unverified",
+        "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
+        "stream_usage_aggregation": "last cumulative snapshot, not sum",
+        "calls": [
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 17671,
+            "output_tokens": 21,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 16598,
+            "max_output_tokens": 4096,
+            "duration_ms": 56156.0,
+            "ttft_ms": null
+          },
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 17774,
+            "output_tokens": 50,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 16701,
+            "max_output_tokens": 4096,
+            "duration_ms": 16063.0,
+            "ttft_ms": 14016.0
+          }
+        ]
+      },
+      "prepare_ms": 1500.0,
+      "generation_ms": 10250.0,
+      "cold_index_ms": 218.0,
+      "cold_index_work_units": 0,
+      "index_template_reused": true
+    },
+    {
+      "case_id": "val-entity-bridge-vi-en",
+      "web_enabled": false,
+      "group": "normal",
+      "scenario": "entity_bridge",
+      "history_message_count": 180,
+      "long_normal": false,
+      "status": "run.completed",
+      "answer": "Service Sentinel-Auth sử dụng cổng kiểm toán mTLS là cổng 9443 và được kỹ sư trưởng Minh Vũ phụ trách.",
+      "answer_sha256": "2e987b72dd262df8e918727a193f5dd289bdd287c9ca8ad31a39c865663cf2b7",
+      "literal_item_recall": 1.0,
+      "baseline_literal_item_recall": 0.0,
+      "semantically_correct": true,
+      "baseline_semantically_correct": false,
+      "quality_ordinal": 2,
+      "baseline_quality_ordinal": 0,
+      "regression": false,
+      "raw_gold_evidence_recall": 0.0,
+      "fitted_gold_evidence_recall": 1.0,
+      "context": {
+        "mode": "normal",
+        "content_scope": "stored_text_only",
+        "budget_profile": "memory",
+        "state": "ready",
+        "reason": null,
+        "eligible": 180,
+        "visited": 5,
+        "evidence": [
+          {
+            "message_id": "504dd56b4c08f80f4a28f2fc525bd7d7",
+            "content_hash": "0f3d0efff0ac374a5a9dc72a1901d6fc4601c28f9d615038af6233aa9498ae40",
+            "start": 0,
+            "end": 91
+          },
+          {
+            "message_id": "bc079496712db6555be0b8fa9c9290ee",
+            "content_hash": "f303b8b6195aa543d87f078eccb87a05c624f19bbe5758e2977b6367870a7f4d",
+            "start": 0,
+            "end": 67
+          },
+          {
+            "message_id": "96ff7ce24b148b96d2ec2f4ac9a4d39f",
+            "content_hash": "b738db6d52f2f2e580f9f660458c9b081f09fa4d7fc130ff0b95ed376be5d12e",
+            "start": 0,
+            "end": 264
+          },
+          {
+            "message_id": "fe7af5a63c69411f1704f80d97b11d6d",
+            "content_hash": "ebcfb00df0d5ecfbf40e5ecf75378f30ba717acc22e49c86488a5e1a31ac058a",
+            "start": 0,
+            "end": 264
+          },
+          {
+            "message_id": "7e3730a02e7ce48fd36034ef932371a4",
+            "content_hash": "a86aa0226b662ebadd74dbe6519ee6669775bec38a526f7d9c9537e44cf0e486",
+            "start": 0,
+            "end": 263
+          }
+        ]
+      },
+      "accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 2302,
+        "output_tokens": 41,
+        "monetary_cost": null,
+        "calls": [
+          {
+            "status": "completed",
+            "input_tokens": 2302,
+            "output_tokens": 41,
+            "reserved_input_tokens": 2554,
+            "configured_retries": 0
+          }
+        ]
+      },
+      "baseline_accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 15595,
+        "output_tokens": 39,
+        "known_input_tokens": 15595,
+        "known_output_tokens": 39,
+        "monetary_cost": null,
+        "price_status": "unverified",
+        "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
+        "stream_usage_aggregation": "last cumulative snapshot, not sum",
+        "calls": [
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 15595,
+            "output_tokens": 39,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 14736,
+            "max_output_tokens": 4096,
+            "duration_ms": 21875.0,
+            "ttft_ms": 16782.0
+          }
+        ]
+      },
+      "prepare_ms": 1593.0,
+      "generation_ms": 10422.0,
+      "cold_index_ms": 41094.0,
+      "cold_index_work_units": 723199,
+      "index_template_reused": false
+    },
+    {
+      "case_id": "val-entity-bridge-vi-en",
+      "web_enabled": true,
+      "group": "normal",
+      "scenario": "entity_bridge",
+      "history_message_count": 180,
+      "long_normal": false,
+      "status": "run.completed",
+      "answer": "Service Sentinel-Auth sử dụng cổng kiểm toán mTLS là cổng 9443 và được kỹ sư trưởng Minh Vũ phụ trách.",
+      "answer_sha256": "2e987b72dd262df8e918727a193f5dd289bdd287c9ca8ad31a39c865663cf2b7",
+      "literal_item_recall": 1.0,
+      "baseline_literal_item_recall": 1.0,
+      "semantically_correct": true,
+      "baseline_semantically_correct": true,
+      "quality_ordinal": 2,
+      "baseline_quality_ordinal": 2,
+      "regression": false,
+      "raw_gold_evidence_recall": 0.0,
+      "fitted_gold_evidence_recall": 1.0,
+      "context": {
+        "mode": "normal",
+        "content_scope": "stored_text_only",
+        "budget_profile": "tool_assisted",
+        "state": "ready",
+        "reason": null,
+        "eligible": 180,
+        "visited": 5,
+        "evidence": [
+          {
+            "message_id": "504dd56b4c08f80f4a28f2fc525bd7d7",
+            "content_hash": "0f3d0efff0ac374a5a9dc72a1901d6fc4601c28f9d615038af6233aa9498ae40",
+            "start": 0,
+            "end": 91
+          },
+          {
+            "message_id": "bc079496712db6555be0b8fa9c9290ee",
+            "content_hash": "f303b8b6195aa543d87f078eccb87a05c624f19bbe5758e2977b6367870a7f4d",
+            "start": 0,
+            "end": 67
+          },
+          {
+            "message_id": "96ff7ce24b148b96d2ec2f4ac9a4d39f",
+            "content_hash": "b738db6d52f2f2e580f9f660458c9b081f09fa4d7fc130ff0b95ed376be5d12e",
+            "start": 0,
+            "end": 264
+          },
+          {
+            "message_id": "fe7af5a63c69411f1704f80d97b11d6d",
+            "content_hash": "ebcfb00df0d5ecfbf40e5ecf75378f30ba717acc22e49c86488a5e1a31ac058a",
+            "start": 0,
+            "end": 264
+          },
+          {
+            "message_id": "7e3730a02e7ce48fd36034ef932371a4",
+            "content_hash": "a86aa0226b662ebadd74dbe6519ee6669775bec38a526f7d9c9537e44cf0e486",
+            "start": 0,
+            "end": 263
+          }
+        ]
+      },
+      "accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 2691,
+        "output_tokens": 41,
+        "monetary_cost": null,
+        "calls": [
+          {
+            "status": "completed",
+            "input_tokens": 2691,
+            "output_tokens": 41,
+            "reserved_input_tokens": 2935,
+            "configured_retries": 0
+          }
+        ]
+      },
+      "baseline_accounting": {
+        "logical_calls": 2,
+        "accounting_complete": true,
+        "input_tokens": 32041,
+        "output_tokens": 78,
+        "known_input_tokens": 32041,
+        "known_output_tokens": 78,
+        "monetary_cost": null,
+        "price_status": "unverified",
+        "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
+        "stream_usage_aggregation": "last cumulative snapshot, not sum",
+        "calls": [
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 15978,
+            "output_tokens": 48,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 15072,
+            "max_output_tokens": 4096,
+            "duration_ms": 92359.0,
+            "ttft_ms": null
+          },
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 16063,
+            "output_tokens": 30,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 15198,
+            "max_output_tokens": 4096,
+            "duration_ms": 20875.0,
+            "ttft_ms": 16969.0
+          }
+        ]
+      },
+      "prepare_ms": 1609.0,
+      "generation_ms": 3735.0,
+      "cold_index_ms": 156.0,
+      "cold_index_work_units": 0,
+      "index_template_reused": true
+    },
+    {
+      "case_id": "val-dense-long-filler-vi",
+      "web_enabled": false,
+      "group": "normal",
+      "scenario": "long_filler_density",
+      "history_message_count": 160,
+      "long_normal": true,
+      "status": "run.completed",
+      "answer": "Mã chính sách lưu vết kiểm toán năm 2027 đã chốt là AUDIT-RET-731 với thời hạn lưu 36 tháng.",
+      "answer_sha256": "46fb7945ed6ac3f7431b9719ad0559282126fb4dd75c7c6fce18497e10d94659",
+      "literal_item_recall": 1.0,
+      "baseline_literal_item_recall": 0.0,
+      "semantically_correct": true,
+      "baseline_semantically_correct": false,
+      "quality_ordinal": 2,
+      "baseline_quality_ordinal": 0,
+      "regression": false,
+      "raw_gold_evidence_recall": 0.0,
+      "fitted_gold_evidence_recall": 1.0,
+      "context": {
+        "mode": "normal",
+        "content_scope": "stored_text_only",
+        "budget_profile": "memory",
+        "state": "ready",
+        "reason": null,
+        "eligible": 160,
+        "visited": 5,
+        "evidence": [
+          {
+            "message_id": "fe530fbf01e159c585ea688b10864506",
+            "content_hash": "8bc7240d310d18fe1123e7393e24c31f90d20264ed34b5cf4422a6641649c470",
+            "start": 0,
+            "end": 89
+          },
+          {
+            "message_id": "5ea69b2de1a2b34d0040320630fb0c33",
+            "content_hash": "2e1e88c5308d7b7df207eff5981949da10d409ab46c4dc9b6fff1eda18c2b46c",
+            "start": 0,
+            "end": 2969
+          },
+          {
+            "message_id": "7375310c1b28371dd86e04f0ef9fed9e",
+            "content_hash": "62b1da278f1581d244577b4e1d8200b4c9b5c09e7ddd5ee408e2c0e548b6b74f",
+            "start": 0,
+            "end": 2969
+          },
+          {
+            "message_id": "02186abb8c2f5349f1acbe28e8af6d38",
+            "content_hash": "061b10aea52612deaee06a9480e0acc2d564bfba22b4c9f6407c3616405fa843",
+            "start": 0,
+            "end": 2969
+          },
+          {
+            "message_id": "216febbc36a3fa7a151b8eef0b9514ca",
+            "content_hash": "f64915a25afde65ab930a3fb172692246b914358b676161f87c67d0c2aced476",
+            "start": 0,
+            "end": 2969
+          }
+        ]
+      },
+      "accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 5275,
+        "output_tokens": 46,
+        "monetary_cost": null,
+        "calls": [
+          {
+            "status": "completed",
+            "input_tokens": 5275,
+            "output_tokens": 46,
+            "reserved_input_tokens": 5527,
+            "configured_retries": 0
+          }
+        ]
+      },
+      "baseline_accounting": {
+        "logical_calls": 2,
+        "accounting_complete": true,
+        "input_tokens": 11427,
+        "output_tokens": 495,
+        "known_input_tokens": 11427,
+        "known_output_tokens": 495,
+        "monetary_cost": null,
+        "price_status": "unverified",
+        "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
+        "stream_usage_aggregation": "last cumulative snapshot, not sum",
+        "calls": [
+          {
+            "stage": "compression",
+            "stream": false,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 3299,
+            "output_tokens": 420,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 3077,
+            "max_output_tokens": 4096,
+            "duration_ms": 16281.0,
+            "ttft_ms": null
+          },
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 8128,
+            "output_tokens": 75,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 7779,
+            "max_output_tokens": 4096,
+            "duration_ms": 6125.0,
+            "ttft_ms": 3531.0
+          }
+        ]
+      },
+      "prepare_ms": 1219.0,
+      "generation_ms": 15375.0,
+      "cold_index_ms": 52922.0,
+      "cold_index_work_units": 4249618,
+      "index_template_reused": false
+    },
+    {
+      "case_id": "val-dense-long-filler-vi",
+      "web_enabled": true,
+      "group": "normal",
+      "scenario": "long_filler_density",
+      "history_message_count": 160,
+      "long_normal": true,
+      "status": "run.completed",
+      "answer": "Mã chính sách lưu vết kiểm toán năm 2027 là AUDIT-RET-731 và thời hạn lưu là 36 tháng.",
+      "answer_sha256": "fb8893d3b7fb8acdd11ef21ae4ed7ee5d099a5e81505cbe5dc6f62034ee3a872",
+      "literal_item_recall": 1.0,
+      "baseline_literal_item_recall": 0.0,
+      "semantically_correct": true,
+      "baseline_semantically_correct": false,
+      "quality_ordinal": 2,
+      "baseline_quality_ordinal": 0,
+      "regression": false,
+      "raw_gold_evidence_recall": 0.0,
+      "fitted_gold_evidence_recall": 1.0,
+      "context": {
+        "mode": "normal",
+        "content_scope": "stored_text_only",
+        "budget_profile": "tool_assisted",
+        "state": "partial",
+        "reason": "prompt_budget",
+        "eligible": 160,
+        "visited": 5,
+        "evidence": [
+          {
+            "message_id": "fe530fbf01e159c585ea688b10864506",
+            "content_hash": "8bc7240d310d18fe1123e7393e24c31f90d20264ed34b5cf4422a6641649c470",
+            "start": 0,
+            "end": 89
+          },
+          {
+            "message_id": "5ea69b2de1a2b34d0040320630fb0c33",
+            "content_hash": "2e1e88c5308d7b7df207eff5981949da10d409ab46c4dc9b6fff1eda18c2b46c",
+            "start": 0,
+            "end": 2969
+          }
+        ]
+      },
+      "accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 2952,
+        "output_tokens": 45,
+        "monetary_cost": null,
+        "calls": [
+          {
+            "status": "completed",
+            "input_tokens": 2952,
+            "output_tokens": 45,
+            "reserved_input_tokens": 3196,
+            "configured_retries": 0
+          }
+        ]
+      },
+      "baseline_accounting": {
+        "logical_calls": 4,
+        "accounting_complete": true,
+        "input_tokens": 29131,
+        "output_tokens": 589,
+        "known_input_tokens": 29131,
+        "known_output_tokens": 589,
+        "monetary_cost": null,
+        "price_status": "unverified",
+        "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
+        "stream_usage_aggregation": "last cumulative snapshot, not sum",
+        "calls": [
+          {
+            "stage": "compression",
+            "stream": false,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 3299,
+            "output_tokens": 423,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 3077,
+            "max_output_tokens": 4096,
+            "duration_ms": 78547.0,
+            "ttft_ms": null
+          },
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 8514,
+            "output_tokens": 21,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 8118,
+            "max_output_tokens": 4096,
+            "duration_ms": 9156.0,
+            "ttft_ms": null
+          },
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 8617,
+            "output_tokens": 47,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 8221,
+            "max_output_tokens": 4096,
+            "duration_ms": 12985.0,
+            "ttft_ms": null
+          },
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 8701,
+            "output_tokens": 98,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 8341,
+            "max_output_tokens": 4096,
+            "duration_ms": 8172.0,
+            "ttft_ms": 3204.0
+          }
+        ]
+      },
+      "prepare_ms": 1718.0,
+      "generation_ms": 7328.0,
+      "cold_index_ms": 110.0,
+      "cold_index_work_units": 0,
+      "index_template_reused": true
+    },
+    {
+      "case_id": "val-multi-decision-abstention-vi",
+      "web_enabled": false,
+      "group": "normal",
+      "scenario": "multi_decision_and_missing_field",
+      "history_message_count": 230,
+      "long_normal": true,
+      "status": "run.completed",
+      "answer": "Mã vùng lưu trữ sao lưu đã chốt là BK-NORTH-04. Lịch chạy kiểm tra toàn vẹn dữ liệu đã chốt là vào 02:30 sáng Chủ nhật. Mật khẩu khóa gốc HSM không được đề cập trong bằng chứng được cung cấp.",
+      "answer_sha256": "c83d93c3acee5d89761ce0819cf9f2a31993ae0ddb8d60842955e4809aa06c5b",
+      "literal_item_recall": 0.6666666666666666,
+      "baseline_literal_item_recall": 0.0,
+      "semantically_correct": true,
+      "baseline_semantically_correct": false,
+      "quality_ordinal": 2,
+      "baseline_quality_ordinal": 0,
+      "regression": false,
+      "raw_gold_evidence_recall": 0.0,
+      "fitted_gold_evidence_recall": 1.0,
+      "context": {
+        "mode": "normal",
+        "content_scope": "stored_text_only",
+        "budget_profile": "memory",
+        "state": "ready",
+        "reason": null,
+        "eligible": 230,
+        "visited": 5,
+        "evidence": [
+          {
+            "message_id": "819614b75d9c248b91dc8ed51333c024",
+            "content_hash": "6d7d95f1938eec267b226e7d79c1e0e6f9ee609c4468c92b3d4303e695c6bc92",
+            "start": 0,
+            "end": 79
+          },
+          {
+            "message_id": "4f567790f027a954361347c155f64e9b",
+            "content_hash": "800aa5399013eb01b0add529b391ed3868f192c054c221f4e9a6fcbbfddf6c0f",
+            "start": 0,
+            "end": 58
+          },
+          {
+            "message_id": "e8febfe4e6832ec8d6ae15c15bf21f9b",
+            "content_hash": "01f01c58be485c7db32ef30bd4d856894ae49b3f40c8252d9abe1ade99f56d5b",
+            "start": 0,
+            "end": 264
+          },
+          {
+            "message_id": "584c8dc5b85aaa6234e614ccac6417b7",
+            "content_hash": "fa1fdb8683f36b5504858b31c744c82c146e3f916b42d659a097397e3bc5c605",
+            "start": 0,
+            "end": 264
+          },
+          {
+            "message_id": "1e5b3628ace3c9733639ae5337aecf51",
+            "content_hash": "7039a7c8e58c206ee51a806bcbdf0472d8c4a4d7d31bfdd1db17f6255e9a3a5c",
+            "start": 0,
+            "end": 263
+          }
+        ]
+      },
+      "accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 2348,
+        "output_tokens": 79,
+        "monetary_cost": null,
+        "calls": [
+          {
+            "status": "completed",
+            "input_tokens": 2348,
+            "output_tokens": 79,
+            "reserved_input_tokens": 2600,
+            "configured_retries": 0
+          }
+        ]
+      },
+      "baseline_accounting": {
+        "logical_calls": 2,
+        "accounting_complete": true,
+        "input_tokens": 34809,
+        "output_tokens": 170,
+        "known_input_tokens": 34809,
+        "known_output_tokens": 170,
+        "monetary_cost": null,
+        "price_status": "unverified",
+        "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
+        "stream_usage_aggregation": "last cumulative snapshot, not sum",
+        "calls": [
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 17353,
+            "output_tokens": 20,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 16324,
+            "max_output_tokens": 4096,
+            "duration_ms": 129234.0,
+            "ttft_ms": null
+          },
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 17456,
+            "output_tokens": 150,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 16427,
+            "max_output_tokens": 4096,
+            "duration_ms": 11141.0,
+            "ttft_ms": 6766.0
+          }
+        ]
+      },
+      "prepare_ms": 1969.0,
+      "generation_ms": 5469.0,
+      "cold_index_ms": 55406.0,
+      "cold_index_work_units": 924806,
+      "index_template_reused": false
+    },
+    {
+      "case_id": "val-multi-decision-abstention-vi",
+      "web_enabled": true,
+      "group": "normal",
+      "scenario": "multi_decision_and_missing_field",
+      "history_message_count": 230,
+      "long_normal": true,
+      "status": "run.completed",
+      "answer": "Mã vùng lưu trữ sao lưu đã chốt là BK-NORTH-04. Lịch chạy kiểm tra toàn vẹn dữ liệu đã chốt là vào 02:30 sáng Chủ nhật. Mật khẩu khóa gốc HSM không được đề cập trong bằng chứng được cung cấp.",
+      "answer_sha256": "c83d93c3acee5d89761ce0819cf9f2a31993ae0ddb8d60842955e4809aa06c5b",
+      "literal_item_recall": 0.6666666666666666,
+      "baseline_literal_item_recall": 0.3333333333333333,
+      "semantically_correct": true,
+      "baseline_semantically_correct": false,
+      "quality_ordinal": 2,
+      "baseline_quality_ordinal": 1,
+      "regression": false,
+      "raw_gold_evidence_recall": 0.0,
+      "fitted_gold_evidence_recall": 1.0,
+      "context": {
+        "mode": "normal",
+        "content_scope": "stored_text_only",
+        "budget_profile": "tool_assisted",
+        "state": "ready",
+        "reason": null,
+        "eligible": 230,
+        "visited": 5,
+        "evidence": [
+          {
+            "message_id": "819614b75d9c248b91dc8ed51333c024",
+            "content_hash": "6d7d95f1938eec267b226e7d79c1e0e6f9ee609c4468c92b3d4303e695c6bc92",
+            "start": 0,
+            "end": 79
+          },
+          {
+            "message_id": "4f567790f027a954361347c155f64e9b",
+            "content_hash": "800aa5399013eb01b0add529b391ed3868f192c054c221f4e9a6fcbbfddf6c0f",
+            "start": 0,
+            "end": 58
+          },
+          {
+            "message_id": "e8febfe4e6832ec8d6ae15c15bf21f9b",
+            "content_hash": "01f01c58be485c7db32ef30bd4d856894ae49b3f40c8252d9abe1ade99f56d5b",
+            "start": 0,
+            "end": 264
+          },
+          {
+            "message_id": "584c8dc5b85aaa6234e614ccac6417b7",
+            "content_hash": "fa1fdb8683f36b5504858b31c744c82c146e3f916b42d659a097397e3bc5c605",
+            "start": 0,
+            "end": 264
+          },
+          {
+            "message_id": "1e5b3628ace3c9733639ae5337aecf51",
+            "content_hash": "7039a7c8e58c206ee51a806bcbdf0472d8c4a4d7d31bfdd1db17f6255e9a3a5c",
+            "start": 0,
+            "end": 263
+          }
+        ]
+      },
+      "accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 2737,
+        "output_tokens": 74,
+        "monetary_cost": null,
+        "calls": [
+          {
+            "status": "completed",
+            "input_tokens": 2737,
+            "output_tokens": 74,
+            "reserved_input_tokens": 2981,
+            "configured_retries": 0
+          }
+        ]
+      },
+      "baseline_accounting": {
+        "logical_calls": 2,
+        "accounting_complete": true,
+        "input_tokens": 35654,
+        "output_tokens": 167,
+        "known_input_tokens": 35654,
+        "known_output_tokens": 167,
+        "monetary_cost": null,
+        "price_status": "unverified",
+        "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
+        "stream_usage_aggregation": "last cumulative snapshot, not sum",
+        "calls": [
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 17736,
+            "output_tokens": 89,
+            "cached_tokens": 800,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 16660,
+            "max_output_tokens": 4096,
+            "duration_ms": 17672.0,
+            "ttft_ms": null
+          },
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 17918,
+            "output_tokens": 78,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 16885,
+            "max_output_tokens": 4096,
+            "duration_ms": 88968.0,
+            "ttft_ms": 85703.0
+          }
+        ]
+      },
+      "prepare_ms": 1484.0,
+      "generation_ms": 5172.0,
+      "cold_index_ms": 156.0,
+      "cold_index_work_units": 0,
+      "index_template_reused": true
+    },
+    {
+      "case_id": "val-bilingual-override-vi-en",
+      "web_enabled": false,
+      "group": "normal",
+      "scenario": "bilingual_policy_override",
+      "history_message_count": 150,
+      "long_normal": false,
+      "status": "run.completed",
+      "answer": "The current webhook signing profile is ED25519-V3 with a retry window of 120s.",
+      "answer_sha256": "17d50341f4c17608fcb0dc4d0a1670ef3a7373d73d8607b94dc032ba5023497f",
+      "literal_item_recall": 1.0,
+      "baseline_literal_item_recall": 0.0,
+      "semantically_correct": true,
+      "baseline_semantically_correct": false,
+      "quality_ordinal": 2,
+      "baseline_quality_ordinal": 0,
+      "regression": false,
+      "raw_gold_evidence_recall": 0.0,
+      "fitted_gold_evidence_recall": 1.0,
+      "context": {
+        "mode": "normal",
+        "content_scope": "stored_text_only",
+        "budget_profile": "memory",
+        "state": "ready",
+        "reason": null,
+        "eligible": 150,
+        "visited": 5,
+        "evidence": [
+          {
+            "message_id": "37abae80165792d4ad2b528491f0d590",
+            "content_hash": "362e418fdc11ece8414232f2f3423530b76e470972f62c0ba09aaae3d21ceca1",
+            "start": 0,
+            "end": 69
+          },
+          {
+            "message_id": "4d7f1eb1cc2e0ad784ae5eb7cd77aba2",
+            "content_hash": "5ef7fdf1b7800b595559f790553d1f16a3a035c81a1ded619cb663f5e2f11015",
+            "start": 0,
+            "end": 98
+          },
+          {
+            "message_id": "619e5786a5867d3032f911a31e387496",
+            "content_hash": "a60ebcaf2979f0ccab84a8df0786de691abdd9ad88a5d9b96b1c7f5aaa350427",
+            "start": 0,
+            "end": 263
+          },
+          {
+            "message_id": "b9f1c616018fee17d00188355d24817d",
+            "content_hash": "7039a7c8e58c206ee51a806bcbdf0472d8c4a4d7d31bfdd1db17f6255e9a3a5c",
+            "start": 0,
+            "end": 263
+          },
+          {
+            "message_id": "d8656aa88b62311522d5c5e3536f824b",
+            "content_hash": "bbd6d0f25c1d5eb8923a3de6d5aa3ae259ba7a352809d89847d19cb014fe7447",
+            "start": 0,
+            "end": 263
+          }
+        ]
+      },
+      "accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 2311,
+        "output_tokens": 36,
+        "monetary_cost": null,
+        "calls": [
+          {
+            "status": "completed",
+            "input_tokens": 2311,
+            "output_tokens": 36,
+            "reserved_input_tokens": 2563,
+            "configured_retries": 0
+          }
+        ]
+      },
+      "baseline_accounting": {
+        "logical_calls": 2,
+        "accounting_complete": true,
+        "input_tokens": 26451,
+        "output_tokens": 44,
+        "known_input_tokens": 26451,
+        "known_output_tokens": 44,
+        "monetary_cost": null,
+        "price_status": "unverified",
+        "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
+        "stream_usage_aggregation": "last cumulative snapshot, not sum",
+        "calls": [
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 13174,
+            "output_tokens": 11,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 12496,
+            "max_output_tokens": 4096,
+            "duration_ms": 61359.0,
+            "ttft_ms": null
+          },
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 13277,
+            "output_tokens": 33,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 12601,
+            "max_output_tokens": 4096,
+            "duration_ms": 62141.0,
+            "ttft_ms": 59734.0
+          }
+        ]
+      },
+      "prepare_ms": 1734.0,
+      "generation_ms": 3906.0,
+      "cold_index_ms": 39985.0,
+      "cold_index_work_units": 602289,
+      "index_template_reused": false
+    },
+    {
+      "case_id": "val-bilingual-override-vi-en",
+      "web_enabled": true,
+      "group": "normal",
+      "scenario": "bilingual_policy_override",
+      "history_message_count": 150,
+      "long_normal": false,
+      "status": "run.completed",
+      "answer": "The current webhook signing profile is ED25519-V3 with a retry window of 120 seconds.",
+      "answer_sha256": "96b113799c3072e9d431bf5e20ae9541924e1a7845d9ab603d1684d490dbb25b",
+      "literal_item_recall": 1.0,
+      "baseline_literal_item_recall": 1.0,
+      "semantically_correct": true,
+      "baseline_semantically_correct": true,
+      "quality_ordinal": 2,
+      "baseline_quality_ordinal": 2,
+      "regression": false,
+      "raw_gold_evidence_recall": 0.0,
+      "fitted_gold_evidence_recall": 1.0,
+      "context": {
+        "mode": "normal",
+        "content_scope": "stored_text_only",
+        "budget_profile": "tool_assisted",
+        "state": "ready",
+        "reason": null,
+        "eligible": 150,
+        "visited": 5,
+        "evidence": [
+          {
+            "message_id": "37abae80165792d4ad2b528491f0d590",
+            "content_hash": "362e418fdc11ece8414232f2f3423530b76e470972f62c0ba09aaae3d21ceca1",
+            "start": 0,
+            "end": 69
+          },
+          {
+            "message_id": "4d7f1eb1cc2e0ad784ae5eb7cd77aba2",
+            "content_hash": "5ef7fdf1b7800b595559f790553d1f16a3a035c81a1ded619cb663f5e2f11015",
+            "start": 0,
+            "end": 98
+          },
+          {
+            "message_id": "619e5786a5867d3032f911a31e387496",
+            "content_hash": "a60ebcaf2979f0ccab84a8df0786de691abdd9ad88a5d9b96b1c7f5aaa350427",
+            "start": 0,
+            "end": 263
+          },
+          {
+            "message_id": "b9f1c616018fee17d00188355d24817d",
+            "content_hash": "7039a7c8e58c206ee51a806bcbdf0472d8c4a4d7d31bfdd1db17f6255e9a3a5c",
+            "start": 0,
+            "end": 263
+          },
+          {
+            "message_id": "d8656aa88b62311522d5c5e3536f824b",
+            "content_hash": "bbd6d0f25c1d5eb8923a3de6d5aa3ae259ba7a352809d89847d19cb014fe7447",
+            "start": 0,
+            "end": 263
+          }
+        ]
+      },
+      "accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 2700,
+        "output_tokens": 36,
+        "monetary_cost": null,
+        "calls": [
+          {
+            "status": "completed",
+            "input_tokens": 2700,
+            "output_tokens": 36,
+            "reserved_input_tokens": 2944,
+            "configured_retries": 0
+          }
+        ]
+      },
+      "baseline_accounting": {
+        "logical_calls": 3,
+        "accounting_complete": true,
+        "input_tokens": 40954,
+        "output_tokens": 164,
+        "known_input_tokens": 40954,
+        "known_output_tokens": 164,
+        "monetary_cost": null,
+        "price_status": "unverified",
+        "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
+        "stream_usage_aggregation": "last cumulative snapshot, not sum",
+        "calls": [
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 13557,
+            "output_tokens": 12,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 12832,
+            "max_output_tokens": 4096,
+            "duration_ms": 26672.0,
+            "ttft_ms": null
+          },
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 13660,
+            "output_tokens": 40,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 12937,
+            "max_output_tokens": 4096,
+            "duration_ms": 5422.0,
+            "ttft_ms": null
+          },
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 13737,
+            "output_tokens": 112,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 13060,
+            "max_output_tokens": 4096,
+            "duration_ms": 27937.0,
+            "ttft_ms": 22890.0
+          }
+        ]
+      },
+      "prepare_ms": 1547.0,
+      "generation_ms": 17078.0,
+      "cold_index_ms": 110.0,
+      "cold_index_work_units": 0,
+      "index_template_reused": true
+    },
+    {
+      "case_id": "val-full-session-decisions-vi",
+      "web_enabled": false,
+      "group": "full_session",
+      "scenario": "full_session_multi_decision_ledger",
+      "history_message_count": 220,
+      "long_normal": false,
+      "status": "run.completed",
+      "answer": "Kết quả chưa đầy đủ: chưa thể xác nhận bao phủ toàn bộ lịch sử.\n\nUNKNOWN",
+      "answer_sha256": "053abb8d5c5261db8d0e52b3aad5c914b6775b48a586c75587861d1f4fb3b261",
+      "literal_item_recall": 0.0,
+      "baseline_literal_item_recall": 0.0,
+      "semantically_correct": false,
+      "baseline_semantically_correct": false,
+      "quality_ordinal": 0,
+      "baseline_quality_ordinal": 0,
+      "regression": false,
+      "raw_gold_evidence_recall": null,
+      "fitted_gold_evidence_recall": null,
+      "context": {
+        "mode": "full_session",
+        "content_scope": "stored_text_only",
+        "budget_profile": "full_session",
+        "state": "partial",
+        "reason": "map_not_ready",
+        "eligible": 220,
+        "visited": 0,
+        "evidence": []
+      },
+      "accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 29596,
+        "output_tokens": 159,
+        "monetary_cost": null,
+        "calls": [
+          {
+            "status": "completed",
+            "input_tokens": 29596,
+            "output_tokens": 159,
+            "reserved_input_tokens": 29852,
+            "configured_retries": 0
+          }
+        ]
+      },
+      "baseline_accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 17214,
+        "output_tokens": 86,
+        "known_input_tokens": 17214,
+        "known_output_tokens": 86,
+        "monetary_cost": null,
+        "price_status": "unverified",
+        "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
+        "stream_usage_aggregation": "last cumulative snapshot, not sum",
+        "calls": [
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 17214,
+            "output_tokens": 86,
+            "cached_tokens": 800,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 16202,
+            "max_output_tokens": 4096,
+            "duration_ms": 18734.0,
+            "ttft_ms": 5984.0
+          }
+        ]
+      },
+      "prepare_ms": 375.0,
+      "generation_ms": 18969.0,
+      "cold_index_ms": 0.0,
+      "cold_index_work_units": null,
+      "index_template_reused": null
+    },
+    {
+      "case_id": "val-full-session-decisions-vi",
+      "web_enabled": true,
+      "group": "full_session",
+      "scenario": "full_session_multi_decision_ledger",
+      "history_message_count": 220,
+      "long_normal": false,
+      "status": "run.completed",
+      "answer": "Kết quả chưa đầy đủ: chưa thể xác nhận bao phủ toàn bộ lịch sử.\n\nUNKNOWN",
+      "answer_sha256": "053abb8d5c5261db8d0e52b3aad5c914b6775b48a586c75587861d1f4fb3b261",
+      "literal_item_recall": 0.0,
+      "baseline_literal_item_recall": 0.5,
+      "semantically_correct": false,
+      "baseline_semantically_correct": false,
+      "quality_ordinal": 0,
+      "baseline_quality_ordinal": 1,
+      "regression": true,
+      "raw_gold_evidence_recall": null,
+      "fitted_gold_evidence_recall": null,
+      "context": {
+        "mode": "full_session",
+        "content_scope": "stored_text_only",
+        "budget_profile": "full_session",
+        "state": "partial",
+        "reason": "map_not_ready",
+        "eligible": 220,
+        "visited": 0,
+        "evidence": []
+      },
+      "accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 29596,
+        "output_tokens": 188,
+        "monetary_cost": null,
+        "calls": [
+          {
+            "status": "completed",
+            "input_tokens": 29596,
+            "output_tokens": 188,
+            "reserved_input_tokens": 29852,
+            "configured_retries": 0
+          }
+        ]
+      },
+      "baseline_accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 17597,
+        "output_tokens": 116,
+        "known_input_tokens": 17597,
+        "known_output_tokens": 116,
+        "monetary_cost": null,
+        "price_status": "unverified",
+        "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
+        "stream_usage_aggregation": "last cumulative snapshot, not sum",
+        "calls": [
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 17597,
+            "output_tokens": 116,
+            "cached_tokens": 1568,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 16538,
+            "max_output_tokens": 4096,
+            "duration_ms": 21781.0,
+            "ttft_ms": 5453.0
+          }
+        ]
+      },
+      "prepare_ms": 1047.0,
+      "generation_ms": 22140.0,
+      "cold_index_ms": 0.0,
+      "cold_index_work_units": null,
+      "index_template_reused": null
+    },
+    {
+      "case_id": "val-full-session-timeline-en",
+      "web_enabled": false,
+      "group": "full_session",
+      "scenario": "full_session_timeline_audit",
+      "history_message_count": 240,
+      "long_normal": false,
+      "status": "run.failed",
+      "answer": "",
+      "answer_sha256": null,
+      "literal_item_recall": 0.0,
+      "baseline_literal_item_recall": 0.0,
+      "semantically_correct": false,
+      "baseline_semantically_correct": false,
+      "quality_ordinal": 0,
+      "baseline_quality_ordinal": 0,
+      "regression": false,
+      "raw_gold_evidence_recall": null,
+      "fitted_gold_evidence_recall": null,
+      "context": {
+        "mode": "full_session",
+        "state": "partial",
+        "reason": "generation_failed"
+      },
+      "accounting": {
+        "logical_calls": 1,
+        "accounting_complete": false,
+        "input_tokens": null,
+        "output_tokens": null,
+        "monetary_cost": null,
+        "calls": [
+          {
+            "status": "failed",
+            "input_tokens": null,
+            "output_tokens": null,
+            "reserved_input_tokens": 29874,
+            "configured_retries": 0
+          }
+        ]
+      },
+      "baseline_accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 17194,
+        "output_tokens": 1836,
+        "known_input_tokens": 17194,
+        "known_output_tokens": 1836,
+        "monetary_cost": null,
+        "price_status": "unverified",
+        "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
+        "stream_usage_aggregation": "last cumulative snapshot, not sum",
+        "calls": [
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 17194,
+            "output_tokens": 1836,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 16209,
+            "max_output_tokens": 4096,
+            "duration_ms": 75922.0,
+            "ttft_ms": 12531.0
+          }
+        ]
+      },
+      "prepare_ms": 406.0,
+      "generation_ms": 61266.0,
+      "cold_index_ms": 0.0,
+      "cold_index_work_units": null,
+      "index_template_reused": null
+    },
+    {
+      "case_id": "val-full-session-timeline-en",
+      "web_enabled": true,
+      "group": "full_session",
+      "scenario": "full_session_timeline_audit",
+      "history_message_count": 240,
+      "long_normal": false,
+      "status": "run.failed",
+      "answer": "",
+      "answer_sha256": null,
+      "literal_item_recall": 0.0,
+      "baseline_literal_item_recall": 0.0,
+      "semantically_correct": false,
+      "baseline_semantically_correct": false,
+      "quality_ordinal": 0,
+      "baseline_quality_ordinal": 0,
+      "regression": false,
+      "raw_gold_evidence_recall": null,
+      "fitted_gold_evidence_recall": null,
+      "context": {
+        "mode": "full_session",
+        "state": "partial",
+        "reason": "generation_failed"
+      },
+      "accounting": {
+        "logical_calls": 1,
+        "accounting_complete": false,
+        "input_tokens": null,
+        "output_tokens": null,
+        "monetary_cost": null,
+        "calls": [
+          {
+            "status": "failed",
+            "input_tokens": null,
+            "output_tokens": null,
+            "reserved_input_tokens": 29874,
+            "configured_retries": 0
+          }
+        ]
+      },
+      "baseline_accounting": {
+        "logical_calls": 1,
+        "accounting_complete": true,
+        "input_tokens": 17577,
+        "output_tokens": 4096,
+        "known_input_tokens": 17577,
+        "known_output_tokens": 4096,
+        "monetary_cost": null,
+        "price_status": "unverified",
+        "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
+        "stream_usage_aggregation": "last cumulative snapshot, not sum",
+        "calls": [
+          {
+            "stage": "generation",
+            "stream": true,
+            "status": "completed",
+            "in_flight": false,
+            "input_tokens": 17577,
+            "output_tokens": 4096,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "usage_snapshots": 1,
+            "observed_deployment_attempts": 1,
+            "observed_deployment_failures": 0,
+            "configured_retries": 2,
+            "estimated_input_tokens": 16545,
+            "max_output_tokens": 4096,
+            "duration_ms": 188968.0,
+            "ttft_ms": 20390.0
+          }
+        ]
+      },
+      "prepare_ms": 968.0,
+      "generation_ms": 61797.0,
+      "cold_index_ms": 0.0,
+      "cold_index_work_units": null,
+      "index_template_reused": null
+    }
+  ]
+}
