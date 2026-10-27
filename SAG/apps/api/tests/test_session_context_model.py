@@ -27,6 +27,7 @@ def work(calls=2):
 async def test_bounded_provider_disables_retries_and_uses_last_cumulative_usage(monkeypatch):
     async def completion(settings, **kwargs):
         assert settings.llm_max_retries == 0 and settings.llm_max_tokens == 4096
+        assert kwargs["response_format"] == {"type": "json_object"}
         assert kwargs["stream_options"] == {"include_usage": True}
 
         async def chunks():

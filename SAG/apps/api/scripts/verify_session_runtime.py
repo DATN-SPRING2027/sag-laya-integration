@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import copy
 import hashlib
+import importlib.metadata
 import json
 import logging
 import time
@@ -31,6 +32,7 @@ from sag_api.services import agent_domain, agent_service
 from sag_api.services.eval.session_context_accounting import CallLedger, TrackedLLM
 from sag_api.services.session_context import model
 from sag_api.services.session_context.budget import BudgetLimits, BudgetState
+from sag_api.services.session_context.graph import ENCODER, NER
 from sag_api.services.session_context.index import sync_index
 from sag_api.services.session_context.runtime import configured_encoder
 from sag_api.services.session_context.scope import resolve_scope
@@ -178,6 +180,37 @@ async def run(args):
             "results": [],
             "scope": "synthetic trusted provenance; source-free; cold index separate; actual runtime/SDK",
             "caps": {"calls": args.max_calls, "seconds": args.max_seconds, "tokens": args.max_tokens},
+            "config": {
+                key: getattr(settings, key)
+                for key in (
+                    "llm_provider",
+                    "llm_model",
+                    "llm_context_window",
+                    "llm_max_tokens",
+                    "llm_max_retries",
+                    "llm_timeout_ms",
+                    "llm_temperature",
+                    "agent_max_steps",
+                    "history_load_limit",
+                    "history_keep_recent",
+                )
+            },
+            "provider_extra_body_sha256": hashlib.sha256(
+                json.dumps(settings.llm_extra_body, sort_keys=True).encode()
+            ).hexdigest(),
+            "models": {"encoder": ENCODER, "ner": NER, "tokenizer": model.TOKENIZER},
+            "dependency_versions": {
+                name: importlib.metadata.version(name)
+                for name in (
+                    "openai",
+                    "httpx",
+                    "litellm",
+                    "sqlalchemy",
+                    "transformers",
+                    "torch",
+                    "sentence-transformers",
+                )
+            },
         }
     output.parent.mkdir(parents=True, exist_ok=True)
     previous = report.get("experiment_accounting", {})

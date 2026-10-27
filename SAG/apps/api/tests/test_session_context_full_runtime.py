@@ -215,3 +215,42 @@ async def test_full_runtime_unknown_usage_stops_after_map_and_never_claims_compl
         if event.type == "run.completed":
             assert event.data["payload"]["session_context"]["state"] == "partial"
             assert "chưa đầy đủ" in event.data["payload"]["output"][:160].casefold()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("quoted_map", [False, True])
+async def test_native_full_runtime_accepts_id_only_reduce_with_canonical_map_provenance(storage_db, monkeypatch,
+                                                                                       quoted_map):
+    factory, scope = storage_db
+    agent, plan = await full_plan(factory, scope)
+
+    class ReferenceOnlyBoundary(ProviderBoundary):
+        async def __call__(self, settings, **request):
+            assert request["response_format"] == {"type": "json_object"}
+            response = await super().__call__(settings, **request)
+            content = response["choices"][0]["message"]["content"]
+            output = json.loads(content)
+            if "items" in output:
+                for item in output["items"]:
+                    for support in item["supports"]:
+                        if quoted_map:
+                            support["quote"] = support["quote"].split(":", 1)[0]
+                        else:
+                            support.pop("quote")
+            else:
+                output["supports"] = [{"id": support["id"]} for support in output["supports"]]
+            response["choices"][0]["message"]["content"] = json.dumps(output)
+            return response
+
+    provider = ReferenceOnlyBoundary()
+    monkeypatch.setattr(model_module, "session_completion", provider)
+    events = [event async for event in stream(factory, scope, agent, plan)]
+    terminal = next(event.data["payload"] for event in events if event.type == "run.completed")
+    assert terminal["session_context"]["state"] == "ready" and terminal["answer_status"] == "answered"
+    assert all(decision in terminal["output"] for decision in ("A-100", "Z-900"))
+    assert terminal["session_accounting"]["logical_calls"] == len(provider.requests) == 2
+    assert terminal["session_accounting"]["accounting_complete"] is True
+    async with factory() as session:
+        from sag_api.db.models import SessionMessageProvenance
+        provenance = await session.get(SessionMessageProvenance, terminal["message_id"])
+        assert {ref["message_id"] for ref in provenance.dependencies} == {"first", "middle", "last", "current"}

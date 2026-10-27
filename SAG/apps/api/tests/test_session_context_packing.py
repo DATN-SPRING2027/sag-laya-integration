@@ -64,7 +64,21 @@ def test_prompt_order_metadata_does_not_count_rows_outside_selected_authorized_e
 
 
 def test_multiple_exact_quotes_can_support_several_items_from_one_message():
-    raw=json.dumps({"answer":"I confirm BLUE","supports":[{"id":"S1","quote":"I confirm"},
-                                                         {"id":"S1","quote":"BLUE"}]})
-    answer,supports=decode_memory_answer(raw,evidence()[:1])
-    assert answer=="I confirm BLUE" and len(supports)==2
+    raw = json.dumps(
+        {"answer": "I confirm BLUE", "supports": [{"id": "S1", "quote": "I confirm"}, {"id": "S1", "quote": "BLUE"}]}
+    )
+    answer, supports = decode_memory_answer(raw, evidence()[:1])
+    assert answer == "I confirm BLUE" and len(supports) == 2
+
+
+def test_reference_only_protocol_resolves_original_quote_and_keeps_invalid_ids_fail_closed():
+    raw = json.dumps({"answer": "BLUE", "supports": [{"id": "S1"}]})
+    answer, supports = decode_memory_answer(raw, evidence(), allow_reference_only=True)
+    assert answer == "BLUE" and supports == [{"id": "S1", "quote": "I confirm BLUE."}]
+    assert decode_memory_answer(raw, evidence())[0] == "UNKNOWN"
+    assert decode_memory_answer(raw.replace("S1", "S9"), evidence(), allow_reference_only=True)[0] == "UNKNOWN"
+    # A supplied bad quote is never repaired or promoted to authority.
+    bad = json.dumps({"answer": "RED", "supports": [{"id": "S1", "quote": "confirm RED"}]})
+    assert decode_memory_answer(bad, evidence(), allow_reference_only=True)[0] == "UNKNOWN"
+    # Removed evidence cannot be restored merely by its original stable ID.
+    assert decode_memory_answer(raw, evidence()[1:], original=evidence(), allow_reference_only=True)[0] == "UNKNOWN"

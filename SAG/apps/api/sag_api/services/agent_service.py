@@ -804,7 +804,7 @@ async def _generate_stream(
                     "Bằng chứng SESSION_EVIDENCE_JSON đã được kiểm tra quyền cho cuộc chat này. "
                     "Có thể dùng trực tiếp để trả lời về lời nói/quyết định trong cuộc chat, kể cả khi tắt Internet; "
                     "không coi đó là bằng chứng tài liệu bên ngoài. Giữ đúng JSON answer/supports "
-                    "và trích nguyên văn quote từ evidence. Nếu không có căn cứ, answer là UNKNOWN."
+                    "và chọn ID evidence hỗ trợ; backend trích quote gốc. Nếu không có căn cứ, answer là UNKNOWN."
                 )
             run_messages = _append_current_scene(list(plan.messages), scene_notes)
             # Freeze the actual initial input before the runtime appends model
@@ -1012,6 +1012,7 @@ async def _generate_stream(
                         raw_output, memory_supports = decode_memory_answer(
                             raw_output, memory.resolved, original=memory.original,
                             max_supports=8192 if memory.selection.mode == "full_session" else 128,
+                            allow_reference_only=True,
                         )
                         if memory.selection.mode == "full_session" and memory.first_model_messages:
                             frozen_prompt_preview = build_prompt_preview(memory.first_model_messages)

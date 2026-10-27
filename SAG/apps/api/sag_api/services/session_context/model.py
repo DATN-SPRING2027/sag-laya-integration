@@ -113,7 +113,7 @@ class BudgetedLLM(LLMClient):
 
         try:
             async with asyncio.timeout(max(0, self.budget.limits.deadline - self.budget.clock())):
-                request = {"messages": messages, "stream": stream}
+                request = {"messages": messages, "stream": stream, "response_format": {"type": "json_object"}}
                 if stream:
                     request["stream_options"] = {"include_usage": True}
                 if tools:

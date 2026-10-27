@@ -39,12 +39,19 @@ async def full_context(factory, scope, *, unknown_assistant=False, oversized_mid
 class SemanticModel:
     """Exact fixture semantics and real budget accounting at each fake dispatch."""
 
-    def __init__(self, context, *, corrupt_quote=False, missing_usage=False, cancel=False, unvisited_support=False):
+    def __init__(self, context, *, corrupt_quote=False, missing_usage=False, cancel=False, unvisited_support=False,
+                 reference_only_map=False, reference_only_reduce=False, reduce_id=None, map_id=None,
+                 corrupt_reduce_quote=False):
         self.context = context
         self.corrupt_quote = corrupt_quote
         self.missing_usage = missing_usage
         self.cancel = cancel
         self.unvisited_support = unvisited_support
+        self.reference_only_map = reference_only_map
+        self.reference_only_reduce = reference_only_reduce
+        self.reduce_id = reduce_id
+        self.map_id = map_id
+        self.corrupt_reduce_quote = corrupt_reduce_quote
         self.requests = []
         self.map_batches = []
         self.reduce_items = []
@@ -66,7 +73,9 @@ class SemanticModel:
             for item in payload:
                 if item["text"].startswith("DECISION"):
                     quote = item["text"].split("\n", 1)[0]
-                    support = {"id": item["id"], "quote": "invalid raw quote" if self.corrupt_quote else quote}
+                    support = {"id": self.map_id or item["id"]}
+                    if self.corrupt_quote or not self.reference_only_map:
+                        support["quote"] = "invalid raw quote" if self.corrupt_quote else quote
                     items.append({"text": quote, "supports": [support]})
             output = {"items": items}
         else:
@@ -74,6 +83,13 @@ class SemanticModel:
             self.reduce_items = payload
             output = {"answer": "\n".join(item["text"] for item in payload),
                       "supports": [support for item in payload for support in item["supports"]]}
+            if self.reference_only_reduce:
+                output["supports"] = [{"id": support["id"]} for support in output["supports"]]
+            if self.reduce_id:
+                output = {"answer": "UNMAPPED-REDUCE-CLAIM", "supports": [{"id": self.reduce_id}]}
+            if self.corrupt_reduce_quote:
+                output = {"answer": "INVALID-QUOTE-CLAIM",
+                          "supports": [{"id": payload[0]["supports"][0]["id"], "quote": "invalid raw quote"}]}
             if self.unvisited_support:
                 # Adversarial model output: this quote exists in the authorized
                 # snapshot, but was never mapped or sent as a reduce item.
@@ -187,3 +203,65 @@ async def test_reduce_cannot_publish_support_from_unvisited_original_outside_map
                  if item.span.ref.message_id in result.visited_ids}
     assert {support["id"] for support in result.supports} <= known_ids
     assert "D-7" not in result.answer
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reference_only_map", [True, False])
+async def test_id_only_reduce_uses_exact_canonical_mapped_pairs_not_expanded_original_span(storage_db,
+                                                                                        reference_only_map):
+    factory, scope = storage_db
+    context = await full_context(factory, scope)
+    model = SemanticModel(context, reference_only_map=reference_only_map, reference_only_reduce=True)
+    result = await aggregate_session(context, model, QUERY, input_limit=1500)
+    assert result.complete is True and result.reason is None
+    assert model.reduce_items
+    expected = {(support["id"], support["quote"]) for item in model.reduce_items for support in item["supports"]}
+    assert {(support["id"], support["quote"]) for support in result.supports} == expected
+    assert all(f"D-{index}" in result.answer for index in (0, 3, 7))
+    known = {f"S{i}": item for i, item in enumerate(context.original, start=1)}
+    for support in result.supports:
+        assert support["quote"] in known[support["id"]].text
+        if reference_only_map:
+            assert support["quote"] == known[support["id"]].text
+        else:
+            assert support["quote"] != known[support["id"]].text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reduce_id", ["S999", "S2"])
+async def test_id_only_reduce_rejects_unknown_or_visited_but_unmapped_reference(storage_db, reduce_id):
+    factory, scope = storage_db
+    context = await full_context(factory, scope)
+    model = SemanticModel(context, reference_only_map=True, reference_only_reduce=True, reduce_id=reduce_id)
+    result = await aggregate_session(context, model, QUERY, input_limit=1500)
+    assert_visible_partial(result)
+    assert result.visited_ids == context.selection.coverage.eligible_ids
+    assert model.reduce_items
+    assert result.reason == "synthesis_not_ready"
+    assert "UNMAPPED-REDUCE-CLAIM" not in result.answer
+    assert reduce_id not in {support["id"] for support in result.supports}
+
+
+@pytest.mark.asyncio
+async def test_id_only_map_cannot_reference_authorized_message_outside_current_batch(storage_db):
+    factory, scope = storage_db
+    context = await full_context(factory, scope)
+    model = SemanticModel(context, reference_only_map=True, reference_only_reduce=True, map_id="S8")
+    result = await aggregate_session(context, model, QUERY, input_limit=600)
+    assert_visible_partial(result)
+    assert len(model.map_batches) == 1 and "S8" not in {item["id"] for item in model.map_batches[0]}
+    assert not result.visited_ids and not result.supports
+    assert result.reason == "map_not_ready"
+
+
+@pytest.mark.asyncio
+async def test_reference_only_protocol_never_repairs_explicit_invalid_reduce_quote(storage_db):
+    factory, scope = storage_db
+    context = await full_context(factory, scope)
+    model = SemanticModel(context, reference_only_map=True, reference_only_reduce=True, corrupt_reduce_quote=True)
+    result = await aggregate_session(context, model, QUERY, input_limit=1500)
+    assert_visible_partial(result)
+    assert "INVALID-QUOTE-CLAIM" not in result.answer
+    assert model.reduce_items
+    assert all(support["quote"] != "invalid raw quote" for support in result.supports)
+    assert result.reason == "synthesis_not_ready"

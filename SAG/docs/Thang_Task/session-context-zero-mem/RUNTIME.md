@@ -61,3 +61,10 @@ flowchart LR
   H --> I[Persist answer and transitive dependencies]
   I --> J[Existing SSE output with visible partial status]
 ```
+
+
+## Model reference protocol v2 (pre-holdout calibration correction)
+
+Observed v2 maps can fail exact-quote copying even when IDs and evidence are available. The internal model may now return supports[{id}] only; an explicit decoder opt-in resolves the whole exact authorized span text on the server. This preserves original immutable span/hash/source/dependency authority without asking the model to reproduce text bytes. Existing supplied quotes remain strictly validated, never repaired; unknown/unselected IDs fail closed. Default decoder stays strict for other callers. Intermediate maps materialize canonical id/quote pairs; reduce may choose only pairs represented by validated intermediate items. Semantic entailment still requires evaluation.
+
+Bounded session model calls request response_format=json_object. Primary SiliconFlow docs define JSON mode; two explicit actual SDK preflight requests verified plain JSON and forced native function-tool mode on the configured Qwen3-8B route (209input+10output tokens, no retries). Result saved locally; four browser requests and these two preflight requests are outside the paired ledger, so no global money-saving claim is made. No JSON-schema support is assumed. This is applied only before final calibration/holdout and does not weaken numeric gates or add retry/repair calls.
