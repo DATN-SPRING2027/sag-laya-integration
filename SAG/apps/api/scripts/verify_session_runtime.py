@@ -146,7 +146,7 @@ async def candidate(case, *, web_enabled):
                 result["raw_selected_evidence"] = [
                     {
                         "message_id": item.span.ref.message_id,
-                        "role": item.role,
+                        "kind": item.kind,
                         "text": item.text,
                     }
                     for item in plan.session_context.original
