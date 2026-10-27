@@ -102,9 +102,11 @@ async def test_native_lease_blocks_concurrent_mutation_until_publication(native_
             )
             await session.commit()
     dispatched = asyncio.Event()
+    writer_pids = []
 
     async def writer():
         async with factory() as session:
+            writer_pids.append(await session.scalar(text("SELECT pg_backend_pid()")))
             dispatched.set()
             if mutation == "message_delete":
                 await session.execute(delete(Message).where(Message.id == "fact"))
@@ -125,8 +127,14 @@ async def test_native_lease_blocks_concurrent_mutation_until_publication(native_
             await context.lock_sources({"source"}, principal(scope))
         task = asyncio.create_task(writer())
         await dispatched.wait()
-        await asyncio.sleep(0.2)
-        assert not task.done(), "mutation bypassed actual PostgreSQL shared evidence lock"
+        # Observe the server's lock wait, rather than infer blocking from a
+        # sleeping/slow client that might not have submitted its mutation yet.
+        async with asyncio.timeout(5):
+            while not await context.lease_session.scalar(
+                text("SELECT cardinality(pg_blocking_pids(:pid)) > 0"), {"pid": writer_pids[0]}
+            ):
+                assert not task.done(), "mutation bypassed actual PostgreSQL shared evidence lock"
+                await asyncio.sleep(0.02)
         await context.revalidate(context.lease_session, principal(scope))
         # Separate publication session can insert its own answer/provenance while
         # selected originals remain locked, with no self-deadlock.
