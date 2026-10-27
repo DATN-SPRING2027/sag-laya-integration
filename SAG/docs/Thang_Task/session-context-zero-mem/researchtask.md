@@ -1,5 +1,15 @@
 # Research: Context toàn session chat
 
+## Review độc lập và bàn giao lên PR40 — 27/10/2026
+
+Thang yêu cầu review độc lập, sau đó yêu cầu push kết quả lên cùng PR40. Snapshot runtime được review là `05b5b19c00822d124f351dc5019e64e0effe3605`, base `77722700fa8ed83112bff6640213b12d0235c11c`. Báo cáo và reproduction nằm tại [reviews/2026-10-27-independent/REVIEW.md](reviews/2026-10-27-independent/REVIEW.md).
+
+Kết luận: merge REQUEST CHANGES, rollout NO-GO, giữ OFF. Bốn lỗi mới đã tái hiện: full-session bypass explicit Source grounding, PostgreSQL ask/delete deadlock40P01, thiếu provenance của failed map batch đã dispatch, và evaluation resume chấp nhận config/caps mới nhưng giữ manifest cũ. Hai nhóm chất lượng normal/full-session đã biết còn nguyên; không coi traversal complete là semantic recall.
+
+Kiểm chứng lượt review: full offline304PASS/5SKIP/2DESELECTED; nativePostgreSQL16.15 trên container disposable riêng5PASS; bốn reproduction invariantFAIL như báo cáo; targetedRuffPASS, fullRuff123diagnostics. Source/corpus/config/model/dependency hashes của calibration/holdout đã lưu khớp code review. Không chạy lại paid provider/holdout; không migrate/backfill dữ liệu thật. Container QA đã được xóa.
+
+Commit bàn giao chỉ thêm evidence review/scripts và cập nhật record này. Reproduction nằm ngoài test suite mặc định, nativePG mặc địnhSKIP; chạy explicit runner để quan sát lỗi chưa sửa. Không sửa production, schema/config hoặc test gốc; không bật feature, merge hoặc approve. User đã yêu cầu push trực tiếp lên nhánh PR40; không tạo PR/nhánh thay thế. `.serena/` được giữ nguyên.
+
 Ngày: 2026-10-26. Record gồm nghiên cứu/đặc tả ban đầu, T1 baseline, T2 hợp đồng, T3a reader/hierarchy và T3b selector offline theo yêu cầu Thang. Chưa tích hợp/đạt nghiệm thu runtime.
 
 Tiếp tục T4 qua đêm26–27/10/2026: đã có [calibration report](CALIBRATION.md), [numeric policy](CALIBRATION-POLICY.json) và [license audit](NER-LICENSE-AUDIT.md). Measurement hoàn tất, rollout NO-GO; xem phần kết quả cuối record.
