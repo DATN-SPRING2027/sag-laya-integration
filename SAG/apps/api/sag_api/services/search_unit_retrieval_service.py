@@ -6,11 +6,13 @@ import asyncio
 import hashlib
 import math
 import re
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
+from weakref import WeakKeyDictionary
 
 import httpx
 from sqlalchemy import func, select
@@ -18,7 +20,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from sag_api.core.config import settings
+from sag_api.core.config import FIXED_SEARCH_TOP_K, settings
 from sag_api.core.db import SessionLocal
 from sag_api.core.errors import ServiceUnavailableError
 from sag_api.core.logging import get_logger
@@ -29,11 +31,14 @@ from sag_api.db.models import (
     DocumentVersion,
     IngestionRun,
     Job,
+    KnowledgeGraphBuild,
     KnowledgeUnit,
     KnowledgeUnitEdge,
+    ProjectSearchState,
     SearchUnit,
     SourceProjectMapping,
     StageRun,
+    TreeManifest,
 )
 from sag_api.enums import DocumentStatus, JobStatus, JobType
 from sag_api.sag import RetrievedSection, SearchOutcome
@@ -55,6 +60,47 @@ from sag_api.services.query_strategy_planner import QueryStrategyPlan, plan_quer
 
 log = get_logger("search_units")
 _routed_query_demand_tasks: set[asyncio.Task[None]] = set()
+_selection_slots = WeakKeyDictionary()
+
+
+async def _select_diverse_sections(query, candidates, *, limit, deadline):
+    """Keep evidence scoring off the API loop and stop it when its request ends."""
+    from sag_api.services.retrieval_service import select_diverse_sections
+
+    loop = asyncio.get_running_loop()
+    slot = _selection_slots.setdefault(loop, asyncio.Semaphore(max(1, settings.search_source_concurrency)))
+    async with asyncio.timeout_at(deadline):
+        await slot.acquire()
+        try:
+            cancelled = threading.Event()
+            task = asyncio.create_task(asyncio.to_thread(
+                select_diverse_sections, query, candidates, limit=limit, _cancelled=cancelled,
+            ))
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled.set()
+                while not task.done():
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                if not task.cancelled():
+                    task.exception()
+                raise
+        finally:
+            slot.release()
+
+
+def _verify_selection_scope(version_ids, previous, refreshed):
+    fields = ("source_id", "project_id", "tenant_id", "partition_id", "acl_mapping_version",
+              "ingestion_run_id", "index_stage_run_id", "search_manifest_checksum")
+    if any(vid not in previous or vid not in refreshed or any(
+        getattr(previous[vid], key) != getattr(refreshed[vid], key) for key in fields
+    ) for vid in version_ids):
+        raise ServiceUnavailableError("Search scope changed during evidence selection")
 
 
 class SearchableSource(Protocol):
@@ -119,7 +165,7 @@ async def _record_routed_query_demand(
     if not by_scope:
         return
     try:
-        async with asyncio.timeout(0.1):
+        async with asyncio.timeout(settings.search_source_timeout):
             async with SessionLocal() as session:
                 occurred_at = datetime.now(UTC)
                 for (tenant_id, project_id, partition_id, tree_version), node_ids in sorted(by_scope.items()):
@@ -861,12 +907,45 @@ async def _get_or_build_scope_knowledge_index(
     current_versions: dict[str, _ReadyVersion],
     allowed_partitions: list[str],
 ) -> _ScopeKnowledgeIndex:
-    digest = _scope_knowledge_digest(current_versions)
+    version_ids = sorted(current_versions)
+    checksum_rows = (await session.execute(select(KnowledgeUnit.id, KnowledgeUnit.checksum, KnowledgeUnit.project_id).where(
+        KnowledgeUnit.document_version_id.in_(version_ids), KnowledgeUnit.is_current.is_(True),
+        KnowledgeUnit.security_partition_id.in_(allowed_partitions),
+    ))).all()
+    checksums = {uid: value for uid, value, _project in checksum_rows}
+    projects = {v.project_id for v in current_versions.values()}
+    active_rows = (await session.execute(select(
+        TreeManifest.project_id, TreeManifest.manifest_json["knowledge_graph_build_id"].as_string(),
+    ).join(ProjectSearchState, ProjectSearchState.active_tree_version == TreeManifest.tree_version)
+        .where(TreeManifest.project_id.in_(projects), TreeManifest.status == "ACTIVE"))).all()
+    pinned = {project: build for project, build in active_rows if build}
+    active_graphs = set(pinned.values())
+    graph_rows = (await session.execute(select(
+        KnowledgeGraphBuild.id, KnowledgeGraphBuild.project_id, KnowledgeGraphBuild.manifest_json["units"],
+    ).where(KnowledgeGraphBuild.project_id.in_(projects),
+            (KnowledgeGraphBuild.id.in_(active_graphs)) | KnowledgeGraphBuild.input_fingerprint.is_(None)))).all()
+    graph_ids = []
+    for project in projects:
+        wanted = {uid: value for uid, value, scope_project in checksum_rows if scope_project == project}
+        candidates = []
+        for build_id, build_project, pairs in graph_rows:
+            if build_project != project:
+                continue
+            if project in pinned and build_id != pinned[project]:
+                continue
+            inventory = dict(pairs or [])
+            relevant = {uid: value for uid, value in wanted.items() if uid in inventory}
+            if wanted and relevant == wanted and all(inventory[uid] == value for uid, value in wanted.items()):
+                candidates.append((build_id in active_graphs, len(relevant), build_id))
+        if candidates:
+            graph_ids.append(max(candidates)[2])
+    digest = hashlib.sha256(repr((
+        _scope_knowledge_digest(current_versions), sorted(checksums.items()), sorted(graph_ids),
+    )).encode()).hexdigest()
     cached = _SCOPE_KNOWLEDGE_INDEX_CACHE.get(digest)
     if cached is not None:
         return cached
 
-    version_ids = sorted(current_versions)
     ku_rows = (
         await session.execute(
             select(
@@ -952,7 +1031,7 @@ async def _get_or_build_scope_knowledge_index(
             ent_exact_versions[e_norm].add(ver_id_str)
 
     edges_by_ku: dict[str, list[tuple[str, float]]] = defaultdict(list)
-    if ku_by_id:
+    if ku_by_id and graph_ids:
         edge_rows = (
             await session.execute(
                 select(
@@ -961,6 +1040,7 @@ async def _get_or_build_scope_knowledge_index(
                     KnowledgeUnitEdge.weight,
                 ).where(
                     KnowledgeUnitEdge.weight >= 0.55,
+                    KnowledgeUnitEdge.build_id.in_(graph_ids),
                     KnowledgeUnitEdge.security_partition_id.in_(allowed_partitions),
                 )
             )
@@ -1105,8 +1185,7 @@ async def _hydrate_sibling_sections_for_top_versions(
     sections: list[RetrievedSection],
     current_versions: dict[str, _ReadyVersion],
     sources: list[SearchableSource],
-    max_versions: int = 3,
-    max_siblings_per_version: int = 4,
+    limit: int,
 ) -> list[RetrievedSection]:
     """Hydrate sibling SearchUnits of top admitted documents so context completion stays coherent."""
     if not sections or not current_versions:
@@ -1117,7 +1196,7 @@ async def _hydrate_sibling_sections_for_top_versions(
         if not v_id or v_id not in current_versions:
             continue
         if v_id not in top_version_scores:
-            if len(top_version_scores) >= max_versions:
+            if len(top_version_scores) >= limit:
                 continue
             top_version_scores[v_id] = float(sec.score or 0.0)
     if not top_version_scores:
@@ -1141,12 +1220,11 @@ async def _hydrate_sibling_sections_for_top_versions(
             )
             siblings: list[RetrievedSection] = []
             for v_id, parent_score in top_version_scores.items():
-                added = 0
                 for idx_su, (sec_template, _s_ord, _e_ord) in enumerate(
                     k_index.hydrated_su_by_version.get(v_id, ())
                 ):
-                    if added >= max_siblings_per_version:
-                        break
+                    if len(siblings) >= limit:
+                        return siblings
                     u_id = str(sec_template.search_unit_id or sec_template.chunk_id or "")
                     if not u_id or u_id in existing_ids:
                         continue
@@ -1160,7 +1238,6 @@ async def _hydrate_sibling_sections_for_top_versions(
                             }
                         )
                     )
-                    added += 1
             return siblings
     except Exception:  # noqa: BLE001 - sibling hydration is best-effort
         return []
@@ -1174,7 +1251,7 @@ async def _expand_multi_hop_sections(
     existing_unit_ids: set[str],
     sources: list[SearchableSource],
     existing_pool_scores: dict[str, float] | None = None,
-    limit: int = 8,
+    limit: int,
 ) -> list[RetrievedSection]:
     """HippoRAG 2 associative passage expansion over ACL-scoped KnowledgeUnitEdge + Artifact Bridges."""
     if not seed_sections or not current_versions:
@@ -1183,7 +1260,7 @@ async def _expand_multi_hop_sections(
     seed_ranges: list[tuple[str, int, int, float]] = []
     ordered_seeds = sorted(seed_sections, key=lambda s: -float(s.score or 0.0))
     top_anchor_score = max((float(s.score or 0.5) for s in ordered_seeds[:1]), default=0.5)
-    for idx_s, section in enumerate(ordered_seeds[:3]):
+    for idx_s, section in enumerate(ordered_seeds[:limit]):
         s_val = max(0.05, float(section.score or 0.5))
         if idx_s == 1 and s_val < 0.82 * top_anchor_score:
             continue
@@ -1253,7 +1330,7 @@ async def _expand_multi_hop_sections(
                     if tgt_id not in seed_ku_scores
                 ),
                 key=lambda item: -item[2],
-            )[:48]
+            )[:limit]
             for s_score, tgt_id, w in seed_edges:
                 tgt_ku = k_index.ku_by_id.get(tgt_id)
                 if tgt_ku is None or tgt_ku.document_version_id in seed_version_ids:
@@ -1404,7 +1481,7 @@ async def _expand_multi_hop_sections(
                         s.chunk_id or "",
                     )
                 )
-                expanded.extend(ver_candidates[:2])
+                expanded.extend(ver_candidates[:limit])
             expanded.sort(
                 key=lambda s: (
                     -s.score,
@@ -1443,11 +1520,68 @@ async def retrieve_search_unit_sections(
     top_k: int | None = None,
     query_strategy_plan: QueryStrategyPlan | None = None,
 ) -> SearchOutcome:
-    """Query only currently authorized versions with a verified Phase 2C manifest."""
-    from sag_api.services.retrieval_service import rerank_sections, select_diverse_sections
+    """Return at most five verified sections, with a bounded candidate pool."""
+    if top_k is not None and top_k < 1:
+        raise ValueError("top_k must be positive")
+    top_k = FIXED_SEARCH_TOP_K
+    plan = query_strategy_plan or plan_query(query)
+    budget = max(1, settings.search_unit_candidate_limit)
+    seed = max(settings.search_top_k, top_k)
+    candidate_limit = min(budget, max(seed * 4, seed + 1))
+    started = time.perf_counter()
+    deadline = asyncio.get_running_loop().time() + settings.search_source_timeout
+    timings: dict[str, float] = defaultdict(float)
+    waves = 0
+    while True:
+        wave_start = time.perf_counter()
+        outcome = await _retrieve_search_unit_sections(
+            engine_manager, sources, query, principal=principal, top_k=top_k,
+            query_strategy_plan=plan, candidate_limit=candidate_limit, deadline=deadline,
+        )
+        waves += 1
+        for key, value in outcome.stats.get("stage_latencies_ms", {}).items():
+            timings[key] += value
+        saturated = bool(outcome.stats.get("candidate_pool_saturated"))
+        hydration_truncated = bool(outcome.stats.get("candidate_units_truncated"))
+        needs_more = len(outcome.sections) < top_k
+        remaining = deadline - asyncio.get_running_loop().time()
+        stop = (
+            "deadline" if remaining <= 0 else
+            "candidate_budget" if hydration_truncated else
+            "candidate_pool_exhausted" if not saturated else
+            "requested_top_k_reached" if not needs_more else
+            "candidate_budget" if candidate_limit >= budget else
+            "deadline" if remaining <= 2 * (time.perf_counter() - wave_start) else None
+        )
+        if stop:
+            elapsed = round((time.perf_counter() - started) * 1000, 2)
+            timings["total_retrieval"] = elapsed
+            return SearchOutcome(query=outcome.query, sections=outcome.sections, stats={
+                **outcome.stats, "automatic_top_k": False, "requested_top_k": top_k,
+                "effective_top_k": len(outcome.sections), "adaptive_waves": waves,
+                "retrieval_stop_reason": stop, "budget_exhausted": stop in {"candidate_budget", "deadline"},
+                "has_more": False,
+                "stage_latencies_ms": dict(timings), "latency_total_ms": elapsed,
+            })
+        candidate_limit = min(budget, candidate_limit * 2)
 
-    requested_limit = max(1, min(int(top_k or settings.search_top_k), 50))
-    candidate_limit = min(64, max(50, requested_limit * 5))
+
+async def _retrieve_search_unit_sections(
+    engine_manager: Any,
+    sources: list[SearchableSource],
+    query: str,
+    *,
+    principal: VerifiedPrincipal | None,
+    top_k: int | None = None,
+    query_strategy_plan: QueryStrategyPlan | None = None,
+    candidate_limit: int,
+    deadline: float,
+) -> SearchOutcome:
+    """Query only currently authorized versions with a verified Phase 2C manifest."""
+    from sag_api.services.retrieval_service import rerank_sections
+
+    requested_limit = min(top_k, settings.search_unit_candidate_limit) if top_k is not None else candidate_limit
+    selection_limit = requested_limit if top_k is not None else None
     strategy_plan = query_strategy_plan or plan_query(query)
     retrieval_stats = {
         "requested_top_k": requested_limit,
@@ -1479,7 +1613,6 @@ async def retrieve_search_unit_sections(
         )
 
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + max(0.1, float(settings.search_source_timeout))
     try:
         async with asyncio.timeout_at(deadline):
             async with SessionLocal() as session:
@@ -1674,6 +1807,9 @@ async def retrieve_search_unit_sections(
                 raise
             t_retrieval_ms = round((time.perf_counter() - t_retrieval_start) * 1000, 2)
         channel_results = [item for path_group, _local_failure, _escape_failure in path_groups for item in path_group]
+        retrieval_stats["candidate_pool_saturated"] = any(
+            len(item[3]) >= candidate_limit or len(item[4]) >= candidate_limit for item in channel_results
+        )
         local_failures = {
             group.scope_key: local_failure
             for group, (_paths, local_failure, _escape_failure) in zip(groups, path_groups, strict=True)
@@ -1762,7 +1898,7 @@ async def retrieve_search_unit_sections(
     candidate_units_before_cap = len({key[-1] for key in hits})
     candidate_unit_ids = _bounded_candidate_unit_ids(
         hits,
-        limit=max(int(settings.search_unit_candidate_limit), candidate_limit * 4),
+        limit=int(settings.search_unit_candidate_limit),
     )
     selected_candidate_ids = set(candidate_unit_ids)
     hits = {key: value for key, value in hits.items() if key[-1] in selected_candidate_ids}
@@ -2021,12 +2157,15 @@ async def retrieve_search_unit_sections(
     semantic = _fair_rank_merge(semantic_lists)
     lexical = _fair_rank_merge(lexical_lists)
     selection_fallback_reason = None
+    selection_deadline = deadline - max(
+        settings.search_rerank_min_remaining_seconds, min(1.0, settings.search_source_timeout * 0.1),
+    )
     rerank_remaining = deadline - loop.time()
     t_rerank_start = time.perf_counter()
     if rerank_remaining <= settings.search_rerank_min_remaining_seconds:
         selection_fallback_reason = "rerank_budget_exhausted"
         fallback_pool = _fair_rank_merge([semantic, lexical])
-        selected = fallback_pool[:requested_limit]
+        selected = fallback_pool[:selection_limit]
         rerank_stats = {
             "candidates": len(fallback_pool),
             "relevant": None,
@@ -2068,18 +2207,22 @@ async def retrieve_search_unit_sections(
                 sections=fused.sections,
                 current_versions=current_versions,
                 sources=sources,
-                max_versions=2,
-                max_siblings_per_version=requested_limit,
+                limit=requested_limit,
             )
             if requested_limit > 1 and fused.sections and not is_multi_hop_query
             else []
         )
         initial_pool = fused.sections + sibling_sections
-        selected, diversity_stats = select_diverse_sections(
-            query,
-            initial_pool,
-            limit=requested_limit,
-        )
+        try:
+            selected, diversity_stats = await _select_diverse_sections(
+                query, initial_pool, limit=selection_limit,
+                deadline=selection_deadline,
+            )
+        except TimeoutError:
+            selection_fallback_reason = "diversity_budget_exhausted"
+            selected = fused.sections[:selection_limit]
+            diversity_stats = {"candidate_count": len(initial_pool), "deduplicated_count": 0,
+                               "anchor_coverage": "unknown", "reason": selection_fallback_reason}
         t_diversity_ms = round((time.perf_counter() - t_div_start) * 1000, 2)
         coverage = {
             **diversity_stats,
@@ -2095,7 +2238,7 @@ async def retrieve_search_unit_sections(
             ),
             "semantic_answerability": "unknown",
         }
-        selection_method = "authorized_content_dedup_mmr"
+        selection_method = "latency_fallback_rrf" if selection_fallback_reason else "authorized_content_dedup_mmr"
     coverage_reason = (
         "NO_BRANCH_EVIDENCE"
         if coverage["status"] == "empty_evidence"
@@ -2114,11 +2257,10 @@ async def retrieve_search_unit_sections(
         else:
             graph_expansion_attempted = True
             seed_pool = selected if selected else (fused.sections if not selection_fallback_reason else [])
-            # Only exclude the top-2 already-selected seed chunks so low-ranked Hop-2 candidates in sections_by_key
-            # can be activated and promoted into the final top-k selection (HippoRAG 2 Bridge Re-scoring).
+            # Keep unselected candidates available for bridge re-scoring within the current breadth.
             existing_ids = {
                 str(s.search_unit_id or s.chunk_id or "")
-                for s in list(seed_pool)[:2]
+                for s in list(seed_pool)[:requested_limit]
                 if (s.search_unit_id or s.chunk_id)
             }
             existing_pool_scores = {
@@ -2134,7 +2276,7 @@ async def retrieve_search_unit_sections(
                 existing_unit_ids=existing_ids,
                 sources=sources,
                 existing_pool_scores=existing_pool_scores,
-                limit=max(8, requested_limit * 2),
+                limit=min(settings.search_unit_candidate_limit, max(8, requested_limit * 2)),
             )
             t_graph_expansion_ms = round((time.perf_counter() - t_graph_start) * 1000, 2)
             graph_expanded_candidates = len(expanded_sections)
@@ -2179,11 +2321,14 @@ async def retrieve_search_unit_sections(
                     if str(s.search_unit_id or s.chunk_id or "") not in seen_exp_ids
                 ]
                 combined_pool = boosted_fused + new_expanded
-                selected, diversity_stats = select_diverse_sections(
-                    query,
-                    combined_pool,
-                    limit=requested_limit,
-                )
+                try:
+                    selected, diversity_stats = await _select_diverse_sections(
+                        query, combined_pool, limit=selection_limit,
+                        deadline=selection_deadline,
+                    )
+                except TimeoutError:
+                    diversity_stats = {**diversity_stats, "reason": "diversity_budget_exhausted"}
+                    selection_fallback_reason = "diversity_budget_exhausted"
                 t_diversity_ms = round(t_diversity_ms + (time.perf_counter() - t_div_start) * 1000, 2)
                 coverage = {
                     **diversity_stats,
@@ -2212,6 +2357,17 @@ async def retrieve_search_unit_sections(
         graph_expansion_attempted=graph_expansion_attempted,
         graph_expanded_candidates=graph_expanded_candidates,
     )
+    selected_version_ids = {str(section.document_version_id or "") for section in selected}
+    if selected_version_ids:
+        try:
+            async with asyncio.timeout_at(deadline):
+                async with SessionLocal() as session:
+                    refreshed = await _load_current_ready_versions(
+                        session, sources, principal, version_ids=selected_version_ids,
+                    )
+            _verify_selection_scope(selected_version_ids, current_versions, refreshed)
+        except (TimeoutError, SQLAlchemyError) as error:
+            raise ServiceUnavailableError("Search scope could not be revalidated") from error
     _schedule_routed_query_demand(groups, decisions)
     total_retrieval_ms = round((time.perf_counter() - t_start) * 1000, 2)
     return SearchOutcome(
@@ -2224,7 +2380,7 @@ async def retrieve_search_unit_sections(
             "semantic_candidates": semantic_candidate_count,
             "lexical_candidates": lexical_candidate_count,
                 **rerank_stats,
-            "fusion_method": "rank_interleave_fallback" if selection_fallback_reason else "rrf",
+            "fusion_method": "rank_interleave_fallback" if selection_fallback_reason == "rerank_budget_exhausted" else "rrf",
             "selection_method": selection_method,
             "cross_scope_merge": "rank_interleave",
             "coverage": coverage,

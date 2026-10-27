@@ -65,7 +65,7 @@ export function RetrievalTestDialog({
     fallbackA;
 
   const [query, setQuery] = React.useState("");
-  const [topK, setTopK] = React.useState(8);
+  const [topK, setTopK] = React.useState<number | undefined>(undefined);
   const [compare, setCompare] = React.useState(false);
   const [strategyA, setStrategyA] = React.useState<SearchStrategy>(fallbackA);
   const [strategyB, setStrategyB] = React.useState<SearchStrategy>(fallbackB);
@@ -166,11 +166,11 @@ export function RetrievalTestDialog({
                 id="rt-k"
                 type="number"
                 min={1}
-                max={50}
-                value={topK}
+                placeholder="Auto"
+                value={topK ?? ""}
                 onChange={(e) =>
                   setTopK(
-                    Math.max(1, Math.min(50, Number(e.target.value) || 1)),
+                    e.target.value === "" ? undefined : Math.max(1, Math.trunc(Number(e.target.value) || 1)),
                   )
                 }
               />

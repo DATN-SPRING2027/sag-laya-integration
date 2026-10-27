@@ -652,8 +652,8 @@
     "extractionLanguage": "Extraction language",
     "chinese": "中文",
     "english": "English",
-    "topK": "Results · {count, number}",
-    "topKAria": "Number of results",
+    "topK": "Initial search breadth · {count, number}",
+    "topKAria": "Initial adaptive search breadth",
     "saving": "Saving…",
     "save": "Save and apply"
   },

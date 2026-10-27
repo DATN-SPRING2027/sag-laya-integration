@@ -258,6 +258,8 @@ class EngineManager:
         self._search_unit_qdrant_client: httpx.AsyncClient | None = None
         self._search_unit_qdrant_client_config: tuple[str, str | None, float] | None = None
         self._search_unit_qdrant_client_lock = asyncio.Lock()
+        self._canonical_embeddings: dict[str, Any] = {}
+        self._canonical_embedding_lock = asyncio.Lock()
         self._create_lock = asyncio.Lock()
         # SQLite permits one writer at a time.  Keep local document mutations
         # serialized across source slots; server databases retain full concurrency.
@@ -346,9 +348,23 @@ class EngineManager:
         return slot.engine.resources.vector
 
     async def get_sag_embedding(self, source_config_id: str = "__knowledge__", source: Source | None = None) -> Any:
-        """0.8.2 起 embedding 经引擎注入(替代 get_embedding_client)。"""
-        slot = await self._slot(source_config_id, source)
-        return slot.engine.resources.embedding
+        """Canonical embeddings reuse SDK clients without bootstrapping legacy event storage."""
+        from zleap.sag.core.adapters.limited import LimitedEmbeddingAdapter
+        from zleap.sag.core.ai.factory import create_embedding_client
+        from zleap.sag.runtime import RuntimeGovernor
+
+        config = self._config_for(source)
+        embedding_config = {**config.embedding.model_dump(), "max_retries": self._settings.embedding_max_retries}
+        key = hashlib.sha256(repr(sorted(embedding_config.items())).encode()).hexdigest()
+        async with self._canonical_embedding_lock:
+            if key not in self._canonical_embeddings:
+                client = await create_embedding_client(embedding_config=embedding_config)
+                embedding = LimitedEmbeddingAdapter(client, RuntimeGovernor(config.runtime_limits))
+                for name in ("model", "base_url", "dimensions", "max_tokens"):
+                    setattr(embedding, name, getattr(client, name, None))
+                self._configure_embedding_client(embedding)
+                self._canonical_embeddings[key] = embedding
+            return self._canonical_embeddings[key]
 
     async def _ensure_universe_query_indexes(self, engine: Any) -> None:
         """Best-effort composite indexes for bounded timeline and neighbor reads."""
@@ -569,10 +585,13 @@ class EngineManager:
             except Exception:
                 res = None
         emb = getattr(res, "embedding", None)
+        self._configure_embedding_client(emb)
+
+    def _configure_embedding_client(self, emb: Any) -> None:
         if emb is not None:
             if getattr(emb, "max_tokens", 512) <= 512:
                 emb.max_tokens = 8192
-            for attr_name in ("_inner", "client", "_client", "_delegate"):
+            for attr_name in ("inner", "_inner", "client", "_client", "_delegate"):
                 inner_emb = getattr(emb, attr_name, None)
                 if inner_emb is not None and getattr(inner_emb, "max_tokens", 512) <= 512:
                     inner_emb.max_tokens = 8192
@@ -625,7 +644,11 @@ class EngineManager:
         model = self._settings.embedding_model.strip().lower()
         if hostname not in ("api.siliconflow.com", "api.siliconflow.cn") or model != "baai/bge-m3":
             return
-        engine.resources.embedding.dimensions = None
+        if emb is not None:
+            emb.dimensions = None
+            inner = getattr(emb, "inner", None)
+            if inner is not None:
+                inner.dimensions = None
 
     async def _ensure_engine_schema(self, engine: DataEngine) -> None:
         if self._schema_ready:
@@ -1040,6 +1063,7 @@ class EngineManager:
                         event_entity_attempts=self._settings.document_event_entity_attempts,
                         extraction_profile=self._settings.document_extraction_profile,
                         document_version_id=document_version_id,
+                        extract_events=self._settings.document_event_extraction_enabled,
                     )
                     if self._settings.sag_relational_provider in (None, "sqlite"):
                         async with self._sqlite_document_mutation_lock:
@@ -1182,7 +1206,13 @@ class EngineManager:
         top_k = top_k or self._settings.search_top_k
         per_source_k = max(top_k, 4)
         requested_sources = len(targets)
-        targets = targets[: self._settings.search_source_candidate_limit]
+        if (
+            self._settings.search_source_candidate_limit
+            and requested_sources > self._settings.search_source_candidate_limit
+        ):
+            from sag_api.core.errors import ValidationError
+
+            raise ValidationError("Search source budget exceeded; narrow the requested source scope")
         has_exclusions = any(source_ids for source_ids in (exclude_source_ids_by_config or {}).values())
 
         if (strategy == "vector" or has_exclusions) and targets:
@@ -1453,9 +1483,9 @@ class EngineManager:
 
         bounded_limit = max(
             1,
-            min(int(limit or self._settings.search_top_k), 50),
+            min(int(limit or self._settings.search_unit_candidate_limit), self._settings.search_unit_candidate_limit),
         )
-        candidate_limit = min(200, max(bounded_limit * 4, 24))
+        candidate_limit = min(self._settings.search_unit_candidate_limit, bounded_limit * 4)
 
         await self._ensure_read_runtime(sources_by_config)
         from zleap.sag.core.adapters.models import Filter, VectorQuery
@@ -3345,6 +3375,13 @@ class EngineManager:
                     log.warning("释放引擎失败 %s: %s", source_config_id, e)
 
     async def aclose_all(self) -> None:
+        async with self._canonical_embedding_lock:
+            for embedding in self._canonical_embeddings.values():
+                try:
+                    await embedding.close()
+                except Exception as error:
+                    log.warning("canonical embedding close failed error_type=%s", type(error).__name__)
+            self._canonical_embeddings.clear()
         # 先标记并摘除，阻止新请求拿到即将关闭的槽；逐槽等待在途操作完成。
         async with self._create_lock:
             async with self._lifecycle_gate.write():

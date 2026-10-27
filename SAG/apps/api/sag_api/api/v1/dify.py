@@ -122,4 +122,4 @@ async def retrieval(
         for section in outcome.sections
         if section.score >= body.retrieval_setting.score_threshold
     ]
-    return DifyRetrievalResponse(records=records)
+    return DifyRetrievalResponse(records=records[:body.retrieval_setting.top_k])

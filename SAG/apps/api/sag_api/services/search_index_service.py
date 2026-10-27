@@ -24,6 +24,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.logging import get_logger
+from sag_api.core.errors import ApiError, is_retryable_error
+from sag_api.core.error_taxonomy import ErrorLayer, ErrorStage
 from sag_api.core.sanitizer import sanitize_error_message
 from sag_api.db.models.routing_rag import (
     CanonicalBlock,
@@ -722,26 +724,35 @@ async def run_search_indexing_stage(
 
     if qdrant_client is not None:
         try:
-            del_res = await qdrant_client.post(
-                f"/collections/{collection_name}/points/delete?wait=true",
-                json={
+            delete_body = {
                     "filter": {
                         "must": [
                             {"key": "document_version_id", "match": {"value": str(document_version.id)}}
                         ]
                     }
-                },
-            )
-            if del_res.status_code >= 400 and del_res.status_code != 404:
-                raise RuntimeError(
-                    f"Qdrant point cleanup failed before indexing: HTTP {del_res.status_code} - {del_res.text}"
+                }
+            delete_url = f"/collections/{collection_name}/points/delete?wait=true"
+            del_res = await qdrant_client.post(delete_url, json=delete_body)
+            if (del_res.status_code == 400 and "index required but not found" in del_res.text.lower()
+                    and "document_version_id" in del_res.text):
+                index_res = await qdrant_client.put(
+                    f"/collections/{collection_name}/index?wait=true",
+                    json={"field_name": "document_version_id", "field_schema": "keyword"},
                 )
+                if index_res.status_code >= 400 and index_res.status_code != 409 and "already exists" not in index_res.text.lower():
+                    index_res.raise_for_status()
+                del_res = await qdrant_client.post(delete_url, json=delete_body)
+            if del_res.status_code >= 400 and del_res.status_code != 404:
+                del_res.raise_for_status()
         except Exception as del_err:
-            log.error("Could not delete prior points from Qdrant: %s", sanitize_error_message(del_err))
+            log.error("Qdrant cleanup failed error_type=%s retryable=%s",
+                      type(del_err).__name__, is_retryable_error(del_err))
             document_version.search_status = "INDEX_FAILED"
             session.add(document_version)
             await session.commit()
-            raise RuntimeError(f"Qdrant point cleanup failed: {del_err}") from del_err
+            raise ApiError(f"Qdrant point cleanup failed ({type(del_err).__name__})",
+                           layer=ErrorLayer.STORE, stage=ErrorStage.PERSIST,
+                           retryable=is_retryable_error(del_err)) from del_err
 
     # 4. Save new units to PostgreSQL
     for u in units:
@@ -752,6 +763,7 @@ async def run_search_indexing_stage(
     blocks_by_id = {b.id: b for b in blocks}
     indexed_count = 0
     indexing_error: str | None = None
+    indexing_exception: Exception | None = None
     if qdrant_client is not None and units:
         try:
             indexed_count = await index_search_units_to_qdrant(
@@ -767,6 +779,7 @@ async def run_search_indexing_stage(
             )
         except Exception as exc:
             indexing_error = str(exc)
+            indexing_exception = exc
             indexed_count = 0
 
     for b in blocks:
@@ -800,7 +813,10 @@ async def run_search_indexing_stage(
                 res_data = count_res.json().get("result", {})
                 if "count" in res_data:
                     qdrant_count = int(res_data["count"])
+            else:
+                count_res.raise_for_status()
         except Exception as count_err:
+            indexing_exception = indexing_exception or count_err
             log.warning("Could not query points count from Qdrant: %s", sanitize_error_message(count_err))
 
     items = sorted(f"{generate_search_unit_point_id(collection_name, u.id)}:{u.content_hash}" for u in units)
@@ -831,6 +847,7 @@ async def run_search_indexing_stage(
                     json=scroll_body,
                 )
                 if not scroll_res.is_success:
+                    scroll_res.raise_for_status()
                     log.warning(
                         "Qdrant scroll returned status %d: %s",
                         scroll_res.status_code,
@@ -852,6 +869,7 @@ async def run_search_indexing_stage(
                 )
                 qdrant_checksum = hashlib.sha256(";".join(q_items).encode("utf-8")).hexdigest()
         except Exception as scroll_err:
+            indexing_exception = indexing_exception or scroll_err
             log.warning("Could not read back points from Qdrant for checksum: %s", sanitize_error_message(scroll_err))
             qdrant_checksum = None
 
@@ -893,13 +911,13 @@ async def run_search_indexing_stage(
             and superseded_version_id
         ):
             try:
-                await delete_search_units_from_qdrant(
+                await delete_document_points_from_qdrant(
                     qdrant_client,
-                    collection_name,
-                    document_version_id=str(superseded_version_id),
+                    project_id=project_id,
+                    document_version_ids=[str(superseded_version_id)],
                 )
             except Exception as exc:
-                logger.warning(
+                log.warning(
                     "Failed to prune superseded version %s from Qdrant: %s",
                     superseded_version_id,
                     exc,
@@ -958,7 +976,8 @@ async def run_search_indexing_stage(
             f"(units={len(units)}, pg={pg_count}, qdrant={qdrant_count}, "
             f"qdrant_checksum={qdrant_checksum})"
         )
-        raise RuntimeError(err_msg)
+        raise ApiError(err_msg, layer=ErrorLayer.STORE, stage=ErrorStage.PERSIST,
+                       retryable=is_retryable_error(indexing_exception) if indexing_exception else False) from indexing_exception
 
     if not units:
         raise RuntimeError("EMPTY_INDEX: Document has no text content to index")

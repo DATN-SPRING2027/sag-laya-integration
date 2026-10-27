@@ -42,6 +42,7 @@ async def enqueue_project_tree_rebuild(
     tenant_id: str,
     project_ids: list[str],
     reason: str,
+    persist_only: bool = False,
 ) -> Job:
     if job_queue is None:
         raise ServiceUnavailableError("Background job queue is unavailable")
@@ -58,7 +59,7 @@ async def enqueue_project_tree_rebuild(
                     select(Job)
                     .where(
                         Job.type == JobType.REBUILD_UNIVERSE_TREE,
-                        Job.status.in_((JobStatus.QUEUED, JobStatus.RUNNING)),
+                        Job.status == JobStatus.QUEUED,
                     )
                     .order_by(Job.created_at)
                     .with_for_update()
@@ -82,12 +83,13 @@ async def enqueue_project_tree_rebuild(
                 )
                 session.add(job)
                 await session.flush()
-            await session.commit()
+            if not persist_only:
+                await session.commit()
     except Exception:
         await session.rollback()
         raise
 
-    if job.status == JobStatus.QUEUED:
+    if not persist_only and job.status == JobStatus.QUEUED:
         from sag_api.services.document_service import _enqueue_persisted_job
 
         await _enqueue_persisted_job(job_queue, job.id)
@@ -240,6 +242,24 @@ async def rebuild_project_universe_tree(
         allow_empty=True,
     )
     if built is None:
+        from sag_api.db.models import ProjectSearchState, TreeManifest
+        from sag_api.services.knowledge_service import knowledge_lock
+        from sag_api.services.knowledge_candidate_service import current_units
+
+        await knowledge_lock(session, "project-input:" + tenant_id + ":" + project_id)
+        if await current_units(session, tenant_id, project_id, allow_empty=True):
+            raise ServiceUnavailableError("Project changed while clearing its empty snapshot")
+        state = await session.scalar(select(ProjectSearchState).where(
+            ProjectSearchState.project_id == project_id).with_for_update())
+        if state is not None and state.active_tree_version:
+            previous = await session.get(TreeManifest, state.active_tree_version)
+            if previous:
+                previous.status = "INACTIVE"
+            state.previous_tree_version = state.active_tree_version
+            state.active_tree_version = None
+            state.active_search_epoch += 1
+            state.last_switched_at = datetime.now(UTC)
+        await session.commit()
         return None
     snapshot, units, _graph, _benchmark = built
     assignments = await _search_unit_assignments(

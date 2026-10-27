@@ -12,3 +12,10 @@ class JobYielded(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+class JobDeferred(Exception):
+    """Wait for a dependency without spending a failure attempt."""
+
+    def __init__(self, delay_seconds: float = 2):
+        self.delay_seconds = delay_seconds

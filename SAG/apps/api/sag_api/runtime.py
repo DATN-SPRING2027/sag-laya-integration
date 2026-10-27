@@ -282,13 +282,20 @@ async def _warmup_engines(engine_manager: EngineManager, settings: Any, session_
     try:
         from sqlalchemy import select
 
-        from sag_api.db.models import Source
+        from sag_api.db.models import Document, Source
 
         async with session_factory() as session:
+            statement = select(Source).order_by(Source.updated_at.desc()).limit(settings.engine_warmup_count)
+            if not settings.document_event_extraction_enabled:
+                statement = statement.where(select(Document.id).where(
+                    Document.source_id == Source.id,
+                    Document.project_id.is_(None),
+                    Document.is_active.is_(True),
+                ).exists())
             rows = (
                 (
                     await session.execute(
-                        select(Source).order_by(Source.updated_at.desc()).limit(settings.engine_warmup_count)
+                        statement
                     )
                 )
                 .scalars()

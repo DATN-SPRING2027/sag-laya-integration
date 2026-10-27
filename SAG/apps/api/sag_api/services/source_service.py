@@ -77,7 +77,7 @@ async def search_source_candidates(
         return []
     if requested_source_ids is not None:
         ordered_ids = list(dict.fromkeys(source_id.strip() for source_id in requested_source_ids if source_id.strip()))
-        if len(ordered_ids) > limit:
+        if limit and len(ordered_ids) > limit:
             raise ValidationError(
                 f"单次最多检索 {limit} 个信息源，请通过 @ 缩小范围",
                 code=ErrorCode.TOO_MANY_SEARCH_SOURCES,
@@ -102,7 +102,7 @@ async def search_source_candidates(
             Source.event_count.desc(),
             Source.updated_at.desc(),
             Source.id,
-        ).limit(limit)
+        )
         try:
             rows = await session.execute(statement)
         except SQLAlchemyError as error:
@@ -113,6 +113,11 @@ async def search_source_candidates(
             for source in rows.scalars().all()
             if include_project_sources or not _is_project_source(source)
         ]
+        if limit and len(sources) > limit:
+            raise ValidationError(
+                "Search source budget exceeded; narrow the requested source scope",
+                code=ErrorCode.TOO_MANY_SEARCH_SOURCES,
+            )
     log.info(
         "source scope resolved authorized_project_count=%d requested_source_count=%d effective_source_count=%d",
         len(principal.allowed_project_ids),
@@ -419,10 +424,10 @@ async def create_source(
     await session.commit()
     await session.refresh(source)
 
-    # Source 与知识引擎父记录必须同时可用。预建失败时补偿删除主库记录，
-    # 避免接口成功却留下无法上传、检索的半成品信源。
+    # Only the opt-in legacy Event pipeline needs SDK parent records provisioned here.
     try:
-        await engine_manager.provision(source.sag_source_config_id, source)
+        if settings.document_event_extraction_enabled:
+            await engine_manager.provision(source.sag_source_config_id, source)
     except ApiError as e:
         log.warning("信源引擎预建失败，回滚信源 %s：%s", source.sag_source_config_id, e.message)
         await session.execute(delete(SourceProjectMapping).where(SourceProjectMapping.source_id == source.id))
@@ -470,6 +475,9 @@ async def delete_source(
     """删除信源并收尾：移除悬挂绑定、关闭引擎槽、清理上传文件。"""
     source = await get_source(session, source_id)
     sag_id = source.sag_source_config_id
+    tree_scopes = (await session.execute(select(
+        SourceProjectMapping.organization_id, SourceProjectMapping.project_id,
+    ).where(SourceProjectMapping.source_id == source_id, SourceProjectMapping.state == "CONFIRMED"))).all()
 
     # 悬挂绑定清理（target_id 为普通字符串，无 FK 级联）
     await session.execute(
@@ -479,7 +487,20 @@ async def delete_source(
         )
     )
     await session.delete(source)
+    tree_jobs = []
+    if job_queue is not None:
+        from sag_api.services.universe_tree_service import enqueue_project_tree_rebuild
+
+        for tenant, project in sorted(set(tree_scopes)):
+            tree_jobs.append(await enqueue_project_tree_rebuild(
+                session, job_queue, tenant_id=tenant, project_ids=[project],
+                reason="source_deleted", persist_only=True))
     await session.commit()
+    if tree_jobs:
+        from sag_api.services.document_service import _enqueue_persisted_job
+
+        for tree_job in tree_jobs:
+            await _enqueue_persisted_job(job_queue, tree_job.id)
 
     # 引擎槽关闭 + 上传目录清理（尽力而为，不阻断删除）
     await engine_manager.release(sag_id)

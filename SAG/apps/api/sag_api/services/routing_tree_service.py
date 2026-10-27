@@ -17,6 +17,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from types import MappingProxyType
 
+import orjson
+
 _PARTITION_ALGORITHM = "constrained-hierarchical-leiden-cpm-v1"
 
 
@@ -150,7 +152,7 @@ class RoutingSnapshot:
     @property
     def manifest(self) -> dict[str, object]:
         """Return a copy so consumers cannot mutate the checksummed snapshot."""
-        return json.loads(self.manifest_json)
+        return orjson.loads(self.manifest_json)
 
 
 def _stable_id(*parts: str) -> str:
@@ -179,14 +181,27 @@ def _profile(units: list[KnowledgeUnitInput], sparse_limit: int) -> NodeProfile:
     vectors = [(unit.unit_id, unit.dense) for unit in units if unit.dense]
     medoid = None
     if vectors:
+        prepared = {}
+        for uid, vector in vectors:
+            scale = max(map(abs, vector))
+            normalized = tuple(value / scale for value in vector) if scale else vector
+            prepared[uid] = (normalized, math.fsum(value * value for value in normalized))
+
+        def cosine(left, right):
+            a, norm_a = prepared[left]
+            b, norm_b = prepared[right]
+            if len(a) != len(b) or not norm_a or not norm_b:
+                return 0.0
+            return max(0.0, math.fsum(x * y for x, y in zip(a, b, strict=True)) / math.sqrt(norm_a * norm_b))
+
         candidates = sorted(vectors, key=lambda item: hashlib.sha256(item[0].encode()).digest())[:64]
         medoid = min(
-            (vector for _, vector in candidates),
+            candidates,
             key=lambda candidate: (
-                -math.fsum(_cosine(candidate, vector) for _, vector in vectors),
-                candidate,
+                -math.fsum(cosine(candidate[0], uid) for uid, _ in vectors),
+                candidate[1],
             ),
-        )
+        )[1]
     sparse_values: dict[str, list[float]] = defaultdict(list)
     for unit in units:
         for term, weight in unit.sparse:

@@ -19,7 +19,6 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Slider } from "@/components/ui/slider";
 import { Spinner } from "@/components/ui/spinner";
 import { api, ApiError } from "@/lib/api";
 import { SEARCH_STRATEGIES } from "@/lib/retrieval-config";
@@ -263,13 +262,13 @@ export function KnowledgeConfigForm() {
             <Field className="sm:col-span-2">
               <FieldLabel>{t("topK", { count: topK })}</FieldLabel>
               <div className="flex h-9 items-center">
-                <Slider
+                <Input
                   aria-label={t("topKAria")}
-                  value={[topK]}
+                  type="number"
                   min={1}
-                  max={50}
                   step={1}
-                  onValueChange={([value]) => setTopK(value)}
+                  value={topK}
+                  onChange={(event) => setTopK(Math.max(1, Math.trunc(Number(event.target.value) || 1)))}
                 />
               </div>
             </Field>

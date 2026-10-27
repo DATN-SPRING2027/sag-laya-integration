@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import json
 import math
 import re
@@ -11,6 +12,7 @@ from bisect import bisect_left
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from datetime import datetime
+from functools import lru_cache
 
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import delete, select, update
@@ -352,6 +354,10 @@ async def unit_checksum(session: AsyncSession, unit: KnowledgeUnit) -> str:
             select(KnowledgeEvidence).where(KnowledgeEvidence.unit_id == unit.id).order_by(KnowledgeEvidence.id)
         )
     ).all()
+    return _unit_checksum(unit, facts)
+
+
+def _unit_checksum(unit, facts) -> str:
     return checksum(
         {
             "id": unit.id,
@@ -364,6 +370,22 @@ async def unit_checksum(session: AsyncSession, unit: KnowledgeUnit) -> str:
             "evidence": [[f.id, f.tier, f.kind, f.extractor_version, f.confidence, f.payload_json] for f in facts],
         }
     )
+
+
+async def unit_checksums(session: AsyncSession, units: Sequence[KnowledgeUnit]) -> dict[str, str]:
+    facts: dict[str, list] = defaultdict(list)
+    ids = [unit.id for unit in units]
+    for offset in range(0, len(ids), 256):
+        rows = (await session.scalars(select(KnowledgeEvidence).where(
+            KnowledgeEvidence.unit_id.in_(ids[offset:offset + 256]),
+        ).order_by(KnowledgeEvidence.id))).all()
+        for fact in rows:
+            facts[fact.unit_id].append(fact)
+    result = {}
+    for offset in range(0, len(units), 128):
+        result.update((unit.id, _unit_checksum(unit, facts[unit.id])) for unit in units[offset:offset + 128])
+        await asyncio.sleep(0)
+    return result
 
 
 async def version_input(session: AsyncSession, version_id: str, config: KnowledgeConfig) -> tuple:
@@ -510,6 +532,8 @@ async def rebuild_knowledge_version(
     extra_entities: Sequence[str] | None = None,
 ) -> list[KnowledgeUnit]:
     # Serialize knowledge work on its own row, rather than a long-held ingestion/readiness row.
+    version, blocks, base, digest = await version_input(session, version_id, config)
+    await knowledge_lock(session, "project-input:" + base["tenant_id"] + ":" + base["project_id"])
     await knowledge_lock(session, "version:" + version_id)
     version, blocks, base, digest = await version_input(session, version_id, config)
     bridged_entities = (
@@ -646,6 +670,37 @@ def _cosine(left: list, right: list) -> float | None:
     return (max(-1.0, min(1.0, value)) + 1) / 2
 
 
+def _prepare_dense(vector):
+    if not vector:
+        return None
+    if any(not math.isfinite(value) for value in vector):
+        raise ValueError("Knowledge dense features must be finite")
+    scale = max(map(abs, vector))
+    if not scale:
+        return (vector, 0.0)
+    normalized = [value / scale for value in vector]
+    return normalized, math.fsum(value * value for value in normalized)
+
+
+def _prepared_cosine(left, right):
+    if left is None or right is None:
+        return None
+    a, norm_a = left
+    b, norm_b = right
+    if len(a) != len(b):
+        raise ValueError("Knowledge dense features must share a dimension")
+    if not norm_a or not norm_b:
+        return None
+    value = math.fsum(x * y for x, y in zip(a, b, strict=True)) / math.sqrt(norm_a * norm_b)
+    return (max(-1.0, min(1.0, value)) + 1) / 2
+
+
+@lru_cache(maxsize=8)
+def _lsh_signs(dimension):
+    return tuple(tuple(1 if int(hashlib.sha256(f"{p}:{i}".encode()).hexdigest()[:8], 16) % 2 else -1
+                       for i in range(dimension)) for p in range(8))
+
+
 def fuse_signals(signals: dict[str, float | None]) -> float:
     observed = [(SIGNAL_WEIGHTS[name], value) for name, value in signals.items() if value is not None]
     if any(not math.isfinite(value) or not 0 <= value <= 1 for _, value in observed):
@@ -677,6 +732,7 @@ def graph_payload(units: list[KnowledgeUnit], config: KnowledgeConfig = Knowledg
             return re.sub(r"[\s_-]+", " ", str(raw_e).casefold()).strip()
 
         unit_map = {u.id: u for u in rows}
+        prepared_dense = {u.id: _prepare_dense(u.features_json.get("dense", [])) for u in rows}
         token_counts = {u.id: terms(u.text + " " + u.provenance_json["section_path"]) for u in rows}
         df = Counter(t for counts in token_counts.values() for t in counts)
         norm_ents_by_unit = {
@@ -699,9 +755,10 @@ def graph_payload(units: list[KnowledgeUnit], config: KnowledgeConfig = Knowledg
             dense = features.get("dense", [])
             if dense:
                 # ponytail: fixed LSH buckets; replace with partition-filtered ANN when dense recall needs it.
+                signs = _lsh_signs(len(dense))
                 bits = tuple(
                     sum(
-                        v * (1 if int(hashlib.sha256(f"{p}:{i}".encode()).hexdigest()[:8], 16) % 2 else -1)
+                        v * signs[p][i]
                         for i, v in enumerate(dense)
                     )
                     >= 0
@@ -783,7 +840,7 @@ def graph_payload(units: list[KnowledgeUnit], config: KnowledgeConfig = Knowledg
             )
             citations_a, citations_b = set(af["citations"]), set(bf["citations"])
             signals = {
-                "semantic": _cosine(af.get("dense", []), bf.get("dense", [])),
+                "semantic": _prepared_cosine(prepared_dense[left], prepared_dense[right]),
                 "lexical": max(0.0, min(1.0, (value - q05) / (q95 - q05))) if q95 > q05 else float(value > 0),
                 "entity": entity,
                 "structure": structure,
@@ -838,15 +895,33 @@ def graph_payload(units: list[KnowledgeUnit], config: KnowledgeConfig = Knowledg
 async def persist_graph(
     session: AsyncSession, units: list[KnowledgeUnit], config: KnowledgeConfig = KnowledgeConfig()
 ) -> KnowledgeGraphBuild:
+    checksums = await unit_checksums(session, units)
     for unit in units:
-        if unit.checksum != await unit_checksum(session, unit):
+        if unit.checksum != checksums[unit.id]:
             raise ValueError("Knowledge Unit/evidence checksum mismatch")
-    payload = graph_payload(units, config)
+    fingerprint = checksum({"algorithm": "knowledge-graph.v1", "config": config.model_dump(mode="json"),
+                            "units": sorted((u.id, u.checksum) for u in units)})
+    if not units or len({(u.tenant_id, u.project_id) for u in units}) != 1:
+        raise ValueError("Graph input requires one nonempty tenant/project")
+    cached = await session.scalar(select(KnowledgeGraphBuild).where(
+        KnowledgeGraphBuild.tenant_id == units[0].tenant_id,
+        KnowledgeGraphBuild.project_id == units[0].project_id,
+        KnowledgeGraphBuild.input_fingerprint == fingerprint,
+    ))
+    if cached:
+        return await verify_graph(session, cached.id)
+    from sag_api.services.cpu_worker import run_cpu
+
+    fields = ("id", "tenant_id", "project_id", "security_partition_id", "document_version_id", "source_id",
+              "ordinal", "text", "features_json", "provenance_json", "valid_from", "valid_to", "checksum")
+    payload = await run_cpu("graph", {"units": [{key: getattr(u, key) for key in fields} for u in units],
+                                      "config": config.model_dump(mode="json")})
     digest = checksum(payload)
     build_id = "graph-" + digest[:24]
     build = await session.get(KnowledgeGraphBuild, build_id)
     if build:
         await verify_graph(session, build_id)
+        build.input_fingerprint = fingerprint
         return build
     build = KnowledgeGraphBuild(
         id=build_id,
@@ -854,6 +929,7 @@ async def persist_graph(
         project_id=payload["project_id"],
         checksum=digest,
         manifest_json=payload,
+        input_fingerprint=fingerprint,
     )
     session.add(build)
     await session.flush()

@@ -122,7 +122,9 @@ _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
     "universe_dirty_sources": {"revision": "INTEGER NOT NULL DEFAULT 1"},
     "tree_manifests": {"manifest_json": "JSON NOT NULL DEFAULT '{}'"},
     "tree_routing_profiles": {"document_version_id": "VARCHAR(128) NOT NULL DEFAULT ''"},
-    "knowledge_jobs": {"result_json": "JSON", "extractor_version": "VARCHAR(128)"},
+    "knowledge_jobs": {"result_json": "JSON", "extractor_version": "VARCHAR(128)", "tree_requested_at": "TIMESTAMP WITH TIME ZONE"},
+    "knowledge_graph_builds": {"input_fingerprint": "VARCHAR(64)"},
+    "canonical_blocks": {"dedup_signature_json": "JSON"},
     "research_tasks": {"execution_json": "JSON NOT NULL DEFAULT '{}'"},
     "ingestion_runs": {
         "content_hash": "VARCHAR(64)",
@@ -134,6 +136,7 @@ _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
 # idempotent for local/embedded upgrades; production deployments can express
 # the same DDL in their migration runner.
 _INDEX_UPGRADES = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS ix_knowledge_graph_input ON knowledge_graph_builds (tenant_id, project_id, input_fingerprint)",
     "CREATE INDEX IF NOT EXISTS ix_messages_thread_created_id ON messages (thread_id, created_at, id)",
     "CREATE INDEX IF NOT EXISTS ix_agents_owner_key ON agents (owner_key)",
     "CREATE INDEX IF NOT EXISTS ix_threads_owner_key ON threads (owner_key)",

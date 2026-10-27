@@ -1,8 +1,7 @@
 import type { SearchStrategy } from "@/lib/retrieval-config";
 import type { SearchResponse } from "@/lib/types";
 
-export const DEFAULT_SEARCH_TOP_K = 12;
-export const MAX_SEARCH_TOP_K = 50;
+export const DEFAULT_SEARCH_TOP_K = 5;
 
 export type SearchRunIntent = "replace" | "load-more";
 export type SearchPhase = "idle" | "searching" | "streaming" | "loading-more";
@@ -16,6 +15,7 @@ export interface SearchIdentity {
 export interface SearchRunResolution {
   intent: SearchRunIntent;
   topK: number;
+  automatic: boolean;
 }
 
 export interface SearchLifecycleState {
@@ -31,10 +31,6 @@ export interface SearchLifecycleState {
   hasMore: boolean;
 }
 
-function clampTopK(value: number): number {
-  return Math.max(1, Math.min(Math.trunc(value), MAX_SEARCH_TOP_K));
-}
-
 /** A stable identity for the inputs that determine a result set. */
 export function createSearchKey({ query, strategy, sourceIds }: SearchIdentity): string {
   const normalizedSourceIds = [...new Set((sourceIds ?? []).filter(Boolean))].sort();
@@ -43,12 +39,11 @@ export function createSearchKey({ query, strategy, sourceIds }: SearchIdentity):
 
 /**
  * Loading more may retain the committed result only when it expands that exact
- * result set. Any ambiguous request safely becomes a fresh, 12-result search.
+ * result set. Any ambiguous request safely becomes a fresh adaptive search.
  */
 export function resolveSearchRun({
   intent = "replace",
   requestedKey,
-  requestedTopK,
   committedKey,
   committedTopK,
   hasResult,
@@ -63,7 +58,7 @@ export function resolveSearchRun({
   idle: boolean;
 }): SearchRunResolution {
   if (intent === "load-more") {
-    const topK = clampTopK(requestedTopK ?? committedTopK + DEFAULT_SEARCH_TOP_K);
+    const topK = DEFAULT_SEARCH_TOP_K;
     if (
       idle
       && hasResult
@@ -71,13 +66,14 @@ export function resolveSearchRun({
       && requestedKey === committedKey
       && topK > committedTopK
     ) {
-      return { intent, topK };
+      return { intent, topK, automatic: false };
     }
-    return { intent: "replace", topK: DEFAULT_SEARCH_TOP_K };
+    return { intent: "replace", topK: DEFAULT_SEARCH_TOP_K, automatic: false };
   }
   return {
     intent: "replace",
-    topK: clampTopK(requestedTopK ?? DEFAULT_SEARCH_TOP_K),
+    topK: DEFAULT_SEARCH_TOP_K,
+    automatic: false,
   };
 }
 
@@ -99,7 +95,7 @@ export function canLoadMoreSearch({
   return phase === "idle"
     && hasResult
     && hasMore
-    && topK < MAX_SEARCH_TOP_K
+    && topK < DEFAULT_SEARCH_TOP_K
     && Boolean(committedKey)
     && draftKey === committedKey;
 }

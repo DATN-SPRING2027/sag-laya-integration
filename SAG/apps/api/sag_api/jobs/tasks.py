@@ -21,13 +21,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sag_api.core.config import settings
 from sag_api.core.db import SessionLocal
 from sag_api.core.error_taxonomy import ErrorLayer, ErrorStage
-from sag_api.core.errors import ApiError, NotFoundError
+from sag_api.core.errors import ApiError, NotFoundError, is_retryable_error
 from sag_api.core.logging import get_logger
 from sag_api.core.sanitizer import sanitize_error_message
 from sag_api.db.models import Document, Job, Source
 from sag_api.db.models.routing_rag import DocumentVersion, IngestionRun, StageRun
 from sag_api.enums import DocumentStatus, JobStatus, JobType
-from sag_api.jobs.control import JobPaused, JobYielded
+from sag_api.jobs.control import JobDeferred, JobPaused, JobYielded
 from sag_api.jobs.octx_tasks import (
     export_octx,
     gc_octx_installation,
@@ -38,7 +38,7 @@ from sag_api.jobs.octx_tasks import (
 from sag_api.jobs.scheduling import SOURCE_MAINTENANCE
 from sag_api.parsing import ParsePaused, prepare_document
 from sag_api.sag import EngineManager
-from sag_api.sag.dto import ProcessCheckpoint
+from sag_api.sag.dto import ProcessCheckpoint, ProcessOutcome
 from sag_api.services.source_operation_service import (
     acquire_operation_lease,
     acquire_source_exclusive_lease,
@@ -236,7 +236,7 @@ async def process_document(session: AsyncSession, job: Job, *, engine_manager: E
 async def _process_document_unlocked(
     session: AsyncSession, job: Job, *, engine_manager: EngineManager, job_queue=None
 ) -> None:
-    """Phân tích cú pháp, nạp và trích xuất đồng thời theo chunk; mỗi chunk hoàn thành sẽ lưu checkpoint."""
+    """Publish canonical search readiness; legacy event extraction is explicitly opt-in."""
     document = await session.get(Document, job.document_id) if job.document_id else None
     if document is None:
         raise NotFoundError("Tài liệu không tồn tại")
@@ -471,7 +471,7 @@ async def _process_document_unlocked(
                         if getattr(settings, "sag_qdrant_api_key", None):
                             qdrant_headers["api-key"] = settings.sag_qdrant_api_key
                         async with httpx.AsyncClient(base_url=qdrant_url, headers=qdrant_headers, timeout=30.0) as qdrant_client:
-                            await run_search_indexing_stage(
+                            search_units = await run_search_indexing_stage(
                                 session,
                                 project_id=ing_run.project_id,
                                 document_version=doc_ver,
@@ -486,7 +486,10 @@ async def _process_document_unlocked(
                 await _pause_or_yield()
             except Exception as pipe_err:
                 pipe_err_str = sanitize_error_message(pipe_err)
-                log.error("Phase 2 pipeline execution failed run_id=%s: %s", run_id, pipe_err_str)
+                log.error("Canonical pipeline failed run_id=%s stage=%s error_type=%s cause_type=%s retryable=%s",
+                          run_id, current_pipeline_stage, type(pipe_err).__name__,
+                          type(pipe_err.__cause__).__name__ if pipe_err.__cause__ else None,
+                          is_retryable_error(pipe_err))
                 await session.rollback()
 
                 # Determine accurate error layer & stage
@@ -551,21 +554,33 @@ async def _process_document_unlocked(
                     pipe_err_str,
                     layer=err_layer,
                     stage=err_stage,
+                    retryable=is_retryable_error(pipe_err),
                 ) from pipe_err
 
-        outcome = await engine_manager.process_document(
-            source.sag_source_config_id,
-            str(prepared.path) if prepared is not None else None,
-            source=source,
-            on_stage=on_stage,
-            checkpoint=checkpoint,
-            on_checkpoint=on_checkpoint,
-            should_pause=should_pause,
-            max_concurrency=settings.document_extract_concurrency,
-            document_title=Path(document.filename).stem.strip(),
-            original_path=target_storage_path if prepared is not None else None,
-            document_version_id=doc_ver.id if (run_id and "doc_ver" in locals() and doc_ver is not None) else None,
-        )
+        if run_id and not settings.document_event_extraction_enabled:
+            if doc_ver.search_status != "SEARCH_READY":
+                raise RuntimeError("Canonical search manifest was not verified")
+            if await should_pause():
+                await _pause_or_yield()
+            outcome = ProcessOutcome(
+                source_id=document.sag_source_id,
+                chunk_count=len(search_units),
+                chunk_ids=[unit.id for unit in search_units],
+            )
+        else:
+            outcome = await engine_manager.process_document(
+                source.sag_source_config_id,
+                str(prepared.path) if prepared is not None else None,
+                source=source,
+                on_stage=on_stage,
+                checkpoint=checkpoint,
+                on_checkpoint=on_checkpoint,
+                should_pause=should_pause,
+                max_concurrency=settings.document_extract_concurrency,
+                document_title=Path(document.filename).stem.strip(),
+                original_path=target_storage_path if prepared is not None else None,
+                document_version_id=doc_ver.id if (run_id and "doc_ver" in locals() and doc_ver is not None) else None,
+            )
         if outcome.paused:
             await _pause_or_yield()
     except (JobPaused, JobYielded):
@@ -732,6 +747,7 @@ async def _process_document_unlocked(
         outcome.event_count,
         outcome.token_usage,
     )
+
     if job_queue is not None:
         try:
             from sag_api.services.universe_service import schedule_universe_refresh
@@ -749,66 +765,6 @@ async def _process_document_unlocked(
                 source.id,
                 sanitize_error_message(uni_err),
             )
-        if run_id:
-            try:
-                ingestion_run = await session.get(IngestionRun, run_id)
-                if ingestion_run is not None:
-                    if getattr(settings, "document_fast_graph_enabled", True) and getattr(
-                        settings, "knowledge_worker_enabled", True
-                    ):
-                        try:
-                            from sag_api.jobs.knowledge import _embed_blocks
-                            from sag_api.services.knowledge_service import (
-                                KnowledgeConfig,
-                                rebuild_knowledge_version,
-                                version_input,
-                            )
-
-                            k_cfg = KnowledgeConfig()
-                            _, k_blocks, _, _ = await version_input(
-                                session, ingestion_run.document_version_id, k_cfg
-                            )
-                            non_heading_blocks = [
-                                (b.id, b.normalized_text)
-                                for b in k_blocks
-                                if b.block_type != "heading" and b.normalized_text.strip()
-                            ]
-                            dense_by_block_id = None
-                            if non_heading_blocks:
-                                kb_embedder = await engine_manager.get_sag_embedding(
-                                    source.sag_source_config_id, source
-                                )
-                                dense_by_block_id = await _embed_blocks(kb_embedder, non_heading_blocks)
-                            await rebuild_knowledge_version(
-                                session,
-                                ingestion_run.document_version_id,
-                                k_cfg,
-                                dense_by_block_id=dense_by_block_id,
-                            )
-                            await session.commit()
-                        except Exception as kb_err:  # noqa: BLE001
-                            await session.rollback()
-                            log.warning(
-                                "Inline foundation knowledge build deferred to worker doc=%s: %s",
-                                document.id,
-                                sanitize_error_message(kb_err),
-                            )
-
-                    from sag_api.services.universe_tree_service import enqueue_tree_rebuild_for_version
-
-                    await enqueue_tree_rebuild_for_version(
-                        session,
-                        job_queue,
-                        ingestion_run.document_version_id,
-                        reason="document_search_ready",
-                    )
-            except Exception as tree_err:  # noqa: BLE001 - tree scheduling must not fail document ingestion
-                await session.rollback()
-                log.warning(
-                    "Universe tree rebuild scheduling delayed doc=%s: %s",
-                    document.id,
-                    sanitize_error_message(tree_err),
-                )
 
 
 async def delete_document_task(
@@ -851,6 +807,7 @@ async def _delete_document_task_unlocked(
 
     # Phase 2 Cleanup: Delete Qdrant points for all document versions belonging to this document
     from sqlalchemy import select
+
     from sag_api.db.models.routing_rag import DocumentVersion
     version_ids = (
         await session.execute(
@@ -883,7 +840,18 @@ async def _delete_document_task_unlocked(
     from sag_api.services.document_service import _refresh_source_counts
 
     await _refresh_source_counts(session, source)
+    tree_job = None
+    if job_queue is not None and document.tenant_id and document.project_id:
+        from sag_api.services.universe_tree_service import enqueue_project_tree_rebuild
+
+        tree_job = await enqueue_project_tree_rebuild(
+            session, job_queue, tenant_id=document.tenant_id, project_ids=[document.project_id],
+            reason="document_deleted", persist_only=True)
     await session.commit()
+    if tree_job is not None:
+        from sag_api.services.document_service import _enqueue_persisted_job
+
+        await _enqueue_persisted_job(job_queue, tree_job.id)
     if path:
         from sag_api.parsing.service import parsed_sidecar_paths
 
@@ -969,6 +937,7 @@ async def _reprocess_document_task_unlocked(
 
     # Create an IngestionRun for Phase 2 processing on reprocess
     from sqlalchemy import select
+
     from sag_api.db.models.routing_rag import DocumentVersion, IngestionRun
     latest_ver = (
         await session.execute(
@@ -1101,6 +1070,8 @@ async def rebuild_universe_tree(
     engine_manager: EngineManager,
     job_queue=None,
 ) -> None:
+    from sag_api.core.errors import ServiceUnavailableError
+    from sag_api.services.tree_publish_service import TreePublishInProgress, TreeSlotInUse
     from sag_api.services.universe_tree_service import rebuild_project_universe_tree
 
     payload = job.payload or {}
@@ -1118,12 +1089,52 @@ async def rebuild_universe_tree(
 
     results = []
     for index, project_id in enumerate(project_ids):
-        result = await rebuild_project_universe_tree(
-            session,
-            engine_manager,
-            tenant_id=tenant_id,
-            project_id=project_id,
-        )
+        from sqlalchemy import select
+
+        from sag_api.db.models import KnowledgeJob
+
+        ingesting = await session.scalar(select(Job.id).join(Document, Document.id == Job.document_id).where(
+            Document.project_id == project_id, Document.tenant_id == tenant_id,
+            Job.type.in_((JobType.PROCESS_DOCUMENT, JobType.REPROCESS_DOCUMENT)),
+            Job.status.in_((JobStatus.QUEUED, JobStatus.RUNNING)),
+        ).limit(1))
+        if ingesting:
+            raise JobDeferred()
+        # Discovery is asynchronous: SEARCH_READY may precede the FOUNDATION row.
+        now = datetime.now(UTC)
+        undiscovered = await session.scalar(select(DocumentVersion.id).join(Document).where(
+            Document.project_id == project_id, Document.tenant_id == tenant_id, Document.is_active.is_(True),
+            Document.status.in_((DocumentStatus.PENDING, DocumentStatus.LOADING,
+                                 DocumentStatus.EXTRACTING, DocumentStatus.READY)),
+            DocumentVersion.search_status.in_(("READY", "SEARCH_READY")),
+            DocumentVersion.search_ready_at.is_not(None),
+            DocumentVersion.valid_from <= now, DocumentVersion.valid_to > now,
+            DocumentVersion.knowledge_status.in_(("NOT_STARTED", "QUEUED")),
+        ).limit(1))
+        if undiscovered:
+            raise JobDeferred()
+        pending = await session.scalar(select(KnowledgeJob.id)
+            .join(DocumentVersion, DocumentVersion.id == KnowledgeJob.document_version_id)
+            .join(Document, Document.id == DocumentVersion.document_id)
+            .where(Document.project_id == project_id, Document.tenant_id == tenant_id,
+                   Document.is_active.is_(True), DocumentVersion.valid_from <= now, DocumentVersion.valid_to > now,
+                   KnowledgeJob.kind == "FOUNDATION", KnowledgeJob.status.in_(("QUEUED", "RUNNING", "RETRY")))
+            .limit(1))
+        if pending:
+            raise JobDeferred()
+        try:
+            result = await rebuild_project_universe_tree(
+                session,
+                engine_manager,
+                tenant_id=tenant_id,
+                project_id=project_id,
+            )
+        except (TreePublishInProgress, TreeSlotInUse) as error:
+            raise JobDeferred() from error
+        except ServiceUnavailableError as error:
+            if isinstance(error.__cause__, TreePublishInProgress):
+                raise JobDeferred() from error
+            raise
         results.append(
             {"project_id": project_id, "status": "empty"}
             if result is None

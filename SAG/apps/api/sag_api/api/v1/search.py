@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
-from sag_api.core.config import settings
+from sag_api.core.config import FIXED_SEARCH_TOP_K, settings
 from sag_api.core.db import get_session
 from sag_api.core.deps import (
     get_current_user,
@@ -510,7 +510,7 @@ async def search(
                     engine_manager,
                     body.query,
                     {source.sag_source_config_id: source},
-                    limit=body.top_k,
+                    limit=FIXED_SEARCH_TOP_K,
                 ),
             )
         stats = _with_query_route_stats(
@@ -682,6 +682,7 @@ async def _run_one_strategy(
     partitioned_ids: set[str],
 ) -> EvalStrategyResultOut:
     """一次跑一个策略,任何失败都吸掉转成 error 字段,不让 gather 把整个对比搞崩。"""
+    top_k = FIXED_SEARCH_TOP_K
     try:
         sections = []
         stats: dict[str, Any] = {}
@@ -714,7 +715,7 @@ async def _run_one_strategy(
         )
     section_outputs: list[SectionOut] = []
     sections.sort(key=lambda section: section.score, reverse=True)
-    for section in sections[: max(1, min(int(top_k or settings.search_top_k), 50))]:
+    for section in sections[:top_k]:
         source = source_refs.get(section.source_config_id or "")
         if source is None:
             continue

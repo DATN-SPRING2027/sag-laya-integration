@@ -72,7 +72,7 @@ class ModelConfigUpdate(BaseModel):
     document_extraction_profile: Literal["standard", "concise"] | None = None
 
     search_strategy: SearchStrategy | None = None
-    search_top_k: int | None = Field(default=None, ge=1, le=50)
+    search_top_k: int | None = Field(default=None, ge=1)
     sag_language: Literal["en", "zh"] | None = None
 
     @field_validator("sag_language", mode="before")

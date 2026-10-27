@@ -15,11 +15,11 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from sag_api.core.config import settings
-from sag_api.core.errors import ServiceUnavailableError, UpstreamError
+from sag_api.core.errors import is_retryable_error
 from sag_api.core.logging import get_logger
 from sag_api.db.models import Document
 from sag_api.enums import DocumentStatus, JobStatus, JobType
-from sag_api.jobs.control import JobDeleted, JobPaused, JobYielded
+from sag_api.jobs.control import JobDeferred, JobDeleted, JobPaused, JobYielded
 from sag_api.jobs.queue import JobQueue
 from sag_api.jobs.scheduling import (
     DELETE_PRIORITY,
@@ -57,21 +57,28 @@ def _is_retryable(exc: Exception) -> bool:
     explicit_retryable = getattr(exc, "__dict__", {}).get("retryable")
     if isinstance(explicit_retryable, bool):
         return explicit_retryable
-    return bool(getattr(exc, "retryable", False)) or isinstance(
-        exc,
-        (ServiceUnavailableError, UpstreamError, OperationalError),
-    )
+    return is_retryable_error(exc)
 
 
 async def _mark_document_waiting_retry(session, job) -> None:
     """Keep a retryable document active without discarding its checkpoint."""
     if job.type != JobType.PROCESS_DOCUMENT or not job.document_id:
         return
-    document = await session.get(Document, job.document_id)
+    document = await session.get(Document, job.document_id, populate_existing=True)
     if document is None:
+        return
+    if document.status in (DocumentStatus.PAUSED, DocumentStatus.PAUSING,
+                           DocumentStatus.DELETING, DocumentStatus.DELETE_FAILED):
         return
     document.status = DocumentStatus.PENDING
     document.error = None
+    from sag_api.db.models import IngestionRun
+
+    run_id = (job.payload or {}).get("run_id")
+    if run_id:
+        run = await session.get(IngestionRun, run_id)
+        if run:
+            run.status, run.completed_at = "QUEUED", None
 
 
 async def _mark_reprocess_failed(session, document_id: str, message: str) -> None:
@@ -1040,6 +1047,13 @@ class InProcessAsyncQueue(JobQueue):
                 if claimed_type in _MAINTENANCE_JOB_TYPES and claimed_source_id:
                     await self.finish_source_maintenance(claimed_source_id, job_id)
                 return
+            except JobDeferred as deferred:
+                await session.rollback()
+                await session.execute(update(Job).where(
+                    Job.id == job_id, Job.status == JobStatus.RUNNING, Job.started_at == claimed_started_at,
+                ).values(status=JobStatus.QUEUED, attempts=Job.attempts - (0 if is_resume else 1),
+                         error=None, finished_at=None))
+                retry_delay_to_schedule = deferred.delay_seconds
             except JobYielded as yielded:
                 await session.rollback()
                 job = await session.get(Job, job_id)

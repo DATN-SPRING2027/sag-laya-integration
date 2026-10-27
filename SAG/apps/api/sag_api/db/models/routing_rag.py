@@ -178,6 +178,7 @@ class CanonicalBlock(Base):
     source_anchor: Mapped[str | None] = mapped_column(String(256), nullable=True)
     normalized_text: Mapped[str] = mapped_column(Text, nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    dedup_signature_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime(), server_default=func.now(), nullable=False
     )

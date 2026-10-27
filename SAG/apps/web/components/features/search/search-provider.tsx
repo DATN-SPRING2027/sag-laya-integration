@@ -430,7 +430,7 @@ export function SearchProvider({
           key: requestedKey,
           query: committedQuery,
           strategy,
-          topK: resolvedRun.topK,
+          topK: Number(result.stats.effective_top_k ?? result.sections.length),
           hasMore: Boolean(result.stats.has_more),
         }),
         history,
@@ -443,7 +443,7 @@ export function SearchProvider({
         {
           query,
           source_ids: sourceIds,
-          top_k: resolvedRun.topK,
+          top_k: resolvedRun.automatic ? undefined : resolvedRun.topK,
           strategy,
           save_exploration: saveExploration,
         },

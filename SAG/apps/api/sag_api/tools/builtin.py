@@ -126,7 +126,7 @@ class SearchContextTool(Tool):
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Câu hỏi hoặc từ khóa cần tìm"},
-                "top_k": {"type": "integer", "description": "Số kết quả cần trả về (không bắt buộc)", "minimum": 1, "maximum": 50},
+                "top_k": {"type": "integer", "description": "SAG hiện truy xuất cố định 5 kết quả", "minimum": 1},
             },
             "required": ["query"],
         },
@@ -138,7 +138,7 @@ class SearchContextTool(Tool):
             return ToolResult(content="(Không tìm thấy tài liệu liên quan.)", citations=[], data={"section_count": 0})
         persona = ctx.persona or {}
         top_k = args.get("top_k") or persona.get("top_k")
-        limit = max(1, min(int(top_k or 8), 50))
+        limit = max(1, int(top_k)) if top_k is not None else None
         source_refs = {s.sag_source_config_id: {"id": s.id, "name": s.name} for s in ctx.sources}
         from sag_api.services.query_strategy_planner import plan_query
         from sag_api.services.search_unit_retrieval_service import retrieve_search_unit_sections

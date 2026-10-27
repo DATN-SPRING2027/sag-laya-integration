@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import math
 import re
+import threading
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from sag_api.core.config import settings
+from sag_api.core.config import FIXED_SEARCH_TOP_K, settings
 from sag_api.core.logging import get_logger
 from sag_api.sag import RetrievedSection, SearchOutcome
 from sag_api.services.evidence_service import (
@@ -374,7 +375,7 @@ def rerank_sections(
     *,
     lexical: list[RetrievedSection] | None = None,
     exact_lexical_keys: set[tuple[str, str]] | None = None,
-    limit: int,
+    limit: int | None,
     analysis: QueryAnalysis | None = None,
 ) -> RerankResult:
     """Fuse retriever rank lists without assuming their scores share a scale."""
@@ -668,7 +669,7 @@ def rerank_sections(
     selected = [
         section.model_copy(update={"score": round(score, 6), "rank": index})
         for index, (score, _coverage, _exact, _rank_sum, _key, section) in enumerate(
-            ranked[: max(1, limit)]
+            ranked if limit is None else ranked[: max(1, limit)]
         )
     ]
     return RerankResult(
@@ -711,11 +712,14 @@ def select_diverse_sections(
     query: str,
     candidates: list[RetrievedSection],
     *,
-    limit: int,
+    limit: int | None,
     diversity_weight: float | None = None,
     near_duplicate_similarity: float | None = None,
+    _cancelled: threading.Event | None = None,
 ) -> tuple[list[RetrievedSection], dict[str, Any]]:
     """Collapse near-identical text and apply deterministic MMR without dropping query anchors."""
+    if limit is None:
+        limit = len(candidates)
     if limit <= 0 or not candidates:
         return [], {"candidate_count": len(candidates), "deduplicated_count": 0, "anchor_coverage": {}}
 
@@ -777,18 +781,21 @@ def select_diverse_sections(
     unique: list[RetrievedSection] = []
     unique_shingles: list[frozenset[str]] = []
     unique_coverage: list[frozenset[str]] = []
+    def check_cancelled() -> None:
+        if _cancelled is not None and _cancelled.is_set():
+            raise InterruptedError("Diversity selection cancelled")
+
     for section in ordered:
+        check_cancelled()
         shingles = _content_shingles(section)
         coverage = anchor_coverage(section)
-        duplicate_index = next(
-            (
-                index
-                for index, previous in enumerate(unique_shingles)
-                if coverage == unique_coverage[index]
-                and _jaccard(shingles, previous) >= duplicate_threshold
-            ),
-            None,
-        )
+        duplicate_index = None
+        for index, previous in enumerate(unique_shingles):
+            if index % 32 == 0:
+                check_cancelled()
+            if coverage == unique_coverage[index] and _jaccard(shingles, previous) >= duplicate_threshold:
+                duplicate_index = index
+                break
         if duplicate_index is None:
             unique.append(section)
             unique_shingles.append(shingles)
@@ -880,7 +887,20 @@ def select_diverse_sections(
 
     fallback_doc_floor = 0.0 if diversity_weight is not None else (0.72 if features.multi_hop else 0.86)
     same_doc_penalty_weight = 0.08 if features.multi_hop else 0.0
+    compared = [0] * len(unique)
+    redundancy = [0.0] * len(unique)
+
+    def max_redundancy(index: int) -> float:
+        # Each pair is unchanged across MMR rounds; compare only newly selected evidence.
+        for offset, chosen in enumerate(selected_indices[compared[index]:]):
+            if offset % 32 == 0:
+                check_cancelled()
+            redundancy[index] = max(redundancy[index], _jaccard(unique_shingles[index], unique_shingles[chosen]))
+        compared[index] = len(selected_indices)
+        return redundancy[index]
+
     while len(selected_indices) < min(limit, len(unique)):
+        check_cancelled()
         remaining = [
             index
             for index in range(len(unique))
@@ -935,10 +955,7 @@ def select_diverse_sections(
                 (1.0 - diversity) * max(0.0, min(1.0, float(unique[index].score or 0.0)))
                 - diversity
                 * (
-                    max(
-                        (_jaccard(unique_shingles[index], unique_shingles[chosen]) for chosen in selected_indices),
-                        default=0.0,
-                    )
+                    max_redundancy(index)
                     ** 2
                 )
                 - (
@@ -980,6 +997,7 @@ async def _lexical_sections(
     sources: list[SearchSource],
     *,
     analysis: QueryAnalysis,
+    candidate_limit: int,
     exclude_source_ids_by_config: DocumentSourceExclusions | None = None,
 ) -> tuple[list[RetrievedSection], set[tuple[str, str]]]:
     grep_chunks = getattr(engine_manager, "grep_chunks", None)
@@ -1001,7 +1019,7 @@ async def _lexical_sections(
             try:
                 options: dict[str, Any] = {
                     "source": source,
-                    "limit": 2,
+                    "limit": candidate_limit,
                 }
                 if (
                     getattr(
@@ -1059,13 +1077,14 @@ async def retrieve_relevant_sections(
 ) -> SearchOutcome:
     """One retrieval contract for search UI and the Agent's search_context tool."""
 
+    top_k = FIXED_SEARCH_TOP_K
     total_start = time.perf_counter()
     analysis = analyze_query(
         query,
         segmentation_enabled=settings.search_chinese_segmentation_enabled,
     )
-    requested_limit = max(1, min(int(top_k or settings.search_top_k), 50))
-    candidate_limit = min(50, max(requested_limit * 3, requested_limit + 8))
+    requested_limit = min(top_k, settings.search_unit_candidate_limit)
+    candidate_limit = min(settings.search_unit_candidate_limit, top_k * 4)
     targets = [(source.sag_source_config_id, source) for source in sources]
     engine_start = time.perf_counter()
     hidden = await _hidden_document_derivatives(sources)
@@ -1089,6 +1108,7 @@ async def retrieve_relevant_sections(
             engine_manager,
             sources,
             analysis=analysis,
+            candidate_limit=candidate_limit,
             exclude_source_ids_by_config=exclusions,
         ),
     )
@@ -1118,7 +1138,14 @@ async def retrieve_relevant_sections(
     total_latency_ms = round((time.perf_counter() - total_start) * 1000, 2)
     stats = {
         **outcome.stats,
-        "requested_top_k": requested_limit,
+        "requested_top_k": top_k,
+        "automatic_top_k": False,
+        "effective_top_k": len(reranked.sections),
+        "budget_exhausted": (
+            len(reranked.sections) >= settings.search_unit_candidate_limit
+            or len(outcome.sections) >= settings.search_unit_candidate_limit
+            or len(lexical) >= settings.search_unit_candidate_limit
+        ),
         "candidate_top_k": candidate_limit,
         "candidates": reranked.candidate_count,
         "relevant": reranked.relevant_count,
@@ -1129,7 +1156,7 @@ async def retrieve_relevant_sections(
         "fusion_retrievers": int(bool(semantic_sections)) + int(bool(lexical_sections)),
         "chinese_segmentation_used": analysis.chinese_segmentation_used,
         "lexical_term_count": len(analysis.lookup_terms),
-        "has_more": reranked.relevant_count > len(reranked.sections),
+        "has_more": False,
         "logically_deleted_filtered": hidden_count,
         "latency_engine_ms": engine_latency_ms,
         "latency_rerank_ms": rerank_latency_ms,

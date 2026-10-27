@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 
 class DifyRetrievalSetting(BaseModel):
-    top_k: int = Field(default=4, ge=1, le=50)
+    top_k: int | None = Field(default=None, ge=1)
     score_threshold: float = Field(
         default=0.0,
         ge=0.0,
