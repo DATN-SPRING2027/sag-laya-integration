@@ -1,6 +1,7 @@
 """Opt-in paired runtime evaluation, synthetic isolated DBs, durable resume.
 
 Never opens application DB or writes real chats. Bad completed answers are never retried.
+Requires explicit SAG_LLM_BASE_URL; schema 3 resumes require full per-call reservations.
 """
 
 from __future__ import annotations
@@ -226,6 +227,10 @@ def _sanitize_endpoint_url(raw_url: str | None) -> dict:
 
 
 def _provider_route_sha256() -> str:
+    if not settings.llm_base_url or not settings.llm_base_url.strip():
+        raise ValueError(
+            "runtime evaluation requires an explicit SAG_LLM_BASE_URL; SDK environment/default routes are not frozen"
+        )
     legacy_probe = apply_litellm_completion_policy(
         settings,
         {
@@ -281,7 +286,7 @@ def build_runtime_manifest(args, cases):
     }
     variants = ["legacy", "runtime"] if getattr(args, "variants", "both") == "both" else [args.variants]
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "split": args.split,
         "case_ids": [case["id"] for case in cases],
         "variants": variants,
@@ -336,7 +341,10 @@ def _validate_call_record(call: object, *, require_observer_counts: bool) -> Non
         if token_val is not None and not _is_nonneg_int(token_val):
             raise ValueError(f"cannot safely resume: invalid {token_key} in call; start a new experiment or reconcile")
     if require_observer_counts:
-        for obs_key in ("observed_deployment_attempts", "observed_deployment_failures"):
+        for obs_key in (
+            "observed_deployment_attempts", "observed_deployment_failures",
+            "estimated_input_tokens", "max_output_tokens", "configured_retries",
+        ):
             if obs_key not in call or not _is_nonneg_int(call[obs_key]):
                 raise ValueError(
                     f"cannot safely resume: invalid {obs_key} in call; start a new experiment or reconcile"
@@ -344,7 +352,9 @@ def _validate_call_record(call: object, *, require_observer_counts: bool) -> Non
     for opt_token_key in ("cached_tokens", "reasoning_tokens"):
         if opt_token_key in call and call[opt_token_key] is not None and not _is_nonneg_int(call[opt_token_key]):
             raise ValueError(f"cannot safely resume: invalid {opt_token_key} in call")
-    for counter_key in ("usage_snapshots", "configured_retries", "estimated_input_tokens", "reserved_input_tokens"):
+    for counter_key in (
+        "usage_snapshots", "configured_retries", "estimated_input_tokens", "reserved_input_tokens", "max_output_tokens",
+    ):
         if counter_key in call and not _is_nonneg_int(call[counter_key]):
             raise ValueError(f"cannot safely resume: invalid {counter_key} in call")
     for time_key in ("duration_ms", "ttft_ms"):
@@ -391,15 +401,15 @@ def validate_runtime_resume(report, expected):
                     f"cannot safely resume: inconsistent experiment_accounting.{key}; "
                     "start a new experiment or reconcile"
                 )
-    if calls:
-        min_reserved = sum(
-            call.get("estimated_input_tokens", 0) * (1 + call.get("configured_retries", 0)) for call in calls
+    recorded_reservations = sum(
+        (call["estimated_input_tokens"] + call["max_output_tokens"]) * (1 + call["configured_retries"])
+        for call in calls
+    )
+    if reserved != recorded_reservations:
+        raise ValueError(
+            "cannot safely resume: reserved_tokens does not match recorded call reservations; "
+            "start a new experiment or reconcile"
         )
-        if reserved <= 0 or reserved < min_reserved:
-            raise ValueError(
-                "cannot safely resume: reserved_tokens is smaller than recorded call reservations; "
-                "start a new experiment or reconcile"
-            )
     seen_keys = set()
     rows_with_accounting = []
     for row in report["results"]:

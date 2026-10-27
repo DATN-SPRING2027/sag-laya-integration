@@ -281,6 +281,7 @@ async def test_runtime_evaluation_resume_must_reject_changed_model_and_caps(tmp_
         "observed_deployment_attempts": 1,
         "configured_retries": 0,
         "estimated_input_tokens": 10,
+        "max_output_tokens": 311,
         "duration_ms": 12.0,
         "ttft_ms": None,
     }
@@ -370,6 +371,8 @@ async def test_runtime_evaluation_resume_must_reject_changed_model_and_caps(tmp_
     zero_call_report = copy.deepcopy(report)
     zero_call_report["results"][0]["accounting"]["logical_calls"] = 0
     zero_call_report["results"][0]["accounting"]["calls"] = []
+    zero_call_report["results"][0]["accounting"]["input_tokens"] = 0
+    zero_call_report["results"][0]["accounting"]["output_tokens"] = 0
     zero_call_report["reserved_tokens"] = 0
     zero_call_report["experiment_accounting"] = harness.CallLedger(
         max_calls=50, max_seconds=600, max_estimated_tokens=100000
@@ -380,14 +383,17 @@ async def test_runtime_evaluation_resume_must_reject_changed_model_and_caps(tmp_
     calls.clear()
 
     # 3. Exhausted budget on resume (calls, tokens, or seconds) must not launch new work or reset totals.
-    for exhausted_field, exhausted_value in (
-        ("reserved_tokens", 100000),
-        ("elapsed_seconds", 600.0),
+    for exhausted_field, exhausted_value, cap_key in (
+        ("max_calls", 1, "calls"),
+        ("max_tokens", 321, "tokens"),
+        ("max_seconds", 12.5, "seconds"),
     ):
         exhausted_report = copy.deepcopy(report)
-        exhausted_report[exhausted_field] = exhausted_value
+        exhausted_args = copy.deepcopy(base_args)
+        setattr(exhausted_args, exhausted_field, exhausted_value)
+        exhausted_report["caps"][cap_key] = exhausted_value
         output.write_text(json.dumps(exhausted_report), encoding="utf-8")
-        await harness.run(base_args)
+        await harness.run(exhausted_args)
         assert not calls, f"Exhausted {exhausted_field} must not launch candidate work"
         saved_exhausted = json.loads(output.read_text(encoding="utf-8"))
         assert len(saved_exhausted["results"]) == 3

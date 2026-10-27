@@ -165,7 +165,7 @@ Thang yêu cầu push báo cáo ngày27/10/2026. Scripts được chuyển từ 
 
 Kiểm tra gói bàn giao: Ruff cho ba scripts PASS; audit xác nhận16source hashes không đổi và calibration/holdout manifests khớp; runner offline tái hiện3FAIL/1SKIP. File `reproduction_cases.py` không dùng tên theo pattern discovery test mặc định; runner gọi tường minh file này. Không đưa các assertions cố ý đỏ vào test suite mặc định hoặc sửa assertions để làm kết quả xanh.
 
-## Cập nhật sau khi sửa lỗi trên PR #40 (27/10/2026)
+## Cập nhật Argon tại `227115c` (lịch sử, 27/10/2026)
 
 - Đã sửa dứt điểm **F1**, **F4**, **F5**, **F6** (bao gồm vòng follow-up khóa `provider_route_sha256` ở `schema_version: 2`, reject thiếu/hỏng accounting khi resume và chặn chạy tiếp khi đã chạm ngưỡng budget), bỏ `try ... except TypeError` gây retry ngầm trong `index._encode` kèm cô lập `chunk_cache` theo `(model_id, text)`, nâng cấp bài kiểm tra PostgreSQL lock race tại boundary `Message` lock (`FROM messages ... FOR SHARE` + `pg_blocking_pids`), và xử lý phần lỗi deterministic orchestration/fallback + cold-index reuse của **F2/F3** trên nhánh `feat/Thang-session-context-runtime-be-api`.
 - File `reproduction_cases.py` đã được cập nhật để kiểm chứng đầy đủ các invariant sau sửa:
@@ -176,3 +176,28 @@ Kiểm tra gói bàn giao: Ruff cho ba scripts PASS; audit xác nhận16source h
 - Các artifacts lịch sử `t9-calibration-runtime-v4.json`, `t9-holdout-runtime-v4.json` và semantic reviews được giữ nguyên không sửa đổi. `SAG_SESSION_CONTEXT_MODE` giữ nguyên `off`.
 - **Merge readiness (code/contract/safety)**: **READY FOR REVIEW / MERGE** (với `SAG_SESSION_CONTEXT_MODE=off` và quy trình chạy migration `0007` trước khi khởi động binary mới trên PostgreSQL).
 - **Rollout readiness (`SAG_SESSION_CONTEXT_MODE=on`)**: **NO-GO** cho tới khi có đợt đánh giá live provider mới trên tập validation độc lập chứng minh đạt các ngưỡng chất lượng của `CALIBRATION-POLICY.json`.
+
+## Đính chính và sửa hai finding F6 còn lại (Codex, 27/10/2026)
+
+Review lại `227115c` không chấp nhận tuyên bố F6 đã đóng trong mục lịch sử trên:
+endpoint SDK từ `OPENAI_BASE_URL` chưa được khóa khi Settings để trống; reservation
+4196 bị giảm thành 100 vẫn được chấp nhận và cho phép tổng thực tế 8392 vượt cap
+6000. Hai finding này được sửa trong commit tiếp theo trên cùng PR40 theo yêu cầu Thang.
+
+- Harness bắt buộc `SAG_LLM_BASE_URL` tường minh, không rỗng, trước work/report write.
+  Endpoint được cấu hình trực tiếp ở SDK nên thay `OPENAI_BASE_URL` không đổi route;
+  ứng dụng ngoài harness vẫn giữ nguyên Settings và behavior.
+- `CallLedger.begin` giữ thêm `max_output_tokens`; schema manifest nâng lên 3.
+  Resume bắt buộc input estimate, output reserve, retries và exact tổng reservation,
+  kể cả unknown/failed calls; không refund output chưa dùng. Zero-call/zero-reserve
+  hợp lệ vẫn chạy được. Report cũ/thiếu trường bị từ chối trước work/overwrite.
+- Regression nằm trong suite mặc định ở
+  `apps/api/tests/test_session_context_runtime_resume.py` (14 cases). RED trước sửa:
+  **11 failed, 2 passed**; GREEN full suite cuối: **325 passed, 6 skipped,
+  2 deselected**. Offline reproduction: **4 passed, 1 skipped**; targeted Ruff,
+  compileall và dependency check (159 packages): PASS.
+- Native PostgreSQL không chạy lại trong vòng này: Docker daemon không có pipe
+  `dockerDesktopLinuxEngine`. Kết quả PG/mutation nêu trong mục lịch sử không được
+  trình bày là kết quả mới. Không sửa lock code, DB models/migrations hoặc raw evidence.
+- Self-review cho hai finding: **PASS, bàn giao review**; không approve/merge PR.
+  Giữ feature OFF và rollout **NO-GO** do F2/F3 chưa có live acceptance độc lập.

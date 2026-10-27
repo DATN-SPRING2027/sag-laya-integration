@@ -44,6 +44,7 @@ class CallLedger:
             "reasoning_tokens": None, "usage_snapshots": 0,
             "observed_deployment_attempts": 0, "observed_deployment_failures": 0,
             "configured_retries": retries, "estimated_input_tokens": estimated_input,
+            "max_output_tokens": max_output,
             "duration_ms": None, "ttft_ms": None,
         }
         self.calls.append(record)

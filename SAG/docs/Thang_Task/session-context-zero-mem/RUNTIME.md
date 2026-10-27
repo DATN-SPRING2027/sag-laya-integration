@@ -70,3 +70,21 @@ Observed v2 maps can fail exact-quote copying even when IDs and evidence are ava
 Bounded session model calls request response_format=json_object. Primary SiliconFlow docs define JSON mode; two explicit actual SDK preflight requests verified plain JSON and forced native function-tool mode on the configured Qwen3-8B route (209input+10output tokens, no retries). Result saved locally; four browser requests and these two preflight requests are outside the paired ledger, so no global money-saving claim is made. No JSON-schema support is assumed. This is applied only before final calibration/holdout and does not weaken numeric gates or add retry/repair calls.
 
 Reference protocol also accepts supports:["S1"] as the exact equivalent of supports:[{"id":"S1"}], only in the explicit internal opt-in decoder. Supplied bad quotes remain rejected. Reducer string IDs resolve only previously mapped canonical quote pairs. Calibrationv3 identified this serialization mismatch before holdout; its diagnostic answers are preserved. Final verification usesv4, with the same numeric thresholds.
+
+## Runtime evaluation resume contract (post-review, 2026-10-27)
+
+`scripts/verify_session_runtime.py` requires an explicit, nonempty `SAG_LLM_BASE_URL`
+before creating or resuming an experiment. SDK environment/default endpoint fallback
+is rejected; the harness hashes the configured route without storing credentials.
+This restriction applies to the opt-in evaluation harness, not application settings.
+
+New manifests use `schema_version: 3`. Every experiment ledger call must retain
+`estimated_input_tokens`, `max_output_tokens` and `configured_retries`, including
+failed/unknown-usage calls. The saved `reserved_tokens` must exactly equal the sum
+of `(estimated_input_tokens + max_output_tokens) * (1 + configured_retries)` for
+all calls. Resume restores that total without refunding unused output allowance;
+an explicit zero-call ledger with zero reservation is valid. Old schema reports,
+missing reservation fields and inconsistent totals are rejected before new work or
+report overwrite. Use a new experiment output rather than editing historical
+reports to make them resumable. No live provider evaluation was repeated for this
+contract change; existing quality/rollout NO-GO remains in force.

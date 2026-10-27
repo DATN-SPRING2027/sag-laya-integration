@@ -490,3 +490,57 @@ Tiếp tục trên nhánh `feat/Thang-session-context-runtime-be-api` từ local
    - `SAG_SESSION_CONTEXT_MODE` giữ nguyên `off`.
    - **Merge readiness (code/contract/safety)**: **READY FOR REVIEW / MERGE**.
    - **Rollout readiness (`SAG_SESSION_CONTEXT_MODE=on`)**: **NO-GO** (chờ đợt đánh giá live provider mới trên tập validation độc lập).
+
+## PR40 — Resume endpoint và reservation, vòng sửa Codex 27/10/2026
+
+Thang yêu cầu sửa hai finding còn lại và push trực tiếp lên PR40. Tiếp tục nhánh
+`feat/Thang-session-context-runtime-be-api`, base hiện tại `227115c`; remote cùng SHA,
+`origin/main=7772270`. Không chuyển nhánh/reset hoặc sửa artifacts đo lịch sử.
+
+Trước triển khai: `verify_session_runtime._provider_route_sha256` hash endpoint từ
+Settings, nhưng SDK có thể đọc `OPENAI_BASE_URL` khi Settings để trống. Harness sẽ
+bắt buộc endpoint tường minh trước tạo manifest/provider/tokenizer, thay vì tự đoán
+route của các SDK. `CallLedger.begin` đã giữ tổng reservation gồm input + output và
+retries nhưng chưa lưu output reserve từng call; validator chỉ đối chiếu input nên
+chấp nhận tổng giảm 4196 xuống 100, mở lại budget. Sẽ lưu `max_output_tokens` từng
+call, bắt buộc đủ các thành phần reservation và đối chiếu tổng chính xác; nâng
+manifest schema lên 3, từ chối report cũ/thiếu thông tin thay vì suy về 0.
+
+Phạm vi file: eval accounting, runtime harness, regression tests mặc định, fixture
+reproduction tương ứng và báo cáo review này. Không đổi public API, scope/ACL,
+provenance, DB/schema/migration, model orchestration hay flag OFF. Tests dùng doubles
+ở provider boundary, không nạp `.env` thật hoặc gọi paid model. Ma trận nghiệm thu:
+endpoint None/rỗng dù có OPENAI_BASE_URL phải reject trước work/overwrite; endpoint
+tường minh không phụ thuộc env; reservation giảm/tăng/thiếu trường phải reject;
+reservation đúng gồm retries, zero-call hợp lệ, resume đủ/thiếu ngân sách giữ tổng;
+report schema cũ reject. Chạy RED trước sửa, focused GREEN, reproductions, full
+offline suite, Ruff và diff review. Native PG không thuộc delta; daemon Docker hiện
+không hoạt động, không dùng DB người dùng để thay thế. F2/F3 vẫn NO-GO rollout.
+
+### Kết quả vòng sửa Codex
+
+- RED trên `227115c`: `tests/test_session_context_runtime_resume.py` có **11 failed,
+  2 passed** (23.93s); tái hiện endpoint ngầm, tổng reservation giảm/tăng, thiếu các
+  thành phần reservation, schema cũ và thiếu output allowance trong ledger.
+- GREEN focused (resume + baseline + calibration): **41 passed** (23.40s).
+  Sau đó bổ sung zero-call regression; full offline cuối cùng
+  `pytest -q -m "not ai_smoke"`: **325 passed, 6 skipped, 2 deselected** (90.02s).
+  Pytest chạy qua wrapper chặn nạp `.env` thật, SQLite in-memory, HF/Transformers
+  offline và `SESSION_CONTEXT_NATIVE_PG_QA=0`; không gọi paid provider.
+- `run_repros.py`: **4 passed, 1 skipped** (25.63s). Fixture lịch sử được cập nhật
+  output reserve đúng 311 (10 + 311 = 321), zero-call totals đúng 0; exhaustion
+  tests dùng caps khớp args/report và giữ ledger thật, không giả tăng tổng reservation.
+- Ruff tại API cwd cho 4 file Python thay đổi: **All checks passed**; compileall
+  3 file implementation/test mới: **PASS**; `uv pip check --python
+  .venv/Scripts/python.exe`: **159 packages compatible**; `git diff --check`: PASS.
+- Native PG/mutation control: **không chạy lại**; `docker info` báo không có pipe
+  `dockerDesktopLinuxEngine`. Không tạo container, không đụng DB thật.
+- Tự review correctness/security/architecture/readability/performance: endpoint
+  bắt buộc trước work; reservation kiểm exact trên cả ledger rỗng và failed calls;
+  không thay model input/output, scope/ACL, schema DB hay runtime flag. Hai finding
+  thuộc phạm vi này đã đóng bằng regression; không coi là nghiệm thu F2/F3/live.
+- Impact/rollback: manifest schema 3 không resume report schema 2 hoặc thiếu
+  `max_output_tokens`; dùng output experiment mới, không sửa/bổ sung ngược raw
+  evidence cũ. Không thêm dependency, migration, secret hoặc env file. Rollback
+  riêng commit này trả lại harness schema 2 và guard cũ, nên không dùng để resume
+  report schema 3. Thang cho phép push commit mới lên cùng PR40, không merge/approve.
