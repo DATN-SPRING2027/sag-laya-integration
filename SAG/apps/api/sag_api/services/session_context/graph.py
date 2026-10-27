@@ -105,6 +105,13 @@ class LocalFeatureEncoder:
         self.encoder_calls = self.encoder_tokens = self.ner_calls = self.ner_tokens = 0
         budget.consume_index_units(0)
 
+    @property
+    def embedding_dimension(self) -> int:
+        return int(self.encoder.get_embedding_dimension())
+
+    def get_embedding_dimension(self) -> int:
+        return int(self.encoder.get_embedding_dimension())
+
     def featurize(self, text: str, *, budget: BudgetState) -> TextFeatures:
         budget.consume_index_units(1 + (len(text) + 1023) // 1024)
         vectors, mentions = [], set()

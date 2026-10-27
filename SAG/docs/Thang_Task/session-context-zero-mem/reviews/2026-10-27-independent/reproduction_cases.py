@@ -410,3 +410,121 @@ async def test_runtime_evaluation_resume_must_reject_changed_model_and_caps(tmp_
     assert resumed["experiment_accounting"]["calls"][0] == prior_call
     assert resumed["reserved_tokens"] >= 321
     assert resumed["elapsed_seconds"] >= 12.5
+
+
+@pytest.mark.asyncio
+async def test_f6_shadow_missing_tokenizer_cache_and_corrupted_vector_dimension_and_crash_resume(
+    storage_db, tmp_path, monkeypatch
+):
+    """Verify the 4 post-review [P2] findings:
+    1. SHADOW falls back cleanly when tokenizer cache is missing (OSError -> ServiceUnavailableError).
+    2. sync_index rebuilds cached vectors whose dimension does not match the encoder.
+    3. Crash after provider attempt persists accounting/reservation and blocks budget reopen on resume.
+    4. Calibration validate_resume locks provider_route_sha256.
+    """
+    import transformers
+    from test_session_context_index import Encoder as DimEncoder
+    from test_session_context_runtime import Encoder as RuntimeEncoder
+    from test_session_context_storage import work
+
+    from sag_api.core.errors import ServiceUnavailableError
+    from sag_api.db.models import Agent, SessionContextIndex
+    from sag_api.services.eval.session_context_calibration import provider_route_sha256, validate_resume
+    from sag_api.services.session_context import runtime
+    from sag_api.services.session_context.index import sync_index
+
+    # (4) Calibration resume locks provider_route_sha256
+    monkeypatch.setattr(settings, "llm_base_url", "https://provider-a.invalid/v1")
+    route_a = provider_route_sha256(settings)
+    monkeypatch.setattr(settings, "llm_base_url", "https://provider-b.invalid/v1")
+    route_b = provider_route_sha256(settings)
+    cal_doc = {
+        "corpus_sha256": "corpus",
+        "config": {},
+        "provider_route_sha256": route_a,
+        "locked_profile": "balanced",
+        "profiles": {},
+        "hierarchy": {},
+        "llm_extra_body_sha256": "body",
+        "case_ids": ["case"],
+        "dependency_versions": {"litellm": "same"},
+        "source_sha256": {
+            name: "same"
+            for name in (
+                "graph.py",
+                "selection.py",
+                "hierarchy.py",
+                "reader.py",
+                "scope.py",
+                "budget.py",
+                "types.py",
+                "eval_session_context.py",
+                "agent_domain.py",
+                "agent_service.py",
+                "llm.py",
+                "prompt.py",
+            )
+        },
+    }
+    validate_resume(cal_doc, cal_doc)
+    with pytest.raises(ValueError, match="resume"):
+        validate_resume(cal_doc, {**cal_doc, "provider_route_sha256": route_b})
+    with pytest.raises(ValueError, match="resume"):
+        validate_resume({k: v for k, v in cal_doc.items() if k != "provider_route_sha256"}, cal_doc)
+
+    # (1) & (2) Missing tokenizer cache in SHADOW + corrupted cached vector dimension in sync_index
+    factory, scope = storage_db
+    monkeypatch.setattr(settings, "llm_model", "Qwen/Qwen3-8B")
+    monkeypatch.setattr(runtime, "configured_encoder", lambda: RuntimeEncoder())
+
+    def missing_tokenizer(*args, **kwargs):
+        raise OSError("missing local tokenizer cache")
+
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", missing_tokenizer)
+    monkeypatch.setattr(settings, "session_context_mode", "shadow")
+    async with factory() as session:
+        session.add(raw("m1", content="First decision ORBIT-1", ordinal=1))
+        session.add(raw("m2", content="Second decision ORBIT-2", ordinal=2))
+        await session.commit()
+        agent, thread = await session.get(Agent, "agent"), await session.get(Thread, "thread")
+        plan = await prepare_ask(
+            session,
+            agent=agent,
+            thread=thread,
+            query="Which code?",
+            principal=principal(scope),
+            owner_key="owner",
+        )
+        assert plan.session_context is None
+
+    monkeypatch.setattr(settings, "session_context_mode", "on")
+    async with factory() as session:
+        agent, thread = await session.get(Agent, "agent"), await session.get(Thread, "thread")
+        with pytest.raises(ServiceUnavailableError):
+            await prepare_ask(
+                session,
+                agent=agent,
+                thread=thread,
+                query="Which code?",
+                principal=principal(scope),
+                owner_key="owner",
+            )
+
+    async with factory() as session:
+        enc1 = DimEncoder()
+        first = await sync_index(session, scope=scope, encoder=enc1, budget=work(), batch_size=2)
+        row = await session.get(SessionContextIndex, first.index_id)
+        corrupted = dict(row.features)
+        corrupted_m1 = dict(corrupted["m1"])
+        corrupted_m1["vector"] = [1.0, 0.1, 0.9]
+        corrupted["m1"] = corrupted_m1
+        row.features = corrupted
+        await session.commit()
+
+    async with factory() as session:
+        enc2 = DimEncoder()
+        healed = await sync_index(session, scope=scope, encoder=enc2, budget=work(), batch_size=2)
+        assert enc2.calls == 1
+        assert all(len(f.vector) == 2 for f in healed.features)
+        graph, _ = healed.views(scope=scope, budget=work())
+        assert len(graph.features) >= 2

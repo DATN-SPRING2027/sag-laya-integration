@@ -17,6 +17,7 @@ storage_db = storage_fixtures.storage_db
 
 class Encoder:
     model_id = "pinned-test"
+    embedding_dimension = 2
 
     def featurize_many(self, texts, **kwargs):
         return tuple(self.featurize(t, **kwargs) for t in texts)

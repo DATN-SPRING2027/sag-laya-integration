@@ -732,7 +732,7 @@ async def prepare_ask(
                 context = await prepare_context(session, key=SessionKey(owner_key, agent.id, thread.id),
                     principal=principal, user_message=user_msg, query=query, requested_source_ids=source_ids,
                     mode=mode, deadline=optional_deadline)
-        except (ServiceUnavailableError, BudgetExceeded, TimeoutError) as error:
+        except (ServiceUnavailableError, BudgetExceeded, TimeoutError, OSError) as error:
             if settings.session_context_mode != "shadow":
                 raise ServiceUnavailableError(
                     "Chưa hoàn tất context cho cuộc chat trong giới hạn lượt này. Vui lòng thử lại.",

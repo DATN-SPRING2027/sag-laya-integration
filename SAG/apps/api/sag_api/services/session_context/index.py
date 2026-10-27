@@ -60,6 +60,18 @@ def _encode(encoder, texts, budget, chunk_cache=None):
         )
 
 
+def _encoder_dimension(encoder) -> int | None:
+    dim = getattr(encoder, "embedding_dimension", None)
+    if type(dim) is int and dim > 0:
+        return dim
+    for target in (encoder, getattr(encoder, "encoder", None)):
+        if target is not None and hasattr(target, "get_embedding_dimension"):
+            value = target.get_embedding_dimension()
+            if type(value) is int and value > 0:
+                return value
+    return None
+
+
 async def sync_index(
     session: AsyncSession,
     *,
@@ -106,6 +118,7 @@ async def sync_index(
         page_size=128,
         budget=budget,
     )
+    expected_dim = _encoder_dimension(encoder)
     features = {}
     for message in history.messages:
         artifact = (row.features or {}).get(message.message_id)
@@ -119,10 +132,16 @@ async def sync_index(
                 tuple(EntityMention(**item) for item in artifact["mentions"]),
             )
             entity_keys(message.content, feature)
-            if feature.content_hash == message.reference.content_hash and feature.model_id == encoder.model_id:
+            if (
+                feature.content_hash == message.reference.content_hash
+                and feature.model_id == encoder.model_id
+                and (expected_dim is None or len(feature.vector) == expected_dim)
+            ):
                 features[message.message_id] = feature
         except (ContextContractError, KeyError, TypeError, ValueError):
             continue  # A damaged derived artifact is rebuilt from the authorized original.
+    if expected_dim is None and len({len(feature.vector) for feature in features.values()}) > 1:
+        features = {}
     pending = [message for message in history.messages if message.message_id not in features]
 
     async def checkpoint(state):
@@ -151,7 +170,9 @@ async def sync_index(
         )
         for message, feature in zip(batch, encoded, strict=True):
             require(
-                feature.model_id == encoder.model_id and feature.content_hash == message.reference.content_hash,
+                feature.model_id == encoder.model_id
+                and feature.content_hash == message.reference.content_hash
+                and (expected_dim is None or len(feature.vector) == expected_dim),
                 "feature_content_changed",
             )
             features[message.message_id] = feature

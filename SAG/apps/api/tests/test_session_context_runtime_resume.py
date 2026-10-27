@@ -179,3 +179,159 @@ def test_ledger_retains_output_reserve_even_with_unknown_usage():
     assert record["max_output_tokens"] == 4096
     assert ledger.reserved_tokens == 8392
     assert ledger.report()["input_tokens"] is None
+
+
+@pytest.mark.asyncio
+async def test_crash_after_provider_attempt_persists_accounting_and_blocks_budget_reopen(
+    resume_run, monkeypatch
+):
+    run = resume_run
+    run.args.max_calls = 2
+    run.args.max_tokens = 20000
+
+    async def crashing_candidate(case, *, web_enabled):
+        run.candidate_calls.append(web_enabled)
+        await run.harness.model.session_completion(
+            SimpleNamespace(llm_max_tokens=4096),
+            messages=[{"role": "user", "content": "synthetic"}],
+        )
+        if web_enabled:
+            raise RuntimeError("simulated crash after provider call before replay checkpoint")
+        return {
+            "case_id": case["id"],
+            "variant": "runtime",
+            "web_enabled": web_enabled,
+            "status": "run.completed",
+            "accounting": {
+                "logical_calls": 1,
+                "accounting_complete": True,
+                "input_tokens": 80,
+                "output_tokens": 20,
+                "calls": [{"status": "completed", "input_tokens": 80, "output_tokens": 20}],
+            },
+        }
+
+    monkeypatch.setattr(run.harness, "candidate", crashing_candidate)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await run.harness.run(run.args)
+
+    assert len(run.provider_calls) == 2
+    saved = json.loads(run.output.read_text(encoding="utf-8"))
+    assert len(saved["experiment_accounting"]["calls"]) == 2
+    assert saved["reserved_tokens"] == 8392
+
+    with pytest.raises(ValueError, match="in-flight|reconcil|call count"):
+        await run.harness.run(run.args)
+    assert len(run.provider_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_sigkill_mid_provider_dispatch_persists_inflight_reservation_and_blocks_resume(
+    resume_run, monkeypatch
+):
+    run = resume_run
+    run.args.max_calls = 2
+    run.args.max_tokens = 20000
+    mid_flight_snapshots = []
+
+    async def sigkill_provider(*args, **kwargs):
+        run.provider_calls.append(kwargs)
+        if len(run.provider_calls) == 2:
+            mid_flight_snapshots.append(run.output.read_text(encoding="utf-8"))
+            raise RuntimeError("transport dropped after remote dispatch")
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="synthetic"))],
+            usage=SimpleNamespace(prompt_tokens=80, completion_tokens=20),
+        )
+
+    monkeypatch.setattr(run.harness.model, "session_completion", sigkill_provider)
+    with pytest.raises(RuntimeError, match="transport dropped"):
+        await run.harness.run(run.args)
+
+    assert len(run.provider_calls) == 2
+    assert len(mid_flight_snapshots) == 1
+    mid_flight = json.loads(mid_flight_snapshots[0])
+    assert len(mid_flight["experiment_accounting"]["calls"]) == 2
+    assert mid_flight["experiment_accounting"]["calls"][-1]["status"] == "started"
+    assert mid_flight["experiment_accounting"]["calls"][-1]["in_flight"] is True
+    assert mid_flight["reserved_tokens"] == 8392
+
+    # Simulate abrupt process death (SIGKILL) while the second provider call was still in flight.
+    run.output.write_text(mid_flight_snapshots[0], encoding="utf-8")
+    with pytest.raises(ValueError, match="in-flight|started|reconcil"):
+        await run.harness.run(run.args)
+    assert len(run.provider_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_crash_after_legacy_tracked_llm_attempt_persists_accounting_and_blocks_resume(
+    resume_run, monkeypatch
+):
+    run = resume_run
+    run.args.variants = "legacy"
+    run.args.max_calls = 2
+    run.args.max_tokens = 20000
+
+    async def crashing_legacy_replay(case, client, ledger, *, web_enabled):
+        run.candidate_calls.append(("legacy", web_enabled))
+        record = ledger.begin(stream=False, estimated_input=100, max_output=4096, retries=0)
+        ledger.observe_attempt(record)
+        run.provider_calls.append({"variant": "legacy", "web_enabled": web_enabled})
+        ledger.settle(record, status="completed", duration_ms=5.0)
+        record.update(input_tokens=80, output_tokens=20)
+        if web_enabled:
+            raise RuntimeError("simulated legacy crash after provider call")
+        return {
+            "case_id": case["id"],
+            "variant": "legacy",
+            "web_enabled": web_enabled,
+            "status": "completed",
+            "accounting": {
+                "logical_calls": 1,
+                "accounting_complete": True,
+                "input_tokens": 80,
+                "output_tokens": 20,
+                "calls": [copy.deepcopy(record)],
+            },
+        }
+
+    monkeypatch.setattr(run.harness.baseline, "replay_case", crashing_legacy_replay)
+    with pytest.raises(RuntimeError, match="simulated legacy crash"):
+        await run.harness.run(run.args)
+
+    assert len(run.provider_calls) == 2
+    saved = json.loads(run.output.read_text(encoding="utf-8"))
+    assert len(saved["experiment_accounting"]["calls"]) == 2
+    assert saved["reserved_tokens"] == 8392
+
+    with pytest.raises(ValueError, match="in-flight|reconcil|call count"):
+        await run.harness.run(run.args)
+    assert len(run.provider_calls) == 2
+
+
+def test_validation_corpus_loads_and_locks_manifest(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[1] / "scripts"))
+    import eval_session_context as baseline
+    import verify_session_runtime as harness
+
+    corpus = Path(__file__).parent / "fixtures" / "session_context_validation_f2_f3.jsonl"
+    cases = baseline.load_cases(corpus)
+    assert len(cases) == 12
+    normal = [c for c in cases if c["group"] == "normal"]
+    full = [c for c in cases if c["group"] == "full_session"]
+    long_normal = [c for c in normal if c["message_count"] > 200 or c["filler_repeat"] > 1]
+    assert len(normal) == 10 and len(full) == 2 and len(long_normal) >= 4
+    monkeypatch.setattr(harness.settings, "llm_base_url", "https://explicit-provider.invalid/v1")
+    args = SimpleNamespace(
+        corpus=corpus,
+        split="validation",
+        case=None,
+        variants="both",
+        output="unused.json",
+        max_calls=180,
+        max_seconds=2400,
+        max_tokens=4000000,
+    )
+    manifest = harness.build_runtime_manifest(args, cases)
+    assert manifest["split"] == "validation"
+    assert len(manifest["case_ids"]) == 12

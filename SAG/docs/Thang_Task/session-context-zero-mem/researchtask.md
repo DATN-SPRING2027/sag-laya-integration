@@ -544,3 +544,23 @@ không hoạt động, không dùng DB người dùng để thay thế. F2/F3 v�
   evidence cũ. Không thêm dependency, migration, secret hoặc env file. Rollback
   riêng commit này trả lại harness schema 2 và guard cũ, nên không dùng để resume
   report schema 3. Thang cho phép push commit mới lên cùng PR40, không merge/approve.
+
+---
+
+## PR40 — Sửa 4 Finding `[P2]` Mới và Nghiệm thu Độc lập F2/F3 (2026-10-27)
+
+### 1. Mục tiêu và Bối cảnh
+
+- **Branch**: `feat/Thang-session-context-runtime-be-api` (PR #40, base `main` `77722700fa8ed83112bff6640213b12d0235c11c`, HEAD trước khi làm: `7c893940f8f1cbb397e687ff18f50489cc8f2a62`).
+- **Phần 1 — Sửa 4 finding `[P2]` tiên quyết trước live validation**:
+  1. **`[P2]` SHADOW làm hỏng lượt chat khi thiếu tokenizer cache** (`model.py`, `runtime.py`, `agent_domain.py`): Chuẩn hóa lỗi nạp tokenizer (`OSError`, `ImportError`) thành `ServiceUnavailableError("Mô hình context session chưa sẵn sàng trên máy chủ.")` để `SHADOW` fallback an toàn về legacy mà vẫn giữ nguyên fail-closed cho lỗi ACL/provenance (`ContextContractError`).
+  2. **`[P2]` Cache vector sai kích thước không được tự dựng lại** (`index.py`, `graph.py`): Kiểm tra chiều vector (`len(feature.vector) == expected_dim`) theo encoder trước khi chấp nhận cache `row.features`; loại bỏ artifact sai kích thước và encode lại từ raw message.
+  3. **`[P2]` Crash giữa replay làm mất accounting và mở lại ngân sách khi resume** (`session_context_accounting.py`, `verify_session_runtime.py`): Ghi bền vững reservation và trạng thái `in_flight` (`status="started"`, `in_flight=True`, `in_flight_replay`) xuống đĩa trước khi dispatch tới provider (cả `observed` cho candidate và `TrackedLLM` cho baseline) và checkpoint ngay khi settle (`completed`/`failed`/`cancelled`). Khi resume, `validate_runtime_resume` từ chối mọi report còn `in_flight_replay`, call có `status == "started"` / `in_flight == True`, hoặc sai lệch giữa tổng call trong `results` và `calls` (kể cả khi `results == []` và `len(calls) > 0`).
+  4. **`[P2]` Resume calibration vẫn chấp nhận đổi provider endpoint** (`session_context_calibration.py`, `calibrate_session_context.py`): Bổ sung `provider_route_sha256` vào manifest/report calibration và khóa khớp trường này trong `session_context_calibration.validate_resume`.
+- **Phần 2 — Nghiệm thu độc lập F2/F3 (Live Paired Validation)**:
+  - Thiết kế tập dữ liệu validation synthetic mới (`tests/fixtures/session_context_validation_f2_f3.jsonl`, `split="validation"`, tách biệt hoàn toàn với `tests/fixtures/session_context.jsonl` lịch sử):
+    - 12 case (`10 normal` + `2 full_session`), gồm tiếng Việt và tiếng Anh/song ngữ, tối thiểu 4 case `long-normal` (`message_count > 200` hoặc `filler_repeat > 1`).
+    - Bao phủ: thông tin cũ ngoài cửa sổ gần nhất, thông tin mới, sửa quyết định, phủ định, thay đổi theo thời gian, đề xuất của assistant chưa được user duyệt, giữ nhiều quyết định của user và phân biệt giữa "không có trong bằng chứng hiện tại" với "không tồn tại trong toàn bộ hội thoại".
+  - Bổ sung tham số `--corpus` và `split="validation"` cho `eval_session_context.py` và `verify_session_runtime.py`, đồng thời ghi thêm `raw_selected_evidence`, `generation_ms`, `history_message_count`, `long_normal` vào kết quả candidate để kiểm toán F2/F3 mà không sửa prompt production, selector, model orchestration hay `CALIBRATION-POLICY.json`.
+  - Đóng băng code, manifest và gold rubric trước khi gọi live provider (`Qwen/Qwen3-8B` qua `https://api.siliconflow.com/v1`, giới hạn cứng: `<= 180` logical calls, `<= 4,000,000` token reservation, `<= 2,400s`).
+  - Chấm từng câu trả lời và đối chiếu toàn bộ 8 quality gates trong `CALIBRATION-POLICY.json`.

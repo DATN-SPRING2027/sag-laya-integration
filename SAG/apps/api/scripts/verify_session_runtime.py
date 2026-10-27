@@ -63,6 +63,12 @@ async def candidate(case, *, web_enabled):
     result = {
         "case_id": case["id"],
         "group": case["group"],
+        "scenario": case.get("scenario"),
+        "history_message_count": case.get("message_count"),
+        "long_normal": bool(
+            case.get("group") == "normal"
+            and (case.get("message_count", 0) > 200 or case.get("filler_repeat", 0) > 1)
+        ),
         "web_enabled": web_enabled,
         "variant": "runtime",
         "status": "no_terminal_event",
@@ -136,6 +142,21 @@ async def candidate(case, *, web_enabled):
                 context_mode=case["group"],
             )
             result["prepare_ms"] = round((time.monotonic() - warm) * 1000, 2)
+            if plan.session_context is not None:
+                result["raw_selected_evidence"] = [
+                    {
+                        "message_id": item.span.ref.message_id,
+                        "role": item.role,
+                        "text": item.text,
+                    }
+                    for item in plan.session_context.original
+                ]
+                result["fitted_evidence_messages"] = [
+                    str(message.get("content", ""))
+                    for message in plan.messages
+                    if str(message.get("content", "")).startswith("SESSION_EVIDENCE_JSON")
+                ]
+        gen_started = time.monotonic()
         async for event in agent_service.generate_stream(
             factory,
             plan=plan,
@@ -157,6 +178,7 @@ async def candidate(case, *, web_enabled):
                     context=payload.get("session_context"),
                     error_code=(payload.get("error") or {}).get("code"),
                 )
+        result["generation_ms"] = round((time.monotonic() - gen_started) * 1000, 2)
         result.update(baseline.score_answer(case, result.get("answer", "")))
     except Exception as error:
         result.update(status="error", error_type=type(error).__name__)
@@ -269,6 +291,7 @@ def _provider_route_sha256() -> str:
 
 def build_runtime_manifest(args, cases):
     root = baseline.API_ROOT
+    corpus_path = Path(getattr(args, "corpus", None) or baseline.CORPUS)
     paths = sorted((root / "sag_api/services/session_context").glob("*.py")) + [
         root / "sag_api/core/litellm_policy.py",
         root / "sag_api/core/model_providers.py",
@@ -291,7 +314,7 @@ def build_runtime_manifest(args, cases):
         "case_ids": [case["id"] for case in cases],
         "variants": variants,
         "source_sha256": manifest,
-        "corpus_sha256": hashlib.sha256(baseline.CORPUS.read_bytes()).hexdigest(),
+        "corpus_sha256": hashlib.sha256(corpus_path.read_bytes()).hexdigest(),
         "scope": "synthetic trusted provenance; source-free; cold index separate; actual runtime/SDK",
         "caps": {"calls": args.max_calls, "seconds": args.max_seconds, "tokens": args.max_tokens},
         "config": {
@@ -332,8 +355,11 @@ def build_runtime_manifest(args, cases):
 def _validate_call_record(call: object, *, require_observer_counts: bool) -> None:
     if not isinstance(call, dict):
         raise ValueError("cannot safely resume: call record must be an object; start a new experiment or reconcile")
-    if call.get("status") not in {"started", "completed", "failed", "cancelled"}:
-        raise ValueError("cannot safely resume: invalid call status; start a new experiment or reconcile")
+    if call.get("status") not in {"completed", "failed", "cancelled"} or call.get("in_flight") is True:
+        raise ValueError(
+            "cannot safely resume: in-flight or started call requires reconciliation; "
+            "start a new experiment or reconcile"
+        )
     for token_key in ("input_tokens", "output_tokens"):
         if token_key not in call:
             raise ValueError(f"cannot safely resume: missing {token_key} in call; start a new experiment or reconcile")
@@ -342,8 +368,11 @@ def _validate_call_record(call: object, *, require_observer_counts: bool) -> Non
             raise ValueError(f"cannot safely resume: invalid {token_key} in call; start a new experiment or reconcile")
     if require_observer_counts:
         for obs_key in (
-            "observed_deployment_attempts", "observed_deployment_failures",
-            "estimated_input_tokens", "max_output_tokens", "configured_retries",
+            "observed_deployment_attempts",
+            "observed_deployment_failures",
+            "estimated_input_tokens",
+            "max_output_tokens",
+            "configured_retries",
         ):
             if obs_key not in call or not _is_nonneg_int(call[obs_key]):
                 raise ValueError(
@@ -353,7 +382,11 @@ def _validate_call_record(call: object, *, require_observer_counts: bool) -> Non
         if opt_token_key in call and call[opt_token_key] is not None and not _is_nonneg_int(call[opt_token_key]):
             raise ValueError(f"cannot safely resume: invalid {opt_token_key} in call")
     for counter_key in (
-        "usage_snapshots", "configured_retries", "estimated_input_tokens", "reserved_input_tokens", "max_output_tokens",
+        "usage_snapshots",
+        "configured_retries",
+        "estimated_input_tokens",
+        "reserved_input_tokens",
+        "max_output_tokens",
     ):
         if counter_key in call and not _is_nonneg_int(call[counter_key]):
             raise ValueError(f"cannot safely resume: invalid {counter_key} in call")
@@ -365,6 +398,10 @@ def _validate_call_record(call: object, *, require_observer_counts: bool) -> Non
 def validate_runtime_resume(report, expected):
     if not isinstance(report, dict) or not isinstance(report.get("results"), list):
         raise ValueError("cannot safely resume: report is malformed; start a new experiment or reconcile")
+    if report.get("in_flight_replay") is not None:
+        raise ValueError(
+            "cannot safely resume: in-flight replay requires reconciliation; start a new experiment or reconcile"
+        )
     for key in REQUIRED_MANIFEST_KEYS:
         if key not in report or report[key] != expected[key]:
             raise ValueError(f"resume manifest mismatch on {key}; start a new experiment or reconcile")
@@ -462,7 +499,7 @@ def validate_runtime_resume(report, expected):
             "cannot safely resume: experiment_accounting has fewer calls than recorded result rows; "
             "start a new experiment or reconcile"
         )
-    if rows_with_accounting and len(rows_with_accounting) == len(report["results"]) and sum_row_calls != len(calls):
+    if len(rows_with_accounting) == len(report["results"]) and sum_row_calls != len(calls):
         raise ValueError(
             "cannot safely resume: experiment_accounting call count does not match result rows; "
             "start a new experiment or reconcile"
@@ -470,7 +507,9 @@ def validate_runtime_resume(report, expected):
 
 
 async def run(args):
-    cases = [case for case in baseline.load_cases() if case["split"] == args.split]
+    corpus_arg = getattr(args, "corpus", None)
+    loaded_cases = baseline.load_cases(Path(corpus_arg)) if corpus_arg else baseline.load_cases()
+    cases = [case for case in loaded_cases if case["split"] == args.split]
     if args.case:
         requested = list(args.case)
         by_id = {case["id"]: case for case in cases}
@@ -499,6 +538,16 @@ async def run(args):
     counter = model.ModelTokenCounter(settings.llm_model, template_kwargs={"enable_thinking": False})
     original = model.session_completion
 
+    def save():
+        report["elapsed_seconds"] = max(spent, spent + time.monotonic() - started)
+        report["experiment_accounting"] = ledger.report()
+        report["reserved_tokens"] = ledger.reserved_tokens
+        tmp = output.with_suffix(output.suffix + ".tmp")
+        tmp.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(output)
+
+    ledger.on_change = save
+
     async def observed(finite, **kwargs):
         record = ledger.begin(
             stream=bool(kwargs.get("stream")),
@@ -511,7 +560,7 @@ async def run(args):
             if not kwargs.get("stream"):
                 record["synthetic_output"] = _attr(_attr(response, "choices")[0], "message").content
                 ledger.usage(record, _attr(response, "usage"))
-                record["status"] = "completed"
+                ledger.settle(record, status="completed")
                 return response
 
             async def stream():
@@ -524,22 +573,16 @@ async def run(args):
                                 record["synthetic_output"] = record.get("synthetic_output", "") + text
                         ledger.usage(record, _attr(chunk, "usage"))
                         yield chunk
-                    record["status"] = "completed"
+                    ledger.settle(record, status="completed")
                 finally:
                     if record["status"] != "completed":
-                        record["status"] = "failed"
+                        ledger.settle(record, status="failed")
                     await response.aclose()
 
             return stream()
-        except BaseException:
-            record["status"] = "failed"
+        except BaseException as error:
+            ledger.settle(record, status="failed", error_type=type(error).__name__)
             raise
-
-    def save():
-        report["elapsed_seconds"] = max(spent, spent + time.monotonic() - started)
-        report["experiment_accounting"] = ledger.report()
-        report["reserved_tokens"] = ledger.reserved_tokens
-        output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     executed_any = False
     client = TrackedLLM(settings, ledger)
@@ -560,12 +603,19 @@ async def run(args):
                             save()
                         return
                     executed_any = True
+                    report["in_flight_replay"] = {
+                        "case_id": case["id"],
+                        "web_enabled": web,
+                        "variant": variant,
+                    }
+                    save()
                     settings.session_context_mode = "off" if variant == "legacy" else "on"
                     if variant == "legacy":
                         result = await baseline.replay_case(case, client, ledger, web_enabled=web)
                         result["variant"] = variant
                     else:
                         result = await candidate(case, web_enabled=web)
+                    report.pop("in_flight_replay", None)
                     report["results"].append(result)
                     save()
                     print(
@@ -591,7 +641,8 @@ async def run(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--live", action="store_true", required=True)
-    parser.add_argument("--split", choices=("calibration", "holdout"), required=True)
+    parser.add_argument("--corpus", type=Path, default=None)
+    parser.add_argument("--split", choices=("calibration", "holdout", "validation"), required=True)
     parser.add_argument("--case", action="append")
     parser.add_argument("--variants", choices=("both", "legacy", "runtime"), default="both")
     parser.add_argument("--output", required=True)

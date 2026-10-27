@@ -298,3 +298,50 @@ async def test_shadow_does_not_swallow_authorization_contract_failure(storage_db
         with pytest.raises(ContextContractError, match="provenance_scope"):
             await prepare_ask(session, agent=agent, thread=thread, query="Which code?",
                                principal=principal(scope), owner_key="owner")
+
+
+@pytest.mark.asyncio
+async def test_missing_tokenizer_cache_shadow_falls_back_and_on_returns_service_unavailable(storage_db, monkeypatch):
+    import transformers
+
+    factory, scope = storage_db
+    monkeypatch.setattr(settings, "llm_model", "Qwen/Qwen3-8B")
+    monkeypatch.setattr(runtime, "configured_encoder", lambda: Encoder())
+
+    def missing_cache(*args, **kwargs):
+        raise OSError("We couldn't connect to huggingface.co and model is not in local cache")
+
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", missing_cache)
+
+    monkeypatch.setattr(settings, "session_context_mode", "shadow")
+    async with factory() as session:
+        session.add(raw("fact", content="Legacy history survives missing tokenizer cache."))
+        await session.commit()
+        agent, thread = await session.get(Agent, "agent"), await session.get(Thread, "thread")
+        plan = await prepare_ask(
+            session,
+            agent=agent,
+            thread=thread,
+            query="Which code?",
+            principal=principal(scope),
+            owner_key="owner",
+        )
+        assert plan.session_context is None
+        assert any(
+            message.get("content") == "Legacy history survives missing tokenizer cache."
+            for message in plan.messages
+        )
+
+    monkeypatch.setattr(settings, "session_context_mode", "on")
+    async with factory() as session:
+        agent, thread = await session.get(Agent, "agent"), await session.get(Thread, "thread")
+        with pytest.raises(ServiceUnavailableError) as exc_info:
+            await prepare_ask(
+                session,
+                agent=agent,
+                thread=thread,
+                query="Which code?",
+                principal=principal(scope),
+                owner_key="owner",
+            )
+        assert exc_info.value.code == "session_context_not_ready"

@@ -19,6 +19,7 @@ storage_db = storage_fixtures.storage_db
 
 class Encoder:
     model_id = "test-model"
+    embedding_dimension = 2
 
     def __init__(self, fail_after=None):
         self.calls = 0
@@ -281,3 +282,45 @@ async def test_sync_index_reuses_exact_chunks_across_slices_and_isolates_cache_a
     model_a.featurize_many(("🙂abcDEF",), batch_size=2, budget=work(), deduplicate=True, chunk_cache=shared_dict)
     model_b.featurize_many(("🙂abcDEF",), batch_size=2, budget=work(), deduplicate=True, chunk_cache=shared_dict)
     assert model_a.encoder_calls == 1 and model_b.encoder_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_corrupted_cached_vector_dimension_is_rebuilt_from_raw_message(storage_db):
+    factory, scope = storage_db
+    async with factory() as session:
+        session.add_all(
+            [
+                raw("m1", content="First decision ORBIT-1", ordinal=1),
+                raw("m2", content="Second decision ORBIT-2", ordinal=2),
+            ]
+        )
+        await session.commit()
+        first_encoder = Encoder()
+        first = await sync_index(session, scope=scope, encoder=first_encoder, budget=work(), batch_size=2)
+        assert first_encoder.calls == 1
+        assert all(len(feature.vector) == 2 for feature in first.features)
+
+        row = await session.get(SessionContextIndex, first.index_id)
+        corrupted_features = dict(row.features)
+        corrupted_m2 = dict(corrupted_features["m2"])
+        corrupted_m2["vector"] = [1.0, 0.1, 0.2]
+        corrupted_features["m2"] = corrupted_m2
+        row.features = corrupted_features
+        await session.commit()
+
+    async with factory() as session:
+        healed_encoder = Encoder()
+        healed = await sync_index(session, scope=scope, encoder=healed_encoder, budget=work(), batch_size=2)
+        assert healed_encoder.calls == 1
+        assert all(len(feature.vector) == 2 for feature in healed.features)
+        graph, _ = healed.views(scope=scope, budget=work())
+        assert len(graph.features) == 2
+        row = await session.get(SessionContextIndex, healed.index_id)
+        assert len(row.features["m1"]["vector"]) == 2
+        assert len(row.features["m2"]["vector"]) == 2
+
+    async with factory() as session:
+        reuse_encoder = Encoder()
+        reused = await sync_index(session, scope=scope, encoder=reuse_encoder, budget=work(), batch_size=2)
+        assert reuse_encoder.calls == 0
+        assert all(len(feature.vector) == 2 for feature in reused.features)

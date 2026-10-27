@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
@@ -22,7 +23,14 @@ class BaselineBudgetExceeded(RuntimeError):
 class CallLedger:
     """Only allowlisted metadata is retained; prompts, keys and exceptions are not."""
 
-    def __init__(self, *, max_calls: int, max_seconds: float, max_estimated_tokens: int = 2_000_000):
+    def __init__(
+        self,
+        *,
+        max_calls: int,
+        max_seconds: float,
+        max_estimated_tokens: int = 2_000_000,
+        on_change: Callable[[], None] | None = None,
+    ):
         if min(max_calls, max_seconds, max_estimated_tokens) <= 0:
             raise ValueError("benchmark limits must be positive")
         self.max_calls = max_calls
@@ -31,30 +39,66 @@ class CallLedger:
         self.reserved_tokens = 0
         self.stage = "generation"
         self.calls: list[dict] = []
+        self.on_change = on_change
+
+    def _notify(self) -> None:
+        if self.on_change is not None:
+            self.on_change()
 
     def begin(self, *, stream: bool, estimated_input: int, max_output: int, retries: int = 0) -> dict:
         reservation = (estimated_input + max_output) * (1 + retries)
-        if (len(self.calls) >= self.max_calls or time.monotonic() >= self.deadline
-                or self.reserved_tokens + reservation > self.max_estimated_tokens):
+        if (
+            len(self.calls) >= self.max_calls
+            or time.monotonic() >= self.deadline
+            or self.reserved_tokens + reservation > self.max_estimated_tokens
+        ):
             raise BaselineBudgetExceeded("benchmark resource limit reached")
         self.reserved_tokens += reservation
         record = {
-            "stage": self.stage, "stream": stream, "status": "started",
-            "input_tokens": None, "output_tokens": None, "cached_tokens": None,
-            "reasoning_tokens": None, "usage_snapshots": 0,
-            "observed_deployment_attempts": 0, "observed_deployment_failures": 0,
-            "configured_retries": retries, "estimated_input_tokens": estimated_input,
+            "stage": self.stage,
+            "stream": stream,
+            "status": "started",
+            "in_flight": True,
+            "input_tokens": None,
+            "output_tokens": None,
+            "cached_tokens": None,
+            "reasoning_tokens": None,
+            "usage_snapshots": 0,
+            "observed_deployment_attempts": 0,
+            "observed_deployment_failures": 0,
+            "configured_retries": retries,
+            "estimated_input_tokens": estimated_input,
             "max_output_tokens": max_output,
-            "duration_ms": None, "ttft_ms": None,
+            "duration_ms": None,
+            "ttft_ms": None,
         }
         self.calls.append(record)
+        self._notify()
         return record
 
     def observe_attempt(self, record: dict) -> None:
         record["observed_deployment_attempts"] += 1
+        self._notify()
 
     def observe_failure(self, record: dict) -> None:
         record["observed_deployment_failures"] += 1
+        self._notify()
+
+    def settle(
+        self,
+        record: dict,
+        *,
+        status: str,
+        error_type: str | None = None,
+        duration_ms: float | None = None,
+    ) -> None:
+        record["status"] = status
+        record["in_flight"] = False
+        if error_type is not None:
+            record["error_type"] = error_type
+        if duration_ms is not None:
+            record["duration_ms"] = duration_ms
+        self._notify()
 
     def usage(self, record: dict, raw: Any) -> None:
         if raw is None:
@@ -63,27 +107,39 @@ class CallLedger:
         for target, source in (("input_tokens", "prompt_tokens"), ("output_tokens", "completion_tokens")):
             value = _attr(raw, source)
             record[target] = value if type(value) is int and value >= 0 else None
-        for target, details in (("cached_tokens", "prompt_tokens_details"),
-                                ("reasoning_tokens", "completion_tokens_details")):
+        for target, details in (
+            ("cached_tokens", "prompt_tokens_details"),
+            ("reasoning_tokens", "completion_tokens_details"),
+        ):
             value = _attr(_attr(raw, details), target)
             record[target] = value if type(value) is int and value >= 0 else None
 
     def report(self, calls: list[dict] | None = None) -> dict:
         records = self.calls if calls is None else calls
+        for item in records:
+            if "in_flight" in item and item.get("status") in {"completed", "failed", "cancelled"}:
+                item["in_flight"] = False
         complete = all(
-            item["status"] == "completed" and item["input_tokens"] is not None
-            and item["output_tokens"] is not None and item["observed_deployment_failures"] == 0
+            item["status"] == "completed"
+            and item["input_tokens"] is not None
+            and item["output_tokens"] is not None
+            and item["observed_deployment_failures"] == 0
             and item["observed_deployment_attempts"] == 1
             for item in records
         )
-        totals = {field: sum(item[field] for item in records if item[field] is not None)
-                  for field in ("input_tokens", "output_tokens")}
+        totals = {
+            field: sum(item[field] for item in records if item[field] is not None)
+            for field in ("input_tokens", "output_tokens")
+        }
         return {
-            "logical_calls": len(records), "accounting_complete": complete,
+            "logical_calls": len(records),
+            "accounting_complete": complete,
             "input_tokens": totals["input_tokens"] if complete else None,
             "output_tokens": totals["output_tokens"] if complete else None,
-            "known_input_tokens": totals["input_tokens"], "known_output_tokens": totals["output_tokens"],
-            "monetary_cost": None, "price_status": "unverified",
+            "known_input_tokens": totals["input_tokens"],
+            "known_output_tokens": totals["output_tokens"],
+            "monetary_cost": None,
+            "price_status": "unverified",
             "transport_retry_visibility": "deployment hooks only; SDK-internal HTTP retries are not observable",
             "stream_usage_aggregation": "last cumulative snapshot, not sum",
             "calls": records,
@@ -103,7 +159,11 @@ class CallLedger:
                 return kwargs
 
             async def async_post_call_failure_deployment_hook(
-                self, request_data, exception, call_type, fallback_depth=None,
+                self,
+                request_data,
+                exception,
+                call_type,
+                fallback_depth=None,
             ):
                 active = _ACTIVE.get()
                 if active is not None:
@@ -128,7 +188,9 @@ class TrackedLLM(LLMClient):
     async def _create_completion(self, messages, *, stream=False, tools=None, tool_choice=None):
         estimated = estimate_tokens(json.dumps({"messages": messages, "tools": tools}, ensure_ascii=False))
         record = self.ledger.begin(
-            stream=stream, estimated_input=estimated, max_output=self._settings.llm_max_tokens,
+            stream=stream,
+            estimated_input=estimated,
+            max_output=self._settings.llm_max_tokens,
             retries=self._settings.llm_max_retries,
         )
         started = time.monotonic()
@@ -136,21 +198,31 @@ class TrackedLLM(LLMClient):
         try:
             async with asyncio.timeout(max(0, self.ledger.deadline - time.monotonic())):
                 response = await super()._create_completion(
-                    messages, stream=stream, tools=tools, tool_choice=tool_choice,
+                    messages,
+                    stream=stream,
+                    tools=tools,
+                    tool_choice=tool_choice,
                 )
             if stream:
                 return self._observed_stream(response, record, started)
             self.ledger.usage(record, _attr(response, "usage"))
-            record["status"] = "completed"
+            self.ledger.settle(
+                record,
+                status="completed",
+                duration_ms=round((time.monotonic() - started) * 1000, 3),
+            )
             return response
         except BaseException as error:
-            record["status"] = "cancelled" if isinstance(error, asyncio.CancelledError) else "failed"
-            record["error_type"] = type(error).__name__
+            status = "cancelled" if isinstance(error, asyncio.CancelledError) else "failed"
+            self.ledger.settle(
+                record,
+                status=status,
+                error_type=type(error).__name__,
+                duration_ms=round((time.monotonic() - started) * 1000, 3),
+            )
             raise
         finally:
             _ACTIVE.reset(token)
-            if not stream or record["status"] != "started":
-                record["duration_ms"] = round((time.monotonic() - started) * 1000, 3)
 
     async def _observed_stream(self, stream, record, started):
         token = _ACTIVE.set((self.ledger, record))
@@ -164,13 +236,27 @@ class TrackedLLM(LLMClient):
                     ):
                         record["ttft_ms"] = round((time.monotonic() - started) * 1000, 3)
                     yield chunk
-            record["status"] = "completed"
+            self.ledger.settle(
+                record,
+                status="completed",
+                duration_ms=round((time.monotonic() - started) * 1000, 3),
+            )
         except BaseException as error:
-            record["status"] = "cancelled" if isinstance(error, (asyncio.CancelledError, GeneratorExit)) else "failed"
-            record["error_type"] = type(error).__name__
+            status = "cancelled" if isinstance(error, (asyncio.CancelledError, GeneratorExit)) else "failed"
+            self.ledger.settle(
+                record,
+                status=status,
+                error_type=type(error).__name__,
+                duration_ms=round((time.monotonic() - started) * 1000, 3),
+            )
             raise
         finally:
-            record["duration_ms"] = round((time.monotonic() - started) * 1000, 3)
+            if record.get("status") == "started":
+                self.ledger.settle(
+                    record,
+                    status="cancelled",
+                    duration_ms=round((time.monotonic() - started) * 1000, 3),
+                )
             try:
                 await self._close_stream(stream)
             finally:

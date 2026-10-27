@@ -327,9 +327,13 @@ async def prepare_context(
     )
     await record_provenance(session, user_message, scope=scope)
     await session.commit()
-    counter = counter or await asyncio.to_thread(
-        ModelTokenCounter, settings.llm_model, template_kwargs={"enable_thinking": False}
-    )
+    if counter is None:
+        try:
+            counter = await asyncio.to_thread(
+                ModelTokenCounter, settings.llm_model, template_kwargs={"enable_thinking": False}
+            )
+        except (OSError, ImportError) as error:
+            raise ServiceUnavailableError("Mô hình context session chưa sẵn sàng trên máy chủ.") from error
     if full:
         records = await read_records(session, scope=scope, budget=budget, exclude_id=user_message.id)
         generation = make_snapshot(scope, records, generation="full").history_digest

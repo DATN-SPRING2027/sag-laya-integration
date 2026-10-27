@@ -8,6 +8,7 @@ from collections.abc import Mapping
 import httpx
 from openai import AsyncOpenAI
 
+from sag_api.core.errors import ServiceUnavailableError
 from sag_api.core.litellm_policy import apply_litellm_completion_policy
 from sag_api.generation.llm import LLMClient, _attr
 from sag_api.services.session_context.budget import BudgetState, TokenUsage
@@ -61,11 +62,14 @@ async def session_completion(settings, **request):
 class ModelTokenCounter:
     def __init__(self, model: str, *, template_kwargs: dict | None = None):
         require(model == TOKENIZER[0], "unsupported_session_tokenizer")
-        from transformers import AutoTokenizer
+        try:
+            from transformers import AutoTokenizer
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            TOKENIZER[0], revision=TOKENIZER[1], local_files_only=True, token=False, trust_remote_code=False
-        )
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                TOKENIZER[0], revision=TOKENIZER[1], local_files_only=True, token=False, trust_remote_code=False
+            )
+        except (OSError, ImportError) as error:
+            raise ServiceUnavailableError("Mô hình context session chưa sẵn sàng trên máy chủ.") from error
         self.template_kwargs = dict(template_kwargs or {})
 
     def count(self, messages, tools=None):

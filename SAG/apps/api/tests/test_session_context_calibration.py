@@ -59,10 +59,23 @@ def test_profiles_are_explicit_with_increasing_resource_envelopes():
     assert profiles()["balanced"].max_messages < profiles()["wide"].max_messages
 
 
-@pytest.mark.parametrize("field", ["config", "profiles", "hierarchy", "llm_extra_body_sha256", "source_sha256",
+@pytest.mark.parametrize(
+    "field",
+    [
+        "config",
+        "provider_route_sha256",
+        "profiles",
+        "hierarchy",
+        "llm_extra_body_sha256",
+        "source_sha256",
                                   "dependency_versions", "case_ids"])
 def test_provider_resume_cannot_mix_changed_payload_or_retrieval_configuration(field):
-    original = {"corpus_sha256": "corpus", "config": {}, "locked_profile": "balanced", "profiles": {},
+    original = {
+        "corpus_sha256": "corpus",
+        "config": {},
+        "provider_route_sha256": "route-a",
+        "locked_profile": "balanced",
+        "profiles": {},
                 "hierarchy": {}, "llm_extra_body_sha256": "body", "case_ids": ["case"],
                 "dependency_versions": {"litellm": "same"}, "source_sha256": {name: "same" for name in (
                     "graph.py", "selection.py", "hierarchy.py", "reader.py", "scope.py", "budget.py", "types.py",
@@ -189,3 +202,61 @@ async def test_candidate_replay_uses_selected_raw_history_without_compression_or
     assert len(ledger.calls) == 1
     assert result["compression_called"] is False
     assert result["gold_verbatim_in_initial_context"] == 1
+
+
+@pytest.mark.asyncio
+async def test_calibration_live_resume_rejects_changed_or_missing_provider_endpoint(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from sag_api.services.eval.session_context_calibration import provider_route_sha256
+    from scripts import calibrate_session_context as harness
+
+    monkeypatch.setattr(harness.settings, "llm_base_url", "https://provider-a.invalid/v1")
+    route_a = provider_route_sha256(harness.settings)
+    base_report = {
+        "corpus_sha256": "corpus",
+        "config": {},
+        "provider_route_sha256": route_a,
+        "locked_profile": "balanced",
+        "profiles": {},
+        "hierarchy": {},
+        "llm_extra_body_sha256": "body",
+        "case_ids": ["case"],
+        "dependency_versions": {"litellm": "same"},
+        "source_sha256": {
+            name: "same"
+            for name in (
+                "graph.py",
+                "selection.py",
+                "hierarchy.py",
+                "reader.py",
+                "scope.py",
+                "budget.py",
+                "types.py",
+                "eval_session_context.py",
+                "agent_domain.py",
+                "agent_service.py",
+                "llm.py",
+                "prompt.py",
+            )
+        },
+        "results": [],
+        "excluded_attempts": [],
+        "accounting": {"calls": []},
+    }
+    previous_path = tmp_path / "previous.json"
+    previous_path.write_text(json.dumps(base_report), encoding="utf-8")
+
+    monkeypatch.setattr(harness.settings, "llm_base_url", "https://provider-b.invalid/v1")
+    args = SimpleNamespace(
+        resume_provider_from=previous_path,
+        max_calls=10,
+        max_estimated_tokens=10000,
+        output=tmp_path / "resumed.json",
+    )
+    with pytest.raises(ValueError, match="resume|explicit.*SAG_LLM_BASE_URL"):
+        await harness.live_replay([], {}, args, dict(base_report))
+
+    monkeypatch.setattr(harness.settings, "llm_base_url", "")
+    with pytest.raises(ValueError, match="explicit.*SAG_LLM_BASE_URL|resume"):
+        await harness.live_replay([], {}, args, dict(base_report))

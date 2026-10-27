@@ -56,7 +56,10 @@ def load_cases(path=CORPUS):
         raise ValueError("duplicate case ID")
     for case in cases:
         messages = expand_case(case)
-        if case["split"] not in {"calibration", "holdout"} or case["group"] not in {"normal", "full_session"}:
+        if case["split"] not in {"calibration", "holdout", "validation"} or case["group"] not in {
+            "normal",
+            "full_session",
+        }:
             raise ValueError("invalid corpus split/group")
         for item in case["gold_items"]:
             if not item["aliases"]:
@@ -77,26 +80,33 @@ def expand_case(case):
     result = []
     for index in range(case["message_count"]):
         fact = facts.get(index, {})
-        result.append({
-            "id": hashlib.sha256(f'{case["id"]}:{index}'.encode()).hexdigest()[:32],
-            "role": fact.get("role", "user" if index % 2 == 0 else "assistant"),
-            "content": fact.get("content", f"Hoạt động số {index}. " + FILLER * case["filler_repeat"]),
-            "created_at": (start + timedelta(minutes=index)).isoformat(),
-        })
+        result.append(
+            {
+                "id": hashlib.sha256(f'{case["id"]}:{index}'.encode()).hexdigest()[:32],
+                "role": fact.get("role", "user" if index % 2 == 0 else "assistant"),
+                "content": fact.get("content", f"Hoạt động số {index}. " + FILLER * case["filler_repeat"]),
+                "created_at": (start + timedelta(minutes=index)).isoformat(),
+            }
+        )
     return result
 
 
 def _normalized(text):
-    return "".join(character for character in unicodedata.normalize("NFKC", text).casefold()
-                   if character.isalnum())
+    return "".join(
+        character for character in unicodedata.normalize("NFKC", text).casefold() if character.isalnum()
+    )
 
 
 def score_answer(case, answer):
-    found = [item["id"] for item in case["gold_items"]
-             if any(_normalized(alias) in _normalized(answer) for alias in item["aliases"])]
+    found = [
+        item["id"]
+        for item in case["gold_items"]
+        if any(_normalized(alias) in _normalized(answer) for alias in item["aliases"])
+    ]
     return {
         "literal_item_recall": len(found) / len(case["gold_items"]) if case["gold_items"] else None,
-        "matched_item_ids": found, "semantic_correctness": "requires_review",
+        "matched_item_ids": found,
+        "semantic_correctness": "requires_review",
     }
 
 
@@ -107,32 +117,63 @@ async def replay_case(case, client, ledger, *, web_enabled, history_override=Non
     tables = [Agent.__table__, Thread.__table__, Message.__table__, AgentBinding.__table__]
     start = time.monotonic()
     call_start = len(ledger.calls)
-    result = {"case_id": case["id"], "group": case["group"], "scenario": case["scenario"],
-              "web_enabled": web_enabled, "history_message_count": len(messages)}
+    result = {
+        "case_id": case["id"],
+        "group": case["group"],
+        "scenario": case["scenario"],
+        "web_enabled": web_enabled,
+        "history_message_count": len(messages),
+    }
     try:
         async with engine.begin() as connection:
             await connection.run_sync(lambda sync: Base.metadata.create_all(sync, tables=tables))
-        principal = VerifiedPrincipal("synthetic-user", "synthetic-org", frozenset({"synthetic-project"}),
-                                      "baseline-fixture", "fixture", "fixture", 0, 2_000_000_000)
+        principal = VerifiedPrincipal(
+            "synthetic-user",
+            "synthetic-org",
+            frozenset({"synthetic-project"}),
+            "baseline-fixture",
+            "fixture",
+            "fixture",
+            0,
+            2_000_000_000,
+        )
         async with factory() as session:
             agent = Agent(id="baseline-agent", owner_key="synthetic-owner", name="Baseline Agent", persona={})
             thread = Thread(id="baseline-thread", agent_id=agent.id, owner_key="synthetic-owner", title="Baseline")
             session.add_all([agent, thread])
             await session.flush()
-            session.add_all([
-                Message(id=m["id"], thread_id=thread.id, role=MessageRole(m["role"]), content=m["content"],
-                        citations=[], steps=[], attachments=[], created_at=datetime.fromisoformat(m["created_at"]))
-                for m in messages
-            ])
+            session.add_all(
+                [
+                    Message(
+                        id=m["id"],
+                        thread_id=thread.id,
+                        role=MessageRole(m["role"]),
+                        content=m["content"],
+                        citations=[],
+                        steps=[],
+                        attachments=[],
+                        created_at=datetime.fromisoformat(m["created_at"]),
+                    )
+                    for m in messages
+                ]
+            )
             await session.commit()
             ledger.stage = "compression"
-            plan = await agent_domain.prepare_ask(session, agent=agent, thread=thread, query=case["query"],
-                                                 principal=principal, owner_key="synthetic-owner",
-                                                 llm=client if history_override is None else None)
+            plan = await agent_domain.prepare_ask(
+                session,
+                agent=agent,
+                thread=thread,
+                query=case["query"],
+                principal=principal,
+                owner_key="synthetic-owner",
+                llm=client if history_override is None else None,
+            )
             if history_override is not None:
                 # Benchmark-only candidate seam: same prompt/runtime/tool policy,
                 # selected history replaces legacy context without a compression LLM call.
-                selected = agent_domain.build_ask_context(agent=agent, query=case["query"], history=history_override)
+                selected = agent_domain.build_ask_context(
+                    agent=agent, query=case["query"], history=history_override
+                )
                 selected.user_message_id = plan.user_message_id
                 plan = selected
         initial_history = "\n".join(str(m["content"]) for m in plan.messages[1:-1])
@@ -148,8 +189,15 @@ async def replay_case(case, client, ledger, *, web_enabled, history_override=Non
         ledger.stage = "generation"
         result["status"] = "no_terminal_event"
         async for event in agent_service.generate_stream(
-            factory, plan=plan, agent=agent, thread_id=thread.id, engine_manager=EngineManager(settings),
-            llm=client, tool_registry=registry, knowledge_only=not web_enabled, principal=principal,
+            factory,
+            plan=plan,
+            agent=agent,
+            thread_id=thread.id,
+            engine_manager=EngineManager(settings),
+            llm=client,
+            tool_registry=registry,
+            knowledge_only=not web_enabled,
+            principal=principal,
         ):
             if event.type in {"run.completed", "run.failed", "run.cancelled"}:
                 result["status"] = event.type
@@ -172,57 +220,96 @@ async def replay_case(case, client, ledger, *, web_enabled, history_override=Non
     return result
 
 
-def manifest(cases):
+def manifest(cases, *, corpus_path=CORPUS):
     return {
-        "corpus_sha256": hashlib.sha256(CORPUS.read_bytes()).hexdigest(),
-        "expansion_sha256": hashlib.sha256(json.dumps([expand_case(c) for c in cases],
-                                                     ensure_ascii=False, sort_keys=True).encode()).hexdigest(),
-        "cases": [{"id": case["id"], "split": case["split"], "group": case["group"],
-                   "messages": case["message_count"], "estimated_history_tokens": sum(
-                       estimate_tokens(m["content"]) for m in expand_case(case)[-settings.history_load_limit:])}
-                  for case in cases],
+        "corpus_sha256": hashlib.sha256(Path(corpus_path).read_bytes()).hexdigest(),
+        "expansion_sha256": hashlib.sha256(
+            json.dumps([expand_case(c) for c in cases], ensure_ascii=False, sort_keys=True).encode()
+        ).hexdigest(),
+        "cases": [
+            {
+                "id": case["id"],
+                "split": case["split"],
+                "group": case["group"],
+                "messages": case["message_count"],
+                "estimated_history_tokens": sum(
+                    estimate_tokens(m["content"]) for m in expand_case(case)[-settings.history_load_limit :]
+                ),
+            }
+            for case in cases
+        ],
     }
 
 
 async def run(args):
-    cases = [case for case in load_cases() if case["split"] == args.split]
+    corpus_path = Path(getattr(args, "corpus", None) or CORPUS)
+    cases = [case for case in load_cases(corpus_path) if case["split"] == args.split]
     if args.case:
         cases = [case for case in cases if case["id"] in args.case]
     if not cases:
         raise ValueError("no matching corpus cases")
-    report = {"schema_version": 1, "mode": "live" if args.live else "corpus_validation_only",
-              "created_at": datetime.now(UTC).isoformat(), "manifest": manifest(cases),
-              "scope": "synthetic disposable SQLite, real prepare_ask/generate_stream; no document sources",
-              "holdout_executed": args.live and args.split == "holdout", "results": []}
-    report["config"] = {key: getattr(settings, key) for key in (
-        "llm_provider", "llm_model", "llm_context_window", "llm_max_tokens", "llm_max_retries",
-        "llm_timeout_ms", "llm_temperature", "history_load_limit", "history_keep_recent", "agent_max_steps",
-    )}
+    report = {
+        "schema_version": 1,
+        "mode": "live" if args.live else "corpus_validation_only",
+        "created_at": datetime.now(UTC).isoformat(),
+        "manifest": manifest(cases, corpus_path=corpus_path),
+        "scope": "synthetic disposable SQLite, real prepare_ask/generate_stream; no document sources",
+        "holdout_executed": args.live and args.split == "holdout",
+        "results": [],
+    }
+    report["config"] = {
+        key: getattr(settings, key)
+        for key in (
+            "llm_provider",
+            "llm_model",
+            "llm_context_window",
+            "llm_max_tokens",
+            "llm_max_retries",
+            "llm_timeout_ms",
+            "llm_temperature",
+            "history_load_limit",
+            "history_keep_recent",
+            "agent_max_steps",
+        )
+    }
     report["python_version"] = platform.python_version()
-    report["dependency_versions"] = {name: importlib.metadata.version(name)
-                                     for name in ("litellm", "sqlalchemy", "aiosqlite")}
+    report["dependency_versions"] = {
+        name: importlib.metadata.version(name) for name in ("litellm", "sqlalchemy", "aiosqlite")
+    }
     report["source_sha256"] = {
         str(path.relative_to(API_ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in [Path(__file__), API_ROOT / "sag_api/services/agent_domain.py",
-                     API_ROOT / "sag_api/services/agent_service.py", API_ROOT / "sag_api/generation/llm.py",
-                     API_ROOT / "sag_api/generation/prompt.py",
-                     API_ROOT / "sag_api/services/eval/session_context_accounting.py"]
+        for path in [
+            Path(__file__),
+            API_ROOT / "sag_api/services/agent_domain.py",
+            API_ROOT / "sag_api/services/agent_service.py",
+            API_ROOT / "sag_api/generation/llm.py",
+            API_ROOT / "sag_api/generation/prompt.py",
+            API_ROOT / "sag_api/services/eval/session_context_accounting.py",
+        ]
     }
     report["llm_extra_body_sha256"] = hashlib.sha256(
         json.dumps(settings.llm_extra_body, sort_keys=True).encode(),
     ).hexdigest()
     report["git_revision"] = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=API_ROOT, text=True,
+        ["git", "rev-parse", "HEAD"],
+        cwd=API_ROOT,
+        text=True,
     ).strip()
     if args.live:
         if not settings.llm_configured:
             raise ValueError("configured LLM credentials are required for --live")
-        ledger = CallLedger(max_calls=args.max_calls, max_seconds=args.max_seconds,
-                            max_estimated_tokens=args.max_estimated_tokens)
+        ledger = CallLedger(
+            max_calls=args.max_calls,
+            max_seconds=args.max_seconds,
+            max_estimated_tokens=args.max_estimated_tokens,
+        )
         client = TrackedLLM(settings, ledger)
         profiles = [False, True] if args.profile == "both" else [args.profile == "web-enabled"]
-        report["resource_caps"] = {"logical_calls": args.max_calls, "seconds": args.max_seconds,
-                                   "worst_case_estimated_tokens": args.max_estimated_tokens}
+        report["resource_caps"] = {
+            "logical_calls": args.max_calls,
+            "seconds": args.max_seconds,
+            "worst_case_estimated_tokens": args.max_estimated_tokens,
+        }
         report["requested_replays"] = len(cases) * len(profiles)
         with ledger.capture_deployments():
             for case in cases:
@@ -231,29 +318,51 @@ async def run(args):
                         break
                     result = await replay_case(case, client, ledger, web_enabled=web_enabled)
                     report["results"].append(result)
-                    print(json.dumps({key: result.get(key) for key in (
-                        "case_id", "web_enabled", "status", "literal_item_recall", "duration_ms",
-                    )}), flush=True)
+                    print(
+                        json.dumps(
+                            {
+                                key: result.get(key)
+                                for key in (
+                                    "case_id",
+                                    "web_enabled",
+                                    "status",
+                                    "literal_item_recall",
+                                    "duration_ms",
+                                )
+                            }
+                        ),
+                        flush=True,
+                    )
                     if result.get("error_type") == BaselineBudgetExceeded.__name__:
                         break
         report["accounting"] = ledger.report()
-        report["execution_status"] = "completed" if (
-            len(report["results"]) == report["requested_replays"]
-            and all(result["status"] == "run.completed" for result in report["results"])
-        ) else "partial"
+        report["execution_status"] = (
+            "completed"
+            if (
+                len(report["results"]) == report["requested_replays"]
+                and all(result["status"] == "run.completed" for result in report["results"])
+            )
+            else "partial"
+        )
         report["summaries"] = []
         for group in ("normal", "full_session"):
             for enabled in profiles:
                 rows = [r for r in report["results"] if r["group"] == group and r["web_enabled"] == enabled]
                 scores = [r["literal_item_recall"] for r in rows if r.get("literal_item_recall") is not None]
                 durations = sorted(r["duration_ms"] for r in rows)
-                report["summaries"].append({
-                    "group": group, "web_enabled": enabled, "n": len(rows),
-                    "mean_literal_item_recall": statistics.mean(scores) if scores else None,
-                    "p50_ms": statistics.median(durations) if durations else None,
-                    "p95_ms": durations[min(len(durations)-1, int(len(durations)*0.95))] if durations else None,
-                    "small_sample": len(rows) < 20,
-                })
+                report["summaries"].append(
+                    {
+                        "group": group,
+                        "web_enabled": enabled,
+                        "n": len(rows),
+                        "mean_literal_item_recall": statistics.mean(scores) if scores else None,
+                        "p50_ms": statistics.median(durations) if durations else None,
+                        "p95_ms": (
+                            durations[min(len(durations) - 1, int(len(durations) * 0.95))] if durations else None
+                        ),
+                        "small_sample": len(rows) < 20,
+                    }
+                )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps({"report": str(args.output), "cases": len(cases), "live": args.live}))
@@ -262,7 +371,8 @@ async def run(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--live", action="store_true", help="Call the configured provider with synthetic text")
-    parser.add_argument("--split", choices=["calibration", "holdout"], default="calibration")
+    parser.add_argument("--corpus", type=Path, default=CORPUS)
+    parser.add_argument("--split", choices=["calibration", "holdout", "validation"], default="calibration")
     parser.add_argument("--case", action="append")
     parser.add_argument("--profile", choices=["both", "web-disabled", "web-enabled"], default="both")
     parser.add_argument("--output", type=Path, default=API_ROOT / ".data/session-context/baseline.json")
