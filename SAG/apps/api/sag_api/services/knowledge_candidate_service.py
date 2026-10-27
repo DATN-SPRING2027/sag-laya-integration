@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -22,7 +23,7 @@ from sag_api.services.knowledge_service import (
     knowledge_lock,
     persist_graph,
     terms,
-    unit_checksum,
+    unit_checksums,
     verify_graph,
     version_input,
 )
@@ -41,7 +42,6 @@ from sag_api.services.routing_tree_service import (
     TreeBuildConfig,
     _profile,
     _walk,
-    build_routing_snapshot,
 )
 from sag_api.services.tree_publish_service import _checksum_manifest, _routing_profile_payload
 from sag_api.services.tree_query_snapshot_service import _query_signal_scores
@@ -191,10 +191,11 @@ async def current_units(
                 DocumentVersion.valid_to > now,
                 DocumentVersion.search_ready_at.is_not(None),
             )
-            .order_by(KnowledgeUnit.id)
+            .order_by(KnowledgeUnit.id).execution_options(populate_existing=True)
         )
     ).all()
     versions = {}
+    checked = await unit_checksums(session, units)
     for unit in units:
         if unit.document_version_id not in versions:
             version = await session.get(DocumentVersion, unit.document_version_id)
@@ -214,7 +215,7 @@ async def current_units(
             or unit.project_id != provenance["project_id"]
             or unit.source_id != provenance["source_id"]
             or unit.security_partition_id != provenance["security_partition_id"]
-            or unit.checksum != await unit_checksum(session, unit)
+            or unit.checksum != checked[unit.id]
         ):
             raise ValueError("Knowledge candidate input/evidence/ACL checksum mismatch")
     if not units and not allow_empty:
@@ -222,7 +223,29 @@ async def current_units(
     return list(units)
 
 
-async def build_project_routing_snapshot(
+@asynccontextmanager
+async def _project_build_lock(session, tenant_id, project_id):
+    if session.get_bind().dialect.name != "postgresql":
+        yield
+        return
+    from sag_api.core.errors import ServiceUnavailableError
+    from sag_api.services.tree_publish_service import TreePublishInProgress, _project_publish_lock
+
+    try:
+        async with _project_publish_lock("build:" + tenant_id + ":" + project_id):
+            yield
+    except TreePublishInProgress as error:
+        raise ServiceUnavailableError("Another project builder owns this scope") from error
+
+
+async def build_project_routing_snapshot(session, *, tenant_id, project_id, **options):
+    async with _project_build_lock(session, tenant_id, project_id):
+        return await _build_project_routing_snapshot(
+            session, tenant_id=tenant_id, project_id=project_id, **options,
+        )
+
+
+async def _build_project_routing_snapshot(
     session: AsyncSession,
     *,
     tenant_id: str,
@@ -236,15 +259,26 @@ async def build_project_routing_snapshot(
     units = await current_units(session, tenant_id, project_id, allow_empty=allow_empty)
     if not units:
         return None
+    captured = [(u.id, u.checksum) for u in units]
     graph = await persist_graph(session, units, graph_config)
     inputs = [routing_unit(unit) for unit in units]
     edges = [
         KnowledgeEdgeInput(edge["source"], edge["target"], edge["weight"])
         for edge in graph.manifest_json["edges"]
     ]
-    topology = build_routing_snapshot(inputs, edges, config=config)
+    from sag_api.services.cpu_worker import run_cpu
+
+    payload = {"units": inputs, "edges": edges, "config": config,
+               "knowledge_metadata": {"knowledge_graph_build_id": graph.id, "knowledge_inputs": captured}}
+    topology = await run_cpu("routing", payload)
     cases, benchmark = benchmark_routes(topology, units, queries, routing_policy)
-    snapshot = build_routing_snapshot(inputs, edges, config=config, benchmark=cases)
+    snapshot = (await run_cpu("routing", {**payload, "benchmark": cases})
+                if cases else topology)
+    latest = await current_units(session, tenant_id, project_id, allow_empty=True)
+    if captured != [(u.id, u.checksum) for u in latest]:
+        from sag_api.core.errors import ServiceUnavailableError
+
+        raise ServiceUnavailableError("Knowledge inputs changed during project rebuild")
     return snapshot, units, graph, benchmark
 
 

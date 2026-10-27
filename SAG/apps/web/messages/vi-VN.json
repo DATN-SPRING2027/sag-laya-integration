@@ -652,8 +652,8 @@
     "extractionLanguage": "Extraction language",
     "chinese": "Tiếng Trung",
     "english": "English",
-    "topK": "Results · {count, number}",
-    "topKAria": "Number of results",
+    "topK": "Độ rộng tìm kiếm ban đầu · {count, number}",
+    "topKAria": "Độ rộng tìm kiếm tự động ban đầu",
     "saving": "Saving…",
     "save": "Save and apply"
   },

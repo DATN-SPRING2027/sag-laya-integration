@@ -290,7 +290,7 @@ export function SearchPanel({
     if (!search.canLoadMore) return;
     await executeSearch({
       intent: "load-more",
-      topK: search.topK + 12,
+      topK: 5,
       saveExploration: false,
     });
   }

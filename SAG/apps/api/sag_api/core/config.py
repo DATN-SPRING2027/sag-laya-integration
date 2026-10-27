@@ -26,6 +26,7 @@ from sag_api.core.model_providers import ModelProviderId, get_model_provider
 from sag_api.enums import SearchStrategy, normalize_search_strategy
 
 _DEFAULT_LLM_PROVIDER = get_model_provider("openai")
+FIXED_SEARCH_TOP_K = 5
 
 
 def _resolve_default_env_file() -> Path:
@@ -98,14 +99,18 @@ class Settings(BaseSettings):
     max_upload_mb: int = 25  # 单文件上传上限
     job_concurrency: int = 4  # 后台处理并发
     knowledge_worker_enabled: bool = True
+    knowledge_graph_timeout_seconds: int = Field(default=300, ge=1)
+    knowledge_foundation_timeout_seconds: float | None = Field(default=None, gt=0)
     knowledge_concurrency: int = Field(default=4, ge=1, le=16)
     knowledge_queue_capacity: int = Field(default=256, ge=1, le=10000)
-    knowledge_daily_tokens: int = Field(default=100000, ge=0)
+    # Optional per-project E2 reservation cap per UTC day; 0 = observe without limiting.
+    knowledge_daily_tokens: int = Field(default=0, ge=0)
     # Optional independent OpenAI-compatible E2 endpoint; empty = E0/E1 only.
     knowledge_e2_url: str = ""
     knowledge_e2_api_key: str = ""
     knowledge_e2_model: str = ""
     document_extract_concurrency: int = Field(default=6, ge=1, le=50)  # 单文档 chunk 抽取并发
+    document_event_extraction_enabled: bool = False
     document_chunk_max_tokens: int = Field(default=1_000, ge=100, le=100_000)
     document_chunk_mode: Literal["standard", "heading_strict"] = "standard"
     document_extraction_profile: Literal["standard", "concise"] = "concise"
@@ -201,6 +206,7 @@ class Settings(BaseSettings):
     # and the indexer rolls the whole document back.
     embedding_concurrency: int = Field(default=6, ge=1, le=64)
     embedding_timeout: int = Field(default=60, ge=5, le=600)
+    embedding_max_retries: int = Field(default=3, ge=0, le=10)
 
     # ── 文档解析（进入 zleap-sag 前统一转为 Markdown）─────────────────
     # auto：PDF 优先 MinerU，未配置或 MinerU 失败时回退本地 MarkItDown。
@@ -220,12 +226,12 @@ class Settings(BaseSettings):
     # multi_es_fast：默认策略。相关率平均比 vector 高 ~14 个百分点；
     # vector store 不支持 lexical(pgvector/qdrant/oceanbase) 时由 engine_manager 自动降级为 vector。
     search_strategy: SearchStrategy = "multi_es_fast"
-    search_top_k: int = 8
-    # 全库检索先选有界信源候选；@ 显式范围同样受此硬上限保护。
-    search_source_candidate_limit: int = Field(default=16, ge=1, le=256)
+    search_top_k: int = Field(default=8, ge=1)  # Initial adaptive search breadth, not a final result cap.
+    # Optional scope budget rejects oversized scopes instead of silently truncating sources.
+    search_source_candidate_limit: int = Field(default=0, ge=0)  # 0 = all authorized sources.
     search_source_concurrency: int = Field(default=4, ge=1, le=32)
     # Hard cap for canonical SearchUnits hydrated and reranked across all scopes.
-    search_unit_candidate_limit: int = Field(default=1024, ge=256, le=1024)
+    search_unit_candidate_limit: int = Field(default=1024, ge=1)
     search_rerank_min_remaining_seconds: float = Field(default=0.1, ge=0.0, le=2.0)
     search_tree_profile_limit: int = Field(default=8192, ge=256, le=16384)
     # Keep part of the routed query's deadline available to its ACL-scoped global escape.

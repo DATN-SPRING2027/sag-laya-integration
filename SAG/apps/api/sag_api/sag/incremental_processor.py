@@ -29,7 +29,6 @@ zleap 职责(0.8.2 已内置,不再由 SAG 实现):实体数契约
 from __future__ import annotations
 
 import asyncio
-import re
 from collections.abc import Awaitable, Callable
 from hashlib import sha256
 from pathlib import Path
@@ -112,6 +111,7 @@ class IncrementalDocumentProcessor:
         event_entity_attempts: int = 2,
         extraction_profile: str = "concise",
         document_version_id: str | None = None,
+        extract_events: bool = False,
     ) -> None:
         self._engine = engine
         self._source_config_id = source_config_id
@@ -123,6 +123,7 @@ class IncrementalDocumentProcessor:
         self._write_event_entity_vectors = bool(write_event_entity_vectors)
         self._extraction_profile = extraction_profile if extraction_profile in {"standard", "concise"} else "concise"
         self._document_version_id = document_version_id
+        self._extract_events = extract_events
         self._detected_language: str | None = None
 
         # 0.8.2 已内置契约与修复重试,以下 0.7.1 参数仅保留接口兼容:
@@ -173,6 +174,13 @@ class IncrementalDocumentProcessor:
             await self._ingest(current, path, on_checkpoint, original_path=original_path)
 
         chunk_set = self._chunk_set_ref(current)
+
+        if not self._extract_events:
+            return ProcessOutcome(
+                source_id=current.source_id,
+                chunk_count=len(current.chunk_ids),
+                chunk_ids=list(current.chunk_ids),
+            )
 
         # 阶段 2:整批抽取(0.8.2 批次粒度;REQ-3 落地前不逐块断点)
         if on_stage:
@@ -410,16 +418,14 @@ class IncrementalDocumentProcessor:
         current.event_ids = []
         current.eventless_chunk_ids = []
         current.token_usage = 0
-        if current.source_id:
+        if current.source_id and self._document_version_id:
             try:
                 from sqlalchemy import update
-                from sag_api.db.models import Document
+                from sag_api.core.db import SessionLocal
+                from sag_api.db.models import Document, DocumentVersion
 
-                async with session_factory() as session:
-                    ver = await session.get(
-                        __import__("sag_api.db.models", fromlist=["DocumentVersion"]).DocumentVersion,
-                        self._document_version_id,
-                    )
+                async with SessionLocal() as session:
+                    ver = await session.get(DocumentVersion, self._document_version_id)
                     if ver and ver.document_id:
                         await session.execute(
                             update(Document)
@@ -466,7 +472,6 @@ class IncrementalDocumentProcessor:
     ) -> tuple[bool, Any]:
         """整批抽取;暂停由 CancellationToken + 后台轮询驱动,进度经 observer 透出。"""
         prompt_manager = getattr(self._engine.resources, "prompts", None)
-        prompt_language = "en"
         if (
             prompt_manager is not None
             and getattr(prompt_manager, "language", None) != "en"

@@ -11,12 +11,15 @@ Follows Ponytail minimalism:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 import uuid
+from collections import OrderedDict
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
+from weakref import WeakKeyDictionary
 
 from sqlalchemy import desc, inspect, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -59,16 +62,66 @@ def compute_minhash_signature(tokens: Sequence[str], num_perm: int = 128) -> lis
     if not shingles:
         shingles = set(tokens)
 
+    encoded = [shingle.encode() for shingle in shingles]
     signature = []
     for i in range(num_perm):
         # 32-bit unsigned sentinel (0xFFFFFFFF) covering the full 8-hex-char MD5 space
         min_val = 0xFFFFFFFF
-        for s in shingles:
-            h = int(hashlib.md5(f"{i}:{s}".encode()).hexdigest()[:8], 16)
+        prefix = hashlib.md5(f"{i}:".encode())
+        for shingle in encoded:
+            digest = prefix.copy()
+            digest.update(shingle)
+            h = int.from_bytes(digest.digest()[:4], "big")
             if h < min_val:
                 min_val = h
         signature.append(min_val)
     return signature
+
+
+_MINHASH_CACHE: OrderedDict[str, list[int]] = OrderedDict()
+_MINHASH_LOCKS = WeakKeyDictionary()
+_MINHASH_ALGORITHM = "md5-128-k5-v1"
+
+
+async def _block_signatures(blocks, *, persist_ids):
+    """Cache derived signatures without changing canonical text/hash/provenance."""
+    from sag_api.services.cpu_worker import run_cpu
+
+    lock = _MINHASH_LOCKS.setdefault(asyncio.get_running_loop(), asyncio.Lock())
+    async with lock:
+        keys = {b.id: hashlib.sha256(b.normalized_text.encode()).hexdigest() for b in blocks}
+        found, missing = {}, {}
+        for block in blocks:
+            key = keys[block.id]
+            stored = block.dedup_signature_json if isinstance(block.dedup_signature_json, dict) else {}
+            signature = stored.get("signature")
+            if (stored.get("algorithm") == _MINHASH_ALGORITHM and stored.get("content_hash") == key
+                    and isinstance(signature, list) and len(signature) == 128
+                    and all(type(v) is int and 0 <= v <= 0xFFFFFFFF for v in signature)
+                    and stored.get("checksum") == _signature_checksum(signature)):
+                found[key] = signature
+            elif key in _MINHASH_CACHE:
+                found[key] = _MINHASH_CACHE[key]
+                _MINHASH_CACHE.move_to_end(key)
+            else:
+                missing[key] = block.normalized_text
+        if missing:
+            found.update(await run_cpu("minhash", {"texts": missing}))
+        for key, signature in found.items():
+            _MINHASH_CACHE[key] = signature
+            _MINHASH_CACHE.move_to_end(key)
+        while len(_MINHASH_CACHE) > 8192:
+            _MINHASH_CACHE.popitem(last=False)
+        for block in blocks:
+            if block.id in persist_ids:
+                block.dedup_signature_json = {"algorithm": _MINHASH_ALGORITHM, "content_hash": keys[block.id],
+                                              "signature": found[keys[block.id]],
+                                              "checksum": _signature_checksum(found[keys[block.id]])}
+        return {b.id: found[keys[b.id]] for b in blocks}
+
+
+def _signature_checksum(signature):
+    return hashlib.sha256(b"".join(value.to_bytes(4, "big") for value in signature)).hexdigest()
 
 
 def estimate_minhash_similarity(sig1: Sequence[int], sig2: Sequence[int]) -> float:
@@ -423,6 +476,89 @@ async def resolve_temporal_supersedes(
     }
 
 
+def _dedup_candidates(curr_blocks, prior_blocks, signatures, block_embeddings, current_version_id):
+    exact_block_matches = 0
+    near_dup_candidates = []
+    prior_hashes = {b.content_hash for b in prior_blocks if b.content_hash}
+    # Precompute MinHash signatures once for all prior blocks and build LSH index
+    prior_sig_by_id: dict[str, list[int]] = {}
+    prior_by_id: dict[str, CanonicalBlock] = {}
+    for pb in prior_blocks:
+        prior_by_id[pb.id] = pb
+        prior_sig_by_id[pb.id] = signatures[pb.id]
+
+    lsh_index = build_lsh_band_index(prior_sig_by_id, num_bands=16, rows_per_band=8)
+
+    for b in curr_blocks:
+        if b.content_hash and b.content_hash in prior_hashes:
+            exact_block_matches += 1
+        else:
+            threshold = get_block_type_threshold(b.block_type)
+            b_sig = signatures[b.id]
+
+            # Query bounded candidates using LSH bands
+            candidate_ids = query_lsh_candidates(b_sig, lsh_index, num_bands=16, rows_per_band=8)
+            cand_blocks = [prior_by_id[cid] for cid in candidate_ids if cid in prior_by_id]
+            # Fall back to prior_blocks if LSH finds no lexical collisions, enabling Tier 4 semantic cosine check
+            eval_blocks = cand_blocks if cand_blocks else prior_blocks
+
+            # Score all candidates and rank deterministically to select the best match
+            block_candidates: list[dict[str, Any]] = []
+            for pb in eval_blocks:
+                pb_sig = prior_sig_by_id.get(pb.id)
+                sim = (
+                    estimate_minhash_similarity(b_sig, pb_sig)
+                    if pb_sig
+                    else compute_text_similarity(b.normalized_text, pb.normalized_text)
+                )
+
+                cosine_sim = 0.0
+                if b.id in block_embeddings and pb.id in block_embeddings:
+                    cosine_sim = compute_cosine_similarity(block_embeddings[b.id], block_embeddings[pb.id])
+
+                is_lexical_match = sim >= threshold
+                is_semantic_match = cosine_sim >= 0.90
+
+                if is_lexical_match or is_semantic_match:
+                    is_contra, is_supp, is_super = detect_semantic_signals(b.normalized_text, pb.normalized_text)
+                    effective_sim = max(sim, cosine_sim)
+                    rel = classify_relation_candidate(
+                        effective_sim,
+                        is_contradiction=is_contra,
+                        is_supersede=is_super,
+                        is_support=is_supp,
+                    )
+                    evidence_note = (
+                        f"MinHash similarity {sim:.3f} >= {threshold}"
+                        if is_lexical_match
+                        else f"Tier 4 Cosine similarity {cosine_sim:.3f} >= 0.90"
+                    )
+                    block_candidates.append({
+                        "source_block_id": b.id,
+                        "target_block_id": pb.id,
+                        "source_version_id": current_version_id,
+                        "target_version_id": pb.document_version_id,
+                        "block_type": b.block_type,
+                        "threshold": threshold,
+                        "similarity_score": round(effective_sim, 3),
+                        "similarity": round(effective_sim, 3),
+                        "relation": rel,
+                        "relation_type": rel,
+                        "is_contradiction": is_contra,
+                        "is_support": is_supp,
+                        "is_supersede": is_super,
+                        "auto_merged": False,
+                        "evidence": f"{evidence_note} on {b.block_type} [relation={rel}]",
+                    })
+
+            if block_candidates:
+                # Rank candidates by (similarity_score, target_block_id) descending to select best match stably
+                block_candidates.sort(key=lambda c: (c["similarity_score"], str(c["target_block_id"])), reverse=True)
+                near_dup_candidates.append(block_candidates[0])
+
+    return exact_block_matches, near_dup_candidates
+
+
 async def run_dedup_and_temporal_stage(
     session: AsyncSession,
     *,
@@ -473,19 +609,7 @@ async def run_dedup_and_temporal_stage(
         )
     ).scalars().all()
 
-    exact_block_matches = 0
-    near_dup_candidates: list[dict[str, Any]] = []
-    prior_hashes = {b.content_hash for b in prior_blocks if b.content_hash}
-
-    # Precompute MinHash signatures once for all prior blocks and build LSH index
-    prior_sig_by_id: dict[str, list[int]] = {}
-    prior_by_id: dict[str, CanonicalBlock] = {}
-    for pb in prior_blocks:
-        prior_by_id[pb.id] = pb
-        t = re.findall(r"\w+", pb.normalized_text.lower())
-        prior_sig_by_id[pb.id] = compute_minhash_signature(t, num_perm=128)
-
-    lsh_index = build_lsh_band_index(prior_sig_by_id, num_bands=16, rows_per_band=8)
+    signatures = await _block_signatures(prior_blocks + curr_blocks, persist_ids={b.id for b in curr_blocks})
 
     # Optional Tier 4: Precompute embeddings for semantic similarity if embedder available
     block_embeddings: dict[str, list[float]] = {}
@@ -511,73 +635,13 @@ async def run_dedup_and_temporal_stage(
         except Exception as emb_err:
             log.warning("Could not compute block embeddings for Tier 4 dedup: %s", emb_err)
 
-    for b in curr_blocks:
-        if b.content_hash and b.content_hash in prior_hashes:
-            exact_block_matches += 1
-        else:
-            threshold = get_block_type_threshold(b.block_type)
-            b_tokens = re.findall(r"\w+", b.normalized_text.lower())
-            b_sig = compute_minhash_signature(b_tokens, num_perm=128)
-
-            # Query bounded candidates using LSH bands
-            candidate_ids = query_lsh_candidates(b_sig, lsh_index, num_bands=16, rows_per_band=8)
-            cand_blocks = [prior_by_id[cid] for cid in candidate_ids if cid in prior_by_id]
-            # Fall back to prior_blocks if LSH finds no lexical collisions, enabling Tier 4 semantic cosine check
-            eval_blocks = cand_blocks if cand_blocks else prior_blocks
-
-            # Score all candidates and rank deterministically to select the best match
-            block_candidates: list[dict[str, Any]] = []
-            for pb in eval_blocks:
-                pb_sig = prior_sig_by_id.get(pb.id)
-                sim = (
-                    estimate_minhash_similarity(b_sig, pb_sig)
-                    if pb_sig
-                    else compute_text_similarity(b.normalized_text, pb.normalized_text)
-                )
-
-                cosine_sim = 0.0
-                if b.id in block_embeddings and pb.id in block_embeddings:
-                    cosine_sim = compute_cosine_similarity(block_embeddings[b.id], block_embeddings[pb.id])
-
-                is_lexical_match = sim >= threshold
-                is_semantic_match = cosine_sim >= 0.90
-
-                if is_lexical_match or is_semantic_match:
-                    is_contra, is_supp, is_super = detect_semantic_signals(b.normalized_text, pb.normalized_text)
-                    effective_sim = max(sim, cosine_sim)
-                    rel = classify_relation_candidate(
-                        effective_sim,
-                        is_contradiction=is_contra,
-                        is_supersede=is_super,
-                        is_support=is_supp,
-                    )
-                    evidence_note = (
-                        f"MinHash similarity {sim:.3f} >= {threshold}"
-                        if is_lexical_match
-                        else f"Tier 4 Cosine similarity {cosine_sim:.3f} >= 0.90"
-                    )
-                    block_candidates.append({
-                        "source_block_id": b.id,
-                        "target_block_id": pb.id,
-                        "source_version_id": document_version.id,
-                        "target_version_id": pb.document_version_id,
-                        "block_type": b.block_type,
-                        "threshold": threshold,
-                        "similarity_score": round(effective_sim, 3),
-                        "similarity": round(effective_sim, 3),
-                        "relation": rel,
-                        "relation_type": rel,
-                        "is_contradiction": is_contra,
-                        "is_support": is_supp,
-                        "is_supersede": is_super,
-                        "auto_merged": False,
-                        "evidence": f"{evidence_note} on {b.block_type} [relation={rel}]",
-                    })
-
-            if block_candidates:
-                # Rank candidates by (similarity_score, target_block_id) descending to select best match stably
-                block_candidates.sort(key=lambda c: (c["similarity_score"], str(c["target_block_id"])), reverse=True)
-                near_dup_candidates.append(block_candidates[0])
+    from sag_api.services.cpu_worker import run_cpu
+    fields = ("id", "normalized_text", "content_hash", "block_type", "document_version_id")
+    exact_block_matches, near_dup_candidates = await run_cpu("dedup_candidates", {
+        "current": [{key: getattr(b, key) for key in fields} for b in curr_blocks],
+        "prior": [{key: getattr(b, key) for key in fields} for b in prior_blocks],
+        "signatures": signatures, "embeddings": block_embeddings, "version_id": document_version.id,
+    })
 
     # Publish validity changes only after the replacement index is verified.
     temporal_result = {"action": "PENDING_INDEX", "active_version_id": None}

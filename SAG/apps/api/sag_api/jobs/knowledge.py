@@ -24,6 +24,7 @@ from sag_api.db.models import (
     KnowledgeQueueControl,
     KnowledgeUnit,
 )
+from sag_api.enums import DocumentStatus
 from sag_api.services.knowledge_service import (
     KnowledgeConfig,
     checksum,
@@ -87,7 +88,7 @@ class QueuePolicy(BaseModel):
 
     concurrency: int = Field(default=2, ge=1, le=16)
     capacity: int = Field(default=256, ge=1, le=10000)
-    daily_tokens: int = Field(default=100000, ge=0)
+    daily_tokens: int = Field(default=0, ge=0)
     max_attempts: int = Field(default=3, ge=1, le=10)
     max_age_seconds: int = Field(default=86400, ge=1)
     timeout_seconds: int = Field(default=60, ge=1, le=600)
@@ -161,10 +162,17 @@ async def enqueue(
 
 
 async def claim_job(
-    session, policy: QueuePolicy, *, e2_enabled: bool, now: datetime | None = None
+    session, policy: QueuePolicy, *, e2_enabled: bool, now: datetime | None = None,
+    foundation_timeout_seconds: float | None = None,
 ) -> KnowledgeJob | None:
     now = now or datetime.now(UTC)
     await _queue_lock(session)
+    if e2_enabled and not policy.daily_tokens:
+        await session.execute(
+            update(KnowledgeJob)
+            .where(KnowledgeJob.status.in_(("QUEUED", "RETRY")), KnowledgeJob.error_code == "DAILY_BUDGET")
+            .values(available_at=now, error_code=None)
+        )
     expired = (
         await session.scalars(
             select(KnowledgeJob)
@@ -209,19 +217,33 @@ async def claim_job(
         if job.kind == "E2":
             # UTF-8 bytes upper-bound text tokens; reserve output + prompt envelope, no hidden retries.
             reserved = policy.max_input_chars * 4 + policy.max_output_tokens + 4096
-            budget_id = job.tenant_id + ":" + now.date().isoformat()
+            document = await session.scalar(
+                select(Document).join(DocumentVersion, DocumentVersion.document_id == Document.id)
+                .where(DocumentVersion.id == job.document_version_id, Document.tenant_id == job.tenant_id)
+            )
+            if document is None or not document.project_id:
+                job.status, job.error_code = "FAILED", "INVALID_PROJECT_SCOPE"
+                continue
+            day = now.date().isoformat()
+            budget_id = "project:" + stable_id(job.tenant_id, document.project_id) + ":" + day
             await insert_once(session, KnowledgeQueueControl, id=budget_id, tokens_reserved=0)
             budget = await session.get(KnowledgeQueueControl, budget_id, populate_existing=True)
-            if budget.tokens_reserved + reserved > policy.daily_tokens:
+            if policy.daily_tokens and budget.tokens_reserved + reserved > policy.daily_tokens:
                 job.available_at = datetime.combine(now.date() + timedelta(days=1), datetime.min.time(), tzinfo=UTC)
                 job.error_code = "DAILY_BUDGET"
                 continue
             budget.tokens_reserved += reserved  # Conservatively charged even after timeout/lease recovery.
+            # Organization totals are observability only; projects never share an admission cap.
+            tenant_id = "tenant:" + job.tenant_id + ":" + day
+            await insert_once(session, KnowledgeQueueControl, id=tenant_id, tokens_reserved=0)
+            tenant_total = await session.get(KnowledgeQueueControl, tenant_id, populate_existing=True)
+            tenant_total.tokens_reserved += reserved
         job.attempts += 1
         job.status, job.error_code = "RUNNING", None
         job.reserved_tokens = reserved
         job.lease_token = str(uuid.uuid4())
-        job.lease_until = now + timedelta(seconds=policy.timeout_seconds + 30)
+        timeout = foundation_timeout_seconds if job.kind == "FOUNDATION" else None
+        job.lease_until = now + timedelta(seconds=(timeout or policy.timeout_seconds) + 30)
         await session.flush()
         return job
     return None
@@ -252,6 +274,10 @@ async def _enrichment_unit(session, job: KnowledgeJob, config: KnowledgeConfig) 
 async def apply_e2(
     session, job: KnowledgeJob, result: dict, *, extractor_version: str, config: KnowledgeConfig = KnowledgeConfig()
 ) -> None:
+    probe = await session.get(KnowledgeUnit, job.unit_id)
+    if probe is None:
+        raise ValueError("Missing enrichment unit")
+    await knowledge_lock(session, "project-input:" + probe.tenant_id + ":" + probe.project_id)
     await knowledge_lock(session, "version:" + job.document_version_id)
     await session.scalar(select(DocumentVersion).where(DocumentVersion.id == job.document_version_id).with_for_update())
     unit = await _enrichment_unit(session, job, config)
@@ -481,6 +507,12 @@ class KnowledgeWorker:
         self.task = None
         self.running: set[asyncio.Task] = set()
         self.discovery_after = ""
+        retries = getattr(settings, "embedding_max_retries", 3)
+        provider_timeout = getattr(settings, "embedding_timeout", 60)
+        envelope = (max(30, provider_timeout) + provider_timeout * (retries + 1)
+                    + sum(min(.5 * 2 ** i, 8) for i in range(retries)) + 30)
+        self.foundation_timeout = (getattr(settings, "knowledge_foundation_timeout_seconds", None)
+                                   or (policy.timeout_seconds if policy else envelope))
 
     @property
     def e2_enabled(self) -> bool:
@@ -492,6 +524,8 @@ class KnowledgeWorker:
         )
 
     async def discover(self):
+        if self.job_queue is not None:
+            await self._request_completed_trees()
         async with self.sessions() as session:
             versions = (
                 await session.scalars(
@@ -499,8 +533,12 @@ class KnowledgeWorker:
                     .join(Document)
                     .where(
                         Document.is_active.is_(True),
-                        Document.status == "READY",
+                        Document.status.in_((DocumentStatus.PENDING, DocumentStatus.LOADING,
+                                             DocumentStatus.EXTRACTING, DocumentStatus.READY)),
                         DocumentVersion.search_status.in_(("READY", "SEARCH_READY")),
+                        DocumentVersion.search_ready_at.is_not(None),
+                        DocumentVersion.valid_from <= datetime.now(UTC),
+                        DocumentVersion.valid_to > datetime.now(UTC),
                         DocumentVersion.knowledge_status.in_(("NOT_STARTED", "FAILED")),
                         DocumentVersion.id > self.discovery_after,
                     )
@@ -574,15 +612,31 @@ class KnowledgeWorker:
                     )
             await session.commit()
 
+    async def _request_completed_trees(self):
+        from sag_api.services.universe_tree_service import enqueue_tree_rebuild_for_version
+
+        async with self.sessions() as session:
+            jobs = list((await session.scalars(select(KnowledgeJob).where(
+                KnowledgeJob.status == "SUCCEEDED", KnowledgeJob.tree_requested_at.is_(None),
+            ).order_by(KnowledgeJob.created_at).limit(32))).all())
+            for job in jobs:
+                await enqueue_tree_rebuild_for_version(
+                    session, self.job_queue, job.document_version_id, reason="knowledge_recovery",
+                )
+                job.tree_requested_at = datetime.now(UTC)
+                await session.commit()
+
     async def run_one(self) -> bool:
         async with self.sessions() as session:
-            job = await claim_job(session, self.policy, e2_enabled=self.e2_enabled)
+            job = await claim_job(session, self.policy, e2_enabled=self.e2_enabled,
+                                  foundation_timeout_seconds=self.foundation_timeout)
             await session.commit()
             if job is None:
                 return False
             job_id, token = job.id, job.lease_token
         try:
-            async with asyncio.timeout(self.policy.timeout_seconds):
+            timeout = self.foundation_timeout if job.kind == "FOUNDATION" else self.policy.timeout_seconds
+            async with asyncio.timeout(timeout):
                 result, extractor, dense_by_block_id = None, None, None
                 if job.kind == "E2":
                     async with self.sessions() as session:
@@ -623,30 +677,15 @@ class KnowledgeWorker:
                         _, _, _, actual = await version_input(session, current.document_version_id, self.config)
                         if actual != current.input_checksum:
                             raise ValueError("Stale foundation input")
-                        rebuilt_units = await rebuild_knowledge_version(
+                        await rebuild_knowledge_version(
                             session,
                             current.document_version_id,
                             self.config,
                             dense_by_block_id=dense_by_block_id,
+                            extra_entities=(
+                                None if getattr(self.settings, "document_event_extraction_enabled", False) else ()
+                            ),
                         )
-                        if rebuilt_units:
-                            from sag_api.services.knowledge_service import persist_graph
-
-                            p_id = rebuilt_units[0].project_id
-                            t_id = rebuilt_units[0].tenant_id
-                            project_units = list(
-                                (
-                                    await session.scalars(
-                                        select(KnowledgeUnit).where(
-                                            KnowledgeUnit.tenant_id == t_id,
-                                            KnowledgeUnit.project_id == p_id,
-                                            KnowledgeUnit.is_current.is_(True),
-                                        )
-                                    )
-                                ).all()
-                            )
-                            if len(project_units) >= 2:
-                                await persist_graph(session, project_units, self.config)
                     else:
                         await apply_e2(session, current, result, extractor_version=extractor, config=self.config)
                         current.result_json, current.extractor_version = result, extractor
@@ -662,6 +701,8 @@ class KnowledgeWorker:
                                 current.document_version_id,
                                 reason=f"knowledge_{current.kind.lower()}_ready",
                             )
+                            current.tree_requested_at = datetime.now(UTC)
+                            await session.commit()
                         except Exception as error:  # noqa: BLE001 - tree scheduling must not retry completed extraction
                             await session.rollback()
                             log.warning("Universe tree rebuild scheduling delayed (%s)", type(error).__name__)
@@ -686,7 +727,9 @@ class KnowledgeWorker:
                             .values(knowledge_status="FAILED")
                         )
                     await session.commit()
-            log.warning("Knowledge job %s failed (%s)", job_id, type(error).__name__)
+            log.warning("Knowledge job failed job_id=%s kind=%s attempt=%s error_type=%s cause_type=%s budget_seconds=%s",
+                        job_id, job.kind, job.attempts, type(error).__name__,
+                        type(error.__cause__).__name__ if error.__cause__ else None, timeout)
         return True
 
     async def _loop(self):

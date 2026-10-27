@@ -56,6 +56,7 @@ class KnowledgeJob(Base):
     unit_id: Mapped[str | None] = mapped_column(String(36))
     result_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     extractor_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    tree_requested_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     tenant_id: Mapped[str] = mapped_column(String(64))
     kind: Mapped[str] = mapped_column(String(16))
     input_checksum: Mapped[str] = mapped_column(String(64))
@@ -79,12 +80,14 @@ class KnowledgeQueueControl(Base):
 
 class KnowledgeGraphBuild(Base):
     __tablename__ = "knowledge_graph_builds"
+    __table_args__ = (Index("ix_knowledge_graph_input", "tenant_id", "project_id", "input_fingerprint", unique=True),)
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(64), index=True)
     project_id: Mapped[str] = mapped_column(String(64), index=True)
     checksum: Mapped[str] = mapped_column(String(64))
     manifest_json: Mapped[dict] = mapped_column(JSON)
+    input_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class KnowledgeUnitEdge(Base):

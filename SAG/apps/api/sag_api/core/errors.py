@@ -16,6 +16,29 @@ from __future__ import annotations
 from sag_api.core.error_taxonomy import ErrorCode, ErrorLayer, ErrorStage
 
 
+def is_retryable_error(error: BaseException) -> bool:
+    """Preserve transient causes across service boundaries; explicit fatal decisions win."""
+    import httpx
+    from sqlalchemy.exc import OperationalError
+
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        explicit = getattr(error, "__dict__", {}).get("retryable")
+        if isinstance(explicit, bool):
+            return explicit
+        if isinstance(error, (ValueError, PermissionError)):
+            return False
+        if isinstance(error, httpx.HTTPStatusError):
+            return error.response.status_code in (408, 429) or error.response.status_code >= 500
+        if (getattr(error, "retryable", False)
+                or isinstance(error, (TimeoutError, httpx.TransportError, OperationalError,
+                                      ServiceUnavailableError, UpstreamError))):
+            return True
+        error = error.__cause__
+    return False
+
+
 class ApiError(Exception):
     """所有 sag 领域异常的基类。"""
 

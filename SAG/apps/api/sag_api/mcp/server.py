@@ -19,6 +19,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
+from sag_api.core.config import FIXED_SEARCH_TOP_K
 from sag_api.core.principal_assertion import VerifiedPrincipal
 from sag_api.services.query_strategy_planner import plan_query
 from sag_api.services.retrieval_service import retrieve_relevant_sections
@@ -226,9 +227,9 @@ def build_source_mcp(
     async def search(
         query: Annotated[str, Field(description="Câu hỏi, chủ đề hoặc từ khóa cần tìm.")],
         top_k: Annotated[
-            int,
-            Field(description="Số bằng chứng tối đa cần trả về; mặc định 8, máy chủ giới hạn trong khoảng 1–50."),
-        ] = 8,
+            int | None,
+            Field(description="Số bằng chứng cần lấy, tối đa 5; mặc định 5.", ge=1),
+        ] = None,
         source_id: SourceId = "",
     ) -> str:
         scope = _require_scope()
@@ -242,7 +243,7 @@ def build_source_mcp(
 
         async with SessionLocal() as session:
             partitioned_ids = await versioned_source_ids(session, [source.id for source in selected])
-        bounded_top_k = max(1, min(top_k, 50))
+        bounded_top_k = min(max(1, top_k), FIXED_SEARCH_TOP_K) if top_k is not None else FIXED_SEARCH_TOP_K
         sections = []
         canonical_sources = [source for source in selected if source.id in partitioned_ids]
         legacy_sources = [source for source in selected if source.id not in partitioned_ids]
@@ -300,7 +301,6 @@ def build_source_mcp(
                 canonical_sources,
                 target,
                 principal=scope.principal,
-                top_k=6,
                 query_strategy_plan=plan_query(target),
             )
             if outcome.sections:

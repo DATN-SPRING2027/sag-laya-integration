@@ -10,12 +10,13 @@ import math
 from collections import Counter, defaultdict
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Literal
 from urllib.parse import quote
 
 import httpx
+import orjson
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
@@ -54,14 +55,17 @@ class PublishVerificationError(TreePublishError):
 
 class TreeSlotInUse(TreePublishError):
     """An earlier request still holds a lease for the inactive slot."""
+    retryable = True
 
 
 class TreePublishInProgress(TreePublishError):
     """Another publisher currently owns this project's publish lock."""
+    retryable = True
 
 
 class StaleTreePublish(TreePublishError):
     """The project pointer changed after this candidate chose its target slot."""
+    retryable = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,7 +97,7 @@ class PreparedTreeCandidate:
 
     @property
     def manifest(self) -> dict[str, Any]:
-        return json.loads(self.manifest_json)
+        return orjson.loads(self.manifest_json)
 
     @property
     def source_routing_profiles(self) -> list[dict[str, Any]]:
@@ -721,7 +725,7 @@ def _verify_persisted_manifest(
     raw = record.manifest_json
     if isinstance(raw, str):
         try:
-            manifest = json.loads(raw)
+            manifest = orjson.loads(raw)
         except ValueError as error:
             raise PublishVerificationError("PostgreSQL staged manifest JSON is malformed") from error
     elif isinstance(raw, dict):
@@ -1015,6 +1019,31 @@ async def _mark_rejected(candidate: PreparedTreeCandidate) -> None:
         log.exception("Could not mark rejected tree manifest")
 
 
+async def _verify_knowledge_inputs(session, candidate):
+    manifest = orjson.loads(candidate.manifest_json)
+    expected = manifest.get("knowledge_inputs")
+    if expected is None:
+        return  # Existing published snapshots retain their original verification contract.
+    from sag_api.db.models import KnowledgeUnit
+    from sag_api.services.knowledge_service import knowledge_lock
+
+    await knowledge_lock(session, "project-input:" + candidate.tenant_id + ":" + candidate.project_id)
+    now = datetime.now(UTC)
+    rows = (await session.execute(select(KnowledgeUnit.id, KnowledgeUnit.checksum)
+        .join(DocumentVersion, DocumentVersion.id == KnowledgeUnit.document_version_id)
+        .join(Document, Document.id == DocumentVersion.document_id)
+        .where(KnowledgeUnit.tenant_id == candidate.tenant_id,
+               KnowledgeUnit.project_id == candidate.project_id, KnowledgeUnit.is_current.is_(True),
+               Document.is_active.is_(True), DocumentVersion.knowledge_status == "DATA_READY",
+               Document.tenant_id == candidate.tenant_id, Document.project_id == candidate.project_id,
+               DocumentVersion.search_status.in_(("READY", "SEARCH_READY")),
+               DocumentVersion.search_ready_at.is_not(None),
+               DocumentVersion.valid_from <= now, DocumentVersion.valid_to > now)
+        .order_by(KnowledgeUnit.id).with_for_update())).all()
+    if [list(row) for row in rows] != expected:
+        raise StaleTreePublish("Knowledge inputs changed before the atomic switch")
+
+
 async def _atomic_switch(
     candidate: PreparedTreeCandidate,
     target_slot: Literal["SLOT_A", "SLOT_B"],
@@ -1025,6 +1054,7 @@ async def _atomic_switch(
 ) -> TreePublishResult:
     async with SessionLocal() as session:
         async with session.begin():
+            await _verify_knowledge_inputs(session, candidate)
             state = await session.scalar(
                 select(ProjectSearchState)
                 .where(ProjectSearchState.project_id == candidate.project_id)
@@ -1078,7 +1108,12 @@ async def publish_tree_candidate(
     qdrant_client: httpx.AsyncClient,
 ) -> TreePublishResult:
     """Write and verify an inactive Qdrant slot before the atomic PostgreSQL switch."""
-    candidate = prepare_tree_candidate(snapshot, search_unit_assignments)
+    from sag_api.services.cpu_worker import run_cpu
+
+    candidate = await run_cpu("prepare_tree", {
+        "snapshot": replace(snapshot, metrics=dict(snapshot.metrics), quality_gates=dict(snapshot.quality_gates)),
+        "assignments": tuple(search_unit_assignments),
+    })
     async with _project_publish_lock(candidate.project_id):
         staged = await _stage_candidate(candidate)
         if isinstance(staged, TreePublishResult):

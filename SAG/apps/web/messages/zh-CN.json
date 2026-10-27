@@ -652,8 +652,8 @@
     "extractionLanguage": "抽取语言",
     "chinese": "中文",
     "english": "English",
-    "topK": "召回条数 · {count, number}",
-    "topKAria": "召回条数",
+    "topK": "初始检索范围 · {count, number}",
+    "topKAria": "自适应检索的初始范围",
     "saving": "保存中…",
     "save": "保存并生效"
   },
