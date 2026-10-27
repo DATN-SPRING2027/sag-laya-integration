@@ -89,6 +89,14 @@ report overwrite. Use a new experiment output rather than editing historical
 reports to make them resumable. No live provider evaluation was repeated for this
 contract change; existing quality/rollout NO-GO remains in force.
 
+Post-fit evaluation diagnostics record each dispatched request separately. For
+normal-mode synthetic replay, `fitted_evidence_recall_by_call` pairs each recall
+with its call index and message hash. `fitted_gold_evidence_recall` describes the
+last dispatched call only, and is null if it has no evidence frame; the separately
+named `fitted_evidence_union_recall` is a union across calls, not proof that any
+single request contained all evidence. Historical pre-fit artifacts cannot be
+used to reconstruct these measurements.
+
 
 ## Post-validation F2 remediation & harness durability contract (2026-10-27)
 

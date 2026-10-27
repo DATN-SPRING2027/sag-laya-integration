@@ -223,32 +223,40 @@ async def candidate(case, *, web_enabled, deadline: float | None = None):
     except Exception as error:
         result.update(status="error", error_type=type(error).__name__)
     finally:
-        if plan is not None and plan.session_context is not None:
-            result["actual_fitted_evidence"] = [
-                {
-                    "message_id": item.span.ref.message_id,
-                    "kind": item.kind,
-                    "text": item.text,
-                }
-                for item in plan.session_context.dispatched_evidence
-            ]
-            result["actual_fitted_evidence_messages"] = list(plan.session_context.dispatched_evidence_messages)
-            result["fitted_evidence_messages"] = list(plan.session_context.dispatched_evidence_messages)
-            result["dispatched_prompt_calls"] = copy.deepcopy(plan.session_context.dispatched_calls)
-            if case.get("group") == "normal":
-                raw_score = baseline.score_selected_evidence(case, expanded, result["raw_selected_evidence"])
-                result["raw_gold_evidence_recall"] = raw_score["item_evidence_recall"]
-                result["raw_gold_evidence_metrics"] = raw_score
-                if result["actual_fitted_evidence_messages"]:
-                    fitted_score = baseline.score_fitted_evidence_messages(
-                        case, expanded, result["actual_fitted_evidence_messages"]
-                    )
-                    result["fitted_gold_evidence_recall"] = fitted_score["item_evidence_recall"]
-                    result["fitted_gold_evidence_metrics"] = fitted_score
-                else:
-                    result["fitted_gold_evidence_recall"] = None
-                    result["fitted_gold_evidence_metrics"] = None
-        await engine.dispose()
+        try:
+            if plan is not None and plan.session_context is not None:
+                context = plan.session_context
+                result["actual_fitted_evidence"] = [
+                    {"message_id": item.span.ref.message_id, "kind": item.kind, "text": item.text}
+                    for item in context.dispatched_evidence.values()
+                ]
+                result["actual_fitted_evidence_messages"] = list(context.dispatched_evidence_messages)
+                result["fitted_evidence_messages"] = list(context.dispatched_evidence_messages)
+                result["dispatched_prompt_calls"] = copy.deepcopy(context.dispatched_calls)
+                if case.get("group") == "normal":
+                    if "raw_selected_evidence" in result:
+                        raw_score = baseline.score_selected_evidence(case, expanded, result["raw_selected_evidence"])
+                        result["raw_gold_evidence_recall"] = raw_score["item_evidence_recall"]
+                        result["raw_gold_evidence_metrics"] = raw_score
+                    per_call = []
+                    for call in context.dispatched_calls:
+                        frames = call["evidence_messages"]
+                        score = baseline.score_fitted_evidence_messages(case, expanded, frames) if frames else None
+                        per_call.append({
+                            "call_index": call["call_index"],
+                            "messages_sha256": call["messages_sha256"],
+                            "item_evidence_recall": score["item_evidence_recall"] if score else None,
+                            "metrics": score,
+                        })
+                    result["fitted_evidence_recall_by_call"] = per_call
+                    final_score = per_call[-1]["metrics"] if per_call else None
+                    result["fitted_gold_evidence_recall"] = final_score["item_evidence_recall"] if final_score else None
+                    result["fitted_gold_evidence_metrics"] = final_score
+                    all_frames = result["actual_fitted_evidence_messages"]
+                    union = baseline.score_fitted_evidence_messages(case, expanded, all_frames) if all_frames else None
+                    result["fitted_evidence_union_recall"] = union["item_evidence_recall"] if union else None
+        finally:
+            await engine.dispose()
     result["duration_ms"] = round((time.monotonic() - started) * 1000, 2)
     return result
 

@@ -108,10 +108,7 @@ class BudgetedLLM(LLMClient):
             await self.before_dispatch()
         reservation = self.budget.reserve_call(input_tokens=self.counter.count(messages, tools))
         if self.on_dispatch is not None:
-            try:
-                self.on_dispatch(messages=messages)
-            except TypeError:
-                self.on_dispatch()
+            self.on_dispatch(messages=messages)
         messages_sha256 = hashlib.sha256(
             json.dumps(
                 [dict(m) if isinstance(m, Mapping) else m for m in messages],
