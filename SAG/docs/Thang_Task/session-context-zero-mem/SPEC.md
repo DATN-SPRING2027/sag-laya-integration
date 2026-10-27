@@ -2,7 +2,7 @@
 
 Ngày: 2026-10-26. Chủ yêu cầu: Thang.
 
-**Trạng thái triển khai 2026-10-27:** T1–T8 đã có implementation và kiểm thử; T9 đang đo bản runtime cố định trên calibration/holdout. Feature mặc định OFF, chưa chấp thuận rollout. Baseline tại [BASELINE](BASELINE.md); runtime và vận hành tại [RUNTIME](RUNTIME.md), schema riêng tại [PERSISTENCE](PERSISTENCE.md). Các mô tả prototype phía dưới ghi lại checkpoint lịch sử; hợp đồng runtime hiện hành ở RUNTIME.
+**Trạng thái triển khai 2026-10-27:** T1–T8 đã có implementation và kiểm thử; T9 đã đo bản runtime cố định trên calibration/holdout, acceptance FAIL; xem VERIFICATION. Feature mặc định OFF, chưa chấp thuận rollout. Baseline tại [BASELINE](BASELINE.md); runtime và vận hành tại [RUNTIME](RUNTIME.md), schema riêng tại [PERSISTENCE](PERSISTENCE.md). Các mô tả prototype phía dưới ghi lại checkpoint lịch sử; hợp đồng runtime hiện hành ở RUNTIME.
 
 Tài liệu cùng task: [nghiên cứu hiện trạng](researchtask.md), [kế hoạch](tasks/plan.md), [checklist](tasks/todo.md).
 

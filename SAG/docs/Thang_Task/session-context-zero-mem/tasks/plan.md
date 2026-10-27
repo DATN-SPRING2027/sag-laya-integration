@@ -4,7 +4,7 @@
 
 **T3a/T3b đã thực hiện:** reader/hierarchy tại [READER-HIERARCHY](../READER-HIERARCHY.md), graph/fusion/closure prototype offline và learned-model smoke tại [GRAPH-SELECTION](../GRAPH-SELECTION.md).
 
-**T4 đã hoàn tất phép đo:** [CALIBRATION](../CALIBRATION.md), [numeric contract](../CALIBRATION-POLICY.json) và [license audit](../NER-LICENSE-AUDIT.md). Contract đã khóa cho bước kiểm chứng tiếp; acceptance/rollout chưa đạt. T5–T8 đã triển khai theo RUNTIME/PERSISTENCE; T9 provider/holdout đang kiểm chứng. Không đồng nghĩa acceptance/rollout PASS.
+**T4 đã hoàn tất phép đo:** [CALIBRATION](../CALIBRATION.md), [numeric contract](../CALIBRATION-POLICY.json) và [license audit](../NER-LICENSE-AUDIT.md). Contract đã khóa cho bước kiểm chứng tiếp; acceptance/rollout chưa đạt. T5–T8 đã triển khai theo RUNTIME/PERSISTENCE; T9 provider/holdout đã kiểm chứng: acceptance FAIL, rollout NO-GO; xem VERIFICATION. Không đồng nghĩa acceptance/rollout PASS.
 
 ## Thứ tự và phụ thuộc
 

@@ -11,3 +11,8 @@ Kiểm chứng: 7 disposable SQLite tests với FK enforcement, restart session/
 T6a đã có adapter keyset/checkpoint/CAS tại services/session_context/storage.py và index.py. Cached vectors chỉ dùng sau current raw hash/model/scope/mention-offset validation, row lookup luôn refresh ORM identity map. Request trước dispatch/output phải revalidate authority và generation; hooks/locks được hoàn tất ở T6b/T7, không suy rằng row-ready đã đủ production safety.
 
 T9 bổ sung native PostgreSQL16 trong containerQA riêng khi Docker trở nên khả dụng: actual0007up/down/reapply giữrawchat; runtime sharedlease chốngconcurrentdelete/invalidate/revoke và separatepublication khôngdeadlock. Opt-in tests/test_session_context_postgres.py,5cases. DùnghaiDBconnections và DBtạmmới; khôngchứngnhận tảiđa tiến trình tùyý, khôngmigrateproduction. BằngchứngcuốiởVERIFICATION.md.
+
+
+Lưu ý bootstrap hiện có của SAG: `core/db.py:init_db` gọi `Base.metadata.create_all` không có guard theo môi trường. Vì models mới được aggregate-import, khởi động binary mới có thể tạo hai bảng dẫn xuất ngay cả khi feature flag OFF. Task không khởi động binary mới trên DB thật. Với PostgreSQL deployment, phải apply0007 bằng quy trình DB riêng **trước khi khởi động code mới** để giữ schema/defaults/constraints theo migration; OFF chỉ tắt đường generation mới, không là guard DDL. Không sửa bootstrap legacy trong phạm vi này. Nếu startup đã tự tạo bảng thì không chạy SQLup mù quáng; kiểm schema thực tế và reconcile qua migration mới có review.
+
+Nếu rollback cần giữ hai bảng ở trạng thái đã drop, phải rollback binary trước khi restart: binary mới vẫn có thể create_all tạo lại các bảng dẫn xuất rỗng. Raw chat không mất, nhưng provenance rỗng không được coi là authority.

@@ -1,6 +1,6 @@
 # Checklist: Context session v1
 
-Trạng thái: T1–T3b prototype và T4 measurement/numeric contract đã thực hiện theo yêu cầu Thang. T5–T8 đã tích hợp và kiểm thử offline; T9 đang kiểm chứng provider/holdout. Rollout vẫn NO-GO đến khi đủ gates. Theo [plan](plan.md), [SPEC](../SPEC.md), [CALIBRATION](../CALIBRATION.md) và các tài liệu liên kết cùng task.
+Trạng thái: T1–T3b prototype và T4 measurement/numeric contract đã thực hiện theo yêu cầu Thang. T5–T8 đã tích hợp và kiểm thử offline; T9 đã đo xong calibration/holdout trên cùng bản cố định: acceptance FAIL/rollout NO-GO; xem VERIFICATION. Không bật rollout. Theo [plan](plan.md), [SPEC](../SPEC.md), [CALIBRATION](../CALIBRATION.md) và các tài liệu liên kết cùng task.
 
 ## Chuẩn bị đã làm
 
@@ -26,27 +26,27 @@ Trạng thái: T1–T3b prototype và T4 measurement/numeric contract đã thự
 - [x] T6b: Delete/revoke/generation fences và request leases; serverPG đa tiến trình còn là gate riêng.
 - [x] T7: Normal-mode thread ask, prompt groups, feature flag, legacy OFF.
 - [x] T8: Full-session bounded synthesis, coverage ledger, native partial/cancel; browser fixture livepartial/reload đã kiểm chứng (evidence/browser).
-- [ ] T9: Holdout + provider/integration/lifecycle/rollback verification.
+- [x] T9 measurement/review: holdout48/48, provider/HTTP/browser/nativePG/rollback đã kiểm chứng và báo cáo. Acceptance FAIL, không đồng nghĩa hoàn tất mục tiêu chất lượng.
 
 ## Điều kiện nghiệm thu bắt buộc
 
 - [ ] Recall được message hợp lệ ở đầu session rất dài, không phụ thuộc last-8/last-200.
 - [ ] Đúng quyết định hiện tại và giữ provenance khi có thay đổi/mâu thuẫn.
 - [ ] Câu tiếp nối có đủ ngữ cảnh; assistant suggestion không bị coi là user approval.
-- [ ] Không cross-owner/thread/project hoặc dùng nguồn đã revoke/delete.
-- [ ] Index stale/failed/cold/cancel không tạo khẳng định nhớ đầy đủ sai.
+- [x] Validators/JWT/HTTP/SQLite và nativePG tests chặn cross-owner/thread/project và evidence revoke/delete; không thay thế kiểm chứng workload triển khai.
+- [x] Protocol tests: stale/failed/cold/cancel không trở thành complete success. Coverage ready vẫn không chứng minh semantic correctness (T9 đã phát hiện lỗi).
 - [ ] Mọi model request/retry/compression/synthesis được tính usage; unknown khác zero.
 - [ ] Không giảm chất lượng theo ngưỡng ghim trước holdout; cải thiện nhớ thông tin cũ.
-- [ ] Savings normal session dài được đo; full-session có báo cáo riêng.
+- [x] Đã đo long-normal holdout token giảm73,81%/77,99%; fullsession báo riêng, qualitygateFAIL chặn rollout.
 - [x] Client SAG thật hiển thị partial/live/reload qua API/provider thật, không mock HTTP; Continuum embed riêng chưa chứng nhận.
-- [ ] Không thay retrieval/ingestion tài liệu hoặc BE identity ngoài scope.
+- [x] Không thay retrieval/ingestion tài liệu hoặc BE identity ngoài scope.
 
 ## Handoff triển khai sau này
 
 - [ ] Relevant tests, lint và integration checks hoàn tất; không coi mock là production acceptance.
-- [ ] Git status/diff/history và secrets/generated/debug review.
-- [ ] DB impact/migration/rollback và config/model/license ghi rõ.
-- [ ] Code review hoàn tất; con người review/CI/merge.
-- [ ] Báo nhánh/commit, checks, hạn chế, exact push command; không tự push.
+- [x] Git status/diff/history và secrets/generated/debug review; giữ .serena/ không liên quan.
+- [x] DB impact/migration/rollback và config/model/license ghi rõ ở PERSISTENCE/RUNTIME/MODEL-LICENSES/HANDOFF.
+- [x] Agent code review/regression hoàn tất; vẫn chờ con người review/CI/merge, không tự approve.
+- [x] Nhánh/commit, checks, hạn chế, exact push command ở HANDOFF; không tự push.
 
 Không checkbox implementation/benchmark nào được đánh dấu chỉ vì tài liệu này đã được viết.
