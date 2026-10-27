@@ -21,10 +21,9 @@ its retry/checkpoint behavior are retained for that opt-in path.
 
 ## Retrieval
 
-- Omit `top_k` (or send `null`) for automatic retrieval. Frontend initial search,
-  Agent search_context, MCP and Dify use this default.
-- Explicit positive `top_k` remains supported for user requests and matched
-  fixed-K benchmarks. There is no fixed 5/8/12/50 result ceiling.
+- The shared retrieval path fixes `top_k` at 5, including Search, Agent, MCP and
+  Dify. Positive request values are accepted for compatibility but do not change
+  retrieval breadth; MCP and Dify may return fewer if their clients request fewer.
 - `search_top_k` is initial candidate breadth, not the number of final results.
   Canonical retrieval doubles candidate breadth while retrievers are saturated
   and anchors/count coverage still needs expansion. Existing relevance gates,
@@ -34,7 +33,7 @@ its retry/checkpoint behavior are retained for that opt-in path.
   earlier wave is not returned after a later authorization failure.
 - `search_unit_candidate_limit` is a configurable work/memory budget (default
   1024, no schema ceiling of 1024). It is not an assertion of answer completeness.
-  Responses expose automatic/explicit mode, effective K, wave count, stop reason
+  Responses expose effective K, wave count, stop reason
   and budget exhaustion. Relevance plateau is not semantic answerability.
 - Source selection defaults to all authorized sources. A positive optional
   `search_source_candidate_limit` rejects an over-budget scope explicitly;
@@ -52,13 +51,12 @@ bounded by the current retrieval work budget instead.
 
 Regression tests cover canonical ingestion without an Event LLM call, failed
 manifest rejection, FOUNDATION before legacy completion, optional extraction,
-standalone SDK embedding lifecycle, source scopes beyond 16, automatic result
-counts beyond 50, explicit K, budget reporting and frontend load-more intent.
+standalone SDK embedding lifecycle, source scopes beyond 16, fixed Top-5,
+candidate-budget reporting and frontend search state.
 
-Dataset runners use the same API/runtime. Their matched Top-5 comparison is
-explicitly requested and remains distinct from automatic product retrieval.
-Live smoke tests and complete benchmark runs are separate artifacts; a smoke
-test is not a full quality or latency benchmark.
+Dataset runners use the same API/runtime and fixed Top-5 retrieval. Live smoke
+tests and complete benchmark runs are separate artifacts; a smoke test is not
+a full quality or latency benchmark.
 
 ## FOUNDATION, graph and routing execution
 
