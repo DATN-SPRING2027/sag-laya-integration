@@ -2,17 +2,17 @@
 
 Ngày: 2026-10-26. Chủ yêu cầu: Thang.
 
-**Trạng thái:** yêu cầu sản phẩm đã được Thang xác nhận; T1 baseline, T2 contracts, T3a reader/hierarchy và T3b selector prototype offline đã thực hiện. Thiết kế cần review; chưa tích hợp hoặc đạt nghiệm thu sản phẩm/runtime. Baseline tại [BASELINE](BASELINE.md).
+**Trạng thái triển khai 2026-10-27:** T1–T8 đã có implementation và kiểm thử; T9 đang đo bản runtime cố định trên calibration/holdout. Feature mặc định OFF, chưa chấp thuận rollout. Baseline tại [BASELINE](BASELINE.md); runtime và vận hành tại [RUNTIME](RUNTIME.md), schema riêng tại [PERSISTENCE](PERSISTENCE.md). Các mô tả prototype phía dưới ghi lại checkpoint lịch sử; hợp đồng runtime hiện hành ở RUNTIME.
 
 Tài liệu cùng task: [nghiên cứu hiện trạng](researchtask.md), [kế hoạch](tasks/plan.md), [checklist](tasks/todo.md).
 
-**T2 đã thực hiện:** [hợp đồng evidence/scope/provenance/budget](CONTRACT.md) và validators/tests nội bộ. Chưa nối selector hoặc grounding vào runtime. Full-session không được báo hoàn tất khi còn lịch sử thiếu provenance; partition stamp gốc không được suy từ project hiện tại.
+**T2 đã thực hiện:** [hợp đồng evidence/scope/provenance/budget](CONTRACT.md) và validators/tests nội bộ; T7 đã nối selector/typed grounding vào runtime theo RUNTIME. Full-session không được báo hoàn tất khi còn lịch sử thiếu provenance; partition stamp gốc không được suy từ project hiện tại.
 
 **T3a đã thực hiện:** [reader/hierarchy offline](READER-HIERARCHY.md), pinned fixture keyset pages và turn/window/temporal episode/local views có nguyên văn provenance. Không coi temporal grouping là semantic episode segmentation hoặc production reader.
 
 **T3b đã thực hiện:** [graph/fusion/closure offline](GRAPH-SELECTION.md), optional learned encoder/NER revisions ghim và synthetic model smoke; không coi là tái lập nguyên vẹn paper. Numeric contract của T4 và các rollout gaps được cập nhật bên dưới.
 
-**T4 đã đo và khóa contract kiểm chứng:** [calibration](CALIBRATION.md), [numeric policy](CALIBRATION-POLICY.json) và [license audit](NER-LICENSE-AUDIT.md). Balanced giữ9/9 raw evidence normal; web-enabled answers5/10→9/10 và long-normal tokens giảm~76,7%. **Chưa đạt rollout gate**: compression-middle bị filler echo, default grounding chưa nhận session evidence, license fine-tune chưa xác minh. T5–T9 và holdout còn lại; không dùng điểm trung bình để bỏ qua regression.
+**T4 đã đo và khóa contract kiểm chứng:** [calibration](CALIBRATION.md), [numeric policy](CALIBRATION-POLICY.json) và [license audit](NER-LICENSE-AUDIT.md). Balanced giữ9/9 raw evidence normal; web-enabled answers5/10→9/10 và long-normal tokens giảm~76,7%. **Chưa đạt rollout gate**: compression-middle bị filler echo, default grounding chưa nhận session evidence, license fine-tune chưa xác minh. Đây là checkpoint T4 cũ. T5–T8 nay đã triển khai, NER candidate/license mới ghi ở MODEL-LICENSES; T9 kiểm chứng riêng, không dùng điểm trung bình để bỏ qua regression.
 
 ## 1. Mục tiêu và quyết định đã xác nhận
 
@@ -235,7 +235,7 @@ async def get_thread(
 
 - **Phần đặc tả ban đầu:** chỉ tài liệu. **T1 được Thang yêu cầu sau đó:** thêm corpus/harness/tests, opt-in stream usage và báo cáo; không đổi selection, schema, dependency, runtime config hoặc public API. Không tự push.
 - **Triển khai tương lai:** dự kiến ảnh hưởng SAG backend; database có thể cần derived index/provenance và phải tách nhánh/PR. FE chỉ là deliverable riêng nếu contract/status cần thay UI.
-- Đề xuất feature flag có OFF/SHADOW/ON, chưa phải cấu hình đang tồn tại. Shadow mặc định không gọi thêm LLM trả phí; muốn so sánh output phải chạy benchmark được kiểm soát.
+- Feature flag SAG_SESSION_CONTEXT_MODE=off|shadow|on đã được triển khai, mặc định off. Shadow mặc định không gọi thêm LLM trả phí; muốn so sánh output phải chạy benchmark được kiểm soát.
 - Bật thử sau khi đạt offline/provider/integration gates. OFF giữ đường legacy để rollback; không xóa lịch sử gốc hay sửa raw messages để rollback.
 - Rollback tắt selector mới, dừng jobs và vô hiệu generation index; schema dẫn xuất có down/cleanup riêng sau khi xác minh không còn reader, không drop tự động khi có request đang dùng.
 

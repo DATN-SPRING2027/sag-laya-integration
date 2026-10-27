@@ -104,6 +104,8 @@ def decode_memory_answer(raw, evidence, *, original=None, max_supports=128, allo
         require(isinstance(value, dict) and isinstance(value.get("answer"), str), "memory_answer")
         supports = value.get("supports")
         require(isinstance(supports, list) and len(supports) <= max_supports, "memory_supports")
+        if allow_reference_only:
+            supports = [{"id": support} if isinstance(support, str) else support for support in supports]
         allowed = {item.span.evidence_id for item in evidence}
         known = {
             f"S{index + 1}": item

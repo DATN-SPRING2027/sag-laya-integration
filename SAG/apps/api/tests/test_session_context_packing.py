@@ -82,3 +82,13 @@ def test_reference_only_protocol_resolves_original_quote_and_keeps_invalid_ids_f
     assert decode_memory_answer(bad, evidence(), allow_reference_only=True)[0] == "UNKNOWN"
     # Removed evidence cannot be restored merely by its original stable ID.
     assert decode_memory_answer(raw, evidence()[1:], original=evidence(), allow_reference_only=True)[0] == "UNKNOWN"
+
+
+def test_string_reference_is_equivalent_to_id_object_only_for_explicit_reference_protocol():
+    raw = json.dumps({"answer": "BLUE", "supports": ["S1"]})
+    assert decode_memory_answer(raw, evidence(), allow_reference_only=True) == (
+        "BLUE",
+        [{"id": "S1", "quote": "I confirm BLUE."}],
+    )
+    assert decode_memory_answer(raw, evidence())[0] == "UNKNOWN"
+    assert decode_memory_answer(raw.replace("S1", "S9"), evidence(), allow_reference_only=True)[0] == "UNKNOWN"

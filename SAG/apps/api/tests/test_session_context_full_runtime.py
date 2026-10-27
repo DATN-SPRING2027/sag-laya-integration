@@ -219,8 +219,9 @@ async def test_full_runtime_unknown_usage_stops_after_map_and_never_claims_compl
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("quoted_map", [False, True])
+@pytest.mark.parametrize("string_references", [False, True])
 async def test_native_full_runtime_accepts_id_only_reduce_with_canonical_map_provenance(storage_db, monkeypatch,
-                                                                                       quoted_map):
+                                                                                       quoted_map, string_references):
     factory, scope = storage_db
     agent, plan = await full_plan(factory, scope)
 
@@ -239,6 +240,10 @@ async def test_native_full_runtime_accepts_id_only_reduce_with_canonical_map_pro
                             support.pop("quote")
             else:
                 output["supports"] = [{"id": support["id"]} for support in output["supports"]]
+            if string_references:
+                for item in output.get("items", [output]):
+                    item["supports"] = [support["id"] if "quote" not in support else support
+                                        for support in item["supports"]]
             response["choices"][0]["message"]["content"] = json.dumps(output)
             return response
 

@@ -41,7 +41,7 @@ class SemanticModel:
 
     def __init__(self, context, *, corrupt_quote=False, missing_usage=False, cancel=False, unvisited_support=False,
                  reference_only_map=False, reference_only_reduce=False, reduce_id=None, map_id=None,
-                 corrupt_reduce_quote=False):
+                 corrupt_reduce_quote=False, string_references=False):
         self.context = context
         self.corrupt_quote = corrupt_quote
         self.missing_usage = missing_usage
@@ -52,6 +52,7 @@ class SemanticModel:
         self.reduce_id = reduce_id
         self.map_id = map_id
         self.corrupt_reduce_quote = corrupt_reduce_quote
+        self.string_references = string_references
         self.requests = []
         self.map_batches = []
         self.reduce_items = []
@@ -95,6 +96,10 @@ class SemanticModel:
                 # snapshot, but was never mapped or sent as a reduce item.
                 quote = self.context.original[-1].text.split("\n", 1)[0]
                 output = {"answer": quote, "supports": [{"id": "S8", "quote": quote}]}
+        if self.string_references:
+            for item in output.get("items", [output]):
+                item["supports"] = [support["id"] if "quote" not in support else support
+                                    for support in item["supports"]]
         self.context.budget.settle_call(
             reservation, None if self.missing_usage else TokenUsage(count, 20))
         return json.dumps(output)
@@ -207,11 +212,14 @@ async def test_reduce_cannot_publish_support_from_unvisited_original_outside_map
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reference_only_map", [True, False])
+@pytest.mark.parametrize("string_references", [False, True])
 async def test_id_only_reduce_uses_exact_canonical_mapped_pairs_not_expanded_original_span(storage_db,
-                                                                                        reference_only_map):
+                                                                                        reference_only_map,
+                                                                                        string_references):
     factory, scope = storage_db
     context = await full_context(factory, scope)
-    model = SemanticModel(context, reference_only_map=reference_only_map, reference_only_reduce=True)
+    model = SemanticModel(context, reference_only_map=reference_only_map, reference_only_reduce=True,
+                          string_references=string_references)
     result = await aggregate_session(context, model, QUERY, input_limit=1500)
     assert result.complete is True and result.reason is None
     assert model.reduce_items
@@ -229,10 +237,13 @@ async def test_id_only_reduce_uses_exact_canonical_mapped_pairs_not_expanded_ori
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reduce_id", ["S999", "S2"])
-async def test_id_only_reduce_rejects_unknown_or_visited_but_unmapped_reference(storage_db, reduce_id):
+@pytest.mark.parametrize("string_references", [False, True])
+async def test_id_only_reduce_rejects_unknown_or_visited_but_unmapped_reference(storage_db, reduce_id,
+                                                                             string_references):
     factory, scope = storage_db
     context = await full_context(factory, scope)
-    model = SemanticModel(context, reference_only_map=True, reference_only_reduce=True, reduce_id=reduce_id)
+    model = SemanticModel(context, reference_only_map=True, reference_only_reduce=True, reduce_id=reduce_id,
+                          string_references=string_references)
     result = await aggregate_session(context, model, QUERY, input_limit=1500)
     assert_visible_partial(result)
     assert result.visited_ids == context.selection.coverage.eligible_ids
@@ -243,10 +254,12 @@ async def test_id_only_reduce_rejects_unknown_or_visited_but_unmapped_reference(
 
 
 @pytest.mark.asyncio
-async def test_id_only_map_cannot_reference_authorized_message_outside_current_batch(storage_db):
+@pytest.mark.parametrize("string_references", [False, True])
+async def test_id_only_map_cannot_reference_authorized_message_outside_current_batch(storage_db, string_references):
     factory, scope = storage_db
     context = await full_context(factory, scope)
-    model = SemanticModel(context, reference_only_map=True, reference_only_reduce=True, map_id="S8")
+    model = SemanticModel(context, reference_only_map=True, reference_only_reduce=True, map_id="S8",
+                          string_references=string_references)
     result = await aggregate_session(context, model, QUERY, input_limit=600)
     assert_visible_partial(result)
     assert len(model.map_batches) == 1 and "S8" not in {item["id"] for item in model.map_batches[0]}

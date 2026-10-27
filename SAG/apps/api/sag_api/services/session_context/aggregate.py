@@ -86,6 +86,8 @@ def _reduction_answer(raw, extracted, evidence, original):
             mapped.setdefault(support["id"], {})[support["quote"]] = support
     expanded = []
     for support in value["supports"]:
+        if isinstance(support, str):
+            support = {"id": support}
         if isinstance(support, dict) and "quote" not in support:
             if not isinstance(support.get("id"), str) or support["id"] not in mapped:
                 raise ValueError("unmapped_synthesis_reference")
