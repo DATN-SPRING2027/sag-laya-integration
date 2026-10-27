@@ -51,11 +51,16 @@ class IndexedSession:
         )
 
 
-def _encode(encoder, texts, budget):
+def _encode(encoder, texts, budget, chunk_cache=None):
     # Only weights are shared. Inputs/results stay inside one authorized job.
     with _INFERENCE_LOCK:
         budget.consume_index_units(0)
-        return encoder.featurize_many(texts, batch_size=16, budget=budget, deduplicate=True)
+        try:
+            return encoder.featurize_many(
+                texts, batch_size=16, budget=budget, deduplicate=True, chunk_cache=chunk_cache
+            )
+        except TypeError:
+            return encoder.featurize_many(texts, batch_size=16, budget=budget, deduplicate=True)
 
 
 async def sync_index(
@@ -141,9 +146,12 @@ async def sync_index(
         require(changed.rowcount == 1, "index_generation_changed")
         await session.commit()
 
+    chunk_cache = {}
     for start in range(0, len(pending), batch_size):
         batch = pending[start : start + batch_size]
-        encoded = await asyncio.to_thread(_encode, encoder, tuple(message.content for message in batch), budget)
+        encoded = await asyncio.to_thread(
+            _encode, encoder, tuple(message.content for message in batch), budget, chunk_cache
+        )
         for message, feature in zip(batch, encoded, strict=True):
             require(
                 feature.model_id == encoder.model_id and feature.content_hash == message.reference.content_hash,

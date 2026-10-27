@@ -80,7 +80,7 @@ class ModelTokenCounter:
 
 
 class BudgetedLLM(LLMClient):
-    def __init__(self, settings, *, budget: BudgetState, counter, before_dispatch=None):
+    def __init__(self, settings, *, budget: BudgetState, counter, before_dispatch=None, on_dispatch=None):
         finite = settings.model_copy(
             update={
                 "llm_max_retries": 0,
@@ -89,13 +89,20 @@ class BudgetedLLM(LLMClient):
             }
         )
         super().__init__(finite, include_stream_usage=True)
-        self.budget, self.counter, self.before_dispatch = budget, counter, before_dispatch
+        self.budget, self.counter, self.before_dispatch, self.on_dispatch = (
+            budget,
+            counter,
+            before_dispatch,
+            on_dispatch,
+        )
         self.calls = []
 
     async def _create_completion(self, messages, *, stream=False, tools=None, tool_choice=None):
         if self.before_dispatch is not None:
             await self.before_dispatch()
         reservation = self.budget.reserve_call(input_tokens=self.counter.count(messages, tools))
+        if self.on_dispatch is not None:
+            self.on_dispatch()
         record = {
             "status": "started",
             "input_tokens": None,

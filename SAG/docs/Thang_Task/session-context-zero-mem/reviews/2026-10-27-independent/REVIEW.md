@@ -164,3 +164,15 @@ Không thêm `--native-pg` nếu chưa tự tạo và xác minh container/DB dis
 Thang yêu cầu push báo cáo ngày27/10/2026. Scripts được chuyển từ scratch sang thư mục này, sửa discovery repository để chạy ở checkout khác và format/lint trước commit. Reproductions nằm ngoài test suite mặc định; đây là các assertions dự kiến FAIL khi lỗi chưa sửa, không phải quality gate đã PASS. NativePG mặc định SKIP, chỉ opt-in sau khi kiểm chứng disposable DB. Không chạy lại paid provider/holdout để chuẩn bị commit bàn giao.
 
 Kiểm tra gói bàn giao: Ruff cho ba scripts PASS; audit xác nhận16source hashes không đổi và calibration/holdout manifests khớp; runner offline tái hiện3FAIL/1SKIP. File `reproduction_cases.py` không dùng tên theo pattern discovery test mặc định; runner gọi tường minh file này. Không đưa các assertions cố ý đỏ vào test suite mặc định hoặc sửa assertions để làm kết quả xanh.
+
+## Cập nhật sau khi sửa lỗi trên PR #40 (27/10/2026)
+
+- Đã sửa dứt điểm **F1**, **F4**, **F5**, **F6** và phần lỗi deterministic orchestration/fallback + cold-index reuse của **F2/F3** trên nhánh `feat/Thang-session-context-runtime-be-api`.
+- File `reproduction_cases.py` đã được cập nhật để kiểm chứng đầy đủ các invariant sau sửa:
+  - Offline (`run_repros.py`): **3 passed, 1 skipped**.
+  - Native PostgreSQL 16.15 disposable container (`run_repros.py --native-pg`): **4 passed** (bao gồm bài kiểm tra đua khóa `_lease` vs `delete_message` với 0 deadlock `40P01`).
+  - Full offline pytest suite (`pytest -q -m "not ai_smoke"`): **309 passed, 6 skipped, 2 deselected**.
+  - Native PostgreSQL suite (`pytest tests/test_session_context_postgres.py -q`): **6 passed**.
+- Các artifacts `t9-calibration-runtime-v4.json`, `t9-holdout-runtime-v4.json` và semantic reviews được giữ nguyên không sửa đổi. `SAG_SESSION_CONTEXT_MODE` giữ nguyên `off`.
+- **Merge readiness (code/contract/safety)**: **READY FOR REVIEW / MERGE** (với `SAG_SESSION_CONTEXT_MODE=off` và quy trình chạy migration `0007` trước khi khởi động binary mới trên PostgreSQL).
+- **Rollout readiness (`SAG_SESSION_CONTEXT_MODE=on`)**: **NO-GO** cho tới khi có đợt đánh giá live provider mới trên tập validation độc lập chứng minh đạt các ngưỡng chất lượng của `CALIBRATION-POLICY.json`.

@@ -259,3 +259,118 @@ async def test_native_full_runtime_accepts_id_only_reduce_with_canonical_map_pro
         from sag_api.db.models import SessionMessageProvenance
         provenance = await session.get(SessionMessageProvenance, terminal["message_id"])
         assert {ref["message_id"] for ref in provenance.dependencies} == {"first", "middle", "last", "current"}
+
+
+@pytest.mark.asyncio
+async def test_full_runtime_rejects_nonempty_source_filter_and_allows_empty_or_none(storage_db, monkeypatch):
+    from sag_api.core.errors import ValidationError
+
+    factory, scope = storage_db
+    agent, plan = await full_plan(factory, scope)
+    provider = ProviderBoundary()
+    monkeypatch.setattr(model_module, "session_completion", provider)
+    async with factory() as session:
+        user = await session.get(Message, "current")
+        with pytest.raises(ValidationError) as caught:
+            await prepare_context(
+                session,
+                key=scope.key,
+                principal=principal(scope),
+                user_message=user,
+                query=QUERY,
+                mode="full_session",
+                requested_source_ids=["source"],
+                counter=Counter(),
+            )
+        assert caught.value.code == "session_context_source_filter_unsupported"
+        empty_ctx = await prepare_context(
+            session,
+            key=scope.key,
+            principal=principal(scope),
+            user_message=user,
+            query=QUERY,
+            mode="full_session",
+            requested_source_ids=[],
+            counter=Counter(),
+        )
+        assert empty_ctx.scope.requested_source_ids == frozenset()
+    scoped_plan = replace(plan, source_ids=["source"])
+    with pytest.raises(ValidationError) as caught:
+        async for _ in stream(factory, scope, agent, scoped_plan):
+            pass
+    assert caught.value.code == "session_context_source_filter_unsupported"
+    assert not provider.requests
+
+
+@pytest.mark.asyncio
+async def test_full_runtime_failed_second_map_persists_all_dispatched_evidence_in_provenance(storage_db, monkeypatch):
+    from datetime import UTC, datetime
+
+    from sag_api.db.models import SessionMessageProvenance, Source, SourceProjectMapping
+    from sag_api.services.session_context.storage import record_provenance
+
+    factory, scope = storage_db
+    async with factory() as session:
+        session.add(Source(id="src-2", name="Source 2", sag_source_config_id="src-2"))
+        await session.flush()
+        session.add(
+            SourceProjectMapping(
+                id="map-2",
+                source_id="src-2",
+                organization_id="org",
+                project_id="project",
+                state="CONFIRMED",
+                confirmed_at=datetime.now(UTC),
+                confirmed_by="qa",
+                approval_ref="qa",
+            )
+        )
+        for index in range(6):
+            session.add(raw(f"b-{index}", content=f"DECISION B-{index}: " + ("note " * 5000), ordinal=index + 10))
+        user = raw("current-b", content=QUERY, ordinal=20)
+        session.add(user)
+        await session.commit()
+        b5 = await session.get(Message, "b-5")
+        await record_provenance(
+            session, b5, scope=replace(scope, source_ids=frozenset({"src-2"})), source_ids=frozenset({"src-2"})
+        )
+        await session.commit()
+        await session.refresh(user)
+        context = await prepare_context(
+            session,
+            key=scope.key,
+            principal=principal(scope),
+            user_message=user,
+            query=QUERY,
+            mode="full_session",
+            counter=Counter(),
+        )
+        agent = await session.get(Agent, "agent")
+        plan = AskPlan(
+            query=QUERY, messages=context.messages(agent, QUERY), user_message_id=user.id, session_context=context
+        )
+
+    class FailSecondMapProvider(ProviderBoundary):
+        maps = 0
+
+        async def __call__(self, settings, **request):
+            response = await super().__call__(settings, **request)
+            prefix, _ = request["messages"][-2]["content"].split("\n", 1)
+            if prefix == "SESSION_EVIDENCE_JSON":
+                self.maps += 1
+                if self.maps == 2:
+                    response["choices"][0]["message"]["content"] = "not-json"
+            return response
+
+    provider = FailSecondMapProvider()
+    monkeypatch.setattr(model_module, "session_completion", provider)
+    events = [event async for event in stream(factory, scope, agent, plan)]
+    terminal = next(event.data["payload"] for event in events if event.type == "run.completed")
+    assert terminal["session_context"]["state"] == "partial"
+    assert terminal["session_context"]["reason"] == "map_not_ready"
+    assert terminal["session_context"]["visited"] < terminal["session_context"]["eligible"]
+    async with factory() as session:
+        provenance = await session.get(SessionMessageProvenance, terminal["message_id"])
+        dep_ids = {ref["message_id"] for ref in provenance.dependencies}
+        assert "b-5" in dep_ids
+        assert "src-2" in set(provenance.source_ids)

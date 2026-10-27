@@ -97,22 +97,28 @@ async def candidate(case, *, web_enabled):
             cold = time.monotonic()
             if case["group"] == "normal":
                 template = INDEX_TEMPLATES.get(case["id"])
-                result["index_template_reused"] = template is not None
+                result["index_template_reused"] = bool(template and template.get("state") == "ready")
                 if template is not None:
                     session.add(SessionContextIndex(**copy.deepcopy(template)))
                     await session.commit()
+                if template is not None and template.get("state") == "ready":
                     result["cold_index_work_units"] = 0
+                    result["index_state"] = "ready"
                 else:
                     encoder = await asyncio.to_thread(configured_encoder)
                     work = BudgetState(BudgetLimits(12288, 4096, 1, 12288, 32000000, time.monotonic() + 180))
-                    async with asyncio.timeout(180):
-                        await sync_index(session, scope=scope, encoder=encoder, budget=work)
-                    result["cold_index_work_units"] = work.index_units
-                    row = await session.scalar(select(SessionContextIndex))
-                    INDEX_TEMPLATES[case["id"]] = {
-                        attribute.key: copy.deepcopy(getattr(row, attribute.key))
-                        for attribute in row.__mapper__.column_attrs
-                    }
+                    try:
+                        async with asyncio.timeout(180):
+                            await sync_index(session, scope=scope, encoder=encoder, budget=work)
+                    finally:
+                        result["cold_index_work_units"] = work.index_units
+                        row = await session.scalar(select(SessionContextIndex))
+                        if row is not None:
+                            result["index_state"] = row.state
+                            INDEX_TEMPLATES[case["id"]] = {
+                                attribute.key: copy.deepcopy(getattr(row, attribute.key))
+                                for attribute in row.__mapper__.column_attrs
+                            }
             result["cold_index_ms"] = round((time.monotonic() - cold) * 1000, 2)
             warm = time.monotonic()
             plan = await agent_domain.prepare_ask(
@@ -156,70 +162,108 @@ async def candidate(case, *, web_enabled):
     return result
 
 
-async def run(args):
-    cases = [case for case in baseline.load_cases() if case["split"] == args.split]
-    if args.case:
-        cases = [case for case in cases if case["id"] in args.case]
+REQUIRED_MANIFEST_KEYS = (
+    "split",
+    "case_ids",
+    "variants",
+    "source_sha256",
+    "corpus_sha256",
+    "scope",
+    "caps",
+    "config",
+    "provider_extra_body_sha256",
+    "models",
+    "dependency_versions",
+)
+
+
+def build_runtime_manifest(args, cases):
     root = baseline.API_ROOT
     paths = sorted((root / "sag_api/services/session_context").glob("*.py")) + [
         root / "sag_api/services/agent_domain.py",
         root / "sag_api/services/agent_service.py",
-        Path(__file__),
+        root / "sag_api/generation/llm.py",
+        root / "sag_api/generation/prompt.py",
+        root / "sag_api/services/eval/session_context_accounting.py",
+        root / "scripts/eval_session_context.py",
+        Path(__file__).resolve(),
     ]
-    manifest = {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+    manifest = {
+        path.resolve().relative_to(root.resolve()).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in paths
+    }
+    variants = ["legacy", "runtime"] if getattr(args, "variants", "both") == "both" else [args.variants]
+    return {
+        "split": args.split,
+        "case_ids": [case["id"] for case in cases],
+        "variants": variants,
+        "source_sha256": manifest,
+        "corpus_sha256": hashlib.sha256(baseline.CORPUS.read_bytes()).hexdigest(),
+        "scope": "synthetic trusted provenance; source-free; cold index separate; actual runtime/SDK",
+        "caps": {"calls": args.max_calls, "seconds": args.max_seconds, "tokens": args.max_tokens},
+        "config": {
+            key: getattr(settings, key)
+            for key in (
+                "llm_provider",
+                "llm_model",
+                "llm_context_window",
+                "llm_max_tokens",
+                "llm_max_retries",
+                "llm_timeout_ms",
+                "llm_temperature",
+                "agent_max_steps",
+                "history_load_limit",
+                "history_keep_recent",
+            )
+        },
+        "provider_extra_body_sha256": hashlib.sha256(
+            json.dumps(settings.llm_extra_body, sort_keys=True).encode()
+        ).hexdigest(),
+        "models": {"encoder": list(ENCODER), "ner": list(NER), "tokenizer": list(model.TOKENIZER)},
+        "dependency_versions": {
+            name: importlib.metadata.version(name)
+            for name in (
+                "openai",
+                "httpx",
+                "litellm",
+                "sqlalchemy",
+                "transformers",
+                "torch",
+                "sentence-transformers",
+            )
+        },
+    }
+
+
+def validate_runtime_resume(report, expected):
+    if not isinstance(report, dict) or not isinstance(report.get("results"), list):
+        raise ValueError("resume report is malformed; use a new output path")
+    for key in REQUIRED_MANIFEST_KEYS:
+        if key not in report or report[key] != expected[key]:
+            raise ValueError(f"resume manifest mismatch on {key}; use a new output path")
+
+
+async def run(args):
+    cases = [case for case in baseline.load_cases() if case["split"] == args.split]
+    if args.case:
+        requested = list(args.case)
+        by_id = {case["id"]: case for case in cases}
+        cases = [by_id[cid] for cid in requested if cid in by_id]
+    expected = build_runtime_manifest(args, cases)
     output = Path(args.output)
     if output.exists():
         report = json.loads(output.read_text(encoding="utf-8"))
-        if report["source_sha256"] != manifest or report["split"] != args.split:
-            raise ValueError("resume source/split mismatch; use a new output path")
+        validate_runtime_resume(report, expected)
     else:
-        report = {
-            "split": args.split,
-            "source_sha256": manifest,
-            "corpus_sha256": hashlib.sha256(baseline.CORPUS.read_bytes()).hexdigest(),
-            "results": [],
-            "scope": "synthetic trusted provenance; source-free; cold index separate; actual runtime/SDK",
-            "caps": {"calls": args.max_calls, "seconds": args.max_seconds, "tokens": args.max_tokens},
-            "config": {
-                key: getattr(settings, key)
-                for key in (
-                    "llm_provider",
-                    "llm_model",
-                    "llm_context_window",
-                    "llm_max_tokens",
-                    "llm_max_retries",
-                    "llm_timeout_ms",
-                    "llm_temperature",
-                    "agent_max_steps",
-                    "history_load_limit",
-                    "history_keep_recent",
-                )
-            },
-            "provider_extra_body_sha256": hashlib.sha256(
-                json.dumps(settings.llm_extra_body, sort_keys=True).encode()
-            ).hexdigest(),
-            "models": {"encoder": ENCODER, "ner": NER, "tokenizer": model.TOKENIZER},
-            "dependency_versions": {
-                name: importlib.metadata.version(name)
-                for name in (
-                    "openai",
-                    "httpx",
-                    "litellm",
-                    "sqlalchemy",
-                    "transformers",
-                    "torch",
-                    "sentence-transformers",
-                )
-            },
-        }
+        report = {**expected, "results": []}
     output.parent.mkdir(parents=True, exist_ok=True)
     previous = report.get("experiment_accounting", {})
     ledger = CallLedger(max_calls=args.max_calls, max_seconds=args.max_seconds, max_estimated_tokens=args.max_tokens)
     started = time.monotonic()
     spent = report.get("elapsed_seconds", 0)
     ledger.deadline = started + max(0, args.max_seconds - spent)
-    ledger.calls = previous.get("calls", [])
-    ledger.reserved_tokens = report.get("reserved_tokens", 0)
+    ledger.calls = list(previous.get("calls", []))
+    ledger.reserved_tokens = max(int(report.get("reserved_tokens", 0)), int(previous.get("reserved_tokens", 0)))
     counter = model.ModelTokenCounter(settings.llm_model, template_kwargs={"enable_thinking": False})
     original = model.session_completion
 

@@ -158,3 +158,28 @@ async def test_http_ask_rejects_unverified_or_different_project_token(session_ht
                                  headers={"authorization": "Bearer " + token})
     assert response.status_code == status and not requests
     assert response.headers["content-type"].startswith("application/json")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "query,context_mode",
+    [(QUERY, "full_session"), ("Liệt kê tất cả quyết định từ đầu cuộc chat.", None)],
+)
+async def test_http_rejects_full_session_with_source_filter_before_persisting_or_calling_provider(
+    session_http, query, context_mode
+):
+    from sqlalchemy import func, select
+
+    client, factory, requests = session_http
+    async with factory() as session:
+        before_count = await session.scalar(select(func.count()).select_from(Message))
+    payload = {"query": query, "source_ids": ["source"], "web_enabled": False}
+    if context_mode is not None:
+        payload["context_mode"] = context_mode
+    response = await client.post(PATH, json=payload)
+    assert response.status_code == 422 and not requests
+    body = response.json()
+    assert body["error"]["code"] == "session_context_source_filter_unsupported"
+    async with factory() as session:
+        after_count = await session.scalar(select(func.count()).select_from(Message))
+    assert after_count == before_count

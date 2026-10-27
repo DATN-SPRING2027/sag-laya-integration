@@ -11,7 +11,7 @@ from threading import Lock
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sag_api.core.errors import ServiceUnavailableError
+from sag_api.core.errors import ServiceUnavailableError, ValidationError
 from sag_api.db.models import (
     Message,
     SessionContextIndex,
@@ -86,6 +86,7 @@ class SessionContext:
     budget_profile: str = "memory"
     tool_source_ids: set[str] = field(default_factory=set, repr=False)
     dispatched_evidence: dict[str, ResolvedEvidence] = field(default_factory=dict, repr=False)
+    request_evidence: tuple[ResolvedEvidence, ...] = field(default=(), repr=False)
 
     def enable_tool_budget(self, max_steps):
         require(self.budget.calls == 0, "late_budget_profile")
@@ -96,8 +97,14 @@ class SessionContext:
             )
             self.budget_profile = "tool_assisted"
 
-    def note_dispatch(self):
-        self.dispatched_evidence.update((item.span.evidence_id, item) for item in self.resolved)
+    def stage_request(self, evidence):
+        self.request_evidence = tuple(evidence)
+
+    def note_dispatch(self, evidence=None):
+        items = self.request_evidence if evidence is None else tuple(evidence)
+        if not items and self.selection.mode != "full_session":
+            items = self.resolved
+        self.dispatched_evidence.update((item.span.evidence_id, item) for item in items)
 
     def messages(self, agent, query):
         if self.selection.mode == "full_session":
@@ -130,6 +137,7 @@ class SessionContext:
             self.selection = replace(
                 self.selection, spans=tuple(item.span for item in kept), state="partial", reason="prompt_budget"
             )
+        self.request_evidence = kept
         return fitted
 
     @property
@@ -205,6 +213,12 @@ class SessionContext:
                 await session.execute(
                     select(Thread).where(Thread.id == self.scope.key.thread_id).with_for_update(read=True)
                 )
+                if self.indexed.index_id:
+                    await session.execute(
+                        select(SessionContextIndex)
+                        .where(SessionContextIndex.id == self.indexed.index_id)
+                        .with_for_update(read=True)
+                    )
                 lease_evidence = self.original if self.selection.mode == "full_session" else self.resolved
                 ids = sorted(
                     {ref.message_id for item in lease_evidence for ref in item.dependency_refs}
@@ -219,12 +233,6 @@ class SessionContext:
                         select(SessionMessageProvenance)
                         .where(SessionMessageProvenance.message_id.in_(batch))
                         .order_by(SessionMessageProvenance.message_id)
-                        .with_for_update(read=True)
-                    )
-                if self.indexed.index_id:
-                    await session.execute(
-                        select(SessionContextIndex)
-                        .where(SessionContextIndex.id == self.indexed.index_id)
                         .with_for_update(read=True)
                     )
                 await self.lock_sources(
@@ -291,6 +299,11 @@ async def prepare_context(
 
     require(mode in {"normal", "full_session"}, "session_mode")
     full = mode == "full_session"
+    if full and requested_source_ids:
+        raise ValidationError(
+            "Chế độ tổng hợp toàn phiên chưa hỗ trợ lọc theo @Source.",
+            code="session_context_source_filter_unsupported",
+        )
     deadline = min(
         deadline if deadline is not None else float("inf"),
         time.monotonic() + min(360 if full else 60, max(0, principal.expires_at - time.time())),

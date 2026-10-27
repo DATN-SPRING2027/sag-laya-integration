@@ -689,6 +689,22 @@ async def prepare_ask(
         }.get(ext, "image/png")
         resolved.append({"id": aid, "media_type": media_type, "path": path})
 
+    mode = None
+    if settings.session_context_mode != "off":
+        from sag_api.services.session_context.runtime import select_mode
+
+        mode = select_mode(query, context_mode)
+        if settings.session_context_mode == "on":
+            if resolved:
+                raise ValidationError(
+                    "Context session hiện chỉ hỗ trợ câu hỏi văn bản.", code="session_context_text_only"
+                )
+            if mode == "full_session" and source_ids:
+                raise ValidationError(
+                    "Chế độ tổng hợp toàn phiên chưa hỗ trợ lọc theo @Source.",
+                    code="session_context_source_filter_unsupported",
+                )
+
     user_msg = Message(
         thread_id=thread.id,
         role=MessageRole.USER,
@@ -702,7 +718,7 @@ async def prepare_ask(
     await session.commit()
     await session.refresh(user_msg)
 
-    if settings.session_context_mode != "off" and not resolved:
+    if settings.session_context_mode != "off" and not resolved and not (mode == "full_session" and source_ids):
         from sag_api.services.session_context.budget import BudgetExceeded
         from sag_api.services.session_context.runtime import prepare_context, select_mode
         from sag_api.services.session_context.types import SessionKey, require

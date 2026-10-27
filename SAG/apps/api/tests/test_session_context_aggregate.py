@@ -278,3 +278,27 @@ async def test_reference_only_protocol_never_repairs_explicit_invalid_reduce_quo
     assert model.reduce_items
     assert all(support["quote"] != "invalid raw quote" for support in result.supports)
     assert result.reason == "synthesis_not_ready"
+
+
+@pytest.mark.asyncio
+async def test_fallback_on_failed_reduce_uses_verified_quotes_not_untrusted_map_absence_text(storage_db):
+    factory, scope = storage_db
+    context = await full_context(factory, scope)
+
+    class HallucinatedMapTextModel(SemanticModel):
+        async def complete(self, messages, **kwargs):
+            raw_out = await super().complete(messages, **kwargs)
+            prefix, _ = messages[-2]["content"].split("\n", 1)
+            if prefix == "SESSION_EVIDENCE_JSON":
+                data = json.loads(raw_out)
+                if data["items"]:
+                    data["items"][0]["text"] = "UNVERIFIED_GLOBAL_ABSENCE: Không có quyết định nào trong toàn phiên."
+                return json.dumps(data)
+            return "invalid-reduce-json"
+
+    model = HallucinatedMapTextModel(context, reference_only_map=True)
+    result = await aggregate_session(context, model, QUERY, input_limit=1500)
+    assert_visible_partial(result)
+    assert result.reason == "synthesis_not_ready"
+    assert "UNVERIFIED_GLOBAL_ABSENCE" not in result.answer
+    assert "DECISION D-0" in result.answer

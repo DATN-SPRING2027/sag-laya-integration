@@ -131,7 +131,8 @@ class LocalFeatureEncoder:
                             tuple(sorted(mentions, key=lambda e: (e.start, e.end, e.label))))
 
     def featurize_many(self, texts: tuple[str, ...], *, batch_size: int,
-                       budget: BudgetState, deduplicate: bool = False) -> tuple[TextFeatures, ...]:
+                       budget: BudgetState, deduplicate: bool = False,
+                       chunk_cache: dict | None = None) -> tuple[TextFeatures, ...]:
         """Bounded inference batches over raw chunks, with optional per-call reuse.
 
         Calls count physical batch invocations; token counts sum unpadded inputs.
@@ -152,6 +153,8 @@ class LocalFeatureEncoder:
         requests = [chunk for _, _, chunk in chunks]
         if deduplicate:
             requests = list(dict.fromkeys(requests))
+            if chunk_cache is not None:
+                requests = [chunk for chunk in requests if chunk not in chunk_cache]
         encoded_results, detected_results = [], []
         for offset in range(0, len(requests), batch_size):
             budget.consume_index_units(batch_size)
@@ -173,7 +176,14 @@ class LocalFeatureEncoder:
             for vector, entities in zip(encoded, detected, strict=True):
                 encoded_results.append(tuple(float(v) for v in vector))
                 detected_results.append(observed_mentions(entities))
-        request_indices = {text: i for i, text in enumerate(requests)} if deduplicate else {}
+        if deduplicate and chunk_cache is not None:
+            for text, vector, entities in zip(requests, encoded_results, detected_results, strict=True):
+                chunk_cache[text] = (vector, entities)
+            request_indices = {text: i for i, text in enumerate(chunk_cache)}
+            encoded_results = [chunk_cache[text][0] for text in chunk_cache]
+            detected_results = [chunk_cache[text][1] for text in chunk_cache]
+        else:
+            request_indices = {text: i for i, text in enumerate(requests)} if deduplicate else {}
         for position, (index, start, text) in enumerate(chunks):
             result_index = request_indices[text] if deduplicate else position
             budget.consume_index_units(dimension + len(detected_results[result_index]))

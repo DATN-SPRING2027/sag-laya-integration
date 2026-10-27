@@ -169,3 +169,42 @@ async def test_native_migration_rollback_preserves_raw_chat_and_reapply(native_p
             assert await session.get(Message, "fact") is not None
     finally:
         await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_native_lease_and_delete_message_acquisition_race_never_deadlocks(native_pg, monkeypatch):
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from sag_api.core.config import settings
+    from sag_api.services.agent_domain import delete_message
+
+    factory, scope, context = native_pg
+    monkeypatch.setattr(settings, "session_context_mode", "on")
+    midpoint = asyncio.Event()
+    execute = AsyncSession.execute
+
+    async def instrumented(session, statement, *args, **kwargs):
+        result = await execute(session, statement, *args, **kwargs)
+        rendered = str(statement)
+        if session is context.lease_session and "FROM session_context_indexes" in rendered and "FOR " in rendered:
+            midpoint.set()
+            await asyncio.sleep(0.05)
+        return result
+
+    monkeypatch.setattr(AsyncSession, "execute", instrumented)
+
+    async def reader():
+        async with context.lease(factory, principal(scope)):
+            await context.revalidate(context.lease_session, principal(scope))
+
+    async def writer():
+        await midpoint.wait()
+        async with factory() as session:
+            await delete_message(session, "agent", "thread", "fact", owner_key="owner")
+
+    outcomes = await asyncio.wait_for(asyncio.gather(reader(), writer(), return_exceptions=True), timeout=10)
+    assert all(not isinstance(outcome, BaseException) for outcome in outcomes), outcomes
+    async with factory() as session:
+        assert await session.get(Message, "fact") is None
+        with pytest.raises(ContextContractError):
+            await context.revalidate(session, principal(scope))

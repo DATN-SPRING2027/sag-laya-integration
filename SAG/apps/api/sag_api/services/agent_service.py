@@ -29,6 +29,7 @@ from sag_agent import (
 from sag_agent import (
     ToolResult as RuntimeToolResult,
 )
+from sag_api.core.errors import ValidationError
 from sag_api.core.principal_assertion import VerifiedPrincipal
 from sag_api.enums import MessageStatus
 from sag_api.generation import LLMClient, build_prompt_preview
@@ -719,6 +720,13 @@ async def _generate_stream(
     partial_answer: list[str] = []  # Chỉ giữ nội dung khi lỗi/hủy và không bị ràng buộc bằng chứng cục bộ.
     handle = None
     terminal = False
+    if memory is not None and memory.selection.mode == "full_session" and (
+        plan.source_ids or memory.scope.requested_source_ids
+    ):
+        raise ValidationError(
+            "Chế độ tổng hợp toàn phiên chưa hỗ trợ lọc theo @Source.",
+            code="session_context_source_filter_unsupported",
+        )
 
     async with session_factory() as session:
         sources = [] if memory is not None and memory.selection.mode == "full_session" else await resolve_sources(
@@ -751,6 +759,7 @@ async def _generate_stream(
             host_tools.extend(mcp_bundle.tools)
             if memory is not None and memory.selection.mode == "full_session":
                 host_tools = []
+                names = []
             tools = tuple(_adapt_tool(tool, host_context, citations, memory=memory, principal=principal)
                           for tool in host_tools)
             if memory is not None and memory.selection.mode == "normal" and (
@@ -770,7 +779,7 @@ async def _generate_stream(
                     f"Một số công cụ đã gắn không khả dụng trong lượt này: {unavailable}. Nếu tác vụ hiện tại cần các năng lực đó, "
                     "phải nói rõ hiện chưa thể xác minh; không dùng kiến thức ghi nhớ của mô hình thay cho dữ kiện thời gian thực hoặc bên ngoài."
                 )
-            if knowledge_only:
+            if not (memory is not None and memory.selection.mode == "full_session") and knowledge_only:
                 offline_rule = (
                     "Kết nối Internet đã tắt trong lượt này; chỉ được dùng kho tri thức cục bộ đã gắn và các công cụ hệ thống cần thiết. "
                     "Không gọi hoặc tuyên bố đã sử dụng trang web, MCP hay nguồn tìm kiếm bên ngoài khác. Việc tắt Internet không có nghĩa là lượt nào cũng phải tìm kiếm; "
@@ -784,7 +793,7 @@ async def _generate_stream(
                         "nếu câu hỏi cần nguồn bên ngoài hoặc tài liệu trong kho tri thức, hãy nói rõ hiện không có căn cứ phù hợp."
                     )
                 scene_notes.append(offline_rule)
-            elif WebSearchTool.configured():
+            elif not (memory is not None and memory.selection.mode == "full_session") and WebSearchTool.configured():
                 scene_notes.append(
                     "Kết nối Internet đã bật trong lượt này. Nếu câu trả lời phụ thuộc vào dữ kiện thời gian thực, mới nhất hoặc bên ngoài, bắt buộc gọi web_search để lấy bằng chứng trên web "
                     "và giữ liên kết nguồn Markdown có thể nhấp gần kết luận; search_context chỉ dùng cho kho tri thức cục bộ của người dùng, không dùng thay cho tìm kiếm Internet. "
@@ -1036,7 +1045,7 @@ async def _generate_stream(
                         and not has_internal_claim
                         and (local_evidence_required or not has_external_claim)
                         and not (memory is not None and memory_supports
-                                 and (not plan.source_ids or memory.selection.mode == "full_session"))
+                                 and not plan.source_ids and not memory.scope.requested_source_ids)
                     ):
                         canonical_answer = "UNKNOWN" if memory is not None else empty_response or no_answer_text()
                         if memory is not None and memory.selection.mode == "full_session" \
@@ -1166,14 +1175,26 @@ async def generate_stream(
     from sag_api.services.session_context.model import BudgetedLLM
 
     context = plan.session_context
+    if context.selection.mode == "full_session" and (plan.source_ids or context.scope.requested_source_ids):
+        raise ValidationError(
+            "Chế độ tổng hợp toàn phiên chưa hỗ trợ lọc theo @Source.",
+            code="session_context_source_filter_unsupported",
+        )
     async with context.lease(session_factory, principal) as lease_session:
 
         async def validate():
             await context.revalidate(lease_session, principal)
             await context.lock_sources(context.tool_source_ids, principal)
-            context.note_dispatch()
 
-        bounded = BudgetedLLM(llm._settings, budget=context.budget, counter=context.counter, before_dispatch=validate)
+
+
+        bounded = BudgetedLLM(
+            llm._settings,
+            budget=context.budget,
+            counter=context.counter,
+            before_dispatch=validate,
+            on_dispatch=context.note_dispatch,
+        )
         context.active_model = bounded
         provider = bounded
         if context.selection.mode == "full_session":
