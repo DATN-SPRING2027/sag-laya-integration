@@ -171,24 +171,31 @@ async def test_native_migration_rollback_preserves_raw_chat_and_reapply(native_p
         await driver.close()
 
 
-@pytest.mark.asyncio
-async def test_native_lease_and_delete_message_acquisition_race_never_deadlocks(native_pg, monkeypatch):
+async def assert_lease_and_delete_message_race_at_message_lock_boundary(native_pg, monkeypatch):
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from sag_api.core.config import settings
     from sag_api.services.agent_domain import delete_message
+    from sag_api.services.session_context.budget import BudgetLimits, BudgetState
+    from sag_api.services.session_context.index import sync_index
 
     factory, scope, context = native_pg
     monkeypatch.setattr(settings, "session_context_mode", "on")
-    midpoint = asyncio.Event()
+    paused, writer_started, continue_reader = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    writer_pids = []
     execute = AsyncSession.execute
 
     async def instrumented(session, statement, *args, **kwargs):
         result = await execute(session, statement, *args, **kwargs)
         rendered = str(statement)
-        if session is context.lease_session and "FROM session_context_indexes" in rendered and "FOR " in rendered:
-            midpoint.set()
-            await asyncio.sleep(0.05)
+        if (
+            session is context.lease_session
+            and "FROM messages" in rendered
+            and "FOR " in rendered
+            and not paused.is_set()
+        ):
+            paused.set()
+            await continue_reader.wait()
         return result
 
     monkeypatch.setattr(AsyncSession, "execute", instrumented)
@@ -198,13 +205,50 @@ async def test_native_lease_and_delete_message_acquisition_race_never_deadlocks(
             await context.revalidate(context.lease_session, principal(scope))
 
     async def writer():
-        await midpoint.wait()
+        await paused.wait()
         async with factory() as session:
+            writer_pids.append(await session.scalar(text("SELECT pg_backend_pid()")))
+            writer_started.set()
             await delete_message(session, "agent", "thread", "fact", owner_key="owner")
 
-    outcomes = await asyncio.wait_for(asyncio.gather(reader(), writer(), return_exceptions=True), timeout=10)
-    assert all(not isinstance(outcome, BaseException) for outcome in outcomes), outcomes
+    tasks = [asyncio.create_task(reader()), asyncio.create_task(writer())]
+    try:
+        await asyncio.wait_for(writer_started.wait(), timeout=5)
+        async with factory() as observer:
+            async with asyncio.timeout(5):
+                while not await observer.scalar(
+                    text("SELECT cardinality(pg_blocking_pids(:pid)) > 0"), {"pid": writer_pids[0]}
+                ):
+                    assert not tasks[1].done(), "delete_message must be observed in a PostgreSQL row-lock wait"
+                    await asyncio.sleep(0.01)
+        continue_reader.set()
+        outcomes = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=8)
+        details = [
+            {"type": type(item).__name__, "sqlstate": getattr(getattr(item, "orig", None), "sqlstate", None)}
+            for item in outcomes
+            if isinstance(item, BaseException)
+        ]
+        assert not details, f"Concurrent lease and delete_message failed or deadlocked: {details}"
+    finally:
+        continue_reader.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
     async with factory() as session:
         assert await session.get(Message, "fact") is None
+        index_row = await session.get(SessionContextIndex, context.indexed.index_id)
+        assert index_row is not None and index_row.state == "stale" and index_row.features == {}
         with pytest.raises(ContextContractError):
             await context.revalidate(session, principal(scope))
+        rebuilt_budget = BudgetState(BudgetLimits(12288, 4096, 1, 12288, 100000, time.monotonic() + 30))
+        rebuilt = await sync_index(session, scope=scope, encoder=Encoder(), budget=rebuilt_budget)
+        assert all(m.message_id != "fact" for m in rebuilt.history.messages)
+        refreshed_index = await session.get(SessionContextIndex, context.indexed.index_id)
+        assert "fact" not in (refreshed_index.features or {})
+
+
+@pytest.mark.asyncio
+async def test_native_lease_and_delete_message_acquisition_race_never_deadlocks(native_pg, monkeypatch):
+    await assert_lease_and_delete_message_race_at_message_lock_boundary(native_pg, monkeypatch)

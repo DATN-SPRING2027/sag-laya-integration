@@ -167,12 +167,12 @@ Kiểm tra gói bàn giao: Ruff cho ba scripts PASS; audit xác nhận16source h
 
 ## Cập nhật sau khi sửa lỗi trên PR #40 (27/10/2026)
 
-- Đã sửa dứt điểm **F1**, **F4**, **F5**, **F6** và phần lỗi deterministic orchestration/fallback + cold-index reuse của **F2/F3** trên nhánh `feat/Thang-session-context-runtime-be-api`.
+- Đã sửa dứt điểm **F1**, **F4**, **F5**, **F6** (bao gồm vòng follow-up khóa `provider_route_sha256` ở `schema_version: 2`, reject thiếu/hỏng accounting khi resume và chặn chạy tiếp khi đã chạm ngưỡng budget), bỏ `try ... except TypeError` gây retry ngầm trong `index._encode` kèm cô lập `chunk_cache` theo `(model_id, text)`, nâng cấp bài kiểm tra PostgreSQL lock race tại boundary `Message` lock (`FROM messages ... FOR SHARE` + `pg_blocking_pids`), và xử lý phần lỗi deterministic orchestration/fallback + cold-index reuse của **F2/F3** trên nhánh `feat/Thang-session-context-runtime-be-api`.
 - File `reproduction_cases.py` đã được cập nhật để kiểm chứng đầy đủ các invariant sau sửa:
-  - Offline (`run_repros.py`): **3 passed, 1 skipped**.
-  - Native PostgreSQL 16.15 disposable container (`run_repros.py --native-pg`): **4 passed** (bao gồm bài kiểm tra đua khóa `_lease` vs `delete_message` với 0 deadlock `40P01`).
-  - Full offline pytest suite (`pytest -q -m "not ai_smoke"`): **309 passed, 6 skipped, 2 deselected**.
+  - Offline (`run_repros.py`): **4 passed, 1 skipped**.
+  - Native PostgreSQL 16.15 disposable container (`run_repros.py --native-pg`): **5 passed** (bao gồm bài kiểm tra đua khóa `_lease` vs `delete_message` tại boundary `Message` lock với `pg_blocking_pids`, chứng minh 0 deadlock `40P01` trên code mới và bắt được `SQLSTATE 40P01` khi nạp `_lease` cũ `9c243af` trong bộ nhớ).
+  - Full offline pytest suite (`pytest -q -m "not ai_smoke"`): **311 passed, 6 skipped, 2 deselected**.
   - Native PostgreSQL suite (`pytest tests/test_session_context_postgres.py -q`): **6 passed**.
-- Các artifacts `t9-calibration-runtime-v4.json`, `t9-holdout-runtime-v4.json` và semantic reviews được giữ nguyên không sửa đổi. `SAG_SESSION_CONTEXT_MODE` giữ nguyên `off`.
+- Các artifacts lịch sử `t9-calibration-runtime-v4.json`, `t9-holdout-runtime-v4.json` và semantic reviews được giữ nguyên không sửa đổi. `SAG_SESSION_CONTEXT_MODE` giữ nguyên `off`.
 - **Merge readiness (code/contract/safety)**: **READY FOR REVIEW / MERGE** (với `SAG_SESSION_CONTEXT_MODE=off` và quy trình chạy migration `0007` trước khi khởi động binary mới trên PostgreSQL).
 - **Rollout readiness (`SAG_SESSION_CONTEXT_MODE=on`)**: **NO-GO** cho tới khi có đợt đánh giá live provider mới trên tập validation độc lập chứng minh đạt các ngưỡng chất lượng của `CALIBRATION-POLICY.json`.

@@ -412,3 +412,81 @@ Tiếp tục trên nhánh `feat/Thang-session-context-runtime-be-api` từ head 
     - `run_repros.py --native-pg`: **4 passed in 13.90s** (0 deadlock `40P01`).
   - Targeted `ruff check` và `git diff --check`: **PASS (0 lỗi)**.
   - Giữ nguyên `SAG_SESSION_CONTEXT_MODE=off` và toàn bộ calibration/holdout evidence artifacts lịch sử không đổi. Rollout vẫn **NO-GO** cho tới khi chạy đánh giá live provider mới trên tập validation độc lập.
+
+## Vòng sửa tiếp theo sau audit độc lập trên `ecc27ce` (27/10/2026) — Kế hoạch và Test Matrix
+
+Tiếp tục trên nhánh `feat/Thang-session-context-runtime-be-api` từ local head `ecc27ce439f84b77f95acf7a1b4e2014336ef7ce` (remote head `9c243af9182886387b808b2f6df5786f9ad0439a`, base `origin/main` `77722700fa8ed83112bff6640213b12d0235c11c`). Giữ nguyên F1, F4 production lock order và F5 đã được xác nhận đúng; chỉ xử lý 4 lỗ hổng còn lại từ `.data/temp/pr40-fix-review/test_fix_audit.py`.
+
+### Kế hoạch sửa file-by-file
+
+1. **F6-A — Khóa resolved provider endpoint/route trong manifest (`SAG/apps/api/scripts/verify_session_runtime.py`)**:
+   - Bổ sung `sag_api/core/litellm_policy.py` và `sag_api/core/model_providers.py` vào danh sách source files được hash trong `build_runtime_manifest`.
+   - Thêm trường bắt buộc `provider_route_sha256` (và `schema_version: 2`) vào `REQUIRED_MANIFEST_KEYS` của `build_runtime_manifest`:
+     - Tính toán từ cấu hình thực tế mà transport (`LLMClient._create_completion` + `session_completion` + `apply_litellm_completion_policy`) sử dụng: `llm_provider`, `routed_llm_model`, `llm_model`, `effective_llm_temperature`, `llm_structured_output_mode`, `llm_base_url` đã chuẩn hóa qua `urlsplit` (loại bỏ/không bao giờ in plaintext `username`/`password`/`query`/`fragment` hay `llm_api_key`), cùng kết quả probe của `apply_litellm_completion_policy` cho cả legacy và session request (đã bỏ `api_base` khỏi bản lưu).
+     - Chỉ lưu SHA-256 digest (`provider_route_sha256`) trong manifest để đổi `llm_base_url` (ví dụ `provider-a` → `provider-b`) bị reject ngay lập tức trước mọi candidate/provider call, đồng thời không bao giờ lộ credentials/API keys/secret URLs trong report.
+     - Không silent-resume report cũ thiếu `schema_version` / `provider_route_sha256`; giữ nguyên các artifacts lịch sử `t9-*-runtime-v4.json`.
+
+2. **F6-B — Validate toàn vẹn accounting khi resume, cấm default zero (`SAG/apps/api/scripts/verify_session_runtime.py`)**:
+   - Trong `validate_runtime_resume(report, expected)`:
+     - Bắt buộc `report` khi resume phải có đủ `elapsed_seconds`, `reserved_tokens`, `experiment_accounting` (thiếu bất kỳ trường nào đều raise `ValueError` với thông báo rõ không thể resume an toàn, cần tạo experiment mới hoặc đối soát).
+     - Kiểm tra kiểu và giá trị:
+       - `elapsed_seconds`: `type(v) in (int, float)` (không chấp nhận `bool`), `math.isfinite(v)` và `v >= 0`.
+       - `reserved_tokens`: `type(v) is int and v >= 0`.
+       - `experiment_accounting`: `dict` có `"calls"` là `list`; mọi phần tử trong `calls` là `dict` hợp lệ (`status` thuộc `{"started", "completed", "failed", "cancelled"}`, `input_tokens`/`output_tokens` nếu có mặt phải là `None` hoặc `int >= 0`, các trường đếm `observed_deployment_attempts`, `observed_deployment_failures`, `estimated_input_tokens`, `configured_retries`, `usage_snapshots`, `cached_tokens`, `reasoning_tokens` đúng kiểu `int >= 0`, `duration_ms`/`ttft_ms` hữu hạn `>= 0`).
+       - Đối soát nhất quán: nếu `experiment_accounting` có các trường tổng hợp (`logical_calls`, `accounting_complete`, `input_tokens`, `output_tokens`, `known_input_tokens`, `known_output_tokens`) thì phải khớp hoàn toàn với kết quả tính lại từ `CallLedger.report(calls)` (đặc biệt: khi có call `input_tokens is None` hoặc `output_tokens is None` hoặc chưa `completed`, `accounting_complete` phải là `False` và `input_tokens`/`output_tokens` phải là `None`, không được diễn thành `0`).
+       - Nếu `calls` không rỗng và có `estimated_input_tokens`, `reserved_tokens` phải `> 0` và `>= sum(c.get("estimated_input_tokens", 0) * (1 + c.get("configured_retries", 0)) for c in calls)`.
+       - Đối soát với `report["results"]`: mỗi phần tử trong `results` phải là `dict` hợp lệ; nếu các dòng `results` có trường `accounting` (`dict`), tổng `logical_calls` của các dòng không được vượt quá `len(experiment_accounting["calls"])` (và nếu mọi dòng đều có `accounting` dict thì tổng `logical_calls` phải bằng đúng `len(experiment_accounting["calls"])`), nhưng vẫn cho phép report hợp lệ có `0` calls khi thực tế các lượt chạy không phát sinh LLM call (`logical_calls == 0`, `calls == []`, `reserved_tokens == 0`).
+   - Trong `run(args)`:
+     - Không dùng default `{}` / `[]` / `0` cho report resume.
+     - Kiểm tra cả 3 ngưỡng budget (`len(ledger.calls) >= args.max_calls or ledger.reserved_tokens >= args.max_tokens or spent >= args.max_seconds or time.monotonic() >= ledger.deadline`) trước khi gọi `candidate` hoặc `baseline.replay_case`; nếu budget đã cạn từ trước khi resume thì thoát ngay mà không chạy candidate/provider và không ghi đè làm giảm `elapsed_seconds`, `reserved_tokens`, `experiment_accounting`.
+
+3. **Encoder — Bỏ `try ... except TypeError` gây retry ngầm (`SAG/apps/api/sag_api/services/session_context/index.py`, `graph.py`, `tests/test_session_context_index.py`)**:
+   - Trong `index._encode`: xóa khối `try ... except TypeError:` và gọi trực tiếp `encoder.featurize_many(texts, batch_size=16, budget=budget, deduplicate=True, chunk_cache=chunk_cache)`.
+   - Trong `graph.LocalFeatureEncoder.featurize_many`: kiểm tra `require(chunk_cache is None or isinstance(chunk_cache, dict), "feature_chunk_cache")` và gắn key `(self.model_id, chunk)` cho `chunk_cache` để cô lập tuyệt đối theo model bên cạnh cô lập theo job/scope trong `sync_index`.
+   - Mọi `TypeError` phát sinh bên trong `featurize_many` propagate ngay sau đúng 1 lần gọi, không retry lần thứ 2.
+
+4. **PostgreSQL — Thay test yếu bằng regression bắt được deadlock của `_lease` cũ tại boundary `Message` lock (`SAG/apps/api/tests/test_session_context_postgres.py`, `SAG/docs/Thang_Task/session-context-zero-mem/reviews/2026-10-27-independent/reproduction_cases.py`)**:
+   - Viết helper dùng chung `assert_lease_and_delete_message_race_at_message_lock_boundary(native_pg, monkeypatch)` trong `tests/test_session_context_postgres.py` và gọi lại từ `reproduction_cases.py`:
+     1. Reader vào `context.lease(...)`, lấy khóa `Message` (`FROM messages ... FOR SHARE`) rồi pause tại `asyncio.Event` trước khi kết thúc `_lease`.
+     2. Writer (`delete_message`) bắt đầu sau khi reader đã giữ khóa `Message`, ghi `pg_backend_pid()` và thực thi `delete_message` (gồm `invalidate` → `UPDATE session_context_indexes` và `DELETE FROM messages`).
+     3. Observer session độc lập poll `SELECT cardinality(pg_blocking_pids(:pid)) > 0` cho tới khi xác nhận server PostgreSQL đã đưa writer vào trạng thái chờ khóa thực sự.
+     4. Cho phép reader tiếp tục (`continue_reader.set()`), hoàn tất `_lease` + `revalidate` và đóng lease.
+     5. Assert cả reader và writer hoàn tất không lỗi (không có `SQLSTATE 40P01`), sau khi writer commit thì `Message("fact")` đã bị xóa (`None`), `SessionContextIndex` ở trạng thái `"stale"` với `features == {}`, `context.revalidate` bị từ chối bằng `ContextContractError`, và chạy lại `sync_index` không phục hồi `"fact"`.
+     6. Khối `finally` giải phóng event, cancel và await mọi task còn chạy để đảm bảo cleanup sạch sẽ.
+   - Thực hiện mutation/control test với `_lease` cũ (`9c243af`) nạp trong bộ nhớ trên PostgreSQL 16.15 disposable container: xác nhận code mới PASS và code cũ FAIL với `40P01`.
+
+### Test Matrix dự kiến
+
+| Nhóm kiểm tra | Test case | Kỳ vọng |
+|---|---|---|
+| F6-A Endpoint freeze | Đổi `settings.llm_base_url` (`provider-a` → `provider-b`), giữ nguyên `llm_model`/caps | Raise `ValueError` trước mọi candidate/provider call; file report không bị ghi đè |
+| F6-A Endpoint secret safety | `llm_api_key` và `llm_base_url` chứa userinfo/query secret | Manifest chỉ lưu hash, không chứa bất kỳ chuỗi bí mật nào |
+| F6-B Accounting validation | Thiếu `experiment_accounting` / `reserved_tokens` / `elapsed_seconds`; `calls` sai kiểu; số âm; `NaN`/` Inf`; `input_tokens: None` nhưng ghi `0` hoặc `accounting_complete: True`; tổng `logical_calls` của `results` lệch `experiment_accounting` | Raise `ValueError` trước mọi candidate/provider call; file report không bị ghi đè |
+| F6-B Zero-call & Exhausted budget | Resume report có `0` calls hợp lệ (`calls=[]`, `logical_calls=0`, `reserved_tokens=0`); resume report đã chạm `max_calls`/`max_tokens`/`max_seconds` | Zero-call hợp lệ được resume tiếp; report đã cạn budget dừng ngay với 0 candidate call và giữ nguyên số liệu đã ghi |
+| Encoder `TypeError` | `featurize_many` ném `TypeError` nội bộ ở lần gọi đầu; `chunk_cache` reuse qua các slices và tách biệt giữa 2 jobs/scopes/models | `TypeError` propagate ngay với `calls == 1`; vectors/mentions/hashes khớp tuyệt đối; không chia sẻ cache xuyên job/scope/model |
+| Native PG lock race | Reader pause tại `FROM messages ... FOR SHARE`, writer `delete_message` bị `pg_blocking_pids` chặn rồi reader tiếp tục | Code mới (`ecc27ce`+): PASS (0 deadlock `40P01`, xóa sạch, không phục hồi dữ liệu xóa); Control `_lease` cũ (`9c243af`): FAIL (`SQLSTATE 40P01`) |
+
+### Kết quả thực thi và kiểm chứng vòng follow-up (2026-10-27)
+
+1. **Tái hiện lỗi trước khi sửa (RED)**:
+   - Chạy `run_repros.py` offline với các assertion mới trước khi sửa production code: **`2 failed, 2 passed, 1 skipped`** (`test_runtime_evaluation_resume_must_reject_changed_model_and_caps` fail vì `provider_route_sha256` chưa có mặt / endpoint đổi chưa bị chặn và accounting thiếu chưa bị reject; `test_encoder_internal_typeerror_must_not_be_retried` fail vì `calls == 2` do `except TypeError` retry).
+2. **Kiểm chứng sau khi sửa (GREEN + Control/Mutation)**:
+   - `pytest tests/test_session_context_index.py -q`: **`8 passed in 4.27s`**.
+   - `run_repros.py` (offline): **`4 passed, 1 skipped in 9.38s`**.
+   - Native PostgreSQL 16.15 disposable container:
+     - `pytest tests/test_session_context_postgres.py -q`: **`6 passed in 11.15s`**.
+     - `run_repros.py --native-pg`: **`5 passed in 13.32s`**.
+     - Mutation/control audit (`.data/temp/pr40-fix-review/test_fix_audit.py` chạy với `-c pyproject.toml`):
+       - `test_resume_rejects_provider_change_or_lost_accounting[base_url]`: **PASSED**
+       - `test_resume_rejects_provider_change_or_lost_accounting[missing_ledger]`: **PASSED**
+       - `test_encoder_internal_typeerror_is_not_retried`: **PASSED**
+       - `test_observed_writer_wait_at_message_lock_boundary[False]` (code mới): **PASSED** (`outcomes=['NoneType', 'NoneType']`, `sqlstates=[None, None]`)
+       - `test_observed_writer_wait_at_message_lock_boundary[True]` (control nạp `_lease` cũ `9c243af` trong bộ nhớ): **FAILED đúng kỳ vọng với `SQLSTATE 40P01`** (`outcomes=['NoneType', 'DBAPIError']`, `sqlstates=[None, '40P01']`)
+       - Regression `test_native_lease_and_delete_message_acquisition_race_never_deadlocks` khi chạy trên `_lease` cũ `9c243af` bắt được `AssertionError: Concurrent lease and delete_message failed or deadlocked: [{'type': 'DBAPIError', 'sqlstate': '40P01'}]`.
+   - Full offline pytest suite (`pytest -q -m "not ai_smoke"`): **`311 passed, 6 skipped, 2 deselected in 36.42s`**.
+   - `ruff check` trên toàn bộ các file chạm tới: **`All checks passed!`**.
+   - `git diff --check`: **`PASS`**.
+   - Disposable PostgreSQL containers đã được xóa sạch sau khi kiểm chứng.
+   - `SAG_SESSION_CONTEXT_MODE` giữ nguyên `off`.
+   - **Merge readiness (code/contract/safety)**: **READY FOR REVIEW / MERGE**.
+   - **Rollout readiness (`SAG_SESSION_CONTEXT_MODE=on`)**: **NO-GO** (chờ đợt đánh giá live provider mới trên tập validation độc lập).

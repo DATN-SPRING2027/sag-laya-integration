@@ -55,12 +55,9 @@ def _encode(encoder, texts, budget, chunk_cache=None):
     # Only weights are shared. Inputs/results stay inside one authorized job.
     with _INFERENCE_LOCK:
         budget.consume_index_units(0)
-        try:
-            return encoder.featurize_many(
-                texts, batch_size=16, budget=budget, deduplicate=True, chunk_cache=chunk_cache
-            )
-        except TypeError:
-            return encoder.featurize_many(texts, batch_size=16, budget=budget, deduplicate=True)
+        return encoder.featurize_many(
+            texts, batch_size=16, budget=budget, deduplicate=True, chunk_cache=chunk_cache
+        )
 
 
 async def sync_index(

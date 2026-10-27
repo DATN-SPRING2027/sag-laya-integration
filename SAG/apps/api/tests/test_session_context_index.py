@@ -183,3 +183,101 @@ async def test_invalid_cached_entity_offsets_are_rebuilt_before_ready_publicatio
         indexed.views(scope=scope, budget=work())
         row = (await session.scalars(select(SessionContextIndex))).one()
         assert row.features["a"]["mentions"] == [] and row.state == "ready"
+
+
+def test_encode_propagates_internal_typeerror_without_second_attempt():
+    from sag_api.services.session_context.index import _encode
+
+    class FailingTypeErrorEncoder:
+        model_id = "typeerror-model"
+        calls = 0
+
+        def featurize_many(self, texts, *, batch_size, budget, deduplicate=False, chunk_cache=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise TypeError("internal inference TypeError")
+            return ()
+
+    encoder = FailingTypeErrorEncoder()
+    with pytest.raises(TypeError, match="internal inference TypeError"):
+        _encode(encoder, ("alpha",), work(), chunk_cache={})
+    assert encoder.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_index_reuses_exact_chunks_across_slices_and_isolates_cache_across_jobs_and_models(storage_db):
+    from dataclasses import replace
+
+    from test_session_context_graph import stub_encoder
+
+    factory, scope = storage_db
+    async with factory() as session:
+        session.add_all([raw("m1", content="🙂abcDEF", ordinal=0), raw("m2", content="🙂abcXYZ", ordinal=1)])
+        await session.commit()
+
+    encoder = stub_encoder(4)
+    expected_m1 = encoder.featurize("🙂abcDEF", budget=work())
+    expected_m2 = encoder.featurize("🙂abcXYZ", budget=work())
+
+    def make_batch_stub(model_id="explicit-stub-model"):
+        inst = stub_encoder(4)
+        inst.model_id = model_id
+
+        class BatchEncoder(type(inst.encoder)):
+            @staticmethod
+            def encode(texts, **kwargs):
+                return [(1.0, 0.0) for _ in texts]
+
+        class BatchNer(type(inst.ner)):
+            def __call__(self, texts, **kwargs):
+                return [super(BatchNer, self).__call__(text) for text in texts]
+
+        inst.encoder, inst.ner = BatchEncoder(), BatchNer()
+        return inst
+
+    sliced_encoder = make_batch_stub()
+    seen_caches = []
+    orig_featurize_many = sliced_encoder.featurize_many
+
+    def tracked_featurize_many(texts, **kwargs):
+        seen_caches.append(id(kwargs.get("chunk_cache")))
+        return orig_featurize_many(texts, **kwargs)
+
+    sliced_encoder.featurize_many = tracked_featurize_many
+    async with factory() as session:
+        indexed = await sync_index(session, scope=scope, encoder=sliced_encoder, budget=work(), batch_size=1)
+    assert indexed.features == (expected_m1, expected_m2)
+    assert len(seen_caches) == 2 and seen_caches[0] == seen_caches[1]
+    assert sliced_encoder.encoder_calls == 2 and sliced_encoder.ner_calls == 2
+    assert sliced_encoder.encoder_tokens == 16 and sliced_encoder.ner_tokens == 16
+
+    other_model_encoder = make_batch_stub("other-stub-model")
+    other_caches = []
+    orig_other = other_model_encoder.featurize_many
+
+    def tracked_other(texts, **kwargs):
+        other_caches.append(id(kwargs.get("chunk_cache")))
+        return orig_other(texts, **kwargs)
+
+    other_model_encoder.featurize_many = tracked_other
+    async with factory() as session:
+        indexed_other = await sync_index(
+            session,
+            scope=replace(scope, source_ids=frozenset()),
+            encoder=other_model_encoder,
+            budget=work(),
+            batch_size=1,
+        )
+    assert len(other_caches) == 2 and other_caches[0] == other_caches[1]
+    assert other_caches[0] != seen_caches[0]
+    assert other_model_encoder.encoder_calls == 2
+    assert other_model_encoder.encoder_tokens == 16
+    assert all(f.model_id == "other-stub-model" for f in indexed_other.features)
+
+    # Even if a caller passes the same dict across two different model_ids, entries are keyed by model_id.
+    shared_dict = {}
+    model_a = make_batch_stub("model-a")
+    model_b = make_batch_stub("model-b")
+    model_a.featurize_many(("🙂abcDEF",), batch_size=2, budget=work(), deduplicate=True, chunk_cache=shared_dict)
+    model_b.featurize_many(("🙂abcDEF",), batch_size=2, budget=work(), deduplicate=True, chunk_cache=shared_dict)
+    assert model_a.encoder_calls == 1 and model_b.encoder_calls == 1

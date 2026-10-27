@@ -142,6 +142,7 @@ class LocalFeatureEncoder:
         require(isinstance(texts, tuple) and all(isinstance(text, str) for text in texts), "feature_texts")
         require(type(batch_size) is int and 1 <= batch_size <= 32, "feature_batch")
         require(type(deduplicate) is bool, "feature_deduplicate")
+        require(chunk_cache is None or isinstance(chunk_cache, dict), "feature_chunk_cache")
         chunks = []
         for index, text in enumerate(texts):
             budget.consume_index_units(1 + len(text))
@@ -154,7 +155,7 @@ class LocalFeatureEncoder:
         if deduplicate:
             requests = list(dict.fromkeys(requests))
             if chunk_cache is not None:
-                requests = [chunk for chunk in requests if chunk not in chunk_cache]
+                requests = [chunk for chunk in requests if (self.model_id, chunk) not in chunk_cache]
         encoded_results, detected_results = [], []
         for offset in range(0, len(requests), batch_size):
             budget.consume_index_units(batch_size)
@@ -178,17 +179,19 @@ class LocalFeatureEncoder:
                 detected_results.append(observed_mentions(entities))
         if deduplicate and chunk_cache is not None:
             for text, vector, entities in zip(requests, encoded_results, detected_results, strict=True):
-                chunk_cache[text] = (vector, entities)
-            request_indices = {text: i for i, text in enumerate(chunk_cache)}
-            encoded_results = [chunk_cache[text][0] for text in chunk_cache]
-            detected_results = [chunk_cache[text][1] for text in chunk_cache]
+                chunk_cache[(self.model_id, text)] = (vector, entities)
+            request_indices = {}
         else:
             request_indices = {text: i for i, text in enumerate(requests)} if deduplicate else {}
         for position, (index, start, text) in enumerate(chunks):
-            result_index = request_indices[text] if deduplicate else position
-            budget.consume_index_units(dimension + len(detected_results[result_index]))
-            vectors[index].append(encoded_results[result_index])
-            for entity in detected_results[result_index]:
+            if deduplicate and chunk_cache is not None:
+                vector, entities = chunk_cache[(self.model_id, text)]
+            else:
+                result_index = request_indices[text] if deduplicate else position
+                vector, entities = encoded_results[result_index], detected_results[result_index]
+            budget.consume_index_units(dimension + len(entities))
+            vectors[index].append(vector)
+            for entity in entities:
                 mentions[index].add(EntityMention(start + entity.start, start + entity.end, entity.label))
         result = []
         for text, parts, entities in zip(texts, vectors, mentions, strict=True):

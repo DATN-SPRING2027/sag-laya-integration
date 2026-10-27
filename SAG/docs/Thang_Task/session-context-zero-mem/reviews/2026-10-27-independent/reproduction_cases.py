@@ -1,6 +1,5 @@
 """Independent synthetic PR40 regressions. No app DB, env files or paid provider."""
 
-import asyncio
 import copy
 import json
 import os
@@ -9,7 +8,6 @@ from datetime import UTC, datetime
 import pytest
 import test_session_context_postgres as pg_fixtures
 import test_session_context_storage as storage_fixtures
-from sqlalchemy.ext.asyncio import AsyncSession
 from test_session_context_full_runtime import ProviderBoundary, full_plan, stream
 from test_session_context_runtime import Counter, principal
 from test_session_context_storage import raw
@@ -17,13 +15,12 @@ from test_session_context_storage import raw
 from sag_api.core.config import settings
 from sag_api.core.errors import ValidationError
 from sag_api.db.models import Message, SessionMessageProvenance, Source, SourceProjectMapping, Thread
-from sag_api.services.agent_domain import AskPlan, delete_message, persist_answer, prepare_ask
+from sag_api.services.agent_domain import AskPlan, persist_answer, prepare_ask
 from sag_api.services.session_context import model as model_module
 from sag_api.services.session_context.aggregate import aggregate_session
 from sag_api.services.session_context.budget import TokenUsage
 from sag_api.services.session_context.runtime import prepare_context
 from sag_api.services.session_context.storage import record_provenance
-from sag_api.services.session_context.types import ContextContractError
 
 storage_db = storage_fixtures.storage_db
 native_pg = pg_fixtures.native_pg
@@ -178,42 +175,30 @@ async def test_every_dispatched_full_batch_must_be_in_answer_provenance(storage_
 @pytest.mark.asyncio
 @pytest.mark.skipif(os.environ.get("SESSION_CONTEXT_NATIVE_PG_QA") != "1", reason="explicit disposable PG QA only")
 async def test_lease_and_delete_must_not_take_index_and_message_in_opposite_order(native_pg, monkeypatch):
-    factory, scope, context = native_pg
-    monkeypatch.setattr(settings, "session_context_mode", "on")
-    midpoint, index_updated, release_lease = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    execute = AsyncSession.execute
+    await pg_fixtures.assert_lease_and_delete_message_race_at_message_lock_boundary(native_pg, monkeypatch)
 
-    async def instrumented(session, statement, *args, **kwargs):
-        result = await execute(session, statement, *args, **kwargs)
-        rendered = str(statement)
-        if session is context.lease_session and "FROM session_context_indexes" in rendered and "FOR " in rendered:
-            midpoint.set()
-            await asyncio.sleep(0.05)
-        if rendered.startswith("UPDATE session_context_indexes"):
-            index_updated.set()
-        return result
 
-    monkeypatch.setattr(AsyncSession, "execute", instrumented)
+def test_encoder_internal_typeerror_must_not_be_retried():
+    import time
 
-    async def reader():
-        async with context.lease(factory, principal(scope)):
-            release_lease.set()
+    from sag_api.services.session_context.budget import BudgetLimits, BudgetState
+    from sag_api.services.session_context.index import _encode
 
-    async def writer():
-        await midpoint.wait()
-        async with factory() as session:
-            await delete_message(session, "agent", "thread", "fact", owner_key="owner")
+    class FailingEncoder:
+        model_id = "typeerror-model"
+        calls = 0
 
-    outcomes = await asyncio.wait_for(asyncio.gather(reader(), writer(), return_exceptions=True), timeout=10)
-    labels = [
-        {"type": type(outcome).__name__, "sqlstate": getattr(getattr(outcome, "orig", None), "sqlstate", None)}
-        for outcome in outcomes
-    ]
-    assert all(not isinstance(outcome, BaseException) for outcome in outcomes), labels
-    async with factory() as session:
-        assert await session.get(Message, "fact") is None
-        with pytest.raises(ContextContractError):
-            await context.revalidate(session, principal(scope))
+        def featurize_many(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise TypeError("synthetic internal inference TypeError")
+            return ("second attempt accepted",)
+
+    encoder = FailingEncoder()
+    work = BudgetState(BudgetLimits(12288, 4096, 1, 12288, 10000, time.monotonic() + 30))
+    with pytest.raises(TypeError, match="synthetic internal inference TypeError"):
+        _encode(encoder, ("synthetic",), work, {})
+    assert encoder.calls == 1
 
 
 @pytest.mark.asyncio
@@ -225,11 +210,13 @@ async def test_runtime_evaluation_resume_must_reject_changed_model_and_caps(tmp_
     sys.path.insert(0, str(Path.cwd() / "scripts"))
     import verify_session_runtime as harness
 
+    monkeypatch.setattr(harness.settings, "llm_base_url", "https://provider-a.invalid/v1")
+    monkeypatch.setattr(harness.settings, "llm_api_key", "sk-secret-api-key-never-log-0123456789")
     monkeypatch.setattr(harness.model, "ModelTokenCounter", lambda *a, **k: Counter())
     calls = []
 
     async def fake_candidate(case, *, web_enabled):
-        calls.append((case["id"], web_enabled, harness.settings.llm_model))
+        calls.append((case["id"], web_enabled, harness.settings.llm_model, harness.settings.llm_base_url))
         return {
             "case_id": case["id"],
             "group": case["group"],
@@ -238,6 +225,14 @@ async def test_runtime_evaluation_resume_must_reject_changed_model_and_caps(tmp_
             "status": "run.completed",
             "answer": "UNKNOWN",
             "answer_status": "no_answer",
+            "accounting": {
+                "logical_calls": 0,
+                "accounting_complete": True,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "monetary_cost": None,
+                "calls": [],
+            },
         }
 
     monkeypatch.setattr(harness, "candidate", fake_candidate)
@@ -255,23 +250,67 @@ async def test_runtime_evaluation_resume_must_reject_changed_model_and_caps(tmp_
     await harness.run(base_args)
     assert len(calls) == 4
     calls.clear()
-    report = json.loads(output.read_text(encoding="utf-8"))
+    raw_report_text = output.read_text(encoding="utf-8")
+    assert "sk-secret-api-key-never-log-0123456789" not in raw_report_text
+
+    # Also verify URL userinfo/query secrets never leak into manifest text.
+    monkeypatch.setattr(
+        harness.settings,
+        "llm_base_url",
+        "https://user:url-secret-pass@provider-a.invalid/v1?api_key=query-secret-token",
+    )
+    secret_manifest_text = json.dumps(harness.build_runtime_manifest(base_args, []))
+    assert "url-secret-pass" not in secret_manifest_text
+    assert "query-secret-token" not in secret_manifest_text
+    assert "sk-secret-api-key-never-log-0123456789" not in secret_manifest_text
+    monkeypatch.setattr(harness.settings, "llm_base_url", "https://provider-a.invalid/v1")
+
+    report = json.loads(raw_report_text)
     report["results"].pop()
     report["elapsed_seconds"] = 12.5
     prior_call = {
+        "stage": "generation",
+        "stream": False,
         "status": "completed",
         "input_tokens": 10,
         "output_tokens": 5,
+        "cached_tokens": 0,
+        "reasoning_tokens": 0,
+        "usage_snapshots": 1,
         "observed_deployment_failures": 0,
         "observed_deployment_attempts": 1,
+        "configured_retries": 0,
+        "estimated_input_tokens": 10,
+        "duration_ms": 12.0,
+        "ttft_ms": None,
+    }
+    report["results"][0]["accounting"] = {
+        "logical_calls": 1,
+        "accounting_complete": True,
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "monetary_cost": None,
+        "calls": [
+            {
+                "status": "completed",
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "reserved_input_tokens": 10,
+                "configured_retries": 0,
+            }
+        ],
     }
     report["reserved_tokens"] = 321
-    report["experiment_accounting"] = {"calls": [prior_call]}
+    report["experiment_accounting"] = harness.CallLedger(
+        max_calls=50, max_seconds=600, max_estimated_tokens=100000
+    ).report([prior_call])
     frozen_bytes = json.dumps(report, indent=2, ensure_ascii=False)
     output.write_text(frozen_bytes, encoding="utf-8")
 
-    # 1. Changing model or caps must raise ValueError before any candidate call and without overwriting report.
+    # 1. Changing endpoint, model, caps, or corrupting/dropping accounting must raise ValueError
+    # before any candidate call and without overwriting report.
     bad_mutations = [
+        lambda r, a: monkeypatch.setattr(harness.settings, "llm_base_url", "https://provider-b.invalid/v1"),
         lambda r, a: setattr(a, "max_calls", 500),
         lambda r, a: setattr(a, "max_seconds", 10000),
         lambda r, a: setattr(a, "max_tokens", 999999),
@@ -283,19 +322,80 @@ async def test_runtime_evaluation_resume_must_reject_changed_model_and_caps(tmp_
         lambda r, a: r["models"].__setitem__("tokenizer", ["other", "rev"]),
         lambda r, a: r["dependency_versions"].__setitem__("openai", "0.0.0"),
         lambda r, a: r.pop("caps", None),
+        lambda r, a: r.pop("provider_route_sha256", None),
+        lambda r, a: r.pop("experiment_accounting", None),
+        lambda r, a: r.pop("reserved_tokens", None),
+        lambda r, a: r.pop("elapsed_seconds", None),
+        lambda r, a: r.__setitem__("reserved_tokens", -1),
+        lambda r, a: r.__setitem__("reserved_tokens", True),
+        lambda r, a: r.__setitem__("reserved_tokens", 0),
+        lambda r, a: r.__setitem__("elapsed_seconds", -0.5),
+        lambda r, a: r.__setitem__("elapsed_seconds", float("nan")),
+        lambda r, a: r.__setitem__("elapsed_seconds", float("inf")),
+        lambda r, a: r["experiment_accounting"].__setitem__("calls", "not-a-list"),
+        lambda r, a: r["experiment_accounting"].__setitem__("logical_calls", 99),
+        lambda r, a: r["experiment_accounting"]["calls"][0].__setitem__("input_tokens", -5),
+        lambda r, a: (
+            r["experiment_accounting"]["calls"][0].__setitem__("input_tokens", None),
+            r["experiment_accounting"].__setitem__("accounting_complete", True),
+        ),
+        lambda r, a: (
+            r["experiment_accounting"]["calls"][0].__setitem__("input_tokens", None),
+            r["experiment_accounting"].__setitem__("accounting_complete", False),
+            r["experiment_accounting"].__setitem__("input_tokens", 0),
+        ),
+        lambda r, a: (
+            r["experiment_accounting"].__setitem__("calls", []),
+            r["experiment_accounting"].__setitem__("logical_calls", 0),
+            r["experiment_accounting"].__setitem__("input_tokens", 0),
+            r["experiment_accounting"].__setitem__("output_tokens", 0),
+            r["experiment_accounting"].__setitem__("known_input_tokens", 0),
+            r["experiment_accounting"].__setitem__("known_output_tokens", 0),
+        ),
     ]
     for mutate in bad_mutations:
+        monkeypatch.setattr(harness.settings, "llm_base_url", "https://provider-a.invalid/v1")
         mutated_report = copy.deepcopy(report)
         mutated_args = copy.deepcopy(base_args)
         mutate(mutated_report, mutated_args)
-        output.write_text(json.dumps(mutated_report), encoding="utf-8")
+        output.write_text(json.dumps(mutated_report, allow_nan=True), encoding="utf-8")
         before_text = output.read_text(encoding="utf-8")
         with pytest.raises(ValueError):
             await harness.run(mutated_args)
         assert not calls, "Rejected resume must not invoke candidate/provider"
         assert output.read_text(encoding="utf-8") == before_text, "Rejected resume must not overwrite report"
+    monkeypatch.setattr(harness.settings, "llm_base_url", "https://provider-a.invalid/v1")
 
-    # 2. Valid resume with identical manifest runs only the missing row and preserves cumulative accounting.
+    # 2. Explicit zero-call report (where completed results genuinely made 0 LLM calls) is accepted on resume.
+    zero_call_report = copy.deepcopy(report)
+    zero_call_report["results"][0]["accounting"]["logical_calls"] = 0
+    zero_call_report["results"][0]["accounting"]["calls"] = []
+    zero_call_report["reserved_tokens"] = 0
+    zero_call_report["experiment_accounting"] = harness.CallLedger(
+        max_calls=50, max_seconds=600, max_estimated_tokens=100000
+    ).report([])
+    output.write_text(json.dumps(zero_call_report), encoding="utf-8")
+    await harness.run(base_args)
+    assert len(calls) == 1
+    calls.clear()
+
+    # 3. Exhausted budget on resume (calls, tokens, or seconds) must not launch new work or reset totals.
+    for exhausted_field, exhausted_value in (
+        ("reserved_tokens", 100000),
+        ("elapsed_seconds", 600.0),
+    ):
+        exhausted_report = copy.deepcopy(report)
+        exhausted_report[exhausted_field] = exhausted_value
+        output.write_text(json.dumps(exhausted_report), encoding="utf-8")
+        await harness.run(base_args)
+        assert not calls, f"Exhausted {exhausted_field} must not launch candidate work"
+        saved_exhausted = json.loads(output.read_text(encoding="utf-8"))
+        assert len(saved_exhausted["results"]) == 3
+        assert saved_exhausted["reserved_tokens"] == exhausted_report["reserved_tokens"]
+        assert saved_exhausted["elapsed_seconds"] >= exhausted_report["elapsed_seconds"]
+        assert saved_exhausted["experiment_accounting"]["calls"] == [prior_call]
+
+    # 4. Valid resume with identical manifest runs only the missing row and preserves cumulative accounting.
     output.write_text(frozen_bytes, encoding="utf-8")
     await harness.run(base_args)
     assert len(calls) == 1
