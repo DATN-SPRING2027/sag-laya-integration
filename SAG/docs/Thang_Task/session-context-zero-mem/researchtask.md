@@ -345,3 +345,10 @@ Finalcode-review nêu sleep0.2 khôngđủchứngminhwriterđãsubmitSQL. Đãth
 Finalopsreview phát hiệnexistingcore/db.pyinit_dbcreate_allunconditional. Modelsnewaggregatecanautocreate2tablesatstartup evenOFF; taskkhôngstartrealAPInewbinary. DocsPERSISTENCE/HANDOFF/PRbodyđãchỉrõmanual0007beforestartup vàOFFkhôngguardDDL. Khôngđổibootstraplegacyngoàiscope/khôngsửaproductionfrozencode.
 
 T9final:calibration24runtime36calls445159input1137output;holdout48paired67calls694252input4449outputaccountingcomplete2083.86s. Source/config/caps/models/dependenciesfrozenidentical. Holdoutreview22child+2parentafterchildusagelimit,16/24correct(normal16/20full0/4),4falseabsence0proposalpromotion. FullstrictsemanticFAIL; longnormalLLMtoken-73.81%/-77.99%4cases/profileincludingbadanswers,fullcostseparate. No-tunefromholdout,noresamplebadanswers. RawfinalsyntheticJSON+hashes/semanticreviews/NO-GOatVERIFICATION,evidence; noAPIkeys/rawrealchat. T9executioncomplete, productqualitynotachieved;OFF,nopush/merge/realDBmigration/backfill.
+
+
+### Consolidation PR38/39/40 theo yêu cầu trực tiếp của Thang
+
+Thang yêu cầu gộp cả ba PR thành một PR để tiếp tục sửa trên cùng nhánh, đóng hai PR còn lại và mô tả đầy đủ. Đây là ngoại lệ được người dùng cho phép cho quy trình tách PR DB/API trước đó. Fetch/inspect main và cả ba remote heads: PR38=5db4464, PR39=74971ba, PR40=df0c904. git merge-base --is-ancestor xác nhận cả38/39 là ancestors của40; diff schema/migrations39→40 bằng0. Không cần cherry-pick, rebase, merge thêm hoặc force-push; giữ toàn bộ commit history.
+
+Giữ PR40/nhánh feat/Thang-session-context-runtime-be-api, targetmain, draft/NO-GO/OFF. Chỉ cập nhật tài liệu PR-BODY/HANDOFF và ghi archive context cho DB PR body; production code/sourcehash/fixtures/gates không đổi. Publish mô tả hợp nhấtT1–T9 và đóng38/39 sau khi xác minh remote code đủ, khôngxóanhánh/mergePR/approve/deploy/migrate/backfill. Kiểm docs/diff/ancestry; không rerun paid/provider tests cho thay đổi chỉ docs. Các số test/holdout bên dưới là bằng chứng từ lần triển khai đã ghi, không giả thành lần chạy mới.

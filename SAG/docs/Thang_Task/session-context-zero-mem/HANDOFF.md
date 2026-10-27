@@ -1,30 +1,25 @@
-# Bàn giao implementation T5–T9
+# Bàn giao session context T1–T9 — PR hợp nhất
 
-Feature giữ `SAG_SESSION_CONTEXT_MODE=off`. Implementation và kết quả nghiệm thu là hai trạng thái riêng; quyết định gate cuối ở VERIFICATION.md/evidence/runtime-verification.summary.json. Không chạy migration/backfill dữ liệu thật, không push/merge/approve.
+**PR duy nhất: [#40](https://github.com/DATN-SPRING2027/sag-laya-integration/pull/40), target `main`, draft.** Theo yêu cầu trực tiếp của Thang, PR này thay thế #38 và #39, chứa cả DB/schema và API/runtime. Quyết định này thay cho hướng dẫn tách DB/API trước đó.
 
-## Repository và nhánh
+Giữ `SAG_SESSION_CONTEXT_MODE=off`: T9 đã đo xong nhưng quality gate FAIL. Xem VERIFICATION.md; không coi một PR là chấp thuận merge/deploy/bật feature. Chưa migrate/backfill dữ liệu thật.
 
-Chỉ `sag-laya-integration/SAG` thay đổi. Không sửa DATN_BE/DATN_FE hoặc ingestion/retrieval tài liệu.
-
-- DB riêng: `feat/Thang-session-context-schema-db`, commit `74971ba`, từ main `7772270`. Hai bảng dẫn xuất, migration0007/up/down, schema tests và DBaudit.
-- API: `feat/Thang-session-context-runtime-be-api`, có toàn bộ prerequisites T1–T4 + T6–T9 và merge prerequisite DB. Diff DB của API so với nhánh schema bằng0; sau DB được merge vào main, PR API tự loại các file schema chung.
-- PR38 hiện vẫn là nhánh reader T1–T3b tại5db4464, chưa nhận các commit local. API branch mới đã chứa các commits đó. Con người cần chọn merge PR38 trước hoặc đánh dấu nó bị thay thế bởi PR API mới để tránh duy trì hai diff trùng; agent không đổi/merge/force-push PR38.
-
-DB PR cần review/CI/merge trước API. Branch API mới tuân theo yêu cầu không reuse taskbranch cũ. Các nhánh persistence-db cũ chỉ là checkpoint local, nhánh schema-db mới là deliverable DB riêng.
-
-## Lệnh cho Thang
-
-Từ repo root sau khi kiểm tra báo cáo cuối:
+## Nhánh duy nhất để tiếp tục sửa
 
 ```powershell
-git push -u origin feat/Thang-session-context-schema-db
-gh pr create --base main --head feat/Thang-session-context-schema-db --title "feat(db): add derived session context metadata" --body-file SAG/docs/Thang_Task/session-context-zero-mem/db/PR-BODY.md
-# Sau khi DB đã được review/CI/merge, push nhánh API và tạo PR:
-git push -u origin feat/Thang-session-context-runtime-be-api
-gh pr create --base main --head feat/Thang-session-context-runtime-be-api --title "feat(sag): add bounded thread session context runtime" --body-file SAG/docs/Thang_Task/session-context-zero-mem/PR-BODY.md
+git fetch origin
+git switch feat/Thang-session-context-runtime-be-api
+git pull --ff-only origin feat/Thang-session-context-runtime-be-api
+# Sửa, kiểm chứng, commit rồi push vào cùng PR #40 theo ủy quyền của Thang.
 ```
 
-Nếu Thang muốn gộp vào PR38, cần chủ động chọn cách reconcile nhánh/DB prerequisite; không gửi schema chung vào PR cũ khi chưa tách review DB.
+Head #38 `5db4464` và #39 `74971ba` đều là ancestors của #40 trước hợp nhất `df0c904`; schema/migration39→40 có diff bằng0. Toàn bộ commit history được giữ, không cần cherry-pick/merge thêm hoặc force-push. Các nhánh reader/schema cũ chỉ giữ để tra cứu; không cần merge hai PR cũ và không tiếp tục phát triển ở đó.
+
+Chỉ `sag-laya-integration/SAG` thay đổi, không sửa DATN_BE/DATN_FE hay ingestion/retrieval tài liệu. Chỉ cập nhật docs khi hợp nhất, production source và hash của bản holdout không đổi. Mô tả đầy đủ T1–T9, tests, DB/config/security/risks/rollback ở PR-BODY.md.
+
+## Review và migration
+
+Một PR bao gồm hai nhóm cần reviewer kiểm rõ: schema/model/migration0007 và API/runtime/provenance/budget. Không còn dependency merge #39 trước, nhưng khi triển khai vẫn phải apply migration trước startup code mới. Human review/CI/merge vẫn bắt buộc.
 
 ## Tác động và rollback
 
