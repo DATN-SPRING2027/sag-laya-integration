@@ -18,6 +18,7 @@ from sag_api.services.session_context.runtime import (
     HIDDEN_SCOPE_PLACEHOLDER,
     invalidate_session_thread_cache,
     load_full_thread_messages_keyset,
+    log_session_audit_trace,
     prepare_session_context_for_ask,
 )
 from sag_api.services.session_context.substrate import (
@@ -43,5 +44,6 @@ __all__ = [
     "build_ecce_context_pack",
     "invalidate_session_thread_cache",
     "load_full_thread_messages_keyset",
+    "log_session_audit_trace",
     "prepare_session_context_for_ask",
 ]

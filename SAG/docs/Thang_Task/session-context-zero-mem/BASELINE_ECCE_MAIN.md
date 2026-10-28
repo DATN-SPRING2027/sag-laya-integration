@@ -11,12 +11,12 @@
 
 | Phiên bản | Cơ chế chính | Mean Recall | Số ca đạt 100% Gold | Tỷ lệ nhiễm quyết định cũ (`Stale Contamination`) | Tokens lịch sử TB / lượt | Mật độ bằng chứng (`Gold / 1k tokens`) | Số lần gọi LLM nén bộ nhớ | Độ trễ P50 / P95 (ms) |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| **`V0_legacy`** | Cơ chế hiện hữu trên `main` (`LIMIT 200` + cắt cứng `40%` / gọi LLM nén mỗi lượt) | `0.0000` | `0/12` | `0.0000` *(mù toàn bộ đoạn cũ)* | `556.8` | `0.00` | `12` *(1 call/lượt)* | `0.11 / 0.16` *(chưa gồm ~1.5–3.5s chờ LLM nén)* |
-| **`V1_hybrid`** | Keyset toàn phiên + Dense Vector + True BM25 Unicode tiếng Việt (`search_index_service`) | `0.8750` | `10/12` | `1.0000` (`3/3`) | `516.8` | `2.74` | `0` | `3.87 / 4.05` |
-| **`V2_graph_ppr`** | `+` `Zero-Mem` Sentence-Gated `Entity ↔ Sentence` + `igraph` PPR (`damping = 0.6`, `prpack`) | `0.9583` | `11/12` | `1.0000` (`3/3`) | `513.0` | `2.92` | `0` | `4.73 / 5.42` |
-| **`V3_dual_hierarchy`** | `+` Phân cấp 4 tầng `Thread → Drift Episode → 3-Turn Window → Turn` & hợp nhất động | `0.9583` | `11/12` | `1.0000` (`3/3`) | `525.9` | `2.85` | `0` | `7.93 / 8.57` |
-| **`V4_closure_temporal`** | `+` **ECCE** Bi-Temporal Decision Ledger (`SUPERSEDES`) & Đóng bao bằng chứng (`±1` kề + Lineage) | `1.0000` | `12/12` | `0.3333` (`1/3`) | `596.4` | `2.79` | `0` | `8.92 / 11.20` |
-| **`V5_ecce_full`** | `+` **ECCE** Submodular Lazy-Greedy Context Budget Optimizer + Self-Auditing Trace | **`1.0000`** | **`12/12`** | **`0.0000` (`0/3`)** | **`390.2`** | **`4.27`** | **`0`** | **`9.07 / 10.96`** |
+| **`V0_legacy`** | Cơ chế hiện hữu trên `main` (`LIMIT 200` + cắt cứng `40%` / gọi LLM nén mỗi lượt) | `0.0000` | `0/12` | `0.0000` *(mù toàn bộ đoạn cũ)* | `556.8` | `0.00` | `12` *(1 call/lượt)* | `0.22 / 0.38` *(chưa gồm ~1.5–3.5s chờ LLM nén)* |
+| **`V1_hybrid`** | Keyset toàn phiên + Dense Vector + Dynamic Corpus-Wide Okapi BM25 tiếng Việt (`term_postings`) | `0.8750` | `10/12` | `1.0000` (`3/3`) | `512.3` | `2.77` | `0` | `6.13 / 10.31` |
+| **`V2_graph_ppr`** | `+` `Zero-Mem` Sentence-Gated `Entity ↔ Sentence` + Ego-Subgraph `igraph` PPR (`damping = 0.6`, `prpack`) | `0.9583` | `11/12` | `1.0000` (`3/3`) | `517.6` | `2.90` | `0` | `6.21 / 7.51` |
+| **`V3_dual_hierarchy`** | `+` Phân cấp 4 tầng `Thread → Drift Episode → 3-Turn Window → Turn` & hợp nhất động | `0.9583` | `11/12` | `1.0000` (`3/3`) | `526.4` | `2.85` | `0` | `14.10 / 21.54` |
+| **`V4_closure_temporal`** | `+` **ECCE** Bi-Temporal Decision Ledger (`SUPERSEDES`) & Đóng bao bằng chứng (`±1` kề + Lineage) | `1.0000` | `12/12` | `0.3333` (`1/3`) | `596.2` | `2.80` | `0` | `11.53 / 20.07` |
+| **`V5_ecce_full`** | `+` **ECCE** Submodular Lazy-Greedy Context Budget Optimizer + Self-Auditing Trace | **`1.0000`** | **`12/12`** | **`0.0000` (`0/3`)** | **`390.2`** | **`4.27`** | **`0`** | **`16.55 / 28.78`** |
 
 ---
 

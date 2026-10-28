@@ -146,3 +146,39 @@
 - **Rủi ro còn lại & các bước tiếp theo:**
   - Chặng 1 lưu chỉ mục `IncrementalSessionIndex` trong RAM có LRU/TTL (tự dựng lại từ bảng `messages` chuẩn của PostgreSQL qua keyset pagination khi restart worker); Chặng 2 (`feat/Thang-ecce-session-schema-db`) và Chặng 3 (`feat/Thang-ecce-qdrant-persistence-be-api`) sẽ bổ sung lưu trữ bền vững bảng dẫn xuất PostgreSQL `0009_*.sql` và collection `session_units_{project_id}` trên Qdrant.
   - Sau khi có môi trường staging kết nối khóa SiliconFlow thật, chạy thêm vòng `shadow` replay với `Kev-4b` (`/systemone`) và `BAAI/bge-m3` live trước khi chuyển mặc định từ `off` sang `on`.
+
+
+---
+
+## 9. Thẩm Định & Khắc Phục Review PR #42 (`pullrequestreview-5678088744`)
+
+Đã kiểm chứng độc lập toàn bộ 5 nhận xét trong review PR #42 của `thanhtai040805` đối chiếu với mã nguồn thực tế:
+
+1. **Mục 1 (`[HIGH]` — Xung đột `requires_grounded_answer` & `_initial_tool_choice` khi `knowledge_only=True`) → ĐÚNG 100%:**
+   - Trong `sag_api/schemas/agent.py:101`, `AskRequest.web_enabled` mặc định là `False`, dẫn tới `knowledge_only=True` ở mọi lượt hỏi thông thường.
+   - Bổ sung `route_decision` và `session_citations` (kèm `cited_source_ids` bắc cầu) vào `AskPlan`.
+   - Trong `agent_service.py`: khi câu hỏi có `memory_scope in {"session_history", "full_session_audit"}`, `not scoped` và có bằng chứng lịch sử hợp lệ (`bool(plan.session_citations)`), `_initial_tool_choice` trả `"auto"` thay vì cưỡng bức `search_context`, đồng thời `_finalize_session_citations` xác thực các nhãn `[S1], [S2]` (loại bỏ `[S99]` bịa đặt) và cho phép vượt qua cổng `requires_grounded_answer` mà vẫn bảo toàn thu hồi quyền bắc cầu qua `_message_source_ids`.
+2. **Mục 2 (`[HIGH]` — Gọi trùng lặp 2 lần `SiliconFlow /systemone` & rơi telemetry `session_audit_trace` ở `shadow`) → ĐÚNG 100%:**
+   - Tái sử dụng `plan.route_decision` trực tiếp trong `_initial_tool_choice` để giảm từ 2 xuống **1 lần gọi `route_query` duy nhất** mỗi lượt hỏi.
+   - Ghi structured log và đẩy mục `{"kind": "session_context", ...}` vào `trace` (`Message.steps`) ở cả chế độ `shadow` và `on` (kèm `details={"scope": "knowledge", "sources": ...}` khi có nguồn tài liệu bắc cầu).
+3. **Mục 3 (`[MEDIUM]` — Phủ định tiếng Việt trước `_CONFIRMED_CUE_RE` & thay thế ngoài 7 Slot cố định) → ĐÚNG 100%:**
+   - Bổ sung kiểm tra phủ định theo mệnh đề (`_has_unnegated_confirmation`) chặn các phó từ `không / chưa / chẳng / đừng / chớ / khoan / tạm thời chưa / not / never` đứng trước động từ chốt, trong khi vẫn giữ đúng câu ghép 2 mệnh đề (*"Không dùng MongoDB nữa, chốt dùng PostgreSQL"*).
+   - Bổ sung `extract_superseded_entity_keys` bắt mẫu thay thế tường minh (*"bỏ A, chốt B"*, *"thay A bằng B"*, *"chuyển sang B thay cho A"*, *"instead of A"*) để đánh dấu `SUPERSEDED` chính xác ngay cả với thực thể ngoài 7 slot cố định và bất kể thứ tự nhắc thực thể.
+4. **Mục 4 (`[MEDIUM]` — Cấu hình `embedder` tường minh & Chuẩn hóa IDF động của BM25) → ĐÚNG 100%:**
+   - Thêm `session_context_embedding_mode: Literal["zero_cost_local", "configured_http"] = "zero_cost_local"` trong `config.py` và nối HTTP Embedder tương thích OpenAI/SiliconFlow qua `_SHARED_TEXT_EMBEDDING_CACHE` khi bật `"configured_http"`.
+   - Lưu `term_freqs` + chỉ mục đảo `term_postings` trong `IncrementalSessionIndex` để tính Robertson–Spärck Jones IDF động trên toàn bộ `len(self.turns)` tại thời điểm truy vấn, giúp điểm BM25 nhất quán 100% giữa lượt đầu và lượt cuối phiên với độ phức tạp $O(\sum_{t \in q} df(t))$.
+5. **Mục 5 (`[SCALABILITY]` — Đọc DB $O(\Delta)$ bằng cursor & Khoanh vùng Ego-Subgraph PPR) → ĐÚNG 100%:**
+   - Lưu cursor `(last_db_created_at, last_db_id)` và tập `seen_raw_ids` trong `IncrementalSessionIndex`: lượt hỏi kế tiếp chỉ query phần tin nhắn mới tăng thêm từ PostgreSQL sau khi đối chiếu nhanh `COUNT(id)` (phát hiện xóa tin nhắn giữa phiên) và kiểm tra quyền `get_authorized_source_ids` trên `cached_cited_source_ids`.
+   - Trong `score_graph_ppr_view`, khoanh vùng Ego-Subgraph có trần khi phiên vượt ngưỡng `400` lượt (chỉ dựng `ig.Graph` trên các lượt chứa thực thể kích hoạt + Top-`256` ứng viên hybrid + lân cận `±1` cùng `Episode`).
+
+
+### Kết Quả Thực Thi & Kiểm Chứng Sau Khắc Phục Review PR #42
+- **Tập tin cập nhật trong bản sửa PR #42:**
+  - `SAG/.env.example`, `SAG/apps/api/sag_api/core/config.py`
+  - `SAG/apps/api/sag_api/services/agent_domain.py`, `SAG/apps/api/sag_api/services/agent_service.py`
+  - `SAG/apps/api/sag_api/services/session_context/__init__.py`, `models.py`, `extractor.py`, `substrate.py`, `optimizer.py`, `runtime.py`
+  - `SAG/apps/api/tests/test_ecce_session_context.py`, `SAG/docs/Thang_Task/session-context-zero-mem/BASELINE_ECCE_MAIN.md`, `SAG/docs/Thang_Task/session-context-zero-mem/researchtask.md`
+- **Kết quả kiểm thử & chất lượng mã nguồn:**
+  - `.\.venv\Scripts\python.exe -m ruff check sag_api/core/config.py sag_api/services/decision_router.py sag_api/api/v1/decision.py sag_api/services/session_context tests/test_ecce_session_context.py tests/eval_ecce_baseline tests/test_ecce_ablation_benchmark.py` → **`All checks passed!`**
+  - `.\.venv\Scripts\python.exe -m ruff check --ignore E501 sag_api/services/agent_service.py sag_api/services/agent_domain.py` → **`All checks passed!`** (mọi dòng thêm/sửa mới đều `<= 120` ký tự).
+  - `.\.venv\Scripts\python.exe -m pytest tests -q` → **`98 passed, 1 skipped in 34.67s`** (bổ sung 3 bài test hồi quy mới trong `test_ecce_session_context.py` kiểm chứng toàn bộ 5 mục review PR #42: `knowledge_only=True` session grounding + `[S99]` stripping + empty-thread blocking, `1` lần gọi `route_query`, lưu `Message.steps` ở cả `shadow` và `on`, thu hồi quyền ACL bắc cầu xuyên lượt, đọc DB tăng dần $O(\Delta)$ bằng cursor, chắn phủ định tiếng Việt + chuỗi thay thế ngoài slot `React → Vue → Svelte`, IDF động BM25 + cấu hình `session_context_embedding_mode`, và Ego-Subgraph PPR `<= 400` lượt).

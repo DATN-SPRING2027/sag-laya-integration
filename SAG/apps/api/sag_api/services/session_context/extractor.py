@@ -45,6 +45,7 @@ _TECH_ANCHOR_RE = re.compile(
     r"redis(?:\s+streams|\s+cache)?|kafka|rabbitmq|celery|bullmq|nats|"
     r"qdrant|milvus|pgvector|pinecone|weaviate|faiss|elasticsearch|opensearch|"
     r"siliconflow|kev-4b|bge-m3|hipporag|leiden|mineru|fastapi|next\.?js|nestjs|prisma|sqlalchemy|"
+    r"react(?:\.js|js)?|vue(?:\.js|js)?|angular|svelte|redux|zustand|tailwind|"
     r"docker|kubernetes|k8s|keycloak|oauth2?|jwt|sso|"
     r"(?:adr|rfc|pr|issue|task|bug|err)[-_ #]?\d+|"
     r"[a-z_][a-z0-9_]{2,}_[a-z0-9_]+|"
@@ -59,24 +60,46 @@ _CANONICAL_TECH_SYNONYMS: dict[str, str] = {
     "mongo": "mongodb",
     "k8s": "kubernetes",
     "nextjs": "next.js",
+    "reactjs": "react",
+    "react.js": "react",
+    "vuejs": "vue",
+    "vue.js": "vue",
 }
+
+_CLAUSE_SPLIT_RE = re.compile(
+    r"[,;:\n]|(?i:\b(?:nhưng|mà|tuy\s+nhiên|thay\s+vào\s+đó|ngược\s+lại|however|but|instead)\b)"
+)
+_PRE_CONFIRM_GUARD_RE = re.compile(
+    r"(?i)\b(?:"
+    r"không|chưa|chẳng|chả|đừng|chớ|khoan|tạm\s+thời\s+chưa|chưa\s+hề|"
+    r"đang\s+cân\s+nhắc|cân\s+nhắc|phân\s+vân|thử|đề\s+xuất|gợi\s+ý|dự\s+kiến|có\s+thể|hay\s+là|"
+    r"not|never|don't|do\s+not|didn't|did\s+not|haven't|hasn't|cannot|can't|considering|might|propose"
+    r")\b"
+)
+_POST_CONFIRM_NEG_RE = re.compile(
+    r"(?i)^\s*(?:không|chưa|bỏ|hủy|loại\s+bỏ|ngừng|từ\s+bỏ|not|never|drop|reject)\b"
+)
 
 _CONFIRMED_CUE_RE = re.compile(
     r"(?i)\b(?:"
     r"chốt(?:\s+dùng|\s+chọn|\s+phương\s+án|\s+lấy|\s+giao|\s+nhé|\s+luôn)?|"
     r"quyết\s+định\s+(?:chọn|dùng|lấy|giữ|chuyển\s+sang|quay\s+lại)|"
     r"thống\s+nhất|"
-    r"chuyển\s+(?:[\wÀ-ỹ]+\s+){0,4}sang\s+dùng|"
+    r"chuyển\s+(?:[\wÀ-ỹ]+\s+){0,4}sang\s+(?:dùng\s+)?|"
+    r"đổi\s+(?:[\wÀ-ỹ]+\s+){0,3}từ\s+[\wÀ-ỹ0-9._-]+\s+sang\b|"
+    r"thay\s+[\wÀ-ỹ0-9._-]+\s+bằng\b|"
     r"đồng\s+ý\s+(?:chọn|dùng|phương\s+án|hướng|với)|"
     r"quay\s+lại\s+dùng|chuyển\s+hẳn\s+sang|vẫn\s+(?:giữ|dùng)\s+(?:nguyên\s+)?|"
     r"đã\s+duyệt|nhận\s+phụ\s+trách|sẽ\s+phụ\s+trách|đảm\s+nhiệm\s+phần|"
-    r"finalized|decided\s+to\s+use|agreed\s+(?:on|to\s+use)|we\s+chose|reverted\s+back\s+to"
+    r"finalized|decided\s+to\s+use|agreed\s+(?:on|to\s+use)|we\s+chose|reverted\s+back\s+to|"
+    r"switched\s+to|replaced\s+[\w0-9._-]+\s+with"
     r")\b"
 )
 _CONSIDERING_CUE_RE = re.compile(
     r"(?i)\b(?:"
     r"đang\s+cân\s+nhắc|cân\s+nhắc\s+(?:thêm|dùng|giữa)|đang\s+nghiêng\s+về|"
-    r"phân\s+vân|chưa\s+chốt|tạm\s+thời\s+nghĩ|considering|evaluating|leaning\s+toward"
+    r"phân\s+vân|chưa\s+chốt|chưa\s+thống\s+nhất|chưa\s+quyết\s+định|tạm\s+thời\s+nghĩ|"
+    r"considering|evaluating|leaning\s+toward|not\s+finalized"
     r")\b"
 )
 _PROPOSED_CUE_RE = re.compile(
@@ -89,6 +112,7 @@ _PROPOSED_CUE_RE = re.compile(
 _NEGATED_CUE_RE = re.compile(
     r"(?i)\b(?:"
     r"bỏ\s+phương\s+án|loại\s+bỏ|không\s+(?:dùng|chọn|lấy)\b.*\bnữa|"
+    r"không\s+(?:thống\s+nhất|đồng\s+ý|chốt|duyệt)|bác\s+bỏ|"
     r"hủy\s+phương\s+án|từ\s+bỏ|dropped|rejected|ruled\s+out|do\s+not\s+use\s+anymore"
     r")\b"
 )
@@ -105,6 +129,18 @@ _ANAPHORIC_SHORT_RE = re.compile(
     r"đồng\s+ý\s+(?:nhé|vậy\s+nhé|luôn)|chốt\s+vậy\s+nhé|theo\s+ý\s+trên|"
     r"option\s+\d+|that\s+option|as\s+proposed\s+above|agreed\s+on\s+that"
     r")\b"
+)
+
+_EXPLICIT_REPLACED_SPAN_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?i)\b(?:thay\s+cho|thay\s+vì|thay\s+thế(?:\s+cho)?|instead\s+of|rather\s+than)\s+([^,.;:\n]{1,48})"),
+    re.compile(r"(?i)\b(?:thay|replace(?:d)?)\s+([^,.;:\n]{1,40}?)\s+(?:bằng|with)\b"),
+    re.compile(
+        r"(?i)\b(?:chuyển|đổi|migrate|switch(?:ed)?)\s+(?:[\wÀ-ỹ]+\s+){0,3}?từ\s+([^,.;:\n]{1,40}?)\s+(?:sang|qua|to)\b"
+    ),
+    re.compile(r"(?i)\bkhông\s+(?:dùng|chọn|lấy|xài)\s+([^,.;:\n]{1,40}?)\s+nữa\b"),
+    re.compile(
+        r"(?i)\b(?:bỏ(?:\s+phương\s+án|\s+hướng)?|loại\s+bỏ|hủy(?:\s+phương\s+án)?|từ\s+bỏ|dropped)\s+([^,.;:\n]{1,44})"
+    ),
 )
 
 _SLOT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -294,6 +330,32 @@ def extract_turn_entities_and_sentences(
     return list(mentions_by_key.values()), sentence_items
 
 
+def extract_superseded_entity_keys(
+    text: str,
+    mentions: Sequence[EntityMention],
+) -> tuple[str, ...]:
+    """Identify entity keys explicitly dropped/replaced in a turn (e.g., 'Chuyển sang Vue thay cho React')."""
+    normalized = normalize_session_text(text)
+    if not normalized or not mentions:
+        return ()
+
+    replaced_keys: list[str] = []
+    seen: set[str] = set()
+    for pattern in _EXPLICIT_REPLACED_SPAN_PATTERNS:
+        for match in pattern.finditer(normalized):
+            span_lower = match.group(1).casefold()
+            for mention in mentions:
+                cand_surfaces = {mention.surface.casefold(), mention.key.removeprefix("entity:")}
+                if any(
+                    surf and re.search(rf"(?<!\w){re.escape(surf)}(?!\w)", span_lower)
+                    for surf in cand_surfaces
+                ):
+                    if mention.key not in seen:
+                        seen.add(mention.key)
+                        replaced_keys.append(mention.key)
+    return tuple(replaced_keys)
+
+
 def infer_topic_slot(text: str) -> str | None:
     """Infer canonical topic slot key for decision superseding & conflict tracking."""
     normalized = normalize_session_text(text)
@@ -327,6 +389,23 @@ def is_interrogative_turn(text: str) -> bool:
     )
 
 
+def _has_unnegated_confirmation(normalized: str) -> bool:
+    """Return True iff at least one clause contains an affirmative confirmation unblocked by negation/tentative cues."""
+    for clause in _CLAUSE_SPLIT_RE.split(normalized):
+        clause_clean = clause.strip()
+        if not clause_clean:
+            continue
+        for match in _CONFIRMED_CUE_RE.finditer(clause_clean):
+            prefix_window = clause_clean[max(0, match.start() - 36) : match.start()]
+            if _PRE_CONFIRM_GUARD_RE.search(prefix_window):
+                continue
+            suffix_window = clause_clean[match.end() : match.end() + 28]
+            if _POST_CONFIRM_NEG_RE.search(suffix_window):
+                continue
+            return True
+    return False
+
+
 def classify_epistemic_state(
     text: str,
     *,
@@ -345,8 +424,9 @@ def classify_epistemic_state(
     if is_interrogative_turn(normalized):
         return "FACT", slot_key, is_anaphoric
 
-    # Order matters: a sentence that drops A AND confirms B ("bỏ Mongo, chốt Postgres") is CONFIRMED on the slot!
-    if _CONFIRMED_CUE_RE.search(normalized):
+    # Order matters: a sentence that drops A AND confirms B ("bỏ Mongo, chốt Postgres") is CONFIRMED on the slot,
+    # Negated confirmations ("chưa chốt dùng Mongo", "không thống nhất") are blocked by _has_unnegated_confirmation.
+    if _has_unnegated_confirmation(normalized):
         return "CONFIRMED", slot_key, is_anaphoric
     if _NEGATED_CUE_RE.search(normalized):
         return "NEGATED", slot_key, is_anaphoric

@@ -1,7 +1,7 @@
 """Incremental Multi-View Token-Free Memory Substrate for SAG-ECCE.
 
 Reuses `SAG main` infrastructure:
-- `search_index_service`: `compute_sparse_bm25_vector`, `compute_unit_embeddings`,
+- `search_index_service`: `COMMON_STOPWORDS`, `compute_sparse_bm25_vector`, `compute_unit_embeddings`,
   `get_cached_text_embedding`, `put_cached_text_embedding`
 - `generation.prompt`: `estimate_tokens`
 - `igraph`: C-accelerated `personalized_pagerank(..., damping=0.6, implementation="prpack")`
@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 import math
 import re
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
@@ -21,6 +21,7 @@ import igraph as ig
 
 from sag_api.generation.prompt import estimate_tokens
 from sag_api.services.search_index_service import (
+    COMMON_STOPWORDS,
     compute_sparse_bm25_vector,
     compute_unit_embeddings,
     get_cached_text_embedding,
@@ -29,6 +30,7 @@ from sag_api.services.search_index_service import (
 from sag_api.services.session_context.extractor import (
     classify_epistemic_state,
     extract_content_terms,
+    extract_superseded_entity_keys,
     extract_turn_entities_and_sentences,
     normalize_session_text,
 )
@@ -50,6 +52,10 @@ SOFT_ALIAS_WEIGHT = 0.65
 SENTENCE_GATE_TOP_K = 3
 SENTENCE_GATE_MIN_COS = 0.12
 PPR_DAMPING = 0.60
+PPR_MAX_SUBGRAPH_TURNS = 400
+PPR_TOP_HYBRID_SEEDS = 220
+BM25_K1 = 1.5
+BM25_B = 0.75
 
 
 def l2_normalize(vec: Sequence[float]) -> tuple[float, ...]:
@@ -88,6 +94,21 @@ def deterministic_ngram_vector(text: str, dim: int = FALLBACK_VECTOR_DIM) -> tup
         sign = 1.0 if ((val >> 32) & 1) == 0 else -1.0
         acc[idx] += sign * weight
     return l2_normalize(acc)
+
+
+def tokenize_bm25_terms(text: str) -> tuple[dict[str, int], int]:
+    """Tokenize text identically to search_index_service.compute_sparse_bm25_vector for dynamic corpus IDF."""
+    cleaned_text = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", normalize_session_text(text).lower())
+    tokens = re.findall(r"\w+", cleaned_text)
+    if not tokens:
+        return {}, 1
+    expanded_tokens: list[str] = list(tokens)
+    for tok in tokens:
+        if tok.isalnum() and not tok.isalpha() and not tok.isdigit() and len(tok) >= 3:
+            for sub in re.findall(r"[a-z]+|\d{2,}", tok):
+                if len(sub) >= 2:
+                    expanded_tokens.append(sub)
+    return dict(Counter(expanded_tokens)), max(1, len(tokens))
 
 
 async def embed_texts_with_main_cache(
@@ -177,7 +198,14 @@ class IncrementalSessionIndex:
         self.entity_surfaces: dict[str, str] = {}
         self.soft_alias_neighbors: dict[str, set[str]] = {}
         self.doc_freqs: dict[str, int] = {}
+        self.term_postings: dict[str, list[tuple[str, int]]] = {}
         self.total_token_words: int = 0
+        # Incremental PostgreSQL cursor & Continuum ACL cache state (O(Delta) DB read)
+        self.last_db_created_at: Any = None
+        self.last_db_id: str | None = None
+        self.seen_db_count: int = 0
+        self.cached_cited_source_ids: set[str] = set()
+        self.had_hidden_acl_turns: bool = False
 
     @property
     def active_decisions(self) -> list[DecisionLedgerEntry]:
@@ -277,9 +305,10 @@ class IncrementalSessionIndex:
             )
 
             content_terms = frozenset(extract_content_terms(content))
-            for term in content_terms:
-                self.doc_freqs[term] = self.doc_freqs.get(term, 0) + 1
-            word_len = max(1, len(re.findall(r"\w+", content.casefold())))
+            term_freqs, word_len = tokenize_bm25_terms(content)
+            for word, tf in term_freqs.items():
+                self.doc_freqs[word] = self.doc_freqs.get(word, 0) + 1
+                self.term_postings.setdefault(word, []).append((t_id, tf))
             self.total_token_words += word_len
             avg_len = self.total_token_words / max(1, ordinal + 1)
 
@@ -290,6 +319,7 @@ class IncrementalSessionIndex:
                 total_corpus_docs=max(50, ordinal + 1),
             )
             epistemic_status, slot_key, is_anaphoric = classify_epistemic_state(content, role=role)
+            superseded_ent_keys = extract_superseded_entity_keys(content, mentions)
 
             episode = self._assign_or_open_episode(
                 turn_id=t_id,
@@ -314,6 +344,8 @@ class IncrementalSessionIndex:
             window_node = self._append_sliding_window(episode, t_id)
             content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
             cited_sources = tuple(sorted(str(s) for s in (msg.get("cited_source_ids") or ()) if s))
+            if cited_sources:
+                self.cached_cited_source_ids.update(cited_sources)
 
             turn_obj = IndexedTurn(
                 turn_id=t_id,
@@ -332,8 +364,11 @@ class IncrementalSessionIndex:
                 content_terms=content_terms,
                 entities=tuple(mentions),
                 sentences=indexed_sentences,
+                term_freqs=term_freqs,
+                doc_word_len=word_len,
                 epistemic_status=epistemic_status,
                 topic_slot_key=slot_key,
+                superseded_entity_keys=superseded_ent_keys,
                 is_anaphoric_or_short=is_anaphoric,
                 cited_source_ids=cited_sources,
             )
@@ -465,16 +500,37 @@ class IncrementalSessionIndex:
     ) -> None:
         if turn.epistemic_status == "FACT" and turn.topic_slot_key is None:
             return
-        slot = turn.topic_slot_key or (turn.entities[0].key if turn.entities else None)
+
+        superseded_set = set(turn.superseded_entity_keys)
+        non_replaced_entities = [e.key for e in turn.entities if e.key not in superseded_set]
+        fallback_ent = non_replaced_entities[0] if non_replaced_entities else (
+            turn.entities[0].key if turn.entities else None
+        )
+        slot = turn.topic_slot_key or fallback_ent
         if slot is None and turn.epistemic_status not in {"OPEN_ISSUE", "CONFIRMED"}:
             return
         slot_key = slot or f"slot:general:{turn.episode_id}"
 
         superseded_ids: list[str] = []
-        if turn.epistemic_status in {"CONFIRMED", "NEGATED"} and slot is not None:
+        adopted_slot: str | None = None
+        if turn.epistemic_status in {"CONFIRMED", "NEGATED"} and (slot is not None or superseded_set):
             for prior_entry in self.decision_ledger:
-                if prior_entry.topic_slot_key != slot_key or prior_entry.valid_to_ts is not None:
+                if prior_entry.valid_to_ts is not None:
                     continue
+                same_slot = slot is not None and prior_entry.topic_slot_key == slot_key
+                explicit_entity_replace = bool(superseded_set) and (
+                    prior_entry.topic_slot_key in superseded_set
+                    or (
+                        prior_entry.topic_slot_key.startswith("entity:")
+                        and bool(set(prior_entry.entity_keys) & superseded_set)
+                    )
+                )
+                if not same_slot and not explicit_entity_replace:
+                    continue
+
+                if turn.topic_slot_key is None and explicit_entity_replace and adopted_slot is None:
+                    adopted_slot = prior_entry.topic_slot_key
+
                 if prior_entry.turn_id in companion_turn_ids:
                     # Companion proposal is being confirmed by this anaphoric turn, not contradicted
                     prior_entry.valid_to_ts = turn.created_at_ts
@@ -494,6 +550,23 @@ class IncrementalSessionIndex:
                     if prior_turn is not None:
                         prior_turn.epistemic_status = "SUPERSEDED"
                         prior_turn.superseded_by_turn_id = turn.turn_id
+                elif turn.epistemic_status == "NEGATED" and prior_entry.epistemic_status in {
+                    "PROPOSED",
+                    "CONSIDERING",
+                    "CONFIRMED",
+                }:
+                    prior_entry.valid_to_ts = turn.created_at_ts
+                    prior_entry.superseded_by_turn_id = turn.turn_id
+                    prior_entry.epistemic_status = "SUPERSEDED"
+                    superseded_ids.append(prior_entry.turn_id)
+                    prior_turn = self.turns_by_id.get(prior_entry.turn_id)
+                    if prior_turn is not None:
+                        prior_turn.epistemic_status = "SUPERSEDED"
+                        prior_turn.superseded_by_turn_id = turn.turn_id
+
+        if adopted_slot is not None:
+            slot_key = adopted_slot
+            turn.topic_slot_key = adopted_slot
 
         if superseded_ids:
             turn.supersedes_turn_ids = tuple(superseded_ids)
@@ -520,6 +593,44 @@ class IncrementalSessionIndex:
                 )
             )
 
+    def score_bm25_dynamic(
+        self,
+        query: str,
+        *,
+        allowed_turn_ids: set[str] | None = None,
+    ) -> dict[str, float]:
+        """Exact corpus-wide Okapi BM25 over term_postings (zero IDF skew between early & late turns)."""
+        q_term_freqs, _ = tokenize_bm25_terms(query)
+        if not q_term_freqs or not self.turns:
+            return {}
+
+        total_docs = max(10, len(self.turns))
+        avg_doc_len = max(8.0, self.total_token_words / max(1, len(self.turns)))
+        scores: dict[str, float] = {}
+
+        for word, q_tf in q_term_freqs.items():
+            postings = self.term_postings.get(word)
+            if not postings:
+                continue
+            df = self.doc_freqs.get(word, 0)
+            if word in COMMON_STOPWORDS:
+                idf = 0.1
+            else:
+                idf = math.log(1.0 + (max(0, total_docs - df) + 0.5) / (df + 0.5))
+            q_weight = idf * (1.0 + 0.25 * (q_tf - 1))
+
+            for turn_id, tf in postings:
+                if allowed_turn_ids is not None and turn_id not in allowed_turn_ids:
+                    continue
+                turn_obj = self.turns_by_id.get(turn_id)
+                if turn_obj is None:
+                    continue
+                len_norm = 1.0 - BM25_B + BM25_B * (turn_obj.doc_word_len / avg_doc_len)
+                tf_weight = (tf * (BM25_K1 + 1.0)) / (tf + BM25_K1 * len_norm)
+                scores[turn_id] = scores.get(turn_id, 0.0) + (q_weight * tf_weight)
+
+        return scores
+
     def score_hybrid_view(
         self,
         query: str,
@@ -527,14 +638,8 @@ class IncrementalSessionIndex:
         *,
         allowed_turn_ids: set[str] | None = None,
     ) -> dict[str, float]:
-        """V1: Unicode True BM25 + Dense Cosine hybrid score across all authorized session turns."""
-        avg_len = self.total_token_words / max(1, len(self.turns))
-        q_sparse = sparse_dict_from_bm25(
-            query,
-            avg_doc_len=avg_len,
-            corpus_doc_freqs=self.doc_freqs,
-            total_corpus_docs=max(50, len(self.turns)),
-        )
+        """V1: Dynamic Corpus-Wide True BM25 + Dense Cosine hybrid score across authorized turns."""
+        bm25_scores = self.score_bm25_dynamic(query, allowed_turn_ids=allowed_turn_ids)
         q_terms = extract_content_terms(query)
         dense_raw: dict[str, float] = {}
         lex_raw: dict[str, float] = {}
@@ -542,13 +647,67 @@ class IncrementalSessionIndex:
             if allowed_turn_ids is not None and turn.turn_id not in allowed_turn_ids:
                 continue
             dense_raw[turn.turn_id] = max(0.0, cosine_sim(query_vec, turn.dense_vector))
-            bm25 = sparse_dot(q_sparse, turn.sparse_bm25)
+            bm25 = bm25_scores.get(turn.turn_id, 0.0)
             overlap = (len(q_terms & turn.content_terms) / len(q_terms)) if q_terms else 0.0
             lex_raw[turn.turn_id] = bm25 + 1.5 * overlap
 
         d_norm = min_max_normalize(dense_raw)
         l_norm = min_max_normalize(lex_raw)
         return {tid: 0.52 * d_norm.get(tid, 0.0) + 0.48 * l_norm.get(tid, 0.0) for tid in dense_raw}
+
+    def _select_ppr_subgraph_turns(
+        self,
+        visible_turns: list[IndexedTurn],
+        entity_act: dict[str, float],
+        hybrid_scores: dict[str, float],
+        visible_id_set: set[str],
+    ) -> list[IndexedTurn]:
+        """Bound PPR graph size to <= PPR_MAX_SUBGRAPH_TURNS for 1M-token / 25k-turn sessions."""
+        if len(visible_turns) <= PPR_MAX_SUBGRAPH_TURNS:
+            return visible_turns
+
+        candidate_ids: set[str] = set()
+        for e_key, act_val in entity_act.items():
+            if act_val >= 0.08:
+                for tid in self.entity_to_turn_counts.get(e_key, ()):
+                    if tid in visible_id_set:
+                        candidate_ids.add(tid)
+
+        ranked_hybrid = sorted(
+            (t.turn_id for t in visible_turns),
+            key=lambda tid: hybrid_scores.get(tid, 0.0),
+            reverse=True,
+        )
+        for tid in ranked_hybrid[:PPR_TOP_HYBRID_SEEDS]:
+            candidate_ids.add(tid)
+
+        # Expand +-1 intra-episode neighbors for continuity until cap
+        expanded_ids = set(candidate_ids)
+        for tid in list(candidate_ids):
+            if len(expanded_ids) >= PPR_MAX_SUBGRAPH_TURNS:
+                break
+            turn_obj = self.turns_by_id.get(tid)
+            if turn_obj is None:
+                continue
+            for delta in (-1, 1):
+                nb_ord = turn_obj.ordinal + delta
+                if 0 <= nb_ord < len(self.turns):
+                    nb = self.turns[nb_ord]
+                    if nb.episode_id == turn_obj.episode_id and nb.turn_id in visible_id_set:
+                        expanded_ids.add(nb.turn_id)
+
+        if len(expanded_ids) > PPR_MAX_SUBGRAPH_TURNS:
+            prioritized = sorted(
+                expanded_ids,
+                key=lambda tid: (
+                    1 if any(m.key in entity_act for m in self.turns_by_id[tid].entities) else 0,
+                    hybrid_scores.get(tid, 0.0),
+                ),
+                reverse=True,
+            )[:PPR_MAX_SUBGRAPH_TURNS]
+            expanded_ids = set(prioritized)
+
+        return [t for t in visible_turns if t.turn_id in expanded_ids]
 
     def score_graph_ppr_view(
         self,
@@ -558,7 +717,7 @@ class IncrementalSessionIndex:
         *,
         allowed_turn_ids: set[str] | None = None,
     ) -> dict[str, float]:
-        """V2: Zero-Mem Query-Conditioned Entity-Sentence Sparse Activation + igraph PPR (damping=0.6)."""
+        """V2: Zero-Mem Query-Conditioned Entity-Sentence Sparse Activation + Bounded igraph PPR."""
         visible_turns = [
             t for t in self.turns if allowed_turn_ids is None or t.turn_id in allowed_turn_ids
         ]
@@ -614,13 +773,26 @@ class IncrementalSessionIndex:
             for k, v in updates.items():
                 entity_act[k] = max(entity_act.get(k, 0.0), v)
 
-        # 3. Build bipartite Entity <-> Turn + intra-episode Turn_i <-> Turn_{i+1} igraph.Graph
-        active_entities = sorted(self.entity_to_turn_counts.keys())
+        # 3. Build bounded Ego-Subgraph Entity <-> Turn + intra-episode Turn_i <-> Turn_{i+1} igraph.Graph
+        subgraph_turns = self._select_ppr_subgraph_turns(
+            visible_turns,
+            entity_act,
+            hybrid_scores,
+            visible_id_set,
+        )
+        subgraph_ent_set: set[str] = set(entity_act.keys())
+        for turn in subgraph_turns:
+            for m in turn.entities:
+                subgraph_ent_set.add(m.key)
+                subgraph_ent_set.update(
+                    nb for nb in self.soft_alias_neighbors.get(m.key, ()) if nb in self.entity_to_turn_counts
+                )
+        active_entities = sorted(e for e in subgraph_ent_set if e in self.entity_to_turn_counts)
         if not active_entities:
             return dict(hybrid_scores)
 
-        turn_idx_map = {t.turn_id: idx for idx, t in enumerate(visible_turns)}
-        ent_offset = len(visible_turns)
+        turn_idx_map = {t.turn_id: idx for idx, t in enumerate(subgraph_turns)}
+        ent_offset = len(subgraph_turns)
         ent_idx_map = {e_key: ent_offset + idx for idx, e_key in enumerate(active_entities)}
         total_vertices = ent_offset + len(active_entities)
 
@@ -628,7 +800,7 @@ class IncrementalSessionIndex:
         weights: list[float] = []
 
         # Relative frequency bipartite edges: w(p, e) = c(p, e) / sum_{e' in E(p)} c(p, e')
-        for turn in visible_turns:
+        for turn in subgraph_turns:
             p_idx = turn_idx_map[turn.turn_id]
             counts_for_turn: list[tuple[int, int]] = []
             for m in turn.entities:
@@ -643,9 +815,9 @@ class IncrementalSessionIndex:
                     weights.append(c / denom)
 
         # Strictly intra-episode, intra-thread continuity edges (fixes Zero-Mem cross-sample bug)
-        for idx in range(len(visible_turns) - 1):
-            t_cur = visible_turns[idx]
-            t_nxt = visible_turns[idx + 1]
+        for idx in range(len(subgraph_turns) - 1):
+            t_cur = subgraph_turns[idx]
+            t_nxt = subgraph_turns[idx + 1]
             if (
                 t_cur.thread_id == t_nxt.thread_id
                 and t_cur.episode_id == t_nxt.episode_id
@@ -674,7 +846,7 @@ class IncrementalSessionIndex:
             return dict(hybrid_scores)
 
         reset = [0.0] * total_vertices
-        for turn in visible_turns:
+        for turn in subgraph_turns:
             reset[turn_idx_map[turn.turn_id]] = 0.30 * max(0.0, hybrid_scores.get(turn.turn_id, 0.0))
         for e_key, act_val in entity_act.items():
             e_idx = ent_idx_map.get(e_key)
@@ -691,7 +863,10 @@ class IncrementalSessionIndex:
             weights=weights,
             implementation="prpack",
         )
-        turn_ppr = {t.turn_id: float(ppr_vals[turn_idx_map[t.turn_id]]) for t in visible_turns}
+        turn_ppr = {
+            t.turn_id: (float(ppr_vals[turn_idx_map[t.turn_id]]) if t.turn_id in turn_idx_map else 0.0)
+            for t in visible_turns
+        }
         return min_max_normalize(turn_ppr)
 
     def score_hierarchy_view(

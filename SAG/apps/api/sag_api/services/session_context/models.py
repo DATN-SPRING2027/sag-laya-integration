@@ -67,10 +67,13 @@ class IndexedTurn:
     content_terms: frozenset[str]
     entities: tuple[EntityMention, ...]
     sentences: tuple[IndexedSentence, ...]
+    term_freqs: dict[str, int] = field(default_factory=dict)
+    doc_word_len: int = 1
     epistemic_status: EpistemicStatus = "FACT"
     topic_slot_key: str | None = None
     superseded_by_turn_id: str | None = None
     supersedes_turn_ids: tuple[str, ...] = ()
+    superseded_entity_keys: tuple[str, ...] = ()
     is_anaphoric_or_short: bool = False
     cited_source_ids: tuple[str, ...] = ()
 
@@ -167,6 +170,7 @@ class ContextAuditTrace:
     total_output_history_tokens: int
     llm_memory_calls: int
     partial_coverage: bool = False
+    route_decision: dict[str, Any] = field(default_factory=dict)
     view_weights: dict[str, float] = field(default_factory=dict)
     selected_groups: list[SelectedEvidenceGroup] = field(default_factory=list)
     rejected_candidates: list[RejectedCandidateTrace] = field(default_factory=list)

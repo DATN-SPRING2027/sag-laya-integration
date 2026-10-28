@@ -110,7 +110,10 @@ def _score_decision_state_view(
         val = 0.0
         slot_match = bool(q_slot and turn.topic_slot_key == q_slot)
         turn_ent_keys = {e.key for e in turn.entities}
-        ent_match = bool(q_ent_keys & turn_ent_keys)
+        ent_match = bool(
+            (q_ent_keys & turn_ent_keys)
+            or (turn.topic_slot_key is not None and turn.topic_slot_key in q_ent_keys)
+        )
         term_overlap = (len(q_terms & turn.content_terms) / len(q_terms)) if q_terms else 0.0
 
         if not (slot_match or ent_match or term_overlap > 0.0):
@@ -207,6 +210,20 @@ def _group_similarity(
     return 0.65 * max(0.0, best_cos) + 0.35 * jacc
 
 
+def _build_verbatim_session_citation(ref: str, turns: Sequence[IndexedTurn]) -> dict[str, Any]:
+    primary = turns[-1]
+    return {
+        "kind": "session_memory",
+        "ref": ref,
+        "primary_message_id": primary.turn_id,
+        "message_ids": [t.turn_id for t in turns],
+        "turn_ordinals": [t.ordinal + 1 for t in turns],
+        "epistemic_status": primary.epistemic_status,
+        "sha256": primary.content_hash,
+        "cited_source_ids": sorted({sid for t in turns for sid in t.cited_source_ids}),
+    }
+
+
 def _format_inert_evidence_message(
     selected_groups: Sequence[SelectedEvidenceGroup],
     index: IncrementalSessionIndex,
@@ -247,6 +264,7 @@ def _format_inert_evidence_message(
                 "turn_ordinals": [t.ordinal + 1 for t in grp_turns],
                 "epistemic_status": grp.epistemic_status,
                 "sha256": primary.content_hash,
+                "cited_source_ids": sorted({sid for t in grp_turns for sid in t.cited_source_ids}),
             }
         )
 
@@ -292,7 +310,7 @@ async def build_ecce_context_pack(
 ) -> SessionContextPack:
     """Execute Multi-View Retrieval + Bounded Closure + Submodular Context Optimization."""
     t_start = time.perf_counter()
-    decision = route_decision or {}
+    decision = dict(route_decision or {})
     memory_scope = str(decision.get("memory_scope") or "session_history")
     temporal_mode = str(decision.get("temporal_mode") or "atemporal")
     router_model = str(decision.get("model") or "deterministic")
@@ -317,6 +335,7 @@ async def build_ecce_context_pack(
             used_recent_tokens=0,
             total_output_history_tokens=0,
             llm_memory_calls=0,
+            route_decision=decision,
             latency_ms=(time.perf_counter() - t_start) * 1000.0,
         )
         return SessionContextPack(history_messages=[], selected_turn_ids=[], session_citations=[], audit_trace=trace)
@@ -356,6 +375,7 @@ async def build_ecce_context_pack(
             used_recent_tokens=used_toks,
             total_output_history_tokens=used_toks,
             llm_memory_calls=llm_calls,
+            route_decision=decision,
             view_weights={"legacy_window": 1.0},
             latency_ms=(time.perf_counter() - t_start) * 1000.0,
         )
@@ -376,6 +396,7 @@ async def build_ecce_context_pack(
         and not has_superseded
     ):
         hist_msgs = [{"role": t.role, "content": t.content} for t in visible_turns]
+        verbatim_citations = [_build_verbatim_session_citation("S1", visible_turns)]
         trace = ContextAuditTrace(
             mode="on",
             ablation=ablation,
@@ -391,13 +412,14 @@ async def build_ecce_context_pack(
             used_recent_tokens=total_all_tokens,
             total_output_history_tokens=total_all_tokens,
             llm_memory_calls=0,
+            route_decision=decision,
             view_weights={"short_verbatim": 1.0},
             latency_ms=(time.perf_counter() - t_start) * 1000.0,
         )
         return SessionContextPack(
             history_messages=hist_msgs,
             selected_turn_ids=[t.turn_id for t in visible_turns],
-            session_citations=[],
+            session_citations=verbatim_citations,
             audit_trace=trace,
         )
 
@@ -520,6 +542,8 @@ async def build_ecce_context_pack(
             temporal_mode=temporal_mode,
             partial_coverage=partial,
         )
+        if recent_turns:
+            citations.append(_build_verbatim_session_citation(f"S{len(citations) + 1}", recent_turns))
         out_msgs: list[dict[str, str]] = []
         if ev_msg is not None:
             out_msgs.append(ev_msg)
@@ -545,6 +569,7 @@ async def build_ecce_context_pack(
             total_output_history_tokens=total_out_toks,
             llm_memory_calls=0,
             partial_coverage=partial,
+            route_decision=decision,
             view_weights={"full_session_ledger_and_episodes": 1.0},
             selected_groups=selected_groups,
             rejected_candidates=rejected[:10],
@@ -615,7 +640,7 @@ async def build_ecce_context_pack(
         fused_scores[tid] = score
 
     # ── Candidate Group Construction & Bounded Closure (V4 & V5) ──
-    rejected: list[RejectedCandidateTrace] = []
+    rejected = []
     ranked_turn_ids = sorted(
         (tid for tid in fused_scores if tid not in recent_id_set),
         key=lambda tid: fused_scores[tid],
@@ -736,7 +761,7 @@ async def build_ecce_context_pack(
             )
 
     # ── Selection: Top-Down Score Fill (V1-V4) vs Submodular Lazy-Greedy Optimizer (V5) ──
-    selected_groups: list[SelectedEvidenceGroup] = []
+    selected_groups = []
     selected_turn_objs: list[list[IndexedTurn]] = []
     covered_query_units: set[str] = set()
     for rt in recent_turns:
@@ -935,6 +960,8 @@ async def build_ecce_context_pack(
         temporal_mode=temporal_mode,
         partial_coverage=False,
     )
+    if recent_turns:
+        citations.append(_build_verbatim_session_citation(f"S{len(citations) + 1}", recent_turns))
     out_msgs = []
     if ev_msg is not None:
         out_msgs.append(ev_msg)
@@ -962,6 +989,7 @@ async def build_ecce_context_pack(
         total_output_history_tokens=total_out_toks,
         llm_memory_calls=0,
         partial_coverage=False,
+        route_decision=decision,
         view_weights=weights,
         selected_groups=selected_groups,
         rejected_candidates=rejected[:10],

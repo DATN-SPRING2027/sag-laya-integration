@@ -25,7 +25,11 @@ from sag_api.db.models import Agent, AgentBinding, Message, Source, Thread
 from sag_api.enums import BindingTargetType, MessageRole, MessageStatus
 from sag_api.generation import build_agent_messages, build_prompt_preview
 from sag_api.generation.prompt import estimate_tokens
-from sag_api.services.session_context import invalidate_session_thread_cache, prepare_session_context_for_ask
+from sag_api.services.session_context import (
+    invalidate_session_thread_cache,
+    log_session_audit_trace,
+    prepare_session_context_for_ask,
+)
 from sag_api.services.source_service import get_authorized_source_ids, search_source_candidates
 
 _log = get_logger("sag.agent_domain")
@@ -602,7 +606,9 @@ class AskPlan:
     prompt_preview: str = ""
     source_ids: list[str] | None = None  # @范围：限定循环内检索工具可见的信源
     user_message_id: str | None = None
-    session_audit_trace: dict | None = None
+    session_audit_trace: dict[str, Any] | None = None
+    route_decision: dict[str, Any] | None = None
+    session_citations: list[dict[str, Any]] = field(default_factory=list)
 
 
 async def _resolve_session_history(
@@ -617,11 +623,11 @@ async def _resolve_session_history(
     source_ids: list[str] | None,
     llm: Any,
     budget_tokens: int,
-) -> tuple[list[dict[str, str]], dict | None]:
+) -> tuple[list[dict[str, str]], dict[str, Any] | None, dict[str, Any] | None, list[dict[str, Any]]]:
     mode = settings.session_context_mode
     if mode == "off":
         compressed = await compress_history(legacy_history, llm=llm, budget_tokens=budget_tokens)
-        return compressed, None
+        return compressed, None, None, []
 
     if mode == "shadow":
         compressed = await compress_history(legacy_history, llm=llm, budget_tokens=budget_tokens)
@@ -637,10 +643,11 @@ async def _resolve_session_history(
                 budget_tokens=budget_tokens,
             )
             pack.audit_trace.mode = "shadow"
-            return compressed, pack.audit_trace.to_dict()
+            log_session_audit_trace(thread_id, pack.audit_trace)
+            return compressed, pack.audit_trace.to_dict(), dict(pack.audit_trace.route_decision), []
         except Exception as exc:  # noqa: BLE001 - shadow telemetry must never fail user ask
             _log.warning("ECCE shadow session context failed (%s)", type(exc).__name__)
-            return compressed, None
+            return compressed, None, None, []
 
     try:
         pack = await prepare_session_context_for_ask(
@@ -653,7 +660,13 @@ async def _resolve_session_history(
             requested_source_ids=source_ids,
             budget_tokens=budget_tokens,
         )
-        return pack.history_messages, pack.audit_trace.to_dict()
+        log_session_audit_trace(thread_id, pack.audit_trace)
+        return (
+            pack.history_messages,
+            pack.audit_trace.to_dict(),
+            dict(pack.audit_trace.route_decision),
+            list(pack.session_citations),
+        )
     except Exception as exc:  # noqa: BLE001 - graceful fallback to bounded legacy window on unexpected error
         _log.warning("ECCE session context fallback to legacy history (%s)", type(exc).__name__)
         fallback_hist = legacy_history or await _history(
@@ -664,7 +677,7 @@ async def _resolve_session_history(
             requested_source_ids=source_ids,
         )
         compressed = await compress_history(fallback_hist, llm=llm, budget_tokens=budget_tokens)
-        return compressed, None
+        return compressed, None, None, []
 
 
 def build_ask_context(
@@ -745,7 +758,7 @@ async def prepare_ask(
         requested_source_ids=source_ids,
     )
     # 历史预算 = 上下文窗口的 40%（其余留给工具轮/回答）
-    history, audit_trace = await _resolve_session_history(
+    history, audit_trace, route_decision, session_citations = await _resolve_session_history(
         session,
         legacy_history=history,
         thread_id=thread.id,
@@ -766,6 +779,8 @@ async def prepare_ask(
     )
     plan.user_message_id = user_msg.id
     plan.session_audit_trace = audit_trace
+    plan.route_decision = route_decision
+    plan.session_citations = session_citations
     return plan
 
 
