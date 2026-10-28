@@ -441,7 +441,8 @@ async def build_ecce_context_pack(
     evidence_budget = max(64, budget_tokens - recent_tokens - envelope_overhead)
 
     allowed_ids = {t.turn_id for t in visible_turns}
-    q_vecs = await embed_texts_with_main_cache([query], embedder=embedder)
+    query_embedder = None if index.embedding_mode == "deterministic-ngram-v1" else embedder
+    q_vecs = await embed_texts_with_main_cache([query], embedder=query_embedder)
     q_vec = q_vecs[0]
     q_terms = extract_content_terms(query)
     q_mentions, _ = extract_turn_entities_and_sentences("query", 0, query)

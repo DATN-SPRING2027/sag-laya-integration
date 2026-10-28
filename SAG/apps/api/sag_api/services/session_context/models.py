@@ -175,6 +175,9 @@ class ContextAuditTrace:
     selected_groups: list[SelectedEvidenceGroup] = field(default_factory=list)
     rejected_candidates: list[RejectedCandidateTrace] = field(default_factory=list)
     latency_ms: float = 0.0
+    persistence_status: str = "memory_only"
+    persisted_units_written: int = 0
+    qdrant_points_upserted: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -221,6 +224,9 @@ class ContextAuditTrace:
                 for r in self.rejected_candidates
             ],
             "latency_ms": round(self.latency_ms, 2),
+            "persistence_status": self.persistence_status,
+            "persisted_units_written": self.persisted_units_written,
+            "qdrant_points_upserted": self.qdrant_points_upserted,
         }
 
 

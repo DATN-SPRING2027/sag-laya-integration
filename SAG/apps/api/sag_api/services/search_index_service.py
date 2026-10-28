@@ -36,20 +36,34 @@ from sag_api.db.models.routing_rag import (
 
 log = get_logger("sag.search_index")
 
-# Bounded LRU cache mapping sha256(text) -> dense vector for batch reuse between SearchUnits and KnowledgeUnits
+# Bounded LRU cache mapping sha256([model_signature + NUL +] text) -> dense vector
 _SHARED_TEXT_EMBEDDING_CACHE: dict[str, list[float]] = {}
 _SHARED_TEXT_EMBEDDING_CACHE_MAX = 4096
 
 
-def get_cached_text_embedding(text: str) -> list[float] | None:
-    key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+def _embedding_cache_key(text: str, model_signature: str = "") -> str:
+    sig = model_signature.strip()
+    payload = f"{sig}\x00{text}" if sig else text
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def get_cached_text_embedding(text: str, *, model_signature: str = "") -> list[float] | None:
+    key = _embedding_cache_key(text, model_signature)
     vec = _SHARED_TEXT_EMBEDDING_CACHE.get(key)
     return list(vec) if vec is not None else None
 
 
-def put_cached_text_embedding(text: str, vector: Sequence[float]) -> None:
-    key = hashlib.sha256(text.encode("utf-8")).hexdigest()
-    if len(_SHARED_TEXT_EMBEDDING_CACHE) >= _SHARED_TEXT_EMBEDDING_CACHE_MAX and key not in _SHARED_TEXT_EMBEDDING_CACHE:
+def put_cached_text_embedding(
+    text: str,
+    vector: Sequence[float],
+    *,
+    model_signature: str = "",
+) -> None:
+    key = _embedding_cache_key(text, model_signature)
+    if (
+        len(_SHARED_TEXT_EMBEDDING_CACHE) >= _SHARED_TEXT_EMBEDDING_CACHE_MAX
+        and key not in _SHARED_TEXT_EMBEDDING_CACHE
+    ):
         oldest_key = next(iter(_SHARED_TEXT_EMBEDDING_CACHE))
         _SHARED_TEXT_EMBEDDING_CACHE.pop(oldest_key, None)
     _SHARED_TEXT_EMBEDDING_CACHE[key] = [float(x) for x in vector]
