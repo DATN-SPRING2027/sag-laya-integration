@@ -45,6 +45,7 @@ from sag_api.db.models.session_context import (
     SessionDecisionLedger,
     SessionGraphEdge,
     SessionUnit,
+    SessionUnitMessage,
 )
 from sag_api.db.models.setting import Setting
 from sag_api.db.models.source import Source
@@ -94,6 +95,7 @@ __all__ = [
     "SessionDecisionLedger",
     "SessionGraphEdge",
     "SessionUnit",
+    "SessionUnitMessage",
     "Setting",
     "Source",
     "SourceProjectMapping",
