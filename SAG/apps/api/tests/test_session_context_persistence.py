@@ -1,0 +1,976 @@
+"""Integration tests for SAG-ECCE Chặng 3: Multi-View Persistence, Cold-Start Hydration,
+Lazy Backfill, O(Delta) Sync, Qdrant `session_units_{project_id}`, and Fail-Closed Reconciliation.
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import httpx
+import pytest
+from sqlalchemy import event, func, select, text
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
+
+from sag_api.core.config import settings
+from sag_api.core.errors import ForbiddenError
+from sag_api.core.principal_assertion import VerifiedPrincipal
+from sag_api.db.base import Base
+from sag_api.db.models import (
+    Agent,
+    Message,
+    SessionDecisionLedger,
+    SessionGraphEdge,
+    SessionUnit,
+    SessionUnitMessage,
+    Source,
+    SourceProjectMapping,
+    Thread,
+)
+from sag_api.enums import MessageRole
+from sag_api.services import agent_domain
+from sag_api.services.search_index_service import _SHARED_TEXT_EMBEDDING_CACHE
+from sag_api.services.session_context import (
+    SESSION_INDEX_CACHE,
+    prepare_session_context_for_ask,
+    reconcile_orphan_session_units,
+    session_qdrant_collection_name,
+    set_custom_session_qdrant_client_factory,
+)
+from sag_api.services.session_context.substrate import deterministic_ngram_vector
+
+
+def _principal(*, org_id: str = "org-continuum", project_id: str = "proj-alpha") -> VerifiedPrincipal:
+    return VerifiedPrincipal(
+        subject="user-thang",
+        organization_id=org_id,
+        allowed_project_ids=frozenset({project_id}),
+        issuer="continuum-be",
+        key_id="kid-1",
+        token_id="jti-1",
+        issued_at=1_760_000_000,
+        expires_at=1_760_000_900,
+        tenant_id=org_id,
+        allowed_partition_ids=frozenset({project_id}),
+    )
+
+
+async def _make_fk_sqlite_engine() -> AsyncEngine:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _enable_sqlite_fk(dbapi_conn, _conn_record) -> None:
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA foreign_keys=ON")
+        cur.close()
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    return engine
+
+
+class _InMemoryQdrantEmulator:
+    """Faithful in-memory Qdrant REST emulator for collections, indexes, points, scroll, and delete."""
+
+    def __init__(self) -> None:
+        self.collections: dict[str, dict[str, Any]] = {}
+        self.indexes: dict[str, dict[str, str]] = {}
+        self.points: dict[str, dict[str, dict[str, Any]]] = {}
+
+    def make_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            base_url="http://qdrant.local",
+            transport=httpx.MockTransport(self._handle),
+        )
+
+    @staticmethod
+    def _matches_filter(payload: dict[str, Any], flt: dict[str, Any] | None) -> bool:
+        if not flt:
+            return True
+        for cond in flt.get("must") or []:
+            key = cond.get("key")
+            match = cond.get("match") or {}
+            val = payload.get(key)
+            if "value" in match:
+                expected = match["value"]
+                if isinstance(val, list):
+                    if expected not in val:
+                        return False
+                elif val != expected:
+                    return False
+            elif "any" in match:
+                allowed = set(match["any"])
+                if isinstance(val, list):
+                    if not (set(val) & allowed):
+                        return False
+                elif val not in allowed:
+                    return False
+        return True
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        parts = [p for p in request.url.path.split("/") if p]
+        method = request.method.upper()
+        body = json.loads(request.content.decode("utf-8")) if request.content else {}
+
+        # /collections/{name}
+        if len(parts) == 2 and parts[0] == "collections":
+            col = parts[1]
+            if method == "GET":
+                if col not in self.collections:
+                    return httpx.Response(404, json={"status": {"error": "Not found"}})
+                return httpx.Response(
+                    200,
+                    json={"result": {"config": {"params": self.collections[col]}}},
+                )
+            if method == "PUT":
+                self.collections[col] = {
+                    "vectors": body.get("vectors") or {},
+                    "sparse_vectors": body.get("sparse_vectors") or {},
+                }
+                self.indexes.setdefault(col, {})
+                self.points.setdefault(col, {})
+                return httpx.Response(200, json={"result": True})
+            if method == "DELETE":
+                self.collections.pop(col, None)
+                self.indexes.pop(col, None)
+                self.points.pop(col, None)
+                return httpx.Response(200, json={"result": True})
+
+        # /collections/{name}/index
+        if len(parts) == 3 and parts[0] == "collections" and parts[2] == "index" and method == "PUT":
+            col = parts[1]
+            if col not in self.collections:
+                return httpx.Response(404, json={"status": {"error": "Not found"}})
+            self.indexes[col][str(body.get("field_name"))] = str(body.get("field_schema"))
+            return httpx.Response(200, json={"result": {"status": "completed"}})
+
+        # /collections/{name}/points
+        if len(parts) == 3 and parts[0] == "collections" and parts[2] == "points" and method == "PUT":
+            col = parts[1]
+            if col not in self.collections:
+                return httpx.Response(404, json={"status": {"error": "Collection missing"}})
+            expected_dim = (
+                self.collections[col]
+                .get("vectors", {})
+                .get("content_vector", {})
+                .get("size")
+            )
+            for pt in body.get("points") or []:
+                c_vec = (pt.get("vector") or {}).get("content_vector") or []
+                if expected_dim and len(c_vec) != expected_dim:
+                    return httpx.Response(400, json={"status": {"error": "Dimension mismatch"}})
+                self.points[col][str(pt["id"])] = {
+                    "id": str(pt["id"]),
+                    "payload": dict(pt.get("payload") or {}),
+                    "vector": dict(pt.get("vector") or {}),
+                }
+            return httpx.Response(200, json={"result": {"status": "completed"}})
+
+        # /collections/{name}/points/scroll
+        if (
+            len(parts) == 4
+            and parts[0] == "collections"
+            and parts[2] == "points"
+            and parts[3] == "scroll"
+            and method == "POST"
+        ):
+            col = parts[1]
+            if col not in self.collections:
+                return httpx.Response(404, json={"status": {"error": "Not found"}})
+            flt = body.get("filter")
+            with_vec = bool(body.get("with_vector"))
+            matched = [
+                {
+                    "id": pt["id"],
+                    "payload": dict(pt["payload"]),
+                    **({"vector": dict(pt["vector"])} if with_vec else {}),
+                }
+                for pt in self.points[col].values()
+                if self._matches_filter(pt["payload"], flt)
+            ]
+            return httpx.Response(
+                200,
+                json={"result": {"points": matched, "next_page_offset": None}},
+            )
+
+        # /collections/{name}/points/delete
+        if (
+            len(parts) == 4
+            and parts[0] == "collections"
+            and parts[2] == "points"
+            and parts[3] == "delete"
+            and method == "POST"
+        ):
+            col = parts[1]
+            if col not in self.collections:
+                return httpx.Response(404, json={"status": {"error": "Not found"}})
+            if "points" in body:
+                for pid in body["points"]:
+                    self.points[col].pop(str(pid), None)
+            elif "filter" in body:
+                flt = body["filter"]
+                to_del = [
+                    pid
+                    for pid, pt in self.points[col].items()
+                    if self._matches_filter(pt["payload"], flt)
+                ]
+                for pid in to_del:
+                    self.points[col].pop(pid, None)
+            return httpx.Response(200, json={"result": {"status": "completed"}})
+
+        return httpx.Response(404, json={"status": {"error": f"Unhandled {method} {request.url.path}"}})
+
+
+class _CountingHttpModelEmbedder:
+    """Counting embedder simulating `configured_http` (`http:BAAI/bge-m3`, dim=64)."""
+
+    def __init__(self, *, model: str = "BAAI/bge-m3", dim: int = 64) -> None:
+        self.model = model
+        self.dim = dim
+        self.batches: list[list[str]] = []
+
+    async def batch_generate(self, texts: list[str]) -> list[list[float]]:
+        self.batches.append(list(texts))
+        return [list(deterministic_ngram_vector(t, dim=self.dim)) for t in texts]
+
+
+@pytest.fixture(autouse=True)
+def _clean_persistence_caches():
+    SESSION_INDEX_CACHE.clear()
+    _SHARED_TEXT_EMBEDDING_CACHE.clear()
+    set_custom_session_qdrant_client_factory(None)
+    yield
+    SESSION_INDEX_CACHE.clear()
+    _SHARED_TEXT_EMBEDDING_CACHE.clear()
+    set_custom_session_qdrant_client_factory(None)
+
+
+@pytest.mark.asyncio
+async def test_lazy_backfill_and_incremental_delta_sync_with_qdrant(monkeypatch) -> None:
+    """Chặng 3.1: Lazy Backfill on legacy thread + O(Delta) append + trigger-safe EPISODE growth + Qdrant."""
+    monkeypatch.setattr(settings, "session_context_mode", "on")
+    monkeypatch.setattr(settings, "decision_provider", "disabled")
+
+    qdrant = _InMemoryQdrantEmulator()
+    q_client = qdrant.make_client()
+    set_custom_session_qdrant_client_factory(lambda: q_client)
+
+    engine = await _make_fk_sqlite_engine()
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    owner_key = "owner-thang-ch3"
+    principal = _principal(project_id="proj-alpha")
+    col_name = session_qdrant_collection_name("proj-alpha")
+    now = datetime.now(UTC) - timedelta(minutes=5)
+
+    async with session_factory() as session:
+        agent = Agent(owner_key=owner_key, name="Continuum Architect")
+        src_doc = Source(name="ADR-09 Payment Spec", sag_source_config_id="sag-adr-09")
+        session.add_all([agent, src_doc])
+        await session.flush()
+
+        mapping = SourceProjectMapping(
+            source_id=src_doc.id,
+            organization_id=principal.organization_id,
+            project_id="proj-alpha",
+            state="CONFIRMED",
+            mapping_version=1,
+            confirmed_at=now,
+            confirmed_by="admin-1",
+            approval_ref="apr-ch3-1",
+        )
+        thread = Thread(agent_id=agent.id, owner_key=owner_key, title="Payment Core Session")
+        session.add_all([mapping, thread])
+        await session.flush()
+
+        # Pre-existing legacy thread (0 session_units rows initially)
+        m0 = Message(
+            thread_id=thread.id,
+            role=MessageRole.USER,
+            content="Đề xuất ban đầu: dịch vụ thanh toán lõi dùng MongoDB cho nhanh.",
+            created_at=now,
+        )
+        m1 = Message(
+            thread_id=thread.id,
+            role=MessageRole.ASSISTANT,
+            content="Theo tài liệu ADR-09, giao dịch tài chính bắt buộc chuẩn ACID khắt khe.",
+            citations=[{"n": 1, "source_id": src_doc.id, "chunk_id": "chk-acid"}],
+            created_at=now + timedelta(seconds=30),
+        )
+        m2 = Message(
+            thread_id=thread.id,
+            role=MessageRole.USER,
+            content="Chốt quyết định cuối cùng: thay MongoDB bằng PostgreSQL 18 cho dịch vụ thanh toán lõi.",
+            created_at=now + timedelta(seconds=60),
+        )
+        session.add_all([m0, m1, m2])
+        await session.commit()
+
+        # 1. First ask triggers Lazy Backfill across all 4 tables + Qdrant!
+        plan_1 = await agent_domain.prepare_ask(
+            session,
+            agent=agent,
+            thread=thread,
+            query="Dịch vụ thanh toán lõi hiện chốt dùng database nào?",
+            principal=principal,
+            owner_key=owner_key,
+        )
+        trace_1 = plan_1.session_audit_trace
+        assert trace_1 is not None
+        assert trace_1["persistence_status"] == "lazy_backfill"
+        assert trace_1["persisted_units_written"] == 7  # 3 TURN + 3 WINDOW + 1 EPISODE
+        assert trace_1["qdrant_points_upserted"] == 7
+
+        # Verify SessionUnit rows & Data Minimization (character spans in sentences_json, zero raw text!)
+        units = list(
+            (
+                await session.execute(
+                    select(SessionUnit)
+                    .where(SessionUnit.thread_id == thread.id)
+                    .order_by(SessionUnit.unit_kind.asc(), SessionUnit.ordinal.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        by_kind = {k: [u for u in units if u.unit_kind == k] for k in ("TURN", "WINDOW", "EPISODE")}
+        assert len(by_kind["TURN"]) == 3
+        assert len(by_kind["WINDOW"]) == 3
+        assert len(by_kind["EPISODE"]) == 1
+        assert by_kind["TURN"][0].epistemic_status == "SUPERSEDED"
+        assert by_kind["TURN"][0].valid_to.year < 9999
+        assert by_kind["TURN"][2].epistemic_status == "CONFIRMED"
+        assert by_kind["TURN"][2].valid_to.year == 9999
+        for sent_meta in by_kind["TURN"][2].sentences_json:
+            assert "text" not in sent_meta
+            assert isinstance(sent_meta["start"], int) and isinstance(sent_meta["end"], int)
+
+        # Verify trigger-populated SessionUnitMessage links
+        link_count = await session.scalar(
+            select(func.count()).select_from(SessionUnitMessage).where(SessionUnitMessage.thread_id == thread.id)
+        )
+        # 3 turns (1+1+1) + 3 windows (1+2+3) + 1 episode (3) = 12 membership links!
+        assert link_count == 12
+
+        # Verify SessionDecisionLedger lineage (`supersedes_id` <-> `superseded_by_id`)
+        decisions = list(
+            (
+                await session.execute(
+                    select(SessionDecisionLedger)
+                    .where(SessionDecisionLedger.thread_id == thread.id)
+                    .order_by(SessionDecisionLedger.turn_ordinal.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(decisions) == 2
+        assert decisions[0].epistemic_status == "SUPERSEDED"
+        assert decisions[0].superseded_by_id == decisions[1].id
+        assert decisions[1].epistemic_status == "CONFIRMED"
+        assert decisions[1].supersedes_id == decisions[0].id
+
+        # Verify SessionGraphEdge types (`ENTITY_MENTION`, `SENTENCE_IN_UNIT`, `ADJACENT`, `SUPERSEDES`, `SOURCE`)
+        edge_types = set(
+            (
+                await session.execute(
+                    select(SessionGraphEdge.edge_type).where(SessionGraphEdge.thread_id == thread.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert {
+            "ENTITY_MENTION",
+            "SENTENCE_IN_UNIT",
+            "ADJACENT_IN_EPISODE",
+            "SUPERSEDES",
+            "CITES_DOCUMENT_SOURCE",
+        }.issubset(edge_types)
+
+        # Verify Qdrant payload Data Minimization (ZERO raw conversation strings!)
+        assert col_name in qdrant.points
+        assert len(qdrant.points[col_name]) == 7
+        raw_qdrant_dump = json.dumps(qdrant.points[col_name], ensure_ascii=False)
+        assert "MongoDB cho nhanh" not in raw_qdrant_dump
+        assert "ACID khắt khe" not in raw_qdrant_dump
+        for pt in qdrant.points[col_name].values():
+            assert "content" not in pt["payload"]
+            assert "summary_text" not in pt["payload"]
+            assert len(pt["vector"]["content_vector"]) == 256
+            assert "indices" in pt["vector"]["bm25_sparse"]
+
+        # 2. Persist assistant reply & run 2nd ask on warm cache -> O(Delta) sync + grown EPISODE replacement!
+        await agent_domain.persist_answer(
+            session_factory,
+            thread.id,
+            "Đã xác nhận dịch vụ thanh toán lõi dùng PostgreSQL 18.",
+            [],
+        )
+        plan_2 = await agent_domain.prepare_ask(
+            session,
+            agent=agent,
+            thread=thread,
+            query="Kiểm tra lại hạn mức kết nối connection pool?",
+            principal=principal,
+            owner_key=owner_key,
+        )
+        trace_2 = plan_2.session_audit_trace
+        assert trace_2 is not None
+        assert trace_2["persistence_status"] == "delta_synced"
+        # 2 delta turns (prev user query + assistant answer) -> 2 TURN + 2 WINDOW + 1 grown EPISODE = 5 (< 11 total!)
+        assert trace_2["persisted_units_written"] == 5
+        ep_after = (
+            await session.execute(
+                select(SessionUnit).where(
+                    SessionUnit.thread_id == thread.id,
+                    SessionUnit.unit_kind == "EPISODE",
+                )
+            )
+        ).scalar_one()
+        assert len(ep_after.source_message_ids_json) == 5
+        assert len(qdrant.points[col_name]) == 11  # 5 TURN + 5 WINDOW + 1 EPISODE
+
+    await q_client.aclose()
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_cold_start_worker_restart_hydrates_from_db_and_qdrant_with_zero_http_reembeds(
+    monkeypatch,
+) -> None:
+    """Chặng 3.2: Cold-start worker restart hydrates prefix from DB + Qdrant with 0 HTTP turn re-embeds."""
+    monkeypatch.setattr(settings, "session_context_mode", "on")
+    monkeypatch.setattr(settings, "decision_provider", "disabled")
+
+    qdrant = _InMemoryQdrantEmulator()
+    q_client = qdrant.make_client()
+    set_custom_session_qdrant_client_factory(lambda: q_client)
+    http_embedder = _CountingHttpModelEmbedder(model="BAAI/bge-m3", dim=64)
+
+    engine = await _make_fk_sqlite_engine()
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    owner_key = "owner-cold-start"
+    principal = _principal(project_id="proj-cold")
+    now = datetime(2026, 10, 28, 2, 0, tzinfo=UTC)
+
+    async with session_factory() as session:
+        agent = Agent(owner_key=owner_key, name="Cold Start Agent")
+        thread = Thread(agent_id="", owner_key=owner_key, title="Cold Start Thread")
+        session.add(agent)
+        await session.flush()
+        thread.agent_id = agent.id
+        session.add(thread)
+        await session.flush()
+
+        for idx, text_body in enumerate(
+            [
+                "Đề xuất dùng Redis Cluster cho tầng session cache.",
+                "Cân nhắc thêm chi phí vận hành hạ tầng Redis Cluster.",
+                "Chốt quyết định: dùng PostgreSQL UNLOGGED TABLE thay cho Redis Cluster để giảm chi phí.",
+                "Ghi nhận cấu hình TTL dọn bảng UNLOGGED mỗi 15 phút.",
+                "Câu hỏi hiện tại?",
+            ]
+        ):
+            session.add(
+                Message(
+                    thread_id=thread.id,
+                    role=MessageRole.USER if idx % 2 == 0 else MessageRole.ASSISTANT,
+                    content=text_body,
+                    created_at=now + timedelta(minutes=idx),
+                )
+            )
+        await session.commit()
+        msgs = list(
+            (
+                await session.execute(
+                    select(Message).where(Message.thread_id == thread.id).order_by(Message.created_at.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        current_q_msg = msgs[-1]
+
+        # Initial cold materialization (embeds 4 historical turns + their sentences + query)
+        pack_initial = await prepare_session_context_for_ask(
+            session,
+            thread_id=thread.id,
+            exclude_message_id=current_q_msg.id,
+            query="Chúng ta đã chốt giải pháp gì thay cho Redis Cluster?",
+            principal=principal,
+            owner_key=owner_key,
+            requested_source_ids=None,
+            budget_tokens=1200,
+            embedder=http_embedder,
+            qdrant_client=q_client,
+        )
+        assert pack_initial.audit_trace.persistence_status == "lazy_backfill"
+        assert len(http_embedder.batches) >= 2  # historical batch + query batch
+
+        # Simulate complete worker process restart: clear BOTH RAM session cache AND text embedding LRU!
+        SESSION_INDEX_CACHE.clear()
+        _SHARED_TEXT_EMBEDDING_CACHE.clear()
+        http_embedder.batches.clear()
+
+        pack_hydrated = await prepare_session_context_for_ask(
+            session,
+            thread_id=thread.id,
+            exclude_message_id=current_q_msg.id,
+            query="Chúng ta đã chốt giải pháp gì thay cho Redis Cluster?",
+            principal=principal,
+            owner_key=owner_key,
+            requested_source_ids=None,
+            budget_tokens=1200,
+            embedder=http_embedder,
+            qdrant_client=q_client,
+        )
+        assert pack_hydrated.audit_trace.persistence_status == "hydrated_clean"
+        assert pack_hydrated.audit_trace.persisted_units_written == 0
+        # ZERO historical turns re-embedded over HTTP! Only the 1 live query string was embedded!
+        assert http_embedder.batches == [["Chúng ta đã chốt giải pháp gì thay cho Redis Cluster?"]]
+        hydrated_blob = json.dumps(pack_hydrated.history_messages, ensure_ascii=False)
+        assert "UNLOGGED TABLE" in hydrated_blob
+
+        # Now add 1 new historical turn + new ask message, simulate another worker restart:
+        # ONLY the 1 new historical turn is embedded (`hydrated_delta`)!
+        new_q_msg = Message(
+            thread_id=thread.id,
+            role=MessageRole.USER,
+            content="Truy vấn tiếp theo sau khi thêm 1 lượt mới?",
+            created_at=now + timedelta(minutes=10),
+        )
+        session.add(new_q_msg)
+        await session.commit()
+
+        SESSION_INDEX_CACHE.clear()
+        _SHARED_TEXT_EMBEDDING_CACHE.clear()
+        http_embedder.batches.clear()
+
+        pack_delta = await prepare_session_context_for_ask(
+            session,
+            thread_id=thread.id,
+            exclude_message_id=new_q_msg.id,
+            query="TTL dọn bảng UNLOGGED là bao nhiêu phút?",
+            principal=principal,
+            owner_key=owner_key,
+            requested_source_ids=None,
+            budget_tokens=1200,
+            embedder=http_embedder,
+            qdrant_client=q_client,
+        )
+        assert pack_delta.audit_trace.persistence_status == "hydrated_delta"
+        # First batch embeds ONLY `current_q_msg` ("Câu hỏi hiện tại?"), NEVER the 4 earlier turns!
+        flattened_embedded = [txt for batch in http_embedder.batches for txt in batch]
+        assert not any("UNLOGGED TABLE" in txt for txt in flattened_embedded)
+        assert any("Câu hỏi hiện tại?" in txt for txt in flattened_embedded)
+
+    await q_client.aclose()
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_middle_of_window_delete_via_raw_sql_and_api_reconciles_db_and_qdrant(
+    monkeypatch,
+) -> None:
+    """Chặng 3.3: Deleting middle message B in A-B-C reconciles ordinals, lineage, windows, and Qdrant."""
+    monkeypatch.setattr(settings, "session_context_mode", "on")
+    monkeypatch.setattr(settings, "decision_provider", "disabled")
+
+    qdrant = _InMemoryQdrantEmulator()
+    q_client = qdrant.make_client()
+    set_custom_session_qdrant_client_factory(lambda: q_client)
+
+    engine = await _make_fk_sqlite_engine()
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    owner_key = "owner-del-ch3"
+    principal = _principal(project_id="proj-del")
+    col_name = session_qdrant_collection_name("proj-del")
+    now = datetime(2026, 10, 28, 3, 0, tzinfo=UTC)
+
+    async with session_factory() as session:
+        agent = Agent(owner_key=owner_key, name="Delete Reconcile Agent")
+        session.add(agent)
+        await session.flush()
+        thread = Thread(agent_id=agent.id, owner_key=owner_key, title="Window ABC Thread")
+        session.add(thread)
+        await session.flush()
+
+        msg_a = Message(
+            thread_id=thread.id,
+            role=MessageRole.USER,
+            content="Đề xuất dùng MongoDB cho module lưu vết kiểm toán.",
+            created_at=now,
+        )
+        msg_b = Message(
+            thread_id=thread.id,
+            role=MessageRole.USER,
+            content="Chốt quyết định: thay MongoDB bằng PostgreSQL 18 cho module lưu vết kiểm toán.",
+            created_at=now + timedelta(seconds=20),
+        )
+        msg_c = Message(
+            thread_id=thread.id,
+            role=MessageRole.ASSISTANT,
+            content="Đã ghi nhận kế hoạch kiểm thử tải 5000 RPS vào thứ Sáu.",
+            created_at=now + timedelta(seconds=40),
+        )
+        session.add_all([msg_a, msg_b, msg_c])
+        await session.commit()
+
+        _ = await agent_domain.prepare_ask(
+            session,
+            agent=agent,
+            thread=thread,
+            query="Module lưu vết kiểm toán đang chốt dùng gì?",
+            principal=principal,
+            owner_key=owner_key,
+        )
+        # Before deleting B: A is SUPERSEDED by B
+        dec_before = list(
+            (
+                await session.execute(
+                    select(SessionDecisionLedger)
+                    .where(SessionDecisionLedger.thread_id == thread.id)
+                    .order_by(SessionDecisionLedger.turn_ordinal.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert dec_before[0].epistemic_status == "SUPERSEDED"
+        assert any(
+            pt["payload"]["message_from_id"] == msg_b.id for pt in qdrant.points[col_name].values()
+        )
+
+        # Part A: Raw SQL DELETE of middle message B (bypasses service layer!)
+        await session.execute(text("DELETE FROM messages WHERE id = :mid"), {"mid": msg_b.id})
+        await session.commit()
+
+        # Immediately after raw SQL DELETE: ON DELETE CASCADE already removed B's unit & window A-B-C!
+        remaining_b_units = (
+            await session.execute(
+                select(SessionUnit).where(SessionUnit.message_from_id == msg_b.id)
+            )
+        ).scalars().all()
+        assert remaining_b_units == []
+
+        # Next ask detects ordinal gap (`[0, 2]` vs `[0, 1]`) -> `reconciled_rebuild` restores A to PROPOSED
+        # and purges B's stale points from Qdrant!
+        plan_reconciled = await agent_domain.prepare_ask(
+            session,
+            agent=agent,
+            thread=thread,
+            query="Đề xuất hiện còn hiệu lực cho module lưu vết kiểm toán là gì?",
+            principal=principal,
+            owner_key=owner_key,
+        )
+        assert plan_reconciled.session_audit_trace is not None
+        assert plan_reconciled.session_audit_trace["persistence_status"] == "reconciled_rebuild"
+
+        dec_after = list(
+            (
+                await session.execute(
+                    select(SessionDecisionLedger)
+                    .where(SessionDecisionLedger.thread_id == thread.id)
+                    .order_by(SessionDecisionLedger.turn_ordinal.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert dec_after[0].epistemic_status == "PROPOSED"
+        assert dec_after[0].superseded_by_id is None
+        assert dec_after[0].valid_to.year == 9999
+        assert all(
+            pt["payload"]["message_from_id"] != msg_b.id
+            and pt["payload"]["message_to_id"] != msg_b.id
+            for pt in qdrant.points[col_name].values()
+        )
+
+        # Part B: API `delete_message` immediately purges derived DB rows & Qdrant points for the thread!
+        await agent_domain.delete_message(
+            session,
+            agent.id,
+            thread.id,
+            msg_a.id,
+            owner_key=owner_key,
+        )
+        db_units_after_api_del = await session.scalar(
+            select(func.count()).select_from(SessionUnit).where(SessionUnit.thread_id == thread.id)
+        )
+        assert db_units_after_api_del == 0
+        assert len(qdrant.points[col_name]) == 0
+
+        # Re-populate via ask, then call `delete_thread` -> verifies full thread cleanup in DB + Qdrant
+        _ = await agent_domain.prepare_ask(
+            session,
+            agent=agent,
+            thread=thread,
+            query="Kiểm tra lại kế hoạch thứ Sáu?",
+            principal=principal,
+            owner_key=owner_key,
+        )
+        assert len(qdrant.points[col_name]) > 0
+        await agent_domain.delete_thread(session, agent.id, thread.id, owner_key=owner_key)
+        assert len(qdrant.points[col_name]) == 0
+
+    await q_client.aclose()
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_continuum_acl_revocation_purges_storage_and_cross_tenant_blocked_fail_closed(
+    monkeypatch,
+) -> None:
+    """Chặng 3.4: Source revocation purges persisted units & Qdrant; cross-tenant principal raises 403."""
+    monkeypatch.setattr(settings, "session_context_mode", "on")
+    monkeypatch.setattr(settings, "decision_provider", "disabled")
+
+    qdrant = _InMemoryQdrantEmulator()
+    q_client = qdrant.make_client()
+    set_custom_session_qdrant_client_factory(lambda: q_client)
+
+    engine = await _make_fk_sqlite_engine()
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    owner_key = "owner-sec-ch3"
+    principal_alpha = _principal(org_id="org-alpha", project_id="proj-alpha")
+    col_name = session_qdrant_collection_name("proj-alpha")
+    now = datetime(2026, 10, 28, 4, 0, tzinfo=UTC)
+
+    async with session_factory() as session:
+        agent = Agent(owner_key=owner_key, name="Security Agent")
+        src_secret = Source(name="Confidential M&A", sag_source_config_id="sag-mna-1")
+        src_public = Source(name="Public Handbook", sag_source_config_id="sag-pub-1")
+        session.add_all([agent, src_secret, src_public])
+        await session.flush()
+
+        map_secret = SourceProjectMapping(
+            source_id=src_secret.id,
+            organization_id="org-alpha",
+            project_id="proj-alpha",
+            state="CONFIRMED",
+            mapping_version=1,
+            confirmed_at=now,
+            confirmed_by="admin-1",
+            approval_ref="apr-sec-1",
+        )
+        map_public = SourceProjectMapping(
+            source_id=src_public.id,
+            organization_id="org-alpha",
+            project_id="proj-alpha",
+            state="CONFIRMED",
+            mapping_version=1,
+            confirmed_at=now,
+            confirmed_by="admin-1",
+            approval_ref="apr-pub-1",
+        )
+        thread = Thread(agent_id=agent.id, owner_key=owner_key, title="M&A Thread")
+        session.add_all([map_secret, map_public, thread])
+        await session.flush()
+
+        m_user = Message(
+            thread_id=thread.id,
+            role=MessageRole.USER,
+            content="Tóm tắt định giá thương vụ M&A mã TITAN-900?",
+            created_at=now,
+        )
+        m_secret = Message(
+            thread_id=thread.id,
+            role=MessageRole.ASSISTANT,
+            content="Thương vụ TITAN-900 có mức định giá trần là 82.5 triệu USD.",
+            citations=[{"n": 1, "source_id": src_secret.id, "chunk_id": "chk-mna"}],
+            created_at=now + timedelta(seconds=15),
+        )
+        session.add_all([m_user, m_secret])
+        await session.commit()
+
+        # 1. While CONFIRMED, `m_secret` is indexed in DB & Qdrant
+        _ = await agent_domain.prepare_ask(
+            session,
+            agent=agent,
+            thread=thread,
+            query="Mức định giá trần của TITAN-900 là bao nhiêu?",
+            principal=principal_alpha,
+            owner_key=owner_key,
+        )
+        assert any(
+            src_secret.id in pt["payload"]["cited_source_ids"]
+            for pt in qdrant.points[col_name].values()
+        )
+
+        # 2. Temporary per-turn `@src_public` filter excludes `m_secret` from prompt WITHOUT wiping DB!
+        plan_scoped = await agent_domain.prepare_ask(
+            session,
+            agent=agent,
+            thread=thread,
+            query="Mức định giá trần của TITAN-900 là bao nhiêu?",
+            source_ids=[src_public.id],
+            principal=principal_alpha,
+            owner_key=owner_key,
+        )
+        assert "82.5 triệu USD" not in json.dumps(plan_scoped.messages, ensure_ascii=False)
+        still_persisted = await session.scalar(
+            select(func.count())
+            .select_from(SessionUnit)
+            .where(SessionUnit.message_from_id == m_secret.id)
+        )
+        assert still_persisted and still_persisted >= 1
+
+        # 3. Cross-tenant / cross-project principal attempting access on `thread.id` -> ForbiddenError!
+        attacker_principal = _principal(org_id="org-evil", project_id="proj-evil")
+        with pytest.raises(ForbiddenError):
+            await agent_domain.prepare_ask(
+                session,
+                agent=agent,
+                thread=thread,
+                query="Đọc lén TITAN-900?",
+                principal=attacker_principal,
+                owner_key=owner_key,
+            )
+
+        # 4. Project-level REVOCATION of `src_secret` -> purges `m_secret` from DB AND Qdrant!
+        map_secret.state = "REVOKED"
+        map_secret.revoked_at = datetime.now(UTC)
+        map_secret.revoked_by = "sec-ops"
+        map_secret.revocation_ref = "rev-sec-1"
+        await session.commit()
+
+        plan_revoked = await agent_domain.prepare_ask(
+            session,
+            agent=agent,
+            thread=thread,
+            query="Mức định giá trần của TITAN-900 là bao nhiêu?",
+            principal=principal_alpha,
+            owner_key=owner_key,
+        )
+        assert plan_revoked.session_audit_trace is not None
+        assert plan_revoked.session_audit_trace["persistence_status"] == "reconciled_rebuild"
+        assert "82.5 triệu USD" not in json.dumps(plan_revoked.messages, ensure_ascii=False)
+
+        revoked_db_units = await session.scalar(
+            select(func.count())
+            .select_from(SessionUnit)
+            .where(SessionUnit.message_from_id == m_secret.id)
+        )
+        assert revoked_db_units == 0
+        assert all(
+            src_secret.id not in pt["payload"]["cited_source_ids"]
+            for pt in qdrant.points[col_name].values()
+        )
+
+    await q_client.aclose()
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_embedding_signature_drift_recreates_qdrant_and_orphan_reconciler(
+    monkeypatch,
+) -> None:
+    """Chặng 3.5: Embedding model signature change recreates derived Qdrant dim & orphan reconciler."""
+    monkeypatch.setattr(settings, "session_context_mode", "on")
+    monkeypatch.setattr(settings, "decision_provider", "disabled")
+
+    qdrant = _InMemoryQdrantEmulator()
+    q_client = qdrant.make_client()
+    set_custom_session_qdrant_client_factory(lambda: q_client)
+
+    engine = await _make_fk_sqlite_engine()
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    owner_key = "owner-drift-ch3"
+    principal = _principal(project_id="proj-drift")
+    col_name = session_qdrant_collection_name("proj-drift")
+    now = datetime(2026, 10, 28, 5, 0, tzinfo=UTC)
+
+    async with session_factory() as session:
+        agent = Agent(owner_key=owner_key, name="Drift Agent")
+        session.add(agent)
+        await session.flush()
+        thread = Thread(agent_id=agent.id, owner_key=owner_key, title="Model Drift Thread")
+        session.add(thread)
+        await session.flush()
+
+        m0 = Message(
+            thread_id=thread.id,
+            role=MessageRole.USER,
+            content="Chốt ngưỡng cảnh báo độ trễ p95 của API là 250ms.",
+            created_at=now,
+        )
+        m_ask = Message(
+            thread_id=thread.id,
+            role=MessageRole.USER,
+            content="Ngưỡng p95 là bao nhiêu?",
+            created_at=now + timedelta(seconds=10),
+        )
+        session.add_all([m0, m_ask])
+        await session.commit()
+
+        # 1. Default deterministic_ngram (`dim=256`, `deterministic-ngram-v1`)
+        pack_det = await prepare_session_context_for_ask(
+            session,
+            thread_id=thread.id,
+            exclude_message_id=m_ask.id,
+            query="Ngưỡng p95 là bao nhiêu?",
+            principal=principal,
+            owner_key=owner_key,
+            requested_source_ids=None,
+            budget_tokens=800,
+            embedder=None,
+            qdrant_client=q_client,
+        )
+        assert pack_det.audit_trace.persistence_status == "lazy_backfill"
+        assert qdrant.collections[col_name]["vectors"]["content_vector"]["size"] == 256
+
+        # 2. Switch to HTTP embedder (`http:BAAI/bge-m3`, `dim=64`) WITHOUT clearing warm cache!
+        bge_embedder = _CountingHttpModelEmbedder(model="BAAI/bge-m3", dim=64)
+        pack_bge = await prepare_session_context_for_ask(
+            session,
+            thread_id=thread.id,
+            exclude_message_id=m_ask.id,
+            query="Ngưỡng p95 là bao nhiêu?",
+            principal=principal,
+            owner_key=owner_key,
+            requested_source_ids=None,
+            budget_tokens=800,
+            embedder=bge_embedder,
+            qdrant_client=q_client,
+        )
+        assert pack_bge.audit_trace.persistence_status == "reconciled_rebuild"
+        assert qdrant.collections[col_name]["vectors"]["content_vector"]["size"] == 64
+        sigs = set(
+            (
+                await session.execute(
+                    select(SessionUnit.embedding_model_signature).where(SessionUnit.thread_id == thread.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert sigs == {"http:BAAI/bge-m3"}
+
+        # 3. Inject 2 orphan Qdrant points and run `reconcile_orphan_session_units`
+        valid_count_before = len(qdrant.points[col_name])
+        for _idx in range(2):
+            fake_pid = str(uuid.uuid4())
+            qdrant.points[col_name][fake_pid] = {
+                "id": fake_pid,
+                "payload": {
+                    "session_unit_id": str(uuid.uuid4()),
+                    "thread_id": thread.id,
+                    "project_id": "proj-drift",
+                },
+                "vector": {"content_vector": [0.0] * 64, "bm25_sparse": {"indices": [], "values": []}},
+            }
+        assert len(qdrant.points[col_name]) == valid_count_before + 2
+
+        rec_result = await reconcile_orphan_session_units(
+            session,
+            q_client,
+            project_id="proj-drift",
+        )
+        assert rec_result["scanned"] == valid_count_before + 2
+        assert rec_result["orphans_deleted"] == 2
+        assert len(qdrant.points[col_name]) == valid_count_before
+
+    await q_client.aclose()
+    await engine.dispose()

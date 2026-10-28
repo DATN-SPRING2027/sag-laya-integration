@@ -281,6 +281,8 @@ class Settings(BaseSettings):
     session_context_mode: Literal["off", "shadow", "on"] = "off"
     session_context_scope: Literal["thread", "project_owner"] = "thread"
     session_context_embedding_mode: Literal["zero_cost_local", "configured_http"] = "zero_cost_local"
+    session_context_persistence_enabled: bool = True
+    session_context_qdrant_sync_enabled: bool = True
     session_context_max_messages: int = Field(default=5000, ge=50, le=50000)
     session_context_full_audit_max_batches: int = Field(default=6, ge=1, le=20)
     decision_provider: Literal["siliconflow", "disabled"] = "siliconflow"

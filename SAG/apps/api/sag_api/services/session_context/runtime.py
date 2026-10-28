@@ -1,11 +1,14 @@
 """Runtime integration bridging PostgreSQL `messages`, Continuum ACL, SiliconFlow routing,
-and the SAG-ECCE Session Context Engine (`off` | `shadow` | `on`).
+durable multi-view persistence (`session_*` + Qdrant `session_units_{project_id}`), and the
+SAG-ECCE Session Context Engine (`off` | `shadow` | `on`).
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+from collections.abc import Collection
+from datetime import timedelta
 from typing import Any
 
 import httpx
@@ -13,6 +16,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.config import settings
+from sag_api.core.errors import ForbiddenError
 from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal
 from sag_api.db.models.agent import Message
@@ -20,6 +24,14 @@ from sag_api.enums import MessageRole, MessageStatus
 from sag_api.services.decision_router import route_query
 from sag_api.services.session_context.models import AblationMode, ContextAuditTrace, SessionContextPack
 from sag_api.services.session_context.optimizer import build_ecce_context_pack
+from sag_api.services.session_context.persistence import (
+    PersistenceSyncStats,
+    _is_missing_session_tables_error,
+    compute_embedding_signature,
+    hydrate_or_backfill_cold_session_index,
+    resolve_persistence_scope,
+    sync_session_index_to_storage,
+)
 from sag_api.services.session_context.substrate import SESSION_INDEX_CACHE
 
 log = get_logger("sag.session_context")
@@ -78,10 +90,11 @@ def resolve_session_embedder(explicit_embedder: Any | None = None) -> Any | None
 def log_session_audit_trace(thread_id: str, trace: ContextAuditTrace) -> None:
     """Emit structured telemetry log for `shadow` and `on` observability."""
     log.info(
-        "ECCE session context trace thread=%s mode=%s scope=%s temporal=%s turns=%d "
-        "ev_tokens=%d recent_tokens=%d budget=%d selected=%d rejected=%d latency_ms=%.2f",
+        "ECCE session context trace thread=%s mode=%s persistence=%s scope=%s temporal=%s "
+        "turns=%d ev_tokens=%d recent_tokens=%d budget=%d selected=%d rejected=%d latency_ms=%.2f",
         thread_id,
         trace.mode,
+        trace.persistence_status,
         trace.memory_scope,
         trace.temporal_mode,
         trace.total_indexed_turns,
@@ -103,14 +116,12 @@ def _compute_scope_signature(
     *,
     owner_key: str,
     principal: VerifiedPrincipal,
-    requested_source_ids: list[str] | None,
 ) -> str:
     tenant_id = str(getattr(principal, "tenant_id", "") or "")
     org_id = str(getattr(principal, "organization_id", "") or "")
     projects = ",".join(sorted(getattr(principal, "allowed_project_ids", ()) or ()))
     partitions = ",".join(sorted(getattr(principal, "allowed_partition_ids", ()) or ()))
-    req_part = ",".join(sorted(requested_source_ids)) if requested_source_ids is not None else "*ALL*"
-    raw = f"{tenant_id}|{org_id}|{projects}|{partitions}|{owner_key}|{req_part}"
+    raw = f"{tenant_id}|{org_id}|{projects}|{partitions}|{owner_key}|*PROJECT*"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
@@ -137,6 +148,7 @@ async def load_full_thread_messages_keyset(
     *,
     thread_id: str,
     exclude_id: str | None = None,
+    exclude_ids: Collection[str] | None = None,
     max_messages: int | None = None,
     after_created_at: Any | None = None,
     after_id: str | None = None,
@@ -146,7 +158,13 @@ async def load_full_thread_messages_keyset(
     if hard_cap <= 0:
         return []
     collected: list[Message] = []
-    last_created_at = after_created_at
+    # Subtract 1us on initial cursor when `exclude_ids` is used so SQLite 1s `CURRENT_TIMESTAMP`
+    # strings ("YYYY-MM-DD HH:MM:SS") compare `>` against Python `.999999` parameters cleanly.
+    last_created_at = (
+        after_created_at - timedelta(microseconds=1)
+        if (after_created_at is not None and exclude_ids is not None and after_id == "")
+        else after_created_at
+    )
     last_id = after_id
 
     while len(collected) < hard_cap:
@@ -158,6 +176,8 @@ async def load_full_thread_messages_keyset(
         )
         if exclude_id:
             stmt = stmt.where(Message.id != exclude_id)
+        if exclude_ids:
+            stmt = stmt.where(Message.id.notin_(list(exclude_ids)))
         if last_created_at is not None and last_id is not None:
             stmt = stmt.where(
                 or_(
@@ -220,7 +240,6 @@ async def _cached_sources_still_authorized(
     *,
     cached_source_ids: set[str],
     principal: VerifiedPrincipal,
-    requested_source_ids: list[str] | None,
 ) -> bool:
     if not cached_source_ids:
         return True
@@ -231,8 +250,6 @@ async def _cached_sources_still_authorized(
         principal=principal,
         requested_source_ids=sorted(cached_source_ids),
     )
-    if requested_source_ids is not None:
-        authorized.intersection_update(requested_source_ids)
     return cached_source_ids.issubset(authorized)
 
 
@@ -248,17 +265,19 @@ async def prepare_session_context_for_ask(
     budget_tokens: int,
     ablation: AblationMode = "V5_ecce_full",
     embedder: Any | None = None,
+    qdrant_client: httpx.AsyncClient | None = None,
 ) -> SessionContextPack:
-    """Build ACL-enforced, SiliconFlow-routed ECCE context pack with O(Delta) DB cursor reads."""
+    """Build ACL-enforced, SiliconFlow-routed, durably-synced ECCE context pack."""
     from sag_api.services.agent_domain import filter_messages_for_scope
 
+    caller_had_pending_state = bool(session.new or session.dirty or session.deleted)
     active_embedder = resolve_session_embedder(embedder)
+    target_emb_sig = compute_embedding_signature(active_embedder)
     projects_sig = ",".join(sorted(getattr(principal, "allowed_project_ids", ()) or ())) or "default"
     scope_key = f"{projects_sig}:{owner_key}"
     scope_sig = _compute_scope_signature(
         owner_key=owner_key,
         principal=principal,
-        requested_source_ids=requested_source_ids,
     )
     index = SESSION_INDEX_CACHE.get_or_create(
         scope_key=scope_key,
@@ -271,7 +290,9 @@ async def prepare_session_context_for_ask(
         and index.last_db_created_at is not None
         and index.last_db_id is not None
         and not index.had_hidden_acl_turns
+        and index.persisted_embedding_signature == target_emb_sig
     )
+    db_count = 0
     if can_use_delta:
         db_count = await count_thread_messages(
             session,
@@ -282,7 +303,6 @@ async def prepare_session_context_for_ask(
             session,
             cached_source_ids=index.cached_cited_source_ids,
             principal=principal,
-            requested_source_ids=requested_source_ids,
         )
         if db_count < index.seen_db_count or not sources_ok:
             SESSION_INDEX_CACHE.invalidate_thread(thread_id)
@@ -293,48 +313,127 @@ async def prepare_session_context_for_ask(
             )
             can_use_delta = False
 
+    persistence_stats = PersistenceSyncStats(status="memory_only")
+    delta_raw: list[Message] = []
+
     if can_use_delta:
+        # Exclude already-seen IDs sharing the boundary second (`boundary_ts_ids`) so 1s-granularity
+        # timestamps + random UUID4s return ONLY genuine unseen delta rows in 1 cursor query.
         remaining_cap = max(0, settings.session_context_max_messages - index.seen_db_count)
-        delta_raw = await load_full_thread_messages_keyset(
+        fetched_tail = await load_full_thread_messages_keyset(
             session,
             thread_id=thread_id,
             exclude_id=exclude_message_id,
+            exclude_ids=index.boundary_ts_ids,
             max_messages=remaining_cap,
             after_created_at=index.last_db_created_at,
-            after_id=index.last_db_id,
+            after_id="",
         )
+        delta_raw = [m for m in fetched_tail if str(m.id) not in index.seen_raw_ids]
+        expected_total = min(settings.session_context_max_messages, db_count)
+        if len(index.seen_raw_ids) + len(delta_raw) != expected_total:
+            # Prefix deletion (e.g. raw SQL DELETE + new ask) or out-of-order backdated insert -> reconcile!
+            SESSION_INDEX_CACHE.invalidate_thread(thread_id)
+            index = SESSION_INDEX_CACHE.get_or_create(
+                scope_key=scope_key,
+                thread_id=thread_id,
+                scope_signature=scope_sig,
+            )
+            can_use_delta = False
+
+    if can_use_delta:
         if delta_raw:
             delta_scoped = await filter_messages_for_scope(
                 session,
                 delta_raw,
                 principal=principal,
-                requested_source_ids=requested_source_ids,
+                requested_source_ids=None,
             )
             delta_records, delta_hidden = _extract_visible_records(delta_scoped)
             if delta_hidden:
                 index.had_hidden_acl_turns = True
-            await index.append_messages(delta_records, embedder=active_embedder)
-            index.last_db_created_at = delta_raw[-1].created_at
-            index.last_db_id = str(delta_raw[-1].id)
-            index.seen_db_count += len(delta_raw)
-        allowed_turn_ids = set(index.turns_by_id.keys())
-    else:
-        raw_messages = await load_full_thread_messages_keyset(
-            session,
-            thread_id=thread_id,
-            exclude_id=exclude_message_id,
-        )
-        scoped_messages = await filter_messages_for_scope(
-            session,
-            raw_messages,
-            principal=principal,
-            requested_source_ids=requested_source_ids,
-        )
-        visible_records, had_hidden = _extract_visible_records(scoped_messages)
-        allowed_turn_ids = {r["id"] for r in visible_records}
 
-        stale_cached_ids = set(index.turns_by_id.keys()) - allowed_turn_ids
-        if stale_cached_ids:
+            prev_turn_count = len(index.turns)
+            prev_win_count = len(index.windows)
+            prev_ep_count = len(index.episodes)
+            prev_ep_last_len = len(index.episodes[-1].turn_ids) if index.episodes else 0
+            prev_dec_count = len(index.decision_ledger)
+            prev_turn_state = {
+                t.turn_id: (t.epistemic_status, t.superseded_by_turn_id) for t in index.turns
+            }
+
+            added = await index.append_messages(delta_records, embedder=active_embedder)
+            index.persisted_embedding_signature = target_emb_sig
+            new_last_dt = delta_raw[-1].created_at
+            if index.last_db_created_at is not None and abs(
+                (new_last_dt - index.last_db_created_at).total_seconds()
+            ) <= 1.0:
+                index.boundary_ts_ids.update(str(m.id) for m in delta_raw)
+            else:
+                index.boundary_ts_ids = {
+                    str(m.id)
+                    for m in delta_raw
+                    if abs((new_last_dt - m.created_at).total_seconds()) <= 1.0
+                }
+            index.last_db_created_at = new_last_dt
+            index.last_db_id = str(delta_raw[-1].id)
+            index.seen_raw_ids.update(str(m.id) for m in delta_raw)
+            index.seen_db_count = len(index.seen_raw_ids)
+
+            if added > 0:
+                try:
+                    scope = await resolve_persistence_scope(
+                        session,
+                        thread_id=thread_id,
+                        principal=principal,
+                        owner_key=owner_key,
+                    )
+                except ForbiddenError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    if _is_missing_session_tables_error(exc):
+                        scope = None
+                    else:
+                        raise
+
+                if scope is not None:
+                    mutated_prior_turns = {
+                        tid
+                        for tid, old_st in prev_turn_state.items()
+                        if (
+                            index.turns_by_id[tid].epistemic_status,
+                            index.turns_by_id[tid].superseded_by_turn_id,
+                        )
+                        != old_st
+                    }
+                    grown_ep_ord = (
+                        prev_ep_count - 1
+                        if prev_ep_count > 0
+                        and len(index.episodes[prev_ep_count - 1].turn_ids) > prev_ep_last_len
+                        else None
+                    )
+                    persistence_stats = await sync_session_index_to_storage(
+                        session,
+                        index=index,
+                        scope=scope,
+                        embedding_sig=target_emb_sig,
+                        mode="delta",
+                        start_turn_ordinal=prev_turn_count,
+                        start_window_ordinal=prev_win_count,
+                        start_episode_ordinal=prev_ep_count,
+                        start_decision_idx=prev_dec_count,
+                        mutated_prior_turn_ids=mutated_prior_turns,
+                        grown_episode_ordinal=grown_ep_ord,
+                        qdrant_client=qdrant_client,
+                        caller_had_pending_state=caller_had_pending_state,
+                    )
+                    persistence_stats.status = "delta_synced"
+            else:
+                persistence_stats = PersistenceSyncStats(status="warm_clean")
+        else:
+            persistence_stats = PersistenceSyncStats(status="warm_clean")
+    else:
+        if index.turns:
             SESSION_INDEX_CACHE.invalidate_thread(thread_id)
             index = SESSION_INDEX_CACHE.get_or_create(
                 scope_key=scope_key,
@@ -342,18 +441,62 @@ async def prepare_session_context_for_ask(
                 scope_signature=scope_sig,
             )
 
-        await index.append_messages(visible_records, embedder=active_embedder)
+        raw_messages = await load_full_thread_messages_keyset(
+            session,
+            thread_id=thread_id,
+            exclude_id=exclude_message_id,
+        )
+        project_scoped = await filter_messages_for_scope(
+            session,
+            raw_messages,
+            principal=principal,
+            requested_source_ids=None,
+        )
+        project_records, had_hidden = _extract_visible_records(project_scoped)
+
+        persistence_stats = await hydrate_or_backfill_cold_session_index(
+            session,
+            index=index,
+            project_records=project_records,
+            principal=principal,
+            owner_key=owner_key,
+            embedder=active_embedder,
+            qdrant_client=qdrant_client,
+            caller_had_pending_state=caller_had_pending_state,
+        )
+        index.persisted_embedding_signature = target_emb_sig
         index.had_hidden_acl_turns = had_hidden
-        index.seen_db_count = len(raw_messages)
+        index.seen_raw_ids = {str(m.id) for m in raw_messages}
+        index.seen_db_count = len(index.seen_raw_ids)
         if raw_messages:
-            index.last_db_created_at = raw_messages[-1].created_at
+            last_dt = raw_messages[-1].created_at
+            index.last_db_created_at = last_dt
             index.last_db_id = str(raw_messages[-1].id)
+            index.boundary_ts_ids = {
+                str(m.id)
+                for m in raw_messages
+                if last_dt is not None
+                and m.created_at is not None
+                and abs((last_dt - m.created_at).total_seconds()) <= 1.0
+            }
+
+    if requested_source_ids is None:
+        allowed_turn_ids = set(index.turns_by_id.keys())
+    else:
+        req_src_set = set(requested_source_ids)
+        allowed_turn_ids = {
+            t.turn_id
+            for t in index.turns
+            if t.role != "assistant" or set(t.cited_source_ids).issubset(req_src_set)
+        }
 
     # SiliconFlow System One routing (run off event loop; deterministic fallback if disabled/unconfigured)
     route_ctx = {
         "has_thread_history": bool(allowed_turn_ids),
         "turn_count": len(allowed_turn_ids),
-        "active_decisions_count": len(index.active_decisions),
+        "active_decisions_count": len(
+            [d for d in index.active_decisions if d.turn_id in allowed_turn_ids]
+        ),
     }
     decision = await asyncio.to_thread(route_query, query, route_ctx)
 
@@ -368,4 +511,7 @@ async def prepare_session_context_for_ask(
         keep_recent_default=settings.history_keep_recent,
         legacy_load_limit=settings.history_load_limit,
     )
+    pack.audit_trace.persistence_status = persistence_stats.status
+    pack.audit_trace.persisted_units_written = persistence_stats.units_written
+    pack.audit_trace.qdrant_points_upserted = persistence_stats.qdrant_points_upserted
     return pack

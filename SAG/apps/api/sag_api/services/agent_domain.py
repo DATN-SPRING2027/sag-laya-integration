@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sag_api.branding import DEFAULT_AGENT_AVATAR, DEFAULT_AGENT_NAME
 from sag_api.core.config import settings
 from sag_api.core.error_taxonomy import ErrorCode
-from sag_api.core.errors import ConflictError, NotFoundError, ValidationError
+from sag_api.core.errors import ConflictError, ForbiddenError, NotFoundError, ValidationError
 from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal
 from sag_api.db.models import Agent, AgentBinding, Message, Source, Thread
@@ -26,9 +26,12 @@ from sag_api.enums import BindingTargetType, MessageRole, MessageStatus
 from sag_api.generation import build_agent_messages, build_prompt_preview
 from sag_api.generation.prompt import estimate_tokens
 from sag_api.services.session_context import (
+    collect_thread_persistence_projects,
     invalidate_session_thread_cache,
     log_session_audit_trace,
     prepare_session_context_for_ask,
+    purge_thread_qdrant_points_for_projects,
+    purge_thread_session_rows,
 )
 from sag_api.services.source_service import get_authorized_source_ids, search_source_candidates
 
@@ -382,9 +385,14 @@ async def get_thread(session: AsyncSession, agent_id: str, thread_id: str, *, ow
 
 async def delete_thread(session: AsyncSession, agent_id: str, thread_id: str, *, owner_key: str) -> None:
     thread = await get_thread(session, agent_id, thread_id, owner_key=owner_key)
+    persisted_projects = await collect_thread_persistence_projects(session, thread_id=thread.id)
+    await purge_thread_session_rows(session, thread_id=thread.id)
     await session.delete(thread)
     invalidate_session_thread_cache(thread.id)
     await session.commit()
+    await purge_thread_qdrant_points_for_projects(
+        session, thread_id=thread.id, project_ids=persisted_projects
+    )
 
 
 async def list_messages_page(
@@ -667,6 +675,8 @@ async def _resolve_session_history(
             dict(pack.audit_trace.route_decision),
             list(pack.session_citations),
         )
+    except ForbiddenError:
+        raise
     except Exception as exc:  # noqa: BLE001 - graceful fallback to bounded legacy window on unexpected error
         _log.warning("ECCE session context fallback to legacy history (%s)", type(exc).__name__)
         fallback_hist = legacy_history or await _history(
@@ -791,9 +801,14 @@ async def delete_message(
     message = await session.get(Message, message_id)
     if message is None or message.thread_id != thread.id:
         raise NotFoundError("Message not found")
+    persisted_projects = await collect_thread_persistence_projects(session, thread_id=thread.id)
+    await purge_thread_session_rows(session, thread_id=thread.id)
     await session.delete(message)
     invalidate_session_thread_cache(thread.id)
     await session.commit()
+    await purge_thread_qdrant_points_for_projects(
+        session, thread_id=thread.id, project_ids=persisted_projects
+    )
 
 
 async def persist_answer(

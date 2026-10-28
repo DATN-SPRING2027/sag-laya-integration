@@ -206,6 +206,9 @@ class IncrementalSessionIndex:
         self.seen_db_count: int = 0
         self.cached_cited_source_ids: set[str] = set()
         self.had_hidden_acl_turns: bool = False
+        self.persisted_embedding_signature: str = ""
+        self.seen_raw_ids: set[str] = set()
+        self.boundary_ts_ids: set[str] = set()
 
     @property
     def active_decisions(self) -> list[DecisionLedgerEntry]:

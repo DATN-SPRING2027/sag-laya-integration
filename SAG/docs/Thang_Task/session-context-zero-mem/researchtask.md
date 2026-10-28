@@ -296,3 +296,64 @@ Qua kiểm tra trực tiếp `sag_api/db/models/agent.py`, `sag_api/db/models/so
 - **PostgreSQL 16 live (`sag-db-1`):**
   - `PG16_SQL_MIGRATION_QA_PASSED`: Chạy `0009_session_context_ecce.sql` lặp 2 lần idempotent, chặn FK chéo tenant/thread, xóa tin giữa `mB` tự động xóa sạch `WINDOW` `wABC` + `session_decision_ledger` + `session_graph_edges`, chạy `0009_session_context_ecce_down.sql` xóa sạch 5 trigger + 5 function + 4 bảng dẫn xuất trong khi giữ nguyên `messages`, chạy lại `0009_*.sql` thành công và dọn sạch schema tạm `sag_ecce_migration_qa_temp`.
   - `PG16_ORM_COMPILED_DDL_QA_PASSED`: Kiểm chứng DDL PostgreSQL biên dịch từ `Base.metadata.create_all` trên `sag-db-1` (`sag_ecce_orm_qa_temp`) cấp đúng default `'[]'` cho `sentences_json` ở tầng DB và kích hoạt cascade xóa tin giữa `mB` đồng nhất 100% với file SQL migration.
+
+
+---
+
+## 12. Chặng 3 (`feat/Thang-ecce-multiview-persistence-be-api`) — Multi-View Durable Persistence, Cold-Start Hydration, Lazy Backfill & Qdrant Sync
+
+- **Ngày thực hiện:** 2026-10-28
+- **Nhánh thực hiện:** `feat/Thang-ecce-multiview-persistence-be-api` (tách mới trực tiếp từ `origin/main` @ `e86f308` sau khi merge PR #43)
+- **Phạm vi PR (`-be-api` thuần túy theo `AGENTS.md`):**
+  - Nối lưu trữ bền vững hai chiều giữa `IncrementalSessionIndex` (RAM) ↔ **PostgreSQL** (`session_units`, `session_unit_messages`, `session_decision_ledger`, `session_graph_edges`) ↔ **Qdrant** (`session_units_{project_id}`), kèm **Cold-Start Hydration**, **Lazy Backfill** cho phiên hội thoại cũ, **O(Δ) Incremental Sync** cho phiên đang chạy, và dọn dẹp tức thì trên cả PostgreSQL lẫn Qdrant khi xóa tin nhắn / xóa hội thoại / thu hồi quyền nguồn dữ liệu.
+  - **0 chỉnh sửa migration hoặc SQLAlchemy model** (`migrations/0001..0009` và `sag_api/db/models/session_context.py` giữ nguyên 100%); **0 chỉnh sửa Frontend** (dành cho Chặng 4 `-fe-ui`).
+
+### 12.1. Phân Tích Hợp Đồng Hiện Hữu & Ranh Giới Bảo Mật / Toàn Vẹn
+
+1. **Giải quyết phạm vi `(tenant_id, project_id)` theo nguyên tắc Fail-Closed (`resolve_persistence_scope`):**
+   - Trong luồng Continuum chuẩn (`principal_assertion.py:449–518`), `VerifiedPrincipal` mang `tenant_id == organization_id` và `allowed_project_ids = frozenset({project_id})` (1 project duy nhất).
+   - Nếu `session_units` đã có bản ghi của `thread_id`: đối chiếu chặt `existing_tenant_id == principal_tenant` và `existing_project_id in principal.allowed_project_ids`; nếu lệch quyền thì **từ chối đọc/ghi bền vững (fail-closed)**.
+   - Nếu `session_units` chưa có bản ghi và `len(principal.allowed_project_ids) > 1`: chỉ ghi bền vững khi `requested_source_ids` phân giải qua `SourceProjectMapping` về đúng **1** `project_id` hợp lệ; nếu vẫn mơ hồ (`0` hoặc `>= 2` project), giữ chỉ mục tạm trong RAM của lượt đó thay vì đoán `project_id`.
+2. **Tách biệt phạm vi lưu trữ cấp Project và bộ lọc `@source_ids` theo từng câu hỏi:**
+   - Dữ liệu bền vững trong `session_units` và `session_units_{project_id}` được lập chỉ mục trên tập tin nhắn được phép ở **cấp Project** (`filter_messages_for_scope(..., requested_source_ids=None)`), để việc người dùng tạm thời lọc `@source_A` ở một câu hỏi không làm xô lệch `ordinal` hay xóa nhầm chỉ mục của `@source_B`.
+   - Tại thời điểm truy xuất của từng câu hỏi, `allowed_turn_ids` vẫn áp dụng đầy đủ cả quyền Project hiện hành lẫn `requested_source_ids` của câu hỏi đó (`ACL Leak Rate = 0.0%`).
+   - **Data Minimization chống lộ văn bản gốc:** Payload Qdrant `session_units_{project_id}` và `SessionUnit.sentences_json` **không lưu bản sao nội dung câu trả lời thô** (`sentences_json` chỉ lưu span ký tự `(start, end)` + `entity_keys`; nội dung văn bản luôn được hydrate trực tiếp từ bảng `messages` sau khi đã đi qua `filter_messages_for_scope`).
+3. **Tuân thủ tuyệt đối các trigger bất biến của Chặng 2 (`0009_session_context_ecce.sql`):**
+   - `TURN` mới (`K .. N-1`) và `WINDOW` mới được `INSERT` tăng dần (`O(Δ)`), tự động kích hoạt `trg_session_units_after_insert_link` điền `session_unit_messages`.
+   - Khi một `TURN` mới thay thế (`SUPERSEDES`) quyết định của `TURN` cũ `j < K`: chỉ `UPDATE` `epistemic_status = 'SUPERSEDED'` và `valid_to` (không chạm các cột định danh bất biến), và cập nhật `session_decision_ledger` theo đúng thứ tự flush (`insert d_new(supersedes_id=d_old.id) -> flush -> d_old.superseded_by_id = d_new.id`).
+   - Khi `EPISODE` đang mở kéo dài thêm lượt mới (`message_to_id` và `source_message_ids_json` thay đổi): thực hiện `DELETE` hàng `EPISODE` cũ rồi `INSERT` hàng `EPISODE` mới trong cùng transaction (giữ nguyên deterministic UUIDv5 `id` & `qdrant_point_id`), tuân thủ 100% `trg_session_units_before_update_guard`.
+4. **Dọn dẹp đồng bộ PostgreSQL + Qdrant khi `delete_message` / `delete_thread` / SQL Delete:**
+   - Khi xóa tin nhắn ở giữa phiên (`mB`), ngoài việc cascade xóa `uB` và `wABC`, các lượt phía sau (`mC`) bị đổi `ordinal` và lượt phía trước (`uA`) có thể không còn bị `mB` thay thế nữa. Do đó:
+     - `agent_domain.delete_message` và `agent_domain.delete_thread` thu thập `project_id` của `thread_id`, dọn sạch các bản ghi dẫn xuất của `thread_id`, xóa toàn bộ point thuộc `thread_id` trên Qdrant `session_units_{project_id}`, và xóa cache RAM.
+     - Ngay cả khi tin nhắn bị xóa trực tiếp bằng SQL ngoài API, bước kiểm tra tiền tố (`prefix & content_hash & embedding_model_signature check`) ở lượt hỏi kế tiếp tự động phát hiện độ lệch `ordinal`, tái lập sạch 4 bảng dẫn xuất của `thread_id` và dọn sạch các Qdrant point mồ côi của `thread_id`.
+
+### 12.2. Danh Sách Thay Đổi Dự Kiến & Ma Trận Kiểm Thử Chặng 3
+
+| File | Hành động | Mục đích |
+|---|---|---|
+| `SAG/apps/api/sag_api/core/config.py` | Cập nhật nhỏ | Bổ sung `session_context_persistence_enabled: bool = True` và `session_context_qdrant_sync_enabled: bool = True`. |
+| `SAG/.env.example` | Cập nhật nhỏ | Đồng bộ chú thích biến môi trường persistence & Qdrant sync của Chặng 3. |
+| `SAG/apps/api/sag_api/services/session_context/models.py` | Cập nhật tương thích ngược | Bổ sung telemetry `persistence_status`, `persisted_units_written`, `qdrant_points_upserted` vào `ContextAuditTrace`. |
+| `SAG/apps/api/sag_api/services/session_context/substrate.py` | Cập nhật nhỏ | Bổ sung `persisted_embedding_signature`, `seen_raw_ids`, `boundary_ts_ids` trên `IncrementalSessionIndex` để kiểm chứng tính toàn vẹn O(Δ) và khử lệch biên giây `CURRENT_TIMESTAMP` + UUID4. |
+| `SAG/apps/api/sag_api/services/session_context/persistence.py` | Tạo mới | Dịch vụ đồng bộ hai chiều `IncrementalSessionIndex` ↔ PostgreSQL (4 bảng) ↔ Qdrant (`session_units_{project_id}`), Cold-Start Hydration, Lazy Backfill, O(Δ) Sync, Delete Purge & Orphan Reconciliation. |
+| `SAG/apps/api/sag_api/services/session_context/runtime.py` | Cập nhật | Tích hợp Cold-Start Hydration + Lazy Backfill + O(Δ) Persistence vào `prepare_session_context_for_ask` và helper dọn dẹp khi xóa message/thread. |
+| `SAG/apps/api/sag_api/services/session_context/__init__.py` | Cập nhật nhỏ | Export các hàm public của `persistence.py`. |
+| `SAG/apps/api/sag_api/services/agent_domain.py` | Cập nhật nhỏ | Gọi dọn dẹp bền vững PostgreSQL + Qdrant trong `delete_message` và `delete_thread`; bảo toàn fail-closed `ForbiddenError` ở chế độ `on`. |
+| `SAG/apps/api/tests/test_session_context_persistence.py` | Tạo mới | Kiểm thử toàn diện Chặng 3: Lazy Backfill phiên cũ, O(Δ) append, Cold-Start Hydration (`0` HTTP embedder calls cho lịch sử cũ), đồng bộ Qdrant `session_units_{project_id}` (dense + sparse BM25 + payload không chứa raw text), khôi phục trạng thái quyết định khi xóa tin giữa `WINDOW`, thu hồi ACL fail-closed, đổi `embedding_model_signature`, và `reconcile_orphan_session_units`. |
+
+**Tiêu chí nghiệm thu Chặng 3 (Đã hoàn thành 100%):**
+- [x] `0` thay đổi trên `migrations/` và `sag_api/db/models/`.
+- [x] Kiểm chứng cả unit/integration tests (`pytest tests -q`, `ruff check`) lẫn kiểm thử thực tế với **PostgreSQL 16 live (`sag-db-1`) + Qdrant v1.14.1 live (`sag-qdrant-1`)** trên schema/collection tạm cô lập rồi dọn sạch 100%.
+- [x] Cold-start worker restart hydrate trực tiếp từ PostgreSQL + Qdrant với **`0` lần gọi lại HTTP Embedder** cho các lượt lịch sử đã lưu (`hydrated_clean` / `hydrated_delta`).
+- [x] Xóa tin nhắn ở giữa `WINDOW` `A–B–C` (qua cả API `delete_message` lẫn raw SQL `DELETE`) hoặc xóa `Thread` dọn sạch cả PostgreSQL lẫn Qdrant `session_units_{project_id}` và phục hồi đúng trạng thái quyết định của các lượt còn lại (`PROPOSED`, open-ended `valid_to`).
+
+### 12.3. Kết Quả Kiểm Chứng Thực Nghiệm Chặng 3
+
+1. **Phát hiện & xử lý thêm 2 góc khuất thực tế trong quá trình tự kiểm thử:**
+   - **Phát hiện đối chiếu đếm phần bù `len(seen_raw_ids) + len(delta_raw) == expected_total`:** Khi một tin nhắn ở giữa phiên bị xóa trực tiếp bằng raw SQL đồng thời có 1 câu hỏi mới chèn vào khiến tổng số hàng `db_count` giữ nguyên (`3 - 1 + 1 = 3`), phép kiểm tra đơn giản `db_count < seen_db_count` sẽ bị đánh lừa; đẳng thức bất biến trên `seen_raw_ids` phát hiện 100% độ lệch tiền tố với chi phí `O(1)` và kích hoạt `reconciled_rebuild` ngay lập tức.
+   - **Khử lỗi so sánh chuỗi `CURRENT_TIMESTAMP` độ phân giải 1 giây + UUID4 ngẫu nhiên trên SQLite:** Kết hợp `boundary_ts_ids` (`Message.id.notin_(boundary_ts_ids)`) với biên lùi `1µs` trên truy vấn con trỏ `O(Δ)` giúp không bỏ sót tin nhắn tạo trong cùng một giây đồng thời không quét thừa các hàng đã thấy, và dọn sạch `session.identity_map` (`_expunge_derived_from_identity_map`) khi thay thế `EPISODE` đang mở (`0` `SAWarning`).
+2. **Kết quả chạy Quality Gate & Live QA:**
+   - **`ruff check`:** `.\.venv\Scripts\python.exe -m ruff check sag_api/core/config.py sag_api/services/session_context tests/test_session_context_persistence.py tests/test_ecce_session_context.py tests/test_session_context_schema.py` và `ruff check --ignore E501 sag_api/services/agent_domain.py` → **`All checks passed!`** (`0` lỗi, `0` cảnh báo).
+   - **`pytest` toàn bộ API:** `.\.venv\Scripts\python.exe -m pytest tests -q` → **`107 passed, 1 skipped in 27.79s`** (`0` warning từ SQLAlchemy).
+   - **End-to-End Live PostgreSQL 16 (`sag-db-1`) + Live Qdrant v1.14.1 (`sag-qdrant-1`):** `LIVE_PG16_AND_QDRANT_CH3_QA_PASSED` trên schema tạm cô lập `sag_ecce_ch3_qa_temp` (chạy trực tiếp `0009_session_context_ecce.sql`) và collection tạm `session_units_proj_ecce_ch3_qa_temp` có xác thực `api-key`, kiểm chứng đầy đủ Lazy Backfill (`7` points dense+sparse, `0` raw text trong payload), `O(Δ)` `delta_synced` với trigger-safe grown `EPISODE`, Cold-Start `hydrated_clean`, xóa tin giữa `m_b` bằng raw SQL → `reconciled_rebuild` khôi phục `PROPOSED`, `reconcile_orphan_session_units`, `delete_thread` xóa sạch `0` bản ghi còn sót, và đã `DROP SCHEMA ... CASCADE` + `DELETE /collections/...` sạch 100%.
+
