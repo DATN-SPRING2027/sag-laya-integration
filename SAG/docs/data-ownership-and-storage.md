@@ -26,6 +26,7 @@
 | Permission/capability | BE | MongoDB | Không tin tưởng permission do frontend tự gửi |
 | SAG source/document/job | SAG | PostgreSQL | Metadata và trạng thái pipeline upload/indexing |
 | Chunk metadata/OCTX state | SAG | PostgreSQL | Dùng để truy vết và quản lý lifecycle |
+| Session context derived units / decision ledger / graph edges | SAG | PostgreSQL | Dẫn xuất từ `messages`, lưu vết chỉ mục đa góc nhìn & sổ cái quyết định lưỡng thời gian theo `thread/project scope` (`ON DELETE CASCADE`) |
 | Embedding/vector và payload chunk | SAG | Qdrant | Dùng cho similarity search và filter retrieval |
 | File upload gốc | SAG | `SAG_UPLOAD_DIR`/volume | Không lưu file gốc trong Qdrant |
 
