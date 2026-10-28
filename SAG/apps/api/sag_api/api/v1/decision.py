@@ -26,6 +26,14 @@ class DecisionRouteResponse(BaseModel):
     need_retrieval: bool = Field(..., description="Có cần tra cứu cơ sở tri thức SAG không")
     suggested_strategy: str = Field(..., description="Chiến lược tìm kiếm đề xuất: vector hoặc multi")
     domain: str = Field(..., description="Chủ đề: technical, business_hr, hoặc general")
+    memory_scope: str = Field(
+        default="project_documents",
+        description="Phạm vi bằng chứng: none, session_history, project_documents, hybrid_both, full_session_audit",
+    )
+    temporal_mode: str = Field(
+        default="atemporal",
+        description="Chế độ thời gian: current_effective, change_lineage, past_point, atemporal",
+    )
     confidence: float = Field(..., description="Độ tin cậy của mô hình")
     latency_ms: float = Field(..., description="Thời gian suy luận (mili-giây)")
     model: str = Field(..., description="Decision model used for classification")

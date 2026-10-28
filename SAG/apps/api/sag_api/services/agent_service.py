@@ -122,6 +122,7 @@ _RESEARCH_TOOL = re.compile(
 # Numeric knowledge markers are plain ``[n]``. A numeric Markdown link label
 # (``[n](https://...)``) is an external link and must not be stripped.
 _CITATION_REFERENCE = re.compile(r"\[(\d+)](?!\()")
+_SESSION_CITATION_REFERENCE = re.compile(r"\[S(\d+)](?!\()")
 _ANSWER_URL = re.compile(r"https?://[^\s<>\"'`，。；：！？、（）【】《》]+", re.IGNORECASE)
 _MAX_EXTERNAL_CITATIONS = 12
 _URL_TRAILING_PUNCTUATION = ".,;:!?)]}，。；：！？、"
@@ -143,6 +144,8 @@ async def _initial_tool_choice(
     *,
     knowledge_only: bool,
     scoped: bool,
+    route_decision: Mapping[str, Any] | None = None,
+    session_grounded: bool = False,
 ) -> str | dict[str, Any]:
     """Apply only high-confidence first-turn routing.
 
@@ -166,7 +169,7 @@ async def _initial_tool_choice(
     # Cloud decision routing is kept off the event loop; failures never block retrieval.
     try:
         from sag_api.services.decision_router import route_query
-        decision = await asyncio.to_thread(route_query, normalized)
+        decision = route_decision if route_decision is not None else await asyncio.to_thread(route_query, normalized)
         if decision.get("is_chitchat") and decision.get("confidence", 0) >= 0.65:
             return "none"
     except Exception:  # noqa: BLE001
@@ -180,6 +183,13 @@ async def _initial_tool_choice(
     )
     if temporal and "get_time" in names:
         return _named_tool_choice("get_time")
+    if (
+        session_grounded
+        and not scoped
+        and not _TIME_INTENT.search(normalized)
+        and not _TIME_ONLY_INTENT.search(normalized)
+    ):
+        return "auto"
     if (knowledge_only or scoped) and "search_context" in names:
         return _named_tool_choice("search_context")
     if _EXPLICIT_RESEARCH_INTENT.search(normalized) and any(_tool_supports_research(tool) for tool in tools):
@@ -265,6 +275,72 @@ def _finalize_answer_citations(
         )
         normalized.append(citation)
     return canonical, normalized
+
+
+def _finalize_session_citations(
+    answer: str,
+    session_citations: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]], bool]:
+    """Validate `[S1]..[Sk]` session memory markers, strip invented `[S99]`, and return used citations."""
+    if not session_citations:
+        cleaned = _SESSION_CITATION_REFERENCE.sub("", answer).strip()
+        cleaned = re.sub(r"[ \t]+([，。！？；：,.!?;:])", r"\1", cleaned)
+        return cleaned, [], False
+
+    valid_by_ref: dict[str, dict[str, Any]] = {}
+    for sc in session_citations:
+        ref = str(sc.get("ref") or "")
+        if ref.startswith("S") and ref[1:].isdigit():
+            valid_by_ref[ref] = dict(sc)
+
+    used_refs: list[str] = []
+
+    def _replace_session_ref(match: re.Match[str]) -> str:
+        ref = f"S{int(match.group(1))}"
+        if ref not in valid_by_ref:
+            return ""
+        if ref not in used_refs:
+            used_refs.append(ref)
+        return f"[{ref}]"
+
+    cleaned = _SESSION_CITATION_REFERENCE.sub(_replace_session_ref, answer).strip()
+    cleaned = re.sub(r"[ \t]+([，。！？；：,.!?;:])", r"\1", cleaned)
+    has_explicit = bool(used_refs)
+    chosen_refs = used_refs if used_refs else list(valid_by_ref)[:3]
+    return cleaned, [valid_by_ref[r] for r in chosen_refs if r in valid_by_ref], has_explicit
+
+
+def _build_session_audit_step(
+    audit_trace: Mapping[str, Any] | None,
+    *,
+    used_session_citations: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    if not isinstance(audit_trace, Mapping):
+        return None
+    audit_mode = str(audit_trace.get("mode") or "")
+    step_entry: dict[str, Any] = {
+        "kind": "session_context",
+        "step": 0,
+        "name": "session_context",
+        "mode": audit_mode,
+        "ms": audit_trace.get("latency_ms", 0),
+        "audit": dict(audit_trace),
+    }
+    if audit_mode == "on" and used_session_citations:
+        transitive_sids = sorted(
+            {
+                str(sid)
+                for sc in used_session_citations
+                for sid in (sc.get("cited_source_ids") or [])
+                if sid
+            }
+        )
+        if transitive_sids:
+            step_entry["details"] = {
+                "scope": "knowledge",
+                "sources": [{"id": sid} for sid in transitive_sids],
+            }
+    return step_entry
 
 
 def _runtime_message_dict(message: Any) -> dict[str, Any]:
@@ -774,6 +850,22 @@ async def generate_stream(
                     + ", ".join(source.name for source in sources)
                     + ". Nếu câu hỏi liên quan đến tài liệu, trước tiên phải gọi search_context và chỉ trả lời dựa trên bằng chứng được trả về."
                 )
+            plan_route_decision = getattr(plan, "route_decision", None)
+            plan_session_citations = list(getattr(plan, "session_citations", None) or [])
+            plan_audit_trace = getattr(plan, "session_audit_trace", None)
+            route_mem_scope = str((plan_route_decision or {}).get("memory_scope") or "")
+            session_grounded_scope = (
+                bool(plan_session_citations)
+                and route_mem_scope in {"session_history", "full_session_audit"}
+                and not bool(plan.source_ids)
+            )
+            if plan_session_citations:
+                scene_notes.append(
+                    "Bằng chứng lịch sử hội thoại của phiên này đã được cung cấp trong khối "
+                    "[Session Memory Evidence] kèm mã [S1], [S2]... Khi câu hỏi hỏi về thông tin "
+                    "hoặc quyết định đã trao đổi trong phiên chat, được phép trả lời trực tiếp "
+                    "dựa trên bằng chứng phiên và giữ nhãn [S1], [S2]."
+                )
             run_messages = _append_current_scene(list(plan.messages), scene_notes)
             # Freeze the actual initial input before the runtime appends model
             # output and tool-result messages. This is the only content the UI
@@ -784,9 +876,12 @@ async def generate_stream(
                 tools,
                 knowledge_only=knowledge_only,
                 scoped=bool(plan.source_ids),
+                route_decision=plan_route_decision,
+                session_grounded=session_grounded_scope,
             )
             local_grounding_required = (
                 local_evidence_required
+                and not session_grounded_scope
                 and initial_tool_choice != "none"
                 and not _TIME_ONLY_INTENT.fullmatch(" ".join(plan.query.strip().split()))
             )
@@ -943,8 +1038,12 @@ async def generate_stream(
                     else:
                         trace.append({"kind": "answer", "step": event.turn, "ms": duration})
                 elif event.type == EventType.RUN_COMPLETED:
+                    raw_output_text = str(payload.get("output") or "")
+                    sanitized_session_output, used_session_citations, has_explicit_session_claim = (
+                        _finalize_session_citations(raw_output_text, plan_session_citations)
+                    )
                     canonical_answer, internal_citations = _finalize_answer_citations(
-                        str(payload.get("output") or ""),
+                        sanitized_session_output,
                         citations,
                     )
                     answer_status = "answered"
@@ -952,7 +1051,7 @@ async def generate_stream(
                     has_internal_claim = any(citation.get("claim_level") == "claim" for citation in internal_citations)
                     external_start = _citation_number_high_water(internal_citations) + 1
                     external_citations = _build_external_citations(
-                        str(payload.get("output") or ""),
+                        sanitized_session_output,
                         external_references,
                         start_n=external_start,
                     )
@@ -961,6 +1060,11 @@ async def generate_stream(
                     if (
                         requires_grounded_answer
                         and not has_internal_claim
+                        and not (
+                            session_grounded_scope
+                            and bool(canonical_answer)
+                            and (has_explicit_session_claim or bool(plan_session_citations))
+                        )
                         and (local_evidence_required or not has_external_claim)
                     ):
                         canonical_answer = empty_response or no_answer_text()
@@ -969,6 +1073,14 @@ async def generate_stream(
                         answer_status = "no_answer"
                         no_answer_reason = host_context.search_context_no_answer_reason or "weak_evidence"
                     canonical_citations = [*internal_citations, *external_citations]
+                    session_step = _build_session_audit_step(
+                        plan_audit_trace,
+                        used_session_citations=(
+                            used_session_citations if answer_status == "answered" and canonical_answer else None
+                        ),
+                    )
+                    if session_step is not None:
+                        trace.insert(0, session_step)
                     message_id = None
                     if thread_id is not None:
                         message_id = await persist_answer(
@@ -999,6 +1111,9 @@ async def generate_stream(
                     if host_context.search_context_called or local_grounding_required:
                         canonical_answer = ""
                         internal_citations = []
+                    session_step = _build_session_audit_step(plan_audit_trace)
+                    if session_step is not None:
+                        trace.insert(0, session_step)
                     error_payload = payload.get("error") if isinstance(payload, Mapping) else None
                     status = (
                         MessageStatus.CANCELLED
