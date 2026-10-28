@@ -1489,3 +1489,472 @@ async def test_warm_delta_db_failure_invalidates_cache_and_recovers_missing_turn
 
     await q_client.aclose()
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_multi_project_principal_resolves_unique_source_mapping_and_skips_ambiguous_threads(
+    monkeypatch,
+) -> None:
+    """PR #44 Review 2 [P1]: Multi-project principal never guesses `allowed_projects[0]`;
+    resolves unique project via `SourceProjectMapping` (`CONFIRMED`) or stays `memory_only`.
+    """
+    monkeypatch.setattr(settings, "session_context_mode", "on")
+    monkeypatch.setattr(settings, "decision_provider", "disabled")
+
+    qdrant = _InMemoryQdrantEmulator()
+    q_client = qdrant.make_client()
+    set_custom_session_qdrant_client_factory(lambda: q_client)
+
+    engine = await _make_fk_sqlite_engine()
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    owner_key = "owner-multi-proj"
+    multi_principal = VerifiedPrincipal(
+        subject="user-multi",
+        organization_id="org-multi",
+        allowed_project_ids=frozenset({"proj-alpha", "proj-beta"}),
+        issuer="continuum-jwks",
+        key_id="kid-multi",
+        token_id="jti-multi",
+        issued_at=1_760_000_000,
+        expires_at=1_760_000_900,
+        tenant_id="org-multi",
+        allowed_partition_ids=frozenset({"proj-alpha", "proj-beta"}),
+    )
+    col_alpha = session_qdrant_collection_name("proj-alpha")
+    col_beta = session_qdrant_collection_name("proj-beta")
+    now = datetime(2026, 10, 28, 9, 0, tzinfo=UTC)
+
+    async with session_factory() as session:
+        agent = Agent(owner_key=owner_key, name="Multi-Project Agent")
+        src_alpha = Source(name="Alpha Spec", sag_source_config_id="sag-alpha-1")
+        src_beta = Source(name="Beta Spec", sag_source_config_id="sag-beta-1")
+        session.add_all([agent, src_alpha, src_beta])
+        await session.flush()
+
+        session.add_all(
+            [
+                SourceProjectMapping(
+                    source_id=src_alpha.id,
+                    organization_id="org-multi",
+                    project_id="proj-alpha",
+                    state="CONFIRMED",
+                    mapping_version=1,
+                    confirmed_at=now,
+                    confirmed_by="admin",
+                    approval_ref="apr-alpha",
+                ),
+                SourceProjectMapping(
+                    source_id=src_beta.id,
+                    organization_id="org-multi",
+                    project_id="proj-beta",
+                    state="CONFIRMED",
+                    mapping_version=1,
+                    confirmed_at=now,
+                    confirmed_by="admin",
+                    approval_ref="apr-beta",
+                ),
+            ]
+        )
+        thread_main = Thread(agent_id=agent.id, owner_key=owner_key, title="Multi Proj Main")
+        thread_req = Thread(agent_id=agent.id, owner_key=owner_key, title="Multi Proj Req")
+        session.add_all([thread_main, thread_req])
+        await session.flush()
+
+        # 1. Ambiguous thread (no cited sources, no `requested_source_ids`) -> MUST stay `memory_only`!
+        u0 = Message(
+            thread_id=thread_main.id,
+            role=MessageRole.USER,
+            content="Xin chào, hãy khởi tạo phiên làm việc.",
+            created_at=now,
+        )
+        u_ask_1 = Message(
+            thread_id=thread_main.id,
+            role=MessageRole.USER,
+            content="Tóm tắt chính sách của dự án Beta?",
+            created_at=now + timedelta(seconds=10),
+        )
+        session.add_all([u0, u_ask_1])
+        await session.commit()
+
+        pack_ambig = await prepare_session_context_for_ask(
+            session,
+            thread_id=thread_main.id,
+            exclude_message_id=u_ask_1.id,
+            query=u_ask_1.content,
+            principal=multi_principal,
+            owner_key=owner_key,
+            requested_source_ids=None,
+            budget_tokens=900,
+            qdrant_client=q_client,
+        )
+        assert pack_ambig.audit_trace.persistence_status == "memory_only"
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(SessionUnit)
+                .where(SessionUnit.thread_id == thread_main.id)
+            )
+            == 0
+        )
+        assert col_alpha not in qdrant.points
+        assert col_beta not in qdrant.points
+
+        # 2. Assistant replies citing `src_beta` (`proj-beta`, NOT `allowed_projects[0]` `proj-alpha`!):
+        #    next warm turn resolves uniquely to `proj-beta` and lazy-backfills ALL turns into `proj-beta`!
+        a_beta = Message(
+            thread_id=thread_main.id,
+            role=MessageRole.ASSISTANT,
+            content="Dự án Beta chốt chu kỳ kiểm toán nội bộ là 30 ngày.",
+            citations=[{"n": 1, "source_id": src_beta.id, "chunk_id": "chk-beta-1"}],
+            created_at=now + timedelta(seconds=20),
+        )
+        u_ask_2 = Message(
+            thread_id=thread_main.id,
+            role=MessageRole.USER,
+            content="Chu kỳ kiểm toán của Beta là bao nhiêu ngày?",
+            created_at=now + timedelta(seconds=30),
+        )
+        session.add_all([a_beta, u_ask_2])
+        await session.commit()
+
+        pack_beta = await prepare_session_context_for_ask(
+            session,
+            thread_id=thread_main.id,
+            exclude_message_id=u_ask_2.id,
+            query=u_ask_2.content,
+            principal=multi_principal,
+            owner_key=owner_key,
+            requested_source_ids=None,
+            budget_tokens=900,
+            qdrant_client=q_client,
+        )
+        assert pack_beta.audit_trace.persistence_status == "lazy_backfill"
+        persisted_rows = list(
+            (
+                await session.execute(
+                    select(SessionUnit).where(SessionUnit.thread_id == thread_main.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(persisted_rows) > 0
+        assert {r.project_id for r in persisted_rows} == {"proj-beta"}
+        assert {tuple(r.security_partition_ids_json) for r in persisted_rows} == {("proj-beta",)}
+        assert col_alpha not in qdrant.points
+        assert len(qdrant.points[col_beta]) == len(persisted_rows)
+
+        # 3. Adding a citation from `src_alpha` (`proj-alpha`) makes the thread cross-project ->
+        #    purges `proj-beta` derived rows & Qdrant points and transitions cleanly to `memory_only`!
+        a_alpha = Message(
+            thread_id=thread_main.id,
+            role=MessageRole.ASSISTANT,
+            content="Dự án Alpha chốt chu kỳ đối soát là 7 ngày.",
+            citations=[{"n": 1, "source_id": src_alpha.id, "chunk_id": "chk-alpha-1"}],
+            created_at=now + timedelta(seconds=40),
+        )
+        u_ask_3 = Message(
+            thread_id=thread_main.id,
+            role=MessageRole.USER,
+            content="So sánh chu kỳ của Beta và Alpha?",
+            created_at=now + timedelta(seconds=50),
+        )
+        session.add_all([a_alpha, u_ask_3])
+        await session.commit()
+
+        pack_cross = await prepare_session_context_for_ask(
+            session,
+            thread_id=thread_main.id,
+            exclude_message_id=u_ask_3.id,
+            query=u_ask_3.content,
+            principal=multi_principal,
+            owner_key=owner_key,
+            requested_source_ids=None,
+            budget_tokens=900,
+            qdrant_client=q_client,
+        )
+        assert pack_cross.audit_trace.persistence_status == "memory_only"
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(SessionUnit)
+                .where(SessionUnit.thread_id == thread_main.id)
+            )
+            == 0
+        )
+        assert len(qdrant.points.get(col_beta, {})) == 0
+        assert col_alpha not in qdrant.points
+
+        # 4. Explicit `requested_source_ids`: multi-project `[src_alpha, src_beta]` stays `memory_only`,
+        #    while single-project `[src_beta]` resolves uniquely to `proj-beta`!
+        r0 = Message(
+            thread_id=thread_req.id,
+            role=MessageRole.USER,
+            content="Khởi tạo yêu cầu rà soát tài liệu.",
+            created_at=now,
+        )
+        r_ask = Message(
+            thread_id=thread_req.id,
+            role=MessageRole.USER,
+            content="Tra cứu quy định?",
+            created_at=now + timedelta(seconds=10),
+        )
+        session.add_all([r0, r_ask])
+        await session.commit()
+
+        pack_req_both = await prepare_session_context_for_ask(
+            session,
+            thread_id=thread_req.id,
+            exclude_message_id=r_ask.id,
+            query=r_ask.content,
+            principal=multi_principal,
+            owner_key=owner_key,
+            requested_source_ids=[src_alpha.id, src_beta.id],
+            budget_tokens=900,
+            qdrant_client=q_client,
+        )
+        assert pack_req_both.audit_trace.persistence_status == "memory_only"
+
+        pack_req_beta = await prepare_session_context_for_ask(
+            session,
+            thread_id=thread_req.id,
+            exclude_message_id=r_ask.id,
+            query=r_ask.content,
+            principal=multi_principal,
+            owner_key=owner_key,
+            requested_source_ids=[src_beta.id],
+            budget_tokens=900,
+            qdrant_client=q_client,
+        )
+        assert pack_req_beta.audit_trace.persistence_status == "lazy_backfill"
+        req_proj_set = set(
+            (
+                await session.execute(
+                    select(SessionUnit.project_id).where(SessionUnit.thread_id == thread_req.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert req_proj_set == {"proj-beta"}
+
+    await q_client.aclose()
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_orphan_session_units_enforces_acl_and_purges_revoked_units_without_repair(
+    monkeypatch,
+) -> None:
+    """PR #44 Review 2 [P2]: `reconcile_orphan_session_units` checks active `SourceProjectMapping`
+    (`state='CONFIRMED'`) BEFORE repairing missing Qdrant points and purges revoked units instead.
+    """
+    monkeypatch.setattr(settings, "session_context_mode", "on")
+    monkeypatch.setattr(settings, "decision_provider", "disabled")
+
+    qdrant = _InMemoryQdrantEmulator()
+    q_client = qdrant.make_client()
+    set_custom_session_qdrant_client_factory(lambda: q_client)
+    http_embedder = _CountingHttpModelEmbedder(model="BAAI/bge-m3", dim=64)
+
+    engine = await _make_fk_sqlite_engine()
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    owner_key = "owner-acl-reconcile"
+    principal = _principal(org_id="org-rec", project_id="proj-rec")
+    col_name = session_qdrant_collection_name("proj-rec")
+    now = datetime(2026, 10, 28, 10, 0, tzinfo=UTC)
+
+    async with session_factory() as session:
+        agent = Agent(owner_key=owner_key, name="Reconcile ACL Agent")
+        src_rev_missing = Source(name="Revoked Missing Qdrant", sag_source_config_id="sag-rm-1")
+        src_rev_synced = Source(name="Revoked Synced Qdrant", sag_source_config_id="sag-rs-1")
+        src_valid = Source(name="Valid Confirmed Source", sag_source_config_id="sag-ok-1")
+        session.add_all([agent, src_rev_missing, src_rev_synced, src_valid])
+        await session.flush()
+
+        map_rev_missing = SourceProjectMapping(
+            source_id=src_rev_missing.id,
+            organization_id="org-rec",
+            project_id="proj-rec",
+            state="CONFIRMED",
+            mapping_version=1,
+            confirmed_at=now,
+            confirmed_by="admin",
+            approval_ref="apr-rm",
+        )
+        map_rev_synced = SourceProjectMapping(
+            source_id=src_rev_synced.id,
+            organization_id="org-rec",
+            project_id="proj-rec",
+            state="CONFIRMED",
+            mapping_version=1,
+            confirmed_at=now,
+            confirmed_by="admin",
+            approval_ref="apr-rs",
+        )
+        map_valid = SourceProjectMapping(
+            source_id=src_valid.id,
+            organization_id="org-rec",
+            project_id="proj-rec",
+            state="CONFIRMED",
+            mapping_version=1,
+            confirmed_at=now,
+            confirmed_by="admin",
+            approval_ref="apr-ok",
+        )
+        t_rev_missing = Thread(agent_id=agent.id, owner_key=owner_key, title="Revoked Missing")
+        t_rev_synced = Thread(agent_id=agent.id, owner_key=owner_key, title="Revoked Synced")
+        t_valid = Thread(agent_id=agent.id, owner_key=owner_key, title="Valid Missing")
+        session.add_all(
+            [map_rev_missing, map_rev_synced, map_valid, t_rev_missing, t_rev_synced, t_valid]
+        )
+        await session.flush()
+
+        # Thread 1: indexed during Qdrant 503 (`qdrant_point_id IS NULL`), cites `src_rev_missing`
+        m1_u = Message(
+            thread_id=t_rev_missing.id,
+            role=MessageRole.USER,
+            content="Cho biết mật khẩu kho khóa ORION-SECRET?",
+            created_at=now,
+        )
+        m1_a = Message(
+            thread_id=t_rev_missing.id,
+            role=MessageRole.ASSISTANT,
+            content="Kho khóa ORION-SECRET dùng mã nội bộ VLT-9988.",
+            citations=[{"n": 1, "source_id": src_rev_missing.id, "chunk_id": "c-rm"}],
+            created_at=now + timedelta(seconds=10),
+        )
+        m1_ask = Message(
+            thread_id=t_rev_missing.id,
+            role=MessageRole.USER,
+            content="Kiểm tra kho khóa?",
+            created_at=now + timedelta(seconds=20),
+        )
+
+        # Thread 2: indexed while Qdrant is healthy (points in Qdrant), cites `src_rev_synced`
+        m2_u = Message(
+            thread_id=t_rev_synced.id,
+            role=MessageRole.USER,
+            content="Cho biết hạn mức mật HELIOS-SECRET?",
+            created_at=now,
+        )
+        m2_a = Message(
+            thread_id=t_rev_synced.id,
+            role=MessageRole.ASSISTANT,
+            content="Hạn mức HELIOS-SECRET là 77 triệu USD.",
+            citations=[{"n": 1, "source_id": src_rev_synced.id, "chunk_id": "c-rs"}],
+            created_at=now + timedelta(seconds=10),
+        )
+        m2_ask = Message(
+            thread_id=t_rev_synced.id,
+            role=MessageRole.USER,
+            content="Kiểm tra hạn mức?",
+            created_at=now + timedelta(seconds=20),
+        )
+
+        # Thread 3: indexed during Qdrant 503 (`qdrant_point_id IS NULL`), cites `src_valid` (`CONFIRMED`)
+        m3_u = Message(
+            thread_id=t_valid.id,
+            role=MessageRole.USER,
+            content="Cho biết quy chuẩn công khai ATLAS-PUBLIC?",
+            created_at=now,
+        )
+        m3_a = Message(
+            thread_id=t_valid.id,
+            role=MessageRole.ASSISTANT,
+            content="Quy chuẩn ATLAS-PUBLIC dùng chuẩn ISO-27001.",
+            citations=[{"n": 1, "source_id": src_valid.id, "chunk_id": "c-ok"}],
+            created_at=now + timedelta(seconds=10),
+        )
+        m3_ask = Message(
+            thread_id=t_valid.id,
+            role=MessageRole.USER,
+            content="Kiểm tra quy chuẩn?",
+            created_at=now + timedelta(seconds=20),
+        )
+        session.add_all([m1_u, m1_a, m1_ask, m2_u, m2_a, m2_ask, m3_u, m3_a, m3_ask])
+        await session.commit()
+
+        # Sync Thread 2 while Qdrant is healthy (`5` points in Qdrant)
+        _ = await prepare_session_context_for_ask(
+            session,
+            thread_id=t_rev_synced.id,
+            exclude_message_id=m2_ask.id,
+            query=m2_ask.content,
+            principal=principal,
+            owner_key=owner_key,
+            requested_source_ids=None,
+            budget_tokens=900,
+            embedder=http_embedder,
+            qdrant_client=q_client,
+        )
+        assert len(qdrant.points[col_name]) == 5
+
+        # Sync Thread 1 & Thread 3 during Qdrant 503 outage (`qdrant_point_id IS NULL` in DB, 0 points added)
+        qdrant.fail_status_code = 503
+        for t_obj, ask_msg in ((t_rev_missing, m1_ask), (t_valid, m3_ask)):
+            _ = await prepare_session_context_for_ask(
+                session,
+                thread_id=t_obj.id,
+                exclude_message_id=ask_msg.id,
+                query=ask_msg.content,
+                principal=principal,
+                owner_key=owner_key,
+                requested_source_ids=None,
+                budget_tokens=900,
+                embedder=http_embedder,
+                qdrant_client=q_client,
+            )
+        assert len(qdrant.points[col_name]) == 5
+
+        # Revoke BOTH `src_rev_missing` and `src_rev_synced` BEFORE any next user ask!
+        # Keep `SESSION_INDEX_CACHE` warm for `t_rev_missing` (tests warm-cache bypass guard)
+        # and clear `_SHARED_TEXT_EMBEDDING_CACHE` + `http_embedder.batches` to verify 0 revoked embeds!
+        for rev_map in (map_rev_missing, map_rev_synced):
+            rev_map.state = "REVOKED"
+            rev_map.revoked_at = datetime.now(UTC)
+            rev_map.revoked_by = "sec-admin"
+            rev_map.revocation_ref = "rev-audit-44"
+        await session.commit()
+
+        SESSION_INDEX_CACHE.invalidate_thread(t_valid.id)
+        _SHARED_TEXT_EMBEDDING_CACHE.clear()
+        http_embedder.batches.clear()
+        qdrant.fail_status_code = None
+
+        rec_stats = await reconcile_orphan_session_units(
+            session,
+            q_client,
+            project_id="proj-rec",
+            embedder=http_embedder,
+        )
+        # Thread 2's 5 revoked points were deleted as orphans; Thread 3's 5 valid units were repaired;
+        # Thread 1's 5 revoked units were PURGED (NEVER repaired or re-embedded)!
+        assert rec_stats["orphans_deleted"] == 5
+        assert rec_stats["missing_repaired"] == 5
+
+        flattened_embedded = [txt for batch in http_embedder.batches for txt in batch]
+        assert not any("ORION-SECRET" in txt or "VLT-9988" in txt for txt in flattened_embedded)
+        assert not any("HELIOS-SECRET" in txt or "77 triệu USD" in txt for txt in flattened_embedded)
+        assert any("ATLAS-PUBLIC" in txt for txt in flattened_embedded)
+
+        for revoked_tid in (t_rev_missing.id, t_rev_synced.id):
+            leftover = await session.scalar(
+                select(func.count())
+                .select_from(SessionUnit)
+                .where(SessionUnit.thread_id == revoked_tid)
+            )
+            assert leftover == 0
+            assert SESSION_INDEX_CACHE.find_thread_entries(revoked_tid) == []
+
+        valid_cnt = await session.scalar(
+            select(func.count())
+            .select_from(SessionUnit)
+            .where(SessionUnit.thread_id == t_valid.id, SessionUnit.qdrant_point_id.is_not(None))
+        )
+        assert valid_cnt == 5
+        assert len(qdrant.points[col_name]) == 5
+        assert {pt["payload"]["thread_id"] for pt in qdrant.points[col_name].values()} == {t_valid.id}
+
+    await q_client.aclose()
+    await engine.dispose()

@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -40,6 +40,8 @@ from sag_api.db.models.session_context import (
     generate_session_unit_id,
     generate_session_unit_point_id,
 )
+from sag_api.db.models.source_project_mapping import SourceProjectMapping
+from sag_api.enums import MessageRole, MessageStatus
 from sag_api.services.search_index_service import (
     compute_sparse_bm25_vector,
     get_cached_text_embedding,
@@ -191,19 +193,78 @@ def _open_qdrant_client_context(
     return httpx.AsyncClient(base_url=qdrant_url, headers=headers, timeout=4.0), True
 
 
+async def _lookup_confirmed_source_projects(
+    session: AsyncSession,
+    *,
+    organization_id: str,
+    source_ids: Collection[str],
+    allowed_projects: Collection[str] | None = None,
+) -> dict[str, str]:
+    """Resolve `{source_id: project_id}` for `CONFIRMED` `SourceProjectMapping` rows."""
+    clean_sids = sorted({str(s).strip() for s in source_ids if str(s).strip()})
+    if not clean_sids or not organization_id:
+        return {}
+    stmt = select(SourceProjectMapping.source_id, SourceProjectMapping.project_id).where(
+        SourceProjectMapping.state == "CONFIRMED",
+        SourceProjectMapping.organization_id == organization_id,
+        SourceProjectMapping.source_id.in_(clean_sids),
+    )
+    if allowed_projects is not None:
+        clean_projects = sorted({str(p).strip() for p in allowed_projects if str(p).strip()})
+        if not clean_projects:
+            return {}
+        stmt = stmt.where(SourceProjectMapping.project_id.in_(clean_projects))
+    rows = (await session.execute(stmt)).all()
+    return {str(sid): str(pid) for sid, pid in rows}
+
+
+async def _collect_thread_message_source_ids(
+    session: AsyncSession,
+    *,
+    thread_id: str,
+) -> set[str]:
+    """Collect all `source_id` values referenced by active `ASSISTANT` messages in `thread_id`."""
+    from sag_api.services.agent_domain import _message_source_ids
+
+    assistant_rows = (
+        await session.execute(
+            select(Message).where(
+                Message.thread_id == thread_id,
+                Message.role == MessageRole.ASSISTANT,
+                Message.status == MessageStatus.OK,
+            )
+        )
+    ).scalars().all()
+    collected: set[str] = set()
+    for msg in assistant_rows:
+        sids = _message_source_ids(msg)
+        if sids:
+            collected.update(str(s).strip() for s in sids if str(s).strip())
+    return collected
+
+
 async def resolve_persistence_scope(
     session: AsyncSession,
     *,
     thread_id: str,
     principal: VerifiedPrincipal,
     owner_key: str,
+    requested_source_ids: Collection[str] | None = None,
+    qdrant_client: httpx.AsyncClient | None = None,
+    caller_had_pending_state: bool = False,
 ) -> SessionPersistenceScope | None:
-    """Resolve and verify `(tenant_id, project_id)` fail-closed against existing persisted thread rows."""
+    """Resolve and verify unique `(tenant_id, project_id)` fail-closed via `SourceProjectMapping`.
+
+    Multi-project principals (`len(allowed_project_ids) > 1`) NEVER pick `allowed_projects[0]`
+    arbitrarily: persistence is activated ONLY when `SourceProjectMapping` (`state='CONFIRMED'`)
+    over thread citations / `requested_source_ids` resolves to a single unambiguous `project_id`.
+    """
     if not settings.session_context_persistence_enabled or not thread_id:
         return None
     tenant_id = str(
         getattr(principal, "tenant_id", "") or getattr(principal, "organization_id", "") or ""
     ).strip()
+    org_id = str(getattr(principal, "organization_id", "") or tenant_id).strip()
     allowed_projects = sorted(
         str(p).strip()
         for p in (getattr(principal, "allowed_project_ids", ()) or ())
@@ -216,7 +277,7 @@ async def resolve_persistence_scope(
             if str(p).strip()
         )
     )
-    if not tenant_id or not allowed_projects:
+    if not tenant_id or not org_id or not allowed_projects:
         return None
 
     rows = (
@@ -226,6 +287,7 @@ async def resolve_persistence_scope(
             .distinct()
         )
     ).all()
+    existing_project_id: str | None = None
     if rows:
         distinct_scopes = {(str(r[0]), str(r[1])) for r in rows}
         for ex_tenant, ex_proj in distinct_scopes:
@@ -238,11 +300,95 @@ async def resolve_persistence_scope(
                 raise ForbiddenError("Session context scope mismatch for thread")
         if len(distinct_scopes) > 1:
             raise ForbiddenError("Ambiguous persisted project scopes for thread")
-        project_id = next(iter(distinct_scopes))[1]
-    else:
-        project_id = allowed_projects[0]
+        existing_project_id = next(iter(distinct_scopes))[1]
 
-    partitions = allowed_partitions if allowed_partitions else (project_id,)
+    raw_thread_sids = await _collect_thread_message_source_ids(session, thread_id=thread_id)
+    org_source_projects = await _lookup_confirmed_source_projects(
+        session,
+        organization_id=org_id,
+        source_ids=raw_thread_sids,
+    )
+    thread_confirmed_projects = set(org_source_projects.values())
+
+    clean_req_sids = sorted(
+        {str(s).strip() for s in (requested_source_ids or ()) if str(s).strip()}
+    )
+    req_source_projects = (
+        await _lookup_confirmed_source_projects(
+            session,
+            organization_id=org_id,
+            source_ids=clean_req_sids,
+            allowed_projects=allowed_projects,
+        )
+        if clean_req_sids
+        else {}
+    )
+    req_projects = set(req_source_projects.values())
+
+    # Never bind or persist a thread that cites active CONFIRMED sources outside `allowed_projects`
+    if not thread_confirmed_projects.issubset(set(allowed_projects)):
+        return None
+
+    # Thread spans >= 2 projects -> purge any partial single-project rows and stay memory-only
+    if len(thread_confirmed_projects) > 1:
+        if existing_project_id is not None:
+            await purge_thread_session_rows(session, thread_id=thread_id)
+            if not caller_had_pending_state:
+                await session.commit()
+            await purge_thread_qdrant_points_for_projects(
+                session,
+                thread_id=thread_id,
+                project_ids=[existing_project_id],
+                qdrant_client=qdrant_client,
+            )
+        return None
+
+    if existing_project_id is not None:
+        if thread_confirmed_projects and thread_confirmed_projects != {existing_project_id}:
+            await purge_thread_session_rows(session, thread_id=thread_id)
+            if not caller_had_pending_state:
+                await session.commit()
+            await purge_thread_qdrant_points_for_projects(
+                session,
+                thread_id=thread_id,
+                project_ids=[existing_project_id],
+                qdrant_client=qdrant_client,
+            )
+            return None
+        if len(allowed_projects) > 1 and clean_req_sids:
+            if len(req_source_projects) != len(clean_req_sids) or not req_projects.issubset(
+                {existing_project_id}
+            ):
+                return None
+        project_id = existing_project_id
+    elif len(allowed_projects) == 1:
+        project_id = allowed_projects[0]
+    else:
+        # Multi-project principal with no existing persisted rows: require a unique confirmed project
+        if len(thread_confirmed_projects) == 1:
+            inferred_proj = next(iter(thread_confirmed_projects))
+            if clean_req_sids and (
+                len(req_source_projects) != len(clean_req_sids)
+                or not req_projects.issubset({inferred_proj})
+            ):
+                return None
+            project_id = inferred_proj
+        else:
+            if (
+                not clean_req_sids
+                or len(req_source_projects) != len(clean_req_sids)
+                or len(req_projects) != 1
+            ):
+                return None
+            project_id = next(iter(req_projects))
+
+    if not allowed_partitions:
+        partitions = (project_id,)
+    elif len(allowed_projects) > 1 and set(allowed_partitions).issubset(set(allowed_projects)):
+        partitions = (project_id,)
+    else:
+        partitions = allowed_partitions
+
     return SessionPersistenceScope(
         tenant_id=tenant_id,
         project_id=project_id,
@@ -587,6 +733,93 @@ def _blend_episode_centroid(turn_vecs: Sequence[Sequence[float]]) -> tuple[float
     return l2_normalize(centroid)
 
 
+async def _verify_persisted_thread_acl_and_messages(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    project_id: str,
+    thread_id: str,
+    thread_units: Sequence[SessionUnit],
+) -> tuple[bool, dict[str, str]]:
+    """Verify every persisted `SessionUnit` in `thread_units` still has active `Message` rows
+    and `CONFIRMED` `SourceProjectMapping` in `(tenant_id, project_id)`.
+
+    Returns `(is_authorized_and_intact, normalized_turn_text_by_message_id)`.
+    """
+    from sag_api.services.agent_domain import _message_source_ids
+
+    if not thread_units or not tenant_id or not project_id:
+        return False, {}
+    if any(
+        u.tenant_id != tenant_id or u.project_id != project_id or u.thread_id != thread_id
+        for u in thread_units
+    ):
+        return False, {}
+
+    turn_units = sorted(
+        (u for u in thread_units if u.unit_kind == "TURN"),
+        key=lambda u: int(u.ordinal),
+    )
+    if not turn_units:
+        return False, {}
+
+    msg_ids = [u.message_from_id for u in turn_units]
+    msg_rows = list(
+        (
+            await session.execute(
+                select(Message).where(
+                    Message.thread_id == thread_id,
+                    Message.id.in_(msg_ids),
+                    Message.status == MessageStatus.OK,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    row_by_id = {str(m.id): m for m in msg_rows}
+    if any(mid not in row_by_id for mid in msg_ids):
+        return False, {}
+
+    required_sids: set[str] = set()
+    norm_text_by_id: dict[str, str] = {}
+    for u in turn_units:
+        m = row_by_id[u.message_from_id]
+        norm_txt = normalize_session_text(str(m.content or ""))
+        if not norm_txt:
+            return False, {}
+        expected_hash = hashlib.sha256(norm_txt.encode("utf-8")).hexdigest()
+        if u.content_hash != expected_hash:
+            return False, {}
+        norm_text_by_id[u.message_from_id] = norm_txt
+
+        u_sids = {str(s).strip() for s in (u.cited_source_ids_json or []) if str(s).strip()}
+        required_sids.update(u_sids)
+        if m.role == MessageRole.ASSISTANT:
+            m_sids = _message_source_ids(m)
+            if m_sids is None:
+                return False, {}
+            required_sids.update(str(s).strip() for s in m_sids if str(s).strip())
+
+    for u in thread_units:
+        if u.unit_kind != "TURN":
+            required_sids.update(
+                str(s).strip() for s in (u.cited_source_ids_json or []) if str(s).strip()
+            )
+
+    if required_sids:
+        confirmed_map = await _lookup_confirmed_source_projects(
+            session,
+            organization_id=tenant_id,
+            source_ids=required_sids,
+            allowed_projects=(project_id,),
+        )
+        if not required_sids.issubset(confirmed_map.keys()):
+            return False, {}
+
+    return True, norm_text_by_id
+
+
 async def _repair_thread_qdrant_from_db_units(
     session: AsyncSession,
     qdrant_client: httpx.AsyncClient,
@@ -597,6 +830,7 @@ async def _repair_thread_qdrant_from_db_units(
     missing_unit_ids: set[str],
     embedder: Any | None = None,
     caller_had_pending_state: bool = False,
+    preverified_turn_texts: dict[str, str] | None = None,
 ) -> int:
     """Reconstruct and upsert missing Qdrant `SessionUnit` points for `thread_id` from PostgreSQL truth."""
     if not thread_units or not missing_unit_ids:
@@ -608,6 +842,34 @@ async def _repair_thread_qdrant_from_db_units(
     )
     if not turn_units:
         return 0
+
+    # Enforce active SourceProjectMapping ACL (`state='CONFIRMED'`) BEFORE warm or cold Qdrant repair
+    if preverified_turn_texts is None:
+        acl_ok, msg_by_id = await _verify_persisted_thread_acl_and_messages(
+            session,
+            tenant_id=turn_units[0].tenant_id,
+            project_id=project_id,
+            thread_id=thread_id,
+            thread_units=thread_units,
+        )
+        if not acl_ok:
+            log.warning(
+                "Purging revoked or stale session units instead of repairing Qdrant project=%s thread=%s",
+                project_id,
+                thread_id,
+            )
+            SESSION_INDEX_CACHE.invalidate_thread(thread_id)
+            await purge_thread_session_rows(session, thread_id=thread_id)
+            if not caller_had_pending_state:
+                await session.commit()
+            await delete_thread_points_from_qdrant(
+                qdrant_client,
+                project_id=project_id,
+                thread_id=thread_id,
+            )
+            return 0
+    else:
+        msg_by_id = preverified_turn_texts
 
     thread_sig = turn_units[0].embedding_model_signature
     if any(u.embedding_model_signature != thread_sig for u in thread_units):
@@ -662,21 +924,8 @@ async def _repair_thread_qdrant_from_db_units(
                 entry.qdrant_rebuild_pending = False
             return upserted
 
-    # Cold DB reconstruction path: load authorized `Message` rows referenced by persisted `TURN` units
+    # Cold DB reconstruction path using ACL-verified `msg_by_id`
     msg_ids = [u.message_from_id for u in turn_units]
-    msg_rows = list(
-        (
-            await session.execute(
-                select(Message).where(
-                    Message.thread_id == thread_id,
-                    Message.id.in_(msg_ids),
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    msg_by_id = {str(m.id): normalize_session_text(str(m.content or "")) for m in msg_rows}
     if any(mid not in msg_by_id or not msg_by_id[mid] for mid in msg_ids):
         return 0
 
@@ -833,7 +1082,40 @@ async def reconcile_orphan_session_units(
         .scalars()
         .all()
     )
-    db_units_by_id = {u.id: u for u in db_units}
+    units_by_thread: dict[str, list[SessionUnit]] = {}
+    for u in db_units:
+        units_by_thread.setdefault(u.thread_id, []).append(u)
+
+    # Verify active `SourceProjectMapping` (`CONFIRMED`) & backing `Message` integrity per thread;
+    # purge any thread whose cited source was revoked before computing orphans or repairing Qdrant.
+    verified_texts_by_thread: dict[str, dict[str, str]] = {}
+    purged_any_thread = False
+    for t_id, t_units in sorted(list(units_by_thread.items())):
+        acl_ok, norm_texts = await _verify_persisted_thread_acl_and_messages(
+            session,
+            tenant_id=t_units[0].tenant_id,
+            project_id=project_id,
+            thread_id=t_id,
+            thread_units=t_units,
+        )
+        if not acl_ok:
+            log.warning(
+                "Purging unauthorized or stale persisted session units during reconciliation project=%s thread=%s",
+                project_id,
+                t_id,
+            )
+            SESSION_INDEX_CACHE.invalidate_thread(t_id)
+            await purge_thread_session_rows(session, thread_id=t_id)
+            units_by_thread.pop(t_id, None)
+            purged_any_thread = True
+        else:
+            verified_texts_by_thread[t_id] = norm_texts
+
+    if purged_any_thread and not caller_had_pending_state:
+        await session.commit()
+
+    valid_db_units = [u for t_units in units_by_thread.values() for u in t_units]
+    db_units_by_id = {u.id: u for u in valid_db_units}
 
     orphan_point_ids: list[str] = []
     present_valid_unit_ids: set[str] = set()
@@ -858,10 +1140,8 @@ async def reconcile_orphan_session_units(
         if del_res.status_code >= 400 and del_res.status_code != 404:
             raise RuntimeError(f"Failed to delete orphan session Qdrant points: {del_res.text}")
 
-    units_by_thread: dict[str, list[SessionUnit]] = {}
     missing_by_thread: dict[str, set[str]] = {}
-    for u in db_units:
-        units_by_thread.setdefault(u.thread_id, []).append(u)
+    for u in valid_db_units:
         if u.qdrant_point_id is None or u.id not in present_valid_unit_ids:
             missing_by_thread.setdefault(u.thread_id, set()).add(u.id)
 
@@ -876,6 +1156,7 @@ async def reconcile_orphan_session_units(
             missing_unit_ids=missing_ids,
             embedder=embedder,
             caller_had_pending_state=caller_had_pending_state,
+            preverified_turn_texts=verified_texts_by_thread.get(t_id),
         )
 
     return {
@@ -1496,6 +1777,26 @@ async def backfill_pending_qdrant_for_thread(
 
     collection_name = session_qdrant_collection_name(scope.project_id)
     try:
+        cited_sids = {s for t in index.turns for s in t.cited_source_ids if s}
+        if cited_sids:
+            confirmed_map = await _lookup_confirmed_source_projects(
+                session,
+                organization_id=scope.tenant_id,
+                source_ids=cited_sids,
+                allowed_projects=(scope.project_id,),
+            )
+            if not cited_sids.issubset(confirmed_map.keys()):
+                SESSION_INDEX_CACHE.invalidate_thread(scope.thread_id)
+                await purge_thread_session_rows(session, thread_id=scope.thread_id)
+                if commit_if_clean and not caller_had_pending_state:
+                    await session.commit()
+                await delete_thread_points_from_qdrant(
+                    client,
+                    project_id=scope.project_id,
+                    thread_id=scope.thread_id,
+                )
+                return 0
+
         all_items = _build_qdrant_items_from_index(
             index,
             scope=scope,
@@ -2220,6 +2521,7 @@ async def hydrate_or_backfill_cold_session_index(
     project_records: Sequence[dict[str, Any]],
     principal: VerifiedPrincipal,
     owner_key: str,
+    requested_source_ids: Collection[str] | None = None,
     embedder: Any | None = None,
     qdrant_client: httpx.AsyncClient | None = None,
     caller_had_pending_state: bool = False,
@@ -2231,6 +2533,9 @@ async def hydrate_or_backfill_cold_session_index(
             thread_id=index.thread_id,
             principal=principal,
             owner_key=owner_key,
+            requested_source_ids=requested_source_ids,
+            qdrant_client=qdrant_client,
+            caller_had_pending_state=caller_had_pending_state,
         )
     except ForbiddenError:
         raise
@@ -2515,6 +2820,7 @@ async def backfill_thread_session_context(
     thread_id: str,
     principal: VerifiedPrincipal,
     owner_key: str,
+    requested_source_ids: Collection[str] | None = None,
     embedder: Any | None = None,
     qdrant_client: httpx.AsyncClient | None = None,
 ) -> PersistenceSyncStats:
@@ -2543,6 +2849,7 @@ async def backfill_thread_session_context(
         project_records=visible_records,
         principal=principal,
         owner_key=owner_key,
+        requested_source_ids=requested_source_ids,
         embedder=active_embedder,
         qdrant_client=qdrant_client,
         caller_had_pending_state=caller_pending,

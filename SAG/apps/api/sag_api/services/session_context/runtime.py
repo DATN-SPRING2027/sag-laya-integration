@@ -303,6 +303,9 @@ async def _resolve_scope_safe(
     thread_id: str,
     principal: VerifiedPrincipal,
     owner_key: str,
+    requested_source_ids: Collection[str] | None = None,
+    qdrant_client: httpx.AsyncClient | None = None,
+    caller_had_pending_state: bool = False,
 ) -> Any | None:
     try:
         return await resolve_persistence_scope(
@@ -310,6 +313,9 @@ async def _resolve_scope_safe(
             thread_id=thread_id,
             principal=principal,
             owner_key=owner_key,
+            requested_source_ids=requested_source_ids,
+            qdrant_client=qdrant_client,
+            caller_had_pending_state=caller_had_pending_state,
         )
     except ForbiddenError:
         raise
@@ -357,6 +363,7 @@ async def prepare_session_context_for_ask(
         and index.last_db_id is not None
         and not index.had_hidden_acl_turns
         and index.persisted_embedding_signature == target_emb_sig
+        and (index.persistence_active or not requested_source_ids)
     )
     db_count = 0
     persisted_state: tuple[int, int] | None = None
@@ -470,43 +477,60 @@ async def prepare_session_context_for_ask(
                         thread_id=thread_id,
                         principal=principal,
                         owner_key=owner_key,
+                        requested_source_ids=requested_source_ids,
+                        qdrant_client=qdrant_client,
+                        caller_had_pending_state=caller_had_pending_state,
                     )
                     if scope is not None:
-                        mutated_prior_turns = {
-                            tid
-                            for tid, old_st in prev_turn_state.items()
-                            if (
-                                index.turns_by_id[tid].epistemic_status,
-                                index.turns_by_id[tid].superseded_by_turn_id,
+                        if not index.persistence_active:
+                            persistence_stats = await _invoke_sync_storage(
+                                session,
+                                index=index,
+                                scope=scope,
+                                embedding_sig=target_emb_sig,
+                                mode="rebuild",
+                                embedder=active_embedder,
+                                qdrant_client=qdrant_client,
+                                caller_had_pending_state=caller_had_pending_state,
                             )
-                            != old_st
-                        }
-                        grown_ep_ord = (
-                            prev_ep_count - 1
-                            if prev_ep_count > 0
-                            and len(index.episodes[prev_ep_count - 1].turn_ids) > prev_ep_last_len
-                            else None
-                        )
-                        persistence_stats = await _invoke_sync_storage(
-                            session,
-                            index=index,
-                            scope=scope,
-                            embedding_sig=target_emb_sig,
-                            mode="delta",
-                            start_turn_ordinal=prev_turn_count,
-                            start_window_ordinal=prev_win_count,
-                            start_episode_ordinal=prev_ep_count,
-                            start_decision_idx=prev_dec_count,
-                            mutated_prior_turn_ids=mutated_prior_turns,
-                            grown_episode_ordinal=grown_ep_ord,
-                            embedder=active_embedder,
-                            qdrant_client=qdrant_client,
-                            caller_had_pending_state=caller_had_pending_state,
-                        )
-                        persistence_stats.status = "delta_synced"
+                            persistence_stats.status = "lazy_backfill"
+                        else:
+                            mutated_prior_turns = {
+                                tid
+                                for tid, old_st in prev_turn_state.items()
+                                if (
+                                    index.turns_by_id[tid].epistemic_status,
+                                    index.turns_by_id[tid].superseded_by_turn_id,
+                                )
+                                != old_st
+                            }
+                            grown_ep_ord = (
+                                prev_ep_count - 1
+                                if prev_ep_count > 0
+                                and len(index.episodes[prev_ep_count - 1].turn_ids) > prev_ep_last_len
+                                else None
+                            )
+                            persistence_stats = await _invoke_sync_storage(
+                                session,
+                                index=index,
+                                scope=scope,
+                                embedding_sig=target_emb_sig,
+                                mode="delta",
+                                start_turn_ordinal=prev_turn_count,
+                                start_window_ordinal=prev_win_count,
+                                start_episode_ordinal=prev_ep_count,
+                                start_decision_idx=prev_dec_count,
+                                mutated_prior_turn_ids=mutated_prior_turns,
+                                grown_episode_ordinal=grown_ep_ord,
+                                embedder=active_embedder,
+                                qdrant_client=qdrant_client,
+                                caller_had_pending_state=caller_had_pending_state,
+                            )
+                            persistence_stats.status = "delta_synced"
                         index.persistence_active = True
                     else:
                         index.persistence_active = False
+                        persistence_stats = PersistenceSyncStats(status="memory_only")
 
                     index.persisted_embedding_signature = target_emb_sig
                     if delta_hidden:
@@ -538,6 +562,9 @@ async def prepare_session_context_for_ask(
                         thread_id=thread_id,
                         principal=principal,
                         owner_key=owner_key,
+                        requested_source_ids=requested_source_ids,
+                        qdrant_client=qdrant_client,
+                        caller_had_pending_state=caller_had_pending_state,
                     )
                     if scope is not None:
                         repaired_pts = await backfill_pending_qdrant_for_thread(
@@ -592,6 +619,7 @@ async def prepare_session_context_for_ask(
                 project_records=project_records,
                 principal=principal,
                 owner_key=owner_key,
+                requested_source_ids=requested_source_ids,
                 embedder=active_embedder,
                 qdrant_client=qdrant_client,
                 caller_had_pending_state=caller_had_pending_state,
