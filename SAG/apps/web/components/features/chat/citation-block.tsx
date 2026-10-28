@@ -1,11 +1,21 @@
 "use client";
 
 import * as React from "react";
-import { ArrowUpRight, BookOpenText, ChevronDown, Globe2, Library } from "lucide-react";
+import {
+  ArrowUpRight,
+  BookOpenText,
+  ChevronDown,
+  CornerUpLeft,
+  Globe2,
+  History,
+  Library,
+  ScanSearch,
+} from "lucide-react";
 import { useTranslations } from "next-intl";
 
-import type { Citation } from "@/lib/types";
+import type { Citation, SessionCitation } from "@/lib/types";
 import { citationCopy } from "@/lib/citation-presentation";
+import { epistemicBadgeClasses } from "@/lib/session-context-presentation";
 import { cn } from "@/lib/utils";
 import { useDetailPanel } from "@/components/features/detail-panel";
 
@@ -24,7 +34,7 @@ function safeExternalUrl(citation: Citation): string | null {
 
 function CitationNumber({ children }: { children: React.ReactNode }) {
   return (
-    <span className="grid size-5 shrink-0 place-items-center rounded-full bg-muted font-mono text-[10px] font-semibold text-muted-foreground">
+    <span className="grid size-5 shrink-0 place-items-center rounded-full bg-muted font-mono text-[10px] font-semibold tabular-nums text-muted-foreground">
       {children}
     </span>
   );
@@ -82,7 +92,7 @@ function CitationBody({ body, title }: { body: string; title: string }) {
               ? t("collapseBody", { title })
               : t("expandBody", { title })}
             title={expanded ? t("collapse") : t("expand")}
-            className="inline-flex h-5 shrink-0 items-center gap-0.5 whitespace-nowrap rounded px-1 text-[10px] font-normal text-muted-foreground/55 outline-none transition-colors hover:bg-muted/40 hover:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
+            className="inline-flex h-5 shrink-0 cursor-pointer items-center gap-0.5 whitespace-nowrap rounded px-1 text-[10px] font-normal text-muted-foreground/55 outline-none transition-colors hover:bg-muted/40 hover:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
           >
             {expanded ? t("collapse") : t("expand")}
             <ChevronDown
@@ -110,7 +120,7 @@ function CitationCard({
   const t = useTranslations("Citations");
   const copy = citationCopy(citation, fallbackIndex);
   const sourceActionClass =
-    "inline-flex h-6 shrink-0 items-center gap-1 whitespace-nowrap rounded-md bg-muted/55 px-1.5 text-[10px] font-medium text-muted-foreground/85 outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-default disabled:opacity-40";
+    "inline-flex h-6 shrink-0 cursor-pointer items-center gap-1 whitespace-nowrap rounded-md bg-muted/55 px-1.5 text-[10px] font-medium text-muted-foreground/85 outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-default disabled:opacity-40";
 
   return (
     <article className="px-2.5 py-2.5 transition-colors hover:bg-background/55">
@@ -157,17 +167,114 @@ function CitationCard({
   );
 }
 
+function SessionCitationCard({
+  item,
+  onJump,
+}: {
+  item: SessionCitation;
+  onJump?: () => void;
+}) {
+  const t = useTranslations("Citations");
+  const primaryTurn =
+    item.turns.find((turn) => turn.id === item.primaryTurnId) ?? item.turns[0];
+  const ordinals = item.turns
+    .map((turn) => turn.ordinal)
+    .filter((ord): ord is number => typeof ord === "number" && ord > 0);
+  const title =
+    item.includedTurnIds.length > 1
+      ? ordinals.length > 1
+        ? t("sessionBundleOrdinals", {
+            first: Math.min(...ordinals),
+            last: Math.max(...ordinals),
+            count: item.includedTurnIds.length,
+          })
+        : t("sessionBundleCount", { count: item.includedTurnIds.length })
+      : primaryTurn?.ordinal
+        ? t("sessionSingleTurnOrdinal", { ordinal: primaryTurn.ordinal })
+        : t("sessionSingleTurnFallback", {
+            id: (item.primaryTurnId ?? item.ref).slice(0, 8),
+          });
+
+  const combinedBody = item.turns
+    .filter((turn) => Boolean(turn.excerpt))
+    .map((turn) => {
+      const rolePrefix =
+        turn.role === "assistant"
+          ? t("roleAssistant")
+          : t("roleUser");
+      return item.turns.length > 1 ? `${rolePrefix}: ${turn.excerpt}` : turn.excerpt;
+    })
+    .join("\n");
+
+  const body = combinedBody || t("sessionTurnOlderUnloaded");
+
+  return (
+    <article className="px-2.5 py-2.5 transition-colors hover:bg-background/55">
+      <div className="flex items-start gap-2.5">
+        <span
+          className={cn(
+            "mt-0.5 inline-flex h-5 min-w-[26px] shrink-0 items-center justify-center rounded-md border px-1 font-mono text-[10px] font-semibold tabular-nums",
+            epistemicBadgeClasses(item.epistemicStatus),
+          )}
+        >
+          {item.ref}
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+              <h4 className="truncate text-xs font-semibold leading-5 text-foreground">
+                {title}
+              </h4>
+              <span
+                className={cn(
+                  "inline-flex items-center rounded border px-1.5 py-0.5 text-[10px] font-medium leading-none",
+                  epistemicBadgeClasses(item.epistemicStatus),
+                )}
+              >
+                {t(`epistemic.${item.epistemicStatus}`)}
+              </span>
+              {typeof item.tokenCost === "number" && item.tokenCost > 0 && (
+                <span className="font-mono text-[10px] tabular-nums text-muted-foreground">
+                  {t("sessionTokenCost", { count: item.tokenCost })}
+                </span>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={onJump}
+              disabled={!onJump}
+              aria-label={t("jumpToSessionTurnAria", { ref: item.ref, title })}
+              title={t("jumpToSessionTurn")}
+              className="inline-flex h-6 shrink-0 cursor-pointer items-center gap-1 whitespace-nowrap rounded-md bg-muted/55 px-1.5 text-[10px] font-medium text-muted-foreground/85 outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-default disabled:opacity-40"
+            >
+              <CornerUpLeft className="size-3" aria-hidden="true" />
+              {t("jumpToSessionTurn")}
+            </button>
+          </div>
+
+          <CitationBody key={body} body={body} title={title} />
+        </div>
+      </div>
+    </article>
+  );
+}
+
 /**
- * A single source center for knowledge-base and web references. Legacy
- * citations without `kind` remain internal so persisted conversations keep
- * their existing traceability.
+ * Dual Source Center for session-history evidence (`[S1]`), internal knowledge-base
+ * passages (`[1]`), and external web references.
  */
 export const CitationBlock = React.memo(function CitationBlock({
   citations,
+  sessionCitations,
   onCitationClick,
+  onSessionCitationClick,
+  onInspectContext,
 }: {
   citations: Citation[];
+  sessionCitations?: SessionCitation[];
   onCitationClick?: (citation: Citation) => void;
+  onSessionCitationClick?: (citation: SessionCitation) => void;
+  onInspectContext?: () => void;
 }) {
   const t = useTranslations("Citations");
   const panel = useDetailPanel();
@@ -195,7 +302,18 @@ export const CitationBlock = React.memo(function CitationBlock({
     return { internal: internalItems, external: externalItems };
   }, [citations]);
 
-  const referenceCount = internal.length + external.length;
+  const sessionItems = React.useMemo(() => {
+    const seen = new Set<string>();
+    const list: SessionCitation[] = [];
+    for (const item of sessionCitations ?? []) {
+      if (seen.has(item.ref)) continue;
+      seen.add(item.ref);
+      list.push(item);
+    }
+    return list;
+  }, [sessionCitations]);
+
+  const referenceCount = internal.length + external.length + sessionItems.length;
   if (!referenceCount) return null;
 
   const openInternal = (citation: Citation) => {
@@ -221,15 +339,25 @@ export const CitationBlock = React.memo(function CitationBlock({
         onClick={() => setExpanded((value) => !value)}
         aria-expanded={expanded}
         aria-controls={contentId}
-        aria-label={t("toggleAria", {
-          action: expanded ? t("collapse") : t("expand"),
-          total: referenceCount,
-          internal: internal.length,
-          external: external.length,
-        })}
+        aria-label={
+          sessionItems.length > 0
+            ? t("toggleAriaWithSession", {
+                action: expanded ? t("collapse") : t("expand"),
+                total: referenceCount,
+                session: sessionItems.length,
+                internal: internal.length,
+                external: external.length,
+              })
+            : t("toggleAria", {
+                action: expanded ? t("collapse") : t("expand"),
+                total: referenceCount,
+                internal: internal.length,
+                external: external.length,
+              })
+        }
         title={expanded ? t("collapseReferences") : t("expandReferences")}
         className={cn(
-          "inline-flex h-6 shrink-0 items-center gap-1 rounded-md px-2 text-[11px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+          "inline-flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded-md px-2 text-[11px] font-medium tabular-nums outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
           expanded
             ? "bg-muted text-foreground"
             : "bg-muted/70 text-muted-foreground hover:bg-muted hover:text-foreground",
@@ -251,10 +379,49 @@ export const CitationBlock = React.memo(function CitationBlock({
         >
           <div className="flex items-center justify-between gap-3 px-3 py-2.5">
             <span className="text-xs font-semibold text-foreground">{t("sources")}</span>
-            <span className="shrink-0 rounded-full bg-background px-1.5 py-0.5 font-mono text-[10px] font-medium tabular-nums text-muted-foreground">
-              {referenceCount}
-            </span>
+            <div className="flex items-center gap-2">
+              {sessionItems.length > 0 && onInspectContext && (
+                <button
+                  type="button"
+                  onClick={onInspectContext}
+                  className="inline-flex h-6 cursor-pointer items-center gap-1 rounded-md border bg-background px-2 text-[10px] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <ScanSearch className="size-3" aria-hidden="true" />
+                  {t("inspectSessionContext")}
+                </button>
+              )}
+              <span className="shrink-0 rounded-full bg-background px-1.5 py-0.5 font-mono text-[10px] font-medium tabular-nums text-muted-foreground">
+                {referenceCount}
+              </span>
+            </div>
           </div>
+
+          {sessionItems.length > 0 && (
+            <div className="border-t border-border/60 px-1.5 py-1.5">
+              <div className="flex items-center justify-between px-1.5 py-1.5">
+                <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-foreground">
+                  <History className="size-3.5" aria-hidden="true" />
+                  {t("sessionHistory")}
+                </span>
+                <span className="font-mono text-[10px] font-normal tabular-nums text-muted-foreground">
+                  {sessionItems.length}
+                </span>
+              </div>
+              <div className="divide-y divide-border/50">
+                {sessionItems.map((item) => (
+                  <SessionCitationCard
+                    key={`session:${item.ref}`}
+                    item={item}
+                    onJump={
+                      onSessionCitationClick
+                        ? () => onSessionCitationClick(item)
+                        : undefined
+                    }
+                  />
+                ))}
+              </div>
+            </div>
+          )}
 
           {internal.length > 0 && (
             <div className="border-t border-border/60 px-1.5 py-1.5">

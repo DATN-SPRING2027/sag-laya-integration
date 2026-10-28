@@ -1,7 +1,21 @@
 "use client";
 
 import * as React from "react";
-import { ArrowUp, Check, Copy, FileUp, Globe2, ImagePlus, Library, Plus, RotateCcw, Square, Trash2, X } from "lucide-react";
+import {
+  ArrowUp,
+  Check,
+  Copy,
+  FileUp,
+  Globe2,
+  ImagePlus,
+  Library,
+  Plus,
+  RotateCcw,
+  ScanSearch,
+  Square,
+  Trash2,
+  X,
+} from "lucide-react";
 import { useLocale, useTranslations } from "next-intl";
 import { toast } from "sonner";
 
@@ -15,7 +29,20 @@ import {
   isComposerCompositionKeyEvent,
   shouldSubmitAfterEnter,
 } from "@/lib/composer-keyboard";
-import type { Citation, Source } from "@/lib/types";
+import {
+  buildDecisionLineage,
+  cleanTurnExcerpt,
+  filterAnswerSessionCitations,
+  parseSessionContextStep,
+  resolveSessionCitations,
+  type DecisionLineageModel,
+} from "@/lib/session-context-presentation";
+import type {
+  Citation,
+  SessionCitation,
+  SessionContextAudit,
+  Source,
+} from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { copyText } from "@/lib/clipboard";
 import { useApp } from "@/components/features/app-shell";
@@ -24,7 +51,7 @@ import {
   useConversationRuntime,
   useConversationSession,
 } from "@/components/features/chat/conversation-provider";
-import { useDetailPanel } from "@/components/features/detail-panel";
+import { useDetailPanel, useIsLgUp } from "@/components/features/detail-panel";
 import type {
   AgentActivityMatch,
   AgentActivityStep,
@@ -59,30 +86,57 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 
+interface MessageSessionMeta {
+  audit: SessionContextAudit;
+  allSessionCitations: SessionCitation[];
+  answerSessionCitations: SessionCitation[];
+  decisionLineage: DecisionLineageModel;
+  transitiveSources: Array<{ id: string; name?: string }>;
+}
+
+function escapeSelectorAttr(value: string): string {
+  if (typeof CSS !== "undefined" && typeof CSS.escape === "function") {
+    return CSS.escape(value);
+  }
+  return value.replace(/["\\]/g, "\\$&");
+}
+
 function MessageActions({
   content,
   citations,
+  sessionCitations,
   createdAt,
   onRetry,
   onDelete,
   onCitationClick,
+  onSessionCitationClick,
+  onInspectContext,
 }: {
   content: string;
   citations: Citation[];
+  sessionCitations?: SessionCitation[];
   createdAt?: string;
   onRetry?: () => void;
   onDelete?: () => void;
   onCitationClick?: (citation: Citation) => void;
+  onSessionCitationClick?: (citation: SessionCitation) => void;
+  onInspectContext?: () => void;
 }) {
   const t = useTranslations("Conversation");
   const locale = useLocale();
   const [done, setDone] = React.useState(false);
   const { timezone } = useApp();
   const btn =
-    "grid size-7 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground";
+    "grid size-7 cursor-pointer place-items-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground";
   return (
     <div className="mt-1 flex min-h-7 flex-wrap items-center gap-x-1 gap-y-0">
-      <CitationBlock citations={citations} onCitationClick={onCitationClick} />
+      <CitationBlock
+        citations={citations}
+        sessionCitations={sessionCitations}
+        onCitationClick={onCitationClick}
+        onSessionCitationClick={onSessionCitationClick}
+        onInspectContext={onInspectContext}
+      />
       <div className="flex items-center gap-1 opacity-0 transition-opacity group-hover/msg:opacity-100 focus-within:opacity-100">
         <Tooltip>
           <TooltipTrigger asChild>
@@ -146,16 +200,11 @@ export interface ConversationPanelProps {
   heroNode: React.ReactNode;
   emptyTitle: string;
   emptyHint: string;
-  /** 空态建议提问：点击即发送 */
   suggestions?: string[];
   placeholder?: string;
-  /** 面板可交互时激活会话与焦点；隐藏但保留挂载时设为 false。 */
   active?: boolean;
-  /** 紧凑入口可隐藏提示词预览，避免在小面板上叠加弹框。 */
   showPromptPreview?: boolean;
-  /** 消息区顶部的入口级内容，例如迷你面板的历史会话选择器。 */
   beforeMessages?: React.ReactNode;
-  /** 来自图谱等外部入口的显式草稿；相同 id 只应用一次。 */
   draftPrompt?: { id: number; text: string } | null;
   onCitationClick?: (citation: Citation, message: ConversationMessage) => void;
   onToolMatchClick?: (
@@ -165,10 +214,6 @@ export interface ConversationPanelProps {
   ) => void;
 }
 
-/**
- * 完整、自适应的对话面板。主工作台和迷你入口只提供外层容器，
- * 历史、流式过程、工具、引用、附件、@ 范围和输入器统一由这里管理。
- */
 export function ConversationPanel({
   sessionId,
   avatarNode,
@@ -191,6 +236,7 @@ export function ConversationPanel({
   const runtime = useConversationRuntime();
   const session = useConversationSession(sessionId);
   const detailPanel = useDetailPanel();
+  const isLgUp = useIsLgUp();
   const {
     input,
     setInput,
@@ -209,6 +255,8 @@ export function ConversationPanel({
   const [uploading, setUploading] = React.useState(false);
   const uploadingRef = React.useRef(false);
   const [stepsCollapsed, setStepsCollapsed] = React.useState(true);
+  const [highlightedMessageId, setHighlightedMessageId] = React.useState<string | null>(null);
+  const highlightTimerRef = React.useRef<number | null>(null);
   const mentionListRef = React.useRef<HTMLDivElement>(null);
   const docRef = React.useRef<HTMLInputElement>(null);
   const fileRef = React.useRef<HTMLInputElement>(null);
@@ -220,6 +268,7 @@ export function ConversationPanel({
   const bottomRef = React.useRef<HTMLDivElement>(null);
   const lastScrollAt = React.useRef(0);
   const followOutputRef = React.useRef(true);
+  const suppressAutoBottomRef = React.useRef(false);
   const sendRef = React.useRef<(text: string) => void>(() => {});
   const lastDraftPromptRef = React.useRef<number | null>(null);
 
@@ -230,6 +279,14 @@ export function ConversationPanel({
   const submitting = uploading || session.run?.lifecycle === "preparing";
   const pendingApproval = session.run?.pendingApproval ?? null;
   const approvalBusy = pendingApproval?.resolving ?? false;
+
+  React.useEffect(() => {
+    return () => {
+      if (highlightTimerRef.current) {
+        window.clearTimeout(highlightTimerRef.current);
+      }
+    };
+  }, []);
 
   React.useEffect(() => {
     if (active) runtime.activate(sessionId);
@@ -255,6 +312,195 @@ export function ConversationPanel({
   React.useEffect(() => {
     imagesRef.current = images;
   }, [images]);
+
+  const sourcesById = React.useMemo(() => {
+    return new Map(sources.map((source) => [source.id, source.name]));
+  }, [sources]);
+
+  const turnExcerptsById = React.useMemo(() => {
+    const map = new Map<string, { role: string; excerpt: string; ordinal?: number }>();
+    let ordinal = 0;
+    for (const message of messages) {
+      if (message.role === "user" || message.role === "assistant") {
+        ordinal += 1;
+        map.set(message.id, {
+          role: message.role,
+          excerpt: cleanTurnExcerpt(message.content),
+          ordinal,
+        });
+      }
+    }
+    return map;
+  }, [messages]);
+
+  const sessionMetaByMessageId = React.useMemo(() => {
+    const map = new Map<string, MessageSessionMeta>();
+    for (const message of messages) {
+      if (message.role !== "assistant") continue;
+      const parsed = parseSessionContextStep(message.steps);
+      if (!parsed) continue;
+      const allSessionCitations = resolveSessionCitations({
+        content: message.content,
+        audit: parsed.audit,
+        messages,
+        assistantMessageId: message.id,
+      });
+      const answerSessionCitations = filterAnswerSessionCitations(
+        parsed.audit,
+        allSessionCitations,
+      );
+      const decisionLineage = buildDecisionLineage({
+        currentAudit: parsed.audit,
+        messages,
+      });
+      const transitiveSources = parsed.transitiveSources.map((src) => ({
+        id: src.id,
+        name: src.name ?? sourcesById.get(src.id),
+      }));
+      map.set(message.id, {
+        audit: parsed.audit,
+        allSessionCitations,
+        answerSessionCitations,
+        decisionLineage,
+        transitiveSources,
+      });
+    }
+    return map;
+  }, [messages, sourcesById]);
+
+  const sessionCitationsByMessageId = React.useMemo(() => {
+    const map = new Map<string, SessionCitation[]>();
+    for (const [msgId, meta] of sessionMetaByMessageId.entries()) {
+      if (meta.audit.mode === "on" && meta.allSessionCitations.length > 0) {
+        map.set(msgId, meta.allSessionCitations);
+      }
+    }
+    return map;
+  }, [sessionMetaByMessageId]);
+
+  const jumpToTurn = React.useCallback(
+    async (turnId: string) => {
+      if (!turnId) return;
+      suppressAutoBottomRef.current = true;
+      followOutputRef.current = false;
+
+      const findElement = () =>
+        scrollRef.current?.querySelector<HTMLElement>(
+          `[data-message-id="${escapeSelectorAttr(turnId)}"]`,
+        ) ?? null;
+
+      let element = findElement();
+      let attempts = 0;
+      while (!element && attempts < 6) {
+        const snapshot = runtime.getSessionSnapshot(sessionId);
+        if (!snapshot.history.hasMore) break;
+        attempts += 1;
+        await runtime.loadOlder(sessionId);
+        await new Promise<void>((resolve) =>
+          window.requestAnimationFrame(() => resolve()),
+        );
+        element = findElement();
+      }
+
+      if (!element) {
+        suppressAutoBottomRef.current = false;
+        toast.info(t("turnUnavailable"));
+        return;
+      }
+
+      const prefersReducedMotion =
+        typeof window !== "undefined"
+        && typeof window.matchMedia === "function"
+        && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+      element.scrollIntoView({
+        behavior: prefersReducedMotion ? "auto" : "smooth",
+        block: "center",
+      });
+      setHighlightedMessageId(turnId);
+      if (highlightTimerRef.current) {
+        window.clearTimeout(highlightTimerRef.current);
+      }
+      highlightTimerRef.current = window.setTimeout(() => {
+        setHighlightedMessageId((current) => (current === turnId ? null : current));
+        suppressAutoBottomRef.current = false;
+      }, 2600);
+    },
+    [runtime, sessionId, t],
+  );
+
+  const jumpToTurnRef = React.useRef(jumpToTurn);
+  jumpToTurnRef.current = jumpToTurn;
+
+  const buildInspectorTarget = React.useCallback(
+    (messageId: string, meta: MessageSessionMeta, focusRef: string | null = null) => ({
+      kind: "session_context" as const,
+      messageId,
+      audit: meta.audit,
+      sessionCitations: meta.allSessionCitations,
+      decisionLineage: meta.decisionLineage,
+      transitiveSources: meta.transitiveSources,
+      focusRef,
+      turnExcerptsById,
+      onJumpToTurn: (turnId: string) => {
+        void jumpToTurnRef.current(turnId);
+      },
+    }),
+    [turnExcerptsById],
+  );
+
+  // Keep an open SessionContextInspector synchronized when older turns or source names load.
+  React.useEffect(() => {
+    const activeTarget = detailPanel.target;
+    if (!showPromptPreview || activeTarget?.kind !== "session_context") return;
+    const meta = sessionMetaByMessageId.get(activeTarget.messageId);
+    if (!meta) return;
+    if (
+      activeTarget.turnExcerptsById !== turnExcerptsById
+      || activeTarget.sessionCitations !== meta.allSessionCitations
+      || activeTarget.decisionLineage !== meta.decisionLineage
+      || activeTarget.transitiveSources !== meta.transitiveSources
+    ) {
+      detailPanel.replace(
+        buildInspectorTarget(
+          activeTarget.messageId,
+          meta,
+          activeTarget.focusRef ?? null,
+        ),
+      );
+    }
+  }, [
+    buildInspectorTarget,
+    detailPanel,
+    sessionMetaByMessageId,
+    showPromptPreview,
+    turnExcerptsById,
+  ]);
+
+  const toggleContextInspector = React.useCallback(
+    (messageId: string) => {
+      if (!showPromptPreview) return;
+      const meta = sessionMetaByMessageId.get(messageId);
+      if (!meta) return;
+      detailPanel.open(buildInspectorTarget(messageId, meta, null));
+    },
+    [buildInspectorTarget, detailPanel, sessionMetaByMessageId, showPromptPreview],
+  );
+
+  const focusContextInspectorRef = React.useCallback(
+    (messageId: string, ref: string | null) => {
+      if (!showPromptPreview) return;
+      const meta = sessionMetaByMessageId.get(messageId);
+      if (!meta) return;
+      const nextTarget = buildInspectorTarget(messageId, meta, ref);
+      if (detailPanel.target?.kind === "session_context") {
+        detailPanel.replace(nextTarget);
+      } else {
+        detailPanel.open(nextTarget);
+      }
+    },
+    [buildInspectorTarget, detailPanel, sessionMetaByMessageId, showPromptPreview],
+  );
 
   const mentionQuery = React.useMemo(() => {
     if (!mentionOpen) return "";
@@ -343,6 +589,27 @@ export function ConversationPanel({
     [detailPanel, onCitationClick],
   );
 
+  const handleTranscriptSessionCitation = React.useCallback(
+    (citation: SessionCitation, message: ConversationMessage) => {
+      const targetTurnId = citation.primaryTurnId ?? citation.includedTurnIds[0];
+      if (targetTurnId) {
+        void jumpToTurn(targetTurnId);
+      }
+      // On desktop (>= 900px), also open/focus the side-by-side Context Inspector card.
+      if (showPromptPreview && isLgUp) {
+        focusContextInspectorRef(message.id, citation.ref);
+      }
+    },
+    [focusContextInspectorRef, isLgUp, jumpToTurn, showPromptPreview],
+  );
+
+  const handleTranscriptSessionContextStep = React.useCallback(
+    (_step: AgentActivityStep, message: ConversationMessage) => {
+      toggleContextInspector(message.id);
+    },
+    [toggleContextInspector],
+  );
+
   const handleTranscriptMatch = React.useCallback(
     (
       match: AgentActivityMatch,
@@ -398,11 +665,17 @@ export function ConversationPanel({
       previousUser,
     }: ConversationMessageRenderContext<ConversationMessage>) => {
       const canMutate = message.role === "assistant" && !streaming;
+      const sessionMeta = sessionMetaByMessageId.get(message.id);
+      const isInspectorOpenForMessage =
+        detailPanel.target?.kind === "session_context"
+        && detailPanel.target.messageId === message.id;
+
       return (
         <>
           <MessageActions
             content={message.content}
             citations={message.citations}
+            sessionCitations={sessionMeta?.answerSessionCitations}
             createdAt={message.createdAt}
             onRetry={
               canMutate && previousUser?.content
@@ -415,14 +688,70 @@ export function ConversationPanel({
                 : undefined
             }
             onCitationClick={(citation) => handleTranscriptCitation(citation, message)}
+            onSessionCitationClick={(citation) =>
+              handleTranscriptSessionCitation(citation, message)
+            }
+            onInspectContext={
+              showPromptPreview && sessionMeta
+                ? () => toggleContextInspector(message.id)
+                : undefined
+            }
           />
-          {showPromptPreview && message.promptPreview && (
-            <PromptPreview preview={message.promptPreview} />
+          {showPromptPreview && (message.promptPreview || sessionMeta) && (
+            <div className="flex flex-wrap items-center gap-1">
+              {message.promptPreview && (
+                <PromptPreview preview={message.promptPreview} />
+              )}
+              {sessionMeta && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      type="button"
+                      onClick={() => toggleContextInspector(message.id)}
+                      aria-pressed={isInspectorOpenForMessage}
+                      aria-label={t("inspectContextAria")}
+                      className={cn(
+                        "mt-1.5 inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-md border px-2 text-[11px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+                        isInspectorOpenForMessage
+                          ? "border-primary/40 bg-primary/10 text-foreground"
+                          : "border-border/70 bg-muted/35 text-muted-foreground hover:bg-muted hover:text-foreground",
+                      )}
+                    >
+                      <ScanSearch className="size-3.5 shrink-0" aria-hidden="true" />
+                      <span>{t("inspectContext")}</span>
+                      <span
+                        className={cn(
+                          "rounded border px-1 py-px font-mono text-[9px] font-semibold uppercase tabular-nums leading-none",
+                          sessionMeta.audit.mode === "on"
+                            ? "border-emerald-600/30 bg-emerald-500/12 text-emerald-800 dark:border-emerald-400/30 dark:bg-emerald-400/15 dark:text-emerald-200"
+                            : sessionMeta.audit.mode === "shadow"
+                              ? "border-amber-600/30 bg-amber-500/12 text-amber-800 dark:border-amber-400/30 dark:bg-amber-400/15 dark:text-amber-200"
+                              : "border-border bg-background/80 text-muted-foreground",
+                        )}
+                      >
+                        {sessionMeta.audit.mode.toUpperCase()}
+                      </span>
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent>{t("inspectContextTooltip")}</TooltipContent>
+                </Tooltip>
+              )}
+            </div>
           )}
         </>
       );
     },
-    [deleteTranscriptMessage, handleTranscriptCitation, showPromptPreview, streaming],
+    [
+      deleteTranscriptMessage,
+      detailPanel.target,
+      handleTranscriptCitation,
+      handleTranscriptSessionCitation,
+      sessionMetaByMessageId,
+      showPromptPreview,
+      streaming,
+      t,
+      toggleContextInspector,
+    ],
   );
 
   const transcriptLive = session.run
@@ -438,6 +767,7 @@ export function ConversationPanel({
   React.useEffect(() => {
     const el = bottomRef.current;
     if (!el) return;
+    if (suppressAutoBottomRef.current) return;
     if (streaming && !followOutputRef.current) return;
     const now = Date.now();
     if (streaming && now - lastScrollAt.current < 120) return;
@@ -449,7 +779,6 @@ export function ConversationPanel({
     api.listSources().then(setSources).catch(() => {});
   }, []);
 
-  // 上下文用量估算：CJK ≈1 token/字，其余 ≈1 token/4 字符（无 tokenizer 的专业近似）
   const ctxTokens = React.useMemo(() => {
     const est = (t: string) => {
       let cjk = 0;
@@ -547,7 +876,6 @@ export function ConversationPanel({
         webEnabled,
       });
 
-      // send 在首次 await 前就登记 run；未登记表示被全局并发边界拒绝，保留草稿。
       if (!runtime.getSessionSnapshot(sessionId).run) {
         await request;
         return;
@@ -558,6 +886,7 @@ export function ConversationPanel({
       setImages([]);
       pendingImages.forEach((image) => URL.revokeObjectURL(image.url));
       setStepsCollapsed(false);
+      suppressAutoBottomRef.current = false;
       followOutputRef.current = true;
 
       void request.catch((error) => {
@@ -651,7 +980,6 @@ export function ConversationPanel({
           },
         )
       ) {
-        // 保留输入法的默认确认行为，同时阻止事件冒泡到 React 的发送处理。
         event.stopPropagation();
       }
     };
@@ -702,9 +1030,15 @@ export function ConversationPanel({
           <ConversationTranscript
             messages={messages}
             live={transcriptLive}
+            highlightedMessageId={highlightedMessageId}
+            sessionCitationsByMessageId={sessionCitationsByMessageId}
             assistantAvatar={avatarNode}
             onCitationClick={handleTranscriptCitation}
+            onSessionCitationClick={handleTranscriptSessionCitation}
             onToolMatchClick={handleTranscriptMatch}
+            onSessionContextClick={
+              showPromptPreview ? handleTranscriptSessionContextStep : undefined
+            }
             renderUserAttachments={renderTranscriptAttachments}
             renderAssistantFooter={renderTranscriptFooter}
             empty={
@@ -719,7 +1053,7 @@ export function ConversationPanel({
                         key={question}
                         type="button"
                         onClick={() => send(question)}
-                        className="rounded-full border bg-card px-3 py-1.5 text-xs text-muted-foreground shadow-soft outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+                        className="cursor-pointer rounded-full border bg-card px-3 py-1.5 text-xs text-muted-foreground shadow-soft outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
                       >
                         {question}
                       </button>

@@ -313,8 +313,121 @@ export interface Thread {
   updated_at: string;
 }
 
+export type EpistemicStatus =
+  | "FACT"
+  | "PROPOSED"
+  | "CONSIDERING"
+  | "CONFIRMED"
+  | "SUPERSEDED"
+  | "NEGATED"
+  | "OPEN_ISSUE";
+
+export type SessionContextMode = "legacy" | "shadow" | "on";
+
+export type AblationMode =
+  | "V0_legacy"
+  | "V1_hybrid"
+  | "V2_graph_ppr"
+  | "V3_dual_hierarchy"
+  | "V4_closure_temporal"
+  | "V5_ecce_full";
+
+export type SessionMemoryScope =
+  | "session_history"
+  | "knowledge_base"
+  | "hybrid_both"
+  | "full_session_audit";
+
+export type TemporalQueryMode =
+  | "atemporal"
+  | "current_effective"
+  | "past_point"
+  | "change_lineage";
+
+export type RejectionReasonCode =
+  | "SUPERSEDED_BY_NEWER_DECISION"
+  | "REDUNDANT_SEMANTIC_DUPLICATE"
+  | "TOKEN_BUDGET_CAP"
+  | "LOW_MARGINAL_UTILITY"
+  | (string & {});
+
+export interface SelectedEvidenceGroupTrace {
+  citation_tag: string;
+  primary_turn_id: string;
+  included_turn_ids: string[];
+  closure_reason: string;
+  epistemic_status: EpistemicStatus;
+  utility_score: number;
+  redundancy_penalty: number;
+  coverage_gain: number;
+  marginal_gain_per_token: number;
+  token_cost: number;
+}
+
+export interface RejectedCandidateTrace {
+  turn_id: string;
+  turn_ordinal: number;
+  raw_score: number;
+  epistemic_status: EpistemicStatus;
+  reason_code: RejectionReasonCode;
+  detail: string;
+}
+
+export interface SessionContextAudit {
+  mode: SessionContextMode;
+  ablation: AblationMode | string;
+  memory_scope: SessionMemoryScope | string;
+  temporal_mode: TemporalQueryMode | string;
+  router_model: string;
+  router_fallback_used: boolean;
+  total_indexed_turns: number;
+  episode_count: number;
+  active_decisions_count: number;
+  budget_tokens: number;
+  used_evidence_tokens: number;
+  used_recent_tokens: number;
+  total_output_history_tokens: number;
+  llm_memory_calls: number;
+  partial_coverage: boolean;
+  view_weights: Record<string, number>;
+  selected_groups: SelectedEvidenceGroupTrace[];
+  rejected_candidates: RejectedCandidateTrace[];
+  latency_ms: number;
+  persistence_status: string;
+  persisted_units_written: number;
+  qdrant_points_upserted: number;
+}
+
+export interface SessionCitationTurnPreview {
+  id: string;
+  role: "user" | "assistant" | "system";
+  excerpt: string;
+  createdAt?: string;
+  ordinal?: number;
+  loaded: boolean;
+}
+
+export interface SessionCitation {
+  ref: string;
+  index: number;
+  kind: "evidence_group" | "short_verbatim" | "recent_continuity";
+  primaryTurnId: string | null;
+  includedTurnIds: string[];
+  epistemicStatus: EpistemicStatus;
+  closureReason: string;
+  utilityScore?: number;
+  redundancyPenalty?: number;
+  coverageGain?: number;
+  marginalGainPerToken?: number;
+  tokenCost?: number;
+  turns: SessionCitationTurnPreview[];
+  mappedInAnswer: boolean;
+}
+
 export interface MessageStep {
-  kind: "thinking" | "tool" | "answer";
+  kind: "thinking" | "tool" | "answer" | "session_context";
+  mode?: SessionContextMode | string;
+  audit?: SessionContextAudit | Record<string, unknown>;
   step: number;
   name?: string;
   label?: string;

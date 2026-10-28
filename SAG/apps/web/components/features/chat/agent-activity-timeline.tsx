@@ -1,11 +1,22 @@
 "use client";
 
 import * as React from "react";
-import { Check, ChevronDown, ChevronRight, X } from "lucide-react";
+import {
+  ArrowUpRight,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  Layers,
+  X,
+} from "lucide-react";
 import { useTranslations } from "next-intl";
 
 import type { MessageStep } from "@/lib/types";
 import { toolScope } from "@/lib/agent-run-activity";
+import {
+  computeBudgetBreakdown,
+  normalizeSessionContextAudit,
+} from "@/lib/session-context-presentation";
 import { cn } from "@/lib/utils";
 import { Spinner } from "@/components/ui/spinner";
 
@@ -27,6 +38,7 @@ export interface AgentActivityTimelineProps {
   collapsed?: boolean;
   onToggle?: () => void;
   onMatchClick?: (match: AgentActivityMatch, step: AgentActivityStep) => void;
+  onSessionContextClick?: (step: AgentActivityStep) => void;
   className?: string;
 }
 
@@ -50,10 +62,72 @@ function argumentPreview(value: unknown, limit = 60) {
 
 function elapsedFor(step: AgentActivityStep, now: number) {
   if (typeof step.ms === "number") return step.ms;
+  if (
+    step.audit
+    && typeof step.audit === "object"
+    && typeof (step.audit as { latency_ms?: unknown }).latency_ms === "number"
+  ) {
+    return (step.audit as { latency_ms: number }).latency_ms;
+  }
   if (step.status === "active" && typeof step.startedAt === "number") {
     return Math.max(0, now - step.startedAt);
   }
   return 0;
+}
+
+function modeBadgeClasses(mode: string): string {
+  switch (mode) {
+    case "on":
+      return "border-emerald-600/35 bg-emerald-500/12 text-emerald-800 dark:border-emerald-400/35 dark:bg-emerald-400/15 dark:text-emerald-200";
+    case "shadow":
+      return "border-amber-600/35 bg-amber-500/12 text-amber-800 dark:border-amber-400/35 dark:bg-amber-400/15 dark:text-amber-200";
+    default:
+      return "border-border bg-muted text-muted-foreground";
+  }
+}
+
+function SessionContextInlineDetails({ step }: { step: AgentActivityStep }) {
+  const t = useTranslations("AgentActivity");
+  const audit = normalizeSessionContextAudit(step.audit, step.mode, step.ms);
+  if (!audit) return null;
+  const budget = computeBudgetBreakdown(audit);
+
+  return (
+    <div className="mb-2 ml-5 mt-1.5 max-w-2xl rounded-md border bg-muted/25 p-2.5 text-[11px] text-muted-foreground">
+      <div className="grid grid-cols-2 gap-x-4 gap-y-1 sm:grid-cols-4">
+        <div>
+          <span className="block text-[10px] text-muted-foreground/75">
+            {t("sessionContext.ablation")}
+          </span>
+          <span className="font-mono text-foreground/85">{audit.ablation}</span>
+        </div>
+        <div>
+          <span className="block text-[10px] text-muted-foreground/75">
+            {t("sessionContext.selected")}
+          </span>
+          <span className="font-mono tabular-nums text-foreground/85">
+            {audit.selected_groups.length}
+          </span>
+        </div>
+        <div>
+          <span className="block text-[10px] text-muted-foreground/75">
+            {t("sessionContext.rejected")}
+          </span>
+          <span className="font-mono tabular-nums text-foreground/85">
+            {audit.rejected_candidates.length}
+          </span>
+        </div>
+        <div>
+          <span className="block text-[10px] text-muted-foreground/75">
+            {t("sessionContext.budget")}
+          </span>
+          <span className="font-mono tabular-nums text-foreground/85">
+            {budget.totalUsedTokens} / {budget.budgetTokens}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function ToolRunDetails({
@@ -111,14 +185,14 @@ function ToolRunDetails({
                 className={cn(
                   "block w-full rounded px-2 py-1.5 text-left",
                   traceable &&
-                    "transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                    "cursor-pointer transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
                 )}
               >
                 <span className="flex min-w-0 items-center gap-1.5 text-foreground/85">
-                  <span className="shrink-0 font-mono">[{match.n ?? index + 1}]</span>
+                  <span className="shrink-0 font-mono tabular-nums">[{match.n ?? index + 1}]</span>
                   <span className="truncate font-medium">{match.heading || t("passage")}</span>
                   {typeof match.score === "number" && (
-                    <span className="ml-auto shrink-0 font-mono text-[10px] text-muted-foreground/70">
+                    <span className="ml-auto shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground/70">
                       {match.score.toFixed(3)}
                     </span>
                   )}
@@ -146,6 +220,7 @@ export function AgentActivityTimeline({
   collapsed: collapsedProp,
   onToggle,
   onMatchClick,
+  onSessionContextClick,
   className,
 }: AgentActivityTimelineProps) {
   const t = useTranslations("AgentActivity");
@@ -204,7 +279,7 @@ export function AgentActivityTimeline({
         className={cn(
           "inline-flex h-5 items-center gap-1 text-[10px] text-muted-foreground outline-none",
           !active &&
-            "rounded transition-colors hover:text-foreground focus-visible:ring-1 focus-visible:ring-border",
+            "cursor-pointer rounded transition-colors hover:text-foreground focus-visible:ring-1 focus-visible:ring-border",
         )}
       >
         {active ? (
@@ -234,11 +309,97 @@ export function AgentActivityTimeline({
             const isError = step.status === "error" || Boolean(step.error);
             const elapsed = elapsedFor(step, now);
             const key = step.id ?? `${step.kind}-${step.step}-${index}`;
+
+            if (step.kind === "session_context") {
+              const audit = normalizeSessionContextAudit(step.audit, step.mode, step.ms);
+              const mode = audit?.mode ?? "legacy";
+              const canOpenInspector = Boolean(audit && onSessionContextClick);
+              const canExpandInline = Boolean(audit && !onSessionContextClick);
+              const inlineOpen = expandedTools.has(key);
+              const summaryText = audit
+                ? t("sessionContext.summary", {
+                    groups: audit.selected_groups.length,
+                    tokens: audit.total_output_history_tokens,
+                  })
+                : "";
+
+              return (
+                <div key={key}>
+                  <button
+                    type="button"
+                    disabled={!canOpenInspector && !canExpandInline}
+                    onClick={() => {
+                      if (canOpenInspector) {
+                        onSessionContextClick?.(step);
+                        return;
+                      }
+                      if (canExpandInline) {
+                        setExpandedTools((current) => {
+                          const next = new Set(current);
+                          if (next.has(key)) next.delete(key);
+                          else next.add(key);
+                          return next;
+                        });
+                      }
+                    }}
+                    className={cn(
+                      "flex w-full items-center gap-2 py-1 text-left outline-none",
+                      (canOpenInspector || canExpandInline) &&
+                        "cursor-pointer rounded transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring",
+                    )}
+                  >
+                    <Layers className="size-3 shrink-0 text-primary" aria-hidden="true" />
+                    <span className="min-w-0 flex-1 truncate text-muted-foreground">
+                      <span className="font-medium text-foreground/85">
+                        {t("sessionContext.label")}
+                      </span>
+                      <span
+                        className={cn(
+                          "ml-1.5 inline-flex items-center rounded border px-1 py-px font-mono text-[9px] font-semibold uppercase leading-none",
+                          modeBadgeClasses(mode),
+                        )}
+                      >
+                        {mode.toUpperCase()}
+                      </span>
+                      {summaryText && (
+                        <span className="tabular-nums">
+                          {" · "}
+                          {summaryText}
+                        </span>
+                      )}
+                      <span className="tabular-nums">
+                        {" · "}
+                        {formatDuration(audit?.latency_ms ?? elapsed)}
+                      </span>
+                    </span>
+                    {canOpenInspector ? (
+                      <ArrowUpRight
+                        className="size-3 shrink-0 text-muted-foreground"
+                        aria-hidden="true"
+                      />
+                    ) : canExpandInline ? (
+                      <ChevronRight
+                        className={cn(
+                          "size-3 shrink-0 text-muted-foreground transition-transform",
+                          inlineOpen && "rotate-90",
+                        )}
+                      />
+                    ) : null}
+                  </button>
+                  {canExpandInline && inlineOpen && (
+                    <SessionContextInlineDetails step={step} />
+                  )}
+                </div>
+              );
+            }
+
             const args = step.arguments?.query !== undefined
               ? String(step.arguments.query)
               : step.arguments?.name !== undefined
                 ? String(step.arguments.name)
-                : step.args || argumentPreview(step.arguments);
+                : typeof step.args === "string"
+                  ? step.args
+                  : argumentPreview(step.arguments ?? step.args);
             const hasDetails =
               step.kind === "tool" &&
               (Boolean(step.arguments && Object.keys(step.arguments).length) ||
@@ -246,7 +407,7 @@ export function AgentActivityTimeline({
                 Boolean(toolScope(step).kind) ||
                 Boolean(step.details?.sources?.length) ||
                 Boolean(step.details?.output_preview));
-            const expanded = expandedTools.has(key);
+            const itemExpanded = expandedTools.has(key);
             const toolLabel = step.name === "search_context"
               ? t("tools.searchContext")
               : step.name === "get_entity"
@@ -257,7 +418,7 @@ export function AgentActivityTimeline({
                     ? t("tools.webSearch")
                     : step.name === "open_webpage"
                       ? t("tools.openWebPage")
-                  : step.label || step.name || t("tool");
+                      : step.label || step.name || t("tool");
 
             return (
               <div key={key}>
@@ -276,7 +437,7 @@ export function AgentActivityTimeline({
                   className={cn(
                     "flex w-full items-center gap-2 py-1 text-left outline-none",
                     hasDetails &&
-                      "rounded transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring",
+                      "cursor-pointer rounded transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring",
                   )}
                 >
                   {isActive ? (
@@ -288,7 +449,7 @@ export function AgentActivityTimeline({
                   )}
 
                   {step.kind === "thinking" ? (
-                    <span className={isActive ? "text-shimmer" : "text-muted-foreground"}>
+                    <span className={isActive ? "text-shimmer tabular-nums" : "tabular-nums text-muted-foreground"}>
                       {t("thinkingRound", {
                         state: isActive ? t("thinkingActive") : t("thinking"),
                         round: step.step,
@@ -296,7 +457,7 @@ export function AgentActivityTimeline({
                       })}
                     </span>
                   ) : step.kind === "answer" ? (
-                    <span className={isActive ? "text-shimmer" : "text-muted-foreground"}>
+                    <span className={isActive ? "text-shimmer tabular-nums" : "tabular-nums text-muted-foreground"}>
                       {t("answering", {
                         state: isActive ? t("answeringActive") : t("answeringDone"),
                         duration: formatDuration(elapsed),
@@ -305,7 +466,7 @@ export function AgentActivityTimeline({
                   ) : (
                     <span
                       className={cn(
-                        "min-w-0 flex-1 truncate",
+                        "min-w-0 flex-1 truncate tabular-nums",
                         isActive
                           ? "text-shimmer"
                           : isError
@@ -334,12 +495,12 @@ export function AgentActivityTimeline({
                     <ChevronRight
                       className={cn(
                         "size-3 shrink-0 text-muted-foreground transition-transform",
-                        expanded && "rotate-90",
+                        itemExpanded && "rotate-90",
                       )}
                     />
                   )}
                 </button>
-                {expanded && (
+                {itemExpanded && (
                   <ToolRunDetails
                     step={step}
                     onMatchClick={onMatchClick}
