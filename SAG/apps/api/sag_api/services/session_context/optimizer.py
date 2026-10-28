@@ -377,6 +377,7 @@ async def build_ecce_context_pack(
             llm_memory_calls=llm_calls,
             route_decision=decision,
             view_weights={"legacy_window": 1.0},
+            recent_turn_ids=tuple(t.turn_id for t in chosen),
             latency_ms=(time.perf_counter() - t_start) * 1000.0,
         )
         return SessionContextPack(
@@ -414,6 +415,7 @@ async def build_ecce_context_pack(
             llm_memory_calls=0,
             route_decision=decision,
             view_weights={"short_verbatim": 1.0},
+            recent_turn_ids=tuple(t.turn_id for t in visible_turns),
             latency_ms=(time.perf_counter() - t_start) * 1000.0,
         )
         return SessionContextPack(
@@ -573,6 +575,7 @@ async def build_ecce_context_pack(
             route_decision=decision,
             view_weights={"full_session_ledger_and_episodes": 1.0},
             selected_groups=selected_groups,
+            recent_turn_ids=tuple(t.turn_id for t in recent_turns),
             rejected_candidates=rejected[:10],
             latency_ms=(time.perf_counter() - t_start) * 1000.0,
         )
@@ -993,6 +996,7 @@ async def build_ecce_context_pack(
         route_decision=decision,
         view_weights=weights,
         selected_groups=selected_groups,
+        recent_turn_ids=tuple(t.turn_id for t in recent_turns),
         rejected_candidates=rejected[:10],
         latency_ms=(time.perf_counter() - t_start) * 1000.0,
     )

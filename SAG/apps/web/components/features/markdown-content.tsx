@@ -8,7 +8,11 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 
 import { splitMarkdownBlocks } from "@/lib/markdown-blocks";
-import { sessionCitationPillClasses } from "@/lib/session-context-presentation";
+import {
+  parseCitationBrackets,
+  sessionCitationPillClasses,
+  type ParsedCitationToken,
+} from "@/lib/session-context-presentation";
 import type { Citation, SessionCitation } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -218,6 +222,30 @@ export function remarkCitationLinks(
   validNumbers: ReadonlySet<string>,
   validSessionRefs: ReadonlySet<string> = new Set(),
 ) {
+  const isTokenValid = (token: ParsedCitationToken): boolean =>
+    token.kind === "doc"
+      ? validNumbers.has(token.number)
+      : validSessionRefs.has(token.ref);
+
+  const toCitationLinkNode = (token: ParsedCitationToken): MdNode =>
+    token.kind === "doc"
+      ? {
+          type: "link",
+          // Hash URLs survive react-markdown's URL sanitizer; the renderer below
+          // replaces them with buttons, so citation clicks never navigate.
+          url: `#citation-${token.number}`,
+          title: null,
+          children: [{ type: "text", value: token.number }],
+          data: { hProperties: { "data-citation": token.number } },
+        }
+      : {
+          type: "link",
+          url: `#session-citation-${token.ref}`,
+          title: null,
+          children: [{ type: "text", value: token.ref }],
+          data: { hProperties: { "data-session-citation": token.ref } },
+        };
+
   return () => {
     const visit = (node: MdNode) => {
       if (
@@ -236,48 +264,50 @@ export function remarkCitationLinks(
           return [child];
         }
 
+        const brackets = parseCitationBrackets(child.value);
+        if (brackets.length === 0) return [child];
+
         const parts: MdNode[] = [];
-        const re = /\[(?:(\d+)|(S[1-9]\d*))\]/g;
         let last = 0;
-        let match: RegExpExecArray | null;
-        while ((match = re.exec(child.value))) {
-          const docNumber = match[1];
-          const sessionRef = match[2];
+        for (const bracket of brackets) {
+          const hasSessionToken = bracket.tokens.some(
+            (token) => token.kind === "session",
+          );
           // A bracketed reference is only interactive when the backend supplied
-          // traceable metadata for that exact reference. Never manufacture a
-          // disabled "citation" control for model-invented references.
-          if (docNumber) {
-            if (!validNumbers.has(docNumber)) continue;
-            if (match.index > last) {
-              parts.push({ type: "text", value: child.value.slice(last, match.index) });
+          // traceable metadata for that exact reference. For purely numeric
+          // brackets (`[1]`, `[1, 2]`), require every number to be valid so prose
+          // intervals like `[1, 100]` stay plain text.
+          if (!hasSessionToken) {
+            if (!bracket.tokens.every(isTokenValid)) continue;
+            if (bracket.start > last) {
+              parts.push({
+                type: "text",
+                value: child.value.slice(last, bracket.start),
+              });
             }
-            parts.push({
-              type: "link",
-              // Hash URLs survive react-markdown's URL sanitizer; the renderer below
-              // replaces them with buttons, so citation clicks never navigate.
-              url: `#citation-${docNumber}`,
-              title: null,
-              children: [{ type: "text", value: docNumber }],
-              data: { hProperties: { "data-citation": docNumber } },
-            });
-            last = match.index + match[0].length;
+            for (const token of bracket.tokens) {
+              parts.push(toCitationLinkNode(token));
+            }
+            last = bracket.end;
             continue;
           }
 
-          if (sessionRef) {
-            if (!validSessionRefs.has(sessionRef)) continue;
-            if (match.index > last) {
-              parts.push({ type: "text", value: child.value.slice(last, match.index) });
-            }
+          if (!bracket.tokens.some(isTokenValid)) continue;
+          if (bracket.start > last) {
             parts.push({
-              type: "link",
-              url: `#session-citation-${sessionRef}`,
-              title: null,
-              children: [{ type: "text", value: sessionRef }],
-              data: { hProperties: { "data-session-citation": sessionRef } },
+              type: "text",
+              value: child.value.slice(last, bracket.start),
             });
-            last = match.index + match[0].length;
           }
+          for (const token of bracket.tokens) {
+            if (isTokenValid(token)) {
+              parts.push(toCitationLinkNode(token));
+            } else {
+              const rawRef = token.kind === "doc" ? token.number : token.ref;
+              parts.push({ type: "text", value: ` [${rawRef}]` });
+            }
+          }
+          last = bracket.end;
         }
         if (!parts.length) return [child];
         if (last < child.value.length) {

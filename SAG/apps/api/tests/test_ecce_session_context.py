@@ -832,3 +832,124 @@ async def test_pr42_knowledge_only_grounding_single_router_call_delta_db_and_tra
         assert scoped_check[0].content == sc_runtime.HIDDEN_SCOPE_PLACEHOLDER
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_pr46_compound_citations_and_recent_turn_provenance() -> None:
+    from sag_api.services import agent_service
+    from sag_api.services.session_context.optimizer import build_ecce_context_pack
+
+    base_time = datetime(2026, 10, 28, 4, 0, tzinfo=UTC)
+    idx = IncrementalSessionIndex("thread-pr46")
+    embedder = _CountingBatchEmbedder()
+    turns = [
+        {
+            "id": "u1",
+            "role": "user",
+            "content": "Chốt kiến trúc lưu trữ dùng Qdrant và PostgreSQL 18.",
+            "created_at": base_time,
+        }
+    ]
+    for num in range(2, 9):
+        turns.append(
+            {
+                "id": f"u{num}",
+                "role": "assistant" if num % 2 == 0 else "user",
+                "content": f"Trao đổi vận hành thường ngày bước {num}.",
+                "created_at": base_time + timedelta(minutes=num),
+            }
+        )
+    await idx.append_messages(turns, embedder=embedder)
+
+    pack = await build_ecce_context_pack(
+        idx,
+        query="Kiến trúc lưu trữ đã chốt là gì và trao đổi vừa rồi nói gì?",
+        budget_tokens=1200,
+        ablation="V5_ecce_full",
+        route_decision={
+            "memory_scope": "session_history",
+            "temporal_mode": "current_effective",
+            "model": "Kev-4b",
+            "fallback_used": False,
+        },
+        embedder=embedder,
+    )
+    # session_history recent_count is 2 -> exact recent_turn_ids must be u7, u8 (not u5..u8)
+    assert list(pack.audit_trace.recent_turn_ids) == ["u7", "u8"]
+    audit_dict = pack.audit_trace.to_dict()
+    assert audit_dict["recent_turn_ids"] == ["u7", "u8"]
+
+    # Compound citation validation & sanitization for both document and session markers
+    doc_pool = [
+        {
+            "n": 1,
+            "source_id": "src-1",
+            "chunk_id": "chk-1",
+            "document_id": "doc-1",
+            "document_version_id": "ver-1",
+            "page_from": 1,
+            "page_to": 1,
+            "anchor": "sec-1",
+            "snippet": "Spec 1",
+        },
+        {
+            "n": 2,
+            "source_id": "src-2",
+            "chunk_id": "chk-2",
+            "document_id": "doc-2",
+            "document_version_id": "ver-2",
+            "page_from": 2,
+            "page_to": 2,
+            "anchor": "sec-2",
+            "snippet": "Spec 2",
+        },
+    ]
+    session_pool = [
+        {
+            "ref": "S1",
+            "kind": "session_memory",
+            "primary_message_id": "u1",
+            "message_ids": ["u1"],
+            "turn_ordinals": [1],
+            "epistemic_status": "CONFIRMED",
+            "cited_source_ids": ["src-1"],
+        },
+        {
+            "ref": "S2",
+            "kind": "session_memory",
+            "primary_message_id": "u8",
+            "message_ids": ["u7", "u8"],
+            "turn_ordinals": [7, 8],
+            "epistemic_status": "FACT",
+            "cited_source_ids": [],
+        },
+    ]
+    raw_answer = (
+        "Tài liệu [1, 2], phiên [S1, S2], hỗn hợp [1, S1], suy diễn [S2, S99], "
+        "khoảng số [1, 100], và mã nguồn `[1, S99]`.\n```txt\n[S99, 99]\n```"
+    )
+    after_doc, verified_docs = agent_service._finalize_answer_citations(raw_answer, doc_pool)
+    final_text, verified_session, has_explicit = agent_service._finalize_session_citations(
+        after_doc, session_pool
+    )
+    assert has_explicit is True
+    assert {c["n"] for c in verified_docs} == {1, 2}
+    assert {c["ref"] for c in verified_session if c.get("mapped")} == {"S1", "S2"}
+    assert "[1, 2]" in final_text
+    assert "[S1, S2]" in final_text
+    assert "[1, S1]" in final_text
+    assert "[S2]" in final_text
+    assert "S99]" not in final_text.split("`")[0]
+    assert "[1, 100]" in final_text
+    assert "`[1, S99]`" in final_text
+
+    step_entry = agent_service._build_session_audit_step(
+        audit_dict,
+        used_session_citations=verified_session,
+        available_session_citations=session_pool,
+    )
+    assert step_entry is not None
+    assert step_entry["details"]["sources"] == [{"id": "src-1"}]
+    assert [c["ref"] for c in step_entry["session_citations"]] == ["S1", "S2"]
+    assert step_entry["session_citations"][1]["message_ids"] == ["u7", "u8"]
+

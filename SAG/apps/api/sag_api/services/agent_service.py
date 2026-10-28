@@ -119,10 +119,14 @@ _RESEARCH_TOOL = re.compile(
     r"tìm kiếm|tra cứu|truy vấn|tin tức|thời tiết|giá|tri thức|tài liệu|trang web)",
     re.IGNORECASE,
 )
-# Numeric knowledge markers are plain ``[n]``. A numeric Markdown link label
+# Numeric knowledge markers are plain ``[n]`` and session markers are ``[Sn]``
+# (or compound ``[1, 2]``, ``[S1, S2]``, ``[1, S1]``). A Markdown link label
 # (``[n](https://...)``) is an external link and must not be stripped.
 _CITATION_REFERENCE = re.compile(r"\[(\d+)](?!\()")
 _SESSION_CITATION_REFERENCE = re.compile(r"\[S(\d+)](?!\()")
+_COMPOUND_CITATION_BRACKET = re.compile(
+    r"\[(\s*(?:\d+|S\d+)(?:\s*[,;、]\s*(?:\d+|S\d+))*)\s*](?!\()"
+)
 _ANSWER_URL = re.compile(r"https?://[^\s<>\"'`，。；：！？、（）【】《》]+", re.IGNORECASE)
 _MAX_EXTERNAL_CITATIONS = 12
 _URL_TRAILING_PUNCTUATION = ".,;:!?)]}，。；：！？、"
@@ -218,6 +222,91 @@ def _append_current_scene(
     return result
 
 
+def _rewrite_prose_citation_brackets(
+    text: str,
+    replacer: Any,
+) -> str:
+    """Apply ``_COMPOUND_CITATION_BRACKET`` replacement outside fenced and inline code."""
+    if not text:
+        return text
+
+    out: list[str] = []
+    prose_start = 0
+    index = 0
+    length = len(text)
+    code_fence: str | None = None
+    inline_ticks = 0
+
+    def _flush_prose(end_idx: int) -> None:
+        nonlocal prose_start
+        if end_idx > prose_start:
+            segment = text[prose_start:end_idx]
+            out.append(_COMPOUND_CITATION_BRACKET.sub(replacer, segment))
+        prose_start = end_idx
+
+    while index < length:
+        line_start = index == 0 or text[index - 1] == "\n"
+        if line_start and inline_ticks == 0:
+            fence_match = re.match(r"^( {0,3})(`{3,}|~{3,})", text[index:])
+            if fence_match:
+                marker = fence_match.group(2)
+                nl_idx = text.find("\n", index)
+                line_end = length if nl_idx == -1 else nl_idx + 1
+                suffix = text[index + len(fence_match.group(0)) : line_end].strip()
+                if code_fence is None:
+                    _flush_prose(index)
+                    code_fence = marker
+                    out.append(text[index:line_end])
+                    prose_start = line_end
+                    index = line_end
+                    continue
+                if (
+                    code_fence[0] == marker[0]
+                    and len(marker) >= len(code_fence)
+                    and suffix == ""
+                ):
+                    out.append(text[index:line_end])
+                    code_fence = None
+                    prose_start = line_end
+                    index = line_end
+                    continue
+
+        if code_fence is not None:
+            index += 1
+            continue
+
+        if text[index] == "`":
+            run_len = 1
+            while index + run_len < length and text[index + run_len] == "`":
+                run_len += 1
+            if inline_ticks == 0:
+                _flush_prose(index)
+                inline_ticks = run_len
+                out.append(text[index : index + run_len])
+                prose_start = index + run_len
+            elif inline_ticks == run_len:
+                out.append(text[index : index + run_len])
+                inline_ticks = 0
+                prose_start = index + run_len
+            else:
+                out.append(text[index : index + run_len])
+                prose_start = index + run_len
+            index += run_len
+            continue
+
+        if inline_ticks > 0:
+            out.append(text[index])
+            prose_start = index + 1
+        index += 1
+
+    if code_fence is None and inline_ticks == 0:
+        _flush_prose(length)
+    elif prose_start < length:
+        out.append(text[prose_start:length])
+
+    return "".join(out)
+
+
 def _finalize_answer_citations(
     answer: str,
     citations: list[dict[str, Any]],
@@ -250,14 +339,42 @@ def _finalize_answer_citations(
     used: list[int] = []
 
     def replace_reference(match: re.Match[str]) -> str:
-        number = int(match.group(1))
-        if number not in traceable:
-            return ""
-        if number not in used:
-            used.append(number)
-        return match.group(0)
+        raw_items = [part.strip() for part in re.split(r"[,;、]", match.group(1)) if part.strip()]
+        if not raw_items:
+            return match.group(0)
+        if len(raw_items) == 1:
+            token = raw_items[0]
+            if token.startswith("S"):
+                return match.group(0)
+            number = int(token)
+            if number not in traceable:
+                return ""
+            if number not in used:
+                used.append(number)
+            return match.group(0)
 
-    canonical = _CITATION_REFERENCE.sub(replace_reference, answer).strip()
+        has_session_token = any(item.startswith("S") for item in raw_items)
+        if not has_session_token:
+            numbers = [int(item) for item in raw_items]
+            if all(num in traceable for num in numbers):
+                for num in numbers:
+                    if num not in used:
+                        used.append(num)
+            return match.group(0)
+
+        kept: list[str] = []
+        for item in raw_items:
+            if item.startswith("S"):
+                kept.append(item)
+            else:
+                num = int(item)
+                if num in traceable:
+                    if num not in used:
+                        used.append(num)
+                    kept.append(str(num))
+        return f"[{', '.join(kept)}]" if kept else ""
+
+    canonical = _rewrite_prose_citation_brackets(answer, replace_reference).strip()
     canonical = re.sub(r"[ \t]+([，。！？；：,.!?;:])", r"\1", canonical)
     explicitly_mapped = set(used)
     if canonical and traceable and not used:
@@ -281,39 +398,61 @@ def _finalize_session_citations(
     answer: str,
     session_citations: list[dict[str, Any]],
 ) -> tuple[str, list[dict[str, Any]], bool]:
-    """Validate `[S1]..[Sk]` session memory markers, strip invented `[S99]`, and return used citations."""
-    if not session_citations:
-        cleaned = _SESSION_CITATION_REFERENCE.sub("", answer).strip()
-        cleaned = re.sub(r"[ \t]+([，。！？；：,.!?;:])", r"\1", cleaned)
-        return cleaned, [], False
-
+    """Validate `[S1]..[Sk]` (single or compound) markers, strip `[S99]`, and return used citations."""
     valid_by_ref: dict[str, dict[str, Any]] = {}
     for sc in session_citations:
         ref = str(sc.get("ref") or "")
-        if ref.startswith("S") and ref[1:].isdigit():
-            valid_by_ref[ref] = dict(sc)
+        if ref.startswith("S") and ref[1:].isdigit() and int(ref[1:]) > 0:
+            canonical_ref = f"S{int(ref[1:])}"
+            valid_by_ref[canonical_ref] = {**dict(sc), "ref": canonical_ref}
 
     used_refs: list[str] = []
 
-    def _replace_session_ref(match: re.Match[str]) -> str:
-        ref = f"S{int(match.group(1))}"
-        if ref not in valid_by_ref:
-            return ""
-        if ref not in used_refs:
-            used_refs.append(ref)
-        return f"[{ref}]"
+    def _replace_session_bracket(match: re.Match[str]) -> str:
+        raw_items = [part.strip() for part in re.split(r"[,;、]", match.group(1)) if part.strip()]
+        if not raw_items or not any(item.startswith("S") for item in raw_items):
+            return match.group(0)
+        kept: list[str] = []
+        for item in raw_items:
+            if item.startswith("S"):
+                num_val = int(item[1:])
+                ref = f"S{num_val}" if num_val > 0 else ""
+                if ref and ref in valid_by_ref:
+                    if ref not in used_refs:
+                        used_refs.append(ref)
+                    kept.append(ref)
+            else:
+                kept.append(item)
+        return f"[{', '.join(kept)}]" if kept else ""
 
-    cleaned = _SESSION_CITATION_REFERENCE.sub(_replace_session_ref, answer).strip()
+    cleaned = _rewrite_prose_citation_brackets(answer, _replace_session_bracket).strip()
     cleaned = re.sub(r"[ \t]+([，。！？；：,.!?;:])", r"\1", cleaned)
-    has_explicit = bool(used_refs)
+    if not valid_by_ref:
+        return cleaned, [], False
+
+    explicitly_mapped = set(used_refs)
+    has_explicit = bool(explicitly_mapped)
     chosen_refs = used_refs if used_refs else list(valid_by_ref)[:3]
-    return cleaned, [valid_by_ref[r] for r in chosen_refs if r in valid_by_ref], has_explicit
+    returned: list[dict[str, Any]] = []
+    for ref in chosen_refs:
+        if ref not in valid_by_ref:
+            continue
+        mapped = ref in explicitly_mapped
+        returned.append(
+            {
+                **valid_by_ref[ref],
+                "mapped": mapped,
+                "claim_level": "claim" if mapped else "run",
+            }
+        )
+    return cleaned, returned, has_explicit
 
 
 def _build_session_audit_step(
     audit_trace: Mapping[str, Any] | None,
     *,
     used_session_citations: list[dict[str, Any]] | None = None,
+    available_session_citations: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     if not isinstance(audit_trace, Mapping):
         return None
@@ -326,20 +465,50 @@ def _build_session_audit_step(
         "ms": audit_trace.get("latency_ms", 0),
         "audit": dict(audit_trace),
     }
-    if audit_mode == "on" and used_session_citations:
-        transitive_sids = sorted(
-            {
-                str(sid)
-                for sc in used_session_citations
-                for sid in (sc.get("cited_source_ids") or [])
-                if sid
-            }
+    if audit_mode == "on":
+        explicit_refs = {
+            str(sc.get("ref") or "")
+            for sc in (used_session_citations or [])
+            if sc.get("mapped")
+        }
+        source_pool = (
+            available_session_citations
+            if available_session_citations is not None
+            else used_session_citations
         )
-        if transitive_sids:
-            step_entry["details"] = {
-                "scope": "knowledge",
-                "sources": [{"id": sid} for sid in transitive_sids],
-            }
+        if source_pool:
+            serialized_session_citations: list[dict[str, Any]] = []
+            for sc in source_pool:
+                ref = str(sc.get("ref") or "")
+                if not (ref.startswith("S") and ref[1:].isdigit() and int(ref[1:]) > 0):
+                    continue
+                canonical_ref = f"S{int(ref[1:])}"
+                mapped = bool(sc.get("mapped")) or (canonical_ref in explicit_refs)
+                serialized_session_citations.append(
+                    {
+                        **dict(sc),
+                        "ref": canonical_ref,
+                        "mapped": mapped,
+                        "claim_level": "claim" if mapped else str(sc.get("claim_level") or "run"),
+                    }
+                )
+            if serialized_session_citations:
+                step_entry["session_citations"] = serialized_session_citations
+
+        if used_session_citations:
+            transitive_sids = sorted(
+                {
+                    str(sid)
+                    for sc in used_session_citations
+                    for sid in (sc.get("cited_source_ids") or [])
+                    if sid
+                }
+            )
+            if transitive_sids:
+                step_entry["details"] = {
+                    "scope": "knowledge",
+                    "sources": [{"id": sid} for sid in transitive_sids],
+                }
     return step_entry
 
 
@@ -1077,6 +1246,9 @@ async def generate_stream(
                         plan_audit_trace,
                         used_session_citations=(
                             used_session_citations if answer_status == "answered" and canonical_answer else None
+                        ),
+                        available_session_citations=(
+                            plan_session_citations if answer_status == "answered" and canonical_answer else None
                         ),
                     )
                     if session_step is not None:

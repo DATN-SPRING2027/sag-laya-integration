@@ -373,6 +373,19 @@ export interface RejectedCandidateTrace {
   detail: string;
 }
 
+export interface BackendSessionCitationTrace {
+  kind?: string;
+  ref: string;
+  primary_message_id: string | null;
+  message_ids: string[];
+  turn_ordinals?: number[];
+  epistemic_status: EpistemicStatus;
+  sha256?: string;
+  cited_source_ids?: string[];
+  mapped?: boolean;
+  claim_level?: "claim" | "run" | string;
+}
+
 export interface SessionContextAudit {
   mode: SessionContextMode;
   ablation: AblationMode | string;
@@ -391,6 +404,8 @@ export interface SessionContextAudit {
   partial_coverage: boolean;
   view_weights: Record<string, number>;
   selected_groups: SelectedEvidenceGroupTrace[];
+  recent_turn_ids?: string[];
+  session_citations?: BackendSessionCitationTrace[];
   rejected_candidates: RejectedCandidateTrace[];
   latency_ms: number;
   persistence_status: string;
@@ -428,6 +443,7 @@ export interface MessageStep {
   kind: "thinking" | "tool" | "answer" | "session_context";
   mode?: SessionContextMode | string;
   audit?: SessionContextAudit | Record<string, unknown>;
+  session_citations?: BackendSessionCitationTrace[] | Array<Record<string, unknown>>;
   step: number;
   name?: string;
   label?: string;

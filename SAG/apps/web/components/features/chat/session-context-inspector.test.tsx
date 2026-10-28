@@ -12,6 +12,7 @@ import { AgentActivityTimeline } from "@/components/features/chat/agent-activity
 import { SessionContextInspector } from "@/components/features/chat/session-context-inspector";
 import {
   buildDecisionLineage,
+  filterAnswerSessionCitations,
   normalizeSessionContextAudit,
   resolveSessionCitations,
 } from "@/lib/session-context-presentation";
@@ -115,6 +116,125 @@ describe("Chặng 4 UI components (Dual Citations, Timeline & Context Inspector)
     expect(container.textContent).toContain("[99]");
     expect(container.textContent).toContain("[S99]");
     expect(container.querySelector("code")?.textContent).toBe("[S1]");
+    unmount();
+  });
+
+  it("renders compound citations [1, 2], [S1, S2], [1, S2] outside code and preserves recent_continuity in CitationBlock (PR #46 Finding 3)", () => {
+    const onDocClick = vi.fn();
+    const onSessionClick = vi.fn();
+
+    const twoDocs: Citation[] = [
+      ...DOC_CITATIONS,
+      {
+        n: 2,
+        kind: "internal",
+        chunk_id: "chunk_2",
+        source_id: "src_2",
+        source_name: "Migration ADR",
+        heading: "Dual Write",
+        snippet: "PostgreSQL + Qdrant sync.",
+        score: 0.88,
+      },
+    ];
+
+    const audit = normalizeSessionContextAudit({
+      mode: "on",
+      ablation: "V5_ecce_full",
+      budget_tokens: 1600,
+      used_evidence_tokens: 64,
+      used_recent_tokens: 48,
+      total_output_history_tokens: 112,
+      selected_groups: [
+        {
+          citation_tag: "S1",
+          primary_turn_id: "u1",
+          included_turn_ids: ["u1"],
+          closure_reason: "direct_match",
+          epistemic_status: "CONFIRMED",
+          utility_score: 0.92,
+          redundancy_penalty: 0,
+          coverage_gain: 0.5,
+          marginal_gain_per_token: 0.03,
+          token_cost: 64,
+        },
+      ],
+      recent_turn_ids: ["u7", "u8"],
+      rejected_candidates: [],
+      latency_ms: 6.2,
+    })!;
+
+    const answerMarkdown =
+      "Docs [1, 2], session [S1, S2], mixed [1, S2], prose interval [1, 100], partial [S1, S99], and code `[1, S1]`.";
+
+    const resolvedSession = resolveSessionCitations({
+      content: answerMarkdown,
+      audit,
+      messages: [
+        { id: "u1", role: "user", content: "Confirmed Qdrant." },
+        { id: "u7", role: "user", content: "Check latency SLA." },
+        { id: "u8", role: "assistant", content: "Latency < 10ms." },
+      ],
+      sessionCitations: [
+        {
+          ref: "S1",
+          primary_message_id: "u1",
+          message_ids: ["u1"],
+          turn_ordinals: [1],
+          epistemic_status: "CONFIRMED",
+        },
+        {
+          ref: "S2",
+          primary_message_id: "u8",
+          message_ids: ["u7", "u8"],
+          turn_ordinals: [2, 3],
+          epistemic_status: "FACT",
+        },
+      ],
+    });
+
+    const answerSession = filterAnswerSessionCitations(audit, resolvedSession);
+    expect(answerSession.map((item) => item.ref)).toEqual(["S1", "S2"]);
+
+    const { container, unmount } = mountWithIntl(
+      <div>
+        <MarkdownContent
+          content={answerMarkdown}
+          citations={twoDocs}
+          sessionCitations={resolvedSession}
+          onCitationClick={onDocClick}
+          onSessionCitationClick={onSessionClick}
+        />
+        <CitationBlock
+          citations={twoDocs}
+          sessionCitations={answerSession}
+          onSessionCitationClick={onSessionClick}
+        />
+      </div>,
+    );
+
+    const proseButtons = Array.from(
+      container.querySelectorAll<HTMLButtonElement>(".answer-prose button"),
+    );
+    expect(proseButtons.map((btn) => btn.textContent)).toEqual([
+      "1",
+      "2",
+      "S1",
+      "S2",
+      "1",
+      "S2",
+      "S1",
+    ]);
+    expect(container.textContent).toContain("[1, 100]");
+    expect(container.textContent).toContain("[S99]");
+    expect(container.querySelector("code")?.textContent).toBe("[1, S1]");
+    expect(container.textContent).toContain("4 references");
+
+    act(() => {
+      proseButtons[3].click();
+    });
+    expect(onSessionClick).toHaveBeenCalledTimes(1);
+    expect(onSessionClick.mock.calls[0][0].ref).toBe("S2");
+    expect(onSessionClick.mock.calls[0][0].includedTurnIds).toEqual(["u7", "u8"]);
     unmount();
   });
 

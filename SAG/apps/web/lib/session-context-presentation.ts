@@ -1,4 +1,5 @@
 import type {
+  BackendSessionCitationTrace,
   EpistemicStatus,
   MessageStep,
   RejectedCandidateTrace,
@@ -52,7 +53,19 @@ export interface SessionTranscriptTurnLike {
 export interface ParsedSessionContextStep {
   step: MessageStep;
   audit: SessionContextAudit;
+  sessionCitations: BackendSessionCitationTrace[];
   transitiveSources: Array<{ id: string; name?: string }>;
+}
+
+export type ParsedCitationToken =
+  | { kind: "doc"; number: string }
+  | { kind: "session"; ref: string };
+
+export interface ParsedCitationBracket {
+  start: number;
+  end: number;
+  raw: string;
+  tokens: ParsedCitationToken[];
 }
 
 export interface DecisionLineageNode {
@@ -186,6 +199,82 @@ function normalizeRejectedCandidate(raw: unknown): RejectedCandidateTrace | null
   };
 }
 
+export function normalizeBackendSessionCitation(
+  raw: unknown,
+): BackendSessionCitationTrace | null {
+  const item = asObject(raw);
+  if (!item) return null;
+
+  const rawRef = safeString(item.ref).trim().toUpperCase();
+  if (!/^S[1-9]\d*$/.test(rawRef)) return null;
+  const canonicalRef = `S${Number.parseInt(rawRef.slice(1), 10)}`;
+
+  const rawIds = Array.isArray(item.message_ids)
+    ? item.message_ids
+    : Array.isArray(item.included_turn_ids)
+      ? item.included_turn_ids
+      : Array.isArray(item.includedTurnIds)
+        ? item.includedTurnIds
+        : Array.isArray(item.turn_ids)
+          ? item.turn_ids
+          : [];
+  const messageIds = rawIds
+    .map((entry) => safeString(entry).trim())
+    .filter((entry) => entry.length > 0);
+  const rawPrimary = safeString(
+    item.primary_message_id ?? item.primary_turn_id ?? item.primaryTurnId,
+  ).trim();
+  if (messageIds.length === 0 && rawPrimary) {
+    messageIds.push(rawPrimary);
+  }
+  if (messageIds.length === 0) return null;
+
+  const primaryMessageId =
+    rawPrimary || messageIds[messageIds.length - 1] || null;
+
+  const rawOrdinals = Array.isArray(item.turn_ordinals)
+    ? item.turn_ordinals
+    : Array.isArray(item.turnOrdinals)
+      ? item.turnOrdinals
+      : undefined;
+  const turnOrdinals = rawOrdinals
+    ? rawOrdinals
+        .map((ord) => safeNonNegativeInt(ord, 0))
+        .filter((ord) => ord > 0)
+    : undefined;
+
+  const rawCitedSources = Array.isArray(item.cited_source_ids)
+    ? item.cited_source_ids
+        .map((sid) => safeString(sid).trim())
+        .filter((sid) => sid.length > 0)
+    : undefined;
+
+  return {
+    ...(typeof item.kind === "string" && item.kind.trim()
+      ? { kind: item.kind.trim() }
+      : {}),
+    ref: canonicalRef,
+    primary_message_id: primaryMessageId,
+    message_ids: messageIds,
+    ...(turnOrdinals && turnOrdinals.length > 0
+      ? { turn_ordinals: turnOrdinals }
+      : {}),
+    epistemic_status: normalizeEpistemicStatus(
+      item.epistemic_status ?? item.epistemicStatus ?? item.status,
+    ),
+    ...(typeof item.sha256 === "string" && item.sha256.trim()
+      ? { sha256: item.sha256.trim() }
+      : {}),
+    ...(rawCitedSources && rawCitedSources.length > 0
+      ? { cited_source_ids: rawCitedSources }
+      : {}),
+    ...(typeof item.mapped === "boolean" ? { mapped: item.mapped } : {}),
+    ...(typeof item.claim_level === "string" && item.claim_level.trim()
+      ? { claim_level: item.claim_level.trim() }
+      : {}),
+  };
+}
+
 export function normalizeSessionContextAudit(
   raw: unknown,
   stepModeFallback?: unknown,
@@ -210,6 +299,18 @@ export function normalizeSessionContextAudit(
         .map((group, index) => normalizeSelectedGroup(group, index + 1))
         .filter((group): group is SelectedEvidenceGroupTrace => group !== null)
     : [];
+
+  const recentTurnIds = Array.isArray(data.recent_turn_ids)
+    ? data.recent_turn_ids
+        .map((entry) => safeString(entry).trim())
+        .filter((entry) => entry.length > 0)
+    : [];
+
+  const auditSessionCitations = Array.isArray(data.session_citations)
+    ? data.session_citations
+        .map(normalizeBackendSessionCitation)
+        .filter((entry): entry is BackendSessionCitationTrace => entry !== null)
+    : undefined;
 
   const rejectedCandidates = Array.isArray(data.rejected_candidates)
     ? data.rejected_candidates
@@ -246,6 +347,10 @@ export function normalizeSessionContextAudit(
     partial_coverage: Boolean(data.partial_coverage),
     view_weights: viewWeights,
     selected_groups: selectedGroups,
+    recent_turn_ids: recentTurnIds,
+    ...(auditSessionCitations && auditSessionCitations.length > 0
+      ? { session_citations: auditSessionCitations }
+      : {}),
     rejected_candidates: rejectedCandidates,
     latency_ms: Math.max(0, safeFiniteNumber(data.latency_ms, safeFiniteNumber(stepMsFallback, 0))),
     persistence_status: safeString(data.persistence_status, "memory_only").trim() || "memory_only",
@@ -266,6 +371,13 @@ export function parseSessionContextStep(
   const audit = normalizeSessionContextAudit(step.audit, step.mode, step.ms);
   if (!audit) return null;
 
+  const rawStepCitations = Array.isArray(step.session_citations)
+    ? step.session_citations
+    : audit.session_citations ?? [];
+  const sessionCitations = rawStepCitations
+    .map(normalizeBackendSessionCitation)
+    .filter((entry): entry is BackendSessionCitationTrace => entry !== null);
+
   const transitiveSources = (step.details?.sources ?? [])
     .map((source) => ({
       id: safeString(source.id).trim(),
@@ -278,6 +390,7 @@ export function parseSessionContextStep(
   return {
     step,
     audit,
+    sessionCitations,
     transitiveSources,
   };
 }
@@ -288,6 +401,8 @@ export function cleanTurnExcerpt(text: string, maxChars = 220): string {
     .replace(/`([^`\n]+)`/g, "$1")
     .replace(/!\[([^\]]*)\]\([^)]+\)/g, "$1")
     .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/\*\*([^*\n]+)\*\*/g, "$1")
+    .replace(/__([^_\n]+)__/g, "$1")
     .replace(/^[#>*\-\s]+/gm, "")
     .replace(/\s+/g, " ")
     .trim();
@@ -297,13 +412,52 @@ export function cleanTurnExcerpt(text: string, maxChars = 220): string {
     : normalized;
 }
 
-/**
- * Extract `[S1]`, `[S2]` markers referenced in Markdown prose outside code blocks / inline code.
- */
-export function extractAnswerSessionCitationRefs(content: string): Set<string> {
-  const refs = new Set<string>();
-  if (!content) return refs;
+const CITATION_BRACKET_RE =
+  /\[(\s*(?:[1-9]\d*|S[1-9]\d*)(?:\s*[,;、]\s*(?:[1-9]\d*|S[1-9]\d*))*)\s*\](?!\()/g;
 
+/**
+ * Shared parser for single (`[1]`, `[S1]`) and compound (`[1, 2]`, `[S1, S2]`, `[1, S1]`)
+ * bracketed citation groups in prose text. Ignores Markdown inline links `[1](https://...)`.
+ */
+export function parseCitationBrackets(text: string): ParsedCitationBracket[] {
+  if (!text) return [];
+  const results: ParsedCitationBracket[] = [];
+  const re = new RegExp(CITATION_BRACKET_RE.source, "g");
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text))) {
+    const inner = match[1] ?? "";
+    const parts = inner
+      .split(/[,;、]/)
+      .map((part) => part.trim())
+      .filter((part) => part.length > 0);
+    if (parts.length === 0) continue;
+
+    const tokens: ParsedCitationToken[] = [];
+    let allMalformedFree = true;
+    for (const part of parts) {
+      if (/^S[1-9]\d*$/.test(part)) {
+        tokens.push({ kind: "session", ref: `S${Number.parseInt(part.slice(1), 10)}` });
+      } else if (/^[1-9]\d*$/.test(part)) {
+        tokens.push({ kind: "doc", number: String(Number.parseInt(part, 10)) });
+      } else {
+        allMalformedFree = false;
+        break;
+      }
+    }
+    if (!allMalformedFree || tokens.length === 0) continue;
+
+    results.push({
+      start: match.index,
+      end: match.index + match[0].length,
+      raw: match[0],
+      tokens,
+    });
+  }
+  return results;
+}
+
+function stripMarkdownCodeForCitationScan(content: string): string {
+  if (!content) return "";
   let codeFence: string | null = null;
   let inlineCodeTicks = 0;
   let proseBuffer = "";
@@ -325,6 +479,7 @@ export function extractAnswerSessionCitationRefs(content: string): Set<string> {
         ) {
           codeFence = null;
         }
+        proseBuffer += "\n";
         index = lineEnd;
         continue;
       }
@@ -335,22 +490,49 @@ export function extractAnswerSessionCitationRefs(content: string): Set<string> {
       while (content[index + runLength] === "`") runLength++;
       if (inlineCodeTicks === 0) inlineCodeTicks = runLength;
       else if (inlineCodeTicks === runLength) inlineCodeTicks = 0;
+      proseBuffer += " ";
       index += runLength;
       continue;
     }
 
     if (!codeFence && inlineCodeTicks === 0) {
       proseBuffer += content[index];
+    } else if (content[index] === "\n") {
+      proseBuffer += "\n";
     }
     index++;
   }
 
-  const re = /\[S([1-9]\d*)\]/g;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(proseBuffer))) {
-    refs.add(`S${match[1]}`);
+  return proseBuffer;
+}
+
+/**
+ * Extract both document (`1`, `2`) and session (`S1`, `S2`) citation markers referenced
+ * in Markdown prose (single or compound `[1, 2]`, `[S1, S2]`, `[1, S1]`), ignoring
+ * fenced code blocks, inline code, and Markdown links.
+ */
+export function extractAnswerCitationRefs(content: string): {
+  docNumbers: Set<string>;
+  sessionRefs: Set<string>;
+} {
+  const docNumbers = new Set<string>();
+  const sessionRefs = new Set<string>();
+  const prose = stripMarkdownCodeForCitationScan(content);
+  for (const bracket of parseCitationBrackets(prose)) {
+    for (const token of bracket.tokens) {
+      if (token.kind === "doc") docNumbers.add(token.number);
+      else sessionRefs.add(token.ref);
+    }
   }
-  return refs;
+  return { docNumbers, sessionRefs };
+}
+
+/**
+ * Extract `[S1]`, `[S2]` markers (including compound `[S1, S2]`, `[1, S1]`) referenced in
+ * Markdown prose outside code blocks / inline code.
+ */
+export function extractAnswerSessionCitationRefs(content: string): Set<string> {
+  return extractAnswerCitationRefs(content).sessionRefs;
 }
 
 function buildTurnLookup(messages: readonly SessionTranscriptTurnLike[]) {
@@ -394,37 +576,39 @@ function resolveTurnPreview(
 }
 
 /**
- * Resolve `[S1]..[Sk]` session citations for an assistant message.
- * - Always resolves `audit.selected_groups` (`S1..Sk`).
- * - Also resolves `short_verbatim` (`S1`) and `recent_continuity` (`S{k+1}`) when `audit.mode === "on"`.
+ * Resolve `[S1]..[Sk]` session citations for an assistant message strictly from
+ * backend-supplied provenance (`audit.selected_groups`, `sessionCitations`, or
+ * `audit.recent_turn_ids`). Client `messages` are used exclusively to enrich turn
+ * previews (`role`, `excerpt`, `createdAt`, `loaded`) — never to guess turn IDs.
  */
 export function resolveSessionCitations({
   content,
   audit,
   messages,
-  assistantMessageId,
+  sessionCitations: rawBackendCitations,
 }: {
   content: string;
   audit: SessionContextAudit | null;
   messages: readonly SessionTranscriptTurnLike[];
-  assistantMessageId: string;
+  assistantMessageId?: string;
+  sessionCitations?: readonly unknown[];
 }): SessionCitation[] {
   if (!audit || audit.mode === "legacy") return [];
 
   const { byId, ordinalById } = buildTurnLookup(messages);
   const answerRefs = extractAnswerSessionCitationRefs(content);
-  const assistantIdx = messages.findIndex((msg) => msg.id === assistantMessageId);
-  const precedingHistory =
-    assistantIdx > 0
-      ? messages
-          .slice(0, assistantIdx)
-          .filter((msg) => msg.role === "user" || msg.role === "assistant")
-      : [];
-  // Exclude the current user prompt immediately preceding this assistant answer:
-  const priorSessionTurns =
-    precedingHistory.length > 0 && precedingHistory[precedingHistory.length - 1]?.role === "user"
-      ? precedingHistory.slice(0, -1)
-      : precedingHistory;
+
+  const backendByRef = new Map<string, BackendSessionCitationTrace>();
+  const rawPool =
+    rawBackendCitations !== undefined
+      ? rawBackendCitations
+      : audit.session_citations ?? [];
+  for (const entry of rawPool) {
+    const normalized = normalizeBackendSessionCitation(entry);
+    if (normalized && !backendByRef.has(normalized.ref)) {
+      backendByRef.set(normalized.ref, normalized);
+    }
+  }
 
   const citations: SessionCitation[] = [];
   const seenRefs = new Set<string>();
@@ -435,15 +619,29 @@ export function resolveSessionCitations({
     seenRefs.add(ref);
     const parsedNum = Number.parseInt(ref.slice(1), 10);
     const index = Number.isInteger(parsedNum) && parsedNum > 0 ? parsedNum : idx + 1;
-    const turns = group.included_turn_ids.map((turnId) =>
-      resolveTurnPreview(turnId, byId, ordinalById),
+    const backendCit = backendByRef.get(ref);
+    const turnIds =
+      backendCit && backendCit.message_ids.length > 0
+        ? [...backendCit.message_ids]
+        : [...group.included_turn_ids];
+    const turns = turnIds.map((turnId, turnIdx) =>
+      resolveTurnPreview(
+        turnId,
+        byId,
+        ordinalById,
+        backendCit?.turn_ordinals?.[turnIdx],
+      ),
     );
     citations.push({
       ref,
       index,
       kind: "evidence_group",
-      primaryTurnId: group.primary_turn_id || group.included_turn_ids[0] || null,
-      includedTurnIds: [...group.included_turn_ids],
+      primaryTurnId:
+        backendCit?.primary_message_id
+        || group.primary_turn_id
+        || turnIds[0]
+        || null,
+      includedTurnIds: turnIds,
       epistemicStatus: group.epistemic_status,
       closureReason: group.closure_reason,
       utilityScore: group.utility_score,
@@ -452,66 +650,105 @@ export function resolveSessionCitations({
       marginalGainPerToken: group.marginal_gain_per_token,
       tokenCost: group.token_cost,
       turns,
-      mappedInAnswer: answerRefs.has(ref),
+      mappedInAnswer: answerRefs.has(ref) || Boolean(backendCit?.mapped),
     });
   }
 
   if (audit.mode === "on") {
-    // Fast-path short session verbatim (`S1` over full short history)
-    const isShortVerbatim =
-      audit.selected_groups.length === 0
-      && (audit.view_weights.short_verbatim === 1 || answerRefs.has("S1"))
-      && priorSessionTurns.length > 0;
-
-    if (isShortVerbatim && !seenRefs.has("S1")) {
-      seenRefs.add("S1");
-      const verbatimTurns = priorSessionTurns.slice(-6);
-      const lastTurn = verbatimTurns[verbatimTurns.length - 1];
-      citations.push({
-        ref: "S1",
-        index: 1,
-        kind: "short_verbatim",
-        primaryTurnId: lastTurn?.id ?? null,
-        includedTurnIds: verbatimTurns.map((turn) => turn.id),
-        epistemicStatus: "FACT",
-        closureReason: "short_session_verbatim",
-        tokenCost: audit.total_output_history_tokens,
-        turns: verbatimTurns.map((turn) =>
-          resolveTurnPreview(turn.id, byId, ordinalById),
+    // 1. Consume explicit backend session citations outside `selected_groups`
+    //    (`short_verbatim` S1 or `recent_continuity` S{k+1}) with exact backend turn IDs.
+    for (const backendCit of backendByRef.values()) {
+      if (seenRefs.has(backendCit.ref) || backendCit.message_ids.length === 0) {
+        continue;
+      }
+      seenRefs.add(backendCit.ref);
+      const parsedNum = Number.parseInt(backendCit.ref.slice(1), 10);
+      const index =
+        Number.isInteger(parsedNum) && parsedNum > 0
+          ? parsedNum
+          : citations.length + 1;
+      const isShortVerbatim =
+        audit.selected_groups.length === 0
+        && (audit.view_weights.short_verbatim === 1 || audit.used_evidence_tokens === 0)
+        && backendCit.ref === "S1";
+      const kind: SessionCitation["kind"] = isShortVerbatim
+        ? "short_verbatim"
+        : "recent_continuity";
+      const closureReason = isShortVerbatim
+        ? "short_session_verbatim"
+        : "recent_continuity";
+      const tokenCost = isShortVerbatim
+        ? audit.total_output_history_tokens
+        : audit.used_recent_tokens;
+      const turns = backendCit.message_ids.map((turnId, turnIdx) =>
+        resolveTurnPreview(
+          turnId,
+          byId,
+          ordinalById,
+          backendCit.turn_ordinals?.[turnIdx],
         ),
-        mappedInAnswer: answerRefs.has("S1"),
+      );
+      citations.push({
+        ref: backendCit.ref,
+        index,
+        kind,
+        primaryTurnId:
+          backendCit.primary_message_id
+          || backendCit.message_ids[backendCit.message_ids.length - 1]
+          || null,
+        includedTurnIds: [...backendCit.message_ids],
+        epistemicStatus: backendCit.epistemic_status,
+        closureReason,
+        tokenCost,
+        turns,
+        mappedInAnswer: answerRefs.has(backendCit.ref) || Boolean(backendCit.mapped),
       });
     }
 
-    // Recent continuity block (`S{selected_groups.length + 1}`)
-    if (audit.used_recent_tokens > 0 && priorSessionTurns.length > 0) {
-      const recentIndex = audit.selected_groups.length + 1;
-      const recentRef = `S${recentIndex}`;
-      if (!seenRefs.has(recentRef) && answerRefs.has(recentRef)) {
-        seenRefs.add(recentRef);
-        const selectedTurnIdSet = new Set(
-          audit.selected_groups.flatMap((group) => group.included_turn_ids),
-        );
-        const recentCandidates = priorSessionTurns
-          .filter((turn) => !selectedTurnIdSet.has(turn.id))
-          .slice(-4);
-        const effectiveRecent =
-          recentCandidates.length > 0 ? recentCandidates : priorSessionTurns.slice(-2);
-        const primaryRecent = effectiveRecent[effectiveRecent.length - 1];
+    // 2. Fallback to exact `audit.recent_turn_ids` if `session_citations` was not passed
+    //    separately. Never slice or guess turn IDs from client `messages`.
+    const backendRecentIds = audit.recent_turn_ids ?? [];
+    if (backendRecentIds.length > 0) {
+      const isShortVerbatim =
+        audit.selected_groups.length === 0 && audit.view_weights.short_verbatim === 1;
+      if (isShortVerbatim && !seenRefs.has("S1")) {
+        seenRefs.add("S1");
+        const primaryId = backendRecentIds[backendRecentIds.length - 1] ?? null;
         citations.push({
-          ref: recentRef,
-          index: recentIndex,
-          kind: "recent_continuity",
-          primaryTurnId: primaryRecent?.id ?? null,
-          includedTurnIds: effectiveRecent.map((turn) => turn.id),
+          ref: "S1",
+          index: 1,
+          kind: "short_verbatim",
+          primaryTurnId: primaryId,
+          includedTurnIds: [...backendRecentIds],
           epistemicStatus: "FACT",
-          closureReason: "recent_continuity",
-          tokenCost: audit.used_recent_tokens,
-          turns: effectiveRecent.map((turn) =>
-            resolveTurnPreview(turn.id, byId, ordinalById),
+          closureReason: "short_session_verbatim",
+          tokenCost: audit.total_output_history_tokens,
+          turns: backendRecentIds.map((turnId) =>
+            resolveTurnPreview(turnId, byId, ordinalById),
           ),
-          mappedInAnswer: true,
+          mappedInAnswer: answerRefs.has("S1"),
         });
+      } else if (!isShortVerbatim && audit.used_recent_tokens > 0) {
+        const recentIndex = audit.selected_groups.length + 1;
+        const recentRef = `S${recentIndex}`;
+        if (!seenRefs.has(recentRef) && answerRefs.has(recentRef)) {
+          seenRefs.add(recentRef);
+          const primaryId = backendRecentIds[backendRecentIds.length - 1] ?? null;
+          citations.push({
+            ref: recentRef,
+            index: recentIndex,
+            kind: "recent_continuity",
+            primaryTurnId: primaryId,
+            includedTurnIds: [...backendRecentIds],
+            epistemicStatus: "FACT",
+            closureReason: "recent_continuity",
+            tokenCost: audit.used_recent_tokens,
+            turns: backendRecentIds.map((turnId) =>
+              resolveTurnPreview(turnId, byId, ordinalById),
+            ),
+            mappedInAnswer: true,
+          });
+        }
       }
     }
   }
@@ -552,27 +789,44 @@ const EPISTEMIC_LINEAGE_RANK: Record<EpistemicStatus, number> = {
 };
 
 /**
- * Build chronological Decision Superseding Lineage chains from the current turn's
- * audit trace plus earlier assistant audits loaded in the conversation thread.
+ * Build chronological Decision Superseding Lineage chains strictly as of the inspected
+ * assistant turn (`assistantMessageId`), combining earlier assistant audits up to that
+ * turn with `currentAudit` and excluding any future turns in the thread.
  */
 export function buildDecisionLineage({
   currentAudit,
   messages,
+  assistantMessageId,
 }: {
   currentAudit: SessionContextAudit | null;
   messages: readonly SessionTranscriptTurnLike[];
+  assistantMessageId?: string;
 }): DecisionLineageModel {
   if (!currentAudit) {
     return { chains: [], totalTrackedDecisions: 0, supersededCount: 0 };
   }
 
-  const { byId, ordinalById } = buildTurnLookup(messages);
+  let lookupMessages: readonly SessionTranscriptTurnLike[] = messages;
+  let priorMessages: readonly SessionTranscriptTurnLike[] = messages;
+  if (typeof assistantMessageId === "string" && assistantMessageId.trim().length > 0) {
+    const targetIndex = messages.findIndex((msg) => msg.id === assistantMessageId);
+    if (targetIndex >= 0) {
+      lookupMessages = messages.slice(0, targetIndex + 1);
+      priorMessages = messages.slice(0, targetIndex);
+    } else {
+      priorMessages = [];
+    }
+  }
+
+  const { byId, ordinalById } = buildTurnLookup(lookupMessages);
 
   const statusByTurn = new Map<string, EpistemicStatus>();
   const fallbackOrdinalByTurn = new Map<string, number>();
   const supersededNextByTurn = new Map<string, string>();
   const currentCitationByTurn = new Map<string, string>();
   const currentCitationRankByTurn = new Map<string, number>();
+  const currentCitationByTurnAndStatus = new Map<string, string>();
+  const lineageClosureCitationByTurn = new Map<string, string>();
   const currentSelectedTurns = new Set<string>();
 
   const setTurnStatus = (turnId: string, nextStatus: EpistemicStatus) => {
@@ -589,6 +843,7 @@ export function buildDecisionLineage({
     status: EpistemicStatus,
   ) => {
     if (!turnId || !citationTag) return;
+    currentCitationByTurnAndStatus.set(`${turnId}:${status}`, citationTag);
     const rank = EPISTEMIC_LINEAGE_RANK[status];
     const prevRank = currentCitationRankByTurn.get(turnId);
     if (prevRank === undefined || rank > prevRank) {
@@ -609,6 +864,9 @@ export function buildDecisionLineage({
           currentSelectedTurns.add(id);
           if (!currentCitationByTurn.has(id)) {
             setCurrentTurnCitation(id, group.citation_tag, group.epistemic_status);
+          }
+          if (group.closure_reason === "decision_lineage_closure") {
+            lineageClosureCitationByTurn.set(id, group.citation_tag);
           }
         }
       }
@@ -632,13 +890,23 @@ export function buildDecisionLineage({
         }
         const headId = ids[headIdx];
         if (headId) {
-          setTurnStatus(headId, group.epistemic_status);
+          if (isCurrent && group.epistemic_status === "CONFIRMED") {
+            supersededNextByTurn.delete(headId);
+            statusByTurn.set(headId, "CONFIRMED");
+          } else {
+            setTurnStatus(headId, group.epistemic_status);
+          }
         }
       } else if (
         DECISION_RELEVANT_STATUSES.has(group.epistemic_status)
         && group.primary_turn_id
       ) {
-        setTurnStatus(group.primary_turn_id, group.epistemic_status);
+        if (isCurrent && group.epistemic_status === "CONFIRMED") {
+          supersededNextByTurn.delete(group.primary_turn_id);
+          statusByTurn.set(group.primary_turn_id, "CONFIRMED");
+        } else {
+          setTurnStatus(group.primary_turn_id, group.epistemic_status);
+        }
       }
     }
 
@@ -658,11 +926,13 @@ export function buildDecisionLineage({
     }
   };
 
-  // Scan thread history first, then apply currentAudit last so current turn state wins.
-  for (const message of messages) {
+  // Scan strictly prior assistant audits up to the inspected turn, then apply currentAudit.
+  for (const message of priorMessages) {
     if (message.role !== "assistant" || !message.steps?.length) continue;
     const parsed = parseSessionContextStep(message.steps);
-    if (parsed) recordAudit(parsed.audit, false);
+    if (parsed && parsed.audit !== currentAudit) {
+      recordAudit(parsed.audit, false);
+    }
   }
   recordAudit(currentAudit, true);
 
@@ -728,6 +998,12 @@ export function buildDecisionLineage({
       const status = supersededBy
         ? "SUPERSEDED"
         : statusByTurn.get(turnId) ?? "CONFIRMED";
+      const nodeCitationTag =
+        status === "SUPERSEDED"
+          ? lineageClosureCitationByTurn.get(turnId)
+            ?? currentCitationByTurnAndStatus.get(`${turnId}:SUPERSEDED`)
+          : currentCitationByTurnAndStatus.get(`${turnId}:${status}`)
+            ?? currentCitationByTurn.get(turnId);
       return {
         turnId,
         ordinal: preview.ordinal,
@@ -736,8 +1012,8 @@ export function buildDecisionLineage({
         createdAt: preview.createdAt,
         loaded: preview.loaded,
         epistemicStatus: status,
-        citationTag: currentCitationByTurn.get(turnId),
-        selectedInCurrentTurn: currentSelectedTurns.has(turnId),
+        citationTag: nodeCitationTag,
+        selectedInCurrentTurn: Boolean(nodeCitationTag) || (status !== "SUPERSEDED" && currentSelectedTurns.has(turnId)),
         supersededByTurnId: supersededBy,
       };
     });

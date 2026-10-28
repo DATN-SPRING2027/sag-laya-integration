@@ -344,6 +344,7 @@ export function ConversationPanel({
         audit: parsed.audit,
         messages,
         assistantMessageId: message.id,
+        sessionCitations: parsed.sessionCitations,
       });
       const answerSessionCitations = filterAnswerSessionCitations(
         parsed.audit,
@@ -352,6 +353,7 @@ export function ConversationPanel({
       const decisionLineage = buildDecisionLineage({
         currentAudit: parsed.audit,
         messages,
+        assistantMessageId: message.id,
       });
       const transitiveSources = parsed.transitiveSources.map((src) => ({
         id: src.id,
