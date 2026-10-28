@@ -19,6 +19,7 @@ from sag_api.db.models import (
 )
 from sag_api.services.knowledge_service import (
     KnowledgeConfig,
+    batch_version_inputs,
     checksum,
     knowledge_lock,
     persist_graph,
@@ -76,7 +77,15 @@ def routing_unit(unit: KnowledgeUnit) -> KnowledgeUnitInput:
 def benchmark_routes(
     snapshot, units: list[KnowledgeUnit], queries: list[CorpusQuery], policy: RoutingPolicy
 ) -> tuple[list[RoutingBenchmarkCase], list[dict]]:
+    if not queries:
+        return [], []
     unit_map = {u.id: u for u in units}
+    manifest_meta = snapshot.manifest
+    sparse_limit = manifest_meta["config"]["profile_sparse_terms"]
+    config_version = manifest_meta["config_version"]
+    manifest_checksum = manifest_meta["checksum"]
+    all_nodes = tuple(_walk(snapshot.roots))
+    scoped_node_cache: dict[tuple[str, str], tuple[int, dict[str, list]] | None] = {}
     cases, evidence = [], []
     for query in sorted(queries, key=lambda q: q.query_id):
         target = unit_map.get(query.target_unit_id)
@@ -100,21 +109,55 @@ def benchmark_routes(
         }
         fingerprint = scope_fingerprint(scope)
         profiles = []
-        for node in _walk(snapshot.roots):
-            members = [routing_unit(accessible[uid]) for uid in node.unit_ids if uid in accessible]
-            if not members:
+        for node in all_nodes:
+            cache_key = (fingerprint, node.node_id)
+            if cache_key not in scoped_node_cache:
+                member_units = [accessible[uid] for uid in node.unit_ids if uid in accessible]
+                if not member_units:
+                    scoped_node_cache[cache_key] = None
+                elif len(member_units) == len(node.unit_ids):
+                    scoped_node_cache[cache_key] = (
+                        len(member_units),
+                        {
+                            "sparse": [list(item) for item in node.profile.sparse],
+                            "entities": list(node.profile.entities),
+                        },
+                    )
+                else:
+                    # Recompute from authorized members BEFORE beam scoring (also tests Source revocation).
+                    members = [
+                        KnowledgeUnitInput(
+                            u.id,
+                            u.tenant_id,
+                            u.project_id,
+                            u.security_partition_id,
+                            (),
+                            tuple((t, float(w)) for t, w in u.features_json["sparse"]),
+                            tuple(u.features_json["entities"]),
+                            u.valid_from,
+                            u.valid_to,
+                        )
+                        for u in member_units
+                    ]
+                    profile = _profile(members, sparse_limit)
+                    scoped_node_cache[cache_key] = (
+                        len(members),
+                        {
+                            "sparse": [list(item) for item in profile.sparse],
+                            "entities": list(profile.entities),
+                        },
+                    )
+            cached_node = scoped_node_cache[cache_key]
+            if cached_node is None:
                 continue
-            # Recompute from authorized members BEFORE beam scoring (also tests Source revocation).
-            profile = _profile(members, snapshot.manifest["config"]["profile_sparse_terms"])
-            scores = _query_signal_scores(
-                query.query, {"sparse": [list(item) for item in profile.sparse], "entities": list(profile.entities)}
-            )
+            member_count, profile_dict = cached_node
+            scores = _query_signal_scores(query.query, profile_dict)
             profiles.append(
                 NodeProfile(
                     node_id=node.node_id,
                     parent_id=node.parent_id,
                     is_leaf=not node.children,
-                    accessible_unit_count=len(members),
+                    accessible_unit_count=member_count,
                     tree_version=snapshot.tree_version,
                     scope_fingerprint=fingerprint,
                     signal_scores=scores,
@@ -125,11 +168,11 @@ def benchmark_routes(
             snapshot_id="offline-benchmark",
             captured_at=datetime(2026, 1, 1, tzinfo=UTC),
             tree_version=snapshot.tree_version,
-            tree_config_version=snapshot.manifest["config_version"],
+            tree_config_version=config_version,
             routing_slot="SLOT_A",
             search_epoch=1,
             manifest_status="ACTIVE",
-            manifest_checksum=snapshot.manifest["checksum"],
+            manifest_checksum=manifest_checksum,
             manifest_verified=True,
             profiles=tuple(profiles),
             scope_fingerprint=fingerprint,
@@ -194,7 +237,7 @@ async def current_units(
             .order_by(KnowledgeUnit.id).execution_options(populate_existing=True)
         )
     ).all()
-    versions = {}
+    versions = await batch_version_inputs(session, [unit.document_version_id for unit in units]) if units else {}
     checked = await unit_checksums(session, units)
     for unit in units:
         if unit.document_version_id not in versions:
@@ -260,7 +303,7 @@ async def _build_project_routing_snapshot(
     if not units:
         return None
     captured = [(u.id, u.checksum) for u in units]
-    graph = await persist_graph(session, units, graph_config)
+    graph = await persist_graph(session, units, graph_config, preverified=True)
     inputs = [routing_unit(unit) for unit in units]
     edges = [
         KnowledgeEdgeInput(edge["source"], edge["target"], edge["weight"])
@@ -272,10 +315,29 @@ async def _build_project_routing_snapshot(
                "knowledge_metadata": {"knowledge_graph_build_id": graph.id, "knowledge_inputs": captured}}
     topology = await run_cpu("routing", payload)
     cases, benchmark = benchmark_routes(topology, units, queries, routing_policy)
-    snapshot = (await run_cpu("routing", {**payload, "benchmark": cases})
+    snapshot = (await run_cpu("routing", {**payload, "benchmark": cases, "precomputed": topology})
                 if cases else topology)
-    latest = await current_units(session, tenant_id, project_id, allow_empty=True)
-    if captured != [(u.id, u.checksum) for u in latest]:
+    now = datetime.now(UTC)
+    latest = (
+        await session.execute(
+            select(KnowledgeUnit.id, KnowledgeUnit.checksum)
+            .join(DocumentVersion)
+            .join(Document)
+            .where(
+                KnowledgeUnit.tenant_id == tenant_id,
+                KnowledgeUnit.project_id == project_id,
+                KnowledgeUnit.is_current.is_(True),
+                Document.is_active.is_(True),
+                DocumentVersion.knowledge_status == "DATA_READY",
+                DocumentVersion.search_status.in_(("READY", "SEARCH_READY")),
+                DocumentVersion.valid_from <= now,
+                DocumentVersion.valid_to > now,
+                DocumentVersion.search_ready_at.is_not(None),
+            )
+            .order_by(KnowledgeUnit.id)
+        )
+    ).all()
+    if captured != [(row[0], row[1]) for row in latest]:
         from sag_api.core.errors import ServiceUnavailableError
 
         raise ServiceUnavailableError("Knowledge inputs changed during project rebuild")

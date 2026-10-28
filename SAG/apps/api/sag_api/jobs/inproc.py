@@ -121,9 +121,11 @@ class InProcessAsyncQueue(JobQueue):
         self._engine_manager = engine_manager
         self._concurrency = concurrency
         self._queue: asyncio.PriorityQueue[tuple[int, int, str]] = asyncio.PriorityQueue()
+        self._queued_job_ids: set[str] = set()
         self._enqueue_sequence = itertools.count()
         self._workers: list[asyncio.Task] = []
         self._retry_tasks: set[asyncio.Task] = set()
+        self._retry_tasks_by_job: dict[str, asyncio.Task] = {}
         self._universe_user_locks: dict[str, asyncio.Lock] = {}
         self._universe_project_locks: dict[str, asyncio.Lock] = {}
         self._source_maintenance_jobs: dict[str, set[str]] = {}
@@ -170,6 +172,9 @@ class InProcessAsyncQueue(JobQueue):
                     if get_blocked_reason(job.payload):
                         return
                     priority = get_priority(job.payload)
+                if job_id in self._queued_job_ids:
+                    return
+                self._queued_job_ids.add(job_id)
                 await self._queue.put((priority, next(self._enqueue_sequence), job_id))
                 return
             except OperationalError as error:
@@ -615,6 +620,11 @@ class InProcessAsyncQueue(JobQueue):
 
     def _schedule_retry(self, job_id: str, delay: float) -> None:
         """退避后重新入队（不阻塞 worker）。"""
+        if job_id in self._queued_job_ids:
+            return
+        existing = self._retry_tasks_by_job.get(job_id)
+        if existing is not None and not existing.done():
+            return
 
         async def _later() -> None:
             try:
@@ -632,9 +642,13 @@ class InProcessAsyncQueue(JobQueue):
                         retry_delay = min(max(retry_delay * 2, 0.0), 60.0)
             except asyncio.CancelledError:
                 pass
+            finally:
+                if self._retry_tasks_by_job.get(job_id) is task:
+                    self._retry_tasks_by_job.pop(job_id, None)
 
         task = asyncio.create_task(_later(), name=f"sag-retry-{job_id}")
         self._retry_tasks.add(task)
+        self._retry_tasks_by_job[job_id] = task
         task.add_done_callback(self._retry_tasks.discard)
 
     async def start(self) -> None:
@@ -678,6 +692,8 @@ class InProcessAsyncQueue(JobQueue):
             await asyncio.gather(*workers, return_exceptions=True)
         self._source_maintenance_tasks.clear()
         self._retry_tasks.clear()
+        self._retry_tasks_by_job.clear()
+        self._queued_job_ids.clear()
         self._workers.clear()
 
         ready_source_ids = tuple(self._source_maintenance_ready)
@@ -911,6 +927,7 @@ class InProcessAsyncQueue(JobQueue):
     async def _worker_loop(self, idx: int) -> None:
         while True:
             _priority, _sequence, job_id = await self._queue.get()
+            self._queued_job_ids.discard(job_id)
             running = asyncio.create_task(self._run(job_id), name=f"sag-job-{job_id}")
             try:
                 await running
@@ -1053,6 +1070,26 @@ class InProcessAsyncQueue(JobQueue):
                     Job.id == job_id, Job.status == JobStatus.RUNNING, Job.started_at == claimed_started_at,
                 ).values(status=JobStatus.QUEUED, attempts=Job.attempts - (0 if is_resume else 1),
                          error=None, finished_at=None))
+                if claimed_type == JobType.REBUILD_UNIVERSE_TREE:
+                    tenant_id = payload.get("tenant_id")
+                    projects = sorted(set(payload.get("project_ids") or []))
+                    queued_trees = (
+                        await session.scalars(
+                            select(Job).where(
+                                Job.type == JobType.REBUILD_UNIVERSE_TREE,
+                                Job.status == JobStatus.QUEUED,
+                                Job.id != job_id,
+                            )
+                        )
+                    ).all()
+                    for dup in queued_trees:
+                        dup_payload = dup.payload or {}
+                        if (
+                            dup_payload.get("tenant_id") == tenant_id
+                            and sorted(set(dup_payload.get("project_ids") or [])) == projects
+                        ):
+                            self._queued_job_ids.discard(dup.id)
+                            await session.delete(dup)
                 retry_delay_to_schedule = deferred.delay_seconds
             except JobYielded as yielded:
                 await session.rollback()

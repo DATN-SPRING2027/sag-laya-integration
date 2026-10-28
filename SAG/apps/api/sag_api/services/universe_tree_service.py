@@ -74,7 +74,9 @@ async def enqueue_project_tree_rebuild(
                 ),
                 None,
             )
+            created = False
             if job is None:
+                created = True
                 job = Job(
                     type=JobType.REBUILD_UNIVERSE_TREE,
                     source_id=None,
@@ -90,9 +92,17 @@ async def enqueue_project_tree_rebuild(
         raise
 
     if not persist_only and job.status == JobStatus.QUEUED:
-        from sag_api.services.document_service import _enqueue_persisted_job
+        already_scheduled = (
+            not created
+            and (
+                job.id in getattr(job_queue, "_queued_job_ids", ())
+                or job.id in getattr(job_queue, "_retry_tasks_by_job", ())
+            )
+        )
+        if not already_scheduled:
+            from sag_api.services.document_service import _enqueue_persisted_job
 
-        await _enqueue_persisted_job(job_queue, job.id)
+            await _enqueue_persisted_job(job_queue, job.id)
     return job
 
 

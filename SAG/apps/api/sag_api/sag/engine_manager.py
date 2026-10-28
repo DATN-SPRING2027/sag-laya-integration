@@ -617,21 +617,21 @@ class EngineManager:
                 if not texts:
                     return []
                 results: list[list[float] | None] = [None] * len(texts)
-                missing_indices: list[int] = []
-                missing_texts: list[str] = []
+                missing_by_text: dict[str, list[int]] = {}
                 for idx, txt in enumerate(texts):
                     cached = get_cached_text_embedding(txt)
                     if cached is not None:
                         results[idx] = cached
                     else:
-                        missing_indices.append(idx)
-                        missing_texts.append(txt)
-                if missing_texts:
-                    fetched = await orig_batch_generate(missing_texts)
-                    for m_idx, txt, vec in zip(missing_indices, missing_texts, fetched, strict=True):
+                        missing_by_text.setdefault(txt, []).append(idx)
+                if missing_by_text:
+                    unique_missing = list(missing_by_text.keys())
+                    fetched = await orig_batch_generate(unique_missing)
+                    for txt, vec in zip(unique_missing, fetched, strict=True):
                         if vec:
                             put_cached_text_embedding(txt, vec)
-                        results[m_idx] = vec
+                        for m_idx in missing_by_text[txt]:
+                            results[m_idx] = vec
                 return [vec or [] for vec in results]
 
             emb.generate = _cached_generate

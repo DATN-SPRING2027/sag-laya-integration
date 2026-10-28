@@ -506,6 +506,7 @@ class KnowledgeWorker:
         self.job_queue = job_queue
         self.task = None
         self.running: set[asyncio.Task] = set()
+        self.scheduling_tree_jobs: set[str] = set()
         self.discovery_after = ""
         retries = getattr(settings, "embedding_max_retries", 3)
         provider_timeout = getattr(settings, "embedding_timeout", 60)
@@ -620,6 +621,11 @@ class KnowledgeWorker:
                 KnowledgeJob.status == "SUCCEEDED", KnowledgeJob.tree_requested_at.is_(None),
             ).order_by(KnowledgeJob.created_at).limit(32))).all())
             for job in jobs:
+                if job.id in self.scheduling_tree_jobs or job.tree_requested_at is not None:
+                    continue
+                await session.refresh(job)
+                if job.id in self.scheduling_tree_jobs or job.tree_requested_at is not None:
+                    continue
                 await enqueue_tree_rebuild_for_version(
                     session, self.job_queue, job.document_version_id, reason="knowledge_recovery",
                 )
@@ -690,8 +696,12 @@ class KnowledgeWorker:
                         await apply_e2(session, current, result, extractor_version=extractor, config=self.config)
                         current.result_json, current.extractor_version = result, extractor
                     current.status, current.lease_token, current.lease_until = "SUCCEEDED", None, None
-                    await session.commit()
-                    if self.job_queue is not None:
+                    if self.job_queue is None:
+                        await session.commit()
+                    else:
+                        self.scheduling_tree_jobs.add(job_id)
+                        current.tree_requested_at = datetime.now(UTC)
+                        await session.flush()
                         try:
                             from sag_api.services.universe_tree_service import enqueue_tree_rebuild_for_version
 
@@ -701,11 +711,13 @@ class KnowledgeWorker:
                                 current.document_version_id,
                                 reason=f"knowledge_{current.kind.lower()}_ready",
                             )
-                            current.tree_requested_at = datetime.now(UTC)
                             await session.commit()
                         except Exception as error:  # noqa: BLE001 - tree scheduling must not retry completed extraction
-                            await session.rollback()
+                            current.tree_requested_at = None
+                            await session.commit()
                             log.warning("Universe tree rebuild scheduling delayed (%s)", type(error).__name__)
+                        finally:
+                            self.scheduling_tree_jobs.discard(job_id)
         except Exception as error:
             # Store only error class; provider bodies/credentials/document text never enter job errors.
             async with self.sessions() as session:

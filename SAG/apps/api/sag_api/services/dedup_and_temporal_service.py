@@ -51,27 +51,32 @@ VALID_RELATIONS = {
 }
 
 
+_MINHASH_PREFIXES = tuple(hashlib.md5(f"{i}:".encode()) for i in range(256))
+
+
 def compute_minhash_signature(tokens: Sequence[str], num_perm: int = 128) -> list[int]:
     """Compute 128-permutation MinHash signature for token k-shingles (k=5 per Phase 2B plan)."""
     if not tokens:
         return [0] * num_perm
     k = min(5, len(tokens))
-    shingles = set()
-    for i in range(len(tokens) - k + 1):
-        shingles.add(" ".join(tokens[i:i+k]))
+    shingles = {" ".join(tokens[i : i + k]) for i in range(len(tokens) - k + 1)}
     if not shingles:
         shingles = set(tokens)
 
     encoded = [shingle.encode() for shingle in shingles]
+    from_bytes = int.from_bytes
+    prefixes = _MINHASH_PREFIXES
+    n_prefixes = len(prefixes)
     signature = []
     for i in range(num_perm):
         # 32-bit unsigned sentinel (0xFFFFFFFF) covering the full 8-hex-char MD5 space
         min_val = 0xFFFFFFFF
-        prefix = hashlib.md5(f"{i}:".encode())
+        prefix = prefixes[i] if i < n_prefixes else hashlib.md5(f"{i}:".encode())
+        prefix_copy = prefix.copy
         for shingle in encoded:
-            digest = prefix.copy()
+            digest = prefix_copy()
             digest.update(shingle)
-            h = int.from_bytes(digest.digest()[:4], "big")
+            h = from_bytes(digest.digest()[:4], "big")
             if h < min_val:
                 min_val = h
         signature.append(min_val)
@@ -611,37 +616,62 @@ async def run_dedup_and_temporal_stage(
 
     signatures = await _block_signatures(prior_blocks + curr_blocks, persist_ids={b.id for b in curr_blocks})
 
-    # Optional Tier 4: Precompute embeddings for semantic similarity if embedder available
-    block_embeddings: dict[str, list[float]] = {}
-    if embedder is not None:
-        try:
-            texts_to_embed = [b.normalized_text for b in curr_blocks] + [pb.normalized_text for pb in prior_blocks]
-            ids_to_embed = [b.id for b in curr_blocks] + [pb.id for pb in prior_blocks]
-            if texts_to_embed:
-                if hasattr(embedder, "batch_generate"):
-                    vecs = await embedder.batch_generate(texts_to_embed)
-                elif hasattr(embedder, "generate"):
-                    vecs = [await embedder.generate(t) for t in texts_to_embed]
-                elif callable(embedder):
-                    import inspect
-                    if inspect.iscoroutinefunction(embedder):
-                        vecs = [await embedder(t) for t in texts_to_embed]
-                    else:
-                        vecs = [embedder(t) for t in texts_to_embed]
-                else:
-                    vecs = []
-                for bid, vec in zip(ids_to_embed, vecs, strict=False):
-                    block_embeddings[bid] = vec
-        except Exception as emb_err:
-            log.warning("Could not compute block embeddings for Tier 4 dedup: %s", emb_err)
+    if not prior_blocks or not curr_blocks:
+        exact_block_matches, near_dup_candidates = 0, []
+    else:
+        # Optional Tier 4: Precompute embeddings for semantic similarity if embedder available
+        block_embeddings: dict[str, list[float]] = {}
+        if embedder is not None:
+            try:
+                from sag_api.services.search_index_service import (
+                    get_cached_text_embedding,
+                    put_cached_text_embedding,
+                )
 
-    from sag_api.services.cpu_worker import run_cpu
-    fields = ("id", "normalized_text", "content_hash", "block_type", "document_version_id")
-    exact_block_matches, near_dup_candidates = await run_cpu("dedup_candidates", {
-        "current": [{key: getattr(b, key) for key in fields} for b in curr_blocks],
-        "prior": [{key: getattr(b, key) for key in fields} for b in prior_blocks],
-        "signatures": signatures, "embeddings": block_embeddings, "version_id": document_version.id,
-    })
+                texts_to_embed = [b.normalized_text for b in curr_blocks] + [pb.normalized_text for pb in prior_blocks]
+                ids_to_embed = [b.id for b in curr_blocks] + [pb.id for pb in prior_blocks]
+                if texts_to_embed:
+                    if hasattr(embedder, "batch_generate"):
+                        vecs_by_idx: dict[int, list[float]] = {}
+                        missing_indices: list[int] = []
+                        missing_texts: list[str] = []
+                        for idx, txt in enumerate(texts_to_embed):
+                            cached = get_cached_text_embedding(txt)
+                            if cached is not None:
+                                vecs_by_idx[idx] = cached
+                            else:
+                                missing_indices.append(idx)
+                                missing_texts.append(txt)
+                        if missing_texts:
+                            fetched = await embedder.batch_generate(missing_texts)
+                            for m_idx, txt, vec in zip(missing_indices, missing_texts, fetched, strict=False):
+                                if vec:
+                                    put_cached_text_embedding(txt, vec)
+                                vecs_by_idx[m_idx] = vec
+                        vecs = [vecs_by_idx.get(i, []) for i in range(len(texts_to_embed))]
+                    elif hasattr(embedder, "generate"):
+                        vecs = [await embedder.generate(t) for t in texts_to_embed]
+                    elif callable(embedder):
+                        import inspect
+                        if inspect.iscoroutinefunction(embedder):
+                            vecs = [await embedder(t) for t in texts_to_embed]
+                        else:
+                            vecs = [embedder(t) for t in texts_to_embed]
+                    else:
+                        vecs = []
+                    for bid, vec in zip(ids_to_embed, vecs, strict=False):
+                        if vec:
+                            block_embeddings[bid] = vec
+            except Exception as emb_err:
+                log.warning("Could not compute block embeddings for Tier 4 dedup: %s", emb_err)
+
+        from sag_api.services.cpu_worker import run_cpu
+        fields = ("id", "normalized_text", "content_hash", "block_type", "document_version_id")
+        exact_block_matches, near_dup_candidates = await run_cpu("dedup_candidates", {
+            "current": [{key: getattr(b, key) for key in fields} for b in curr_blocks],
+            "prior": [{key: getattr(b, key) for key in fields} for b in prior_blocks],
+            "signatures": signatures, "embeddings": block_embeddings, "version_id": document_version.id,
+        })
 
     # Publish validity changes only after the replacement index is verified.
     temporal_result = {"action": "PENDING_INDEX", "active_version_id": None}

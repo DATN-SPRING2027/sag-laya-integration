@@ -15,7 +15,7 @@ from datetime import datetime
 from functools import lru_cache
 
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, insert, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -375,15 +375,15 @@ def _unit_checksum(unit, facts) -> str:
 async def unit_checksums(session: AsyncSession, units: Sequence[KnowledgeUnit]) -> dict[str, str]:
     facts: dict[str, list] = defaultdict(list)
     ids = [unit.id for unit in units]
-    for offset in range(0, len(ids), 256):
+    for offset in range(0, len(ids), 1024):
         rows = (await session.scalars(select(KnowledgeEvidence).where(
-            KnowledgeEvidence.unit_id.in_(ids[offset:offset + 256]),
+            KnowledgeEvidence.unit_id.in_(ids[offset:offset + 1024]),
         ).order_by(KnowledgeEvidence.id))).all()
         for fact in rows:
             facts[fact.unit_id].append(fact)
     result = {}
-    for offset in range(0, len(units), 128):
-        result.update((unit.id, _unit_checksum(unit, facts[unit.id])) for unit in units[offset:offset + 128])
+    for offset in range(0, len(units), 256):
+        result.update((unit.id, _unit_checksum(unit, facts[unit.id])) for unit in units[offset:offset + 256])
         await asyncio.sleep(0)
     return result
 
@@ -459,6 +459,142 @@ async def version_input(session: AsyncSession, version_id: str, config: Knowledg
     return version, blocks, provenance, digest
 
 
+async def batch_version_inputs(session: AsyncSession, version_ids: Sequence[str]) -> dict[str, tuple]:
+    unique_vids = sorted({str(v) for v in version_ids if v})
+    if not unique_vids:
+        return {}
+    versions_by_id = {
+        v.id: v
+        for v in (
+            await session.scalars(
+                select(DocumentVersion)
+                .where(DocumentVersion.id.in_(unique_vids))
+                .execution_options(populate_existing=True)
+            )
+        ).all()
+    }
+    doc_ids = sorted({v.document_id for v in versions_by_id.values() if v.document_id})
+    docs_by_id = (
+        {
+            d.id: d
+            for d in (
+                await session.scalars(
+                    select(Document).where(Document.id.in_(doc_ids)).execution_options(populate_existing=True)
+                )
+            ).all()
+        }
+        if doc_ids
+        else {}
+    )
+    src_ids = sorted({d.source_id for d in docs_by_id.values() if d.source_id})
+    proj_ids = sorted({d.project_id for d in docs_by_id.values() if d.project_id})
+    confirmed_mappings = (
+        {
+            (m.source_id, m.project_id)
+            for m in (
+                await session.scalars(
+                    select(SourceProjectMapping).where(
+                        SourceProjectMapping.source_id.in_(src_ids),
+                        SourceProjectMapping.project_id.in_(proj_ids),
+                        SourceProjectMapping.state == "CONFIRMED",
+                    )
+                )
+            ).all()
+        }
+        if src_ids and proj_ids
+        else set()
+    )
+    runs_by_ver: dict[str, list[tuple[str | None, str | None]]] = defaultdict(list)
+    for r_vid, r_tid, r_pid in (
+        await session.execute(
+            select(IngestionRun.document_version_id, IngestionRun.tenant_id, IngestionRun.project_id).where(
+                IngestionRun.document_version_id.in_(unique_vids)
+            )
+        )
+    ).all():
+        runs_by_ver[r_vid].append((r_tid, r_pid))
+    blocks_by_ver: dict[str, list[CanonicalBlock]] = defaultdict(list)
+    for blk in (
+        await session.scalars(
+            select(CanonicalBlock)
+            .where(CanonicalBlock.document_version_id.in_(unique_vids))
+            .order_by(CanonicalBlock.document_version_id, CanonicalBlock.ordinal)
+        )
+    ).all():
+        blocks_by_ver[blk.document_version_id].append(blk)
+    snapshots_by_ver = {
+        s.document_version_id: s
+        for s in (
+            await session.scalars(select(SourceSnapshot).where(SourceSnapshot.document_version_id.in_(unique_vids)))
+        ).all()
+    }
+    results: dict[str, tuple] = {}
+    for vid in unique_vids:
+        version = versions_by_id.get(vid)
+        document = docs_by_id.get(version.document_id) if version else None
+        if not version or not document or not document.is_active or version.search_status not in {"READY", "SEARCH_READY"}:
+            raise ValueError("Knowledge producer requires an active SEARCH_READY version")
+        partition = (version.metadata_json or {}).get("security_partition_id")
+        if not all(
+            isinstance(v, str) and v.strip()
+            for v in (document.tenant_id, document.project_id, document.source_id, partition)
+        ):
+            raise ValueError("Knowledge producer requires explicit tenant/project/source/partition")
+        if (document.source_id, document.project_id) not in confirmed_mappings:
+            raise ValueError("Knowledge producer requires a confirmed Project-to-Source mapping")
+        if any(
+            r_tid != document.tenant_id or r_pid != document.project_id
+            for r_tid, r_pid in runs_by_ver.get(version.id, ())
+        ):
+            raise ValueError("Knowledge producer scope conflicts with ingestion provenance")
+        blocks = blocks_by_ver.get(version.id, [])
+        if not blocks:
+            raise ValueError("Knowledge producer requires canonical source artifacts")
+        if any(hashlib.sha256(b.normalized_text.encode()).hexdigest() != b.content_hash for b in blocks):
+            raise ValueError("Canonical artifact checksum mismatch")
+        source = snapshots_by_ver.get(version.id)
+        if source and source.checksum_sha256 != version.file_hash:
+            raise ValueError("Source snapshot checksum differs from DocumentVersion")
+        config = KnowledgeConfig.model_validate((version.metadata_json or {}).get("knowledge_config", {}))
+        provenance = {
+            "tenant_id": document.tenant_id,
+            "project_id": document.project_id,
+            "source_id": document.source_id,
+            "document_id": document.id,
+            "document_version_id": version.id,
+            "version_no": version.version_no,
+            "security_partition_id": partition,
+            "source_snapshot_id": source.id if source else None,
+            "source_checksum": source.checksum_sha256 if source else version.file_hash,
+            "published_at": version.source_published_at.isoformat() if version.source_published_at else None,
+            "observed_at": version.observed_at.isoformat(),
+            "ingested_at": version.ingested_at.isoformat() if version.ingested_at else None,
+            "supersedes_id": version.supersedes_id,
+        }
+        digest = checksum(
+            {
+                "config": config.model_dump(mode="json"),
+                "provenance": provenance,
+                "validity": [version.valid_from.isoformat(), version.valid_to.isoformat()],
+                "blocks": [
+                    [
+                        b.id,
+                        b.ordinal,
+                        b.block_type,
+                        b.content_hash,
+                        b.page_from,
+                        b.page_to,
+                        b.section_path,
+                        b.source_anchor,
+                    ]
+                    for b in blocks
+                ],
+            }
+        )
+        results[vid] = ({b.id: b for b in blocks}, provenance, digest)
+    return results
+
+
 async def _load_sag_engine_entities(session: AsyncSession, document_id: str) -> tuple[str, ...]:
     """Harvest LLM-extracted entities from sag-engine (LightRAG Dual-Level Bridging)."""
     document = await session.get(Document, document_id)
@@ -532,10 +668,23 @@ async def rebuild_knowledge_version(
     extra_entities: Sequence[str] | None = None,
 ) -> list[KnowledgeUnit]:
     # Serialize knowledge work on its own row, rather than a long-held ingestion/readiness row.
-    version, blocks, base, digest = await version_input(session, version_id, config)
-    await knowledge_lock(session, "project-input:" + base["tenant_id"] + ":" + base["project_id"])
-    await knowledge_lock(session, "version:" + version_id)
-    version, blocks, base, digest = await version_input(session, version_id, config)
+    pre_ver = await session.get(DocumentVersion, version_id)
+    pre_doc = await session.get(Document, pre_ver.document_id) if pre_ver else None
+    if (
+        pre_doc is not None
+        and isinstance(pre_doc.tenant_id, str)
+        and pre_doc.tenant_id.strip()
+        and isinstance(pre_doc.project_id, str)
+        and pre_doc.project_id.strip()
+    ):
+        await knowledge_lock(session, "project-input:" + pre_doc.tenant_id + ":" + pre_doc.project_id)
+        await knowledge_lock(session, "version:" + version_id)
+        version, blocks, base, digest = await version_input(session, version_id, config)
+    else:
+        version, blocks, base, digest = await version_input(session, version_id, config)
+        await knowledge_lock(session, "project-input:" + base["tenant_id"] + ":" + base["project_id"])
+        await knowledge_lock(session, "version:" + version_id)
+        version, blocks, base, digest = await version_input(session, version_id, config)
     bridged_entities = (
         tuple(extra_entities)
         if extra_entities is not None
@@ -547,7 +696,10 @@ async def rebuild_knowledge_version(
             await session.scalars(select(KnowledgeUnit).where(KnowledgeUnit.document_version_id == version_id))
         ).all()
     }
+    existing_checksums = await unit_checksums(session, list(existing.values())) if existing else {}
     units = []
+    updated_unit_ids: list[str] = []
+    new_evidence_rows: list[KnowledgeEvidence] = []
     for block in blocks:
         if block.block_type == "heading" or not block.normalized_text.strip():
             continue
@@ -584,7 +736,7 @@ async def rebuild_knowledge_version(
             and unit.content_hash == block.content_hash
             and unit.provenance_json == provenance
             and unit.features_json == features
-            and unit.checksum == await unit_checksum(session, unit)
+            and unit.checksum == existing_checksums.get(unit.id)
         ):
             unit.is_current = True
             units.append(unit)
@@ -597,24 +749,35 @@ async def rebuild_knowledge_version(
         unit.provenance_json, unit.features_json = provenance, features
         unit.valid_from, unit.valid_to = version.valid_from, version.valid_to
         session.add(unit)
-        await session.flush()
-        await session.execute(delete(KnowledgeEvidence).where(KnowledgeEvidence.unit_id == unit_id))
+        updated_unit_ids.append(unit_id)
+        unit_evidence_by_id: dict[str, KnowledgeEvidence] = {}
         for fact in facts:
             payload = evidence_payload(fact, provenance, unit.valid_from, unit.valid_to)
-            session.add(
-                KnowledgeEvidence(
-                    id=stable_id(unit_id, checksum(fact)),
-                    unit_id=unit_id,
-                    tier=fact["tier"],
-                    kind=fact["kind"],
-                    extractor_version=fact["extractor_version"],
-                    confidence=fact["confidence"],
-                    payload_json=payload,
+            ev_id = stable_id(unit_id, checksum(fact))
+            unit_evidence_by_id[ev_id] = KnowledgeEvidence(
+                id=ev_id,
+                unit_id=unit_id,
+                tier=fact["tier"],
+                kind=fact["kind"],
+                extractor_version=fact["extractor_version"],
+                confidence=fact["confidence"],
+                payload_json=payload,
+            )
+        sorted_unit_evidence = [unit_evidence_by_id[k] for k in sorted(unit_evidence_by_id)]
+        unit.checksum = _unit_checksum(unit, sorted_unit_evidence)
+        new_evidence_rows.extend(sorted_unit_evidence)
+        units.append(unit)
+    if updated_unit_ids:
+        await session.flush()
+        for offset in range(0, len(updated_unit_ids), 512):
+            await session.execute(
+                delete(KnowledgeEvidence).where(
+                    KnowledgeEvidence.unit_id.in_(updated_unit_ids[offset : offset + 512])
                 )
             )
+        if new_evidence_rows:
+            session.add_all(new_evidence_rows)
         await session.flush()
-        unit.checksum = await unit_checksum(session, unit)
-        units.append(unit)
     live = {u.id for u in units}
     for old in existing.values():
         if old.id not in live:
@@ -664,8 +827,8 @@ def _cosine(left: list, right: list) -> float | None:
     if not scale_a or not scale_b:
         return None
     a, b = [v / scale_a for v in left], [v / scale_b for v in right]
-    value = math.fsum(x * y for x, y in zip(a, b, strict=True)) / math.sqrt(
-        math.fsum(x * x for x in a) * math.fsum(y * y for y in b)
+    value = math.sumprod(a, b) / math.sqrt(
+        math.sumprod(a, a) * math.sumprod(b, b)
     )
     return (max(-1.0, min(1.0, value)) + 1) / 2
 
@@ -679,7 +842,7 @@ def _prepare_dense(vector):
     if not scale:
         return (vector, 0.0)
     normalized = [value / scale for value in vector]
-    return normalized, math.fsum(value * value for value in normalized)
+    return normalized, math.sumprod(normalized, normalized)
 
 
 def _prepared_cosine(left, right):
@@ -691,7 +854,7 @@ def _prepared_cosine(left, right):
         raise ValueError("Knowledge dense features must share a dimension")
     if not norm_a or not norm_b:
         return None
-    value = math.fsum(x * y for x, y in zip(a, b, strict=True)) / math.sqrt(norm_a * norm_b)
+    value = math.sumprod(a, b) / math.sqrt(norm_a * norm_b)
     return (max(-1.0, min(1.0, value)) + 1) / 2
 
 
@@ -757,11 +920,7 @@ def graph_payload(units: list[KnowledgeUnit], config: KnowledgeConfig = Knowledg
                 # ponytail: fixed LSH buckets; replace with partition-filtered ANN when dense recall needs it.
                 signs = _lsh_signs(len(dense))
                 bits = tuple(
-                    sum(
-                        v * signs[p][i]
-                        for i, v in enumerate(dense)
-                    )
-                    >= 0
+                    math.sumprod(dense, signs[p]) >= 0
                     for p in range(8)
                 )
                 keys += [("dense", band, bits[band : band + 4]) for band in (0, 4)]
@@ -893,12 +1052,17 @@ def graph_payload(units: list[KnowledgeUnit], config: KnowledgeConfig = Knowledg
 
 
 async def persist_graph(
-    session: AsyncSession, units: list[KnowledgeUnit], config: KnowledgeConfig = KnowledgeConfig()
+    session: AsyncSession,
+    units: list[KnowledgeUnit],
+    config: KnowledgeConfig = KnowledgeConfig(),
+    *,
+    preverified: bool = False,
 ) -> KnowledgeGraphBuild:
-    checksums = await unit_checksums(session, units)
-    for unit in units:
-        if unit.checksum != checksums[unit.id]:
-            raise ValueError("Knowledge Unit/evidence checksum mismatch")
+    if not preverified:
+        checksums = await unit_checksums(session, units)
+        for unit in units:
+            if unit.checksum != checksums[unit.id]:
+                raise ValueError("Knowledge Unit/evidence checksum mismatch")
     fingerprint = checksum({"algorithm": "knowledge-graph.v1", "config": config.model_dump(mode="json"),
                             "units": sorted((u.id, u.checksum) for u in units)})
     if not units or len({(u.tenant_id, u.project_id) for u in units}) != 1:
@@ -933,17 +1097,19 @@ async def persist_graph(
     )
     session.add(build)
     await session.flush()
-    for edge in payload["edges"]:
-        session.add(
-            KnowledgeUnitEdge(
-                build_id=build_id,
-                source_unit_id=edge["source"],
-                target_unit_id=edge["target"],
-                security_partition_id=edge["partition"],
-                weight=edge["weight"],
-                signals_json={"signals": edge["signals"], "raw_lexical": edge["raw_lexical"]},
-            )
-        )
+    edge_rows = [
+        {
+            "build_id": build_id,
+            "source_unit_id": edge["source"],
+            "target_unit_id": edge["target"],
+            "security_partition_id": edge["partition"],
+            "weight": edge["weight"],
+            "signals_json": {"signals": edge["signals"], "raw_lexical": edge["raw_lexical"]},
+        }
+        for edge in payload["edges"]
+    ]
+    for offset in range(0, len(edge_rows), 1000):
+        await session.execute(insert(KnowledgeUnitEdge), edge_rows[offset : offset + 1000])
     await session.flush()
     return build
 

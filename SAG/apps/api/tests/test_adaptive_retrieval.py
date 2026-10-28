@@ -175,3 +175,37 @@ async def test_sibling_expansion_uses_one_budget_across_documents(monkeypatch):
         limit=4,
     )
     assert len(expanded) == 4
+
+
+@pytest.mark.asyncio
+async def test_precision_pruned_diversity_selection_stops_after_one_wave(monkeypatch):
+    monkeypatch.setattr(settings, "search_unit_candidate_limit", 256)
+    monkeypatch.setattr(settings, "search_top_k", 8)
+    calls = []
+
+    async def fetch(*args, candidate_limit, top_k, **kwargs):
+        calls.append(candidate_limit)
+        return SearchOutcome(
+            query="multipart upload limits",
+            sections=sections(3),
+            stats={
+                "candidate_pool_saturated": True,
+                "coverage": {
+                    "candidate_count": 37,
+                    "deduplicated_count": 0,
+                    "anchor_coverage": "not_required",
+                },
+                "stage_latencies_ms": {"candidate_retrieval": 1.0},
+            },
+        )
+
+    monkeypatch.setattr(retrieval, "_retrieve_search_unit_sections", fetch)
+    result = await retrieval.retrieve_search_unit_sections(
+        None, [], "multipart upload limits", principal=None, top_k=5
+    )
+    assert len(result.sections) == 3
+    assert result.stats["adaptive_waves"] == 1
+    assert result.stats["retrieval_stop_reason"] == "requested_top_k_reached"
+    assert result.stats["budget_exhausted"] is False
+    assert calls == [32]
+

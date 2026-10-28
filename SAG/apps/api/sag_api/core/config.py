@@ -236,7 +236,7 @@ class Settings(BaseSettings):
     search_tree_profile_limit: int = Field(default=8192, ge=256, le=16384)
     # Keep part of the routed query's deadline available to its ACL-scoped global escape.
     search_tree_escape_reserve_seconds: float = Field(default=1.5, ge=0.1, le=10.0)
-    search_tree_snapshot_timeout: float = Field(default=1.0, ge=0.05, le=10.0)
+    search_tree_snapshot_timeout: float = Field(default=3.0, ge=0.05, le=10.0)
     # Exact, profile-content-addressed route decisions only. Semantic matching
     # and answer/evidence caching have no enablement path in this release.
     search_route_decision_cache_enabled: bool = False
