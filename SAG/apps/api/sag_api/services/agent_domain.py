@@ -19,12 +19,16 @@ from sag_api.branding import DEFAULT_AGENT_AVATAR, DEFAULT_AGENT_NAME
 from sag_api.core.config import settings
 from sag_api.core.error_taxonomy import ErrorCode
 from sag_api.core.errors import ConflictError, NotFoundError, ValidationError
+from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal
 from sag_api.db.models import Agent, AgentBinding, Message, Source, Thread
 from sag_api.enums import BindingTargetType, MessageRole, MessageStatus
 from sag_api.generation import build_agent_messages, build_prompt_preview
 from sag_api.generation.prompt import estimate_tokens
+from sag_api.services.session_context import invalidate_session_thread_cache, prepare_session_context_for_ask
 from sag_api.services.source_service import get_authorized_source_ids, search_source_candidates
+
+_log = get_logger("sag.agent_domain")
 
 _DEFAULT_TITLES = {"New chat", "Cuộc trò chuyện mới"}
 _KNOWLEDGE_TOOL_NAMES = frozenset({"search_context", "get_entity"})
@@ -375,6 +379,7 @@ async def get_thread(session: AsyncSession, agent_id: str, thread_id: str, *, ow
 async def delete_thread(session: AsyncSession, agent_id: str, thread_id: str, *, owner_key: str) -> None:
     thread = await get_thread(session, agent_id, thread_id, owner_key=owner_key)
     await session.delete(thread)
+    invalidate_session_thread_cache(thread.id)
     await session.commit()
 
 
@@ -597,6 +602,69 @@ class AskPlan:
     prompt_preview: str = ""
     source_ids: list[str] | None = None  # @范围：限定循环内检索工具可见的信源
     user_message_id: str | None = None
+    session_audit_trace: dict | None = None
+
+
+async def _resolve_session_history(
+    session: AsyncSession,
+    *,
+    legacy_history: list[dict[str, str]],
+    thread_id: str,
+    exclude_id: str,
+    query: str,
+    principal: VerifiedPrincipal,
+    owner_key: str,
+    source_ids: list[str] | None,
+    llm: Any,
+    budget_tokens: int,
+) -> tuple[list[dict[str, str]], dict | None]:
+    mode = settings.session_context_mode
+    if mode == "off":
+        compressed = await compress_history(legacy_history, llm=llm, budget_tokens=budget_tokens)
+        return compressed, None
+
+    if mode == "shadow":
+        compressed = await compress_history(legacy_history, llm=llm, budget_tokens=budget_tokens)
+        try:
+            pack = await prepare_session_context_for_ask(
+                session,
+                thread_id=thread_id,
+                exclude_message_id=exclude_id,
+                query=query,
+                principal=principal,
+                owner_key=owner_key,
+                requested_source_ids=source_ids,
+                budget_tokens=budget_tokens,
+            )
+            pack.audit_trace.mode = "shadow"
+            return compressed, pack.audit_trace.to_dict()
+        except Exception as exc:  # noqa: BLE001 - shadow telemetry must never fail user ask
+            _log.warning("ECCE shadow session context failed (%s)", type(exc).__name__)
+            return compressed, None
+
+    try:
+        pack = await prepare_session_context_for_ask(
+            session,
+            thread_id=thread_id,
+            exclude_message_id=exclude_id,
+            query=query,
+            principal=principal,
+            owner_key=owner_key,
+            requested_source_ids=source_ids,
+            budget_tokens=budget_tokens,
+        )
+        return pack.history_messages, pack.audit_trace.to_dict()
+    except Exception as exc:  # noqa: BLE001 - graceful fallback to bounded legacy window on unexpected error
+        _log.warning("ECCE session context fallback to legacy history (%s)", type(exc).__name__)
+        fallback_hist = legacy_history or await _history(
+            session,
+            thread_id,
+            exclude_id=exclude_id,
+            principal=principal,
+            requested_source_ids=source_ids,
+        )
+        compressed = await compress_history(fallback_hist, llm=llm, budget_tokens=budget_tokens)
+        return compressed, None
 
 
 def build_ask_context(
@@ -669,7 +737,7 @@ async def prepare_ask(
     await session.commit()
     await session.refresh(user_msg)
 
-    history = await _history(
+    history = [] if settings.session_context_mode == "on" else await _history(
         session,
         thread.id,
         exclude_id=user_msg.id,
@@ -677,7 +745,18 @@ async def prepare_ask(
         requested_source_ids=source_ids,
     )
     # 历史预算 = 上下文窗口的 40%（其余留给工具轮/回答）
-    history = await compress_history(history, llm=llm, budget_tokens=int(settings.llm_context_window * 0.4))
+    history, audit_trace = await _resolve_session_history(
+        session,
+        legacy_history=history,
+        thread_id=thread.id,
+        exclude_id=user_msg.id,
+        query=query,
+        principal=principal,
+        owner_key=owner_key,
+        source_ids=source_ids,
+        llm=llm,
+        budget_tokens=int(settings.llm_context_window * 0.4),
+    )
     plan = build_ask_context(
         agent=agent,
         query=query,
@@ -686,6 +765,7 @@ async def prepare_ask(
         source_ids=source_ids,
     )
     plan.user_message_id = user_msg.id
+    plan.session_audit_trace = audit_trace
     return plan
 
 
@@ -697,6 +777,7 @@ async def delete_message(
     if message is None or message.thread_id != thread.id:
         raise NotFoundError("Message not found")
     await session.delete(message)
+    invalidate_session_thread_cache(thread.id)
     await session.commit()
 
 
