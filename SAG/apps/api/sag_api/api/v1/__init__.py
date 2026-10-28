@@ -5,12 +5,13 @@ from sag_api.api.v1 import (
     agents,
     attachments,
     auth,
+    decision,
     dify,
     documents,
+    handover,
     insights,
     jobs,
     knowledge,
-    decision,
     octx,
     openai,
     search,
@@ -40,6 +41,7 @@ for _module in (
 ):
     api_router.include_router(_module.router)
 api_router.include_router(documents.project_router)
+api_router.include_router(handover.router)
 api_router.include_router(search.global_router)
 
 __all__ = ["api_router"]
