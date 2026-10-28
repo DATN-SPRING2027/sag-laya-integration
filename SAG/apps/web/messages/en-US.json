@@ -272,7 +272,9 @@
     "image": "Image",
     "imageUnavailable": "🖼 Image{alt, select, other {: {alt}}} (see original file)",
     "openSource": "Open source {number}",
-    "source": "Source {number}"
+    "source": "Source {number}",
+    "openSessionSource": "Jump to session turn {ref}",
+    "sessionSource": "Session evidence {ref}"
   },
   "SourceForm": {
     "created": "Source created. You can upload documents now.",
@@ -973,7 +975,11 @@
     "reject": "Reject",
     "allowOnce": "Allow once",
     "thinking": "Thinking…",
-    "sessionMissing": "Conversation runtime session not found: {id}"
+    "sessionMissing": "Conversation runtime session not found: {id}",
+    "turnUnavailable": "The referenced conversation turn is no longer available in this thread",
+    "inspectContext": "Context audit",
+    "inspectContextAria": "Open session Context Inspector",
+    "inspectContextTooltip": "Inspect session evidence, token budget, and decision superseding lineage"
   },
   "Citations": {
     "visitExternal": "Visit external source: {title}",
@@ -992,7 +998,29 @@
     "referenceCount": "{count, plural, one {# reference} other {# references}}",
     "sources": "Reference sources",
     "internal": "Internal sources",
-    "external": "External references"
+    "external": "External references",
+    "toggleAriaWithSession": "{action} {total, plural, one {# reference} other {# references}}: {session, plural, one {# session evidence item} other {# session evidence items}}, {internal, plural, one {# internal source} other {# internal sources}}, and {external, plural, one {# external reference} other {# external references}}",
+    "inspectSessionContext": "Inspect context",
+    "sessionHistory": "Session history evidence",
+    "sessionBundleOrdinals": "Turns #{first, number}–#{last, number} ({count, number} turns)",
+    "sessionBundleCount": "Evidence bundle ({count, number} turns)",
+    "sessionSingleTurnOrdinal": "Conversation turn #{ordinal, number}",
+    "sessionSingleTurnFallback": "Conversation turn #{id}",
+    "sessionTurnOlderUnloaded": "Located in earlier history — click to load earlier messages and jump.",
+    "roleUser": "User",
+    "roleAssistant": "Assistant",
+    "sessionTokenCost": "{count, number} tok",
+    "jumpToSessionTurn": "Jump to turn",
+    "jumpToSessionTurnAria": "Scroll to session evidence {ref}: {title}",
+    "epistemic": {
+      "FACT": "Fact",
+      "PROPOSED": "Proposed",
+      "CONSIDERING": "Considering",
+      "CONFIRMED": "Confirmed",
+      "SUPERSEDED": "Superseded",
+      "NEGATED": "Negated",
+      "OPEN_ISSUE": "Open issue"
+    }
   },
   "PromptPreview": {
     "open": "View this run’s model input",
@@ -1034,6 +1062,14 @@
       "getTime": "Check time",
       "webSearch": "Search the web",
       "openWebPage": "Open webpage"
+    },
+    "sessionContext": {
+      "label": "Session context (ECCE)",
+      "summary": "{groups, number} bundles · {tokens, number} tok",
+      "ablation": "Profile",
+      "selected": "Selected",
+      "rejected": "Rejected",
+      "budget": "Budget"
     }
   },
   "Search": {
@@ -1211,7 +1247,8 @@
       "restore": "Restore",
       "maximize": "Maximize",
       "expandReading": "Expand reading view",
-      "close": "Close"
+      "close": "Close",
+      "sessionContextTitle": "Session Context Inspector"
     }
   },
   "PetMini": {
@@ -1753,5 +1790,136 @@
     "includesQA": "Key Q&A interaction events",
     "includesErrors": "Error and exception information",
     "includesEnv": "System environment information"
+  },
+  "SessionContextInspector": {
+    "epistemic": {
+      "FACT": "Fact",
+      "PROPOSED": "Proposed",
+      "CONSIDERING": "Considering",
+      "CONFIRMED": "Confirmed",
+      "SUPERSEDED": "Superseded",
+      "NEGATED": "Negated",
+      "OPEN_ISSUE": "Open issue"
+    },
+    "modes": {
+      "on": "Active (ON)",
+      "shadow": "Shadow audit (SHADOW)",
+      "legacy": "Legacy"
+    },
+    "shadowModeNotice": "SHADOW mode records explainable audit telemetry without altering the prompt; this answer still used standard message history.",
+    "persistence": {
+      "hydrated_clean": "Hydrated clean (PG + Qdrant)",
+      "warm_clean": "Warm cache clean",
+      "delta_synced": "Delta synced",
+      "lazy_backfill": "Lazy backfilled",
+      "drift_rebuilt": "Vectors rebuilt (Model drift)",
+      "qdrant_reconciled": "Qdrant reconciled",
+      "sync_failed": "Storage sync failed",
+      "qdrant_degraded": "Qdrant degraded",
+      "memory_only": "In-memory only",
+      "legacy_bypass": "Legacy bypass"
+    },
+    "kpi": {
+      "turnsAndEpisodes": "Turns / Episodes",
+      "activeDecisions": "Active decisions",
+      "llmMemoryCalls": "Memory LLM calls",
+      "latency": "Engine latency"
+    },
+    "meta": {
+      "scope": "Scope",
+      "temporal": "Temporal",
+      "router": "Router",
+      "routerFallback": "fallback",
+      "syncedUnits": "Persisted",
+      "transitiveSources": "Transitive knowledge sources"
+    },
+    "memoryScopes": {
+      "session_history": "Session history",
+      "knowledge_base": "Knowledge base",
+      "hybrid_both": "Session + Knowledge",
+      "full_session_audit": "Full session audit"
+    },
+    "temporalModes": {
+      "atemporal": "Atemporal",
+      "current_effective": "Current effective",
+      "past_point": "Past point-in-time",
+      "change_lineage": "Change lineage"
+    },
+    "budget": {
+      "title": "Context token budget allocation",
+      "tokensUnit": "tok",
+      "evidence": "Evidence [S*]",
+      "recent": "Recent turns",
+      "remaining": "{count, number} tok remaining",
+      "partialCoverageWarning": "Partial coverage: conversation history exceeded the token cap, so lower-utility candidates were pruned by the submodular optimizer."
+    },
+    "tabs": {
+      "selected": "Selected",
+      "rejected": "Rejected",
+      "lineage": "Lineage"
+    },
+    "views": {
+      "title": "Multi-view fusion weights",
+      "subtitle": "Zero-LLM-call scoring channels",
+      "state": "Decision ledger",
+      "graph": "Entity graph (PPR)",
+      "hybrid": "Lexical + Dense",
+      "hierarchy": "Episodes & Windows",
+      "short_verbatim": "Short-session verbatim",
+      "legacy": "Sequential history"
+    },
+    "closureReasons": {
+      "direct_match": "Direct match",
+      "decision_lineage_closure": "Decision lineage closure",
+      "anaphoric_prev_neighbor_closure": "Previous turn coreference closure",
+      "anaphoric_confirmation_closure": "Confirmation reply closure",
+      "qa_pair_neighbor_closure": "Adjacent Q&A closure",
+      "cross_view_bridge": "Cross-view bridge",
+      "single_turn": "Single turn",
+      "short_session_verbatim": "Short session verbatim",
+      "recent_continuity": "Recent continuity window"
+    },
+    "selected": {
+      "emptyTitle": "No prior session evidence needed",
+      "emptyDescription": "This turn either started the conversation or relied exclusively on standalone knowledge-base sources.",
+      "citedInAnswer": "Cited",
+      "utility": "Utility",
+      "coverageGain": "Coverage gain",
+      "redundancy": "Redundancy",
+      "gainPerToken": "Gain / tok"
+    },
+    "roles": {
+      "user": "User",
+      "assistant": "Assistant"
+    },
+    "turnOrdinalRole": "Turn #{ordinal, number} · {role}",
+    "turnNumber": "Turn #{ordinal, number}",
+    "turnOlderUnloaded": "This turn is in an earlier history page. Click “Jump to turn” to load and highlight it.",
+    "jumpToTurn": "Jump to turn",
+    "rejectionReasons": {
+      "SUPERSEDED_BY_NEWER_DECISION": "Superseded by newer decision",
+      "REDUNDANT_SEMANTIC_DUPLICATE": "Semantic duplicate",
+      "TOKEN_BUDGET_CAP": "Token budget cap",
+      "LOW_MARGINAL_UTILITY": "Low marginal utility"
+    },
+    "rejected": {
+      "emptyTitle": "No candidates rejected",
+      "emptyDescription": "All candidate turns fit within the token budget without supersession conflicts or semantic duplication.",
+      "filterAria": "Filter rejected candidates by reason",
+      "filterAll": "All",
+      "noFilterMatches": "No rejected candidates match this filter.",
+      "resetFilter": "Reset filter",
+      "rawScore": "Raw score",
+      "jumpToSuperseding": "Jump to superseding turn"
+    },
+    "lineage": {
+      "activeCount": "Active decisions",
+      "supersededCount": "Superseded turns",
+      "emptyTitle": "No decision lineage transitions yet",
+      "emptyDescription": "When proposals are refined, negated, or superseded by confirmed decisions across turns, their transition chain appears here.",
+      "supersessionChainTitle": "Decision supersession chain #{index, number}",
+      "decisionStateTitle": "Decision state #{index, number}",
+      "supersededTransition": "Superseded by newer confirmed decision"
+    }
   }
 }

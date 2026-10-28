@@ -8,7 +8,12 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 
 import { splitMarkdownBlocks } from "@/lib/markdown-blocks";
-import type { Citation } from "@/lib/types";
+import {
+  parseCitationBrackets,
+  sessionCitationPillClasses,
+  type ParsedCitationToken,
+} from "@/lib/session-context-presentation";
+import type { Citation, SessionCitation } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 type MdNode = {
@@ -213,10 +218,45 @@ function normalizeExplicitMathDelimiters(content: string): string {
   return normalized;
 }
 
-function remarkCitationLinks(validNumbers: ReadonlySet<string>) {
+export function remarkCitationLinks(
+  validNumbers: ReadonlySet<string>,
+  validSessionRefs: ReadonlySet<string> = new Set(),
+) {
+  const isTokenValid = (token: ParsedCitationToken): boolean =>
+    token.kind === "doc"
+      ? validNumbers.has(token.number)
+      : validSessionRefs.has(token.ref);
+
+  const toCitationLinkNode = (token: ParsedCitationToken): MdNode =>
+    token.kind === "doc"
+      ? {
+          type: "link",
+          // Hash URLs survive react-markdown's URL sanitizer; the renderer below
+          // replaces them with buttons, so citation clicks never navigate.
+          url: `#citation-${token.number}`,
+          title: null,
+          children: [{ type: "text", value: token.number }],
+          data: { hProperties: { "data-citation": token.number } },
+        }
+      : {
+          type: "link",
+          url: `#session-citation-${token.ref}`,
+          title: null,
+          children: [{ type: "text", value: token.ref }],
+          data: { hProperties: { "data-session-citation": token.ref } },
+        };
+
   return () => {
     const visit = (node: MdNode) => {
-      if (node.type === "link" || node.type === "code" || node.type === "inlineCode") return;
+      if (
+        node.type === "link"
+        || node.type === "code"
+        || node.type === "inlineCode"
+        || node.type === "math"
+        || node.type === "inlineMath"
+      ) {
+        return;
+      }
       if (!node.children) return;
       node.children = node.children.flatMap((child) => {
         if (child.type !== "text" || typeof child.value !== "string") {
@@ -224,28 +264,50 @@ function remarkCitationLinks(validNumbers: ReadonlySet<string>) {
           return [child];
         }
 
+        const brackets = parseCitationBrackets(child.value);
+        if (brackets.length === 0) return [child];
+
         const parts: MdNode[] = [];
-        const re = /\[(\d+)\]/g;
         let last = 0;
-        let match: RegExpExecArray | null;
-        while ((match = re.exec(child.value))) {
-          // A bracketed number is only interactive when the backend supplied
-          // traceable metadata for that exact number. Never manufacture a
-          // disabled "citation" control for model-invented references.
-          if (!validNumbers.has(match[1])) continue;
-          if (match.index > last) {
-            parts.push({ type: "text", value: child.value.slice(last, match.index) });
+        for (const bracket of brackets) {
+          const hasSessionToken = bracket.tokens.some(
+            (token) => token.kind === "session",
+          );
+          // A bracketed reference is only interactive when the backend supplied
+          // traceable metadata for that exact reference. For purely numeric
+          // brackets (`[1]`, `[1, 2]`), require every number to be valid so prose
+          // intervals like `[1, 100]` stay plain text.
+          if (!hasSessionToken) {
+            if (!bracket.tokens.every(isTokenValid)) continue;
+            if (bracket.start > last) {
+              parts.push({
+                type: "text",
+                value: child.value.slice(last, bracket.start),
+              });
+            }
+            for (const token of bracket.tokens) {
+              parts.push(toCitationLinkNode(token));
+            }
+            last = bracket.end;
+            continue;
           }
-          parts.push({
-            type: "link",
-            // Hash URLs survive react-markdown's URL sanitizer; the renderer below
-            // replaces them with buttons, so citation clicks never navigate.
-            url: `#citation-${match[1]}`,
-            title: null,
-            children: [{ type: "text", value: match[1] }],
-            data: { hProperties: { "data-citation": match[1] } },
-          });
-          last = match.index + match[0].length;
+
+          if (!bracket.tokens.some(isTokenValid)) continue;
+          if (bracket.start > last) {
+            parts.push({
+              type: "text",
+              value: child.value.slice(last, bracket.start),
+            });
+          }
+          for (const token of bracket.tokens) {
+            if (isTokenValid(token)) {
+              parts.push(toCitationLinkNode(token));
+            } else {
+              const rawRef = token.kind === "doc" ? token.number : token.ref;
+              parts.push({ type: "text", value: ` [${rawRef}]` });
+            }
+          }
+          last = bracket.end;
         }
         if (!parts.length) return [child];
         if (last < child.value.length) {
@@ -331,12 +393,16 @@ function MdImage(props: React.ImgHTMLAttributes<HTMLImageElement>) {
 export const MarkdownContent = React.memo(function MarkdownContent({
   content,
   citations,
+  sessionCitations,
   onCitationClick,
+  onSessionCitationClick,
   streaming = false,
 }: {
   content: string;
   citations?: Citation[];
+  sessionCitations?: SessionCitation[];
   onCitationClick?: (citation: Citation) => void;
+  onSessionCitationClick?: (citation: SessionCitation) => void;
   streaming?: boolean;
 }) {
   const t = useTranslations("Markdown");
@@ -352,9 +418,22 @@ export const MarkdownContent = React.memo(function MarkdownContent({
         .map((citation) => [String(citation.n), citation]),
     );
   }, [citations]);
+
+  const sessionCitationByRef = React.useMemo(() => {
+    return new Map(
+      (sessionCitations ?? [])
+        .filter((item) => /^S[1-9]\d*$/.test(item.ref))
+        .map((item) => [item.ref, item]),
+    );
+  }, [sessionCitations]);
+
   const citationPlugin = React.useMemo(
-    () => remarkCitationLinks(new Set(citationByNumber.keys())),
-    [citationByNumber],
+    () =>
+      remarkCitationLinks(
+        new Set(citationByNumber.keys()),
+        new Set(sessionCitationByRef.keys()),
+      ),
+    [citationByNumber, sessionCitationByRef],
   );
 
   return (
@@ -394,7 +473,7 @@ export const MarkdownContent = React.memo(function MarkdownContent({
                     if (citation) onCitationClick?.(citation);
                   }}
                   className={cn(
-                    "relative -top-px mx-0.5 inline-flex size-[18px] items-center justify-center rounded-full bg-muted font-mono text-[10px] font-semibold leading-none text-muted-foreground no-underline outline-none transition-colors align-baseline focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1",
+                    "relative -top-px mx-0.5 inline-flex size-[18px] items-center justify-center rounded-full bg-muted font-mono text-[10px] font-semibold leading-none tabular-nums text-muted-foreground no-underline outline-none transition-colors align-baseline focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1",
                     citation
                       ? "cursor-pointer hover:bg-muted-foreground/20 hover:text-foreground"
                       : "cursor-default opacity-60",
@@ -406,6 +485,46 @@ export const MarkdownContent = React.memo(function MarkdownContent({
                 </button>
               );
             }
+
+            const sessionMatch = href?.match(/^#session-citation-(S[1-9]\d*)$/);
+            if (sessionMatch) {
+              const ref = sessionMatch[1];
+              const sessionItem = sessionCitationByRef.get(ref);
+              const firstTurn = sessionItem?.turns.find((turn) => Boolean(turn.excerpt));
+              const tooltipText = sessionItem
+                ? firstTurn?.excerpt
+                  ? `[${ref}] ${firstTurn.excerpt}`
+                  : t("sessionSource", { ref })
+                : t("sessionSource", { ref });
+              const interactive = Boolean(sessionItem && onSessionCitationClick);
+              return (
+                <button
+                  type="button"
+                  disabled={!interactive}
+                  onClick={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    if (sessionItem) onSessionCitationClick?.(sessionItem);
+                  }}
+                  className={cn(
+                    "relative -top-px mx-0.5 inline-flex h-[18px] min-w-[22px] items-center justify-center rounded-md border px-1 font-mono text-[10px] font-semibold leading-none tabular-nums no-underline outline-none transition-colors align-baseline focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1",
+                    sessionCitationPillClasses(
+                      sessionItem?.epistemicStatus ?? "FACT",
+                      interactive,
+                    ),
+                  )}
+                  aria-label={
+                    interactive
+                      ? t("openSessionSource", { ref })
+                      : t("sessionSource", { ref })
+                  }
+                  title={tooltipText}
+                >
+                  {children}
+                </button>
+              );
+            }
+
             return (
               <a href={href} target="_blank" rel="noopener noreferrer" {...props}>
                 {children}

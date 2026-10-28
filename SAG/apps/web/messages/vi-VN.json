@@ -272,7 +272,9 @@
     "image": "Image",
     "imageUnavailable": "🖼 Image{alt, select, other {: {alt}}} (see original file)",
     "openSource": "Open source {number}",
-    "source": "Source {number}"
+    "source": "Source {number}",
+    "openSessionSource": "Đi tới lượt hội thoại {ref}",
+    "sessionSource": "Bằng chứng phiên {ref}"
   },
   "SourceForm": {
     "created": "Source created. You can upload documents now.",
@@ -973,7 +975,11 @@
     "reject": "Reject",
     "allowOnce": "Allow once",
     "thinking": "Thinking…",
-    "sessionMissing": "Conversation runtime session not found: {id}"
+    "sessionMissing": "Conversation runtime session not found: {id}",
+    "turnUnavailable": "Lượt hội thoại tham chiếu không còn khả dụng trong phiên này",
+    "inspectContext": "Ngữ cảnh ECCE",
+    "inspectContextAria": "Mở bảng kiểm toán ngữ cảnh phiên (Context Inspector)",
+    "inspectContextTooltip": "Kiểm toán bằng chứng phiên, ngân sách token và chuỗi kế thừa quyết định"
   },
   "Citations": {
     "visitExternal": "Visit external source: {title}",
@@ -992,7 +998,29 @@
     "referenceCount": "{count, plural, one {# reference} other {# references}}",
     "sources": "Reference sources",
     "internal": "Internal sources",
-    "external": "External references"
+    "external": "External references",
+    "toggleAriaWithSession": "{action} {total, number} nguồn tham khảo: {session, number} bằng chứng phiên, {internal, number} nguồn nội bộ và {external, number} nguồn bên ngoài",
+    "inspectSessionContext": "Kiểm toán ngữ cảnh",
+    "sessionHistory": "Bằng chứng lịch sử phiên",
+    "sessionBundleOrdinals": "Cụm lượt #{first, number}–#{last, number} ({count, number} lượt)",
+    "sessionBundleCount": "Cụm bằng chứng ({count, number} lượt)",
+    "sessionSingleTurnOrdinal": "Lượt hội thoại #{ordinal, number}",
+    "sessionSingleTurnFallback": "Lượt hội thoại #{id}",
+    "sessionTurnOlderUnloaded": "Lượt hội thoại nằm ở trang lịch sử cũ hơn — nhấn để tự động tải và cuộn tới.",
+    "roleUser": "Người dùng",
+    "roleAssistant": "Trợ lý",
+    "sessionTokenCost": "{count, number} tok",
+    "jumpToSessionTurn": "Đi tới lượt",
+    "jumpToSessionTurnAria": "Cuộn tới bằng chứng phiên {ref}: {title}",
+    "epistemic": {
+      "FACT": "Sự kiện",
+      "PROPOSED": "Đề xuất",
+      "CONSIDERING": "Đang cân nhắc",
+      "CONFIRMED": "Đã chốt",
+      "SUPERSEDED": "Đã thay thế",
+      "NEGATED": "Đã bác bỏ",
+      "OPEN_ISSUE": "Vấn đề mở"
+    }
   },
   "PromptPreview": {
     "open": "View this run’s model input",
@@ -1034,6 +1062,14 @@
       "getTime": "Check time",
       "webSearch": "Search the web",
       "openWebPage": "Open webpage"
+    },
+    "sessionContext": {
+      "label": "Ngữ cảnh phiên ECCE",
+      "summary": "{groups, number} cụm · {tokens, number} tok",
+      "ablation": "Cấu hình",
+      "selected": "Đã chọn",
+      "rejected": "Đã loại",
+      "budget": "Ngân sách"
     }
   },
   "Search": {
@@ -1211,7 +1247,8 @@
       "restore": "Restore",
       "maximize": "Maximize",
       "expandReading": "Expand reading view",
-      "close": "Close"
+      "close": "Close",
+      "sessionContextTitle": "Kiểm toán ngữ cảnh phiên (ECCE)"
     }
   },
   "PetMini": {
@@ -1753,5 +1790,136 @@
     "includesQA": "Key Q&A interaction events",
     "includesErrors": "Error and exception information",
     "includesEnv": "System environment information"
+  },
+  "SessionContextInspector": {
+    "epistemic": {
+      "FACT": "Sự kiện",
+      "PROPOSED": "Đề xuất",
+      "CONSIDERING": "Đang cân nhắc",
+      "CONFIRMED": "Đã chốt",
+      "SUPERSEDED": "Đã thay thế",
+      "NEGATED": "Đã bác bỏ",
+      "OPEN_ISSUE": "Vấn đề mở"
+    },
+    "modes": {
+      "on": "Đang bật (ON)",
+      "shadow": "Đối chiếu ngầm (SHADOW)",
+      "legacy": "Cơ bản (LEGACY)"
+    },
+    "shadowModeNotice": "Chế độ SHADOW chỉ ghi nhận dấu vết kiểm toán để đối chiếu chất lượng; câu trả lời hiện tại vẫn dùng lịch sử chuẩn và chưa chèn trích dẫn [S*].",
+    "persistence": {
+      "hydrated_clean": "Khôi phục sạch (PG + Qdrant)",
+      "warm_clean": "Bộ nhớ ấm đồng bộ",
+      "delta_synced": "Đã đồng bộ delta",
+      "lazy_backfill": "Đã backfill bền vững",
+      "drift_rebuilt": "Đã tái lập vector (Model Drift)",
+      "qdrant_reconciled": "Đã đối soát bù Qdrant",
+      "sync_failed": "Lỗi đồng bộ lưu trữ",
+      "qdrant_degraded": "Qdrant tạm gián đoạn",
+      "memory_only": "Chỉ lưu trên RAM",
+      "legacy_bypass": "Bỏ qua lưu trữ ECCE"
+    },
+    "kpi": {
+      "turnsAndEpisodes": "Lượt / Phân đoạn",
+      "activeDecisions": "Quyết định hiệu lực",
+      "llmMemoryCalls": "Lệnh LLM bộ nhớ",
+      "latency": "Độ trễ ECCE"
+    },
+    "meta": {
+      "scope": "Phạm vi",
+      "temporal": "Chế độ thời gian",
+      "router": "Bộ định tuyến",
+      "routerFallback": "dự phòng",
+      "syncedUnits": "Ghi bền vững",
+      "transitiveSources": "Nguồn tri thức bắc cầu"
+    },
+    "memoryScopes": {
+      "session_history": "Lịch sử hội thoại",
+      "knowledge_base": "Kho tri thức",
+      "hybrid_both": "Kết hợp Phiên + Tri thức",
+      "full_session_audit": "Kiểm toán toàn phiên"
+    },
+    "temporalModes": {
+      "atemporal": "Phi thời gian",
+      "current_effective": "Hiệu lực hiện hành",
+      "past_point": "Mốc quá khứ",
+      "change_lineage": "Truy vết thay đổi"
+    },
+    "budget": {
+      "title": "Phân bổ ngân sách token ngữ cảnh",
+      "tokensUnit": "tok",
+      "evidence": "Bằng chứng [S*]",
+      "recent": "Lượt liền kề",
+      "remaining": "Còn trống {count, number} tok",
+      "partialCoverageWarning": "Độ phủ một phần: dung lượng hội thoại vượt trần ngân sách nên bộ tối ưu submodular đã lược bỏ các lượt có lợi ích biên thấp hơn."
+    },
+    "tabs": {
+      "selected": "Đã chọn",
+      "rejected": "Đã loại",
+      "lineage": "Kế thừa"
+    },
+    "views": {
+      "title": "Trọng số dung hợp đa góc nhìn",
+      "subtitle": "4 kênh truy xuất không tốn LLM token",
+      "state": "Sổ cái quyết định",
+      "graph": "Đồ thị thực thể (PPR)",
+      "hybrid": "Từ vựng + Vector",
+      "hierarchy": "Phân đoạn & Cửa sổ",
+      "short_verbatim": "Nguyên văn phiên ngắn",
+      "legacy": "Lịch sử tuần tự"
+    },
+    "closureReasons": {
+      "direct_match": "Khớp trực tiếp",
+      "decision_lineage_closure": "Đóng gói chuỗi kế thừa quyết định",
+      "anaphoric_prev_neighbor_closure": "Mở rộng lượt trước giải đại từ",
+      "anaphoric_confirmation_closure": "Kèm lượt xác nhận liền sau",
+      "qa_pair_neighbor_closure": "Cặp Hỏi–Đáp liền kề",
+      "cross_view_bridge": "Cầu nối đa góc nhìn",
+      "single_turn": "Lượt đơn lẻ",
+      "short_session_verbatim": "Toàn bộ phiên ngắn",
+      "recent_continuity": "Duy trì mạch hội thoại gần nhất"
+    },
+    "selected": {
+      "emptyTitle": "Không cần trích xuất bằng chứng lịch sử",
+      "emptyDescription": "Câu hỏi này là lượt mở đầu hoặc chỉ truy vấn kho tri thức độc lập nên không tiêu tốn ngân sách bằng chứng phiên.",
+      "citedInAnswer": "Đã trích dẫn",
+      "utility": "Độ hữu dụng",
+      "coverageGain": "Độ phủ mới",
+      "redundancy": "Phạt trùng lặp",
+      "gainPerToken": "Lợi ích / tok"
+    },
+    "roles": {
+      "user": "Người dùng",
+      "assistant": "Trợ lý"
+    },
+    "turnOrdinalRole": "Lượt #{ordinal, number} · {role}",
+    "turnNumber": "Lượt #{ordinal, number}",
+    "turnOlderUnloaded": "Nội dung lượt này nằm ở trang lịch sử cũ hơn. Nhấn «Đi tới lượt» để tải và xem trực tiếp.",
+    "jumpToTurn": "Đi tới lượt",
+    "rejectionReasons": {
+      "SUPERSEDED_BY_NEWER_DECISION": "Đã bị quyết định mới thay thế",
+      "REDUNDANT_SEMANTIC_DUPLICATE": "Trùng lặp ngữ nghĩa",
+      "TOKEN_BUDGET_CAP": "Vượt trần ngân sách token",
+      "LOW_MARGINAL_UTILITY": "Lợi ích biên thấp"
+    },
+    "rejected": {
+      "emptyTitle": "Không có ứng viên nào bị loại",
+      "emptyDescription": "Tất cả lượt phù hợp đều nằm gọn trong ngân sách và không phát sinh xung đột quyết định.",
+      "filterAria": "Lọc ứng viên bị loại theo lý do",
+      "filterAll": "Tất cả",
+      "noFilterMatches": "Không có ứng viên nào thuộc nhóm lý do này.",
+      "resetFilter": "Xóa bộ lọc",
+      "rawScore": "Điểm gốc",
+      "jumpToSuperseding": "Đi tới lượt chốt mới"
+    },
+    "lineage": {
+      "activeCount": "Quyết định hiệu lực",
+      "supersededCount": "Lượt đã bị thay thế",
+      "emptyTitle": "Chưa phát sinh chuỗi thay đổi quyết định",
+      "emptyDescription": "Khi người dùng đề xuất, cân nhắc rồi chốt phương án mới thay thế phương án cũ, dòng thời gian kế thừa sẽ hiển thị tại đây.",
+      "supersessionChainTitle": "Chuỗi kế thừa quyết định #{index, number}",
+      "decisionStateTitle": "Trạng thái quyết định #{index, number}",
+      "supersededTransition": "Đề xuất cũ được thay thế bởi quyết định mới hơn"
+    }
   }
 }

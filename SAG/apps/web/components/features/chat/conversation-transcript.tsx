@@ -3,7 +3,7 @@
 import * as React from "react";
 import { useTranslations } from "next-intl";
 
-import type { Citation } from "@/lib/types";
+import type { Citation, SessionCitation } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { MarkdownContent } from "@/components/features/markdown-content";
 import {
@@ -18,7 +18,6 @@ export interface ConversationTranscriptMessage {
   content: string;
   citations?: Citation[];
   steps?: AgentActivityStep[];
-  /** 失败/取消气泡的错误说明；有值时以警示样式显示在正文下方。 */
   errorMessage?: string;
 }
 
@@ -43,14 +42,24 @@ export interface ConversationMessageItemProps {
   index: number;
   previousUser?: ConversationTranscriptMessage;
   streaming?: boolean;
+  highlighted?: boolean;
+  sessionCitations?: SessionCitation[];
   activity?: Omit<ConversationLiveActivity, "messageId" | "streaming">;
   assistantAvatar?: React.ReactNode;
   onCitationClick?: (
     citation: Citation,
     message: ConversationTranscriptMessage,
   ) => void;
+  onSessionCitationClick?: (
+    citation: SessionCitation,
+    message: ConversationTranscriptMessage,
+  ) => void;
   onToolMatchClick?: (
     match: AgentActivityMatch,
+    step: AgentActivityStep,
+    message: ConversationTranscriptMessage,
+  ) => void;
+  onSessionContextClick?: (
     step: AgentActivityStep,
     message: ConversationTranscriptMessage,
   ) => void;
@@ -65,14 +74,18 @@ export interface ConversationTranscriptProps<
 > {
   messages: readonly Message[];
   live?: ConversationLiveActivity;
+  highlightedMessageId?: string | null;
+  sessionCitationsByMessageId?: ReadonlyMap<string, SessionCitation[]>;
   assistantAvatar?: React.ReactNode;
   empty?: React.ReactNode;
   onCitationClick?: (citation: Citation, message: Message) => void;
+  onSessionCitationClick?: (citation: SessionCitation, message: Message) => void;
   onToolMatchClick?: (
     match: AgentActivityMatch,
     step: AgentActivityStep,
     message: Message,
   ) => void;
+  onSessionContextClick?: (step: AgentActivityStep, message: Message) => void;
   renderUserAttachments?: (message: Message) => React.ReactNode;
   renderAssistantFooter?: (
     context: ConversationMessageRenderContext<Message>,
@@ -85,10 +98,14 @@ export const ConversationMessageItem = React.memo(function ConversationMessageIt
   index,
   previousUser,
   streaming = false,
+  highlighted = false,
+  sessionCitations,
   activity,
   assistantAvatar,
   onCitationClick,
+  onSessionCitationClick,
   onToolMatchClick,
+  onSessionContextClick,
   renderUserAttachments,
   renderAssistantFooter,
 }: ConversationMessageItemProps) {
@@ -97,15 +114,30 @@ export const ConversationMessageItem = React.memo(function ConversationMessageIt
     (citation: Citation) => onCitationClick?.(citation, message),
     [message, onCitationClick],
   );
+  const handleSessionCitationClick = React.useCallback(
+    (citation: SessionCitation) => onSessionCitationClick?.(citation, message),
+    [message, onSessionCitationClick],
+  );
   const handleToolMatchClick = React.useCallback(
     (match: AgentActivityMatch, step: AgentActivityStep) =>
       onToolMatchClick?.(match, step, message),
     [message, onToolMatchClick],
   );
+  const handleSessionContextClick = React.useCallback(
+    (step: AgentActivityStep) => onSessionContextClick?.(step, message),
+    [message, onSessionContextClick],
+  );
+
+  const highlightClasses = highlighted
+    ? "rounded-xl bg-primary/[0.06] ring-2 ring-primary/75 ring-offset-4 ring-offset-background transition-all duration-300 motion-reduce:transition-none"
+    : "";
 
   if (message.role === "user") {
     return (
-      <div className="flex flex-col items-end gap-1.5">
+      <div
+        data-message-id={message.id}
+        className={cn("scroll-mt-6 flex flex-col items-end gap-1.5", highlightClasses)}
+      >
         {renderUserAttachments?.(message)}
         {message.content && (
           <div className="max-w-[85%] whitespace-pre-wrap rounded-lg rounded-tr-sm bg-primary px-4 py-2.5 text-sm text-primary-foreground">
@@ -124,7 +156,10 @@ export const ConversationMessageItem = React.memo(function ConversationMessageIt
     : null;
 
   return (
-    <div className="group/msg flex gap-3">
+    <div
+      data-message-id={message.id}
+      className={cn("group/msg scroll-mt-6 flex gap-3", highlightClasses)}
+    >
       {assistantAvatar}
       <div className="min-w-0 flex-1">
         {steps.length > 0 && (
@@ -133,6 +168,9 @@ export const ConversationMessageItem = React.memo(function ConversationMessageIt
             collapsed={activity?.collapsed}
             onToggle={activity?.onToggle}
             onMatchClick={handleToolMatchClick}
+            onSessionContextClick={
+              onSessionContextClick ? handleSessionContextClick : undefined
+            }
           />
         )}
 
@@ -145,7 +183,11 @@ export const ConversationMessageItem = React.memo(function ConversationMessageIt
           <MarkdownContent
             content={message.content}
             citations={message.citations}
+            sessionCitations={sessionCitations}
             onCitationClick={handleCitationClick}
+            onSessionCitationClick={
+              onSessionCitationClick ? handleSessionCitationClick : undefined
+            }
             streaming={streaming}
           />
         ) : null}
@@ -173,16 +215,24 @@ export function ConversationTranscript<
 >({
   messages,
   live,
+  highlightedMessageId,
+  sessionCitationsByMessageId,
   assistantAvatar,
   empty,
   onCitationClick,
+  onSessionCitationClick,
   onToolMatchClick,
+  onSessionContextClick,
   renderUserAttachments,
   renderAssistantFooter,
   className,
 }: ConversationTranscriptProps<Message>) {
   const citationHandler = onCitationClick as ConversationMessageItemProps["onCitationClick"];
+  const sessionCitationHandler =
+    onSessionCitationClick as ConversationMessageItemProps["onSessionCitationClick"];
   const toolMatchHandler = onToolMatchClick as ConversationMessageItemProps["onToolMatchClick"];
+  const sessionContextHandler =
+    onSessionContextClick as ConversationMessageItemProps["onSessionContextClick"];
   const attachmentsRenderer = renderUserAttachments as ConversationMessageItemProps["renderUserAttachments"];
   const footerRenderer = renderAssistantFooter as ConversationMessageItemProps["renderAssistantFooter"];
 
@@ -211,10 +261,14 @@ export function ConversationTranscript<
             index={index}
             previousUser={precedingUser}
             streaming={live?.messageId === message.id && live.streaming}
+            highlighted={highlightedMessageId === message.id}
+            sessionCitations={sessionCitationsByMessageId?.get(message.id)}
             activity={currentActivity}
             assistantAvatar={assistantAvatar}
             onCitationClick={citationHandler}
+            onSessionCitationClick={sessionCitationHandler}
             onToolMatchClick={toolMatchHandler}
+            onSessionContextClick={sessionContextHandler}
             renderUserAttachments={attachmentsRenderer}
             renderAssistantFooter={footerRenderer}
           />

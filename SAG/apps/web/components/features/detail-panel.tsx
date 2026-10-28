@@ -18,7 +18,14 @@ import {
 
 import { api, ApiError } from "@/lib/api";
 import { getToken } from "@/lib/auth";
-import type { CitationEventRef, Doc } from "@/lib/types";
+import type {
+  CitationEventRef,
+  Doc,
+  SessionCitation,
+  SessionContextAudit,
+} from "@/lib/types";
+import type { DecisionLineageModel } from "@/lib/session-context-presentation";
+import { SessionContextInspector } from "@/components/features/chat/session-context-inspector";
 import { formatBytes, formatDate, formatTokenCount, relativeTime } from "@/lib/format";
 import { documentParserStatus } from "@/lib/document-parser-status";
 import { cleanCitationText, stripCitationTransportTokens } from "@/lib/citation-presentation";
@@ -50,12 +57,24 @@ export type DetailTarget =
       sourceName?: string;
       eventRefs?: CitationEventRef[];
     }
-  | { kind: "document"; sourceId: string; documentId: string; title?: string };
+  | { kind: "document"; sourceId: string; documentId: string; title?: string }
+  | {
+      kind: "session_context";
+      messageId: string;
+      audit: SessionContextAudit;
+      sessionCitations: readonly SessionCitation[];
+      decisionLineage: DecisionLineageModel;
+      transitiveSources?: ReadonlyArray<{ id: string; name?: string }>;
+      focusRef?: string | null;
+      turnExcerptsById?: ReadonlyMap<string, { role: string; excerpt: string; ordinal?: number }>;
+      onJumpToTurn?: (turnId: string) => void;
+    };
 
 interface PanelCtx {
   target: DetailTarget | null;
   maximized: boolean;
   open: (target: DetailTarget) => void;
+  replace: (target: DetailTarget) => void;
   close: () => void;
   toggleMaximize: () => void;
   /** 详情 ResizablePanel 的命令句柄（放大/还原经官方 resize API） */
@@ -66,6 +85,7 @@ const Ctx = React.createContext<PanelCtx>({
   target: null,
   maximized: false,
   open: () => {},
+  replace: () => {},
   close: () => {},
   toggleMaximize: () => {},
   panelRef: { current: null },
@@ -80,6 +100,12 @@ function sameTarget(a: DetailTarget, b: DetailTarget): boolean {
   }
   if (a.kind === "chunk" && b.kind === "chunk") {
     return a.sourceId === b.sourceId && a.chunkId === b.chunkId;
+  }
+  if (a.kind === "session_context" && b.kind === "session_context") {
+    return (
+      a.messageId === b.messageId
+      && (a.focusRef ?? null) === (b.focusRef ?? null)
+    );
   }
   return false;
 }
@@ -99,6 +125,9 @@ export function DetailPanelProvider({ children }: { children: React.ReactNode })
   }, []);
   // 同一目标二次点击 = 关闭（toggle）。用户预期：点开某文档后再点同一个文档
   // 应该收起面板；否则会以为"点没反应"。不同目标点击 = 切换目标，就地更新。
+  const replace = React.useCallback((t: DetailTarget) => {
+    setTarget(t);
+  }, []);
   const open = React.useCallback((t: DetailTarget) => {
     setTarget((prev) => {
       if (prev && sameTarget(prev, t)) {
@@ -140,7 +169,7 @@ export function DetailPanelProvider({ children }: { children: React.ReactNode })
   }, [section, close]);
 
   return (
-    <Ctx.Provider value={{ target, maximized, open, close, toggleMaximize, panelRef }}>
+    <Ctx.Provider value={{ target, maximized, open, replace, close, toggleMaximize, panelRef }}>
       {children}
     </Ctx.Provider>
   );
@@ -736,7 +765,33 @@ export function DocumentDetailContent({
 
 // ── 面板外壳 ─────────────────────────────────────────────────────────
 
-function PanelBody({ target }: { target: DetailTarget }) {
+function PanelBody({
+  target,
+  onAfterJump,
+}: {
+  target: DetailTarget;
+  onAfterJump?: () => void;
+}) {
+  if (target.kind === "session_context") {
+    return (
+      <SessionContextInspector
+        audit={target.audit}
+        sessionCitations={target.sessionCitations}
+        decisionLineage={target.decisionLineage}
+        transitiveSources={target.transitiveSources}
+        focusRef={target.focusRef}
+        turnExcerptsById={target.turnExcerptsById}
+        onJumpToTurn={
+          target.onJumpToTurn
+            ? (turnId) => {
+                onAfterJump?.();
+                target.onJumpToTurn?.(turnId);
+              }
+            : undefined
+        }
+      />
+    );
+  }
   return target.kind === "chunk" ? (
     <ChunkView target={target} />
   ) : (
@@ -769,10 +824,14 @@ export function DetailPanelSheet() {
     <Sheet open onOpenChange={(o) => !o && close()}>
       <SheetContent side="right" className="flex w-full flex-col gap-4 sm:max-w-lg">
         <SheetTitle className="text-sm font-medium">
-          {target.kind === "chunk" ? t("panel.chunkTitle") : t("panel.documentTitle")}
+          {target.kind === "chunk"
+            ? t("panel.chunkTitle")
+            : target.kind === "session_context"
+              ? t("panel.sessionContextTitle")
+              : t("panel.documentTitle")}
         </SheetTitle>
         <div className="flex min-h-0 flex-1 flex-col overflow-y-auto [scrollbar-gutter:stable]">
-          <PanelBody target={target} />
+          <PanelBody target={target} onAfterJump={close} />
         </div>
       </SheetContent>
     </Sheet>
@@ -789,7 +848,11 @@ export function DetailPanelOutlet() {
     <aside className="flex min-h-0 min-w-0 flex-1 flex-col bg-background">
       <div className="flex h-12 shrink-0 items-center gap-1 border-b px-3">
         <span className="min-w-0 flex-1 truncate text-sm font-medium">
-          {target.kind === "chunk" ? t("panel.chunkTitle") : t("panel.documentTitle")}
+          {target.kind === "chunk"
+            ? t("panel.chunkTitle")
+            : target.kind === "session_context"
+              ? t("panel.sessionContextTitle")
+              : t("panel.documentTitle")}
         </span>
         <Tooltip>
           <TooltipTrigger asChild>

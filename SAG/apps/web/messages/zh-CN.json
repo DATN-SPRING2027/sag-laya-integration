@@ -272,7 +272,9 @@
     "image": "图片",
     "imageUnavailable": "🖼 图片{alt, select, other {：{alt}}}（见原文件）",
     "openSource": "打开来源 {number}",
-    "source": "来源 {number}"
+    "source": "来源 {number}",
+    "openSessionSource": "定位到会话轮次 {ref}",
+    "sessionSource": "会话证据 {ref}"
   },
   "SourceForm": {
     "created": "信源已创建，去上传文档吧",
@@ -973,7 +975,11 @@
     "reject": "拒绝",
     "allowOnce": "允许一次",
     "thinking": "正在思考…",
-    "sessionMissing": "对话运行实例不存在：{id}"
+    "sessionMissing": "对话运行实例不存在：{id}",
+    "turnUnavailable": "引用的会话轮次在当前对话中已不可用",
+    "inspectContext": "上下文审计",
+    "inspectContextAria": "打开会话上下文审计面板",
+    "inspectContextTooltip": "查看会话证据分组、Token 预算与决策演进链路"
   },
   "Citations": {
     "visitExternal": "访问外部来源：{title}",
@@ -992,7 +998,29 @@
     "referenceCount": "引用 {count, number}",
     "sources": "引用来源",
     "internal": "内部来源",
-    "external": "外部引用"
+    "external": "外部引用",
+    "toggleAriaWithSession": "{action} {total, number} 条引用，其中会话证据 {session, number} 条，内部来源 {internal, number} 条，外部引用 {external, number} 条",
+    "inspectSessionContext": "上下文审计",
+    "sessionHistory": "会话历史证据",
+    "sessionBundleOrdinals": "第 #{first, number}–#{last, number} 轮（共 {count, number} 轮）",
+    "sessionBundleCount": "证据分组（{count, number} 轮）",
+    "sessionSingleTurnOrdinal": "对话第 #{ordinal, number} 轮",
+    "sessionSingleTurnFallback": "对话轮次 #{id}",
+    "sessionTurnOlderUnloaded": "该轮次位于更早的历史分页中，点击即可自动加载并跳转。",
+    "roleUser": "用户",
+    "roleAssistant": "助手",
+    "sessionTokenCost": "{count, number} tok",
+    "jumpToSessionTurn": "定位轮次",
+    "jumpToSessionTurnAria": "滚动至会话证据 {ref}：{title}",
+    "epistemic": {
+      "FACT": "事实",
+      "PROPOSED": "提议",
+      "CONSIDERING": "权衡中",
+      "CONFIRMED": "已确认",
+      "SUPERSEDED": "已替代",
+      "NEGATED": "已否决",
+      "OPEN_ISSUE": "待决问题"
+    }
   },
   "PromptPreview": {
     "open": "查看本轮模型输入",
@@ -1034,6 +1062,14 @@
       "getTime": "查询时间",
       "webSearch": "联网搜索",
       "openWebPage": "打开网页"
+    },
+    "sessionContext": {
+      "label": "会话上下文引擎 (ECCE)",
+      "summary": "{groups, number} 组 · {tokens, number} tok",
+      "ablation": "配置",
+      "selected": "入选",
+      "rejected": "淘汰",
+      "budget": "预算"
     }
   },
   "Search": {
@@ -1211,7 +1247,8 @@
       "restore": "还原",
       "maximize": "放大",
       "expandReading": "铺开阅读",
-      "close": "关闭"
+      "close": "关闭",
+      "sessionContextTitle": "会话上下文审计 (ECCE)"
     }
   },
   "PetMini": {
@@ -1753,5 +1790,136 @@
     "includesQA": "问答交互关键事件",
     "includesErrors": "错误与异常信息",
     "includesEnv": "系统环境信息"
+  },
+  "SessionContextInspector": {
+    "epistemic": {
+      "FACT": "事实",
+      "PROPOSED": "提议",
+      "CONSIDERING": "权衡中",
+      "CONFIRMED": "已确认",
+      "SUPERSEDED": "已替代",
+      "NEGATED": "已否决",
+      "OPEN_ISSUE": "待决问题"
+    },
+    "modes": {
+      "on": "已启用 (ON)",
+      "shadow": "影子审计 (SHADOW)",
+      "legacy": "传统模式 (LEGACY)"
+    },
+    "shadowModeNotice": "SHADOW 模式仅在后台记录可解释审计轨迹用于对比，当前回答仍使用常规历史消息。",
+    "persistence": {
+      "hydrated_clean": "持久化恢复正常 (PG + Qdrant)",
+      "warm_clean": "热缓存已同步",
+      "delta_synced": "增量已同步",
+      "lazy_backfill": "已完成回填持久化",
+      "drift_rebuilt": "向量模型变更已重建",
+      "qdrant_reconciled": "Qdrant 已补偿同步",
+      "sync_failed": "持久化同步失败",
+      "qdrant_degraded": "Qdrant 降级运行",
+      "memory_only": "仅内存模式",
+      "legacy_bypass": "跳过 ECCE 存储"
+    },
+    "kpi": {
+      "turnsAndEpisodes": "轮次 / 话题段",
+      "activeDecisions": "有效决策",
+      "llmMemoryCalls": "记忆 LLM 调用",
+      "latency": "引擎耗时"
+    },
+    "meta": {
+      "scope": "记忆范围",
+      "temporal": "时序模式",
+      "router": "路由器",
+      "routerFallback": "回退",
+      "syncedUnits": "持久化写入",
+      "transitiveSources": "传递关联信源"
+    },
+    "memoryScopes": {
+      "session_history": "会话历史",
+      "knowledge_base": "知识库",
+      "hybrid_both": "会话 + 知识库",
+      "full_session_audit": "全会话审计"
+    },
+    "temporalModes": {
+      "atemporal": "非时序",
+      "current_effective": "当前有效态",
+      "past_point": "历史时点",
+      "change_lineage": "演进链路"
+    },
+    "budget": {
+      "title": "上下文 Token 预算分配",
+      "tokensUnit": "tok",
+      "evidence": "历史证据 [S*]",
+      "recent": "近期连贯轮次",
+      "remaining": "剩余 {count, number} tok",
+      "partialCoverageWarning": "部分覆盖：历史上下文超出预算上限，次模优化器已裁剪边际收益较低的候选轮次。"
+    },
+    "tabs": {
+      "selected": "入选证据",
+      "rejected": "淘汰审计",
+      "lineage": "决策演进"
+    },
+    "views": {
+      "title": "多视图融合权重",
+      "subtitle": "零 LLM 调用检索通道",
+      "state": "决策状态账本",
+      "graph": "实体图谱 (PPR)",
+      "hybrid": "词法 + 稠密向量",
+      "hierarchy": "话题段与滑窗",
+      "short_verbatim": "短会话全文保留",
+      "legacy": "顺序历史"
+    },
+    "closureReasons": {
+      "direct_match": "直接命中",
+      "decision_lineage_closure": "决策演进链路闭包",
+      "anaphoric_prev_neighbor_closure": "前序指代消解闭包",
+      "anaphoric_confirmation_closure": "后序确认回复闭包",
+      "qa_pair_neighbor_closure": "相邻问答对闭包",
+      "cross_view_bridge": "跨视图桥接",
+      "single_turn": "单轮命中",
+      "short_session_verbatim": "短会话完整保留",
+      "recent_continuity": "近期对话连贯窗口"
+    },
+    "selected": {
+      "emptyTitle": "无需检索早期会话证据",
+      "emptyDescription": "当前提问为首轮对话或仅依赖独立知识库来源，未消耗历史证据预算。",
+      "citedInAnswer": "正文已引用",
+      "utility": "效用分",
+      "coverageGain": "新增覆盖",
+      "redundancy": "冗余惩罚",
+      "gainPerToken": "边际收益/tok"
+    },
+    "roles": {
+      "user": "用户",
+      "assistant": "助手"
+    },
+    "turnOrdinalRole": "第 #{ordinal, number} 轮 · {role}",
+    "turnNumber": "第 #{ordinal, number} 轮",
+    "turnOlderUnloaded": "该轮次位于更早的历史分页中，点击「定位轮次」即可加载查看。",
+    "jumpToTurn": "定位轮次",
+    "rejectionReasons": {
+      "SUPERSEDED_BY_NEWER_DECISION": "已被新决策替代",
+      "REDUNDANT_SEMANTIC_DUPLICATE": "语义冗余重复",
+      "TOKEN_BUDGET_CAP": "超出 Token 预算上限",
+      "LOW_MARGINAL_UTILITY": "边际收益过低"
+    },
+    "rejected": {
+      "emptyTitle": "无淘汰候选轮次",
+      "emptyDescription": "所有相关候选轮次均在预算范围内入选，未发生决策替代冲突。",
+      "filterAria": "按淘汰原因筛选",
+      "filterAll": "全部",
+      "noFilterMatches": "当前筛选条件下没有淘汰记录。",
+      "resetFilter": "重置筛选",
+      "rawScore": "原始分",
+      "jumpToSuperseding": "定位至新确认轮次"
+    },
+    "lineage": {
+      "activeCount": "当前有效决策",
+      "supersededCount": "已替代旧轮次",
+      "emptyTitle": "暂无决策替代演进记录",
+      "emptyDescription": "当多轮对话中出现方案提议、权衡修改并由新结论替代旧方案时，完整演进链路将在此展示。",
+      "supersessionChainTitle": "决策替代链路 #{index, number}",
+      "decisionStateTitle": "决策状态记录 #{index, number}",
+      "supersededTransition": "旧方案已被更新确认的决策替代"
+    }
   }
 }

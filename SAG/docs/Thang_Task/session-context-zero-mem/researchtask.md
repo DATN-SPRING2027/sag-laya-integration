@@ -296,3 +296,47 @@ Qua kiểm tra trực tiếp `sag_api/db/models/agent.py`, `sag_api/db/models/so
 - **PostgreSQL 16 live (`sag-db-1`):**
   - `PG16_SQL_MIGRATION_QA_PASSED`: Chạy `0009_session_context_ecce.sql` lặp 2 lần idempotent, chặn FK chéo tenant/thread, xóa tin giữa `mB` tự động xóa sạch `WINDOW` `wABC` + `session_decision_ledger` + `session_graph_edges`, chạy `0009_session_context_ecce_down.sql` xóa sạch 5 trigger + 5 function + 4 bảng dẫn xuất trong khi giữ nguyên `messages`, chạy lại `0009_*.sql` thành công và dọn sạch schema tạm `sag_ecce_migration_qa_temp`.
   - `PG16_ORM_COMPILED_DDL_QA_PASSED`: Kiểm chứng DDL PostgreSQL biên dịch từ `Base.metadata.create_all` trên `sag-db-1` (`sag_ecce_orm_qa_temp`) cấp đúng default `'[]'` cho `sentences_json` ở tầng DB và kích hoạt cascade xóa tin giữa `mB` đồng nhất 100% với file SQL migration.
+
+---
+
+## 12. Chặng 4 (`feat/Thang-ecce-context-inspector-fe-ui`) & Thẩm Định 3 Finding Review Trên PR #46
+
+- **Ngày thực hiện:** 2026-10-28
+- **Nhánh thực hiện:** `feat/Thang-ecce-context-inspector-fe-ui` (tách mới trực tiếp từ `origin/main` @ `b29a84b`, PR #46)
+- **Phạm vi:** Explainable UI & Context Inspector trên `SAG/apps/web` kèm đồng bộ trường dây dẫn `session_citations` / `recent_turn_ids` trong bước `session_context` của `SAG/apps/api` (`0` thay đổi schema/migration PostgreSQL hay cấu hình).
+
+### 12.1. Thẩm Định Độc Lập 3 Finding Mức `[P2]` Tại Commit `63c3104`
+
+1. **Finding 1 (`[P2]` — UI tự suy đoán nguồn của citation `recent_continuity` / `short_verbatim`, dẫn đến trỏ sai bằng chứng) → ĐÚNG 100%:**
+   - **Hiện trạng & nguyên nhân:**
+     - Tại `SAG/apps/web/lib/session-context-presentation.ts:468,495`, UI đang tự cắt `.slice(-6)` cho `short_verbatim` và `.filter(!selectedTurnIdSet.has(...)).slice(-4)` cho `recent_continuity`.
+     - Trong khi trên Backend (`sag_api/services/session_context/optimizer.py:427–439`), `recent_keep_n` phụ thuộc `memory_scope`/`ablation` (`2` cho `session_history | hybrid_both | full_session_audit`, `4` cho nhánh còn lại) và bị cắt sớm theo trần token `recent_cap = max(64, int(budget_tokens * 0.20))`.
+     - Thêm vào đó, khi truy vết đầu–cuối sang `sag_api/services/agent_service.py:313–343` (`_build_session_audit_step`), hàm này nhận `used_session_citations` nhưng mới chỉ trích `cited_source_ids` sang `details.sources` mà chưa ghi danh sách `session_citations` vào `step_entry["session_citations"]` (lưu ý không được đưa vào `Message.citations` vì `agent_domain._message_source_ids` fail-closed trên mọi citation thiếu `source_id`/`url`), đồng thời `ContextAuditTrace.to_dict()` chưa xuất `recent_turn_ids`.
+   - **Thiết kế khắc phục:**
+     - Trên Backend (`models.py`, `optimizer.py`, `agent_service.py`): bổ sung `recent_turn_ids` vào `ContextAuditTrace` và ghi `session_citations` (đã chuẩn hóa `mapped` / `claim_level` từ `plan_session_citations` & `used_session_citations`) vào `step_entry["session_citations"]` khi `mode == "on"`, giữ nguyên 100% logic ACL bắc cầu trên `details.sources` và không đụng tới `Message.citations`.
+     - Trên Frontend (`types.ts`, `session-context-presentation.ts`, `conversation-panel.tsx`): xóa bỏ hoàn toàn logic tự cắt `.slice(-4)` / `.slice(-6)` trên `messages`; `resolveSessionCitations` chỉ nhận danh sách turn ID tường minh từ Backend (`sessionCitations` từ `step.session_citations` / tham số truyền vào, `audit.selected_groups`, và `audit.recent_turn_ids`), còn `messages` chỉ dùng để điền preview (`role`, `excerpt`, `createdAt`, `ordinal`, `loaded`).
+
+2. **Finding 2 (`[P2]` — Inspector của câu trả lời cũ bị lẫn quyết định ở tương lai) → ĐÚNG 100%:**
+   - **Hiện trạng & nguyên nhân:**
+     - Tại `session-context-presentation.ts:662–667` và `conversation-panel.tsx:352`, `buildDecisionLineage` không nhận `assistantMessageId` nên quét toàn bộ `messages` của thread (bao gồm cả các câu trả lời sau lượt đang kiểm tra). Cạnh `supersededNextByTurn` thu thập từ tương lai không bị xóa, khiến khi mở Inspector của câu trả lời đầu tiên (lúc `A` còn `CONFIRMED`), UI hiển thị đồng thời cả chuỗi tương lai `A SUPERSEDED → B CONFIRMED` lẫn nhánh đơn `A CONFIRMED`.
+   - **Thiết kế khắc phục:**
+     - Bổ sung `assistantMessageId` vào `buildDecisionLineage({ currentAudit, messages, assistantMessageId })` và truyền `assistantMessageId: message.id` từ `ConversationPanel`.
+     - Khi `assistantMessageId` xác định vị trí `targetIdx` trong `messages`, chỉ quét các lượt trả lời tiền tố `messages.slice(0, targetIdx)` và chỉ dùng `messages.slice(0, targetIdx + 1)` cho bảng tra preview, sau đó áp dụng `currentAudit` của chính lượt `assistantMessageId`. Đồng thời nếu `currentAudit` xác nhận trực tiếp một `primary_turn_id` đang ở trạng thái `CONFIRMED` (ví dụ sau khi tin nhắn thay thế ở giữa bị xóa), dọn sạch cạnh `supersededNextByTurn` cũ của turn đó.
+
+3. **Finding 3 (`[P2]` — Citation gộp `[1, 2]`, `[S1, S2]`, `[1, S1]` được mô tả hỗ trợ nhưng không được nhận diện) → ĐÚNG 100%:**
+   - **Hiện trạng & nguyên nhân:**
+     - `markdown-content.tsx:240` (`/\[(?:(\d+)|(S[1-9]\d*))\]/g`), `extractAnswerSessionCitationRefs` (`/\[S([1-9]\d*)\]/g`) và regex hậu kiểm trên `agent_service.py` chỉ khớp nhãn đơn lẻ, bỏ sót hoàn toàn các cụm gộp `[1, 2]`, `[S1, S2]`, `[1, S1]`, `[S1; S2]`. Hệ quả là văn bản giữ nguyên text thô không bấm được và `mappedInAnswer=false` làm rơi citation `recent_continuity` khỏi `CitationBlock`.
+   - **Thiết kế khắc phục:**
+     - Xây dựng bộ parser dùng chung `parseCitationBrackets` & `extractAnswerCitationRefs` trong `session-context-presentation.ts` (bỏ qua fenced code blocks, inline code và Markdown links `[...](...)`), hỗ trợ cả đơn lẻ và gộp (`[1, 2]`, `[S1, S2]`, `[1, S1]`, phân tách bởi `,` / `;` / `、`), đồng thời bảo vệ khoảng số toán học thuần túy (ví dụ `[1, 100]` khi `100` không thuộc tập `validNumbers` thì giữ nguyên văn bản gốc).
+     - Tái sử dụng trực tiếp `parseCitationBrackets` trong `remarkCitationLinks` (`markdown-content.tsx`) và đồng bộ nhận diện/lọc citation gộp trong `_finalize_session_citations` & `_finalize_answer_citations` (`agent_service.py`).
+
+### 12.2. Kết Quả Kiểm Chứng Thực Nghiệm Sau Khắc Phục PR #46
+
+- [x] **Repro Finding 1:** Lịch sử `u1…u8`, `selected_groups` chứa `u1` (`S1`), backend `session_citations` chỉ cấp `["u7", "u8"]` cho `S2` (và `ContextAuditTrace.recent_turn_ids == ["u7", "u8"]`) → `resolveSessionCitations` trả đúng `["u7", "u8"]` (không kéo nhầm `u5, u6`), và không bao giờ tự cắt `.slice(-4)` / `.slice(-6)` khi thiếu provenance từ backend.
+- [x] **Repro Finding 2:** Lượt `a_1` chốt `A` (`CONFIRMED`), lượt `a_2` thay `A` bằng `B` (`A SUPERSEDED → B CONFIRMED`) → Inspector của `a_1` chỉ hiển thị `A CONFIRMED` (`supersededCount = 0`, `0` quyết định tương lai `B`, `0` nhánh trùng mâu thuẫn); Inspector của `a_2` hiển thị đúng `A SUPERSEDED → B CONFIRMED`.
+- [x] **Repro Finding 3:** Bộ parser dùng chung `parseCitationBrackets` & `extractAnswerCitationRefs` nhận diện đầy đủ cả citation đơn và gộp (`[1, 2]`, `[S1, S2]`, `[1, S1]`, `[S1; S2]`, `[1][S1]`), bỏ qua inline code, fenced code blocks, Markdown links `[S9](https://...)` và giữ nguyên khoảng số thuần túy `[1, 100]`; `recent_continuity` được trích dẫn trong cụm gộp (`[2, S3]`) giữ `mappedInAnswer = true` và hiển thị đầy đủ trong `CitationBlock`.
+- [x] **Vòng lặp Visual Audit & Polish (Phase 3–4):** Rà soát ảnh chụp thực tế phát hiện và xử lý luôn 2 điểm hiển thị phụ: (1) lọc ký hiệu in đậm `**...**` / `__...__` trong `cleanTurnExcerpt` để preview lượt không lộ cú pháp Markdown thô; (2) tách bảng ánh xạ `currentCitationByTurnAndStatus` / `lineageClosureCitationByTurn` để nút `SUPERSEDED` không bị gắn nhầm thẻ `[S2]` của khía cạnh `OPEN_ISSUE` trên cùng một lượt.
+- [x] **Cổng chất lượng tự động & Visual QA xanh 100%:**
+  - Frontend (`SAG/apps/web`): `i18n:check` (`1643` keys × 3 locales), `typecheck` (`tsc --noEmit`), `lint` (`eslint --max-warnings=0`), `test:unit` (`7` test files, `39 passed`), `next build` (`0` lỗi).
+  - Backend (`SAG/apps/api`): `ruff check` (`All checks passed!`), `pytest tests -q` (`113 passed, 1 skipped`).
+  - Browser Visual QA (`1440px`, `1280px`, `768px`, `375px` Light/Dark kết nối `sag-api-1`): `0` lỗi Console, `0` Hydration warning, `0` ngoại lệ JS, `0` lỗi mạng HTTP >= 400, `0` tràn ngang.

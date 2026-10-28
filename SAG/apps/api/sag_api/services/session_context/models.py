@@ -173,6 +173,7 @@ class ContextAuditTrace:
     route_decision: dict[str, Any] = field(default_factory=dict)
     view_weights: dict[str, float] = field(default_factory=dict)
     selected_groups: list[SelectedEvidenceGroup] = field(default_factory=list)
+    recent_turn_ids: tuple[str, ...] = ()
     rejected_candidates: list[RejectedCandidateTrace] = field(default_factory=list)
     latency_ms: float = 0.0
     persistence_status: str = "memory_only"
@@ -212,6 +213,7 @@ class ContextAuditTrace:
                 }
                 for g in self.selected_groups
             ],
+            "recent_turn_ids": list(self.recent_turn_ids),
             "rejected_candidates": [
                 {
                     "turn_id": r.turn_id,
