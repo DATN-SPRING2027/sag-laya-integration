@@ -111,23 +111,66 @@ def tokenize_bm25_terms(text: str) -> tuple[dict[str, int], int]:
     return dict(Counter(expanded_tokens)), max(1, len(tokens))
 
 
-async def embed_texts_with_main_cache(
+def declared_embedder_dim(embedder: Any | None) -> int | None:
+    """Return explicit positive integer vector dimension declared on `embedder`, if any."""
+    if embedder is None:
+        return FALLBACK_VECTOR_DIM
+    for attr in ("dim", "dimensions", "_dimensions"):
+        raw = getattr(embedder, attr, None)
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
+            return raw
+    cfg = getattr(embedder, "config", None)
+    if cfg is not None:
+        for attr in ("dim", "dimensions"):
+            raw = getattr(cfg, attr, None)
+            if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
+                return raw
+    return None
+
+
+def compute_embedding_signature(embedder: Any | None) -> str:
+    """Compute non-empty deterministic signature identifying the active embedding space."""
+    if embedder is None:
+        return "deterministic-ngram-v1"
+    model_name = str(
+        getattr(embedder, "_model", "")
+        or getattr(embedder, "model", "")
+        or getattr(embedder, "model_name", "")
+        or getattr(getattr(embedder, "config", None), "model", "")
+        or ""
+    ).strip()
+    if model_name:
+        return f"http:{model_name}"[:128]
+    dim_val = declared_embedder_dim(embedder)
+    cls_name = f"{type(embedder).__module__}.{type(embedder).__qualname__}"
+    if dim_val is not None:
+        return f"embedder:{cls_name}:d{dim_val}"[:128]
+    return f"embedder:{cls_name}"[:128]
+
+
+async def embed_texts_with_provenance(
     texts: Sequence[str],
     *,
     embedder: Any | None = None,
-) -> list[tuple[float, ...]]:
-    """Batch-embed texts via SAG main's HTTP/SiliconFlow embedder + shared LRU cache, or deterministic fallback."""
+) -> tuple[list[tuple[float, ...]], str]:
+    """Batch-embed texts with model-scoped cache keys and return `(vectors, actual_source_signature)`."""
     if not texts:
-        return []
+        return [], compute_embedding_signature(embedder)
     if embedder is None:
-        return [deterministic_ngram_vector(t) for t in texts]
+        return [deterministic_ngram_vector(t) for t in texts], "deterministic-ngram-v1"
 
+    emb_sig = compute_embedding_signature(embedder)
+    expected_dim = declared_embedder_dim(embedder)
     results: list[tuple[float, ...] | None] = [None] * len(texts)
     missing_indices: list[int] = []
     missing_texts: list[str] = []
     for idx, txt in enumerate(texts):
-        cached = get_cached_text_embedding(txt)
-        if cached is not None:
+        cached = get_cached_text_embedding(txt, model_signature=emb_sig)
+        if (
+            cached is not None
+            and len(cached) > 0
+            and (expected_dim is None or len(cached) == expected_dim)
+        ):
             results[idx] = l2_normalize(cached)
         else:
             missing_indices.append(idx)
@@ -136,13 +179,54 @@ async def embed_texts_with_main_cache(
     if missing_texts:
         try:
             computed = await compute_unit_embeddings(embedder, missing_texts)
+            if len(computed) != len(missing_texts):
+                raise ValueError("Embedder returned mismatched vector count")
             for idx, txt, raw_vec in zip(missing_indices, missing_texts, computed, strict=True):
-                put_cached_text_embedding(txt, raw_vec)
+                if not raw_vec:
+                    raise ValueError("Embedder returned empty vector")
+                if expected_dim is not None and len(raw_vec) != expected_dim:
+                    raise ValueError(
+                        f"Embedder {emb_sig} returned dim={len(raw_vec)}, expected {expected_dim}"
+                    )
+                put_cached_text_embedding(txt, raw_vec, model_signature=emb_sig)
                 results[idx] = l2_normalize(raw_vec)
         except Exception:  # noqa: BLE001 - fail-open to deterministic local projection if HTTP embedder errors
-            return [deterministic_ngram_vector(t) for t in texts]
+            return [deterministic_ngram_vector(t) for t in texts], "deterministic-ngram-v1"
 
-    return [vec if vec is not None else deterministic_ngram_vector(texts[i]) for i, vec in enumerate(results)]
+    finalized = [
+        vec if vec is not None else deterministic_ngram_vector(texts[i])
+        for i, vec in enumerate(results)
+    ]
+    if finalized:
+        first_dim = len(finalized[0])
+        if any(len(v) != first_dim for v in finalized):
+            # Re-embed cleanly if a stale cache entry had a drifted dimension for the same model label
+            try:
+                recomputed = await compute_unit_embeddings(embedder, list(texts))
+                if len(recomputed) != len(texts) or any(not rv for rv in recomputed):
+                    raise ValueError("Invalid recomputed vector batch")
+                ref_dim = len(recomputed[0])
+                if any(len(rv) != ref_dim for rv in recomputed):
+                    raise ValueError("Inconsistent vector dimensions within single embedder batch")
+                rebuilt: list[tuple[float, ...]] = []
+                for txt, raw_vec in zip(texts, recomputed, strict=True):
+                    put_cached_text_embedding(txt, raw_vec, model_signature=emb_sig)
+                    rebuilt.append(l2_normalize(raw_vec))
+                return rebuilt, emb_sig
+            except Exception:  # noqa: BLE001
+                return [deterministic_ngram_vector(t) for t in texts], "deterministic-ngram-v1"
+
+    return finalized, emb_sig
+
+
+async def embed_texts_with_main_cache(
+    texts: Sequence[str],
+    *,
+    embedder: Any | None = None,
+) -> list[tuple[float, ...]]:
+    """Batch-embed texts via SAG main's HTTP/SiliconFlow embedder + model-scoped LRU cache."""
+    vectors, _ = await embed_texts_with_provenance(texts, embedder=embedder)
+    return vectors
 
 
 def sparse_dict_from_bm25(
@@ -207,6 +291,9 @@ class IncrementalSessionIndex:
         self.cached_cited_source_ids: set[str] = set()
         self.had_hidden_acl_turns: bool = False
         self.persisted_embedding_signature: str = ""
+        self.persistence_active: bool = False
+        self.qdrant_sync_pending: bool = False
+        self.qdrant_rebuild_pending: bool = False
         self.seen_raw_ids: set[str] = set()
         self.boundary_ts_ids: set[str] = set()
 
@@ -226,11 +313,10 @@ class IncrementalSessionIndex:
         project_aliases: Sequence[tuple[str, str]] = (),
     ) -> int:
         """Incrementally index only unseen messages in chronological order."""
-        target_mode = f"embedder:{type(embedder).__name__}" if embedder is not None else "deterministic_ngram"
+        target_mode = compute_embedding_signature(embedder)
         if self.embedding_mode not in {"unset", target_mode}:
             # Vector space changed -> rebuild cleanly in the new vector space
             self.__init__(self.thread_id, scope_signature=self.scope_signature)
-        self.embedding_mode = target_mode
 
         pending: list[dict[str, Any]] = []
         for msg in raw_messages:
@@ -245,6 +331,8 @@ class IncrementalSessionIndex:
             pending.append(msg)
 
         if not pending:
+            if self.embedding_mode == "unset":
+                self.embedding_mode = target_mode
             return 0
 
         # Pre-extract entities & sentences for all pending turns (0 LLM calls)
@@ -271,8 +359,28 @@ class IncrementalSessionIndex:
                 texts_to_embed.append(s_text)
             sent_vec_ranges.append((s_start_idx, len(texts_to_embed)))
 
-        # Single batch embedding call across all new turns + sentences
-        all_vectors = await embed_texts_with_main_cache(texts_to_embed, embedder=embedder)
+        # Single batch embedding call across all new turns + sentences (with provenance verification)
+        all_vectors, actual_sig = await embed_texts_with_provenance(texts_to_embed, embedder=embedder)
+        if self.turns and actual_sig != self.embedding_mode:
+            # HTTP embedder degraded mid-thread -> re-project entire thread in uniform fallback space
+            prior_records = [
+                {
+                    "id": t.turn_id,
+                    "role": t.role,
+                    "content": t.content,
+                    "created_at": t.created_at_ts,
+                    "cited_source_ids": list(t.cited_source_ids),
+                }
+                for t in self.turns
+            ]
+            self.__init__(self.thread_id, scope_signature=self.scope_signature)
+            await self.append_messages(
+                [*prior_records, *pending],
+                embedder=None,
+                project_aliases=project_aliases,
+            )
+            return len(pending)
+        self.embedding_mode = actual_sig
 
         for offset, msg in enumerate(pending):
             t_id = str(msg["id"])
@@ -949,6 +1057,9 @@ class BoundedSessionIndexCache:
         while len(self._store) > self._max_threads:
             self._store.popitem(last=False)
         return fresh
+
+    def find_thread_entries(self, thread_id: str) -> list[IncrementalSessionIndex]:
+        return [idx for (_, tid), idx in self._store.items() if tid == thread_id]
 
     def invalidate_thread(self, thread_id: str) -> int:
         keys = [k for k in self._store if k[1] == thread_id]

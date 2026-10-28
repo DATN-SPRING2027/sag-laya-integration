@@ -78,6 +78,7 @@ class _InMemoryQdrantEmulator:
         self.collections: dict[str, dict[str, Any]] = {}
         self.indexes: dict[str, dict[str, str]] = {}
         self.points: dict[str, dict[str, dict[str, Any]]] = {}
+        self.fail_status_code: int | None = None
 
     def make_client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -110,6 +111,11 @@ class _InMemoryQdrantEmulator:
         return True
 
     def _handle(self, request: httpx.Request) -> httpx.Response:
+        if self.fail_status_code is not None:
+            return httpx.Response(
+                self.fail_status_code,
+                json={"status": {"error": f"Simulated Qdrant HTTP {self.fail_status_code}"}},
+            )
         parts = [p for p in request.url.path.split("/") if p]
         method = request.method.upper()
         body = json.loads(request.content.decode("utf-8")) if request.content else {}
@@ -970,7 +976,516 @@ async def test_embedding_signature_drift_recreates_qdrant_and_orphan_reconciler(
         )
         assert rec_result["scanned"] == valid_count_before + 2
         assert rec_result["orphans_deleted"] == 2
+        assert rec_result["missing_repaired"] == 0
         assert len(qdrant.points[col_name]) == valid_count_before
+
+    await q_client.aclose()
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_http_model_a_to_http_model_b_drift_with_warm_cache_and_provenance_guard(
+    monkeypatch,
+) -> None:
+    """PR #44 [P1]: Switching HTTP model A (64d) -> HTTP model B (32d) with warm caches calls B & verifies vectors."""
+    from sag_api.services.session_context.persistence import (
+        SessionPersistenceScope,
+        sync_session_index_to_storage,
+    )
+    from sag_api.services.session_context.substrate import IncrementalSessionIndex
+
+    monkeypatch.setattr(settings, "session_context_mode", "on")
+    monkeypatch.setattr(settings, "decision_provider", "disabled")
+
+    qdrant = _InMemoryQdrantEmulator()
+    q_client = qdrant.make_client()
+    set_custom_session_qdrant_client_factory(lambda: q_client)
+
+    engine = await _make_fk_sqlite_engine()
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    owner_key = "owner-http-ab"
+    principal = _principal(project_id="proj-http-ab")
+    col_name = session_qdrant_collection_name("proj-http-ab")
+    now = datetime(2026, 10, 28, 6, 0, tzinfo=UTC)
+
+    async with session_factory() as session:
+        agent = Agent(owner_key=owner_key, name="HTTP Drift Agent")
+        session.add(agent)
+        await session.flush()
+        thread = Thread(agent_id=agent.id, owner_key=owner_key, title="HTTP Model A -> B")
+        session.add(thread)
+        await session.flush()
+
+        m0 = Message(
+            thread_id=thread.id,
+            role=MessageRole.USER,
+            content="Chốt quyết định kiến trúc: dùng cổng API Gateway Kong 3.8 cho cụm biên.",
+            created_at=now,
+        )
+        m1 = Message(
+            thread_id=thread.id,
+            role=MessageRole.ASSISTANT,
+            content="Đã lưu cấu hình rate-limit 2000 req/s trên Kong 3.8.",
+            created_at=now + timedelta(seconds=15),
+        )
+        m_ask = Message(
+            thread_id=thread.id,
+            role=MessageRole.USER,
+            content="Cụm biên đang dùng API Gateway nào?",
+            created_at=now + timedelta(seconds=30),
+        )
+        session.add_all([m0, m1, m_ask])
+        await session.commit()
+
+        # 1. Run HTTP Model A (`dim=64`) -> populates BOTH `_SHARED_TEXT_EMBEDDING_CACHE` and `SESSION_INDEX_CACHE`
+        model_a = _CountingHttpModelEmbedder(model="provider/model-A", dim=64)
+        pack_a = await prepare_session_context_for_ask(
+            session,
+            thread_id=thread.id,
+            exclude_message_id=m_ask.id,
+            query="Cụm biên đang dùng API Gateway nào?",
+            principal=principal,
+            owner_key=owner_key,
+            requested_source_ids=None,
+            budget_tokens=900,
+            embedder=model_a,
+            qdrant_client=q_client,
+        )
+        assert pack_a.audit_trace.persistence_status == "lazy_backfill"
+        assert len(model_a.batches) >= 1
+        assert qdrant.collections[col_name]["vectors"]["content_vector"]["size"] == 64
+
+        # 2. Switch to HTTP Model B (`dim=32`) WITHOUT clearing `_SHARED_TEXT_EMBEDDING_CACHE` or `SESSION_INDEX_CACHE`!
+        model_b = _CountingHttpModelEmbedder(model="provider/model-B", dim=32)
+        pack_b = await prepare_session_context_for_ask(
+            session,
+            thread_id=thread.id,
+            exclude_message_id=m_ask.id,
+            query="Cụm biên đang dùng API Gateway nào?",
+            principal=principal,
+            owner_key=owner_key,
+            requested_source_ids=None,
+            budget_tokens=900,
+            embedder=model_b,
+            qdrant_client=q_client,
+        )
+        assert pack_b.audit_trace.persistence_status == "reconciled_rebuild"
+        # Model B MUST be invoked for historical turns (never reusing Model A's 64-dim cache!)
+        assert len(model_b.batches) >= 1
+        flattened_b = [txt for batch in model_b.batches for txt in batch]
+        assert any("Kong 3.8" in txt for txt in flattened_b)
+
+        sigs_b = set(
+            (
+                await session.execute(
+                    select(SessionUnit.embedding_model_signature).where(SessionUnit.thread_id == thread.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert sigs_b == {"http:provider/model-B"}
+        assert qdrant.collections[col_name]["vectors"]["content_vector"]["size"] == 32
+        assert len(qdrant.points[col_name]) == 5  # 2 TURN + 2 WINDOW + 1 EPISODE
+        for pt in qdrant.points[col_name].values():
+            assert len(pt["vector"]["content_vector"]) == 32
+            assert pt["payload"]["embedding_model_signature"] == "http:provider/model-B"
+
+        # 3. Failing HTTP Model C (`503`) must NOT overwrite DB/Qdrant with fallback vectors
+        class _FailingHttpEmbedder:
+            model = "provider/model-C"
+            dim = 48
+
+            async def batch_generate(self, texts: list[str]) -> list[list[float]]:
+                raise RuntimeError("Upstream embedding provider 503")
+
+        pack_c = await prepare_session_context_for_ask(
+            session,
+            thread_id=thread.id,
+            exclude_message_id=m_ask.id,
+            query="Cụm biên đang dùng API Gateway nào?",
+            principal=principal,
+            owner_key=owner_key,
+            requested_source_ids=None,
+            budget_tokens=900,
+            embedder=_FailingHttpEmbedder(),
+            qdrant_client=q_client,
+        )
+        assert pack_c.audit_trace.persistence_status == "degraded_unpersisted"
+        sigs_after_c = set(
+            (
+                await session.execute(
+                    select(SessionUnit.embedding_model_signature).where(SessionUnit.thread_id == thread.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert sigs_after_c == {"http:provider/model-B"}
+        assert qdrant.collections[col_name]["vectors"]["content_vector"]["size"] == 32
+
+        # Direct provenance & dimension guard check on `sync_session_index_to_storage`
+        bad_idx = IncrementalSessionIndex(thread.id)
+        await bad_idx.append_messages(
+            [{"id": m0.id, "role": "user", "content": m0.content, "created_at": now}],
+            embedder=None,
+        )
+        with pytest.raises(ValueError, match="Refusing to persist"):
+            await sync_session_index_to_storage(
+                session,
+                index=bad_idx,
+                scope=SessionPersistenceScope(
+                    tenant_id=principal.organization_id,
+                    project_id="proj-http-ab",
+                    thread_id=thread.id,
+                    owner_key=owner_key,
+                    security_partition_ids=("proj-http-ab",),
+                ),
+                embedding_sig="http:provider/model-B",
+                mode="rebuild",
+                embedder=model_b,
+                qdrant_client=q_client,
+            )
+
+    await q_client.aclose()
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_qdrant_503_outage_backfills_on_warm_retry_and_bidirectional_reconciler(
+    monkeypatch,
+) -> None:
+    """PR #44 [P2 #1]: Qdrant 503 during backfill leaves durable pending state & heals on recovery."""
+    monkeypatch.setattr(settings, "session_context_mode", "on")
+    monkeypatch.setattr(settings, "decision_provider", "disabled")
+
+    qdrant = _InMemoryQdrantEmulator()
+    q_client = qdrant.make_client()
+    set_custom_session_qdrant_client_factory(lambda: q_client)
+    http_embedder = _CountingHttpModelEmbedder(model="BAAI/bge-m3", dim=64)
+
+    engine = await _make_fk_sqlite_engine()
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    owner_key = "owner-qdrant-503"
+    principal = _principal(project_id="proj-qdrant-503")
+    col_name = session_qdrant_collection_name("proj-qdrant-503")
+    now = datetime(2026, 10, 28, 7, 0, tzinfo=UTC)
+
+    async with session_factory() as session:
+        agent = Agent(owner_key=owner_key, name="Qdrant Recovery Agent")
+        session.add(agent)
+        await session.flush()
+        thread_1 = Thread(agent_id=agent.id, owner_key=owner_key, title="Qdrant Outage Thread 1")
+        thread_2 = Thread(agent_id=agent.id, owner_key=owner_key, title="Qdrant Outage Thread 2")
+        session.add_all([thread_1, thread_2])
+        await session.flush()
+
+        for idx, body_txt in enumerate(
+            [
+                "Chốt dùng Kafka KRaft 3.8 cho luồng đối soát giao dịch.",
+                "Đã cấu hình replication factor = 3 cho topic đối soát.",
+                "Luồng đối soát đang dùng broker nào?",
+            ]
+        ):
+            session.add(
+                Message(
+                    thread_id=thread_1.id,
+                    role=MessageRole.USER if idx % 2 == 0 else MessageRole.ASSISTANT,
+                    content=body_txt,
+                    created_at=now + timedelta(seconds=idx * 20),
+                )
+            )
+        await session.commit()
+        t1_msgs = list(
+            (
+                await session.execute(
+                    select(Message).where(Message.thread_id == thread_1.id).order_by(Message.created_at.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        t1_ask = t1_msgs[-1]
+
+        # Part A: Qdrant returns 503 during initial backfill -> PG saves with `qdrant_point_id IS NULL`
+        qdrant.fail_status_code = 503
+        pack_503 = await prepare_session_context_for_ask(
+            session,
+            thread_id=thread_1.id,
+            exclude_message_id=t1_ask.id,
+            query="Luồng đối soát đang dùng broker nào?",
+            principal=principal,
+            owner_key=owner_key,
+            requested_source_ids=None,
+            budget_tokens=900,
+            embedder=http_embedder,
+            qdrant_client=q_client,
+        )
+        assert pack_503.audit_trace.persistence_status == "lazy_backfill"
+        assert pack_503.audit_trace.qdrant_points_upserted == 0
+        assert col_name not in qdrant.points
+        unsynced_cnt = await session.scalar(
+            select(func.count())
+            .select_from(SessionUnit)
+            .where(SessionUnit.thread_id == thread_1.id, SessionUnit.qdrant_point_id.is_(None))
+        )
+        assert unsynced_cnt == 5  # 2 TURN + 2 WINDOW + 1 EPISODE
+
+        # Qdrant recovers (`200 OK`): next warm ask (with 0 new messages!) automatically backfills Qdrant!
+        qdrant.fail_status_code = None
+        pack_healed = await prepare_session_context_for_ask(
+            session,
+            thread_id=thread_1.id,
+            exclude_message_id=t1_ask.id,
+            query="Luồng đối soát đang dùng broker nào?",
+            principal=principal,
+            owner_key=owner_key,
+            requested_source_ids=None,
+            budget_tokens=900,
+            embedder=http_embedder,
+            qdrant_client=q_client,
+        )
+        assert pack_healed.audit_trace.persistence_status == "qdrant_backfilled"
+        assert pack_healed.audit_trace.qdrant_points_upserted == 5
+        assert len(qdrant.points[col_name]) == 5
+        unsynced_after = await session.scalar(
+            select(func.count())
+            .select_from(SessionUnit)
+            .where(SessionUnit.thread_id == thread_1.id, SessionUnit.qdrant_point_id.is_(None))
+        )
+        assert unsynced_after == 0
+
+        # Cold-start after recovery must now achieve 0 historical HTTP re-embeddings!
+        SESSION_INDEX_CACHE.clear()
+        _SHARED_TEXT_EMBEDDING_CACHE.clear()
+        http_embedder.batches.clear()
+        pack_cold = await prepare_session_context_for_ask(
+            session,
+            thread_id=thread_1.id,
+            exclude_message_id=t1_ask.id,
+            query="Luồng đối soát đang dùng broker nào?",
+            principal=principal,
+            owner_key=owner_key,
+            requested_source_ids=None,
+            budget_tokens=900,
+            embedder=http_embedder,
+            qdrant_client=q_client,
+        )
+        assert pack_cold.audit_trace.persistence_status == "hydrated_clean"
+        flattened_t1_cold = [txt for batch in http_embedder.batches for txt in batch]
+        assert not any("Kafka KRaft" in txt for txt in flattened_t1_cold)
+        assert len(http_embedder.batches) <= 1
+
+        # Part B: Thread 2 hits Qdrant 503, then `reconcile_orphan_session_units` heals missing points!
+        t2_m0 = Message(
+            thread_id=thread_2.id,
+            role=MessageRole.USER,
+            content="Chốt dùng ClickHouse 24.8 cho kho phân tích OLAP.",
+            created_at=now + timedelta(minutes=5),
+        )
+        t2_ask = Message(
+            thread_id=thread_2.id,
+            role=MessageRole.USER,
+            content="Kho phân tích OLAP dùng gì?",
+            created_at=now + timedelta(minutes=6),
+        )
+        session.add_all([t2_m0, t2_ask])
+        await session.commit()
+
+        qdrant.fail_status_code = 503
+        _ = await prepare_session_context_for_ask(
+            session,
+            thread_id=thread_2.id,
+            exclude_message_id=t2_ask.id,
+            query="Kho phân tích OLAP dùng gì?",
+            principal=principal,
+            owner_key=owner_key,
+            requested_source_ids=None,
+            budget_tokens=900,
+            embedder=http_embedder,
+            qdrant_client=q_client,
+        )
+        assert len(qdrant.points[col_name]) == 5  # Thread 2's 3 units are missing from Qdrant!
+
+        # Simulate cold state + Qdrant recovery, then run bidirectional `reconcile_orphan_session_units`
+        SESSION_INDEX_CACHE.clear()
+        _SHARED_TEXT_EMBEDDING_CACHE.clear()
+        qdrant.fail_status_code = None
+        rec_stats = await reconcile_orphan_session_units(
+            session,
+            q_client,
+            project_id="proj-qdrant-503",
+            embedder=http_embedder,
+        )
+        assert rec_stats["orphans_deleted"] == 0
+        assert rec_stats["missing_repaired"] == 3  # 1 TURN + 1 WINDOW + 1 EPISODE for thread_2
+        assert len(qdrant.points[col_name]) == 8
+
+        # Cold restart on Thread 2 now hydrates from Qdrant with 0 historical HTTP calls!
+        SESSION_INDEX_CACHE.clear()
+        _SHARED_TEXT_EMBEDDING_CACHE.clear()
+        http_embedder.batches.clear()
+        pack_t2_cold = await prepare_session_context_for_ask(
+            session,
+            thread_id=thread_2.id,
+            exclude_message_id=t2_ask.id,
+            query="Kho phân tích OLAP dùng gì?",
+            principal=principal,
+            owner_key=owner_key,
+            requested_source_ids=None,
+            budget_tokens=900,
+            embedder=http_embedder,
+            qdrant_client=q_client,
+        )
+        assert pack_t2_cold.audit_trace.persistence_status == "hydrated_clean"
+        flattened_t2_cold = [txt for batch in http_embedder.batches for txt in batch]
+        assert not any("ClickHouse 24.8" in txt for txt in flattened_t2_cold)
+        assert len(http_embedder.batches) <= 1
+
+    await q_client.aclose()
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_warm_delta_db_failure_invalidates_cache_and_recovers_missing_turn(
+    monkeypatch,
+) -> None:
+    """PR #44 [P2 #2]: Transient DB write failure on warm delta must NOT leave phantom cursor in RAM."""
+    import sag_api.services.session_context.persistence as persistence_mod
+
+    monkeypatch.setattr(settings, "session_context_mode", "on")
+    monkeypatch.setattr(settings, "decision_provider", "disabled")
+
+    qdrant = _InMemoryQdrantEmulator()
+    q_client = qdrant.make_client()
+    set_custom_session_qdrant_client_factory(lambda: q_client)
+
+    engine = await _make_fk_sqlite_engine()
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    owner_key = "owner-fault-ch3"
+    principal = _principal(project_id="proj-fault")
+    now = datetime(2026, 10, 28, 8, 0, tzinfo=UTC)
+
+    async with session_factory() as session:
+        agent = Agent(owner_key=owner_key, name="Fault Injection Agent")
+        session.add(agent)
+        await session.flush()
+        thread = Thread(agent_id=agent.id, owner_key=owner_key, title="Fault Injection Thread")
+        session.add(thread)
+        await session.flush()
+
+        m0 = Message(
+            thread_id=thread.id,
+            role=MessageRole.USER,
+            content="Lượt 1: Chốt dùng Valkey 8 cho hàng đợi tác vụ nhanh.",
+            created_at=now,
+        )
+        m_ask_1 = Message(
+            thread_id=thread.id,
+            role=MessageRole.USER,
+            content="Câu hỏi lượt 1?",
+            created_at=now + timedelta(seconds=10),
+        )
+        session.add_all([m0, m_ask_1])
+        await session.commit()
+
+        # 1. Persist Turn 1 cleanly -> warm cache has 1 turn, DB has 1 TURN unit
+        pack_1 = await prepare_session_context_for_ask(
+            session,
+            thread_id=thread.id,
+            exclude_message_id=m_ask_1.id,
+            query="Hàng đợi tác vụ nhanh dùng gì?",
+            principal=principal,
+            owner_key=owner_key,
+            requested_source_ids=None,
+            budget_tokens=900,
+            qdrant_client=q_client,
+        )
+        assert pack_1.audit_trace.persistence_status == "lazy_backfill"
+        turn_cnt_1 = await session.scalar(
+            select(func.count())
+            .select_from(SessionUnit)
+            .where(SessionUnit.thread_id == thread.id, SessionUnit.unit_kind == "TURN")
+        )
+        assert turn_cnt_1 == 1
+
+        # 2. Add Turn 2 (`m_ask_1` becomes history when `m_ask_2` is current ask) & inject 1-shot DB failure!
+        m_ask_2 = Message(
+            thread_id=thread.id,
+            role=MessageRole.USER,
+            content="Câu hỏi lượt 2?",
+            created_at=now + timedelta(seconds=20),
+        )
+        session.add(m_ask_2)
+        await session.commit()
+
+        orig_sync = persistence_mod.sync_session_index_to_storage
+        fail_once = {"armed": True}
+
+        async def _flaky_sync(*args: Any, **kwargs: Any):
+            if fail_once["armed"]:
+                fail_once["armed"] = False
+                raise RuntimeError("Simulated transient PostgreSQL write error")
+            return await orig_sync(*args, **kwargs)
+
+        monkeypatch.setattr(persistence_mod, "sync_session_index_to_storage", _flaky_sync)
+
+        with pytest.raises(RuntimeError, match="Simulated transient PostgreSQL write error"):
+            await prepare_session_context_for_ask(
+                session,
+                thread_id=thread.id,
+                exclude_message_id=m_ask_2.id,
+                query="Kiểm tra sau lỗi đồng bộ?",
+                principal=principal,
+                owner_key=owner_key,
+                requested_source_ids=None,
+                budget_tokens=900,
+                qdrant_client=q_client,
+            )
+
+        # DB still only has 1 TURN unit (`m0`), and warm cache MUST have been invalidated!
+        turn_cnt_during_fault = await session.scalar(
+            select(func.count())
+            .select_from(SessionUnit)
+            .where(SessionUnit.thread_id == thread.id, SessionUnit.unit_kind == "TURN")
+        )
+        assert turn_cnt_during_fault == 1
+        assert SESSION_INDEX_CACHE.find_thread_entries(thread.id) == []
+
+        # 3. Next call (after fault clears, with 0 new messages) MUST backfill missing Turn 2 (`hydrated_delta`)!
+        pack_recovered = await prepare_session_context_for_ask(
+            session,
+            thread_id=thread.id,
+            exclude_message_id=m_ask_2.id,
+            query="Kiểm tra sau lỗi đồng bộ?",
+            principal=principal,
+            owner_key=owner_key,
+            requested_source_ids=None,
+            budget_tokens=900,
+            qdrant_client=q_client,
+        )
+        assert pack_recovered.audit_trace.persistence_status == "hydrated_delta"
+        turn_cnt_recovered = await session.scalar(
+            select(func.count())
+            .select_from(SessionUnit)
+            .where(SessionUnit.thread_id == thread.id, SessionUnit.unit_kind == "TURN")
+        )
+        assert turn_cnt_recovered == 2
+
+        # 4. Subsequent call with no new messages now cleanly reports `warm_clean` with RAM == DB == 2!
+        pack_warm = await prepare_session_context_for_ask(
+            session,
+            thread_id=thread.id,
+            exclude_message_id=m_ask_2.id,
+            query="Kiểm tra sau lỗi đồng bộ?",
+            principal=principal,
+            owner_key=owner_key,
+            requested_source_ids=None,
+            budget_tokens=900,
+            qdrant_client=q_client,
+        )
+        assert pack_warm.audit_trace.persistence_status == "warm_clean"
+        assert pack_warm.audit_trace.total_indexed_turns == 2
 
     await q_client.aclose()
     await engine.dispose()

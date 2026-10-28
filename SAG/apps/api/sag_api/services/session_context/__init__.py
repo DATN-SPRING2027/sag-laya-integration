@@ -17,6 +17,7 @@ from sag_api.services.session_context.optimizer import build_ecce_context_pack
 from sag_api.services.session_context.persistence import (
     PersistenceSyncStats,
     SessionPersistenceScope,
+    backfill_pending_qdrant_for_thread,
     backfill_thread_session_context,
     build_session_unit_qdrant_payload,
     collect_thread_persistence_projects,
@@ -62,6 +63,7 @@ __all__ = [
     "SelectedEvidenceGroup",
     "SessionContextPack",
     "SessionPersistenceScope",
+    "backfill_pending_qdrant_for_thread",
     "backfill_thread_session_context",
     "build_ecce_context_pack",
     "build_session_unit_qdrant_payload",

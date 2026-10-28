@@ -28,6 +28,7 @@ from sag_api.core.errors import ForbiddenError
 from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal
 from sag_api.core.sanitizer import sanitize_error_message
+from sag_api.db.models.agent import Message
 from sag_api.db.models.session_context import (
     SESSION_OPEN_ENDED_VALID_TO,
     SessionDecisionLedger,
@@ -58,10 +59,13 @@ from sag_api.services.session_context.models import (
 )
 from sag_api.services.session_context.substrate import (
     FALLBACK_VECTOR_DIM,
+    SESSION_INDEX_CACHE,
     SOFT_ALIAS_WEIGHT,
     IncrementalSessionIndex,
+    compute_embedding_signature,
+    declared_embedder_dim,
     deterministic_ngram_vector,
-    embed_texts_with_main_cache,
+    embed_texts_with_provenance,
     l2_normalize,
     sparse_dict_from_bm25,
 )
@@ -132,16 +136,6 @@ def session_qdrant_collection_name(project_id: str) -> str:
     """Return canonical per-project Qdrant collection name for session units."""
     safe_proj = re.sub(r"[^A-Za-z0-9_\-]", "_", str(project_id).strip())
     return f"session_units_{safe_proj}"
-
-
-def compute_embedding_signature(embedder: Any | None) -> str:
-    """Compute non-empty deterministic signature identifying the active embedding space."""
-    if embedder is None:
-        return "deterministic-ngram-v1"
-    model_name = str(getattr(embedder, "_model", "") or getattr(embedder, "model", "") or "").strip()
-    if model_name:
-        return f"http:{model_name}"[:128]
-    return f"embedder:{type(embedder).__name__}"[:128]
 
 
 def _ts_to_utc(ts: float | None) -> datetime:
@@ -263,6 +257,7 @@ async def ensure_session_qdrant_collection(
     *,
     project_id: str,
     vector_dim: int,
+    force_verify: bool = False,
 ) -> str:
     """Ensure `session_units_{project_id}` exists with matching vector_dim & filter indexes.
 
@@ -275,7 +270,7 @@ async def ensure_session_qdrant_collection(
         "http" if isinstance(transport, httpx.AsyncHTTPTransport) else f"mock:{id(transport)}"
     )
     cache_key = (transport_tag, str(qdrant_client.base_url), collection_name)
-    if _VERIFIED_SESSION_COLLECTIONS.get(cache_key) == vector_dim:
+    if not force_verify and _VERIFIED_SESSION_COLLECTIONS.get(cache_key) == vector_dim:
         return collection_name
 
     needs_create = True
@@ -416,6 +411,17 @@ async def upsert_session_units_to_qdrant(
         f"/collections/{collection_name}/points?wait=true",
         json={"points": points},
     )
+    if res.status_code in {400, 404}:
+        await ensure_session_qdrant_collection(
+            qdrant_client,
+            project_id=project_id,
+            vector_dim=vector_dim,
+            force_verify=True,
+        )
+        res = await qdrant_client.put(
+            f"/collections/{collection_name}/points?wait=true",
+            json={"points": points},
+        )
     res.raise_for_status()
     return len(points)
 
@@ -426,15 +432,24 @@ async def fetch_thread_turn_vectors_from_qdrant(
     tenant_id: str,
     project_id: str,
     thread_id: str,
+    expected_embedding_sig: str | None = None,
+    expected_dim: int | None = None,
 ) -> dict[str, tuple[float, ...]]:
     """Scroll dense `TURN` vectors for a thread from Qdrant (`0` HTTP embedder calls on cold start)."""
     collection_name = session_qdrant_collection_name(project_id)
     vectors_by_unit_id: dict[str, tuple[float, ...]] = {}
+    observed_dim: int | None = expected_dim
     next_offset: Any = None
     while True:
         body: dict[str, Any] = {
             "limit": 256,
-            "with_payload": ["session_unit_id", "unit_kind", "tenant_id", "thread_id"],
+            "with_payload": [
+                "session_unit_id",
+                "unit_kind",
+                "tenant_id",
+                "thread_id",
+                "embedding_model_signature",
+            ],
             "with_vector": True,
             "filter": {
                 "must": [
@@ -448,25 +463,71 @@ async def fetch_thread_turn_vectors_from_qdrant(
         if next_offset is not None:
             body["offset"] = next_offset
         res = await qdrant_client.post(f"/collections/{collection_name}/points/scroll", json=body)
-        if not res.is_success:
+        if res.status_code == 404:
             break
+        if not res.is_success:
+            res.raise_for_status()
         result = res.json().get("result", {})
         points = result.get("points") or []
         for pt in points:
             payload = pt.get("payload") or {}
             uid = str(payload.get("session_unit_id") or "")
+            pt_sig = str(payload.get("embedding_model_signature") or "")
+            if expected_embedding_sig and pt_sig != expected_embedding_sig:
+                continue
             vec_field = pt.get("vector") or {}
             raw_vec = (
                 vec_field.get("content_vector")
                 if isinstance(vec_field, dict)
                 else (vec_field if isinstance(vec_field, list) else None)
             )
-            if uid and isinstance(raw_vec, list) and raw_vec:
-                vectors_by_unit_id[uid] = l2_normalize(raw_vec)
+            if not uid or not isinstance(raw_vec, list) or not raw_vec:
+                continue
+            if observed_dim is not None and len(raw_vec) != observed_dim:
+                continue
+            observed_dim = len(raw_vec)
+            vectors_by_unit_id[uid] = l2_normalize(raw_vec)
         next_offset = result.get("next_page_offset")
         if next_offset is None or not points:
             break
     return vectors_by_unit_id
+
+
+async def _scroll_thread_qdrant_points(
+    qdrant_client: httpx.AsyncClient,
+    *,
+    project_id: str,
+    thread_id: str,
+) -> list[dict[str, Any]]:
+    """Scroll point IDs and metadata payloads for `thread_id` in `session_units_{project_id}`."""
+    collection_name = session_qdrant_collection_name(project_id)
+    collected: list[dict[str, Any]] = []
+    next_offset: Any = None
+    while True:
+        body: dict[str, Any] = {
+            "limit": 500,
+            "with_payload": ["session_unit_id", "embedding_model_signature"],
+            "with_vector": False,
+            "filter": {
+                "must": [
+                    {"key": "thread_id", "match": {"value": str(thread_id)}},
+                ]
+            },
+        }
+        if next_offset is not None:
+            body["offset"] = next_offset
+        res = await qdrant_client.post(f"/collections/{collection_name}/points/scroll", json=body)
+        if res.status_code == 404:
+            return []
+        if not res.is_success:
+            res.raise_for_status()
+        result = res.json().get("result", {})
+        points = result.get("points") or []
+        collected.extend(points)
+        next_offset = result.get("next_page_offset")
+        if next_offset is None or not points:
+            break
+    return collected
 
 
 async def delete_thread_points_from_qdrant(
@@ -491,27 +552,265 @@ async def delete_thread_points_from_qdrant(
         del_res.raise_for_status()
 
 
+async def _mark_units_qdrant_synced(
+    session: AsyncSession,
+    *,
+    collection_name: str,
+    synced_units: Sequence[SessionUnit],
+    commit_if_clean: bool = True,
+    caller_had_pending_state: bool = False,
+) -> None:
+    """Persist deterministic `qdrant_point_id` onto `SessionUnit` rows ONLY after Qdrant upsert succeeds."""
+    if not synced_units:
+        return
+    dedup_units = {u.id: u for u in synced_units}
+    async with session.begin_nested():
+        for uid, u_obj in dedup_units.items():
+            point_id = generate_session_unit_point_id(collection_name, uid)
+            await session.execute(
+                update(SessionUnit)
+                .where(SessionUnit.id == uid)
+                .values(qdrant_point_id=point_id)
+            )
+            u_obj.qdrant_point_id = point_id
+        await session.flush()
+    if commit_if_clean and not caller_had_pending_state:
+        await session.commit()
+
+
+def _blend_episode_centroid(turn_vecs: Sequence[Sequence[float]]) -> tuple[float, ...]:
+    """Reproduce `EpisodeSegment` running centroid over constituent `TURN` vectors."""
+    centroid = list(turn_vecs[0])
+    for idx_v, tv in enumerate(turn_vecs[1:], start=1):
+        blended = [(centroid[i] * idx_v + float(tv[i])) / (idx_v + 1) for i in range(len(tv))]
+        centroid = list(l2_normalize(blended))
+    return l2_normalize(centroid)
+
+
+async def _repair_thread_qdrant_from_db_units(
+    session: AsyncSession,
+    qdrant_client: httpx.AsyncClient,
+    *,
+    project_id: str,
+    thread_id: str,
+    thread_units: Sequence[SessionUnit],
+    missing_unit_ids: set[str],
+    embedder: Any | None = None,
+    caller_had_pending_state: bool = False,
+) -> int:
+    """Reconstruct and upsert missing Qdrant `SessionUnit` points for `thread_id` from PostgreSQL truth."""
+    if not thread_units or not missing_unit_ids:
+        return 0
+    collection_name = session_qdrant_collection_name(project_id)
+    turn_units = sorted(
+        (u for u in thread_units if u.unit_kind == "TURN"),
+        key=lambda u: int(u.ordinal),
+    )
+    if not turn_units:
+        return 0
+
+    thread_sig = turn_units[0].embedding_model_signature
+    if any(u.embedding_model_signature != thread_sig for u in thread_units):
+        log.warning("Skipping Qdrant repair for mixed-signature thread=%s", thread_id)
+        return 0
+
+    # Fast path: reuse warm `IncrementalSessionIndex` if present with matching signature & turn set
+    warm_entries = SESSION_INDEX_CACHE.find_thread_entries(thread_id)
+    for warm_idx in warm_entries:
+        if (
+            warm_idx.embedding_mode == thread_sig
+            and len(warm_idx.turns) == len(turn_units)
+            and all(
+                warm_idx.turns[i].turn_id == turn_units[i].message_from_id
+                for i in range(len(turn_units))
+            )
+        ):
+            scope = SessionPersistenceScope(
+                tenant_id=turn_units[0].tenant_id,
+                project_id=project_id,
+                thread_id=thread_id,
+                owner_key=str(turn_units[0].owner_key or ""),
+                security_partition_ids=tuple(turn_units[0].security_partition_ids_json or ()),
+            )
+            items = _build_qdrant_items_from_index(
+                warm_idx,
+                scope=scope,
+                embedding_sig=thread_sig,
+                only_unit_ids=missing_unit_ids,
+            )
+            if not items:
+                return 0
+            _validate_vectors_for_persistence(
+                index=warm_idx,
+                qdrant_upsert_batch=items,
+                embedding_sig=thread_sig,
+            )
+            upserted = await upsert_session_units_to_qdrant(
+                qdrant_client,
+                project_id=project_id,
+                items=items,
+            )
+            await _mark_units_qdrant_synced(
+                session,
+                collection_name=collection_name,
+                synced_units=[u for u, _, _ in items],
+                commit_if_clean=True,
+                caller_had_pending_state=caller_had_pending_state,
+            )
+            for entry in warm_entries:
+                entry.qdrant_sync_pending = False
+                entry.qdrant_rebuild_pending = False
+            return upserted
+
+    # Cold DB reconstruction path: load authorized `Message` rows referenced by persisted `TURN` units
+    msg_ids = [u.message_from_id for u in turn_units]
+    msg_rows = list(
+        (
+            await session.execute(
+                select(Message).where(
+                    Message.thread_id == thread_id,
+                    Message.id.in_(msg_ids),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    msg_by_id = {str(m.id): normalize_session_text(str(m.content or "")) for m in msg_rows}
+    if any(mid not in msg_by_id or not msg_by_id[mid] for mid in msg_ids):
+        return 0
+
+    turn_texts = [msg_by_id[u.message_from_id] for u in turn_units]
+    if thread_sig == "deterministic-ngram-v1":
+        computed_vecs = [deterministic_ngram_vector(txt) for txt in turn_texts]
+        actual_sig = "deterministic-ngram-v1"
+    else:
+        from sag_api.services.session_context.runtime import resolve_session_embedder
+
+        cand_embedder = resolve_session_embedder(embedder)
+        if cand_embedder is None or compute_embedding_signature(cand_embedder) != thread_sig:
+            log.warning(
+                "Cannot repair Qdrant points for thread=%s: active embedder does not match '%s'",
+                thread_id,
+                thread_sig,
+            )
+            return 0
+        computed_vecs, actual_sig = await embed_texts_with_provenance(
+            turn_texts,
+            embedder=cand_embedder,
+        )
+        if actual_sig != thread_sig:
+            log.warning(
+                "Skipping Qdrant repair for thread=%s: embedder degraded (%s != %s)",
+                thread_id,
+                actual_sig,
+                thread_sig,
+            )
+            return 0
+
+    if not computed_vecs or any(not v for v in computed_vecs):
+        return 0
+    ref_dim = len(computed_vecs[0])
+    if any(len(v) != ref_dim for v in computed_vecs):
+        return 0
+
+    turn_vec_by_msg_id = {
+        u.message_from_id: vec for u, vec in zip(turn_units, computed_vecs, strict=True)
+    }
+    doc_freqs: dict[str, int] = {}
+    total_words = 0
+    for u in turn_units:
+        for word in (u.term_freqs_json or {}):
+            doc_freqs[str(word)] = doc_freqs.get(str(word), 0) + 1
+        total_words += max(1, int(u.doc_word_len or 1))
+    avg_len = max(8.0, total_words / max(1, len(turn_units)))
+    total_docs = max(50, len(turn_units))
+
+    repair_items: list[tuple[SessionUnit, Sequence[float], dict[str, list]]] = []
+    for u in thread_units:
+        if u.id not in missing_unit_ids:
+            continue
+        if u.unit_kind == "TURN":
+            dense_vec = turn_vec_by_msg_id.get(u.message_from_id)
+            if dense_vec is None:
+                continue
+            sparse_vec = compute_sparse_bm25_vector(
+                msg_by_id[u.message_from_id],
+                avg_doc_len=avg_len,
+                corpus_doc_freqs=doc_freqs,
+                total_corpus_docs=total_docs,
+            )
+            repair_items.append((u, dense_vec, sparse_vec))
+        else:
+            src_mids = [str(m) for m in (u.source_message_ids_json or []) if str(m) in turn_vec_by_msg_id]
+            if not src_mids:
+                continue
+            span_vecs = [turn_vec_by_msg_id[m] for m in src_mids]
+            if u.unit_kind == "WINDOW":
+                avg_v = [sum(v[i] for v in span_vecs) / len(span_vecs) for i in range(ref_dim)]
+                dense_vec = l2_normalize(avg_v)
+            else:
+                dense_vec = _blend_episode_centroid(span_vecs)
+            joined_txt = "\n".join(msg_by_id[m] for m in src_mids)
+            sparse_vec = compute_sparse_bm25_vector(
+                joined_txt,
+                avg_doc_len=avg_len,
+                corpus_doc_freqs=doc_freqs,
+                total_corpus_docs=total_docs,
+            )
+            repair_items.append((u, dense_vec, sparse_vec))
+
+    if not repair_items:
+        return 0
+
+    upserted = await upsert_session_units_to_qdrant(
+        qdrant_client,
+        project_id=project_id,
+        items=repair_items,
+    )
+    await _mark_units_qdrant_synced(
+        session,
+        collection_name=collection_name,
+        synced_units=[u for u, _, _ in repair_items],
+        commit_if_clean=True,
+        caller_had_pending_state=caller_had_pending_state,
+    )
+    for entry in warm_entries:
+        entry.qdrant_sync_pending = False
+        entry.qdrant_rebuild_pending = False
+    return upserted
+
+
 async def reconcile_orphan_session_units(
     session: AsyncSession,
     qdrant_client: httpx.AsyncClient,
     *,
     project_id: str,
+    embedder: Any | None = None,
 ) -> dict[str, int]:
-    """Identify and delete orphan Qdrant points in `session_units_{project_id}` missing from PostgreSQL."""
+    """Bidirectionally reconcile `session_units_{project_id}` against PostgreSQL `session_units`.
+
+    1. Deletes orphan or signature-drifted Qdrant points missing from PostgreSQL.
+    2. Backfills missing Qdrant points for PostgreSQL `SessionUnit` rows (`qdrant_point_id IS NULL`
+       or absent from Qdrant after transient `503` / collection recovery).
+    """
+    caller_had_pending_state = bool(session.new or session.dirty or session.deleted)
     collection_name = session_qdrant_collection_name(project_id)
     all_points: list[dict[str, Any]] = []
     next_offset: Any = None
     while True:
         body: dict[str, Any] = {
             "limit": 500,
-            "with_payload": ["session_unit_id", "thread_id"],
+            "with_payload": ["session_unit_id", "thread_id", "embedding_model_signature"],
             "with_vector": False,
         }
         if next_offset is not None:
             body["offset"] = next_offset
         res = await qdrant_client.post(f"/collections/{collection_name}/points/scroll", json=body)
-        if not res.is_success:
+        if res.status_code == 404:
             break
+        if not res.is_success:
+            res.raise_for_status()
         data = res.json().get("result", {})
         points = data.get("points") or []
         all_points.extend(points)
@@ -519,31 +818,38 @@ async def reconcile_orphan_session_units(
         if next_offset is None or not points:
             break
 
-    if not all_points:
-        return {"scanned": 0, "orphans_deleted": 0}
-
-    point_unit_map = {
-        p["id"]: (p.get("payload") or {}).get("session_unit_id")
-        for p in all_points
-        if p.get("id")
-    }
-    valid_unit_ids: set[str] = set()
-    candidate_ids = [str(uid) for uid in point_unit_map.values() if uid]
-    for idx in range(0, len(candidate_ids), 500):
-        batch = candidate_ids[idx : idx + 500]
-        rows = (
+    db_units = list(
+        (
             await session.execute(
-                select(SessionUnit.id).where(
-                    SessionUnit.project_id == project_id,
-                    SessionUnit.id.in_(batch),
+                select(SessionUnit)
+                .where(SessionUnit.project_id == project_id)
+                .order_by(
+                    SessionUnit.thread_id.asc(),
+                    SessionUnit.unit_kind.asc(),
+                    SessionUnit.ordinal.asc(),
                 )
             )
-        ).scalars().all()
-        valid_unit_ids.update(str(r) for r in rows)
+        )
+        .scalars()
+        .all()
+    )
+    db_units_by_id = {u.id: u for u in db_units}
 
-    orphan_point_ids = [
-        pid for pid, uid in point_unit_map.items() if not uid or str(uid) not in valid_unit_ids
-    ]
+    orphan_point_ids: list[str] = []
+    present_valid_unit_ids: set[str] = set()
+    for pt in all_points:
+        pid = pt.get("id")
+        if not pid:
+            continue
+        payload = pt.get("payload") or {}
+        uid = str(payload.get("session_unit_id") or "")
+        pt_sig = str(payload.get("embedding_model_signature") or "")
+        db_u = db_units_by_id.get(uid) if uid else None
+        if db_u is None or (pt_sig and pt_sig != db_u.embedding_model_signature):
+            orphan_point_ids.append(str(pid))
+        else:
+            present_valid_unit_ids.add(uid)
+
     if orphan_point_ids:
         del_res = await qdrant_client.post(
             f"/collections/{collection_name}/points/delete?wait=true",
@@ -551,7 +857,32 @@ async def reconcile_orphan_session_units(
         )
         if del_res.status_code >= 400 and del_res.status_code != 404:
             raise RuntimeError(f"Failed to delete orphan session Qdrant points: {del_res.text}")
-    return {"scanned": len(all_points), "orphans_deleted": len(orphan_point_ids)}
+
+    units_by_thread: dict[str, list[SessionUnit]] = {}
+    missing_by_thread: dict[str, set[str]] = {}
+    for u in db_units:
+        units_by_thread.setdefault(u.thread_id, []).append(u)
+        if u.qdrant_point_id is None or u.id not in present_valid_unit_ids:
+            missing_by_thread.setdefault(u.thread_id, set()).add(u.id)
+
+    missing_repaired = 0
+    for t_id, missing_ids in sorted(missing_by_thread.items()):
+        missing_repaired += await _repair_thread_qdrant_from_db_units(
+            session,
+            qdrant_client,
+            project_id=project_id,
+            thread_id=t_id,
+            thread_units=units_by_thread[t_id],
+            missing_unit_ids=missing_ids,
+            embedder=embedder,
+            caller_had_pending_state=caller_had_pending_state,
+        )
+
+    return {
+        "scanned": len(all_points),
+        "orphans_deleted": len(orphan_point_ids),
+        "missing_repaired": missing_repaired,
+    }
 
 
 async def collect_thread_persistence_projects(
@@ -720,9 +1051,10 @@ def _build_turn_session_unit(
     embedding_sig: str,
     collection_name: str,
     turns_by_id: dict[str, IndexedTurn],
+    qdrant_point_id: str | None = None,
 ) -> SessionUnit:
+    _ = collection_name
     unit_id = generate_session_unit_id(scope.thread_id, "TURN", turn.ordinal, turn.turn_id)
-    point_id = generate_session_unit_point_id(collection_name, unit_id)
     valid_from, valid_to = _turn_valid_window(turn, turns_by_id)
     return SessionUnit(
         id=unit_id,
@@ -759,7 +1091,7 @@ def _build_turn_session_unit(
         token_count=max(0, int(turn.token_count)),
         content_hash=turn.content_hash,
         embedding_model_signature=embedding_sig,
-        qdrant_point_id=point_id,
+        qdrant_point_id=qdrant_point_id,
         valid_from=valid_from,
         valid_to=valid_to,
     )
@@ -777,13 +1109,14 @@ def _build_span_session_unit(
     embedding_sig: str,
     collection_name: str,
     turns_by_id: dict[str, IndexedTurn],
+    qdrant_point_id: str | None = None,
 ) -> SessionUnit:
+    _ = collection_name
     dedup_turn_ids = list(dict.fromkeys(str(tid) for tid in turn_ids if tid in turns_by_id))
     span_turns = [turns_by_id[tid] for tid in dedup_turn_ids]
     first_tid = dedup_turn_ids[0]
     last_tid = dedup_turn_ids[-1]
     unit_id = generate_session_unit_id(scope.thread_id, unit_kind, ordinal, first_tid)
-    point_id = generate_session_unit_point_id(collection_name, unit_id)
 
     combined_hash = hashlib.sha256(
         "|".join(t.content_hash for t in span_turns).encode("utf-8")
@@ -829,7 +1162,7 @@ def _build_span_session_unit(
         token_count=sum(max(1, t.token_count) for t in span_turns),
         content_hash=combined_hash,
         embedding_model_signature=embedding_sig,
-        qdrant_point_id=point_id,
+        qdrant_point_id=qdrant_point_id,
         valid_from=valid_from,
         valid_to=SESSION_OPEN_ENDED_VALID_TO,
     )
@@ -1006,6 +1339,269 @@ def _sparse_qdrant_dict_for_span(
     )
 
 
+def _validate_vectors_for_persistence(
+    *,
+    index: IncrementalSessionIndex,
+    qdrant_upsert_batch: Sequence[tuple[SessionUnit, Sequence[float], dict[str, list]]],
+    embedding_sig: str,
+    embedder: Any | None = None,
+) -> int | None:
+    """Verify vector provenance signature and uniform dimensions before writing to DB or Qdrant."""
+    sig = embedding_sig.strip()
+    if not sig:
+        raise ValueError("embedding_model_signature must not be empty")
+    if embedder is not None:
+        embedder_sig = compute_embedding_signature(embedder)
+        if embedder_sig != sig:
+            raise ValueError(
+                f"Embedder signature '{embedder_sig}' does not match target '{sig}'"
+            )
+    if index.turns and index.embedding_mode != sig:
+        raise ValueError(
+            f"Refusing to persist session vectors from '{index.embedding_mode}' under '{sig}'"
+        )
+
+    expected_dim = (
+        declared_embedder_dim(embedder)
+        if embedder is not None
+        else (FALLBACK_VECTOR_DIM if sig == "deterministic-ngram-v1" else None)
+    )
+    observed_dim: int | None = expected_dim
+
+    for turn in index.turns:
+        if not turn.dense_vector:
+            raise ValueError(f"Empty dense vector on turn {turn.turn_id}")
+        if observed_dim is None:
+            observed_dim = len(turn.dense_vector)
+        elif len(turn.dense_vector) != observed_dim:
+            raise ValueError(
+                f"Inconsistent turn vector dimension {len(turn.dense_vector)} != {observed_dim}"
+            )
+
+    for win in index.windows:
+        if win.turn_ids and (not win.dense_vector or (observed_dim and len(win.dense_vector) != observed_dim)):
+            raise ValueError(f"Inconsistent window vector dimension on {win.window_id}")
+
+    for ep in index.episodes:
+        if ep.turn_ids and (not ep.centroid or (observed_dim and len(ep.centroid) != observed_dim)):
+            raise ValueError(f"Inconsistent episode centroid dimension on {ep.episode_id}")
+
+    for unit, dense_vec, _ in qdrant_upsert_batch:
+        if unit.embedding_model_signature != sig:
+            raise ValueError(
+                f"Unit {unit.id} signature '{unit.embedding_model_signature}' != '{sig}'"
+            )
+        if not dense_vec:
+            raise ValueError(f"Empty Qdrant vector for SessionUnit {unit.id}")
+        if observed_dim is None:
+            observed_dim = len(dense_vec)
+        elif len(dense_vec) != observed_dim:
+            raise ValueError(
+                f"Inconsistent Qdrant vector dimension {len(dense_vec)} != {observed_dim} on {unit.id}"
+            )
+
+    return observed_dim
+
+
+def _build_qdrant_items_from_index(
+    index: IncrementalSessionIndex,
+    *,
+    scope: SessionPersistenceScope,
+    embedding_sig: str,
+    only_unit_ids: set[str] | None = None,
+) -> list[tuple[SessionUnit, Sequence[float], dict[str, list]]]:
+    """Build Qdrant `(SessionUnit, dense_vec, sparse_vec)` items from `IncrementalSessionIndex`."""
+    collection_name = session_qdrant_collection_name(scope.project_id)
+    ep_ord_by_id = {ep.episode_id: ep.ordinal for ep in index.episodes}
+    items: list[tuple[SessionUnit, Sequence[float], dict[str, list]]] = []
+
+    for turn in index.turns:
+        u_id = generate_session_unit_id(scope.thread_id, "TURN", turn.ordinal, turn.turn_id)
+        if only_unit_ids is not None and u_id not in only_unit_ids:
+            continue
+        u_row = _build_turn_session_unit(
+            turn,
+            scope=scope,
+            episode_ordinal=ep_ord_by_id.get(turn.episode_id, 0),
+            embedding_sig=embedding_sig,
+            collection_name=collection_name,
+            turns_by_id=index.turns_by_id,
+        )
+        items.append((u_row, turn.dense_vector, _sparse_qdrant_dict_for_turn(turn)))
+
+    for win in index.windows:
+        if not win.turn_ids:
+            continue
+        first_tid = win.turn_ids[0]
+        w_id = generate_session_unit_id(scope.thread_id, "WINDOW", win.ordinal, first_tid)
+        if only_unit_ids is not None and w_id not in only_unit_ids:
+            continue
+        w_row = _build_span_session_unit(
+            unit_kind="WINDOW",
+            ordinal=win.ordinal,
+            episode_id=win.episode_id,
+            episode_ordinal=ep_ord_by_id.get(win.episode_id, 0),
+            window_id=win.window_id,
+            turn_ids=win.turn_ids,
+            scope=scope,
+            embedding_sig=embedding_sig,
+            collection_name=collection_name,
+            turns_by_id=index.turns_by_id,
+        )
+        items.append((w_row, win.dense_vector, _sparse_qdrant_dict_for_span(win.turn_ids, index=index)))
+
+    for ep in index.episodes:
+        if not ep.turn_ids:
+            continue
+        ep_uid = generate_session_unit_id(scope.thread_id, "EPISODE", ep.ordinal, ep.turn_ids[0])
+        if only_unit_ids is not None and ep_uid not in only_unit_ids:
+            continue
+        ep_row = _build_span_session_unit(
+            unit_kind="EPISODE",
+            ordinal=ep.ordinal,
+            episode_id=ep.episode_id,
+            episode_ordinal=ep.ordinal,
+            window_id=None,
+            turn_ids=ep.turn_ids,
+            scope=scope,
+            embedding_sig=embedding_sig,
+            collection_name=collection_name,
+            turns_by_id=index.turns_by_id,
+        )
+        items.append((ep_row, ep.centroid, _sparse_qdrant_dict_for_span(ep.turn_ids, index=index)))
+
+    return items
+
+
+async def backfill_pending_qdrant_for_thread(
+    session: AsyncSession,
+    *,
+    index: IncrementalSessionIndex,
+    scope: SessionPersistenceScope,
+    embedding_sig: str,
+    embedder: Any | None = None,
+    qdrant_client: httpx.AsyncClient | None = None,
+    commit_if_clean: bool = True,
+    caller_had_pending_state: bool = False,
+) -> int:
+    """Retry/backfill any missing or pending Qdrant `SessionUnit` points for `scope.thread_id`."""
+    if not index.turns:
+        index.qdrant_sync_pending = False
+        index.qdrant_rebuild_pending = False
+        return 0
+
+    client, should_close = _open_qdrant_client_context(session, qdrant_client)
+    if client is None:
+        return 0
+
+    collection_name = session_qdrant_collection_name(scope.project_id)
+    try:
+        all_items = _build_qdrant_items_from_index(
+            index,
+            scope=scope,
+            embedding_sig=embedding_sig,
+        )
+        _validate_vectors_for_persistence(
+            index=index,
+            qdrant_upsert_batch=all_items,
+            embedding_sig=embedding_sig,
+            embedder=embedder,
+        )
+        all_expected_ids = {u.id for u, _, _ in all_items}
+
+        db_unsynced_ids = set(
+            (
+                await session.execute(
+                    select(SessionUnit.id).where(
+                        SessionUnit.thread_id == scope.thread_id,
+                        SessionUnit.qdrant_point_id.is_(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        if index.qdrant_rebuild_pending:
+            await delete_thread_points_from_qdrant(
+                client,
+                project_id=scope.project_id,
+                thread_id=scope.thread_id,
+            )
+            index.qdrant_rebuild_pending = False
+            items_to_upsert = all_items
+        else:
+            existing_pts = await _scroll_thread_qdrant_points(
+                client,
+                project_id=scope.project_id,
+                thread_id=scope.thread_id,
+            )
+            stale_pids: list[str] = []
+            present_uids: set[str] = set()
+            for pt in existing_pts:
+                pid = pt.get("id")
+                payload = pt.get("payload") or {}
+                uid = str(payload.get("session_unit_id") or "")
+                pt_sig = str(payload.get("embedding_model_signature") or "")
+                if not uid or uid not in all_expected_ids or (pt_sig and pt_sig != embedding_sig):
+                    if pid:
+                        stale_pids.append(str(pid))
+                else:
+                    present_uids.add(uid)
+
+            if stale_pids:
+                del_res = await client.post(
+                    f"/collections/{collection_name}/points/delete?wait=true",
+                    json={"points": stale_pids},
+                )
+                if del_res.status_code >= 400 and del_res.status_code != 404:
+                    del_res.raise_for_status()
+
+            missing_ids = db_unsynced_ids | (all_expected_ids - present_uids)
+            items_to_upsert = [item for item in all_items if item[0].id in missing_ids]
+
+        upserted = 0
+        if items_to_upsert:
+            upserted = await upsert_session_units_to_qdrant(
+                client,
+                project_id=scope.project_id,
+                items=items_to_upsert,
+            )
+            await _mark_units_qdrant_synced(
+                session,
+                collection_name=collection_name,
+                synced_units=[u for u, _, _ in items_to_upsert],
+                commit_if_clean=commit_if_clean,
+                caller_had_pending_state=caller_had_pending_state,
+            )
+        elif db_unsynced_ids:
+            # Points were already in Qdrant, only DB markers were missing
+            synced_objs = [item[0] for item in all_items if item[0].id in db_unsynced_ids]
+            await _mark_units_qdrant_synced(
+                session,
+                collection_name=collection_name,
+                synced_units=synced_objs,
+                commit_if_clean=commit_if_clean,
+                caller_had_pending_state=caller_had_pending_state,
+            )
+
+        index.qdrant_sync_pending = False
+        index.qdrant_rebuild_pending = False
+        return upserted
+    except Exception as q_exc:  # noqa: BLE001
+        index.qdrant_sync_pending = True
+        log.warning(
+            "Deferred Qdrant backfill failed project=%s thread=%s err=%s",
+            scope.project_id,
+            scope.thread_id,
+            sanitize_error_message(q_exc),
+        )
+        return 0
+    finally:
+        if should_close:
+            await client.aclose()
+
+
 async def sync_session_index_to_storage(
     session: AsyncSession,
     *,
@@ -1019,11 +1615,19 @@ async def sync_session_index_to_storage(
     start_decision_idx: int = 0,
     mutated_prior_turn_ids: set[str] | None = None,
     grown_episode_ordinal: int | None = None,
+    embedder: Any | None = None,
     qdrant_client: httpx.AsyncClient | None = None,
     commit_if_clean: bool = True,
     caller_had_pending_state: bool = False,
 ) -> PersistenceSyncStats:
     """Persist `IncrementalSessionIndex` (`mode='rebuild'` or `mode='delta'`) to PostgreSQL & Qdrant."""
+    _validate_vectors_for_persistence(
+        index=index,
+        qdrant_upsert_batch=(),
+        embedding_sig=embedding_sig,
+        embedder=embedder,
+    )
+
     stats = PersistenceSyncStats(status=mode)
     collection_name = session_qdrant_collection_name(scope.project_id)
     ep_ord_by_id = {ep.episode_id: ep.ordinal for ep in index.episodes}
@@ -1038,279 +1642,342 @@ async def sync_session_index_to_storage(
             decision_ids_by_turn[dec.turn_id] = generate_session_decision_id(u_id, dec.topic_slot_key)
 
     qdrant_upsert_batch: list[tuple[SessionUnit, Sequence[float], dict[str, list]]] = []
+    prior_unsynced_ids: set[str] = set()
 
-    async with session.begin_nested():
-        if mode == "rebuild":
-            await purge_thread_session_rows(session, thread_id=scope.thread_id)
-            start_turn_ordinal = 0
-            start_window_ordinal = 0
-            start_episode_ordinal = 0
-            start_decision_idx = 0
-            mutated_prior_turn_ids = set()
-            grown_episode_ordinal = None
-
-        # 1. Update newly superseded prior TURN units (`epistemic_status` & `valid_to` only)
-        for prior_tid in sorted(mutated_prior_turn_ids or ()):
-            prior_turn = index.turns_by_id.get(prior_tid)
-            if prior_turn is None or prior_turn.ordinal >= start_turn_ordinal:
-                continue
-            prior_uid = turn_unit_ids[prior_tid]
-            _, new_valid_to = _turn_valid_window(prior_turn, index.turns_by_id)
-            await session.execute(
-                update(SessionUnit)
-                .where(SessionUnit.id == prior_uid)
-                .values(
-                    epistemic_status=prior_turn.epistemic_status,
-                    valid_to=new_valid_to,
-                )
-            )
-            rebuilt_unit = _build_turn_session_unit(
-                prior_turn,
-                scope=scope,
-                episode_ordinal=ep_ord_by_id.get(prior_turn.episode_id, 0),
-                embedding_sig=embedding_sig,
-                collection_name=collection_name,
-                turns_by_id=index.turns_by_id,
-            )
-            qdrant_upsert_batch.append(
-                (rebuilt_unit, prior_turn.dense_vector, _sparse_qdrant_dict_for_turn(prior_turn))
-            )
-
-        # 2. Insert new TURN units
-        new_turn_units: list[SessionUnit] = []
-        for turn in index.turns[start_turn_ordinal:]:
-            u_row = _build_turn_session_unit(
-                turn,
-                scope=scope,
-                episode_ordinal=ep_ord_by_id.get(turn.episode_id, 0),
-                embedding_sig=embedding_sig,
-                collection_name=collection_name,
-                turns_by_id=index.turns_by_id,
-            )
-            new_turn_units.append(u_row)
-            qdrant_upsert_batch.append(
-                (u_row, turn.dense_vector, _sparse_qdrant_dict_for_turn(turn))
-            )
-        if new_turn_units:
-            session.add_all(new_turn_units)
-
-        # 3. Insert new WINDOW units
-        new_window_units: list[SessionUnit] = []
-        for win in index.windows[start_window_ordinal:]:
-            if not win.turn_ids:
-                continue
-            w_row = _build_span_session_unit(
-                unit_kind="WINDOW",
-                ordinal=win.ordinal,
-                episode_id=win.episode_id,
-                episode_ordinal=ep_ord_by_id.get(win.episode_id, 0),
-                window_id=win.window_id,
-                turn_ids=win.turn_ids,
-                scope=scope,
-                embedding_sig=embedding_sig,
-                collection_name=collection_name,
-                turns_by_id=index.turns_by_id,
-            )
-            new_window_units.append(w_row)
-            qdrant_upsert_batch.append(
-                (
-                    w_row,
-                    win.dense_vector,
-                    _sparse_qdrant_dict_for_span(win.turn_ids, index=index),
-                )
-            )
-        if new_window_units:
-            session.add_all(new_window_units)
-
-        # 4. Replace grown active EPISODE unit via DELETE + INSERT (respects immutable update trigger)
-        if grown_episode_ordinal is not None and 0 <= grown_episode_ordinal < start_episode_ordinal:
-            grown_ep = index.episodes[grown_episode_ordinal]
-            grown_ep_uid = generate_session_unit_id(
-                scope.thread_id, "EPISODE", grown_ep.ordinal, grown_ep.turn_ids[0]
-            )
-            await session.execute(
-                delete(SessionGraphEdge).where(
-                    or_(
-                        SessionGraphEdge.source_unit_id == grown_ep_uid,
-                        SessionGraphEdge.target_unit_id == grown_ep_uid,
+    try:
+        async with session.begin_nested():
+            if mode == "rebuild":
+                await purge_thread_session_rows(session, thread_id=scope.thread_id)
+                start_turn_ordinal = 0
+                start_window_ordinal = 0
+                start_episode_ordinal = 0
+                start_decision_idx = 0
+                mutated_prior_turn_ids = set()
+                grown_episode_ordinal = None
+            else:
+                prior_unsynced_ids = set(
+                    (
+                        await session.execute(
+                            select(SessionUnit.id).where(
+                                SessionUnit.thread_id == scope.thread_id,
+                                SessionUnit.qdrant_point_id.is_(None),
+                            )
+                        )
                     )
+                    .scalars()
+                    .all()
                 )
-            )
-            await session.execute(
-                delete(SessionUnitMessage).where(SessionUnitMessage.session_unit_id == grown_ep_uid)
-            )
-            await session.execute(delete(SessionUnit).where(SessionUnit.id == grown_ep_uid))
-            await session.flush()
-            _expunge_derived_from_identity_map(
-                session,
-                thread_id=scope.thread_id,
-                only_unit_id=grown_ep_uid,
-            )
 
-            ep_row = _build_span_session_unit(
-                unit_kind="EPISODE",
-                ordinal=grown_ep.ordinal,
-                episode_id=grown_ep.episode_id,
-                episode_ordinal=grown_ep.ordinal,
-                window_id=None,
-                turn_ids=grown_ep.turn_ids,
-                scope=scope,
-                embedding_sig=embedding_sig,
-                collection_name=collection_name,
-                turns_by_id=index.turns_by_id,
-            )
-            session.add(ep_row)
-            qdrant_upsert_batch.append(
-                (
-                    ep_row,
-                    grown_ep.centroid,
-                    _sparse_qdrant_dict_for_span(grown_ep.turn_ids, index=index),
-                )
-            )
-            stats.units_written += 1
-
-        # 5. Insert brand-new EPISODE units
-        new_episode_units: list[SessionUnit] = []
-        for ep in index.episodes[start_episode_ordinal:]:
-            if not ep.turn_ids:
-                continue
-            ep_row = _build_span_session_unit(
-                unit_kind="EPISODE",
-                ordinal=ep.ordinal,
-                episode_id=ep.episode_id,
-                episode_ordinal=ep.ordinal,
-                window_id=None,
-                turn_ids=ep.turn_ids,
-                scope=scope,
-                embedding_sig=embedding_sig,
-                collection_name=collection_name,
-                turns_by_id=index.turns_by_id,
-            )
-            new_episode_units.append(ep_row)
-            qdrant_upsert_batch.append(
-                (
-                    ep_row,
-                    ep.centroid,
-                    _sparse_qdrant_dict_for_span(ep.turn_ids, index=index),
-                )
-            )
-        if new_episode_units:
-            session.add_all(new_episode_units)
-
-        await session.flush()
-        stats.units_written += (
-            len(new_turn_units) + len(new_window_units) + len(new_episode_units)
-        )
-
-        # 6. Insert new SessionDecisionLedger entries in chronological flush order (lineage-safe)
-        for dec_idx in range(start_decision_idx, len(index.decision_ledger)):
-            entry = index.decision_ledger[dec_idx]
-            u_id = turn_unit_ids.get(entry.turn_id)
-            turn_obj = index.turns_by_id.get(entry.turn_id)
-            if not u_id or turn_obj is None:
-                continue
-            dec_id = decision_ids_by_turn[entry.turn_id]
-            superseded_dec_ids = [
-                decision_ids_by_turn[tid]
-                for tid in entry.supersedes_turn_ids
-                if tid in decision_ids_by_turn
-            ]
-            primary_supersedes_id = superseded_dec_ids[-1] if superseded_dec_ids else None
-            valid_from = _ts_to_utc(entry.valid_from_ts)
-            ledger_kind = "OPEN_ISSUE" if entry.epistemic_status == "OPEN_ISSUE" else "DECISION"
-            companion_uids = [
-                turn_unit_ids[cid] for cid in entry.companion_turn_ids if cid in turn_unit_ids
-            ]
-            dec_row = SessionDecisionLedger(
-                id=dec_id,
-                tenant_id=scope.tenant_id,
-                project_id=scope.project_id,
-                thread_id=scope.thread_id,
-                session_unit_id=u_id,
-                ledger_kind=ledger_kind,
-                topic_slot_key=entry.topic_slot_key,
-                turn_ordinal=entry.turn_ordinal,
-                epistemic_status=(
-                    "NEGATED" if turn_obj.epistemic_status == "NEGATED" else turn_obj.epistemic_status
-                )
-                if entry.superseded_by_turn_id is None
-                else entry.epistemic_status,
-                summary_text=entry.summary_text,
-                entity_keys_json=list(entry.entity_keys),
-                superseded_entity_keys_json=list(turn_obj.superseded_entity_keys),
-                companion_unit_ids_json=companion_uids,
-                supersedes_id=primary_supersedes_id,
-                superseded_by_id=None,
-                supersedes_ids_json=superseded_dec_ids,
-                security_partition_ids_json=list(scope.security_partition_ids),
-                cited_source_ids_json=list(turn_obj.cited_source_ids),
-                valid_from=valid_from,
-                valid_to=(
-                    valid_from
-                    if turn_obj.epistemic_status == "NEGATED" and entry.superseded_by_turn_id is None
-                    else SESSION_OPEN_ENDED_VALID_TO
-                ),
-            )
-            session.add(dec_row)
-            await session.flush()
-
-            # Close any prior decision entries superseded or confirmed by `entry.turn_id`
-            for prior_idx in range(0, dec_idx):
-                prior_entry = index.decision_ledger[prior_idx]
-                if prior_entry.superseded_by_turn_id != entry.turn_id:
+            # 1. Update newly superseded prior TURN units (`epistemic_status`, `valid_to`, dirty `qdrant_point_id`)
+            for prior_tid in sorted(mutated_prior_turn_ids or ()):
+                prior_turn = index.turns_by_id.get(prior_tid)
+                if prior_turn is None or prior_turn.ordinal >= start_turn_ordinal:
                     continue
-                prior_dec_id = decision_ids_by_turn.get(prior_entry.turn_id)
-                if not prior_dec_id:
-                    continue
-                prior_from = _ts_to_utc(prior_entry.valid_from_ts)
-                closed_to = max(prior_from, valid_from)
+                prior_uid = turn_unit_ids[prior_tid]
+                _, new_valid_to = _turn_valid_window(prior_turn, index.turns_by_id)
                 await session.execute(
-                    update(SessionDecisionLedger)
-                    .where(SessionDecisionLedger.id == prior_dec_id)
+                    update(SessionUnit)
+                    .where(SessionUnit.id == prior_uid)
                     .values(
-                        epistemic_status=prior_entry.epistemic_status,
-                        superseded_by_id=dec_id,
-                        valid_to=closed_to,
+                        epistemic_status=prior_turn.epistemic_status,
+                        valid_to=new_valid_to,
+                        qdrant_point_id=None,
                     )
                 )
-
-        # 7. Insert SessionGraphEdge rows for newly indexed turns
-        new_edges: list[SessionGraphEdge] = []
-        for turn in index.turns[start_turn_ordinal:]:
-            new_edges.extend(
-                _build_turn_graph_edges(
-                    turn,
-                    index=index,
+                rebuilt_unit = _build_turn_session_unit(
+                    prior_turn,
                     scope=scope,
-                    turn_unit_ids=turn_unit_ids,
+                    episode_ordinal=ep_ord_by_id.get(prior_turn.episode_id, 0),
+                    embedding_sig=embedding_sig,
+                    collection_name=collection_name,
+                    turns_by_id=index.turns_by_id,
                 )
-            )
-        if new_edges:
-            session.add_all(new_edges)
+                qdrant_upsert_batch.append(
+                    (rebuilt_unit, prior_turn.dense_vector, _sparse_qdrant_dict_for_turn(prior_turn))
+                )
+
+            # 2. Insert new TURN units
+            new_turn_units: list[SessionUnit] = []
+            for turn in index.turns[start_turn_ordinal:]:
+                u_row = _build_turn_session_unit(
+                    turn,
+                    scope=scope,
+                    episode_ordinal=ep_ord_by_id.get(turn.episode_id, 0),
+                    embedding_sig=embedding_sig,
+                    collection_name=collection_name,
+                    turns_by_id=index.turns_by_id,
+                )
+                new_turn_units.append(u_row)
+                qdrant_upsert_batch.append(
+                    (u_row, turn.dense_vector, _sparse_qdrant_dict_for_turn(turn))
+                )
+            if new_turn_units:
+                session.add_all(new_turn_units)
+
+            # 3. Insert new WINDOW units
+            new_window_units: list[SessionUnit] = []
+            for win in index.windows[start_window_ordinal:]:
+                if not win.turn_ids:
+                    continue
+                w_row = _build_span_session_unit(
+                    unit_kind="WINDOW",
+                    ordinal=win.ordinal,
+                    episode_id=win.episode_id,
+                    episode_ordinal=ep_ord_by_id.get(win.episode_id, 0),
+                    window_id=win.window_id,
+                    turn_ids=win.turn_ids,
+                    scope=scope,
+                    embedding_sig=embedding_sig,
+                    collection_name=collection_name,
+                    turns_by_id=index.turns_by_id,
+                )
+                new_window_units.append(w_row)
+                qdrant_upsert_batch.append(
+                    (
+                        w_row,
+                        win.dense_vector,
+                        _sparse_qdrant_dict_for_span(win.turn_ids, index=index),
+                    )
+                )
+            if new_window_units:
+                session.add_all(new_window_units)
+
+            # 4. Replace grown active EPISODE unit via DELETE + INSERT (respects immutable update trigger)
+            if grown_episode_ordinal is not None and 0 <= grown_episode_ordinal < start_episode_ordinal:
+                grown_ep = index.episodes[grown_episode_ordinal]
+                grown_ep_uid = generate_session_unit_id(
+                    scope.thread_id, "EPISODE", grown_ep.ordinal, grown_ep.turn_ids[0]
+                )
+                prior_unsynced_ids.discard(grown_ep_uid)
+                await session.execute(
+                    delete(SessionGraphEdge).where(
+                        or_(
+                            SessionGraphEdge.source_unit_id == grown_ep_uid,
+                            SessionGraphEdge.target_unit_id == grown_ep_uid,
+                        )
+                    )
+                )
+                await session.execute(
+                    delete(SessionUnitMessage).where(SessionUnitMessage.session_unit_id == grown_ep_uid)
+                )
+                await session.execute(delete(SessionUnit).where(SessionUnit.id == grown_ep_uid))
+                await session.flush()
+                _expunge_derived_from_identity_map(
+                    session,
+                    thread_id=scope.thread_id,
+                    only_unit_id=grown_ep_uid,
+                )
+
+                ep_row = _build_span_session_unit(
+                    unit_kind="EPISODE",
+                    ordinal=grown_ep.ordinal,
+                    episode_id=grown_ep.episode_id,
+                    episode_ordinal=grown_ep.ordinal,
+                    window_id=None,
+                    turn_ids=grown_ep.turn_ids,
+                    scope=scope,
+                    embedding_sig=embedding_sig,
+                    collection_name=collection_name,
+                    turns_by_id=index.turns_by_id,
+                )
+                session.add(ep_row)
+                qdrant_upsert_batch.append(
+                    (
+                        ep_row,
+                        grown_ep.centroid,
+                        _sparse_qdrant_dict_for_span(grown_ep.turn_ids, index=index),
+                    )
+                )
+                stats.units_written += 1
+
+            # 5. Insert brand-new EPISODE units
+            new_episode_units: list[SessionUnit] = []
+            for ep in index.episodes[start_episode_ordinal:]:
+                if not ep.turn_ids:
+                    continue
+                ep_row = _build_span_session_unit(
+                    unit_kind="EPISODE",
+                    ordinal=ep.ordinal,
+                    episode_id=ep.episode_id,
+                    episode_ordinal=ep.ordinal,
+                    window_id=None,
+                    turn_ids=ep.turn_ids,
+                    scope=scope,
+                    embedding_sig=embedding_sig,
+                    collection_name=collection_name,
+                    turns_by_id=index.turns_by_id,
+                )
+                new_episode_units.append(ep_row)
+                qdrant_upsert_batch.append(
+                    (
+                        ep_row,
+                        ep.centroid,
+                        _sparse_qdrant_dict_for_span(ep.turn_ids, index=index),
+                    )
+                )
+            if new_episode_units:
+                session.add_all(new_episode_units)
+
             await session.flush()
+            stats.units_written += (
+                len(new_turn_units) + len(new_window_units) + len(new_episode_units)
+            )
 
-    if commit_if_clean and not caller_had_pending_state:
-        await session.commit()
+            # 6. Insert new SessionDecisionLedger entries in chronological flush order (lineage-safe)
+            for dec_idx in range(start_decision_idx, len(index.decision_ledger)):
+                entry = index.decision_ledger[dec_idx]
+                u_id = turn_unit_ids.get(entry.turn_id)
+                turn_obj = index.turns_by_id.get(entry.turn_id)
+                if not u_id or turn_obj is None:
+                    continue
+                dec_id = decision_ids_by_turn[entry.turn_id]
+                superseded_dec_ids = [
+                    decision_ids_by_turn[tid]
+                    for tid in entry.supersedes_turn_ids
+                    if tid in decision_ids_by_turn
+                ]
+                primary_supersedes_id = superseded_dec_ids[-1] if superseded_dec_ids else None
+                valid_from = _ts_to_utc(entry.valid_from_ts)
+                ledger_kind = "OPEN_ISSUE" if entry.epistemic_status == "OPEN_ISSUE" else "DECISION"
+                companion_uids = [
+                    turn_unit_ids[cid] for cid in entry.companion_turn_ids if cid in turn_unit_ids
+                ]
+                dec_row = SessionDecisionLedger(
+                    id=dec_id,
+                    tenant_id=scope.tenant_id,
+                    project_id=scope.project_id,
+                    thread_id=scope.thread_id,
+                    session_unit_id=u_id,
+                    ledger_kind=ledger_kind,
+                    topic_slot_key=entry.topic_slot_key,
+                    turn_ordinal=entry.turn_ordinal,
+                    epistemic_status=(
+                        "NEGATED" if turn_obj.epistemic_status == "NEGATED" else turn_obj.epistemic_status
+                    )
+                    if entry.superseded_by_turn_id is None
+                    else entry.epistemic_status,
+                    summary_text=entry.summary_text,
+                    entity_keys_json=list(entry.entity_keys),
+                    superseded_entity_keys_json=list(turn_obj.superseded_entity_keys),
+                    companion_unit_ids_json=companion_uids,
+                    supersedes_id=primary_supersedes_id,
+                    superseded_by_id=None,
+                    supersedes_ids_json=superseded_dec_ids,
+                    security_partition_ids_json=list(scope.security_partition_ids),
+                    cited_source_ids_json=list(turn_obj.cited_source_ids),
+                    valid_from=valid_from,
+                    valid_to=(
+                        valid_from
+                        if turn_obj.epistemic_status == "NEGATED" and entry.superseded_by_turn_id is None
+                        else SESSION_OPEN_ENDED_VALID_TO
+                    ),
+                )
+                session.add(dec_row)
+                await session.flush()
 
-    # 8. Sync derived vectors to Qdrant `session_units_{project_id}` (graceful fail-open if offline)
+                # Close any prior decision entries superseded or confirmed by `entry.turn_id`
+                for prior_idx in range(0, dec_idx):
+                    prior_entry = index.decision_ledger[prior_idx]
+                    if prior_entry.superseded_by_turn_id != entry.turn_id:
+                        continue
+                    prior_dec_id = decision_ids_by_turn.get(prior_entry.turn_id)
+                    if not prior_dec_id:
+                        continue
+                    prior_from = _ts_to_utc(prior_entry.valid_from_ts)
+                    closed_to = max(prior_from, valid_from)
+                    await session.execute(
+                        update(SessionDecisionLedger)
+                        .where(SessionDecisionLedger.id == prior_dec_id)
+                        .values(
+                            epistemic_status=prior_entry.epistemic_status,
+                            superseded_by_id=dec_id,
+                            valid_to=closed_to,
+                        )
+                    )
+
+            # 7. Insert SessionGraphEdge rows for newly indexed turns
+            new_edges: list[SessionGraphEdge] = []
+            for turn in index.turns[start_turn_ordinal:]:
+                new_edges.extend(
+                    _build_turn_graph_edges(
+                        turn,
+                        index=index,
+                        scope=scope,
+                        turn_unit_ids=turn_unit_ids,
+                    )
+                )
+            if new_edges:
+                session.add_all(new_edges)
+                await session.flush()
+
+        if commit_if_clean and not caller_had_pending_state:
+            await session.commit()
+    except BaseException:
+        if commit_if_clean and not caller_had_pending_state and session.in_transaction():
+            await session.rollback()
+        _expunge_derived_from_identity_map(session, thread_id=scope.thread_id)
+        raise
+
+    # Include any earlier `qdrant_point_id IS NULL` units so delta turns also heal past Qdrant outages
+    if index.qdrant_rebuild_pending:
+        qdrant_upsert_batch = _build_qdrant_items_from_index(
+            index,
+            scope=scope,
+            embedding_sig=embedding_sig,
+        )
+    elif prior_unsynced_ids:
+        queued_ids = {u.id for u, _, _ in qdrant_upsert_batch}
+        carryover_ids = prior_unsynced_ids - queued_ids
+        if carryover_ids:
+            qdrant_upsert_batch = [
+                *_build_qdrant_items_from_index(
+                    index,
+                    scope=scope,
+                    embedding_sig=embedding_sig,
+                    only_unit_ids=carryover_ids,
+                ),
+                *qdrant_upsert_batch,
+            ]
+
+    # 8. Sync derived vectors to Qdrant `session_units_{project_id}` (durable retry via qdrant_point_id IS NULL)
     client, should_close = _open_qdrant_client_context(session, qdrant_client)
     if client is not None:
+        if mode == "rebuild":
+            index.qdrant_rebuild_pending = True
+        if qdrant_upsert_batch or index.qdrant_rebuild_pending:
+            index.qdrant_sync_pending = True
         try:
-            if mode == "rebuild":
+            if index.qdrant_rebuild_pending:
                 await delete_thread_points_from_qdrant(
                     client,
                     project_id=scope.project_id,
                     thread_id=scope.thread_id,
                 )
+                index.qdrant_rebuild_pending = False
             if qdrant_upsert_batch:
+                _validate_vectors_for_persistence(
+                    index=index,
+                    qdrant_upsert_batch=qdrant_upsert_batch,
+                    embedding_sig=embedding_sig,
+                    embedder=embedder,
+                )
                 stats.qdrant_points_upserted = await upsert_session_units_to_qdrant(
                     client,
                     project_id=scope.project_id,
                     items=qdrant_upsert_batch,
                 )
+                await _mark_units_qdrant_synced(
+                    session,
+                    collection_name=collection_name,
+                    synced_units=[u for u, _, _ in qdrant_upsert_batch],
+                    commit_if_clean=commit_if_clean,
+                    caller_had_pending_state=caller_had_pending_state,
+                )
+            index.qdrant_sync_pending = False
         except Exception as q_exc:  # noqa: BLE001
+            index.qdrant_sync_pending = True
             log.warning(
-                "Qdrant session unit sync skipped project=%s thread=%s err=%s",
+                "Qdrant session unit sync deferred for retry project=%s thread=%s err=%s",
                 scope.project_id,
                 scope.thread_id,
                 sanitize_error_message(q_exc),
@@ -1332,7 +1999,7 @@ def _reconstruct_prefix_into_index(
     embedder: Any | None,
 ) -> None:
     """Hydrate prefix `0 .. K - 1` into `IncrementalSessionIndex` without re-running NER or HTTP embedding."""
-    target_mode = f"embedder:{type(embedder).__name__}" if embedder is not None else "deterministic_ngram"
+    target_mode = compute_embedding_signature(embedder)
     index.embedding_mode = target_mode
 
     unit_id_to_turn_id = {u.id: u.message_from_id for u in persisted_turn_units}
@@ -1379,7 +2046,11 @@ def _reconstruct_prefix_into_index(
             s_start = max(0, int(s_meta.get("start", 0)))
             s_end = min(len(content), max(s_start, int(s_meta.get("end", len(content)))))
             s_text = content[s_start:s_end].strip() or content
-            cached_s_vec = get_cached_text_embedding(s_text) if embedder is not None else None
+            cached_s_vec = (
+                get_cached_text_embedding(s_text, model_signature=target_mode)
+                if embedder is not None
+                else None
+            )
             if cached_s_vec is not None and len(cached_s_vec) == len(t_vec):
                 s_vec = l2_normalize(cached_s_vec)
             elif embedder is None:
@@ -1570,8 +2241,11 @@ async def hydrate_or_backfill_cold_session_index(
         raise
 
     if scope is None:
+        index.persistence_active = False
         await index.append_messages(project_records, embedder=embedder)
         return PersistenceSyncStats(status="memory_only")
+
+    index.persistence_active = True
 
     try:
         persisted_turn_units = list(
@@ -1592,6 +2266,7 @@ async def hydrate_or_backfill_cold_session_index(
         )
     except Exception as exc:  # noqa: BLE001
         if _is_missing_session_tables_error(exc):
+            index.persistence_active = False
             await index.append_messages(project_records, embedder=embedder)
             return PersistenceSyncStats(status="memory_only")
         raise
@@ -1599,6 +2274,7 @@ async def hydrate_or_backfill_cold_session_index(
     k_persisted = len(persisted_turn_units)
     n_visible = len(project_records)
     embedding_sig = compute_embedding_signature(embedder)
+    expected_dim = declared_embedder_dim(embedder)
 
     # Empty visible history: purge any lingering derived state if k_persisted > 0
     if n_visible == 0:
@@ -1635,6 +2311,14 @@ async def hydrate_or_backfill_cold_session_index(
     # Lazy Backfill (`k == 0`) or Reconciled Rebuild (delete / ACL revocation / model drift)
     if not prefix_ok:
         await index.append_messages(project_records, embedder=embedder)
+        if index.turns and index.embedding_mode != embedding_sig:
+            log.warning(
+                "Skipping cold persistence write for thread=%s: embedder degraded (%s != %s)",
+                scope.thread_id,
+                index.embedding_mode,
+                embedding_sig,
+            )
+            return PersistenceSyncStats(status="degraded_unpersisted")
         status_label = "lazy_backfill" if k_persisted == 0 else "reconciled_rebuild"
         sync_stats = await sync_session_index_to_storage(
             session,
@@ -1642,6 +2326,7 @@ async def hydrate_or_backfill_cold_session_index(
             scope=scope,
             embedding_sig=embedding_sig,
             mode="rebuild",
+            embedder=embedder,
             qdrant_client=qdrant_client,
             caller_had_pending_state=caller_had_pending_state,
         )
@@ -1650,6 +2335,7 @@ async def hydrate_or_backfill_cold_session_index(
 
     # Prefix `0 .. K - 1` is valid -> Hydrate from PostgreSQL + Qdrant with 0 HTTP re-embeddings!
     hydrated_vectors: dict[str, tuple[float, ...]] = {}
+    qdrant_missing_during_hydration = False
     if embedder is None:
         for idx_i, u_row in enumerate(persisted_turn_units):
             content_norm = normalize_session_text(str(project_records[idx_i]["content"]))
@@ -1658,8 +2344,12 @@ async def hydrate_or_backfill_cold_session_index(
         missing_units: list[tuple[SessionUnit, str]] = []
         for idx_i, u_row in enumerate(persisted_turn_units):
             content_norm = normalize_session_text(str(project_records[idx_i]["content"]))
-            cached_vec = get_cached_text_embedding(content_norm)
-            if cached_vec is not None:
+            cached_vec = get_cached_text_embedding(content_norm, model_signature=embedding_sig)
+            if (
+                cached_vec is not None
+                and len(cached_vec) > 0
+                and (expected_dim is None or len(cached_vec) == expected_dim)
+            ):
                 hydrated_vectors[u_row.id] = l2_normalize(cached_vec)
             else:
                 missing_units.append((u_row, content_norm))
@@ -1673,13 +2363,22 @@ async def hydrate_or_backfill_cold_session_index(
                         tenant_id=scope.tenant_id,
                         project_id=scope.project_id,
                         thread_id=scope.thread_id,
+                        expected_embedding_sig=embedding_sig,
+                        expected_dim=expected_dim,
                     )
                     for u_row, content_norm in missing_units:
                         q_vec = q_vecs.get(u_row.id)
                         if q_vec is not None:
                             hydrated_vectors[u_row.id] = q_vec
-                            put_cached_text_embedding(content_norm, q_vec)
+                            put_cached_text_embedding(
+                                content_norm,
+                                q_vec,
+                                model_signature=embedding_sig,
+                            )
+                        else:
+                            qdrant_missing_during_hydration = True
                 except Exception as q_exc:  # noqa: BLE001
+                    index.qdrant_sync_pending = True
                     log.warning(
                         "Cold-start Qdrant vector hydration fallback thread=%s err=%s",
                         scope.thread_id,
@@ -1695,10 +2394,13 @@ async def hydrate_or_backfill_cold_session_index(
                 if u_row.id not in hydrated_vectors
             ]
             if still_missing:
-                fallback_vecs = await embed_texts_with_main_cache(
+                fallback_vecs, actual_sig = await embed_texts_with_provenance(
                     [txt for _, txt in still_missing],
                     embedder=embedder,
                 )
+                if actual_sig != embedding_sig:
+                    await index.append_messages(project_records, embedder=None)
+                    return PersistenceSyncStats(status="degraded_unpersisted")
                 for (u_row, _), f_vec in zip(still_missing, fallback_vecs, strict=True):
                     hydrated_vectors[u_row.id] = f_vec
 
@@ -1728,9 +2430,31 @@ async def hydrate_or_backfill_cold_session_index(
     )
 
     if k_persisted == n_visible:
+        has_db_unsynced = (
+            await session.execute(
+                select(SessionUnit.id)
+                .where(
+                    SessionUnit.thread_id == scope.thread_id,
+                    SessionUnit.qdrant_point_id.is_(None),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none() is not None
+        repaired_pts = 0
+        if has_db_unsynced or qdrant_missing_during_hydration:
+            repaired_pts = await backfill_pending_qdrant_for_thread(
+                session,
+                index=index,
+                scope=scope,
+                embedding_sig=embedding_sig,
+                embedder=embedder,
+                qdrant_client=qdrant_client,
+                caller_had_pending_state=caller_had_pending_state,
+            )
         return PersistenceSyncStats(
             status="hydrated_clean",
             hydrated_turns=k_persisted,
+            qdrant_points_upserted=repaired_pts,
         )
 
     # Append ONLY the unseen tail `K .. N - 1` (`O(Delta)`!)
@@ -1743,6 +2467,14 @@ async def hydrate_or_backfill_cold_session_index(
     }
 
     await index.append_messages(project_records[k_persisted:], embedder=embedder)
+    if index.turns and index.embedding_mode != embedding_sig:
+        log.warning(
+            "Skipping delta persistence write for thread=%s: embedder degraded (%s != %s)",
+            scope.thread_id,
+            index.embedding_mode,
+            embedding_sig,
+        )
+        return PersistenceSyncStats(status="degraded_unpersisted")
 
     mutated_prior_turns = {
         tid
@@ -1768,6 +2500,7 @@ async def hydrate_or_backfill_cold_session_index(
         start_decision_idx=prev_dec_count,
         mutated_prior_turn_ids=mutated_prior_turns,
         grown_episode_ordinal=grown_ep_ord,
+        embedder=embedder,
         qdrant_client=qdrant_client,
         caller_had_pending_state=caller_had_pending_state,
     )
