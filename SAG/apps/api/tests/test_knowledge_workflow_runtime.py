@@ -724,3 +724,47 @@ def test_selection_scope_revalidation_rejects_revoked_or_changed_mapping():
         _verify_selection_scope({"v"}, {"v": original}, {"v": changed})
     with pytest.raises(ServiceUnavailableError):
         _verify_selection_scope({"v"}, {"v": original}, {})
+
+
+@pytest.mark.asyncio
+async def test_persistent_cpu_worker_reuses_process_across_calls():
+    loop = asyncio.get_running_loop()
+    first = await cpu_worker.run_cpu("minhash", {"texts": {"a": "alpha beta gamma"}})
+    pid_first = cpu_worker._WORKERS[loop].process.pid
+    second = await cpu_worker.run_cpu("minhash", {"texts": {"b": "delta epsilon zeta"}})
+    pid_second = cpu_worker._WORKERS[loop].process.pid
+    assert pid_first is not None and pid_first == pid_second
+    assert len(first["a"]) == 128 and len(second["b"]) == 128
+
+
+@pytest.mark.asyncio
+async def test_request_completed_trees_skips_in_flight_scheduling_jobs(ingestion_db, monkeypatch):
+    await ready(ingestion_db)
+    queue = SimpleNamespace(enqueue=AsyncMock())
+    worker = KnowledgeWorker(
+        ingestion_db,
+        Settings(),
+        embed=SimpleNamespace(batch_generate=AsyncMock(return_value=[[1.0, 0.0]])),
+        job_queue=queue,
+    )
+    await worker.discover()
+    async with ingestion_db() as session:
+        job = await session.scalar(select(KnowledgeJob))
+        job.status = "SUCCEEDED"
+        job.tree_requested_at = None
+        job_id = job.id
+        await session.commit()
+    calls = 0
+
+    async def count_enqueue(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr(universe_tree_service, "enqueue_tree_rebuild_for_version", count_enqueue)
+    worker.scheduling_tree_jobs.add(job_id)
+    await worker._request_completed_trees()
+    assert calls == 0
+    worker.scheduling_tree_jobs.discard(job_id)
+    await worker._request_completed_trees()
+    assert calls == 1
+

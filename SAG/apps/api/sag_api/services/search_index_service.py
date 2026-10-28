@@ -148,6 +148,9 @@ def compute_sparse_bm25_vector(
     }
 
 
+import asyncio
+from weakref import WeakKeyDictionary
+
 PAYLOAD_INDEX_FIELDS = [
     ("tenant_id", "keyword"),
     ("project_id", "keyword"),
@@ -165,6 +168,9 @@ PAYLOAD_INDEX_FIELDS = [
     ("secondary_node_ids_b", "keyword"),
 ]
 
+_VERIFIED_CLIENT_COLLECTIONS: WeakKeyDictionary[Any, set[tuple[str, int]]] = WeakKeyDictionary()
+_CLIENT_COLLECTION_LOCKS: WeakKeyDictionary[Any, dict[str, asyncio.Lock]] = WeakKeyDictionary()
+
 
 async def ensure_qdrant_collection_and_indexes(
     qdrant_client: httpx.AsyncClient,
@@ -172,75 +178,121 @@ async def ensure_qdrant_collection_and_indexes(
     vector_dim: int = 1536,
 ) -> None:
     """Ensure per-project collection exists with dense+sparse config and pre-provisioned payload indexes."""
-    # 0. Check if collection already exists to verify vector dimension compatibility
-    try:
-        info_res = await qdrant_client.get(f"/collections/{collection_name}")
-        if info_res.is_success:
-            cfg = info_res.json().get("result", {}).get("config", {})
-            existing_vectors = cfg.get("params", {}).get("vectors", {})
-            if isinstance(existing_vectors, dict) and "content_vector" in existing_vectors:
-                existing_dim = existing_vectors["content_vector"].get("size")
-                if existing_dim and existing_dim != vector_dim:
-                    raise ValueError(
-                        f"Qdrant collection {collection_name} dimension mismatch: "
-                        f"existing {existing_dim} vs required {vector_dim}"
-                    )
-    except Exception as check_exc:
-        if isinstance(check_exc, ValueError):
-            raise
-        log.debug("Collection check skipped or non-fatal: %s", sanitize_error_message(check_exc))
+    verified_set = _VERIFIED_CLIENT_COLLECTIONS.get(qdrant_client)
+    if verified_set is not None and (collection_name, vector_dim) in verified_set:
+        return
 
-    # 1. Create collection with dense and sparse vectors
-    try:
-        col_res = await qdrant_client.put(
-            f"/collections/{collection_name}",
-            json={
-                "vectors": {
-                    "content_vector": {
-                        "size": vector_dim,
-                        "distance": "Cosine",
-                    }
-                },
-                "sparse_vectors": {
-                    "bm25_sparse": {
-                        "modifier": "idf"
-                    }
-                }
-            },
-        )
-        if col_res.status_code >= 400 and col_res.status_code != 409:
-            err_text = col_res.text.lower()
-            if "already exists" not in err_text:
-                raise RuntimeError(
-                    f"Failed to create Qdrant collection {collection_name}: HTTP {col_res.status_code} - {col_res.text}"
+    locks_by_col = _CLIENT_COLLECTION_LOCKS.get(qdrant_client)
+    if locks_by_col is None:
+        locks_by_col = {}
+        try:
+            _CLIENT_COLLECTION_LOCKS[qdrant_client] = locks_by_col
+        except TypeError:
+            locks_by_col = {}
+    col_lock = locks_by_col.setdefault(collection_name, asyncio.Lock())
+
+    async with col_lock:
+        verified_set = _VERIFIED_CLIENT_COLLECTIONS.get(qdrant_client)
+        if verified_set is not None and (collection_name, vector_dim) in verified_set:
+            return
+
+        # 0. Check if collection already exists to verify vector dimension compatibility and existing indexes
+        collection_ready = False
+        collection_verified = False
+        existing_indexed_fields: set[str] = set()
+        try:
+            info_res = await qdrant_client.get(f"/collections/{collection_name}")
+            if info_res.is_success:
+                result_data = info_res.json().get("result", {})
+                if isinstance(result_data, dict):
+                    cfg = result_data.get("config", {})
+                    existing_vectors = cfg.get("params", {}).get("vectors", {})
+                    existing_sparse = cfg.get("params", {}).get("sparse_vectors", {})
+                    if isinstance(existing_vectors, dict) and "content_vector" in existing_vectors:
+                        existing_dim = existing_vectors["content_vector"].get("size")
+                        if existing_dim and existing_dim != vector_dim:
+                            raise ValueError(
+                                f"Qdrant collection {collection_name} dimension mismatch: "
+                                f"existing {existing_dim} vs required {vector_dim}"
+                            )
+                        if isinstance(existing_sparse, dict) and "bm25_sparse" in existing_sparse:
+                            collection_ready = True
+                            collection_verified = True
+                    payload_schema = result_data.get("payload_schema")
+                    if isinstance(payload_schema, dict):
+                        existing_indexed_fields = set(payload_schema.keys())
+        except Exception as check_exc:
+            if isinstance(check_exc, ValueError):
+                raise
+            log.debug("Collection check skipped or non-fatal: %s", sanitize_error_message(check_exc))
+
+        # 1. Create collection with dense and sparse vectors when not already verified
+        if not collection_ready:
+            try:
+                col_res = await qdrant_client.put(
+                    f"/collections/{collection_name}",
+                    json={
+                        "vectors": {
+                            "content_vector": {
+                                "size": vector_dim,
+                                "distance": "Cosine",
+                            }
+                        },
+                        "sparse_vectors": {
+                            "bm25_sparse": {
+                                "modifier": "idf"
+                            }
+                        }
+                    },
                 )
-    except Exception as exc:
-        if isinstance(exc, (RuntimeError, ValueError)):
-            raise
-        log.warning("Could not ensure Qdrant collection %s: %s", collection_name, sanitize_error_message(exc))
+                if col_res.status_code >= 400 and col_res.status_code != 409:
+                    err_text = col_res.text.lower()
+                    if "already exists" not in err_text:
+                        raise RuntimeError(
+                            f"Failed to create Qdrant collection {collection_name}: HTTP {col_res.status_code} - {col_res.text}"
+                        )
+                collection_verified = True
+            except Exception as exc:
+                if isinstance(exc, (RuntimeError, ValueError)):
+                    raise
+                log.warning("Could not ensure Qdrant collection %s: %s", collection_name, sanitize_error_message(exc))
 
-    # 2. Pre-provision payload indexes for fast filtering; fail stage if index creation fails
-    import asyncio
-
-    async def _create_payload_index(field_name: str, field_schema: str) -> None:
-        idx_res = await qdrant_client.put(
-            f"/collections/{collection_name}/index?wait=true",
-            json={
-                "field_name": field_name,
-                "field_schema": field_schema,
-            },
-        )
-        if idx_res.status_code >= 400 and idx_res.status_code != 409:
-            err_text = idx_res.text.lower()
-            if "already exists" not in err_text:
-                raise RuntimeError(
-                    f"Failed to create Qdrant payload index '{field_name}' ({field_schema}): "
-                    f"HTTP {idx_res.status_code} - {idx_res.text}"
+        # 2. Pre-provision missing payload indexes for fast filtering; fail stage if index creation fails
+        missing_index_fields = [
+            (fname, fschema)
+            for fname, fschema in PAYLOAD_INDEX_FIELDS
+            if fname not in existing_indexed_fields
+        ]
+        if missing_index_fields:
+            async def _create_payload_index(field_name: str, field_schema: str) -> None:
+                idx_res = await qdrant_client.put(
+                    f"/collections/{collection_name}/index?wait=true",
+                    json={
+                        "field_name": field_name,
+                        "field_schema": field_schema,
+                    },
                 )
+                if idx_res.status_code >= 400 and idx_res.status_code != 409:
+                    err_text = idx_res.text.lower()
+                    if "already exists" not in err_text:
+                        raise RuntimeError(
+                            f"Failed to create Qdrant payload index '{field_name}' ({field_schema}): "
+                            f"HTTP {idx_res.status_code} - {idx_res.text}"
+                        )
 
-    await asyncio.gather(
-        *(_create_payload_index(fname, fschema) for fname, fschema in PAYLOAD_INDEX_FIELDS)
-    )
+            await asyncio.gather(
+                *(_create_payload_index(fname, fschema) for fname, fschema in missing_index_fields)
+            )
+
+        if collection_verified:
+            try:
+                vset = _VERIFIED_CLIENT_COLLECTIONS.get(qdrant_client)
+                if vset is None:
+                    vset = set()
+                    _VERIFIED_CLIENT_COLLECTIONS[qdrant_client] = vset
+                vset.add((collection_name, vector_dim))
+            except TypeError:
+                pass
 
 
 def build_search_units_from_blocks(

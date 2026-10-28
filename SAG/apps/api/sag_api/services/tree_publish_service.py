@@ -477,6 +477,21 @@ def _validate_qdrant_completed(data: Any) -> None:
         raise PublishVerificationError("Qdrant did not confirm completed payload writes")
 
 
+def _validate_qdrant_batch_completed(data: Any, expected_count: int) -> None:
+    result = data.get("result") if isinstance(data, dict) else None
+    if not isinstance(data, dict) or data.get("status") != "ok":
+        raise PublishVerificationError("Qdrant did not confirm completed payload writes")
+    if isinstance(result, list):
+        if len(result) != expected_count or any(
+            not isinstance(item, dict) or item.get("status") != "completed" for item in result
+        ):
+            raise PublishVerificationError("Qdrant did not confirm completed payload writes")
+        return
+    if isinstance(result, dict) and result.get("status") == "completed":
+        return
+    raise PublishVerificationError("Qdrant did not confirm completed payload writes")
+
+
 async def update_inactive_slot_qdrant_payloads(
     qdrant_client: httpx.AsyncClient,
     collection_name: str,
@@ -484,10 +499,34 @@ async def update_inactive_slot_qdrant_payloads(
 ) -> None:
     if not payload_batches:
         raise PublishVerificationError("Tree candidate produced no Qdrant payload writes")
-    path = f"/collections/{quote(collection_name, safe='')}/points/payload?wait=true"
+    quoted_collection = quote(collection_name, safe="")
+    single_path = f"/collections/{quoted_collection}/points/payload?wait=true"
+    if len(payload_batches) > 1:
+        batch_path = f"/collections/{quoted_collection}/points/batch?wait=true"
+        fallback_to_single = False
+        for start in range(0, len(payload_batches), _MAX_QDRANT_POINT_BATCH):
+            chunk = payload_batches[start : start + _MAX_QDRANT_POINT_BATCH]
+            try:
+                response = await qdrant_client.post(
+                    batch_path,
+                    json={"operations": [{"set_payload": item} for item in chunk]},
+                )
+                if response.status_code in (404, 405):
+                    fallback_to_single = True
+                    break
+                if response.status_code != 200:
+                    raise PublishVerificationError("Qdrant payload write returned an error status")
+                _validate_qdrant_batch_completed(response.json(), len(chunk))
+            except PublishVerificationError:
+                raise
+            except (httpx.HTTPError, ValueError, TypeError) as error:
+                raise PublishVerificationError("Qdrant payload write could not be acknowledged") from error
+        if not fallback_to_single:
+            return
+
     for batch in payload_batches:
         try:
-            response = await qdrant_client.post(path, json=batch)
+            response = await qdrant_client.post(single_path, json=batch)
             if response.status_code != 200:
                 raise PublishVerificationError("Qdrant payload write returned an error status")
             _validate_qdrant_completed(response.json())
@@ -691,21 +730,30 @@ async def _verify_qdrant_slot(
         {"key": "tenant_id", "match": {"value": candidate.tenant_id}},
     ]
     collection = f"search_units_{candidate.project_id}"
-    total = await _count_qdrant_points(qdrant_client, collection, common)
-    if total != candidate.expected_point_count:
+    count_tasks = [
+        _count_qdrant_points(qdrant_client, collection, common),
+        *(
+            _count_qdrant_points(
+                qdrant_client,
+                collection,
+                [*common, {"key": "security_partition_id", "match": {"value": partition_id}}],
+            )
+            for partition_id, _expected in candidate.partition_counts
+        ),
+    ]
+    counts_and_payloads = await asyncio.gather(
+        *count_tasks,
+        _verify_qdrant_point_payloads(candidate, target_slot, qdrant_client),
+    )
+    counts = counts_and_payloads[:-1]
+    if counts[0] != candidate.expected_point_count:
         raise PublishVerificationError("Qdrant total point count does not match the candidate manifest")
 
     # Per-partition counts are the pre-publish ACL smoke check. The payload must
     # retain the tree version and exact security partition for every expected unit.
-    for partition_id, expected in candidate.partition_counts:
-        partition_filter = [
-            *common,
-            {"key": "security_partition_id", "match": {"value": partition_id}},
-        ]
-        actual = await _count_qdrant_points(qdrant_client, collection, partition_filter)
+    for (_partition_id, expected), actual in zip(candidate.partition_counts, counts[1:], strict=True):
         if actual != expected:
             raise PublishVerificationError("Qdrant ACL partition count does not match the candidate manifest")
-    await _verify_qdrant_point_payloads(candidate, target_slot, qdrant_client)
 
 
 def _verify_persisted_manifest(
@@ -713,6 +761,7 @@ def _verify_persisted_manifest(
     candidate: PreparedTreeCandidate,
     *,
     expected_status: str = "INACTIVE",
+    candidate_manifest: dict[str, Any] | None = None,
 ) -> None:
     if (
         record is None
@@ -732,8 +781,9 @@ def _verify_persisted_manifest(
         manifest = raw
     else:
         raise PublishVerificationError("PostgreSQL staged manifest JSON is missing")
+    expected_manifest = candidate_manifest if candidate_manifest is not None else candidate.manifest
     if (
-        manifest != candidate.manifest
+        manifest != expected_manifest
         or manifest.get("checksum") != record.checksum
         or manifest.get("tree_version") != record.tree_version
         or _checksum_manifest(manifest) != record.checksum
@@ -752,8 +802,12 @@ async def _database_now(session: AsyncSession) -> datetime:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
-def _tree_manifest_row(candidate: PreparedTreeCandidate) -> TreeManifest:
-    manifest = candidate.manifest
+def _tree_manifest_row(
+    candidate: PreparedTreeCandidate,
+    *,
+    manifest: dict[str, Any] | None = None,
+) -> TreeManifest:
+    manifest = manifest if manifest is not None else candidate.manifest
     metrics = manifest.get("quality_metrics") or {}
     return TreeManifest(
         tree_version=candidate.tree_version,
@@ -772,9 +826,14 @@ def _tree_manifest_row(candidate: PreparedTreeCandidate) -> TreeManifest:
     )
 
 
-def _tree_routing_profile_rows(candidate: PreparedTreeCandidate) -> list[TreeRoutingProfile]:
+def _tree_routing_profile_rows(
+    candidate: PreparedTreeCandidate,
+    *,
+    source_profiles: list[dict[str, Any]] | None = None,
+) -> list[TreeRoutingProfile]:
+    profiles = source_profiles if source_profiles is not None else candidate.source_routing_profiles
     rows = []
-    for profile in candidate.source_routing_profiles:
+    for profile in profiles:
         rows.append(
             TreeRoutingProfile(
                 project_id=profile["project_id"],
@@ -798,6 +857,8 @@ def _tree_routing_profile_rows(candidate: PreparedTreeCandidate) -> list[TreeRou
 async def _verify_stored_source_profiles(
     session: AsyncSession,
     candidate: PreparedTreeCandidate,
+    *,
+    expected_profiles: list[dict[str, Any]] | None = None,
 ) -> None:
     records = (
         await session.scalars(
@@ -832,7 +893,8 @@ async def _verify_stored_source_profiles(
         if record.profile_checksum != _scoped_profile_checksum(candidate.tree_version, profile):
             raise PublishVerificationError("Persisted Source-scoped routing profile checksum is inconsistent")
         observed.append(profile)
-    if observed != candidate.source_routing_profiles:
+    target_profiles = expected_profiles if expected_profiles is not None else candidate.source_routing_profiles
+    if observed != target_profiles:
         raise PublishVerificationError("Persisted Source-scoped routing profiles differ from the candidate")
 
 
@@ -897,7 +959,12 @@ async def _project_publish_lock(project_id: str) -> AsyncIterator[None]:
 
 async def _stage_candidate(
     candidate: PreparedTreeCandidate,
+    *,
+    candidate_manifest: dict[str, Any] | None = None,
 ) -> tuple[Literal["SLOT_A", "SLOT_B"], str | None, str, int] | TreePublishResult:
+    parsed_manifest = candidate_manifest if candidate_manifest is not None else candidate.manifest
+    profiles = parsed_manifest.get("source_routing_profiles")
+    source_profiles = profiles if isinstance(profiles, list) else []
     async with SessionLocal() as session:
         async with session.begin():
             state = await session.scalar(
@@ -917,9 +984,18 @@ async def _stage_candidate(
 
             existing = await session.get(TreeManifest, candidate.tree_version)
             if state.active_tree_version == candidate.tree_version:
-                _verify_persisted_manifest(existing, candidate, expected_status="ACTIVE")
+                _verify_persisted_manifest(
+                    existing,
+                    candidate,
+                    expected_status="ACTIVE",
+                    candidate_manifest=parsed_manifest,
+                )
                 active_slot = _active_slot(state)
-                await _verify_stored_source_profiles(session, candidate)
+                await _verify_stored_source_profiles(
+                    session,
+                    candidate,
+                    expected_profiles=source_profiles,
+                )
                 return TreePublishResult(
                     project_id=candidate.project_id,
                     tree_version=candidate.tree_version,
@@ -965,7 +1041,7 @@ async def _stage_candidate(
             if existing is not None:
                 if existing.project_id != candidate.project_id or existing.status == "ACTIVE":
                     raise TreePublishError("Candidate tree version already belongs to another active manifest")
-                staged = _tree_manifest_row(candidate)
+                staged = _tree_manifest_row(candidate, manifest=parsed_manifest)
                 for field in (
                     "config_version",
                     "node_count",
@@ -981,14 +1057,14 @@ async def _stage_candidate(
                 ):
                     setattr(existing, field, getattr(staged, field))
             else:
-                session.add(_tree_manifest_row(candidate))
+                session.add(_tree_manifest_row(candidate, manifest=parsed_manifest))
             await session.execute(
                 delete(TreeRoutingProfile).where(
                     TreeRoutingProfile.project_id == candidate.project_id,
                     TreeRoutingProfile.tree_version == candidate.tree_version,
                 )
             )
-            session.add_all(_tree_routing_profile_rows(candidate))
+            session.add_all(_tree_routing_profile_rows(candidate, source_profiles=source_profiles))
             return (
                 target_slot,
                 state.active_tree_version,
@@ -997,11 +1073,18 @@ async def _stage_candidate(
             )
 
 
-async def _verify_staged_candidate(candidate: PreparedTreeCandidate) -> None:
+async def _verify_staged_candidate(
+    candidate: PreparedTreeCandidate,
+    *,
+    candidate_manifest: dict[str, Any] | None = None,
+) -> None:
+    parsed_manifest = candidate_manifest if candidate_manifest is not None else candidate.manifest
+    profiles = parsed_manifest.get("source_routing_profiles")
+    source_profiles = profiles if isinstance(profiles, list) else []
     async with SessionLocal() as session:
         record = await session.get(TreeManifest, candidate.tree_version)
-        _verify_persisted_manifest(record, candidate)
-        await _verify_stored_source_profiles(session, candidate)
+        _verify_persisted_manifest(record, candidate, candidate_manifest=parsed_manifest)
+        await _verify_stored_source_profiles(session, candidate, expected_profiles=source_profiles)
 
 
 async def _mark_rejected(candidate: PreparedTreeCandidate) -> None:
@@ -1019,8 +1102,8 @@ async def _mark_rejected(candidate: PreparedTreeCandidate) -> None:
         log.exception("Could not mark rejected tree manifest")
 
 
-async def _verify_knowledge_inputs(session, candidate):
-    manifest = orjson.loads(candidate.manifest_json)
+async def _verify_knowledge_inputs(session, candidate, *, candidate_manifest: dict[str, Any] | None = None):
+    manifest = candidate_manifest if candidate_manifest is not None else orjson.loads(candidate.manifest_json)
     expected = manifest.get("knowledge_inputs")
     if expected is None:
         return  # Existing published snapshots retain their original verification contract.
@@ -1051,22 +1134,49 @@ async def _atomic_switch(
     previous_tree_version: str | None,
     previous_slot: str,
     previous_epoch: int,
+    already_verified: bool = False,
+    candidate_manifest: dict[str, Any] | None = None,
 ) -> TreePublishResult:
+    from sqlalchemy.orm import load_only
+
     async with SessionLocal() as session:
         async with session.begin():
-            await _verify_knowledge_inputs(session, candidate)
+            await _verify_knowledge_inputs(session, candidate, candidate_manifest=candidate_manifest)
             state = await session.scalar(
                 select(ProjectSearchState)
                 .where(ProjectSearchState.project_id == candidate.project_id)
                 .with_for_update()
             )
-            record = await session.scalar(
-                select(TreeManifest)
-                .where(TreeManifest.tree_version == candidate.tree_version)
-                .with_for_update()
-            )
-            _verify_persisted_manifest(record, candidate)
-            await _verify_stored_source_profiles(session, candidate)
+            if already_verified:
+                record = await session.scalar(
+                    select(TreeManifest)
+                    .options(
+                        load_only(
+                            TreeManifest.tree_version,
+                            TreeManifest.project_id,
+                            TreeManifest.status,
+                            TreeManifest.checksum,
+                        )
+                    )
+                    .where(TreeManifest.tree_version == candidate.tree_version)
+                    .with_for_update()
+                )
+                if (
+                    record is None
+                    or record.project_id != candidate.project_id
+                    or record.tree_version != candidate.tree_version
+                    or record.status != "INACTIVE"
+                    or record.checksum != candidate.checksum
+                ):
+                    raise PublishVerificationError("PostgreSQL staged manifest identity or status is inconsistent")
+            else:
+                record = await session.scalar(
+                    select(TreeManifest)
+                    .where(TreeManifest.tree_version == candidate.tree_version)
+                    .with_for_update()
+                )
+                _verify_persisted_manifest(record, candidate, candidate_manifest=candidate_manifest)
+                await _verify_stored_source_profiles(session, candidate)
             if (
                 state is None
                 or state.active_tree_version != previous_tree_version
@@ -1077,7 +1187,12 @@ async def _atomic_switch(
                 raise StaleTreePublish("Project pointer changed while the candidate was being verified")
 
             if previous_tree_version and previous_tree_version != candidate.tree_version:
-                previous = await session.get(TreeManifest, previous_tree_version)
+                previous = await session.scalar(
+                    select(TreeManifest)
+                    .options(load_only(TreeManifest.tree_version, TreeManifest.status))
+                    .where(TreeManifest.tree_version == previous_tree_version)
+                    .with_for_update()
+                )
                 if previous is not None:
                     previous.status = "INACTIVE"
             record.status = "ACTIVE"
@@ -1114,23 +1229,28 @@ async def publish_tree_candidate(
         "snapshot": replace(snapshot, metrics=dict(snapshot.metrics), quality_gates=dict(snapshot.quality_gates)),
         "assignments": tuple(search_unit_assignments),
     })
+    candidate_manifest = candidate.manifest
     async with _project_publish_lock(candidate.project_id):
-        staged = await _stage_candidate(candidate)
+        staged = await _stage_candidate(candidate, candidate_manifest=candidate_manifest)
         if isinstance(staged, TreePublishResult):
             await _verify_qdrant_slot(candidate, staged.routing_slot, qdrant_client)
             return staged
         target_slot, previous_tree_version, previous_slot, previous_epoch = staged
         batches = build_inactive_slot_payloads(candidate, target_slot)
         try:
-            await _verify_database_search_units(candidate)
-            await _clear_inactive_slot_qdrant_payloads(qdrant_client, candidate, target_slot)
+            await asyncio.gather(
+                _verify_database_search_units(candidate),
+                _clear_inactive_slot_qdrant_payloads(qdrant_client, candidate, target_slot),
+            )
             await update_inactive_slot_qdrant_payloads(
                 qdrant_client,
                 f"search_units_{candidate.project_id}",
                 batches,
             )
-            await _verify_staged_candidate(candidate)
-            await _verify_qdrant_slot(candidate, target_slot, qdrant_client)
+            await asyncio.gather(
+                _verify_staged_candidate(candidate, candidate_manifest=candidate_manifest),
+                _verify_qdrant_slot(candidate, target_slot, qdrant_client),
+            )
         except (PublishVerificationError, httpx.HTTPError, SQLAlchemyError) as error:
             await _mark_rejected(candidate)
             if isinstance(error, PublishVerificationError):
@@ -1143,6 +1263,8 @@ async def publish_tree_candidate(
                 previous_tree_version=previous_tree_version,
                 previous_slot=previous_slot,
                 previous_epoch=previous_epoch,
+                already_verified=True,
+                candidate_manifest=candidate_manifest,
             )
         except Exception:
             await _mark_rejected(candidate)

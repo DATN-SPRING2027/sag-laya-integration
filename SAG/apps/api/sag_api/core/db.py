@@ -159,6 +159,31 @@ _INDEX_UPGRADES = (
 
 
 async def _ensure_columns() -> None:
+    if engine.dialect.name == "postgresql":
+        async with engine.begin() as conn:
+            rows = (
+                await conn.execute(
+                    text(
+                        """
+                        SELECT table_name, column_name
+                        FROM information_schema.columns
+                        WHERE table_schema = current_schema()
+                        """
+                    )
+                )
+            ).all()
+            cols_by_table: dict[str, set[str]] = {}
+            for tname, cname in rows:
+                cols_by_table.setdefault(tname, set()).add(cname)
+            for table, cols in _COLUMN_UPGRADES.items():
+                existing = cols_by_table.get(table)
+                if existing is None:
+                    continue
+                for col, ddl in cols.items():
+                    if col not in existing:
+                        await conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+        return
+
     from sqlalchemy import inspect as sa_inspect
 
     def _existing(sync_conn, table: str) -> set[str] | None:
@@ -178,6 +203,32 @@ async def _ensure_columns() -> None:
 
 
 async def _ensure_indexes() -> None:
+    if engine.dialect.name == "postgresql":
+        async with engine.begin() as conn:
+            existing_tables = set(
+                (
+                    await conn.scalars(
+                        text("SELECT tablename FROM pg_tables WHERE schemaname = current_schema()")
+                    )
+                ).all()
+            )
+            existing_indexes = set(
+                (
+                    await conn.scalars(
+                        text("SELECT indexname FROM pg_indexes WHERE schemaname = current_schema()")
+                    )
+                ).all()
+            )
+            for ddl in _INDEX_UPGRADES:
+                table = ddl.split(" ON ", 1)[1].split(" ", 1)[0]
+                if table not in existing_tables:
+                    continue
+                idx_name = ddl.split("IF NOT EXISTS ", 1)[1].split(" ON ", 1)[0].strip()
+                if idx_name in existing_indexes:
+                    continue
+                await conn.exec_driver_sql(ddl)
+        return
+
     from sqlalchemy import inspect as sa_inspect
 
     async with engine.begin() as conn:
@@ -268,8 +319,21 @@ async def init_db() -> None:
     """Initialize tables in development (production uses Alembic). Import models to register into metadata."""
     from sag_api.db import models  # noqa: F401
 
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    if engine.dialect.name == "postgresql":
+        async with engine.begin() as conn:
+            existing_tables = set(
+                (
+                    await conn.scalars(
+                        text("SELECT tablename FROM pg_tables WHERE schemaname = current_schema()")
+                    )
+                ).all()
+            )
+            required_tables = {t.name for t in Base.metadata.tables.values()}
+            if not required_tables.issubset(existing_tables):
+                await conn.run_sync(Base.metadata.create_all)
+    else:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
     await _ensure_columns()
     await _ensure_document_schema_widths()
     await _ensure_indexes()

@@ -1543,7 +1543,19 @@ async def retrieve_search_unit_sections(
             timings[key] += value
         saturated = bool(outcome.stats.get("candidate_pool_saturated"))
         hydration_truncated = bool(outcome.stats.get("candidate_units_truncated"))
-        needs_more = len(outcome.sections) < top_k
+        coverage = outcome.stats.get("coverage") or {}
+        unique_candidates = (
+            int(coverage.get("candidate_count", 0)) - int(coverage.get("deduplicated_count", 0))
+            if isinstance(coverage, dict) and "candidate_count" in coverage and "deduplicated_count" in coverage
+            else len(outcome.sections)
+        )
+        anchor_cov = coverage.get("anchor_coverage") if isinstance(coverage, dict) else None
+        precision_pruned = (
+            bool(outcome.sections)
+            and unique_candidates >= top_k
+            and anchor_cov in ("complete", "not_required")
+        )
+        needs_more = len(outcome.sections) < top_k and not precision_pruned
         remaining = deadline - asyncio.get_running_loop().time()
         stop = (
             "deadline" if remaining <= 0 else

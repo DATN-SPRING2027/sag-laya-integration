@@ -1133,6 +1133,16 @@ async def update_inactive_slot_qdrant_payloads(
     if not payload_batches:
         return True
     try:
+        if len(payload_batches) > 1:
+            batch_res = await qdrant_client.post(
+                f"/collections/{collection_name}/points/batch?wait=true",
+                json={"operations": [{"set_payload": batch} for batch in payload_batches]},
+            )
+            if batch_res.status_code == 200:
+                return True
+            if batch_res.status_code not in (404, 405):
+                log.error("Qdrant batch payload update failed status=%s body=%s", batch_res.status_code, batch_res.text)
+                return False
         for batch in payload_batches:
             res = await qdrant_client.post(
                 f"/collections/{collection_name}/points/payload?wait=true",

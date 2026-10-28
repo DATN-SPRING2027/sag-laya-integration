@@ -169,30 +169,38 @@ def _cosine(left: tuple[float, ...], right: tuple[float, ...]) -> float:
         return 0.0
     scaled_left = tuple(value / left_scale for value in left)
     scaled_right = tuple(value / right_scale for value in right)
-    dot = math.fsum(a * b for a, b in zip(scaled_left, scaled_right, strict=True))
+    dot = math.sumprod(scaled_left, scaled_right)
     norm = math.sqrt(
-        math.fsum(value * value for value in scaled_left)
-        * math.fsum(value * value for value in scaled_right)
+        math.sumprod(scaled_left, scaled_left)
+        * math.sumprod(scaled_right, scaled_right)
     )
     return max(0.0, dot / norm) if norm else 0.0
 
 
-def _profile(units: list[KnowledgeUnitInput], sparse_limit: int) -> NodeProfile:
+def _profile(
+    units: list[KnowledgeUnitInput],
+    sparse_limit: int,
+    *,
+    prepared_dense: dict[str, tuple[tuple[float, ...], float]] | None = None,
+) -> NodeProfile:
     vectors = [(unit.unit_id, unit.dense) for unit in units if unit.dense]
     medoid = None
     if vectors:
-        prepared = {}
-        for uid, vector in vectors:
-            scale = max(map(abs, vector))
-            normalized = tuple(value / scale for value in vector) if scale else vector
-            prepared[uid] = (normalized, math.fsum(value * value for value in normalized))
+        if prepared_dense is not None:
+            prepared = {uid: prepared_dense[uid] for uid, _ in vectors}
+        else:
+            prepared = {}
+            for uid, vector in vectors:
+                scale = max(map(abs, vector))
+                normalized = tuple(value / scale for value in vector) if scale else vector
+                prepared[uid] = (normalized, math.sumprod(normalized, normalized))
 
         def cosine(left, right):
             a, norm_a = prepared[left]
             b, norm_b = prepared[right]
             if len(a) != len(b) or not norm_a or not norm_b:
                 return 0.0
-            return max(0.0, math.fsum(x * y for x, y in zip(a, b, strict=True)) / math.sqrt(norm_a * norm_b))
+            return max(0.0, math.sumprod(a, b) / math.sqrt(norm_a * norm_b))
 
         candidates = sorted(vectors, key=lambda item: hashlib.sha256(item[0].encode()).digest())[:64]
         medoid = min(
@@ -330,6 +338,8 @@ def build_routing_snapshot(
     *,
     config: TreeBuildConfig = TreeBuildConfig(),
     benchmark: Iterable[RoutingBenchmarkCase] = (),
+    extra_manifest: Mapping[str, object] | None = None,
+    precomputed: RoutingSnapshot | None = None,
 ) -> RoutingSnapshot:
     rows = list(units)
     if not rows:
@@ -430,65 +440,85 @@ def build_routing_snapshot(
     partition_units: dict[str, list[str]] = defaultdict(list)
     for unit in rows:
         partition_units[unit.security_partition_id].append(unit.unit_id)
-    roots: list[RoutingNode] = []
-    lineage: list[tuple[str, str | None]] = []
-    all_child_sizes: list[int] = []
-    cohesion_values: list[float] = []
-    edge_cut_values: list[float] = []
-    max_depth = 0
-    largest_group_ratio = 0.0
-
-    def make_node(partition: str, member_ids: tuple[str, ...], parent_id: str | None, depth: int) -> RoutingNode:
-        nonlocal max_depth, largest_group_ratio
-        node_id = _stable_id(tenant_id, project_id, partition, *member_ids)
-        lineage.append((node_id, parent_id))
-        max_depth = max(max_depth, depth)
-        children: tuple[RoutingNode, ...] = ()
-        if len(member_ids) > config.target_cluster_size and depth < config.max_depth:
-            member_set = set(member_ids)
-            scoped_edges = {
-                (source_id, target_id): weight
-                for source_id in member_ids
-                for target_id, weight in edge_adjacency.get(source_id, ())
-                if source_id < target_id and target_id in member_set
-            }
-            clusters = _partition(member_ids, scoped_edges, config)
-            if len(clusters) > config.max_children:
-                raise RuntimeError("partitioner exceeded max_children after balanced fallback")
-            if len(clusters) > 1:
-                internal_ratio, cut_ratio = _edge_metrics(clusters, scoped_edges)
-                cohesion_values.append(internal_ratio)
-                edge_cut_values.append(cut_ratio)
-                all_child_sizes.extend(len(group) for group in clusters)
-                largest_group_ratio = max(largest_group_ratio, max(map(len, clusters)) / len(member_ids))
-                children = tuple(
-                    make_node(partition, group, node_id, depth + 1)
-                    for group in clusters
-                )
-        return RoutingNode(
-            node_id=node_id,
-            parent_id=parent_id,
-            depth=depth,
-            tenant_id=tenant_id,
-            project_id=project_id,
-            security_partition_id=partition,
-            unit_ids=member_ids,
-            profile=_profile([unit_map[item] for item in member_ids], config.profile_sparse_terms),
-            children=children,
-        )
-
-    for partition, member_ids in sorted(partition_units.items()):
-        root = make_node(partition, tuple(sorted(member_ids)), None, 0)
-        roots.append(root)
-
-    edge_cut = math.fsum(edge_cut_values) / len(edge_cut_values) if edge_cut_values else 0.0
-    cohesion = math.fsum(cohesion_values) / len(cohesion_values) if cohesion_values else 0.0
-    if all_child_sizes:
-        total_size = sum(all_child_sizes)
-        probs = [size / total_size for size in all_child_sizes]
-        entropy = -sum(prob * math.log(prob) for prob in probs)
+    if precomputed is not None:
+        roots = list(precomputed.roots)
+        lineage = list(precomputed.lineage)
+        edge_cut = float(precomputed.metrics.get("edge_cut") or 0.0)
+        cohesion = float(precomputed.metrics.get("cohesion") or 0.0)
+        entropy = float(precomputed.metrics.get("child_size_entropy") or 0.0)
+        max_depth = int(precomputed.metrics.get("depth") or 0)
+        largest_group_ratio = float(precomputed.metrics.get("giant_ratio") or 0.0)
     else:
-        entropy = 0.0
+        prepared_dense_by_uid: dict[str, tuple[tuple[float, ...], float]] = {}
+        for unit in rows:
+            if unit.dense:
+                scale = max(map(abs, unit.dense))
+                normalized = tuple(value / scale for value in unit.dense) if scale else unit.dense
+                prepared_dense_by_uid[unit.unit_id] = (normalized, math.sumprod(normalized, normalized))
+
+        roots = []
+        lineage = []
+        all_child_sizes: list[int] = []
+        cohesion_values: list[float] = []
+        edge_cut_values: list[float] = []
+        max_depth = 0
+        largest_group_ratio = 0.0
+
+        def make_node(partition: str, member_ids: tuple[str, ...], parent_id: str | None, depth: int) -> RoutingNode:
+            nonlocal max_depth, largest_group_ratio
+            node_id = _stable_id(tenant_id, project_id, partition, *member_ids)
+            lineage.append((node_id, parent_id))
+            max_depth = max(max_depth, depth)
+            children: tuple[RoutingNode, ...] = ()
+            if len(member_ids) > config.target_cluster_size and depth < config.max_depth:
+                member_set = set(member_ids)
+                scoped_edges = {
+                    (source_id, target_id): weight
+                    for source_id in member_ids
+                    for target_id, weight in edge_adjacency.get(source_id, ())
+                    if source_id < target_id and target_id in member_set
+                }
+                clusters = _partition(member_ids, scoped_edges, config)
+                if len(clusters) > config.max_children:
+                    raise RuntimeError("partitioner exceeded max_children after balanced fallback")
+                if len(clusters) > 1:
+                    internal_ratio, cut_ratio = _edge_metrics(clusters, scoped_edges)
+                    cohesion_values.append(internal_ratio)
+                    edge_cut_values.append(cut_ratio)
+                    all_child_sizes.extend(len(group) for group in clusters)
+                    largest_group_ratio = max(largest_group_ratio, max(map(len, clusters)) / len(member_ids))
+                    children = tuple(
+                        make_node(partition, group, node_id, depth + 1)
+                        for group in clusters
+                    )
+            return RoutingNode(
+                node_id=node_id,
+                parent_id=parent_id,
+                depth=depth,
+                tenant_id=tenant_id,
+                project_id=project_id,
+                security_partition_id=partition,
+                unit_ids=member_ids,
+                profile=_profile(
+                    [unit_map[item] for item in member_ids],
+                    config.profile_sparse_terms,
+                    prepared_dense=prepared_dense_by_uid,
+                ),
+                children=children,
+            )
+
+        for partition, member_ids in sorted(partition_units.items()):
+            root = make_node(partition, tuple(sorted(member_ids)), None, 0)
+            roots.append(root)
+
+        edge_cut = math.fsum(edge_cut_values) / len(edge_cut_values) if edge_cut_values else 0.0
+        cohesion = math.fsum(cohesion_values) / len(cohesion_values) if cohesion_values else 0.0
+        if all_child_sizes:
+            total_size = sum(all_child_sizes)
+            probs = [size / total_size for size in all_child_sizes]
+            entropy = -sum(prob * math.log(prob) for prob in probs)
+        else:
+            entropy = 0.0
     cases = list(benchmark)
     if any(
         not isinstance(case.query_id, str)
@@ -630,6 +660,7 @@ def build_routing_snapshot(
             }
             for case in cases
         ],
+        **(dict(extra_manifest) if extra_manifest else {}),
     }
     checksum = hashlib.sha256(
         json.dumps(canonical, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()

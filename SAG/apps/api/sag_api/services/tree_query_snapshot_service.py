@@ -5,11 +5,11 @@ from __future__ import annotations
 import math
 import re
 from collections import defaultdict
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import delete, select, tuple_
+from sqlalchemy import delete, func, select, tuple_
 from sqlalchemy.orm import load_only
 
 from sag_api.core.config import settings
@@ -254,20 +254,9 @@ async def acquire_tree_query_snapshot(
     request_snapshot_id = str(uuid4())
     async with session_factory() as session:
         async with session.begin():
-            active_state_projects = (
-                await session.scalars(
-                    select(ProjectSearchState.project_id).where(
-                        ProjectSearchState.project_id.in_(projects),
-                        ProjectSearchState.active_tree_version.is_not(None),
-                    )
-                )
-            ).all()
-            if len(set(active_state_projects)) != len(projects):
-                return None
-
             rows = (
                 await session.execute(
-                    select(ProjectSearchState, TreeManifest)
+                    select(ProjectSearchState, TreeManifest, func.now())
                     .options(
                         load_only(
                             TreeManifest.tree_version,
@@ -282,14 +271,25 @@ async def acquire_tree_query_snapshot(
                         (TreeManifest.tree_version == ProjectSearchState.active_tree_version)
                         & (TreeManifest.project_id == ProjectSearchState.project_id),
                     )
-                    .where(ProjectSearchState.project_id.in_(projects))
+                    .where(
+                        ProjectSearchState.project_id.in_(projects),
+                        ProjectSearchState.active_tree_version.is_not(None),
+                    )
                     .order_by(ProjectSearchState.project_id)
                     .with_for_update(read=True, of=ProjectSearchState)
                 )
             ).all()
-            by_project = {state.project_id: (state, manifest_record) for state, manifest_record in rows}
+            by_project = {state.project_id: (state, manifest_record) for state, manifest_record, _ in rows}
             if set(by_project) != set(projects):
                 return None
+            raw_now = rows[0][2]
+            captured_at = (
+                raw_now.replace(tzinfo=UTC)
+                if isinstance(raw_now, datetime) and raw_now.tzinfo is None
+                else raw_now.astimezone(UTC)
+                if isinstance(raw_now, datetime)
+                else await _database_now(session)
+            )
 
             scoped_requests: list[dict[str, Any]] = []
             leases: dict[str, tuple[str, str, int]] = {}
@@ -408,7 +408,6 @@ async def acquire_tree_query_snapshot(
                         )
                     ].append(profile)
 
-            captured_at = await _database_now(session)
             group_rows: list[GroupRoutingSnapshot] = []
             for request in scoped_requests:
                 state = request["state"]
@@ -467,7 +466,7 @@ async def acquire_tree_query_snapshot(
                     )
                 )
 
-            database_now = await _database_now(session)
+            database_now = captured_at
             expires_at = database_now + timedelta(
                 seconds=max(30.0, float(settings.search_source_timeout) + 15.0)
             )

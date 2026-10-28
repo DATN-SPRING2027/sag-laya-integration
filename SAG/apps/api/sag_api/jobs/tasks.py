@@ -466,21 +466,39 @@ async def _process_document_unlocked(
 
                         current_pipeline_stage = "INDEX"
                         from sag_api.services.search_index_service import run_search_indexing_stage
-                        qdrant_url = getattr(settings, "sag_qdrant_url", "http://localhost:6333").rstrip("/")
-                        qdrant_headers = {}
-                        if getattr(settings, "sag_qdrant_api_key", None):
-                            qdrant_headers["api-key"] = settings.sag_qdrant_api_key
-                        async with httpx.AsyncClient(base_url=qdrant_url, headers=qdrant_headers, timeout=30.0) as qdrant_client:
+                        shared_qdrant_client = None
+                        if engine_manager is not None and hasattr(engine_manager, "get_search_unit_qdrant_client"):
+                            try:
+                                shared_qdrant_client = await engine_manager.get_search_unit_qdrant_client()
+                            except Exception:
+                                shared_qdrant_client = None
+                        if shared_qdrant_client is not None:
                             search_units = await run_search_indexing_stage(
                                 session,
                                 project_id=ing_run.project_id,
                                 document_version=doc_ver,
                                 security_partition_id=sec_partition,
                                 tenant_id=ing_run.tenant_id,
-                                qdrant_client=qdrant_client,
+                                qdrant_client=shared_qdrant_client,
                                 embedder=embedder,
                                 run_id=run_id,
                             )
+                        else:
+                            qdrant_url = getattr(settings, "sag_qdrant_url", "http://localhost:6333").rstrip("/")
+                            qdrant_headers = {}
+                            if getattr(settings, "sag_qdrant_api_key", None):
+                                qdrant_headers["api-key"] = settings.sag_qdrant_api_key
+                            async with httpx.AsyncClient(base_url=qdrant_url, headers=qdrant_headers, timeout=30.0) as qdrant_client:
+                                search_units = await run_search_indexing_stage(
+                                    session,
+                                    project_id=ing_run.project_id,
+                                    document_version=doc_ver,
+                                    security_partition_id=sec_partition,
+                                    tenant_id=ing_run.tenant_id,
+                                    qdrant_client=qdrant_client,
+                                    embedder=embedder,
+                                    run_id=run_id,
+                                )
                         await session.commit()
             except (JobPaused, JobYielded, ParsePaused):
                 await _pause_or_yield()
