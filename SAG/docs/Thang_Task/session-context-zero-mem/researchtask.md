@@ -182,3 +182,117 @@
   - `.\.venv\Scripts\python.exe -m ruff check sag_api/core/config.py sag_api/services/decision_router.py sag_api/api/v1/decision.py sag_api/services/session_context tests/test_ecce_session_context.py tests/eval_ecce_baseline tests/test_ecce_ablation_benchmark.py` → **`All checks passed!`**
   - `.\.venv\Scripts\python.exe -m ruff check --ignore E501 sag_api/services/agent_service.py sag_api/services/agent_domain.py` → **`All checks passed!`** (mọi dòng thêm/sửa mới đều `<= 120` ký tự).
   - `.\.venv\Scripts\python.exe -m pytest tests -q` → **`98 passed, 1 skipped in 34.67s`** (bổ sung 3 bài test hồi quy mới trong `test_ecce_session_context.py` kiểm chứng toàn bộ 5 mục review PR #42: `knowledge_only=True` session grounding + `[S99]` stripping + empty-thread blocking, `1` lần gọi `route_query`, lưu `Message.steps` ở cả `shadow` và `on`, thu hồi quyền ACL bắc cầu xuyên lượt, đọc DB tăng dần $O(\Delta)$ bằng cursor, chắn phủ định tiếng Việt + chuỗi thay thế ngoài slot `React → Vue → Svelte`, IDF động BM25 + cấu hình `session_context_embedding_mode`, và Ego-Subgraph PPR `<= 400` lượt).
+
+
+---
+
+## 10. Chặng 2 (`feat/Thang-ecce-session-schema-db`) — Thiết Kế Schema Provenance, Decision Ledger & Graph Substrate
+
+- **Ngày thực hiện:** 2026-10-28
+- **Nhánh thực hiện:** `feat/Thang-ecce-session-schema-db` (tách mới trực tiếp từ `origin/main` @ `76f3ab9` sau khi merge PR #42)
+- **Phạm vi PR (`-db` deliverable độc lập theo `AGENTS.md`):**
+  - Chỉ bổ sung migration PostgreSQL tiến (`0009_session_context_ecce.sql`), script rollback (`scripts/0009_session_context_ecce_down.sql`), SQLAlchemy ORM models (`sag_api/db/models/session_context.py` + đăng ký `Base.metadata`), đồng bộ tài liệu lưu trữ (`data-ownership-and-storage.md`) và kiểm thử ràng buộc schema/cascade/migration.
+  - **Không sửa bất kỳ migration cũ nào (`0001`–`0008`)**, không sửa cột của `threads`/`messages`, và không trộn logic runtime Qdrant/API của Chặng 3 (`-be-api`) vào nhánh `-db`.
+
+### 10.1. Sự Thật Schema Hiện Hữu Trên `main` (`76f3ab9`) & PostgreSQL 16 Thực Tế
+Qua kiểm tra trực tiếp `sag_api/db/models/agent.py`, `sag_api/db/models/source_project_mapping.py`, `sag_api/db/models/routing_rag.py` và `\d threads`, `\d messages` trên container `postgres:16` (`sag-db-1`):
+1. `threads.id` và `messages.id` đều có kiểu **`VARCHAR(32)`** (`uuid.uuid4().hex`), không phải `VARCHAR(36)` → mọi khóa ngoại trỏ về `threads(id)` và `messages(id)` bắt buộc dùng `VARCHAR(32)`.
+2. `threads.owner_key` có kiểu `VARCHAR(64)` (nullable cho dữ liệu cũ cục bộ, có mặt với phiên Continuum).
+3. `source_project_mappings.organization_id` và `project_id` dùng **`VARCHAR(256)`** để chứa đầy đủ định danh từ Continuum BE (MongoDB); theo `SAG/docs/data-ownership-and-storage.md`, tuyệt đối không tạo bảng hay FK sang User/Project của MongoDB mà lưu `tenant_id VARCHAR(256)` và `project_id VARCHAR(256)` kèm `CHECK (length(trim(...)) > 0)`.
+4. Các bảng dẫn xuất chuẩn của `SAG main` (`DocumentVersion`, `SearchUnit`, `KnowledgeUnit`, `KnowledgeGraphEdge`) dùng khóa chính UUIDv5 tất định **`VARCHAR(36)`** và mốc mở lưỡng thời gian `valid_to = 9999-12-31T23:59:59+00:00` (`UTCDateTime()`).
+5. Thư mục `SAG/apps/api/migrations/` chỉ chứa các tệp migration tiến `0001_*.sql` → `0008_*.sql`; script rollback được đặt tách riêng tại `SAG/apps/api/scripts/` (như `acl_001_source_project_mappings_down.sql`) để tránh rủi ro script chạy tuần tự `migrations/*.sql` vô tình xóa bảng.
+
+### 10.2. Đặc Tả Chi Tiết 3 Bảng Dẫn Xuất (`0009_session_context_ecce.sql`)
+
+1. **`session_units` (Đơn vị truy xuất đa độ mịn có truy nguyên gốc hội thoại — `TURN | WINDOW | EPISODE`):**
+   - Khóa chính `id VARCHAR(36)` (UUIDv5 tất định `generate_session_unit_id(thread_id, unit_kind, ordinal, message_from_id)`).
+   - Phạm vi cô lập: `tenant_id VARCHAR(256) NOT NULL`, `project_id VARCHAR(256) NOT NULL`, `thread_id VARCHAR(32) NOT NULL REFERENCES threads(id) ON DELETE CASCADE`, `owner_key VARCHAR(64) NULL`.
+   - Phân cấp & truy nguyên: `unit_kind VARCHAR(16) NOT NULL DEFAULT 'TURN'` (`TURN | WINDOW | EPISODE`), `ordinal INTEGER NOT NULL >= 0`, `episode_id VARCHAR(64) NOT NULL`, `episode_ordinal INTEGER NOT NULL >= 0`, `window_id VARCHAR(64) NULL`, `message_from_id VARCHAR(32) NOT NULL REFERENCES messages(id) ON DELETE CASCADE`, `message_to_id VARCHAR(32) NOT NULL REFERENCES messages(id) ON DELETE CASCADE`, `role VARCHAR(16) NULL`.
+   - Ngữ nghĩa quyết định & đóng bao: `epistemic_status VARCHAR(24) NOT NULL DEFAULT 'FACT'` (`FACT | PROPOSED | CONSIDERING | CONFIRMED | SUPERSEDED | NEGATED | OPEN_ISSUE`), `topic_slot_key VARCHAR(128) NULL`, `is_anaphoric_or_short BOOLEAN NOT NULL DEFAULT FALSE`.
+   - Ranh giới ACL bắc cầu (Fail-Closed): `security_partition_ids_json JSON NOT NULL DEFAULT '[]'`, `cited_source_ids_json JSON NOT NULL DEFAULT '[]'`.
+   - Đặc trưng Zero-Token & kiểm soát vector drift: `entity_mentions_json JSON NOT NULL`, `sentences_json JSON NOT NULL`, `term_freqs_json JSON NOT NULL` (phục vụ Dynamic Corpus-Wide BM25), `doc_word_len INTEGER NOT NULL >= 0`, `token_count INTEGER NOT NULL >= 0`, `content_hash VARCHAR(64) NOT NULL` (SHA-256), `embedding_model_signature VARCHAR(128) NOT NULL`, `qdrant_point_id VARCHAR(36) NULL`.
+   - Hiệu lực lưỡng thời gian: `[valid_from, valid_to)` với `CHECK (valid_to >= valid_from)`, kèm `created_at`, `updated_at`.
+   - Ràng buộc duy nhất & chỉ mục nóng: `uq_session_units_thread_kind_ordinal (thread_id, unit_kind, ordinal)`, `ix_session_units_project_thread`, `ix_session_units_thread_episode`, `ix_session_units_message_from`, `ix_session_units_message_to`, `ix_session_units_temporal`.
+
+2. **`session_decision_ledger` (Sổ cái trạng thái công việc & quyết định lưỡng thời gian):**
+   - Khóa chính `id VARCHAR(36)` (UUIDv5 tất định `generate_session_decision_id(session_unit_id, topic_slot_key)`).
+   - Khóa ngoại cascade: `thread_id VARCHAR(32) NOT NULL REFERENCES threads(id) ON DELETE CASCADE`, `session_unit_id VARCHAR(36) NOT NULL REFERENCES session_units(id) ON DELETE CASCADE`.
+   - Phân loại & trạng thái: `ledger_kind VARCHAR(24) NOT NULL DEFAULT 'DECISION'` (`DECISION | OPEN_TASK | CONSTRAINT | OPEN_ISSUE`), `topic_slot_key VARCHAR(128) NOT NULL`, `turn_ordinal INTEGER NOT NULL >= 0`, `epistemic_status VARCHAR(24) NOT NULL`, `summary_text TEXT NOT NULL`.
+   - Dòng dõi thay thế (`Lineage` & `Non-Slot Replacement`): `entity_keys_json JSON`, `superseded_entity_keys_json JSON`, `companion_unit_ids_json JSON`, `supersedes_id VARCHAR(36) NULL REFERENCES session_decision_ledger(id) ON DELETE SET NULL`, `superseded_by_id VARCHAR(36) NULL REFERENCES session_decision_ledger(id) ON DELETE SET NULL`, `supersedes_ids_json JSON`.
+   - Ranh giới ACL & thời gian: `security_partition_ids_json JSON`, `cited_source_ids_json JSON`, `valid_from`, `valid_to` (`CHECK (valid_to >= valid_from)`), `created_at`, `updated_at`.
+   - Ràng buộc duy nhất & chỉ mục: `uq_session_decision_unit_slot (session_unit_id, topic_slot_key)`, `ix_session_decision_thread_slot_status`, `ix_session_decision_project_status`, `ix_session_decision_supersedes`, `ix_session_decision_superseded_by`.
+
+3. **`session_graph_edges` (Đồ thị đa quan hệ phục vụ `igraph` Personalized PageRank & Đóng bao bằng chứng):**
+   - Khóa chính `id VARCHAR(36)` (UUIDv5 tất định `generate_session_graph_edge_id(source_unit_id, source_node_key, target_node_key, edge_type)`).
+   - Neo truy nguyên chống rò rỉ dữ liệu mồ côi khi xóa lẻ tin nhắn: `source_unit_id VARCHAR(36) NOT NULL REFERENCES session_units(id) ON DELETE CASCADE` (mọi cạnh — kể cả `ALIAS_CANDIDATE` hay `ENTITY_MENTION` — đều bắt buộc neo vào `SessionUnit` phát sinh ra nó), kết hợp `target_unit_id VARCHAR(36) NULL REFERENCES session_units(id) ON DELETE CASCADE` (cho cạnh nối 2 lượt như `ADJACENT_IN_EPISODE`, `SUPERSEDES`). Nhờ `source_unit_id NOT NULL`, ràng buộc `UNIQUE (source_unit_id, source_node_key, target_node_key, edge_type)` hoạt động đồng nhất tuyệt đối trên cả PostgreSQL và SQLite (không gặp bẫy `NULL != NULL`) và xóa bất kỳ `Message` nào cũng tự động dọn sạch 100% cạnh đồ thị phát sinh từ tin nhắn đó.
+   - Đỉnh & trọng số: `source_node_type` / `target_node_type` (`UNIT | SENTENCE | ENTITY | EPISODE | SOURCE`), `source_node_key` / `target_node_key` (`VARCHAR(256)`), `edge_type` (`ENTITY_MENTION | SENTENCE_IN_UNIT | ADJACENT_IN_EPISODE | SUPERSEDES | ALIAS_CANDIDATE | CITES_DOCUMENT_SOURCE`), `weight DOUBLE PRECISION NOT NULL DEFAULT 1.0` (`CHECK (weight >= 0.0)`), `metadata_json JSON`, `created_at`.
+
+### 10.3. Danh Sách Thay Đổi Dự Kiến & Ma Trận Kiểm Thử Chặng 2
+
+| File | Hành động | Mục đích |
+|---|---|---|
+| `SAG/apps/api/migrations/0009_session_context_ecce.sql` | Tạo mới | Forward DDL tạo 3 bảng dẫn xuất, `CHECK`, `UNIQUE`, FK cascade và indexes. |
+| `SAG/apps/api/scripts/0009_session_context_ecce_down.sql` | Tạo mới | Script rollback tường minh xóa sạch indexes & 3 bảng dẫn xuất theo thứ tự ngược phụ thuộc. |
+| `SAG/apps/api/sag_api/db/models/session_context.py` | Tạo mới | SQLAlchemy 2.0 ORM models (`SessionUnit`, `SessionDecisionLedger`, `SessionGraphEdge`) + hàm sinh UUIDv5 tất định. |
+| `SAG/apps/api/sag_api/db/models/__init__.py` | Cập nhật nhỏ | Đăng ký 3 model mới vào `Base.metadata` để đồng bộ `init_db()` và test harness. |
+| `SAG/docs/data-ownership-and-storage.md` | Cập nhật nhỏ | Đồng bộ bảng phân định quyền sở hữu lưu trữ theo Rule 04. |
+| `SAG/apps/api/tests/test_session_context_schema.py` | Tạo mới | Kiểm thử toàn diện: UUIDv5 tất định, ORM CRUD, mọi `CHECK` & `UNIQUE` constraints, cascade khi xóa lẻ `Message` / xóa `Thread` / `ON DELETE SET NULL` trên chuỗi `SUPERSEDES`, và kiểm chứng tương đương DDL của `0009_*.sql` / `_down.sql`. |
+
+**Tiêu chí nghiệm thu Chặng 2:**
+- [x] Không chạm vào `0001`–`0008` hay cột của bảng hiện hữu.
+- [x] Kiểm chứng trực tiếp vòng lặp `up → insert & FK cascade checks → down → up` trên **PostgreSQL 16 thật** (`sag-db-1`, trên schema tạm cô lập `sag_ecce_migration_qa_temp`, sau đó dọn sạch schema tạm).
+- [x] Toàn bộ test suite `pytest tests -q` và `ruff check` xanh 100%.
+
+### 10.4. Kết Quả Thực Thi Chặng 2 & Đánh Giá Tác Động Migration / Rollback
+- **Danh sách tập tin đã tạo/cập nhật (`6` tệp):**
+  - Tạo mới: `SAG/apps/api/migrations/0009_session_context_ecce.sql`, `SAG/apps/api/scripts/0009_session_context_ecce_down.sql`, `SAG/apps/api/sag_api/db/models/session_context.py`, `SAG/apps/api/tests/test_session_context_schema.py`.
+  - Cập nhật đồng bộ: `SAG/apps/api/sag_api/db/models/__init__.py`, `SAG/docs/data-ownership-and-storage.md`, `SAG/docs/Thang_Task/session-context-zero-mem/researchtask.md`.
+- **Kết quả kiểm chứng thực tế:**
+  - `.\.venv\Scripts\python.exe -m ruff check sag_api/db/models/session_context.py sag_api/db/models/__init__.py tests/test_session_context_schema.py` → **`All checks passed!`**
+  - `.\.venv\Scripts\python.exe -m pytest tests -q` → **`102 passed, 1 skipped in 35.85s`** (`4` test mới trong `test_session_context_schema.py` kiểm chứng sinh khóa UUIDv5, đối khớp `1:1` cột/index giữa SQL DDL và ORM `Base.metadata`, `ON DELETE CASCADE` + `ON DELETE SET NULL`, và toàn bộ `CHECK`/`UNIQUE` constraints).
+  - **PostgreSQL 16 live (`sag-db-1`):** Đã chạy thực tế trên schema tạm `sag_ecce_migration_qa_temp` (`LIKE public.agents / public.threads / public.messages INCLUDING ALL`): `0009_session_context_ecce.sql` chạy lặp idempotent `2` lần (`exit code 0`), xóa lẻ `messages` dọn sạch `session_units`, `session_decision_ledger` và `session_graph_edges` đồng thời chuyển `supersedes_id` sang `NULL`, chạy `0009_session_context_ecce_down.sql` xóa sạch 3 bảng dẫn xuất mà giữ nguyên `messages`, chạy lại `0009_session_context_ecce.sql` khôi phục đủ `20` chỉ mục (PK + UNIQUE + B-Tree), và `DROP SCHEMA sag_ecce_migration_qa_temp CASCADE`.
+- **Tác động Database, Lock & Rollback (`AGENTS.md` Mandatory DB Impact Report):**
+  - **Tính chất thay đổi:** Thuần túy bổ sung mới (`additive expand migration`) — tạo 3 bảng mới `session_units`, `session_decision_ledger`, `session_graph_edges`. Không sửa cột của `threads`/`messages` và không chạm vào migration `0001`–`0008`.
+  - **Tác động Lock khi chạy trên Production:** Các câu lệnh `CREATE TABLE IF NOT EXISTS ... REFERENCES threads(id) / messages(id)` trong PostgreSQL 16 chỉ giữ khóa ngắn `SHARE ROW EXCLUSIVE` ở bước ghi metadata FK (mili-giây trên bảng rỗng mới tạo, không quét dữ liệu lịch sử cũ và không khóa đọc `SELECT` trên `threads`/`messages`).
+  - **Quy trình Rollback an toàn:** Chạy `psql -v ON_ERROR_STOP=1 -f SAG/apps/api/scripts/0009_session_context_ecce_down.sql` để xóa sạch 3 bảng dẫn xuất theo thứ tự ngược phụ thuộc (`session_graph_edges → session_decision_ledger → session_units`). Toàn bộ lịch sử gốc trong `threads` và `messages` được bảo toàn 100%, không mất dữ liệu người dùng.
+- **Bước tiếp theo (Chặng 3):** Sau khi PR Chặng 2 (`-db`) được review & merge vào `main`, tách nhánh mới `feat/Thang-ecce-multiview-persistence-be-api` từ `main` để nối persistence hai chiều (`PostgreSQL` 3 bảng mới + `Qdrant` `session_units_{project_id}` + backfill cuốn chiếu) vào `sag_api/services/session_context/runtime.py`.
+
+
+---
+
+## 11. Thẩm Định & Khắc Phục 4 Điểm Review Trên PR #43 (`feat/Thang-ecce-session-schema-db`)
+
+Đã kiểm chứng độc lập cả 4 nhận xét trên PR #43 bằng test thực nghiệm trên SQLite & PostgreSQL 16 (`sag-db-1`). **Kết luận: Cả 4 điểm đều ĐÚNG ở góc độ thiết kế ràng buộc CSDL và hàm băm khóa, xứng đáng được khóa chặt ngay ở tầng Schema Chặng 2 trước khi sang Chặng 3:**
+
+1. **Finding 1 (`Xóa tin giữa window A–B–C`) → ĐÚNG 100%:**
+   - **Nguyên nhân:** `session_units` ban đầu chỉ giữ FK tới hai đầu mút `message_from_id` (`A`) và `message_to_id` (`C`). Khi tạo đơn vị `WINDOW` (hoặc `EPISODE`) gộp `A–B–C` rồi xóa tin ở giữa `B`, FK ở `A` và `C` không kích hoạt nên hàng `WINDOW` chứa đặc trưng dẫn xuất từ `B` vẫn tồn tại.
+   - **Khắc phục triệt để ở tầng DB:**
+     - Bổ sung cột `source_message_ids_json JSON NOT NULL DEFAULT '[]'` cùng ràng buộc `ck_session_units_turn_single_msg` (`unit_kind != 'TURN' OR message_from_id = message_to_id`) và `ck_session_units_span_source_ids` (`message_from_id = message_to_id OR json_array_length(source_message_ids_json) >= 2`).
+     - Bổ sung bảng liên kết truy nguyên `session_unit_messages` (`SessionUnitMessage`) nối `ON DELETE CASCADE` vào `messages(id)` và `(session_unit_id, tenant_id, project_id, thread_id)`, kết hợp bộ trigger:
+       - `trg_session_units_before_update_guard`: chặn sửa định danh truy nguyên & danh sách tin nhắn cấu thành khi `UPDATE`.
+       - `trg_session_units_after_insert_link`: kiểm tra kiểu mảng chuỗi JSON + bắt buộc chứa đủ hai đầu mút `message_from_id` / `message_to_id`, tự động liên kết toàn bộ tin nhắn thành viên (bao gồm cả dải `TURN` ở giữa) vào `session_unit_messages`, và kiểm tra mọi tin nhắn thành viên thuộc đúng `NEW.thread_id`.
+       - `trg_session_unit_messages_before_update_guard`: khóa bất biến các dòng trong `session_unit_messages`.
+       - `trg_session_unit_messages_cascade_unit`: `AFTER DELETE ON session_unit_messages` tự động `DELETE FROM session_units WHERE id = OLD.session_unit_id`.
+     - Kết quả: Xóa bất kỳ tin nhắn nào (`A`, **`B` ở giữa**, hay `C`) trong `WINDOW` / `EPISODE` đều tự động xóa sạch `SessionUnit` bao phủ nó cùng toàn bộ `session_decision_ledger` và `session_graph_edges` dẫn xuất (hoạt động đồng nhất trên cả PostgreSQL 16 và SQLite, kể cả qua `0009_*.sql` lẫn `Base.metadata.create_all`).
+
+2. **Finding 2 (`Default ORM khác SQL` trên `sentences_json` và các cột `JSON`/số) → ĐÚNG 100%:**
+   - **Nguyên nhân:** Trong `sag_api/db/models/session_context.py`, các cột `JSON` chỉ khai báo `default=list`/`default=dict` ở tầng Python mà thiếu `server_default=text("'[]'")` / `server_default=text("'{}'")` ở tầng DDL CSDL; các cột số dùng chuỗi `'0'` thay vì hằng số `0`.
+   - **Khắc phục:** Bổ sung đầy đủ `server_default=text("'[]'")`, `server_default=text("'{}'")`, `server_default=text("0")`, `server_default=text("1")`, `server_default=text("1.0")` trên toàn bộ cột của ORM để DDL sinh từ `Base.metadata.create_all` khớp `1:1` với `0009_session_context_ecce.sql`, kèm bài test đối khớp `server_default` tự động.
+
+3. **Finding 3 (`Liên kết sai tenant/project/thread` giữa các bảng dẫn xuất và `messages`) → ĐÚNG 100%:**
+   - **Nguyên nhân:** FK đơn cột `REFERENCES session_units(id)` và `REFERENCES messages(id)` cho phép bản ghi con (`ledger`, `graph_edges`) mang `(tenant_id, project_id, thread_id)` khác với bản ghi cha.
+   - **Khắc phục:**
+     - Thêm `CONSTRAINT uq_session_units_scope_identity UNIQUE (id, tenant_id, project_id, thread_id)` trên `session_units`.
+     - Chuyển FK trên `session_unit_messages`, `session_decision_ledger` và cả 2 đầu `source_unit_id` / `target_unit_id` của `session_graph_edges` sang **Composite Foreign Key** `(unit_id, tenant_id, project_id, thread_id) REFERENCES session_units (id, tenant_id, project_id, thread_id) ON DELETE CASCADE` (`MATCH SIMPLE` chuẩn SQL vẫn cho phép `target_unit_id IS NULL` nhưng bắt buộc khớp đủ 4 cột khi `NOT NULL`).
+     - Bổ sung kiểm tra khớp `messages.thread_id = NEW.thread_id` trong trigger của `session_units`, và kiểm tra khớp `(tenant_id, project_id, thread_id)` (cùng chống tự tham chiếu `id = supersedes_id`) trên `supersedes_id` / `superseded_by_id` của `session_decision_ledger`.
+
+4. **Finding 4 (`Trùng UUIDv5 khi ghép chuỗi bằng dấu ':'`) → ĐÚNG 100%:**
+   - **Nguyên nhân:** Ghép `f"...:{source_node_key}:{target_node_key}:..."` gây va chạm tiền ảnh khi `node_key` chứa dấu `:` (ví dụ `("entity:a:b", "c")` và `("entity:a", "b:c")` sinh cùng một chuỗi đầu vào UUIDv5).
+   - **Khắc phục:** Chuyển cả 4 hàm `generate_session_unit_id`, `generate_session_unit_point_id`, `generate_session_decision_id`, `generate_session_graph_edge_id` sang mã hóa tuple JSON chuẩn hóa đơn ánh (`json.dumps([...], separators=(",", ":"), ensure_ascii=False)` — song ánh toán học trên bộ chuỗi/số nguyên bất kỳ), đồng thời đưa cả `source_node_type` và `target_node_type` vào khóa duy nhất `uq_session_graph_edges_provenance` và hàm sinh ID cạnh.
+
+### 11.1. Kết Quả Kiểm Chứng Thực Nghiệm Sau Khắc Phục
+- **`ruff check`:** `.\.venv\Scripts\python.exe -m ruff check sag_api/db/models/session_context.py sag_api/db/models/__init__.py tests/test_session_context_schema.py` → **`All checks passed!`**
+- **`pytest` toàn bộ API:** `.\.venv\Scripts\python.exe -m pytest tests -q` → **`102 passed, 1 skipped in 30.24s`** (kiểm chứng đầy đủ cả 4 finding: xóa tin giữa `WINDOW` `A–B–C` & `X–Y–Z`, đối khớp `server_default` + raw SQL `INSERT` bỏ trống `sentences_json`, chặn tham chiếu chéo `tenant_id/project_id/thread_id` trên mọi bảng con & `supersedes_id`, và không đụng độ UUIDv5 khi đầu vào chứa `:`).
+- **PostgreSQL 16 live (`sag-db-1`):**
+  - `PG16_SQL_MIGRATION_QA_PASSED`: Chạy `0009_session_context_ecce.sql` lặp 2 lần idempotent, chặn FK chéo tenant/thread, xóa tin giữa `mB` tự động xóa sạch `WINDOW` `wABC` + `session_decision_ledger` + `session_graph_edges`, chạy `0009_session_context_ecce_down.sql` xóa sạch 5 trigger + 5 function + 4 bảng dẫn xuất trong khi giữ nguyên `messages`, chạy lại `0009_*.sql` thành công và dọn sạch schema tạm `sag_ecce_migration_qa_temp`.
+  - `PG16_ORM_COMPILED_DDL_QA_PASSED`: Kiểm chứng DDL PostgreSQL biên dịch từ `Base.metadata.create_all` trên `sag-db-1` (`sag_ecce_orm_qa_temp`) cấp đúng default `'[]'` cho `sentences_json` ở tầng DB và kích hoạt cascade xóa tin giữa `mB` đồng nhất 100% với file SQL migration.
