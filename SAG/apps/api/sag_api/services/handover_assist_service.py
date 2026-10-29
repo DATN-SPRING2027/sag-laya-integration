@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from sag_api.core.error_taxonomy import ErrorCode, ErrorLayer, ErrorStage
 from sag_api.core.errors import ServiceUnavailableError, UpstreamError
@@ -16,6 +18,7 @@ from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal
 from sag_api.generation.llm import LLMClient
 from sag_api.schemas.handover_assist import (
+    AssistCoverageOut,
     CitationLocatorPayload,
     CitationPayload,
     GeneratedDraftItemOut,
@@ -31,8 +34,9 @@ from sag_api.schemas.handover_assist import (
 log = get_logger("handover_assist")
 
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.DOTALL)
-_MAX_EVIDENCE_UNITS = 80
-_MAX_UNIT_CHARS = 4000
+_MAX_EVIDENCE_UNITS = 100
+_MAX_INDEXED_UNITS_PER_SOURCE = 25
+_MAX_UNIT_CHARS = 1600
 
 
 @dataclass(frozen=True)
@@ -53,56 +57,135 @@ async def _load_indexed_units(
     project_id: str,
     sources: list[HandoverAssistSourceInput],
 ) -> dict[tuple[str, int], list[tuple[LocatorKind, str, str, str]]]:
-    """Load ready SearchUnits from Postgres when logicalSourceId matches an indexed document."""
-    logical_targets = {
-        (src.logicalSourceId.strip(), src.version): (src.kind, src.id, src.version)
+    """Load ready SearchUnits from Postgres filtered by exact (logicalSourceId, version) pairs."""
+    logical_targets: set[tuple[str, int]] = {
+        (src.logicalSourceId.strip(), src.version)
         for src in sources
         if src.logicalSourceId and src.logicalSourceId.strip()
     }
-    if not logical_targets or not principal.tenant_id:
+    if not logical_targets or not principal.tenant_id or not principal.allowed_partition_ids:
         return {}
 
     try:
-        from sag_api.db.models import Document, DocumentVersion, SearchUnit
+        from sag_api.db.models import CanonicalBlock, Document, DocumentVersion, SearchUnit
 
-        logical_ids = {logical_id for logical_id, _ver in logical_targets}
-        stmt = (
+        start_block = aliased(CanonicalBlock)
+        end_block = aliased(CanonicalBlock)
+        pair_filters = [
+            and_(
+                Document.logical_source_id == logical_id,
+                DocumentVersion.version_no == version_no,
+            )
+            for logical_id, version_no in sorted(logical_targets)
+        ]
+        ranked_subq = (
             select(
-                Document.logical_source_id,
-                DocumentVersion.version_no,
-                SearchUnit.id,
-                SearchUnit.page_from,
-                SearchUnit.section_path,
-                SearchUnit.search_text,
+                Document.logical_source_id.label("logical_source_id"),
+                DocumentVersion.id.label("document_version_id"),
+                DocumentVersion.version_no.label("version_no"),
+                SearchUnit.id.label("unit_id"),
+                SearchUnit.page_from.label("page_from"),
+                SearchUnit.section_path.label("section_path"),
+                start_block.ordinal.label("start_ordinal"),
+                end_block.ordinal.label("end_ordinal"),
+                func.row_number()
+                .over(
+                    partition_by=(Document.logical_source_id, DocumentVersion.version_no),
+                    order_by=(
+                        SearchUnit.page_from.asc(),
+                        start_block.ordinal.asc(),
+                        SearchUnit.id.asc(),
+                    ),
+                )
+                .label("source_rn"),
             )
             .join(DocumentVersion, DocumentVersion.document_id == Document.id)
             .join(SearchUnit, SearchUnit.document_version_id == DocumentVersion.id)
+            .join(start_block, start_block.id == SearchUnit.block_from_id)
+            .join(end_block, end_block.id == SearchUnit.block_to_id)
             .where(
                 Document.tenant_id == principal.tenant_id,
                 Document.project_id == project_id,
-                Document.security_partition_id.in_(principal.allowed_partition_ids),
                 Document.is_active.is_(True),
-                Document.logical_source_id.in_(logical_ids),
+                or_(*pair_filters),
                 DocumentVersion.search_status.in_(("READY", "SEARCH_READY")),
+                SearchUnit.security_partition_id.in_(principal.allowed_partition_ids),
+                start_block.document_version_id == DocumentVersion.id,
+                end_block.document_version_id == DocumentVersion.id,
             )
-            .limit(80)
+            .subquery()
+        )
+        max_rows = max(_MAX_EVIDENCE_UNITS, len(logical_targets) * _MAX_INDEXED_UNITS_PER_SOURCE)
+        stmt = (
+            select(
+                ranked_subq.c.logical_source_id,
+                ranked_subq.c.document_version_id,
+                ranked_subq.c.version_no,
+                ranked_subq.c.unit_id,
+                ranked_subq.c.page_from,
+                ranked_subq.c.section_path,
+                ranked_subq.c.start_ordinal,
+                ranked_subq.c.end_ordinal,
+            )
+            .where(ranked_subq.c.source_rn <= _MAX_INDEXED_UNITS_PER_SOURCE)
+            .order_by(
+                ranked_subq.c.logical_source_id.asc(),
+                ranked_subq.c.version_no.asc(),
+                ranked_subq.c.source_rn.asc(),
+            )
+            .limit(max_rows)
         )
         result = await session.execute(stmt)
         rows = result.all()
+        if not rows:
+            return {}
+
+        version_ids = sorted({str(row[1]) for row in rows if row[1]})
+        blocks_by_version: dict[str, list[tuple[int, str]]] = defaultdict(list)
+        if version_ids:
+            blk_stmt = (
+                select(
+                    CanonicalBlock.document_version_id,
+                    CanonicalBlock.ordinal,
+                    CanonicalBlock.normalized_text,
+                )
+                .where(CanonicalBlock.document_version_id.in_(version_ids))
+                .order_by(CanonicalBlock.document_version_id.asc(), CanonicalBlock.ordinal.asc())
+            )
+            blk_rows = (await session.execute(blk_stmt)).all()
+            for ver_id, ordinal, norm_text in blk_rows:
+                blocks_by_version[str(ver_id)].append((int(ordinal), str(norm_text or "")))
     except Exception as exc:  # noqa: BLE001
         log.debug("Skipping optional indexed SearchUnit enrichment: %s", type(exc).__name__)
         return {}
 
     mapped: dict[tuple[str, int], list[tuple[LocatorKind, str, str, str]]] = {}
-    for logical_id, version_no, unit_id, page_from, section_path, search_text in rows:
+    for (
+        logical_id,
+        doc_version_id,
+        version_no,
+        unit_id,
+        page_from,
+        section_path,
+        start_ord,
+        end_ord,
+    ) in rows:
         key = (str(logical_id), int(version_no))
-        if key not in logical_targets or not search_text or not str(search_text).strip():
+        if key not in logical_targets or int(start_ord) > int(end_ord):
+            continue
+        unit_texts = [
+            b_text
+            for b_ord, b_text in blocks_by_version.get(str(doc_version_id), ())
+            if int(start_ord) <= b_ord <= int(end_ord) and b_text.strip()
+        ]
+        combined_text = "\n\n".join(unit_texts).strip()
+        if not combined_text:
             continue
         loc_kind: LocatorKind = "CHUNK" if unit_id else "PAGE"
         loc_val = str(unit_id)[:200] if unit_id else str(max(1, int(page_from or 1)))
         heading = str(section_path or "")[:255]
         mapped.setdefault(key, []).append(
-            (loc_kind, loc_val, heading, str(search_text).strip()[:_MAX_UNIT_CHARS])
+            (loc_kind, loc_val, heading, combined_text[:_MAX_UNIT_CHARS])
         )
     return mapped
 
@@ -110,51 +193,108 @@ async def _load_indexed_units(
 def _build_evidence_units(
     sources: list[HandoverAssistSourceInput],
     indexed_by_logical: dict[tuple[str, int], list[tuple[LocatorKind, str, str, str]]],
-) -> list[_EvidenceUnit]:
-    units: list[_EvidenceUnit] = []
+    *,
+    max_units: int | None = None,
+) -> tuple[list[_EvidenceUnit], AssistCoverageOut]:
+    source_buckets: list[
+        tuple[SourceRefPayload, str, list[tuple[LocatorKind, str, str, str]]]
+    ] = []
+    seen_source_refs: dict[tuple[str, str, int], int] = {}
+
     for src in sources:
-        ref = SourceRefPayload(kind=src.kind, id=src.id, version=src.version)
-        seen_locators: set[tuple[str, str]] = set()
-        if src.logicalSourceId:
+        src_key = (src.kind, src.id, src.version)
+        if src_key in seen_source_refs:
+            bucket_idx = seen_source_refs[src_key]
+            ref, title, candidates = source_buckets[bucket_idx]
+        else:
+            ref = SourceRefPayload(kind=src.kind, id=src.id, version=src.version)
+            candidates = []
+            seen_source_refs[src_key] = len(source_buckets)
+            source_buckets.append((ref, src.title, candidates))
+
+        seen_locators: set[tuple[str, str]] = {
+            (cand[0], cand[1]) for cand in candidates
+        }
+        if src.logicalSourceId and src.logicalSourceId.strip():
             for loc_kind, loc_val, heading, text in indexed_by_logical.get(
                 (src.logicalSourceId.strip(), src.version), []
             ):
-                if len(units) >= _MAX_EVIDENCE_UNITS:
-                    break
                 dedup_key = (loc_kind, loc_val)
-                if dedup_key in seen_locators:
+                cleaned = text.strip()
+                if dedup_key in seen_locators or not cleaned:
                     continue
                 seen_locators.add(dedup_key)
-                units.append(
-                    _EvidenceUnit(
-                        index=len(units) + 1,
-                        source=ref,
-                        title=src.title,
-                        locator_kind=loc_kind,
-                        locator_value=loc_val,
-                        heading=heading,
-                        content=text[:_MAX_UNIT_CHARS],
-                    )
-                )
+                candidates.append((loc_kind, loc_val, heading, cleaned[:_MAX_UNIT_CHARS]))
+
         for excerpt in src.excerpts:
-            if len(units) >= _MAX_EVIDENCE_UNITS:
-                break
             dedup_key = (excerpt.locatorKind, excerpt.locatorValue)
-            if dedup_key in seen_locators:
+            cleaned = excerpt.content.strip()
+            if dedup_key in seen_locators or not cleaned:
                 continue
             seen_locators.add(dedup_key)
+            candidates.append(
+                (
+                    excerpt.locatorKind,
+                    excerpt.locatorValue,
+                    excerpt.heading,
+                    cleaned[:_MAX_UNIT_CHARS],
+                )
+            )
+
+    effective_cap = max(0, int(_MAX_EVIDENCE_UNITS if max_units is None else max_units))
+    selected_per_source: list[list[tuple[LocatorKind, str, str, str]]] = [
+        [] for _ in source_buckets
+    ]
+    total_selected = 0
+    round_idx = 0
+    while total_selected < effective_cap:
+        progressed = False
+        for bucket_idx, (_ref, _title, candidates) in enumerate(source_buckets):
+            if round_idx < len(candidates):
+                selected_per_source[bucket_idx].append(candidates[round_idx])
+                total_selected += 1
+                progressed = True
+                if total_selected >= effective_cap:
+                    break
+        if not progressed:
+            break
+        round_idx += 1
+
+    units: list[_EvidenceUnit] = []
+    included_sources: list[SourceRefPayload] = []
+    skipped_sources: list[SourceRefPayload] = []
+    truncated_sources: list[SourceRefPayload] = []
+
+    for bucket_idx, (ref, title, candidates) in enumerate(source_buckets):
+        chosen = selected_per_source[bucket_idx]
+        if chosen:
+            included_sources.append(ref)
+        else:
+            skipped_sources.append(ref)
+        if candidates and len(chosen) < len(candidates):
+            truncated_sources.append(ref)
+        for loc_kind, loc_val, heading, content in chosen:
             units.append(
                 _EvidenceUnit(
                     index=len(units) + 1,
                     source=ref,
-                    title=src.title,
-                    locator_kind=excerpt.locatorKind,
-                    locator_value=excerpt.locatorValue,
-                    heading=excerpt.heading,
-                    content=excerpt.content.strip()[:_MAX_UNIT_CHARS],
+                    title=title,
+                    locator_kind=loc_kind,
+                    locator_value=loc_val,
+                    heading=heading,
+                    content=content,
                 )
             )
-    return units
+
+    coverage = AssistCoverageOut(
+        requestedSources=len(source_buckets),
+        includedSources=included_sources,
+        skippedSources=skipped_sources,
+        truncatedSources=truncated_sources,
+        totalEvidenceUnits=len(units),
+        truncated=bool(truncated_sources),
+    )
+    return units, coverage
 
 
 def _render_evidence_catalog(units: list[_EvidenceUnit]) -> str:
@@ -268,14 +408,25 @@ async def execute_handover_assist(
 ) -> HandoverAssistResponse:
     """Execute bounded, citation-verified handover assistance within principal scope."""
     if not body.sources:
+        empty_coverage = AssistCoverageOut(
+            requestedSources=0,
+            includedSources=[],
+            skippedSources=[],
+            truncatedSources=[],
+            totalEvidenceUnits=0,
+            truncated=False,
+        )
         if body.task == "QUESTION_ANSWER":
             return HandoverAssistResponse(
                 task="QUESTION_ANSWER",
                 answerStatus="INSUFFICIENT_EVIDENCE",
                 message="No authorized published sources are available to answer this question.",
                 sections=[],
+                coverage=empty_coverage,
             )
-        return HandoverAssistResponse(task=body.task, candidates=[], items=[])
+        return HandoverAssistResponse(
+            task=body.task, candidates=[], items=[], coverage=empty_coverage
+        )
 
     _ensure_llm_ready(llm)
     indexed_units = await _load_indexed_units(
@@ -284,7 +435,7 @@ async def execute_handover_assist(
         project_id=project_id,
         sources=body.sources,
     )
-    units = _build_evidence_units(body.sources, indexed_units)
+    units, coverage = _build_evidence_units(body.sources, indexed_units)
     if not units:
         if body.task == "QUESTION_ANSWER":
             return HandoverAssistResponse(
@@ -292,8 +443,11 @@ async def execute_handover_assist(
                 answerStatus="INSUFFICIENT_EVIDENCE",
                 message="Authorized sources contain no traceable excerpts for this question.",
                 sections=[],
+                coverage=coverage,
             )
-        return HandoverAssistResponse(task=body.task, candidates=[], items=[])
+        return HandoverAssistResponse(
+            task=body.task, candidates=[], items=[], coverage=coverage
+        )
 
     by_index = {unit.index: unit for unit in units}
     catalog_text = _render_evidence_catalog(units)
@@ -340,7 +494,9 @@ async def execute_handover_assist(
                     continue
                 seen_source_keys.add(src_key)
                 candidates.append(ProposedCandidateOut(source=unit.source, reason=reason))
-        return HandoverAssistResponse(task="SOURCE_PROPOSAL", candidates=candidates)
+        return HandoverAssistResponse(
+            task="SOURCE_PROPOSAL", candidates=candidates, coverage=coverage
+        )
 
     if body.task == "DRAFT_GENERATION":
         messages = [
@@ -394,7 +550,9 @@ async def execute_handover_assist(
                 layer=ErrorLayer.LLM,
                 stage=ErrorStage.GENERATE,
             )
-        return HandoverAssistResponse(task="DRAFT_GENERATION", items=items)
+        return HandoverAssistResponse(
+            task="DRAFT_GENERATION", items=items, coverage=coverage
+        )
 
     # QUESTION_ANSWER
     messages = [
@@ -435,12 +593,17 @@ async def execute_handover_assist(
                 )
 
     if not verified_sections:
+        insufficient_msg = (
+            msg_raw
+            if status_raw == "INSUFFICIENT_EVIDENCE" and msg_raw
+            else "The authorized published handover sources do not contain sufficient evidence to answer this question."
+        )
         return HandoverAssistResponse(
             task="QUESTION_ANSWER",
             answerStatus="INSUFFICIENT_EVIDENCE",
-            message=msg_raw
-            or "The authorized published handover sources do not contain sufficient evidence to answer this question.",
+            message=insufficient_msg,
             sections=[],
+            coverage=coverage,
         )
 
     return HandoverAssistResponse(
@@ -448,5 +611,6 @@ async def execute_handover_assist(
         answerStatus="ANSWERED",
         message=msg_raw or "Grounded answer synthesized from authorized published handover sources.",
         sections=verified_sections,
+        coverage=coverage,
     )
 

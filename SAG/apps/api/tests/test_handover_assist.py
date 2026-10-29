@@ -346,3 +346,349 @@ async def test_handover_assist_question_answer_fails_closed_on_insufficient_evid
             },
         )
         assert fail_res.status_code in {500, 503}
+
+    # 4. ANSWERED with only unverified citations downgrades cleanly without contradictory message
+    unverified_llm = SimpleNamespace(
+        configured=True,
+        complete=AsyncMock(
+            return_value=json.dumps(
+                {
+                    "answerStatus": "ANSWERED",
+                    "message": "Found complete answer in authorized sources.",
+                    "sections": [
+                        {
+                            "text": "Unverified claim citing nonexistent index [999].",
+                            "evidenceIndices": [999],
+                        }
+                    ],
+                }
+            )
+        ),
+    )
+    app_unverified = _build_app(unverified_llm)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app_unverified), base_url="http://test"
+    ) as client:
+        downgraded_res = await client.post(
+            "/api/v1/projects/751a2b3c4d5e6f7a8b9c0d20/handover/assist",
+            headers=_bff_headers(),
+            json={
+                "task": "QUESTION_ANSWER",
+                "query": "What is the escalation SLA?",
+                "sources": [
+                    {
+                        "kind": "PROJECT_DOCUMENT",
+                        "id": "851a2b3c4d5e6f7a8b9c0d31",
+                        "version": 3,
+                        "title": "Staging Validation Guide",
+                        "excerpts": [
+                            {
+                                "locatorKind": "PAGE",
+                                "locatorValue": "4",
+                                "heading": "Readiness Verification",
+                                "content": "Verify readiness probes for 15 minutes.",
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+        assert downgraded_res.status_code == 200
+        downgraded_body = downgraded_res.json()
+        assert downgraded_body["answerStatus"] == "INSUFFICIENT_EVIDENCE"
+        assert downgraded_body["sections"] == []
+        assert "Found complete answer" not in downgraded_body["message"]
+
+
+@pytest.mark.asyncio
+async def test_handover_assist_distributes_evidence_budget_fairly_and_reports_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sag_api.schemas.handover_assist import HandoverAssistSourceInput
+    from sag_api.services import handover_assist_service
+
+    monkeypatch.setattr(settings, "bff_service_token", "test-bff-token")
+
+    # 1. Exact F10 reproduction: 5 sources x 25 excerpts with cap=80 -> [16, 16, 16, 16, 16] (never [25, 25, 25, 5, 0])
+    five_sources_raw = [
+        {
+            "kind": "PROJECT_DOCUMENT",
+            "id": f"851a2b3c4d5e6f7a8b9c0d{i + 10:02d}",
+            "version": 1,
+            "title": f"Runbook Source #{i + 1}",
+            "excerpts": [
+                {
+                    "locatorKind": "SECTION",
+                    "locatorValue": f"sec-{j + 1}",
+                    "heading": f"Section {j + 1}",
+                    "content": f"Source {i + 1} operational detail #{j + 1}.",
+                }
+                for j in range(25)
+            ],
+        }
+        for i in range(5)
+    ]
+    parsed_five = [HandoverAssistSourceInput.model_validate(s) for s in five_sources_raw]
+    units_80, cov_80 = handover_assist_service._build_evidence_units(
+        parsed_five, {}, max_units=80
+    )
+    per_source_counts_80 = [
+        sum(1 for u in units_80 if u.source.id == s["id"]) for s in five_sources_raw
+    ]
+    assert per_source_counts_80 == [16, 16, 16, 16, 16]
+    assert cov_80.requestedSources == 5
+    assert len(cov_80.includedSources) == 5
+    assert cov_80.skippedSources == []
+    assert len(cov_80.truncatedSources) == 5
+    assert cov_80.totalEvidenceUnits == 80
+    assert cov_80.truncated is True
+
+    # 2. Schema max_length=100 sources under default budget (100) -> every single source gets 1 unit
+    hundred_sources_raw = [
+        {
+            "kind": "KNOWLEDGE_OBJECT",
+            "id": f"951a2b3c4d5e6f7a8b9c{i:04x}",
+            "version": 1,
+            "title": f"Knowledge #{i}",
+            "excerpts": [
+                {
+                    "locatorKind": "SECTION",
+                    "locatorValue": "sec-1",
+                    "heading": "Summary",
+                    "content": f"Summary {i} part 1.",
+                },
+                {
+                    "locatorKind": "SECTION",
+                    "locatorValue": "sec-2",
+                    "heading": "Details",
+                    "content": f"Summary {i} part 2.",
+                },
+            ],
+        }
+        for i in range(100)
+    ]
+    llm = SimpleNamespace(
+        configured=True,
+        complete=AsyncMock(
+            return_value=json.dumps(
+                {
+                    "candidates": [
+                        {
+                            "evidenceIndex": 100,
+                            "reason": "Even the 100th source is represented in the catalog.",
+                        }
+                    ]
+                }
+            )
+        ),
+    )
+    app = _build_app(llm)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        res = await client.post(
+            "/api/v1/projects/751a2b3c4d5e6f7a8b9c0d20/handover/assist",
+            headers=_bff_headers(),
+            json={
+                "task": "SOURCE_PROPOSAL",
+                "query": "architecture ownership",
+                "maxItems": 10,
+                "sources": hundred_sources_raw,
+            },
+        )
+        assert res.status_code == 200
+        payload = res.json()
+        assert payload["coverage"]["requestedSources"] == 100
+        assert len(payload["coverage"]["includedSources"]) == 100
+        assert payload["coverage"]["skippedSources"] == []
+        assert payload["coverage"]["totalEvidenceUnits"] == 100
+        assert payload["coverage"]["truncated"] is True
+        assert payload["candidates"] == [
+            {
+                "source": {
+                    "kind": "KNOWLEDGE_OBJECT",
+                    "id": hundred_sources_raw[99]["id"],
+                    "version": 1,
+                },
+                "reason": "Even the 100th source is represented in the catalog.",
+            }
+        ]
+
+
+@pytest.mark.asyncio
+async def test_handover_assist_filters_indexed_units_by_exact_version_in_sql_before_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from sag_api.db.base import Base
+    from sag_api.db.models import CanonicalBlock, Document, DocumentVersion, SearchUnit
+
+    monkeypatch.setattr(settings, "bff_service_token", "test-bff-token")
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(
+            Base.metadata.create_all,
+            tables=[
+                Document.__table__,
+                DocumentVersion.__table__,
+                CanonicalBlock.__table__,
+                SearchUnit.__table__,
+            ],
+        )
+
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    org_id = "651a2b3c4d5e6f7a8b9c0d10"
+    project_id = "751a2b3c4d5e6f7a8b9c0d20"
+
+    async with session_factory() as db:
+        doc = Document(
+            id="doc-runbook-row",
+            tenant_id=org_id,
+            project_id=project_id,
+            logical_source_id="continuum-doc-runbook",
+            filename="runbook.md",
+            storage_path="/tmp/runbook.md",
+            is_active=True,
+        )
+        v1 = DocumentVersion(
+            id="doc-ver-1",
+            document_id=doc.id,
+            version_no=1,
+            file_hash="a" * 64,
+            status="READY",
+            search_status="READY",
+        )
+        v2 = DocumentVersion(
+            id="doc-ver-2",
+            document_id=doc.id,
+            version_no=2,
+            file_hash="b" * 64,
+            status="READY",
+            search_status="READY",
+        )
+        db.add_all([doc, v1, v2])
+
+        # Seed 100 chunks on stale v1 so an unfiltered LIMIT(80) would return ONLY v1 rows
+        for idx in range(100):
+            blk = CanonicalBlock(
+                id=f"v1-blk-{idx:03d}",
+                document_version_id=v1.id,
+                ordinal=idx,
+                block_type="paragraph",
+                page_from=1,
+                page_to=1,
+                section_path="Legacy v1",
+                normalized_text=f"Stale v1 chunk #{idx} that must never enter v2 context.",
+                content_hash=f"{idx:064x}",
+            )
+            su = SearchUnit(
+                id=f"v1-su-{idx:03d}",
+                document_version_id=v1.id,
+                block_from_id=blk.id,
+                block_to_id=blk.id,
+                security_partition_id=project_id,
+                content_hash=f"{idx:064x}",
+                token_count=20,
+                page_from=1,
+                page_to=1,
+                section_path="Legacy v1",
+            )
+            db.add_all([blk, su])
+
+        # Seed 2 chunks on requested v2
+        for idx in range(2):
+            blk2 = CanonicalBlock(
+                id=f"v2-blk-{idx:03d}",
+                document_version_id=v2.id,
+                ordinal=idx,
+                block_type="paragraph",
+                page_from=idx + 1,
+                page_to=idx + 1,
+                section_path=f"Runbook v2 Section {idx + 1}",
+                normalized_text=f"Pinned v2 authoritative step #{idx + 1}: blue-green cutover.",
+                content_hash=f"{idx + 1000:064x}",
+            )
+            su2 = SearchUnit(
+                id=f"v2-su-{idx:03d}",
+                document_version_id=v2.id,
+                block_from_id=blk2.id,
+                block_to_id=blk2.id,
+                security_partition_id=project_id,
+                content_hash=f"{idx + 1000:064x}",
+                token_count=20,
+                page_from=idx + 1,
+                page_to=idx + 1,
+                section_path=f"Runbook v2 Section {idx + 1}",
+            )
+            db.add_all([blk2, su2])
+        await db.commit()
+
+    captured_prompts: list[list[dict[str, str]]] = []
+
+    async def _complete_spy(messages: list[dict[str, str]]) -> str:
+        captured_prompts.append(messages)
+        return json.dumps(
+            {
+                "answerStatus": "ANSWERED",
+                "message": "Grounded in v2 indexed chunks.",
+                "sections": [
+                    {
+                        "text": "Blue-green cutover is required in v2 [1].",
+                        "evidenceIndices": [1],
+                    }
+                ],
+            }
+        )
+
+    llm = SimpleNamespace(configured=True, complete=AsyncMock(side_effect=_complete_spy))
+    app = _build_app(llm)
+
+    async def _real_sqlite_session():
+        async with session_factory() as db:
+            yield db
+
+    app.dependency_overrides[get_session] = _real_sqlite_session
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            res = await client.post(
+                f"/api/v1/projects/{project_id}/handover/assist",
+                headers=_bff_headers(org_id=org_id, project_id=project_id),
+                json={
+                    "task": "QUESTION_ANSWER",
+                    "query": "What cutover method is required in v2?",
+                    "sources": [
+                        {
+                            "kind": "PROJECT_DOCUMENT",
+                            "id": "851a2b3c4d5e6f7a8b9c0d31",
+                            "version": 2,
+                            "title": "Production Cutover Runbook",
+                            "logicalSourceId": "continuum-doc-runbook",
+                            "excerpts": [],
+                        }
+                    ],
+                },
+            )
+            assert res.status_code == 200
+            body = res.json()
+            assert body["answerStatus"] == "ANSWERED"
+            assert body["sections"][0]["citations"] == [
+                {
+                    "source": {
+                        "kind": "PROJECT_DOCUMENT",
+                        "id": "851a2b3c4d5e6f7a8b9c0d31",
+                        "version": 2,
+                    },
+                    "locator": {"kind": "CHUNK", "value": "v2-su-000"},
+                }
+            ]
+            assert len(captured_prompts) == 1
+            prompt_user_text = captured_prompts[0][1]["content"]
+            assert "Pinned v2 authoritative step #1: blue-green cutover." in prompt_user_text
+            assert "Stale v1 chunk" not in prompt_user_text
+    finally:
+        await engine.dispose()

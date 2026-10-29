@@ -91,6 +91,15 @@ class GroundedAnswerSectionOut(StrictModel):
     citations: list[CitationPayload] = Field(min_length=1, max_length=50)
 
 
+class AssistCoverageOut(StrictModel):
+    requestedSources: int = Field(ge=0)
+    includedSources: list[SourceRefPayload] = Field(default_factory=list)
+    skippedSources: list[SourceRefPayload] = Field(default_factory=list)
+    truncatedSources: list[SourceRefPayload] = Field(default_factory=list)
+    totalEvidenceUnits: int = Field(ge=0)
+    truncated: bool = False
+
+
 class HandoverAssistResponse(StrictModel):
     task: HandoverAssistTask
     candidates: list[ProposedCandidateOut] = Field(default_factory=list)
@@ -98,4 +107,5 @@ class HandoverAssistResponse(StrictModel):
     answerStatus: Literal["ANSWERED", "INSUFFICIENT_EVIDENCE"] | None = None
     message: str | None = Field(default=None, max_length=1000)
     sections: list[GroundedAnswerSectionOut] = Field(default_factory=list)
+    coverage: AssistCoverageOut | None = None
 

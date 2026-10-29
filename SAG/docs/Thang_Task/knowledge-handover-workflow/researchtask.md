@@ -39,19 +39,19 @@
 - **Auth**: `principal: VerifiedPrincipal = Depends(require_project_bff_principal)`
   - Verifies `project_id in principal.allowed_project_ids` and `bool(principal.tenant_id)` (`403` otherwise).
 - **Modes (`task`)**:
-  1. `SOURCE_PROPOSAL`: ranks/filters server-supplied eligible project source candidates against focus query / departing responsibility context, returning ordered `{ source_kind, source_id, version, score, reason }` restricted strictly to input candidate IDs.
-  2. `DRAFT_GENERATION`: synthesizes structured draft items (`title`, `body`, `citations`, `gap_reason`) grounded strictly in the provided `sources` (combining any ready SAG indexed `SearchUnit`s matching `(tenant_id, project_id, logical_source_id, version)` with server-verified source excerpts). Never fabricates source IDs, versions, or locators outside the input set.
-  3. `QUESTION_ANSWER`: answers `question` strictly from provided permitted `sources`; returns `status = "ANSWERED"` with non-empty verified `sections` + `citations`, or `status = "INSUFFICIENT_EVIDENCE"` with `sections = []`.
+  1. `SOURCE_PROPOSAL`: ranks/filters server-supplied eligible project source candidates against focus query / departing responsibility context, returning ordered `candidates: [{ source: { kind, id, version }, reason }]` restricted strictly to input candidate IDs, plus `coverage` metadata (`requestedSources`, `includedSources`, `skippedSources`, `truncatedSources`, `totalEvidenceUnits`, `truncated`).
+  2. `DRAFT_GENERATION`: synthesizes structured draft items (`title`, `body`, `requirement`, `sources`, `citations`) grounded strictly in the provided `sources` (combining any ready SAG indexed `SearchUnit`s + `CanonicalBlock`s filtered in SQL by exact `(tenant_id, project_id, logical_source_id, version_no)` before per-source/global `LIMIT` with server-verified source excerpts, allocated round-robin across all requested sources). Never fabricates source IDs, versions, or locators outside the input set.
+  3. `QUESTION_ANSWER`: answers `query` strictly from provided permitted `sources`; returns `answerStatus = "ANSWERED"` with non-empty verified `sections` + `citations`, or `answerStatus = "INSUFFICIENT_EVIDENCE"` with `sections = []` (never leaking an `ANSWERED` message when sections are stripped for unverified citations).
 
 ---
 
 ## 4. File-by-File Change Matrix
 
-1. `SAG/apps/api/sag_api/schemas/handover_assist.py` — Pydantic v2 request/response schemas with strict bounds (`extra="forbid"`, max sources/excerpts/lengths, official `source_kind` enum).
-2. `SAG/apps/api/sag_api/services/handover_assist_service.py` — Grounded candidate ranking, draft synthesis, and cited Q&A with prompt-injection safe evidence blocks, indexed `SearchUnit` lookup when available, and strict citation/locator verification against input sources.
+1. `SAG/apps/api/sag_api/schemas/handover_assist.py` — Pydantic v2 request/response schemas with strict bounds (`extra="forbid"`, max sources/excerpts/lengths, official `source_kind` enum, `AssistCoverageOut` truncation/coverage reporting).
+2. `SAG/apps/api/sag_api/services/handover_assist_service.py` — Grounded candidate ranking, draft synthesis, and cited Q&A with prompt-injection safe evidence blocks, SQL-level `(logical_source_id, version_no)` filtering + `ROW_NUMBER()` per-source windowing over `SearchUnit`/`CanonicalBlock`, fair round-robin evidence budget allocation across sources, and strict citation/locator verification against input sources.
 3. `SAG/apps/api/sag_api/api/v1/handover.py` — Project-scoped router `POST /projects/{project_id}/handover/assist` guarded by `Depends(require_project_bff_principal)`.
 4. `SAG/apps/api/sag_api/api/v1/__init__.py` — Mount `handover.router`.
-5. `SAG/apps/api/tests/test_handover_assist.py` — Unit & FastAPI route tests covering BFF auth/scope enforcement, `Task Note` rejection on official proposal/Q&A, grounded citation validation, `INSUFFICIENT_EVIDENCE` fail-closed behavior, prompt-injection resistance, and LLM failure propagation (`503`/`502`, never faking success).
+5. `SAG/apps/api/tests/test_handover_assist.py` — 7 async FastAPI + SQLAlchemy/SQLite tests covering BFF auth/scope enforcement, `Task Note` rejection on official proposal/Q&A, grounded citation validation, `INSUFFICIENT_EVIDENCE` fail-closed & downgrade behavior, LLM failure propagation (`503`/`500`), fair round-robin budget + `coverage` reporting (`5x25` and `100` sources), and SQL-level exact `(logical_source_id, version_no)` filtering before `LIMIT`.
 
 ---
 
