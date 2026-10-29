@@ -73,7 +73,22 @@ async def lifespan(app: FastAPI):
                     log.warning("Failed to initialize knowledge worker embedder: %s", error)
             if settings.knowledge_worker_enabled:
                 await knowledge_worker.start()
-            yield
+            import asyncio
+            from sag_api.services.universe_knowledge_service import warm_active_tree_manifest_cache
+
+            warm_task = asyncio.create_task(
+                warm_active_tree_manifest_cache(SessionLocal),
+                name="sag-warm-universe-manifest",
+            )
+            try:
+                yield
+            finally:
+                if not warm_task.done():
+                    warm_task.cancel()
+                    try:
+                        await warm_task
+                    except BaseException:  # noqa: BLE001
+                        pass
     finally:
         failures: list[BaseException] = []
         for cleanup in (

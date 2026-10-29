@@ -318,6 +318,9 @@ export function KnowledgeRoutingUniverse({ interactive = true }: { interactive?:
           }),
         ));
         pages.push(...batch.filter((item): item is UniverseKnowledgePage => item !== null));
+        if (!controller.signal.aborted && pages.length > 0) {
+          setAmbientPages([...pages]);
+        }
       }
       // A parent page supplies real connections between its child regions.
       const scopes = trees.flatMap((tree) => {
@@ -337,7 +340,7 @@ export function KnowledgeRoutingUniverse({ interactive = true }: { interactive?:
         ));
         batch.forEach((value) => { if (value) links.push(...value.edges); });
       }
-      if (!controller.signal.aborted) { setAmbientPages(pages); setAmbientLinks(links); }
+      if (!controller.signal.aborted) { setAmbientPages([...pages]); setAmbientLinks(links); }
     })().finally(() => { if (!controller.signal.aborted) setPageLoading(false); });
     return () => controller.abort();
   }, [interactive, trees, active, current?.node.is_leaf, onFailure]);

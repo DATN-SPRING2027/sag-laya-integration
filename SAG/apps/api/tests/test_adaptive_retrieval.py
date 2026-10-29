@@ -26,9 +26,18 @@ def sections(count):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("requested,expected", [(None, 5), (5, 5), (70, 5), (3, 5)])
-async def test_retrieval_always_requests_five_results(
-    monkeypatch, requested, expected
+@pytest.mark.parametrize(
+    "query,requested,expected,expected_auto,expected_first_wave",
+    [
+        ("policies", None, 5, False, 32),
+        ("policies", 5, 5, False, 32),
+        ("policies", 3, 3, False, 32),
+        ("policies", 70, 50, False, 200),
+        ("liệt kê 20 file liên quan đến chính sách", None, 20, True, 80),
+    ],
+)
+async def test_retrieval_resolves_cardinality_from_plan_and_api_override(
+    monkeypatch, query, requested, expected, expected_auto, expected_first_wave
 ):
     monkeypatch.setattr(settings, "search_unit_candidate_limit", 256)
     monkeypatch.setattr(settings, "search_top_k", 8)
@@ -38,7 +47,7 @@ async def test_retrieval_always_requests_five_results(
         calls.append(candidate_limit)
         pool = sections(min(candidate_limit, 80))
         return SearchOutcome(
-            query="policies",
+            query=query,
             sections=pool[:top_k],
             stats={
                 "candidate_pool_saturated": candidate_limit <= 80,
@@ -48,11 +57,11 @@ async def test_retrieval_always_requests_five_results(
         )
 
     monkeypatch.setattr(retrieval, "_retrieve_search_unit_sections", fetch)
-    result = await retrieval.retrieve_search_unit_sections(None, [], "policies", principal=None, top_k=requested)
+    result = await retrieval.retrieve_search_unit_sections(None, [], query, principal=None, top_k=requested)
     assert len(result.sections) == expected
-    assert result.stats["automatic_top_k"] is False
+    assert result.stats["automatic_top_k"] is expected_auto
     assert result.stats["requested_top_k"] == expected
-    assert calls == [32]
+    assert calls == [expected_first_wave]
 
 
 @pytest.mark.asyncio

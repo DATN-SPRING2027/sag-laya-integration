@@ -486,6 +486,10 @@ async def require_project_bff_principal(request: Request) -> VerifiedPrincipal:
     """Accept a tightly scoped BE service context on project document endpoints."""
     service_tokens = request.headers.getlist("X-SAG-BFF-Service-Token")
     if not service_tokens:
+        app = request.scope.get("app")
+        override = getattr(app, "dependency_overrides", {}).get(require_principal_assertion)
+        if override is not None:
+            return await override(request)
         return await require_principal_assertion(request)
     await require_bff_service_token(request)
 

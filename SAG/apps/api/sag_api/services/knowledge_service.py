@@ -312,7 +312,7 @@ def extract_e0_e1(
     confidence = max((f["confidence"] for f in facts if f["kind"] in {"entity", "alias"}), default=0.55)
     causal = bool(
         re.search(
-            r"\b(?:because|therefore|due to|must|shall|abstain|vì|do đó|nếu|phải|từ chối|bắt buộc)\b",
+            r"\b(?:because|therefore|due to|must|shall|vì|do đó|nếu|phải|từ chối|bắt buộc)\b",
             text,
             re.IGNORECASE,
         )

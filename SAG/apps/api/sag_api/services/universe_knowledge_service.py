@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -56,10 +58,164 @@ class KnowledgeUniverseSnapshot:
     members: dict[str, set[str]]
     assignments: list[dict[str, Any]]
     edges: list[tuple[str, str, float]]
+    edges_by_unit: dict[str, tuple[tuple[int, str, str, float], ...]] | None = None
 
     @property
     def unit_ids(self) -> set[str]:
         return set().union(*self.members.values())
+
+
+_VERIFIED_TREE_MANIFEST_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
+_VERIFIED_TREE_MANIFEST_CACHE_MAX = 16
+_VERIFIED_TREE_MANIFEST_LOCKS: dict[tuple[str, str, str], asyncio.Lock] = {}
+
+_SNAPSHOT_MEMBERSHIP_CACHE: dict[
+    tuple[Any, ...],
+    tuple[
+        dict[str, frozenset[str]],
+        tuple[dict[str, Any], ...],
+        tuple[tuple[str, str, float], ...],
+        dict[str, tuple[tuple[int, str, str, float], ...]],
+    ],
+] = {}
+_SNAPSHOT_MEMBERSHIP_CACHE_MAX = 32
+
+
+def _build_edges_by_unit(
+    edges: list[tuple[str, str, float]] | tuple[tuple[str, str, float], ...],
+) -> dict[str, tuple[tuple[int, str, str, float], ...]]:
+    by_unit: dict[str, list[tuple[int, str, str, float]]] = defaultdict(list)
+    for idx, (src, tgt, weight) in enumerate(edges):
+        entry = (idx, src, tgt, weight)
+        by_unit[src].append(entry)
+        if tgt != src:
+            by_unit[tgt].append(entry)
+    return {uid: tuple(items) for uid, items in by_unit.items()}
+
+
+def _slim_verified_manifest(raw: dict[str, Any]) -> dict[str, Any]:
+    """Drop bulky embedding payloads after SHA-256 verification while preserving all scope/routing fields."""
+    raw_routing = raw.get("routing_profiles")
+    slim_routing = (
+        [
+            {k: v for k, v in item.items() if k != "centroid"} if isinstance(item, dict) else item
+            for item in raw_routing
+        ]
+        if isinstance(raw_routing, list)
+        else raw_routing
+    )
+    raw_source_profiles = raw.get("source_routing_profiles")
+    slim_source_profiles = (
+        [
+            {
+                "project_id": item.get("project_id"),
+                "source_id": item.get("source_id"),
+                "document_version_id": item.get("document_version_id"),
+                "partition_id": item.get("partition_id"),
+                "tenant_id": item.get("tenant_id"),
+                "node_id": item.get("node_id"),
+            }
+            if isinstance(item, dict)
+            else item
+            for item in raw_source_profiles
+        ]
+        if isinstance(raw_source_profiles, list)
+        else raw_source_profiles
+    )
+    return {
+        "tenant_id": raw.get("tenant_id"),
+        "project_id": raw.get("project_id"),
+        "routing_profiles": slim_routing,
+        "source_routing_profiles": slim_source_profiles,
+        "search_unit_assignments": raw.get("search_unit_assignments"),
+        "edges": raw.get("edges", []),
+    }
+
+
+async def get_verified_tree_manifest_projection(
+    session: AsyncSession,
+    project_id: str,
+    tree_version: str,
+    expected_checksum: str,
+) -> dict[str, Any]:
+    """Load and cryptographically verify an immutable TreeManifest once per (project_id, tree_version, checksum)."""
+    if (
+        not isinstance(expected_checksum, str)
+        or len(expected_checksum) != 64
+        or any(ch not in "0123456789abcdef" for ch in expected_checksum)
+        or tree_version != f"tree-{expected_checksum[:24]}"
+    ):
+        raise ServiceUnavailableError("Published knowledge snapshot failed integrity validation")
+
+    cache_key = (project_id, tree_version, expected_checksum)
+    cached = _VERIFIED_TREE_MANIFEST_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    lock = _VERIFIED_TREE_MANIFEST_LOCKS.get(cache_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _VERIFIED_TREE_MANIFEST_LOCKS[cache_key] = lock
+
+    try:
+        async with lock:
+            cached = _VERIFIED_TREE_MANIFEST_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+            raw = await session.scalar(
+                select(TreeManifest.manifest_json).where(
+                    TreeManifest.project_id == project_id,
+                    TreeManifest.tree_version == tree_version,
+                    TreeManifest.checksum == expected_checksum,
+                    TreeManifest.status == "ACTIVE",
+                )
+            )
+            if not isinstance(raw, dict):
+                raise ServiceUnavailableError("Published knowledge snapshot failed integrity validation")
+            try:
+                verified_digest = await asyncio.to_thread(_checksum_manifest, raw)
+            except PublishVerificationError as error:
+                raise ServiceUnavailableError("Published knowledge snapshot is not canonical JSON") from error
+            if raw.get("project_id") != project_id or verified_digest != expected_checksum:
+                raise ServiceUnavailableError("Published knowledge snapshot failed integrity validation")
+            slim = _slim_verified_manifest(raw)
+            if len(_VERIFIED_TREE_MANIFEST_CACHE) >= _VERIFIED_TREE_MANIFEST_CACHE_MAX:
+                _VERIFIED_TREE_MANIFEST_CACHE.pop(next(iter(_VERIFIED_TREE_MANIFEST_CACHE)))
+            _VERIFIED_TREE_MANIFEST_CACHE[cache_key] = slim
+            return slim
+    finally:
+        if not lock.locked():
+            _VERIFIED_TREE_MANIFEST_LOCKS.pop(cache_key, None)
+
+
+async def warm_active_tree_manifest_cache(session_factory: Any) -> None:
+    """Pre-verify active project tree manifests in the background so cold Universe loads do not block."""
+    try:
+        async with session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        ProjectSearchState.project_id,
+                        TreeManifest.tree_version,
+                        TreeManifest.checksum,
+                    )
+                    .join(TreeManifest, ProjectSearchState.active_tree_version == TreeManifest.tree_version)
+                    .where(
+                        TreeManifest.project_id == ProjectSearchState.project_id,
+                        TreeManifest.status == "ACTIVE",
+                    )
+                    .limit(_VERIFIED_TREE_MANIFEST_CACHE_MAX)
+                )
+            ).all()
+            for project_id, tree_version, digest in rows:
+                try:
+                    await get_verified_tree_manifest_projection(session, project_id, tree_version, digest)
+                except ServiceUnavailableError:
+                    continue
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - best-effort startup warm-up
+        return
 
 
 def _snapshot_memberships(
@@ -136,56 +292,59 @@ async def load_knowledge_universe_snapshot(
 ) -> KnowledgeUniverseSnapshot:
     if tree.project_id not in principal.allowed_project_ids or not principal.tenant_id:
         raise NotFoundError("Knowledge project is unavailable")
-    row = (
-        await session.execute(
-            select(TreeManifest.manifest_json, TreeManifest.checksum)
-            .join(ProjectSearchState, ProjectSearchState.active_tree_version == TreeManifest.tree_version)
-            .where(
-                ProjectSearchState.project_id == tree.project_id,
-                ProjectSearchState.active_search_epoch == tree.search_epoch,
-                TreeManifest.project_id == tree.project_id,
-                TreeManifest.tree_version == tree.tree_version,
-                TreeManifest.status == "ACTIVE",
-            )
-            .with_for_update(read=True, of=ProjectSearchState)
+    digest = await session.scalar(
+        select(TreeManifest.checksum)
+        .join(ProjectSearchState, ProjectSearchState.active_tree_version == TreeManifest.tree_version)
+        .where(
+            ProjectSearchState.project_id == tree.project_id,
+            ProjectSearchState.active_search_epoch == tree.search_epoch,
+            TreeManifest.project_id == tree.project_id,
+            TreeManifest.tree_version == tree.tree_version,
+            TreeManifest.status == "ACTIVE",
         )
-    ).one_or_none()
-    if row is None:
-        raise ConflictError("The knowledge snapshot changed; refresh the universe")
-    raw, digest = row
-    try:
-        verified_digest = _checksum_manifest(raw) if isinstance(raw, dict) else None
-    except PublishVerificationError as error:
-        raise ServiceUnavailableError("Published knowledge snapshot is not canonical JSON") from error
-    if (
-        not isinstance(raw, dict)
-        or not isinstance(digest, str)
-        or raw.get("tenant_id") != principal.tenant_id
-        or raw.get("project_id") != tree.project_id
-        or verified_digest != digest
-        or tree.tree_version != f"tree-{digest[:24]}"
-    ):
-        raise ServiceUnavailableError("Published knowledge snapshot failed integrity validation")
-    sources = list(
-        (
-            await session.scalars(
-                select(Source)
-                .where(
-                    Source.id.in_(select(SourceProjectMapping.source_id).where(
-                        SourceProjectMapping.organization_id == principal.organization_id,
-                        SourceProjectMapping.project_id == tree.project_id,
-                        SourceProjectMapping.state == "CONFIRMED",
-                    )),
-                )
-                .order_by(Source.id)
-                .limit(settings.universe_manifest_source_limit + 1)
-            )
-        ).all()
+        .with_for_update(read=True, of=ProjectSearchState)
     )
-    if len(sources) > settings.universe_manifest_source_limit:
-        raise ServiceUnavailableError("Universe exceeds the configured authorized source limit")
-    versions = await _load_current_ready_versions(session, sources, principal)
-    versions = {key: value for key, value in versions.items() if value.project_id == tree.project_id}
+    if digest is None:
+        raise ConflictError("The knowledge snapshot changed; refresh the universe")
+    raw = await get_verified_tree_manifest_projection(
+        session,
+        tree.project_id,
+        tree.tree_version,
+        digest,
+    )
+    if raw.get("tenant_id") != principal.tenant_id or raw.get("project_id") != tree.project_id:
+        raise ServiceUnavailableError("Published knowledge snapshot failed integrity validation")
+
+    session_info = getattr(session, "info", None)
+    shared_scope = session_info.get("_universe_req_scope") if isinstance(session_info, dict) else None
+    if isinstance(shared_scope, dict) and shared_scope.get("ready_versions") is not None:
+        versions = {
+            key: value
+            for key, value in shared_scope["ready_versions"].items()
+            if value.project_id == tree.project_id
+        }
+    else:
+        sources = list(
+            (
+                await session.scalars(
+                    select(Source)
+                    .where(
+                        Source.id.in_(select(SourceProjectMapping.source_id).where(
+                            SourceProjectMapping.organization_id == principal.organization_id,
+                            SourceProjectMapping.project_id == tree.project_id,
+                            SourceProjectMapping.state == "CONFIRMED",
+                        )),
+                    )
+                    .order_by(Source.id)
+                    .limit(settings.universe_manifest_source_limit + 1)
+                )
+            ).all()
+        )
+        if len(sources) > settings.universe_manifest_source_limit:
+            raise ServiceUnavailableError("Universe exceeds the configured authorized source limit")
+        versions = await _load_current_ready_versions(session, sources, principal)
+        versions = {key: value for key, value in versions.items() if value.project_id == tree.project_id}
+
     scopes = {(value.source_id, key, value.partition_id) for key, value in versions.items()}
     scope_key = checksum(
         {
@@ -201,8 +360,41 @@ async def load_knowledge_universe_snapshot(
             ),
         }
     )
-    members, assignments, edges = _snapshot_memberships(raw, tree, principal.tenant_id, scopes)
-    return KnowledgeUniverseSnapshot(tree, principal.tenant_id, scope_key, scopes, members, assignments, edges)
+    membership_key = (
+        tree.project_id,
+        tree.tree_version,
+        digest,
+        principal.tenant_id,
+        frozenset(scopes),
+        tuple(node.id for node in tree.nodes),
+    )
+    cached_membership = _SNAPSHOT_MEMBERSHIP_CACHE.get(membership_key)
+    if cached_membership is None:
+        members, assignments, edges = _snapshot_memberships(raw, tree, principal.tenant_id, scopes)
+        edges_by_unit = _build_edges_by_unit(edges)
+        if len(_SNAPSHOT_MEMBERSHIP_CACHE) >= _SNAPSHOT_MEMBERSHIP_CACHE_MAX:
+            _SNAPSHOT_MEMBERSHIP_CACHE.pop(next(iter(_SNAPSHOT_MEMBERSHIP_CACHE)))
+        _SNAPSHOT_MEMBERSHIP_CACHE[membership_key] = (
+            {node_id: frozenset(unit_set) for node_id, unit_set in members.items()},
+            tuple(assignments),
+            tuple(edges),
+            edges_by_unit,
+        )
+    else:
+        frozen_members, tuple_assignments, tuple_edges, edges_by_unit = cached_membership
+        members = {node_id: set(unit_set) for node_id, unit_set in frozen_members.items()}
+        assignments = list(tuple_assignments)
+        edges = list(tuple_edges)
+    return KnowledgeUniverseSnapshot(
+        tree,
+        principal.tenant_id,
+        scope_key,
+        scopes,
+        members,
+        assignments,
+        edges,
+        edges_by_unit=edges_by_unit,
+    )
 
 
 def _unit_query(snapshot: KnowledgeUniverseSnapshot, ids: set[str] | None):
@@ -423,15 +615,23 @@ async def _present_units(
         unit_id_set = set(unit_ids)
         neighbor_ids_by_unit: dict[str, set[str]] = {uid: set() for uid in unit_ids}
         missing_neighbor_ids: set[str] = set()
-        for src, tgt, _w in snapshot.edges:
-            if src in unit_id_set:
-                neighbor_ids_by_unit[src].add(tgt)
-                if tgt not in doc_by_unit:
-                    missing_neighbor_ids.add(tgt)
-            if tgt in unit_id_set:
-                neighbor_ids_by_unit[tgt].add(src)
-                if src not in doc_by_unit:
-                    missing_neighbor_ids.add(src)
+        if snapshot.edges_by_unit is not None:
+            for uid in unit_ids:
+                for _idx, src, tgt, _w in snapshot.edges_by_unit.get(uid, ()):
+                    other = tgt if src == uid else src
+                    neighbor_ids_by_unit[uid].add(other)
+                    if other not in doc_by_unit:
+                        missing_neighbor_ids.add(other)
+        else:
+            for src, tgt, _w in snapshot.edges:
+                if src in unit_id_set:
+                    neighbor_ids_by_unit[src].add(tgt)
+                    if tgt not in doc_by_unit:
+                        missing_neighbor_ids.add(tgt)
+                if tgt in unit_id_set:
+                    neighbor_ids_by_unit[tgt].add(src)
+                    if src not in doc_by_unit:
+                        missing_neighbor_ids.add(src)
         if missing_neighbor_ids:
             neighbor_doc_rows = (
                 await session.execute(
@@ -545,11 +745,17 @@ async def knowledge_universe_page(
         anchor = (await session.execute(_unit_query(snapshot, {related_to}))).one_or_none()
         if anchor is None:
             raise NotFoundError("Knowledge unit is unavailable")
-        ids = {
-            target if source == related_to else source
-            for source, target, _weight in snapshot.edges
-            if related_to in {source, target}
-        }
+        if snapshot.edges_by_unit is not None:
+            ids = {
+                target if source == related_to else source
+                for _idx, source, target, _weight in snapshot.edges_by_unit.get(related_to, ())
+            }
+        else:
+            ids = {
+                target if source == related_to else source
+                for source, target, _weight in snapshot.edges
+                if related_to in {source, target}
+            }
     context = {
         "v": 2, "kind": "knowledge", "scope": snapshot.scope_key,
         "node": node_id, "related": related_to,
@@ -568,11 +774,21 @@ async def knowledge_universe_page(
     visible = {unit.id for unit in units}
     if related_to:
         visible.add(related_to)
-    visible_triples = [
-        (source, target, weight)
-        for source, target, weight in snapshot.edges
-        if source in visible and target in visible
-    ][:settings.universe_edge_budget_desktop]
+    if snapshot.edges_by_unit is not None:
+        matched_by_idx: dict[int, tuple[str, str, float]] = {}
+        for uid in visible:
+            for idx, source, target, weight in snapshot.edges_by_unit.get(uid, ()):
+                if idx not in matched_by_idx and source in visible and target in visible:
+                    matched_by_idx[idx] = (source, target, weight)
+        visible_triples = [
+            matched_by_idx[idx] for idx in sorted(matched_by_idx)
+        ][:settings.universe_edge_budget_desktop]
+    else:
+        visible_triples = [
+            (source, target, weight)
+            for source, target, weight in snapshot.edges
+            if source in visible and target in visible
+        ][:settings.universe_edge_budget_desktop]
     row_by_id = {r[0].id: r for r in rows}
     if anchor is not None:
         row_by_id[anchor[0].id] = anchor
@@ -661,12 +877,20 @@ async def knowledge_universe_detail(
 
     synapses: list[UniverseKnowledgeSynapseOut] = []
     if snapshot.edges and snapshot.tree.projection != "source":
+        allowed_unit_ids = snapshot.unit_ids
         neighbor_weights: dict[str, float] = {}
-        for src, tgt, weight in snapshot.edges:
-            if src == unit.id and tgt in snapshot.unit_ids:
-                neighbor_weights[tgt] = max(neighbor_weights.get(tgt, 0.0), float(weight))
-            elif tgt == unit.id and src in snapshot.unit_ids:
-                neighbor_weights[src] = max(neighbor_weights.get(src, 0.0), float(weight))
+        if snapshot.edges_by_unit is not None:
+            for _idx, src, tgt, weight in snapshot.edges_by_unit.get(unit.id, ()):
+                if src == unit.id and tgt in allowed_unit_ids:
+                    neighbor_weights[tgt] = max(neighbor_weights.get(tgt, 0.0), float(weight))
+                elif tgt == unit.id and src in allowed_unit_ids:
+                    neighbor_weights[src] = max(neighbor_weights.get(src, 0.0), float(weight))
+        else:
+            for src, tgt, weight in snapshot.edges:
+                if src == unit.id and tgt in allowed_unit_ids:
+                    neighbor_weights[tgt] = max(neighbor_weights.get(tgt, 0.0), float(weight))
+                elif tgt == unit.id and src in allowed_unit_ids:
+                    neighbor_weights[src] = max(neighbor_weights.get(src, 0.0), float(weight))
         if neighbor_weights:
             top_neighbor_ids = {
                 nid

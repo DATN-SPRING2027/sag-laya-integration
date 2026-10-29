@@ -63,7 +63,14 @@ _routed_query_demand_tasks: set[asyncio.Task[None]] = set()
 _selection_slots = WeakKeyDictionary()
 
 
-async def _select_diverse_sections(query, candidates, *, limit, deadline):
+async def _select_diverse_sections(
+    query,
+    candidates,
+    *,
+    limit,
+    deadline,
+    per_document_limit: int | None = None,
+):
     """Keep evidence scoring off the API loop and stop it when its request ends."""
     from sag_api.services.retrieval_service import select_diverse_sections
 
@@ -74,7 +81,12 @@ async def _select_diverse_sections(query, candidates, *, limit, deadline):
         try:
             cancelled = threading.Event()
             task = asyncio.create_task(asyncio.to_thread(
-                select_diverse_sections, query, candidates, limit=limit, _cancelled=cancelled,
+                select_diverse_sections,
+                query,
+                candidates,
+                limit=limit,
+                per_document_limit=per_document_limit,
+                _cancelled=cancelled,
             ))
             try:
                 return await asyncio.shield(task)
@@ -831,8 +843,20 @@ def _routing_trace(
 
 
 _ARTIFACT_CODE_RE = re.compile(
-    r"\b(pr|sup|int|inc|eng|adr|des|rlt|sec|ops|fin|leg|rfc|bug|iss|tkt|ticket)[\s_#-]+(\d{2,6}[a-z0-9]*)\b",
+    r"\b([a-z]{2,8})[\s_#-]+(\d{2,6}[a-z0-9]*)\b",
     re.IGNORECASE,
+)
+_NON_ARTIFACT_PREFIXES = frozenset(
+    {
+        "in", "on", "at", "to", "by", "of", "or", "as", "is", "be", "do", "no",
+        "up", "if", "so", "an", "we", "he", "it", "us", "vs",
+        "the", "and", "for", "from", "with", "into", "over", "after", "under", "between",
+        "year", "years", "month", "months", "week", "weeks", "day", "days", "hour", "hours",
+        "page", "pages", "step", "steps", "tier", "tiers", "part", "parts", "item", "items",
+        "line", "lines", "table", "tables", "figure", "figures", "note", "notes", "top", "max", "min",
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+        "ngay", "thang", "nam", "tuan", "gio", "phut", "giay", "trang", "buoc", "lan", "phan", "muc",
+    }
 )
 _INTERNAL_URI_SLUG_RE = re.compile(
     r"(?:[a-z][a-z0-9+.-]*:\/\/|(?<!https:)(?<!http:)\/\/)[^\s<>\]\)`\"']+\/([a-z0-9][a-z0-9_-]{5,120})",
@@ -846,9 +870,9 @@ def _extract_artifact_codes(text: str) -> set[str]:
     codes: set[str] = set()
     for match in _ARTIFACT_CODE_RE.finditer(text):
         prefix = match.group(1).lower()
+        if prefix in _NON_ARTIFACT_PREFIXES:
+            continue
         num = match.group(2).lower()
-        if prefix == "ticket":
-            prefix = "tkt"
         codes.add(f"{prefix} {num}")
     return codes
 
@@ -1229,7 +1253,7 @@ async def _hydrate_sibling_sections_for_top_versions(
                     if not u_id or u_id in existing_ids:
                         continue
                     existing_ids.add(u_id)
-                    decay = max(0.76, 0.88 - 0.03 * idx_su)
+                    decay = max(0.55, 0.72 - 0.03 * idx_su)
                     siblings.append(
                         sec_template.model_copy(
                             update={
@@ -1398,11 +1422,6 @@ async def _expand_multi_hop_sections(
                                 if ent_hit or path_hit:
                                     matched_scores.append(b_score)
                             if matched_scores:
-                                is_roster_section = ku.sec_path_norm.endswith(
-                                    ("> ownership", "> change log", "> changelog", "> approvers", "> reviewers")
-                                )
-                                if not path_matched and is_roster_section:
-                                    continue
                                 best_b = max(matched_scores)
                                 mult = 0.88 if path_matched else min(0.75, 0.70 + 0.03 * (len(matched_scores) - 1))
                                 neighbor_scores[ku.id] = max(neighbor_scores.get(ku.id, 0.0), best_b * mult)
@@ -1520,13 +1539,29 @@ async def retrieve_search_unit_sections(
     top_k: int | None = None,
     query_strategy_plan: QueryStrategyPlan | None = None,
 ) -> SearchOutcome:
-    """Return at most five verified sections, with a bounded candidate pool."""
+    """Return verified sections according to the 7-axis RetrievalPlan, with a bounded candidate pool."""
     if top_k is not None and top_k < 1:
         raise ValueError("top_k must be positive")
-    top_k = FIXED_SEARCH_TOP_K
-    plan = query_strategy_plan or plan_query(query)
+    plan = query_strategy_plan or plan_query(query, requested_top_k=top_k)
+    if top_k is not None and plan.retrieval_plan.cardinality.requested_n != top_k:
+        from dataclasses import replace
+        from sag_api.services.retrieval_plan import build_retrieval_plan
+
+        plan = replace(
+            plan,
+            retrieval_plan=build_retrieval_plan(
+                query,
+                requested_top_k=top_k,
+                strategy_mode=plan.primary_strategy.value,
+                clauses=plan.retrieval_plan.decomposition.subqueries,
+                multi_hop=plan.multi_hop_eligible,
+                exact_lookup=plan.primary_strategy.value == "EXACT",
+                constraints=plan.retrieval_plan.constraints,
+            ),
+        )
+    effective_top_k = plan.retrieval_plan.cardinality.effective_n
     budget = max(1, settings.search_unit_candidate_limit)
-    seed = max(settings.search_top_k, top_k)
+    seed = max(settings.search_top_k, effective_top_k)
     candidate_limit = min(budget, max(seed * 4, seed + 1))
     started = time.perf_counter()
     deadline = asyncio.get_running_loop().time() + settings.search_source_timeout
@@ -1535,7 +1570,7 @@ async def retrieve_search_unit_sections(
     while True:
         wave_start = time.perf_counter()
         outcome = await _retrieve_search_unit_sections(
-            engine_manager, sources, query, principal=principal, top_k=top_k,
+            engine_manager, sources, query, principal=principal, top_k=effective_top_k,
             query_strategy_plan=plan, candidate_limit=candidate_limit, deadline=deadline,
         )
         waves += 1
@@ -1552,10 +1587,10 @@ async def retrieve_search_unit_sections(
         anchor_cov = coverage.get("anchor_coverage") if isinstance(coverage, dict) else None
         precision_pruned = (
             bool(outcome.sections)
-            and unique_candidates >= top_k
+            and unique_candidates >= effective_top_k
             and anchor_cov in ("complete", "not_required")
         )
-        needs_more = len(outcome.sections) < top_k and not precision_pruned
+        needs_more = len(outcome.sections) < effective_top_k and not precision_pruned
         remaining = deadline - asyncio.get_running_loop().time()
         stop = (
             "deadline" if remaining <= 0 else
@@ -1569,8 +1604,12 @@ async def retrieve_search_unit_sections(
             elapsed = round((time.perf_counter() - started) * 1000, 2)
             timings["total_retrieval"] = elapsed
             return SearchOutcome(query=outcome.query, sections=outcome.sections, stats={
-                **outcome.stats, "automatic_top_k": False, "requested_top_k": top_k,
-                "effective_top_k": len(outcome.sections), "adaptive_waves": waves,
+                **outcome.stats,
+                "automatic_top_k": top_k is None and plan.retrieval_plan.cardinality.count_source.value != "DEFAULT",
+                "requested_top_k": effective_top_k,
+                "effective_top_k": len(outcome.sections),
+                "retrieval_plan": plan.retrieval_plan.as_trace(),
+                "adaptive_waves": waves,
                 "retrieval_stop_reason": stop, "budget_exhausted": stop in {"candidate_budget", "deadline"},
                 "has_more": False,
                 "stage_latencies_ms": dict(timings), "latency_total_ms": elapsed,
@@ -1594,7 +1633,8 @@ async def _retrieve_search_unit_sections(
 
     requested_limit = min(top_k, settings.search_unit_candidate_limit) if top_k is not None else candidate_limit
     selection_limit = requested_limit if top_k is not None else None
-    strategy_plan = query_strategy_plan or plan_query(query)
+    strategy_plan = query_strategy_plan or plan_query(query, requested_top_k=top_k)
+    per_doc_limit = strategy_plan.retrieval_plan.per_document_limit
     retrieval_stats = {
         "requested_top_k": requested_limit,
         "candidate_top_k": candidate_limit,
@@ -2177,7 +2217,12 @@ async def _retrieve_search_unit_sections(
     if rerank_remaining <= settings.search_rerank_min_remaining_seconds:
         selection_fallback_reason = "rerank_budget_exhausted"
         fallback_pool = _fair_rank_merge([semantic, lexical])
-        selected = fallback_pool[:selection_limit]
+        if per_doc_limit == 1 and selection_limit is not None:
+            from sag_api.services.retrieval_plan import group_sections_by_document
+
+            selected = group_sections_by_document(fallback_pool, limit=selection_limit)
+        else:
+            selected = fallback_pool[:selection_limit]
         rerank_stats = {
             "candidates": len(fallback_pool),
             "relevant": None,
@@ -2202,7 +2247,7 @@ async def _retrieve_search_unit_sections(
         t_diversity_ms = round((time.perf_counter() - t_rerank_start) * 1000, 2)
     else:
         t_fusion_start = time.perf_counter()
-        fused = rerank_sections(query, semantic, lexical=lexical, limit=candidate_limit)
+        fused = rerank_sections(query, semantic, lexical=lexical, limit=None)
         t_fusion_ms = round((time.perf_counter() - t_fusion_start) * 1000, 2)
         rerank_stats = {
             "candidates": fused.candidate_count,
@@ -2221,18 +2266,26 @@ async def _retrieve_search_unit_sections(
                 sources=sources,
                 limit=requested_limit,
             )
-            if requested_limit > 1 and fused.sections and not is_multi_hop_query
+            if not is_multi_hop_query and requested_limit > 1 and fused.sections and per_doc_limit != 1
             else []
         )
         initial_pool = fused.sections + sibling_sections
         try:
             selected, diversity_stats = await _select_diverse_sections(
-                query, initial_pool, limit=selection_limit,
+                query,
+                initial_pool,
+                limit=selection_limit,
                 deadline=selection_deadline,
+                per_document_limit=per_doc_limit,
             )
         except TimeoutError:
             selection_fallback_reason = "diversity_budget_exhausted"
-            selected = fused.sections[:selection_limit]
+            if per_doc_limit == 1 and selection_limit is not None:
+                from sag_api.services.retrieval_plan import group_sections_by_document
+
+                selected = group_sections_by_document(fused.sections, limit=selection_limit)
+            else:
+                selected = fused.sections[:selection_limit]
             diversity_stats = {"candidate_count": len(initial_pool), "deduplicated_count": 0,
                                "anchor_coverage": "unknown", "reason": selection_fallback_reason}
         t_diversity_ms = round((time.perf_counter() - t_div_start) * 1000, 2)
@@ -2319,24 +2372,28 @@ async def _retrieve_search_unit_sections(
                             and bool(seed_doc_ids)
                             and str(f_sec.document_id or "") not in seed_doc_ids
                         )
-                        is_strong_bridge = exp_score >= 0.76 * top_seed_score
+                        is_strong_bridge = exp_score >= 0.85 * top_seed_score
                         bonus = 0.08 if (is_cross_doc_multi_hop and is_strong_bridge) else 0.0
                         raw_boost = max(float(f_sec.score or 0.0), exp_score + bonus)
                         boosted_score = max(float(f_sec.score or 0.0), min(hop2_cap, raw_boost))
                         boosted_fused.append(f_sec.model_copy(update={"score": round(boosted_score, 6)}))
                     else:
                         boosted_fused.append(f_sec)
-                unconfirmed_cap = min(hop2_cap, max(0.05, top_seed_score * 0.82))
+                unconfirmed_cap = min(hop2_cap, max(0.05, top_seed_score * 0.85))
                 new_expanded = [
                     s.model_copy(update={"score": round(min(unconfirmed_cap, float(s.score or 0.0)), 6)})
                     for s in expanded_sections
                     if str(s.search_unit_id or s.chunk_id or "") not in seen_exp_ids
+                    and float(s.score or 0.0) >= 0.85 * top_seed_score
                 ]
                 combined_pool = boosted_fused + new_expanded
                 try:
                     selected, diversity_stats = await _select_diverse_sections(
-                        query, combined_pool, limit=selection_limit,
+                        query,
+                        combined_pool,
+                        limit=selection_limit,
                         deadline=selection_deadline,
+                        per_document_limit=per_doc_limit,
                     )
                 except TimeoutError:
                     diversity_stats = {**diversity_stats, "reason": "diversity_budget_exhausted"}

@@ -5,7 +5,7 @@ Complies with Section 9.1 and 9.2 of phase-0-contracts-and-foundations.md.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -38,3 +38,21 @@ class DocumentVersionStatusResponse(BaseModel):
     current_stage: str
     stage_progress: dict[str, StageProgressItem] = Field(default_factory=dict)
     error: dict[str, Any] | None = None
+    progress: int = 0
+    document_status: str | None = None
+    parser_provider: str | None = None
+    parser_status: str | None = None
+    chunk_count: int = 0
+    event_count: int = 0
+    token_usage: int = 0
+
+
+class DocumentRevokeRequest(BaseModel):
+    logical_source_id: str | None = None
+    document_id: str | None = None
+    reason: str | None = None
+
+
+class DocumentRevokeResponse(BaseModel):
+    status: Literal["REVOKED", "ALREADY_REVOKED", "NOT_FOUND"]
+    document_id: str | None = None

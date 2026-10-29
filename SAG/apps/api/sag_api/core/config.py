@@ -130,14 +130,29 @@ class Settings(BaseSettings):
         ".text",
         ".pdf",
         ".docx",
+        ".doc",
         ".pptx",
+        ".ppt",
         ".xls",
         ".xlsx",
+        ".odt",
+        ".ods",
+        ".odp",
+        ".rtf",
         ".csv",
         ".tsv",
         ".html",
         ".htm",
         ".json",
+        ".yaml",
+        ".yml",
+        ".xml",
+        ".drawio",
+        ".sql",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".webp",
         ".epub",
     }
 
@@ -243,6 +258,8 @@ class Settings(BaseSettings):
     # Diversity knobs are retrieval quality parameters, not answerability/confidence thresholds.
     search_mmr_diversity_weight: float = Field(default=0.5, ge=0.0, le=1.0)
     search_near_duplicate_similarity: float = Field(default=0.98, ge=0.9, le=1.0)
+    search_doc_admission_ratio: float = Field(default=0.75, ge=0.0, le=1.0)
+    search_same_doc_penalty_weight: float = Field(default=0.06, ge=0.0, le=0.5)
     search_chinese_segmentation_enabled: bool = False
     # 精确模式（multi）含查询侧 LLM 往返；超时/失败/空结果自动回退快速模式（vector）。
     search_source_timeout: float = 25.0

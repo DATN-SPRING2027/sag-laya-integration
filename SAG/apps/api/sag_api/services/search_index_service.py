@@ -112,11 +112,9 @@ def compute_sparse_bm25_vector(
     import re
     from collections import Counter
 
-    # Normalize thousand-separated numbers (1,577 -> 1577) and compound abbreviations (PP&E -> ppe)
+    # Normalize thousand-separated numbers (1,577 -> 1577) and ampersand initialisms (R&D -> rd)
     cleaned_text = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", text.lower())
-    cleaned_text = re.sub(r"\bpp(?:\s*&\s*|n)e\b", "ppe ppne property plant equipment", cleaned_text)
-    cleaned_text = re.sub(r"\bshee\s+t\b", "sheet", cleaned_text)
-    cleaned_text = re.sub(r"\bflow\s+s\b", "flows", cleaned_text)
+    cleaned_text = re.sub(r"\b([a-z]{1,2})\s*&\s*([a-z]{1,2})\b", r"\1\2", cleaned_text)
     tokens = re.findall(r"\w+", cleaned_text)
     if not tokens:
         return {"indices": [], "values": []}
@@ -154,6 +152,19 @@ def compute_sparse_bm25_vector(
         token_idx = int(hashlib.md5(word.encode("utf-8")).hexdigest()[:8], 16) % 1000000
         # Deduplicate indices and preserve highest weight on hash collision for Qdrant uniqueness
         sparse_map[token_idx] = max(sparse_map.get(token_idx, 0.0), round(bm25_weight, 4))
+        if word.isascii() and word.isalpha():
+            stem = (
+                word[:-3]
+                if len(word) >= 6 and word.endswith("ing")
+                else word[:-2]
+                if len(word) >= 6 and word.endswith("ed")
+                else word[:-1]
+                if len(word) >= 5 and word.endswith("s") and not word.endswith("ss")
+                else None
+            )
+            if stem and len(stem) >= 3:
+                stem_idx = int(hashlib.md5(stem.encode("utf-8")).hexdigest()[:8], 16) % 1000000
+                sparse_map[stem_idx] = max(sparse_map.get(stem_idx, 0.0), round(bm25_weight * 0.55, 4))
 
     sorted_indices = sorted(sparse_map.keys())
     return {
@@ -617,9 +628,9 @@ async def index_search_units_to_qdrant(
         )
         sparse_vec = compute_sparse_bm25_vector(
             ctx_text,
-            avg_doc_len=avg_len,
-            corpus_doc_freqs=dict(corpus_doc_freqs),
-            total_corpus_docs=max(1, total_docs),
+            avg_doc_len=256.0,
+            corpus_doc_freqs=None,
+            total_corpus_docs=1000,
         )
         points.append({
             "id": point_id,
