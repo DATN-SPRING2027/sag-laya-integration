@@ -274,9 +274,7 @@ async def test_handover_assist_question_answer_fails_closed_on_insufficient_evid
         ),
     )
     app_answered = _build_app(answered_llm)
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app_answered), base_url="http://test"
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app_answered), base_url="http://test") as client:
         ans_res = await client.post(
             "/api/v1/projects/751a2b3c4d5e6f7a8b9c0d20/handover/assist",
             headers=_bff_headers(),
@@ -318,9 +316,7 @@ async def test_handover_assist_question_answer_fails_closed_on_insufficient_evid
         complete=AsyncMock(side_effect=ServiceUnavailableError("LLM provider timeout")),
     )
     app_failing = _build_app(failing_llm)
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app_failing), base_url="http://test"
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app_failing), base_url="http://test") as client:
         fail_res = await client.post(
             "/api/v1/projects/751a2b3c4d5e6f7a8b9c0d20/handover/assist",
             headers=_bff_headers(),
@@ -366,9 +362,7 @@ async def test_handover_assist_question_answer_fails_closed_on_insufficient_evid
         ),
     )
     app_unverified = _build_app(unverified_llm)
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app_unverified), base_url="http://test"
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app_unverified), base_url="http://test") as client:
         downgraded_res = await client.post(
             "/api/v1/projects/751a2b3c4d5e6f7a8b9c0d20/handover/assist",
             headers=_bff_headers(),
@@ -429,12 +423,8 @@ async def test_handover_assist_distributes_evidence_budget_fairly_and_reports_co
         for i in range(5)
     ]
     parsed_five = [HandoverAssistSourceInput.model_validate(s) for s in five_sources_raw]
-    units_80, cov_80 = handover_assist_service._build_evidence_units(
-        parsed_five, {}, max_units=80
-    )
-    per_source_counts_80 = [
-        sum(1 for u in units_80 if u.source.id == s["id"]) for s in five_sources_raw
-    ]
+    units_80, cov_80 = handover_assist_service._build_evidence_units(parsed_five, {}, max_units=80)
+    per_source_counts_80 = [sum(1 for u in units_80 if u.source.id == s["id"]) for s in five_sources_raw]
     assert per_source_counts_80 == [16, 16, 16, 16, 16]
     assert cov_80.requestedSources == 5
     assert len(cov_80.includedSources) == 5
@@ -483,9 +473,7 @@ async def test_handover_assist_distributes_evidence_budget_fairly_and_reports_co
         ),
     )
     app = _build_app(llm)
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         res = await client.post(
             "/api/v1/projects/751a2b3c4d5e6f7a8b9c0d20/handover/assist",
             headers=_bff_headers(),
@@ -515,9 +503,41 @@ async def test_handover_assist_distributes_evidence_budget_fairly_and_reports_co
         ]
 
 
+@pytest.mark.parametrize("reason", ["duplicate_excerpt", "normalized_logical_id"])
+def test_coverage_aggregates_truncation_across_duplicate_inputs(reason: str) -> None:
+    from sag_api.schemas.handover_assist import HandoverAssistSourceInput
+    from sag_api.services.handover_assist_service import _build_evidence_units
+
+    first = HandoverAssistSourceInput.model_validate(
+        {
+            "kind": "PROJECT_DOCUMENT",
+            "id": "851a2b3c4d5e6f7a8b9c0d31",
+            "version": 1,
+            "title": "Runbook",
+            "excerpts": [{"locatorKind": "SECTION", "locatorValue": "one", "content": "Short"}],
+        }
+    )
+    second = first.model_copy(update={"logicalSourceId": " logical-runbook "})
+    if reason == "duplicate_excerpt":
+        second = HandoverAssistSourceInput.model_validate(
+            {
+                **first.model_dump(),
+                "excerpts": [
+                    {"locatorKind": "SECTION", "locatorValue": "two", "content": "x" * 2000},
+                ],
+            }
+        )
+    _, coverage = _build_evidence_units([first, second], {}, truncated_indexed_sources={("logical-runbook", 1)})
+    assert coverage.requestedSources == 1
+    assert coverage.truncated is True
+    assert len(coverage.truncatedSources) == 1
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize("wide_span", [False, True])
 async def test_handover_assist_filters_indexed_units_by_exact_version_in_sql_before_limit(
     monkeypatch: pytest.MonkeyPatch,
+    wide_span: bool,
 ) -> None:
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -623,6 +643,36 @@ async def test_handover_assist_filters_indexed_units_by_exact_version_in_sql_bef
                 section_path=f"Runbook v2 Section {idx + 1}",
             )
             db.add_all([blk2, su2])
+        # Unrelated blocks in the requested version must not be materialized.
+        for idx in range(1000):
+            db.add(
+                CanonicalBlock(
+                    id=f"unreferenced-{idx}",
+                    document_version_id=v2.id,
+                    ordinal=1000 + idx,
+                    block_type="paragraph",
+                    page_from=99,
+                    page_to=99,
+                    section_path="Unreferenced",
+                    normalized_text="UNREFERENCED_BLOCK_" + "x" * 5000,
+                    content_hash=f"{idx + 2000:064x}",
+                )
+            )
+        if wide_span:
+            db.add(
+                SearchUnit(
+                    id="wide-unit",
+                    document_version_id=v2.id,
+                    block_from_id="unreferenced-0",
+                    block_to_id="unreferenced-999",
+                    security_partition_id=project_id,
+                    content_hash="e" * 64,
+                    token_count=10000,
+                    page_from=99,
+                    page_to=99,
+                    section_path="Oversized unit",
+                )
+            )
         await db.commit()
 
     captured_prompts: list[list[dict[str, str]]] = []
@@ -645,16 +695,27 @@ async def test_handover_assist_filters_indexed_units_by_exact_version_in_sql_bef
     llm = SimpleNamespace(configured=True, complete=AsyncMock(side_effect=_complete_spy))
     app = _build_app(llm)
 
+    fetched_block_rows: list[list] = []
+
     async def _real_sqlite_session():
         async with session_factory() as db:
+            original_execute = db.execute
+
+            async def _inspect_execute(statement, *args, **kwargs):
+                result = await original_execute(statement, *args, **kwargs)
+                if "normalized_text" in str(statement):
+                    rows = result.all()
+                    fetched_block_rows.append(rows)
+                    return SimpleNamespace(all=lambda: rows)
+                return result
+
+            monkeypatch.setattr(db, "execute", _inspect_execute)
             yield db
 
     app.dependency_overrides[get_session] = _real_sqlite_session
 
     try:
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://test"
-        ) as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             res = await client.post(
                 f"/api/v1/projects/{project_id}/handover/assist",
                 headers=_bff_headers(org_id=org_id, project_id=project_id),
@@ -690,5 +751,12 @@ async def test_handover_assist_filters_indexed_units_by_exact_version_in_sql_bef
             prompt_user_text = captured_prompts[0][1]["content"]
             assert "Pinned v2 authoritative step #1: blue-green cutover." in prompt_user_text
             assert "Stale v1 chunk" not in prompt_user_text
+            assert len(fetched_block_rows) == 1
+            assert len(fetched_block_rows[0]) <= (10 if wide_span else 2)
+            assert all(len(str(row[-1])) <= 1600 for row in fetched_block_rows[0])
+            if wide_span:
+                assert body["coverage"]["truncated"] is True
+            else:
+                assert "UNREFERENCED_BLOCK_" not in prompt_user_text
     finally:
         await engine.dispose()

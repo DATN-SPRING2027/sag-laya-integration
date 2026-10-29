@@ -36,6 +36,7 @@ log = get_logger("handover_assist")
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.DOTALL)
 _MAX_EVIDENCE_UNITS = 100
 _MAX_INDEXED_UNITS_PER_SOURCE = 25
+_MAX_BLOCKS_PER_UNIT = 8
 _MAX_UNIT_CHARS = 1600
 
 
@@ -56,6 +57,7 @@ async def _load_indexed_units(
     principal: VerifiedPrincipal,
     project_id: str,
     sources: list[HandoverAssistSourceInput],
+    truncated_sources: set[tuple[str, int]] | None = None,
 ) -> dict[tuple[str, int], list[tuple[LocatorKind, str, str, str]]]:
     """Load ready SearchUnits from Postgres filtered by exact (logicalSourceId, version) pairs."""
     logical_targets: set[tuple[str, int]] = {
@@ -98,6 +100,11 @@ async def _load_indexed_units(
                     ),
                 )
                 .label("source_rn"),
+                func.count()
+                .over(
+                    partition_by=(Document.logical_source_id, DocumentVersion.version_no),
+                )
+                .label("source_total"),
             )
             .join(DocumentVersion, DocumentVersion.document_id == Document.id)
             .join(SearchUnit, SearchUnit.document_version_id == DocumentVersion.id)
@@ -126,6 +133,7 @@ async def _load_indexed_units(
                 ranked_subq.c.section_path,
                 ranked_subq.c.start_ordinal,
                 ranked_subq.c.end_ordinal,
+                ranked_subq.c.source_total,
             )
             .where(ranked_subq.c.source_rn <= _MAX_INDEXED_UNITS_PER_SOURCE)
             .order_by(
@@ -140,21 +148,50 @@ async def _load_indexed_units(
         if not rows:
             return {}
 
-        version_ids = sorted({str(row[1]) for row in rows if row[1]})
-        blocks_by_version: dict[str, list[tuple[int, str]]] = defaultdict(list)
-        if version_ids:
-            blk_stmt = (
-                select(
-                    CanonicalBlock.document_version_id,
-                    CanonicalBlock.ordinal,
-                    CanonicalBlock.normalized_text,
+        # Join only the selected SearchUnit spans; do not load whole versions.
+        # Both row count and cell length are bounded before materialization.
+        selected = stmt.subquery()
+        block_window = (
+            select(
+                selected.c.unit_id,
+                selected.c.logical_source_id,
+                selected.c.version_no,
+                func.length(CanonicalBlock.normalized_text).label("text_length"),
+                func.count().over(partition_by=selected.c.unit_id).label("block_total"),
+                func.row_number()
+                .over(
+                    partition_by=selected.c.unit_id,
+                    order_by=(CanonicalBlock.ordinal.asc(), CanonicalBlock.id.asc()),
                 )
-                .where(CanonicalBlock.document_version_id.in_(version_ids))
-                .order_by(CanonicalBlock.document_version_id.asc(), CanonicalBlock.ordinal.asc())
+                .label("block_rn"),
+                func.substr(CanonicalBlock.normalized_text, 1, _MAX_UNIT_CHARS).label("normalized_text"),
             )
-            blk_rows = (await session.execute(blk_stmt)).all()
-            for ver_id, ordinal, norm_text in blk_rows:
-                blocks_by_version[str(ver_id)].append((int(ordinal), str(norm_text or "")))
+            .join(
+                CanonicalBlock,
+                and_(
+                    CanonicalBlock.document_version_id == selected.c.document_version_id,
+                    CanonicalBlock.ordinal >= selected.c.start_ordinal,
+                    CanonicalBlock.ordinal <= selected.c.end_ordinal,
+                ),
+            )
+            .subquery()
+        )
+        blk_stmt = (
+            select(block_window)
+            .where(
+                block_window.c.block_rn <= _MAX_BLOCKS_PER_UNIT,
+            )
+            .order_by(block_window.c.unit_id, block_window.c.block_rn)
+        )
+        blocks_by_unit: dict[str, list[str]] = defaultdict(list)
+        for unit_id, logical_id, version_no, text_length, block_total, _rn, text in (
+            await session.execute(blk_stmt)
+        ).all():
+            blocks_by_unit[str(unit_id)].append(str(text or ""))
+            if truncated_sources is not None and (
+                int(block_total) > _MAX_BLOCKS_PER_UNIT or int(text_length or 0) > _MAX_UNIT_CHARS
+            ):
+                truncated_sources.add((str(logical_id), int(version_no)))
     except Exception as exc:  # noqa: BLE001
         log.debug("Skipping optional indexed SearchUnit enrichment: %s", type(exc).__name__)
         return {}
@@ -162,31 +199,30 @@ async def _load_indexed_units(
     mapped: dict[tuple[str, int], list[tuple[LocatorKind, str, str, str]]] = {}
     for (
         logical_id,
-        doc_version_id,
+        _doc_version_id,
         version_no,
         unit_id,
         page_from,
         section_path,
         start_ord,
         end_ord,
+        source_total,
     ) in rows:
         key = (str(logical_id), int(version_no))
         if key not in logical_targets or int(start_ord) > int(end_ord):
             continue
-        unit_texts = [
-            b_text
-            for b_ord, b_text in blocks_by_version.get(str(doc_version_id), ())
-            if int(start_ord) <= b_ord <= int(end_ord) and b_text.strip()
-        ]
+        unit_texts = [text for text in blocks_by_unit.get(str(unit_id), ()) if text.strip()]
         combined_text = "\n\n".join(unit_texts).strip()
+        if truncated_sources is not None and (
+            int(source_total) > _MAX_INDEXED_UNITS_PER_SOURCE or len(combined_text) > _MAX_UNIT_CHARS
+        ):
+            truncated_sources.add(key)
         if not combined_text:
             continue
         loc_kind: LocatorKind = "CHUNK" if unit_id else "PAGE"
         loc_val = str(unit_id)[:200] if unit_id else str(max(1, int(page_from or 1)))
         heading = str(section_path or "")[:255]
-        mapped.setdefault(key, []).append(
-            (loc_kind, loc_val, heading, combined_text[:_MAX_UNIT_CHARS])
-        )
+        mapped.setdefault(key, []).append((loc_kind, loc_val, heading, combined_text[:_MAX_UNIT_CHARS]))
     return mapped
 
 
@@ -195,11 +231,11 @@ def _build_evidence_units(
     indexed_by_logical: dict[tuple[str, int], list[tuple[LocatorKind, str, str, str]]],
     *,
     max_units: int | None = None,
+    truncated_indexed_sources: set[tuple[str, int]] | None = None,
 ) -> tuple[list[_EvidenceUnit], AssistCoverageOut]:
-    source_buckets: list[
-        tuple[SourceRefPayload, str, list[tuple[LocatorKind, str, str, str]]]
-    ] = []
+    source_buckets: list[tuple[SourceRefPayload, str, list[tuple[LocatorKind, str, str, str]]]] = []
     seen_source_refs: dict[tuple[str, str, int], int] = {}
+    truncated_buckets: set[int] = set()
 
     for src in sources:
         src_key = (src.kind, src.id, src.version)
@@ -209,12 +245,17 @@ def _build_evidence_units(
         else:
             ref = SourceRefPayload(kind=src.kind, id=src.id, version=src.version)
             candidates = []
-            seen_source_refs[src_key] = len(source_buckets)
+            bucket_idx = len(source_buckets)
+            seen_source_refs[src_key] = bucket_idx
             source_buckets.append((ref, src.title, candidates))
 
-        seen_locators: set[tuple[str, str]] = {
-            (cand[0], cand[1]) for cand in candidates
-        }
+        logical_id = src.logicalSourceId.strip() if src.logicalSourceId else ""
+        if (logical_id, src.version) in (truncated_indexed_sources or set()) or any(
+            len(excerpt.content.strip()) > _MAX_UNIT_CHARS for excerpt in src.excerpts
+        ):
+            truncated_buckets.add(bucket_idx)
+
+        seen_locators: set[tuple[str, str]] = {(cand[0], cand[1]) for cand in candidates}
         if src.logicalSourceId and src.logicalSourceId.strip():
             for loc_kind, loc_val, heading, text in indexed_by_logical.get(
                 (src.logicalSourceId.strip(), src.version), []
@@ -242,9 +283,7 @@ def _build_evidence_units(
             )
 
     effective_cap = max(0, int(_MAX_EVIDENCE_UNITS if max_units is None else max_units))
-    selected_per_source: list[list[tuple[LocatorKind, str, str, str]]] = [
-        [] for _ in source_buckets
-    ]
+    selected_per_source: list[list[tuple[LocatorKind, str, str, str]]] = [[] for _ in source_buckets]
     total_selected = 0
     round_idx = 0
     while total_selected < effective_cap:
@@ -271,7 +310,7 @@ def _build_evidence_units(
             included_sources.append(ref)
         else:
             skipped_sources.append(ref)
-        if candidates and len(chosen) < len(candidates):
+        if (candidates and len(chosen) < len(candidates)) or bucket_idx in truncated_buckets:
             truncated_sources.append(ref)
         for loc_kind, loc_val, heading, content in chosen:
             units.append(
@@ -424,18 +463,22 @@ async def execute_handover_assist(
                 sections=[],
                 coverage=empty_coverage,
             )
-        return HandoverAssistResponse(
-            task=body.task, candidates=[], items=[], coverage=empty_coverage
-        )
+        return HandoverAssistResponse(task=body.task, candidates=[], items=[], coverage=empty_coverage)
 
     _ensure_llm_ready(llm)
+    truncated_indexed_sources: set[tuple[str, int]] = set()
     indexed_units = await _load_indexed_units(
         session,
         principal=principal,
         project_id=project_id,
         sources=body.sources,
+        truncated_sources=truncated_indexed_sources,
     )
-    units, coverage = _build_evidence_units(body.sources, indexed_units)
+    units, coverage = _build_evidence_units(
+        body.sources,
+        indexed_units,
+        truncated_indexed_sources=truncated_indexed_sources,
+    )
     if not units:
         if body.task == "QUESTION_ANSWER":
             return HandoverAssistResponse(
@@ -445,9 +488,7 @@ async def execute_handover_assist(
                 sections=[],
                 coverage=coverage,
             )
-        return HandoverAssistResponse(
-            task=body.task, candidates=[], items=[], coverage=coverage
-        )
+        return HandoverAssistResponse(task=body.task, candidates=[], items=[], coverage=coverage)
 
     by_index = {unit.index: unit for unit in units}
     catalog_text = _render_evidence_catalog(units)
@@ -494,9 +535,7 @@ async def execute_handover_assist(
                     continue
                 seen_source_keys.add(src_key)
                 candidates.append(ProposedCandidateOut(source=unit.source, reason=reason))
-        return HandoverAssistResponse(
-            task="SOURCE_PROPOSAL", candidates=candidates, coverage=coverage
-        )
+        return HandoverAssistResponse(task="SOURCE_PROPOSAL", candidates=candidates, coverage=coverage)
 
     if body.task == "DRAFT_GENERATION":
         messages = [
@@ -550,9 +589,7 @@ async def execute_handover_assist(
                 layer=ErrorLayer.LLM,
                 stage=ErrorStage.GENERATE,
             )
-        return HandoverAssistResponse(
-            task="DRAFT_GENERATION", items=items, coverage=coverage
-        )
+        return HandoverAssistResponse(task="DRAFT_GENERATION", items=items, coverage=coverage)
 
     # QUESTION_ANSWER
     messages = [
@@ -588,9 +625,7 @@ async def execute_handover_assist(
             text = str(sec.get("text") or "").strip()[:10000]
             _sources, citations = _resolve_citations(sec.get("evidenceIndices"), by_index)
             if text and citations:
-                verified_sections.append(
-                    GroundedAnswerSectionOut(text=text, citations=citations[:50])
-                )
+                verified_sections.append(GroundedAnswerSectionOut(text=text, citations=citations[:50]))
 
     if not verified_sections:
         insufficient_msg = (
@@ -613,4 +648,3 @@ async def execute_handover_assist(
         sections=verified_sections,
         coverage=coverage,
     )
-

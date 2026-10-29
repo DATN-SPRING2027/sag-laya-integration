@@ -45,6 +45,19 @@
 
 ---
 
+## Review round 2 — 2026-10-29 (before implementation)
+
+- R2-SAG01: the SearchUnit window is bounded but the subsequent CanonicalBlock query fetches every block in each selected document version. Restrict SQL to the selected units' ordinal spans and bound oversized spans while reporting incomplete coverage. Preserve exact tenant, project, source version and fair per-source allocation.
+- Add a regression with many unrelated blocks in a requested version and an oversized requested span; inspect actual rows fetched, not just the returned text. Run the Handover pytest suite and scoped Ruff checks. No PostgreSQL schema, migration or configuration change is required.
+
+## Review round 2 verification — 2026-10-29
+
+- CanonicalBlock retrieval now joins only selected SearchUnit ordinal spans. SQL limits each unit to 8 blocks and each materialized text cell to 1,600 characters; huge spans, oversized text and per-source unit limits are surfaced in coverage metadata. Tenant/project/partition/exact-version filters and round-robin evidence allocation remain in force.
+- Regression tests seed 1,000 unrelated blocks in the requested document version and inspect the actual rows returned by SQL. Both narrow and oversized spans are covered. A further two regressions cover merged duplicate input sources and normalized logical IDs when reporting truncation.
+- `python -B -m pytest -p no:cacheprovider tests/test_handover_assist.py -q`: **10 passed** using the existing API virtualenv. `ruff check` and `ruff format --check` on the changed service/tests: PASS.
+- CodeRabbit raised **1 minor issue** (duplicate/whitespace coverage accounting). It was reproduced by two failing tests, fixed per source bucket, and the complete Handover suite passed again. No extra review issue was silently discarded.
+- No PostgreSQL migration/schema, Qdrant or environment change. SQL executes under SQLite in these focused tests; a live PostgreSQL integration run is not claimed.
+
 ## 4. File-by-File Change Matrix
 
 1. `SAG/apps/api/sag_api/schemas/handover_assist.py` — Pydantic v2 request/response schemas with strict bounds (`extra="forbid"`, max sources/excerpts/lengths, official `source_kind` enum, `AssistCoverageOut` truncation/coverage reporting).
