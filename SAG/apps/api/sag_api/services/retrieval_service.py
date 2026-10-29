@@ -1434,8 +1434,11 @@ async def synthesize_search_answer(
     if llm is None or not getattr(llm, "configured", False):
         return SearchAnswer(fallback, _citations_used_by_answer(fallback, citations), "answered")
 
+    from sag_api.core.token_usage import token_usage_scope
+
     try:
-        answer = await llm.complete(pack.messages)
+        with token_usage_scope(component="answer_generation"):
+            answer = await llm.complete(pack.messages)
     except Exception as error:  # noqa: BLE001
         log.warning("搜索答案生成失败，回退证据摘要：%s", error)
         return SearchAnswer(fallback, _citations_used_by_answer(fallback, citations), "answered")
@@ -1484,11 +1487,14 @@ async def stream_synthesize_search_answer(
         yield SearchAnswerUpdate(kind="completed", text=fallback, citations=used_citations)
         return
 
+    from sag_api.core.token_usage import token_usage_scope
+
     parts: list[str] = []
     try:
-        async for delta in llm.stream_complete(pack.messages):
-            if delta:
-                parts.append(delta)
+        with token_usage_scope(component="answer_generation"):
+            async for delta in llm.stream_complete(pack.messages):
+                if delta:
+                    parts.append(delta)
     except asyncio.CancelledError:
         raise
     except Exception as error:  # noqa: BLE001

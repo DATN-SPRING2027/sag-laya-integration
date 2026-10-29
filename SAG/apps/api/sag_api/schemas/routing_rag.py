@@ -47,6 +47,26 @@ class DocumentVersionStatusResponse(BaseModel):
     token_usage: int = 0
 
 
+class DocumentExtractedChunkItem(BaseModel):
+    chunk_id: str
+    ordinal: int
+    section_path: str = ""
+    block_type: str = "paragraph"
+    page_from: int = 1
+    page_to: int = 1
+    token_count: int = 0
+    content: str
+
+
+class DocumentVersionChunksResponse(BaseModel):
+    document_id: str
+    version_no: int
+    source_stage: Literal["SEARCH_UNITS", "CANONICAL_BLOCKS", "EMPTY"] = "EMPTY"
+    total_chunks: int = 0
+    total_tokens: int = 0
+    items: list[DocumentExtractedChunkItem] = Field(default_factory=list)
+
+
 class DocumentRevokeRequest(BaseModel):
     logical_source_id: str | None = None
     document_id: str | None = None

@@ -25,6 +25,7 @@ from sag_api.core.errors import (
 )
 from sag_api.core.litellm_policy import apply_litellm_completion_policy
 from sag_api.core.logging import get_logger
+from sag_api.core.token_usage import extract_chat_usage, record_llm_usage
 
 log = get_logger("generation")
 
@@ -125,8 +126,17 @@ class LLMClient:
                 request["tool_choice"] = tool_choice
         if self._settings.llm_base_url:
             request["api_base"] = self._settings.llm_base_url
-        request = apply_litellm_completion_policy(self._settings, request)
-        return await _litellm_completion(**request)
+        normalized = apply_litellm_completion_policy(self._settings, request)
+        try:
+            return await _litellm_completion(**normalized)
+        except Exception as err:
+            if stream and "stream_options" in normalized and "stream_options" in str(err).casefold():
+                fallback_request = dict(request)
+                fallback_request["stream_options"] = None
+                return await _litellm_completion(
+                    **apply_litellm_completion_policy(self._settings, fallback_request)
+                )
+            raise
 
     @staticmethod
     async def _close_stream(stream: Any) -> None:
@@ -149,12 +159,16 @@ class LLMClient:
         """
 
         self._ensure_configured()
+        serialized_messages = [message.to_model_dict() for message in request.messages]
         tool_parts: dict[int, dict[str, str]] = {}
         finish_reason: str | None = None
+        latest_raw_usage: Any = None
+        collected_parts: list[str] = []
+        usage_recorded = False
         stream = None
         try:
             stream = await self._create_completion(
-                [message.to_model_dict() for message in request.messages],
+                serialized_messages,
                 tools=list(request.tools) or None,
                 tool_choice=request.tool_choice if request.tools else None,
                 stream=True,
@@ -163,6 +177,7 @@ class LLMClient:
                 cancellation.raise_if_cancelled()
                 raw_usage = _attr(chunk, "usage")
                 if raw_usage is not None:
+                    latest_raw_usage = raw_usage
                     prompt_details = _attr(raw_usage, "prompt_tokens_details")
                     completion_details = _attr(raw_usage, "completion_tokens_details")
                     yield ModelChunk(
@@ -181,6 +196,7 @@ class LLMClient:
                 delta = _attr(choice, "delta", {})
                 token = _attr(delta, "content")
                 if token:
+                    collected_parts.append(token)
                     yield ModelChunk(text_delta=token)
                 for fallback_index, tool_delta in enumerate(_attr(delta, "tool_calls") or []):
                     index = _attr(tool_delta, "index")
@@ -199,6 +215,17 @@ class LLMClient:
                             part["arguments"] += (
                                 arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False)
                             )
+
+            if latest_raw_usage is not None or collected_parts or tool_parts:
+                tool_completion_text = "".join(collected_parts) + "".join(
+                    p.get("name", "") + p.get("arguments", "") for p in tool_parts.values()
+                )
+                record_llm_usage(
+                    model=self._settings.llm_model,
+                    usage=extract_chat_usage(latest_raw_usage, serialized_messages, tool_completion_text),
+                    component="agent_turn",
+                )
+                usage_recorded = True
 
             calls: list[RuntimeToolCall] = []
             for index in sorted(tool_parts):
@@ -231,6 +258,16 @@ class LLMClient:
             log.warning("LLM 轮次流式调用失败：%s", e)
             raise _classify_llm_error(e, stage=ErrorStage.GENERATE) from e
         finally:
+            if not usage_recorded and (latest_raw_usage is not None or collected_parts or tool_parts):
+                tool_completion_text = "".join(collected_parts) + "".join(
+                    p.get("name", "") + p.get("arguments", "") for p in tool_parts.values()
+                )
+                record_llm_usage(
+                    model=self._settings.llm_model,
+                    usage=extract_chat_usage(latest_raw_usage, serialized_messages, tool_completion_text),
+                    component="agent_turn",
+                )
+                usage_recorded = True
             if stream is not None:
                 try:
                     await self._close_stream(stream)
@@ -249,7 +286,12 @@ class LLMClient:
                     layer=ErrorLayer.LLM,
                     stage=ErrorStage.GENERATE,
                 )
-            return _attr(_attr(choices[0], "message", {}), "content", "") or ""
+            content = _attr(_attr(choices[0], "message", {}), "content", "") or ""
+            record_llm_usage(
+                model=self._settings.llm_model,
+                usage=extract_chat_usage(_attr(resp, "usage"), messages, content),
+            )
+            return content
         except ApiError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -260,20 +302,39 @@ class LLMClient:
 
         self._ensure_configured()
         stream = None
+        latest_raw_usage: Any = None
+        collected_parts: list[str] = []
+        usage_recorded = False
         try:
             stream = await self._create_completion(messages, stream=True)
             async for chunk in stream:
+                raw_usage = _attr(chunk, "usage")
+                if raw_usage is not None:
+                    latest_raw_usage = raw_usage
                 choices = _attr(chunk, "choices", []) or []
                 if not choices:
                     continue
                 token = _attr(_attr(choices[0], "delta", {}), "content")
                 if token:
+                    collected_parts.append(token)
                     yield token
+            if latest_raw_usage is not None or collected_parts:
+                record_llm_usage(
+                    model=self._settings.llm_model,
+                    usage=extract_chat_usage(latest_raw_usage, messages, "".join(collected_parts)),
+                )
+                usage_recorded = True
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
             raise _classify_llm_error(e, stage=ErrorStage.GENERATE) from e
         finally:
+            if not usage_recorded and (latest_raw_usage is not None or collected_parts):
+                record_llm_usage(
+                    model=self._settings.llm_model,
+                    usage=extract_chat_usage(latest_raw_usage, messages, "".join(collected_parts)),
+                )
+                usage_recorded = True
             # Closing explicitly makes browser aborts release the upstream HTTP
             # connection immediately, even when the stream is only partly read.
             if stream is not None:

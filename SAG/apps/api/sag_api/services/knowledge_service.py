@@ -324,23 +324,18 @@ def extract_e0_e1(
         + (0.25 if block.block_type in {"code", "table"} else 0)
         + (0.25 if causal else 0),
     )
-    hard = bool(re.search(r"contradict|supersed|thay thế|trái ngược", text, re.IGNORECASE))
     return facts, {
-        # Foundation stage: Dense embeddings for Knowledge Unit are deferred to dedicated
-        # embedder follow-up when not provided; signals are calibrated and renormalized via fuse_signals().
+        # Foundation stage: deterministic E0/E1 extraction + DenseGraph embeddings (100% cache-reused
+        # from Phase 2C). Phase 5B E2 LLM enrichment was permanently removed after 81-file RetrievalCI
+        # A/B evaluation showed 0 recall gain, -0.73% precision, -20% abstention, and +242% ingest cost
+        # (see docs/adr-remove-e2-llm-enrichment.md).
         "dense": dense_list,
         "sparse": sparse,
         "entities": labels,
         "citations": sorted(set(re.findall(r"(?:https?|[a-z][a-z0-9+.-]*):\/\/[^\s<>\]\)]*[^\s<>\]\).,;:!?]", text))),
         "local_confidence": confidence,
         "importance": importance,
-        "e2_reason": "semantic_relation"
-        if hard
-        else (
-            "low_confidence_important"
-            if confidence < config.e2_low_confidence and importance >= config.e2_importance_min
-            else ("causal_constraint" if causal and importance >= config.e2_importance_min else None)
-        ),
+        "e2_reason": None,
     }
 
 
@@ -795,26 +790,6 @@ async def rebuild_knowledge_version(
         "knowledge_config": config.model_dump(mode="json"),
     }
     await session.flush()
-    # Validated model responses are source artifacts too: replay without another model call or token charge.
-    from sag_api.jobs.knowledge import apply_e2
-
-    artifacts = (
-        await session.scalars(
-            select(KnowledgeJob).where(
-                KnowledgeJob.document_version_id == version_id,
-                KnowledgeJob.kind == "E2",
-                KnowledgeJob.status == "SUCCEEDED",
-                KnowledgeJob.result_json.is_not(None),
-            )
-        )
-    ).all()
-    by_id = {u.id: u for u in units}
-    for artifact in artifacts:
-        unit = by_id.get(artifact.unit_id)
-        if unit and artifact.input_checksum == unit.input_checksum:
-            await apply_e2(
-                session, artifact, artifact.result_json, extractor_version=artifact.extractor_version, config=config
-            )
     return units
 
 

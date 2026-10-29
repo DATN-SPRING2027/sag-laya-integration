@@ -1033,9 +1033,9 @@ def test_system_bottleneck_bug_fixes_e0_routing_and_multihop_diversity() -> None
     assert "Dự án A" in vn_features["entities"]
     assert "120 câu" in vn_features["entities"]
     assert "30 ngày" in vn_features["entities"]
-    assert vn_features["e2_reason"] == "causal_constraint"
+    assert vn_features["e2_reason"] is None
 
-    # Low-confidence important block (no E0 entities, but has causal/constraint keywords -> importance=0.50)
+    # Low-confidence important block preserves importance/confidence while E2 LLM enrichment remains disabled
     low_conf_block = _make_block(
         "Quy định",
         "nếu tỷ lệ câu trả lời thiếu bằng chứng vượt ngưỡng thì hệ thống bắt buộc phải từ chối trả lời ngay.",
@@ -1044,7 +1044,7 @@ def test_system_bottleneck_bug_fixes_e0_routing_and_multihop_diversity() -> None
     _, low_conf_features = extract_e0_e1(low_conf_block)
     assert low_conf_features["local_confidence"] == pytest.approx(0.55)
     assert low_conf_features["importance"] >= 0.50
-    assert low_conf_features["e2_reason"] == "low_confidence_important"
+    assert low_conf_features["e2_reason"] is None
 
     # 2. Tree Routing: _query_signal_scores strips stopwords and produces decisive margin (>= 0.18)
     branch_a_profile = {
@@ -1196,9 +1196,8 @@ def test_system_bottleneck_bug_fixes_e0_routing_and_multihop_diversity() -> None
     assert [s.document_id for s in mh5_selected] == ["doc-1", "doc-2", "doc-3", "doc-4", "doc-5"]
 
 
-def test_vietnamese_entity_lexer_multihop_and_e2_span_alignment() -> None:
-    """Verify Vietnamese entity extraction, newline boundary safety, multi-hop detection, and E2 span alignment."""
-    from sag_api.jobs.knowledge import _align_e2_spans
+def test_vietnamese_entity_lexer_and_multihop_detection() -> None:
+    """Verify Vietnamese entity extraction, newline boundary safety, and multi-hop query feature detection."""
     from sag_api.services.query_analysis import extract_query_features
 
     # 1. Newline boundary safety + Vietnamese full date + compound proper nouns + single-word mid-sentence proper nouns
@@ -1232,24 +1231,3 @@ def test_vietnamese_entity_lexer_multihop_and_e2_span_alignment() -> None:
     mh_q2 = "Sự khác nhau giữa quy trình phê duyệt cấp 1 và quy trình khẩn cấp là gì, và khi nào cần áp dụng?"
     assert extract_query_features(mh_q1).multi_hop is True
     assert extract_query_features(mh_q2).multi_hop is True
-
-    # 3. E2 verbatim quote span alignment
-    raw_text = "Theo Điều 13 Thông tư 36/2014/TT-NHNN, trường hợp khẩn cấp phải báo cáo Ngân hàng Nhà nước."
-    aligned = _align_e2_spans(
-        {
-            "entities": [
-                {"quote": "Thông tư 36/2014/TT-NHNN", "start": 0, "end": 5, "confidence": 0.9, "label": "Thông tư 36/2014/TT-NHNN"},
-            ],
-            "claims": [
-                {"quote": "Non-existent quote", "start": 0, "end": 10, "confidence": 0.9},
-            ],
-            "aliases": [],
-            "relations": [],
-        },
-        raw_text,
-        "blk-1",
-    )
-    assert len(aligned["entities"]) == 1
-    assert len(aligned["claims"]) == 0
-    ent_span = aligned["entities"][0]
-    assert raw_text[ent_span["start"] : ent_span["end"]] == "Thông tư 36/2014/TT-NHNN"

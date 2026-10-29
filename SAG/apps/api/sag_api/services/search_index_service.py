@@ -530,6 +530,12 @@ async def compute_unit_embeddings(embedder: Any, texts: Sequence[str]) -> list[l
 
     if len(vectors) != len(texts):
         raise RuntimeError(f"Embedding count mismatch: expected {len(texts)}, got {len(vectors)}")
+    if not getattr(embedder, "_sag_token_metered_cache_wrapped", False):
+        from sag_api.core.token_usage import extract_embedding_usage, record_embedding_usage
+        record_embedding_usage(
+            model=getattr(embedder, "model", None) or getattr(settings, "embedding_model", None),
+            usage=extract_embedding_usage(None, list(texts)),
+        )
     return vectors
 
 
@@ -568,6 +574,18 @@ async def index_search_units_to_qdrant(
     # Single-Brain Unified Batch Embedding: when using a real batch embedder, pre-batch
     # any individual CanonicalBlock texts alongside SearchUnit contextual texts in 1 HTTP call
     # so KnowledgeWorker gets a 0ms cache hit with 0 extra network calls.
+    from sag_api.core.token_usage import estimate_text_tokens, token_usage_scope
+    _preload_block_count = 0
+    _preload_est_tokens = 0
+    _su_est_tokens = estimate_text_tokens(contextual_texts)
+    _embed_scope = token_usage_scope(
+        component="search_index_embedding",
+        project_id=project_id,
+        tenant_id=tenant_id,
+        document_id=document_id or getattr(version, "document_id", None),
+        document_version_id=getattr(version, "id", None),
+    )
+    _index_ledger = _embed_scope.__enter__()
     if hasattr(embedder, "batch_generate") and blocks_by_id:
         extra_block_texts: list[str] = []
         seen_texts = set(contextual_texts)
@@ -576,16 +594,37 @@ async def index_search_units_to_qdrant(
             if blk.block_type != "heading" and bt and bt not in seen_texts and get_cached_text_embedding(bt) is None:
                 seen_texts.add(bt)
                 extra_block_texts.append(blk.normalized_text)
+        _preload_block_count = len(extra_block_texts)
+        _preload_est_tokens = estimate_text_tokens(extra_block_texts)
         combined_batch = list(contextual_texts) + extra_block_texts
-        all_vectors = await compute_unit_embeddings(embedder, combined_batch)
+        try:
+            all_vectors = await compute_unit_embeddings(embedder, combined_batch)
+        except BaseException:
+            _embed_scope.__exit__(None, None, None)
+            raise
         for txt, vec in zip(combined_batch, all_vectors, strict=True):
             put_cached_text_embedding(txt, vec)
         vectors = all_vectors[: len(contextual_texts)]
     else:
-        vectors = await compute_unit_embeddings(embedder, contextual_texts)
+        try:
+            vectors = await compute_unit_embeddings(embedder, contextual_texts)
+        except BaseException:
+            _embed_scope.__exit__(None, None, None)
+            raise
         if hasattr(embedder, "batch_generate"):
             for txt, vec in zip(contextual_texts, vectors, strict=True):
                 put_cached_text_embedding(txt, vec)
+    _embed_scope.__exit__(None, None, None)
+    _index_ledger.set_metadata(
+        search_unit_texts_count=len(contextual_texts),
+        knowledge_block_preload_texts_count=_preload_block_count,
+        search_unit_estimated_tokens=_su_est_tokens,
+        knowledge_block_preload_estimated_tokens=_preload_est_tokens,
+    )
+    try:
+        setattr(version, "_last_search_index_token_usage", _index_ledger.to_summary())
+    except Exception:
+        pass
     vector_dim = len(vectors[0]) if vectors and len(vectors[0]) > 0 else 1536
 
     # 1. Ensure collection exists and payload indexes are created
@@ -1007,6 +1046,16 @@ async def run_search_indexing_stage(
     session.add(document_version)
     await session.flush()
 
+    _idx_token_usage = getattr(document_version, "_last_search_index_token_usage", None)
+    if _idx_token_usage is not None:
+        document_version.metadata_json = {
+            **(document_version.metadata_json or {}),
+            "search_index_token_usage": _idx_token_usage,
+        }
+        session.add(document_version)
+        await session.flush()
+        from sag_api.core.token_usage import sync_document_token_usage
+        await sync_document_token_usage(session, document_version.id)
     duration_ms = (datetime.now(UTC) - start_time).total_seconds() * 1000.0
 
     # 7. Record StageRun with Manifest verification
@@ -1038,6 +1087,7 @@ async def run_search_indexing_stage(
                 "qdrant_checksum": qdrant_checksum,
                 "manifest_verified": manifest_verified,
                 "collection_name": collection_name,
+                "token_usage": _idx_token_usage,
                 "error": (
                     sanitize_error_message(indexing_error)
                     if indexing_error

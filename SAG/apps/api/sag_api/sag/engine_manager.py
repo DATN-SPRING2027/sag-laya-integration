@@ -595,6 +595,8 @@ class EngineManager:
                 inner_emb = getattr(emb, attr_name, None)
                 if inner_emb is not None and getattr(inner_emb, "max_tokens", 512) <= 512:
                     inner_emb.max_tokens = 8192
+        from sag_api.core.token_usage import wrap_embedding_client_with_cache_and_metering
+        wrap_embedding_client_with_cache_and_metering(emb, default_model=self._settings.embedding_model)
         if emb is not None and not getattr(emb, "_sag_shared_cache_wrapped", False):
             from sag_api.services.search_index_service import (
                 get_cached_text_embedding,
@@ -1370,7 +1372,9 @@ class EngineManager:
             primary_config_id = source_config_ids[0]
             slot = await self._slot(primary_config_id, sources_by_config[primary_config_id])
             engine = slot.engine
-            query_vector = await engine.resources.embedding.generate(query)
+            from sag_api.core.token_usage import token_usage_scope
+            with token_usage_scope(component="query_embedding"):
+                query_vector = await engine.resources.embedding.generate(query)
             timings["vector.embedding"] = round((time.perf_counter() - t0) * 1000, 2)
             t1 = time.perf_counter()
             exclusions = {
@@ -1493,7 +1497,9 @@ class EngineManager:
         async def recall_vectors() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
             slot = await self._slot(source_config_ids[0], sources_by_config[source_config_ids[0]])
             engine = slot.engine
-            query_vector = await engine.resources.embedding.generate(query)
+            from sag_api.core.token_usage import token_usage_scope
+            with token_usage_scope(component="query_embedding"):
+                query_vector = await engine.resources.embedding.generate(query)
             store = engine.resources.vector
             filters = Filter.one_of("data_source_id", tuple(source_config_ids))
 

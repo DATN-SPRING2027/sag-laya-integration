@@ -22,6 +22,7 @@ from sag_api.core.error_taxonomy import ErrorCode
 from sag_api.core.errors import ApiError, ValidationError
 from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal, require_project_read_principal
+from sag_api.core.token_usage import TokenLedger, token_usage_scope
 from sag_api.db.models import Source, User
 from sag_api.enums import SEARCH_STRATEGIES, normalize_search_strategy
 from sag_api.generation import LLMClient
@@ -475,6 +476,30 @@ def _sse(event: str, payload: dict) -> dict[str, str]:
     return {"event": event, "data": json.dumps(payload, ensure_ascii=False)}
 
 
+def _resolve_search_project_id(
+    principal: VerifiedPrincipal,
+    sources: list[Source] | None = None,
+) -> str | None:
+    for src in sources or ():
+        proj_id = getattr(src, "project_id", None)
+        if proj_id:
+            return str(proj_id)
+    if principal and principal.allowed_project_ids:
+        return next(iter(sorted(principal.allowed_project_ids)), None)
+    return None
+
+
+def _with_token_usage_stats(response: SearchResponse, ledger: TokenLedger) -> SearchResponse:
+    return response.model_copy(
+        update={
+            "stats": {
+                **response.stats,
+                "token_usage": ledger.to_summary(),
+            }
+        }
+    )
+
+
 @router.post("", response_model=SearchResponse)
 async def search(
     source_id: str,
@@ -492,97 +517,104 @@ async def search(
         from sag_api.core.errors import NotFoundError
 
         raise NotFoundError("信源不存在")
-    partitioned = source.id in await versioned_source_ids(session, [source.id])
-    route_plan = await _build_query_route(
-        body.query,
-        [source_id],
-        body.strategy,
-        requested_top_k=body.top_k,
-    )
-    if route_plan.need_retrieval:
-        if partitioned:
-            from sag_api.services.search_unit_retrieval_service import retrieve_search_unit_sections
+    project_id = _resolve_search_project_id(principal, [source])
+    with token_usage_scope(
+        component="search_request",
+        project_id=project_id,
+        tenant_id=principal.tenant_id,
+    ) as search_token_ledger:
+        partitioned = source.id in await versioned_source_ids(session, [source.id])
+        route_plan = await _build_query_route(
+            body.query,
+            [source_id],
+            body.strategy,
+            requested_top_k=body.top_k,
+        )
+        if route_plan.need_retrieval:
+            if partitioned:
+                from sag_api.services.search_unit_retrieval_service import retrieve_search_unit_sections
 
-            outcome = await retrieve_search_unit_sections(
-                engine_manager,
-                [source],
-                body.query,
-                principal=principal,
-                top_k=body.top_k,
-                query_strategy_plan=route_plan.strategy_plan,
-            )
-            event_scores = {}
-        else:
-            outcome, event_scores = await asyncio.gather(
-                retrieve_relevant_sections(
+                outcome = await retrieve_search_unit_sections(
                     engine_manager,
                     [source],
                     body.query,
-                    strategy=route_plan.strategy,
+                    principal=principal,
                     top_k=body.top_k,
-                ),
-                recall_event_scores(
-                    engine_manager,
-                    body.query,
-                    {source.sag_source_config_id: source},
-                    limit=route_plan.strategy_plan.retrieval_plan.cardinality.effective_n,
-                ),
+                    query_strategy_plan=route_plan.strategy_plan,
+                )
+                event_scores = {}
+            else:
+                outcome, event_scores = await asyncio.gather(
+                    retrieve_relevant_sections(
+                        engine_manager,
+                        [source],
+                        body.query,
+                        strategy=route_plan.strategy,
+                        top_k=body.top_k,
+                    ),
+                    recall_event_scores(
+                        engine_manager,
+                        body.query,
+                        {source.sag_source_config_id: source},
+                        limit=route_plan.strategy_plan.retrieval_plan.cardinality.effective_n,
+                    ),
+                )
+            stats = _with_query_route_stats(
+                {
+                    **outcome.stats,
+                    "event_candidates": len(event_scores),
+                },
+                route_plan,
             )
-        stats = _with_query_route_stats(
-            {
+            outcome = SearchOutcome(query=body.query, sections=outcome.sections, stats=stats)
+        else:
+            event_scores = {}
+            stats = _with_query_route_stats(
+                {
+                    "sources": 0,
+                    "requested_strategy": route_plan.strategy,
+                    "effective_strategy": None,
+                    "fallback_used": False,
+                },
+                route_plan,
+            )
+            outcome = SearchOutcome(query=body.query, sections=[], stats=stats)
+        for section in outcome.sections:
+            section.source_config_id = section.source_config_id or source.sag_source_config_id
+        graph_fields = (
+            {"events": [], "entities": [], "relations": []}
+            if partitioned
+            else await _event_graph_fields(
+                engine_manager,
+                outcome.sections,
+                {source.sag_source_config_id: source},
+                event_scores=event_scores,
+            )
+        )
+        answer = (
+            await synthesize_search_answer(body.query, outcome.sections, llm=llm, sources=[source])
+            if route_plan.need_retrieval
+            else SearchAnswer("", [], "skipped")
+        )
+        # 对外 source_id = sag 信源 id（可路由 / 取原文），不泄漏引擎内部 id
+        return SearchResponse(
+            query=body.query,
+            sections=[
+                SectionOut(**{**s.model_dump(), "source_id": source.id}, source_name=source.name) for s in outcome.sections
+            ],
+            **graph_fields,
+            source_hits=_source_hits(graph_fields["events"]),
+            summary=answer.text,
+            citations=answer.citations,
+            answer_status=answer.status,
+            no_answer_reason=answer.no_answer_reason,
+            stats={
                 **outcome.stats,
-                "event_candidates": len(event_scores),
+                "event_hits": len(graph_fields["events"]),
+                "event_recall": "vector+chunk" if event_scores else "chunk",
+                "token_usage": search_token_ledger.to_summary(),
             },
-            route_plan,
         )
-        outcome = SearchOutcome(query=body.query, sections=outcome.sections, stats=stats)
-    else:
-        event_scores = {}
-        stats = _with_query_route_stats(
-            {
-                "sources": 0,
-                "requested_strategy": route_plan.strategy,
-                "effective_strategy": None,
-                "fallback_used": False,
-            },
-            route_plan,
-        )
-        outcome = SearchOutcome(query=body.query, sections=[], stats=stats)
-    for section in outcome.sections:
-        section.source_config_id = section.source_config_id or source.sag_source_config_id
-    graph_fields = (
-        {"events": [], "entities": [], "relations": []}
-        if partitioned
-        else await _event_graph_fields(
-            engine_manager,
-            outcome.sections,
-            {source.sag_source_config_id: source},
-            event_scores=event_scores,
-        )
-    )
-    answer = (
-        await synthesize_search_answer(body.query, outcome.sections, llm=llm, sources=[source])
-        if route_plan.need_retrieval
-        else SearchAnswer("", [], "skipped")
-    )
-    # 对外 source_id = sag 信源 id（可路由 / 取原文），不泄漏引擎内部 id
-    return SearchResponse(
-        query=body.query,
-        sections=[
-            SectionOut(**{**s.model_dump(), "source_id": source.id}, source_name=source.name) for s in outcome.sections
-        ],
-        **graph_fields,
-        source_hits=_source_hits(graph_fields["events"]),
-        summary=answer.text,
-        citations=answer.citations,
-        answer_status=answer.status,
-        no_answer_reason=answer.no_answer_reason,
-        stats={
-            **outcome.stats,
-            "event_hits": len(graph_fields["events"]),
-            "event_recall": "vector+chunk" if event_scores else "chunk",
-        },
-    )
 
 
 @global_router.post("", response_model=SearchResponse)
@@ -596,28 +628,38 @@ async def global_search(
     llm: LLMClient = Depends(get_llm),
 ) -> SearchResponse:
     """全局搜索；connector 只返回结构化证据，JWT 可生成摘要并保存探索。"""
-    prepared = await _prepare_global_search(session, engine_manager, body, principal=principal)
-    if request.state.auth_kind == "connector":
-        return prepared.response.model_copy(
-            update={"summary": "", "exploration_id": None, "answer_status": "skipped"},
+    default_project_id = _resolve_search_project_id(principal)
+    with token_usage_scope(
+        component="search_request",
+        project_id=default_project_id,
+        tenant_id=principal.tenant_id,
+    ) as search_token_ledger:
+        prepared = await _prepare_global_search(session, engine_manager, body, principal=principal)
+        prepared.response = _with_token_usage_stats(prepared.response, search_token_ledger)
+        if request.state.auth_kind == "connector":
+            return prepared.response.model_copy(
+                update={"summary": "", "exploration_id": None, "answer_status": "skipped"},
+            )
+        resolved_project_id = _resolve_search_project_id(principal, prepared.sources)
+        with token_usage_scope(project_id=resolved_project_id, tenant_id=principal.tenant_id):
+            answer = (
+                await synthesize_search_answer(
+                    prepared.outcome.query,
+                    prepared.outcome.sections,
+                    llm=llm,
+                    sources=prepared.sources,
+                )
+                if not prepared.answer_skipped
+                else SearchAnswer("", [], "skipped")
+            )
+        completed = await _complete_global_search(
+            session,
+            _user,
+            body,
+            prepared,
+            answer,
         )
-    answer = (
-        await synthesize_search_answer(
-            prepared.outcome.query,
-            prepared.outcome.sections,
-            llm=llm,
-            sources=prepared.sources,
-        )
-        if not prepared.answer_skipped
-        else SearchAnswer("", [], "skipped")
-    )
-    return await _complete_global_search(
-        session,
-        _user,
-        body,
-        prepared,
-        answer,
-    )
+        return _with_token_usage_stats(completed, search_token_ledger)
 
 
 @global_router.post("/stream")
@@ -632,53 +674,63 @@ async def global_search_stream(
     """Stream a grounded summary after returning the stable retrieval result."""
 
     async def event_gen():
-        try:
-            # Run retrieval inside the response task: EventSourceResponse can
-            # send keep-alive pings immediately and cancel this work as soon as
-            # the browser starts a newer search or disconnects.
-            prepared = await _prepare_global_search(session, engine_manager, body, principal=principal)
-            yield _sse("result", prepared.response.model_dump(mode="json"))
-            if prepared.answer_skipped:
-                answer = SearchAnswer("", [], "skipped")
-            else:
-                answer = SearchAnswer("", [], "no_answer", "empty_evidence")
-                async for update in stream_synthesize_search_answer(
-                    prepared.outcome.query,
-                    prepared.outcome.sections,
-                    llm=llm,
-                    sources=prepared.sources,
-                ):
-                    if update.kind == "delta":
-                        yield _sse("summary.delta", {"delta": update.text})
-                    else:
-                        answer = SearchAnswer(
-                            update.text,
-                            update.citations or [],
-                            update.status,
-                            update.no_answer_reason,
-                        )
+        default_project_id = _resolve_search_project_id(principal)
+        with token_usage_scope(
+            component="search_request",
+            project_id=default_project_id,
+            tenant_id=principal.tenant_id,
+        ) as search_token_ledger:
+            try:
+                # Run retrieval inside the response task: EventSourceResponse can
+                # send keep-alive pings immediately and cancel this work as soon as
+                # the browser starts a newer search or disconnects.
+                prepared = await _prepare_global_search(session, engine_manager, body, principal=principal)
+                prepared.response = _with_token_usage_stats(prepared.response, search_token_ledger)
+                yield _sse("result", prepared.response.model_dump(mode="json"))
+                if prepared.answer_skipped:
+                    answer = SearchAnswer("", [], "skipped")
+                else:
+                    answer = SearchAnswer("", [], "no_answer", "empty_evidence")
+                    resolved_project_id = _resolve_search_project_id(principal, prepared.sources)
+                    with token_usage_scope(project_id=resolved_project_id, tenant_id=principal.tenant_id):
+                        async for update in stream_synthesize_search_answer(
+                            prepared.outcome.query,
+                            prepared.outcome.sections,
+                            llm=llm,
+                            sources=prepared.sources,
+                        ):
+                            if update.kind == "delta":
+                                yield _sse("summary.delta", {"delta": update.text})
+                            else:
+                                answer = SearchAnswer(
+                                    update.text,
+                                    update.citations or [],
+                                    update.status,
+                                    update.no_answer_reason,
+                                )
 
-            completed = await _complete_global_search(
-                session,
-                user,
-                body,
-                prepared,
-                answer,
-            )
-            yield _sse("completed", completed.model_dump(mode="json"))
-        except asyncio.CancelledError:
-            # Client disconnect/new search cancellation must stop the upstream
-            # model stream, not be reported as a failed search.
-            raise
-        except ApiError as error:
-            log.warning("搜索流异常终止：%s", error.message)
-            yield _sse("error", {"code": error.code, "message": error.message})
-        except Exception as error:  # noqa: BLE001
-            log.exception("搜索流未处理异常：%s", error)
-            yield _sse(
-                "error",
-                {"code": ErrorCode.STREAM_ERROR, "message": "搜索生成意外中断"},
-            )
+                completed = await _complete_global_search(
+                    session,
+                    user,
+                    body,
+                    prepared,
+                    answer,
+                )
+                completed = _with_token_usage_stats(completed, search_token_ledger)
+                yield _sse("completed", completed.model_dump(mode="json"))
+            except asyncio.CancelledError:
+                # Client disconnect/new search cancellation must stop the upstream
+                # model stream, not be reported as a failed search.
+                raise
+            except ApiError as error:
+                log.warning("搜索流异常终止：%s", error.message)
+                yield _sse("error", {"code": error.code, "message": error.message})
+            except Exception as error:  # noqa: BLE001
+                log.exception("搜索流未处理异常：%s", error)
+                yield _sse(
+                    "error",
+                    {"code": ErrorCode.STREAM_ERROR, "message": "搜索生成意外中断"},
+                )
 
     return EventSourceResponse(
         event_gen(),

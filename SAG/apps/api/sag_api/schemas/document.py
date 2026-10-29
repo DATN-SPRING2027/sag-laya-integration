@@ -38,6 +38,7 @@ class DocumentOut(BaseModel):
     event_count: int
     progress: int
     token_usage: int
+    token_usage_breakdown: dict | None = None
     error: str | None
     error_layer: str | None = None
     error_stage: str | None = None

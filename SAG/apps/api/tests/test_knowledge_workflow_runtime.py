@@ -768,3 +768,65 @@ async def test_request_completed_trees_skips_in_flight_scheduling_jobs(ingestion
     await worker._request_completed_trees()
     assert calls == 1
 
+
+@pytest.mark.asyncio
+async def test_tree_defers_for_pending_foundation_and_ignores_removed_e2(
+    ingestion_db, monkeypatch
+):
+    from sag_api.db.models import KnowledgeUnit
+    from sag_api.jobs import tasks
+    from sag_api.jobs.control import JobDeferred
+
+    await ready(ingestion_db)
+    rebuilt = AsyncMock(return_value=None)
+    monkeypatch.setattr(universe_tree_service, "rebuild_project_universe_tree", rebuilt)
+    monkeypatch.setattr(tasks.settings, "knowledge_worker_enabled", True)
+
+    async with ingestion_db() as session:
+        (await session.get(Job, "job")).status = JobStatus.SUCCEEDED
+        version = await session.get(DocumentVersion, "version")
+        version.knowledge_status = "DATA_READY"
+        session.add(
+            KnowledgeUnit(
+                id="unit-1",
+                tenant_id="tenant",
+                project_id="project",
+                source_id="source",
+                security_partition_id="project",
+                document_version_id="version",
+                ordinal=0,
+                text="The upload size limit is 10 MiB.",
+                content_hash="hash-1",
+                input_checksum="in-1",
+                checksum="chk-1",
+                features_json={"e2_reason": None, "importance": 0.8},
+                provenance_json={"tenant_id": "tenant", "project_id": "project"},
+                valid_from=version.valid_from,
+                valid_to=version.valid_to,
+                is_current=True,
+            )
+        )
+        foundation_job = KnowledgeJob(
+            id="foundation-1",
+            tenant_id="tenant",
+            document_version_id="version",
+            kind="FOUNDATION",
+            input_checksum="in-1",
+            status="QUEUED",
+            priority=100,
+        )
+        session.add(foundation_job)
+        await session.commit()
+
+        # 1. Queued FOUNDATION job defers tree rebuild until FOUNDATION completes.
+        tree = Job(type=JobType.REBUILD_UNIVERSE_TREE, payload={"tenant_id": "tenant", "project_ids": ["project"]})
+        with pytest.raises(JobDeferred):
+            await tasks.rebuild_universe_tree(session, tree, engine_manager=None)
+
+        # 2. Once FOUNDATION succeeds, tree rebuild proceeds immediately without any E2 LLM stage.
+        foundation_job.status = "SUCCEEDED"
+        await session.commit()
+        await tasks.rebuild_universe_tree(session, tree, engine_manager=None)
+        assert rebuilt.await_count == 1
+
+

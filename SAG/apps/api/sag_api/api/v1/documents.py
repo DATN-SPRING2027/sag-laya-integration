@@ -10,6 +10,7 @@ from fastapi import (
     File,
     Form,
     Header,
+    Query,
     Request,
     Response,
     UploadFile,
@@ -52,10 +53,12 @@ from sag_api.schemas.routing_rag import (
     DocumentRevokeRequest,
     DocumentRevokeResponse,
     DocumentUploadResponse,
+    DocumentVersionChunksResponse,
     DocumentVersionStatusResponse,
 )
 from sag_api.services.document_service import (
     delete_document,
+    get_document_version_chunks,
     get_document_version_status,
     get_or_create_project_source,
     get_public_document,
@@ -582,6 +585,29 @@ async def delete_(
 # ============================================================================
 
 
+@project_router.get(
+    "/token-usage",
+    summary="Aggregate per-file, per-component, and per-token-type usage and cost for a project",
+)
+async def get_project_token_usage_endpoint(
+    project_id: str,
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    if project_id not in principal.allowed_project_ids or not principal.tenant_id:
+        raise ForbiddenError(
+            f"Principal '{principal.subject}' is not authorized to access project '{project_id}'"
+        )
+    from sag_api.core.token_usage import build_project_token_usage_report
+
+    return await build_project_token_usage_report(
+        session,
+        tenant_id=principal.tenant_id,
+        project_id=project_id,
+    )
+# ============================================================================
+
+
 @project_router.post(
     "/upload",
     response_model=DocumentUploadResponse,
@@ -799,3 +825,38 @@ async def reprocess_project_document_endpoint(
     async with source_document_mutation(SessionLocal, source.id, "document-reprocess"):
         job = await reprocess_document(session, source, doc.id, job_queue=job_queue)
     return JobOut.model_validate(job)
+
+
+
+@project_router.get(
+    "/{document_id}/versions/{version_no}/chunks",
+    response_model=DocumentVersionChunksResponse,
+    summary="List extracted canonical chunks for an indexed project document version",
+)
+async def query_document_version_chunks(
+    project_id: str,
+    document_id: str,
+    version_no: int,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    principal: VerifiedPrincipal = Depends(require_project_bff_principal),
+    session: AsyncSession = Depends(get_session),
+) -> DocumentVersionChunksResponse:
+    if project_id not in principal.allowed_project_ids or not principal.tenant_id:
+        raise ForbiddenError(
+            f"Principal '{principal.subject}' is not authorized to access project '{project_id}'"
+        )
+    return await get_document_version_chunks(
+        session,
+        project_id=project_id,
+        document_id=document_id,
+        version_no=version_no,
+        limit=limit,
+        offset=offset,
+        principal=LocalVerifiedPrincipal(
+            user_id=principal.subject,
+            tenant_id=principal.tenant_id,
+            allowed_projects=principal.allowed_project_ids,
+            allowed_partitions=principal.allowed_partition_ids,
+        ),
+    )

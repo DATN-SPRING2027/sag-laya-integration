@@ -236,7 +236,10 @@ async def metrics(request: Request, format: str = "prometheus") -> Response:
     knowledge_ready = bool(runtime and runtime.ready)
     qdrant_ready = await _qdrant_ready(request)
 
+    from sag_api.core.token_usage import get_runtime_token_usage
     from sag_api.services.route_cache_service import route_decision_cache
+
+    runtime_token_usage = get_runtime_token_usage()
 
     cache_size = len(route_decision_cache)
     cache_max = route_decision_cache.max_entries
@@ -247,6 +250,7 @@ async def metrics(request: Request, format: str = "prometheus") -> Response:
             content={
                 "status": "ok",
                 "system_up": 1,
+                "token_usage": runtime_token_usage,
                 "db_ready": db_ready,
                 "knowledge_runtime_ready": knowledge_ready,
                 "qdrant_ready": qdrant_ready,
@@ -259,9 +263,6 @@ async def metrics(request: Request, format: str = "prometheus") -> Response:
                     "job_concurrency": settings.job_concurrency,
                     "knowledge_concurrency": settings.knowledge_concurrency,
                     "knowledge_queue_capacity": settings.knowledge_queue_capacity,
-                    "knowledge_daily_tokens": settings.knowledge_daily_tokens,
-                    "knowledge_daily_tokens_scope": "project",
-                    "knowledge_daily_tokens_enforced": settings.knowledge_daily_tokens > 0,
                 },
                 "search": {
                     "top_k": settings.search_top_k,
@@ -294,12 +295,9 @@ async def metrics(request: Request, format: str = "prometheus") -> Response:
         "# HELP sag_job_concurrency Maximum worker concurrency for document ingestion",
         "# TYPE sag_job_concurrency gauge",
         f"sag_job_concurrency {settings.job_concurrency}",
-        "# HELP sag_knowledge_queue_capacity Maximum capacity for knowledge enrichment queue",
+        "# HELP sag_knowledge_queue_capacity Maximum capacity for knowledge foundation queue",
         "# TYPE sag_knowledge_queue_capacity gauge",
         f"sag_knowledge_queue_capacity {settings.knowledge_queue_capacity}",
-        "# HELP sag_knowledge_daily_tokens Project UTC-day E2 reservation cap; 0=unlimited (not measured usage)",
-        "# TYPE sag_knowledge_daily_tokens gauge",
-        f"sag_knowledge_daily_tokens {settings.knowledge_daily_tokens}",
         "# HELP sag_search_top_k Initial candidate breadth for adaptive search (not a result cap)",
         "# TYPE sag_search_top_k gauge",
         f"sag_search_top_k {settings.search_top_k}",
@@ -309,6 +307,17 @@ async def metrics(request: Request, format: str = "prometheus") -> Response:
         "# HELP sag_search_rerank_min_remaining_seconds Latency budget margin triggering fast rank interleave",
         "# TYPE sag_search_rerank_min_remaining_seconds gauge",
         f"sag_search_rerank_min_remaining_seconds {settings.search_rerank_min_remaining_seconds}",
+        "# HELP sag_tokens_total Total measured tokens consumed since process start",
+        "# TYPE sag_tokens_total counter",
+        f'sag_tokens_total{{token_type="embedding_input"}} {int(runtime_token_usage["totals"]["embedding_input_tokens"])}',
+        f'sag_tokens_total{{token_type="llm_input"}} {int(runtime_token_usage["totals"]["llm_input_tokens"])}',
+        f'sag_tokens_total{{token_type="llm_cached_input"}} {int(runtime_token_usage["totals"]["llm_cached_input_tokens"])}',
+        f'sag_tokens_total{{token_type="llm_output"}} {int(runtime_token_usage["totals"]["llm_output_tokens"])}',
+        f'sag_tokens_total{{token_type="llm_reasoning"}} {int(runtime_token_usage["totals"]["llm_reasoning_tokens"])}',
+        f'sag_tokens_total{{token_type="all"}} {int(runtime_token_usage["totals"]["total_tokens"])}',
+        "# HELP sag_token_cost_usd_total Estimated cumulative USD cost of measured tokens since process start",
+        "# TYPE sag_token_cost_usd_total counter",
+        f'sag_token_cost_usd_total {float(runtime_token_usage["cost_usd"]):.8f}',
     ]
     if qdrant_ready is not None:
         lines.extend(

@@ -422,3 +422,329 @@ async def test_project_upload_revoke_and_status_lifecycle(ingestion_db, tmp_path
         )
         assert reupload_res.version_no == 2
         assert reupload_res.is_duplicate is False
+
+
+@pytest.mark.asyncio
+async def test_canonical_stage_progress_pause_resume_and_reprocess_status(ingestion_db, tmp_path, monkeypatch):
+    JobPaused = tasks.JobPaused
+    from sag_api.services import canonical_service, dedup_and_temporal_service
+    from sag_api.services.document_service import (
+        get_document_version_status,
+        handle_document_upload,
+        pause_document,
+        reprocess_document,
+        resume_document,
+    )
+
+    monkeypatch.setattr(tasks.settings, "data_dir", str(tmp_path))
+    monkeypatch.setattr(tasks.settings, "document_event_extraction_enabled", False)
+
+    fake_queue = SimpleNamespace(
+        enqueue=AsyncMock(),
+        begin_source_maintenance=lambda *_args, **_kwargs: None,
+        source_maintenance_requested=lambda *_args, **_kwargs: False,
+        source_stop_requested=lambda *_args, **_kwargs: False,
+    )
+
+    observed_stages: list[tuple[str, int, str]] = []
+    parse_calls = 0
+    dedup_calls = 0
+
+    orig_parse = canonical_service.parse_and_persist_document_content
+    orig_dedup = dedup_and_temporal_service.run_dedup_and_temporal_stage
+
+    async with ingestion_db() as session:
+        upload_res = await handle_document_upload(
+            session,
+            tenant_id="tenant-stage",
+            project_id="project-stage",
+            owner_id="user-stage",
+            security_partition_id="project-stage",
+            client_token="idem-stage-1",
+            file_bytes=b"# Architecture\n\nVector indexing pipeline details.\n",
+            original_filename="arch.md",
+            content_type="text/markdown",
+            logical_source_id="be-doc-stage",
+            job_queue=fake_queue,
+        )
+        initial_status = await get_document_version_status(
+            session,
+            project_id="project-stage",
+            document_id=upload_res.document_id,
+            version_no=1,
+        )
+        assert initial_status.current_stage == "RECEIVE"
+        assert initial_status.progress == 5
+        assert initial_status.document_status == "pending"
+
+        doc = await session.get(Document, upload_res.document_id)
+        source = await session.get(Source, doc.source_id)
+        job = await session.scalar(select(Job).where(Job.document_id == doc.id))
+        job.status = JobStatus.RUNNING
+        await session.commit()
+
+        async def wrapped_parse(sess, ver_id, content, **kwargs):
+            nonlocal parse_calls
+            parse_calls += 1
+            st = await get_document_version_status(
+                sess,
+                project_id="project-stage",
+                document_id=upload_res.document_id,
+                version_no=1,
+            )
+            observed_stages.append((st.current_stage, st.progress, st.document_status or ""))
+            return await orig_parse(sess, ver_id, content, **kwargs)
+
+        async def wrapped_dedup(sess, **kwargs):
+            nonlocal dedup_calls
+            dedup_calls += 1
+            st = await get_document_version_status(
+                sess,
+                project_id="project-stage",
+                document_id=upload_res.document_id,
+                version_no=1,
+            )
+            observed_stages.append((st.current_stage, st.progress, st.document_status or ""))
+            result = await orig_dedup(sess, **kwargs)
+            # Trigger cooperative pause right after DEDUP_TEMPORAL completes (before INDEX_SEARCH)
+            async with ingestion_db() as ctrl_sess:
+                ctrl_source = await ctrl_sess.get(Source, source.id)
+                await pause_document(ctrl_sess, ctrl_source, doc.id)
+            return result
+
+        async def wrapped_index(sess, *, document_version, **kwargs):
+            st = await get_document_version_status(
+                sess,
+                project_id="project-stage",
+                document_id=upload_res.document_id,
+                version_no=1,
+            )
+            observed_stages.append((st.current_stage, st.progress, st.document_status or ""))
+            document_version.search_status = "SEARCH_READY"
+            document_version.search_ready_at = datetime.now(UTC)
+            return [SimpleNamespace(id="unit-1")]
+
+        monkeypatch.setattr(canonical_service, "parse_and_persist_document_content", wrapped_parse)
+        monkeypatch.setattr(dedup_and_temporal_service, "run_dedup_and_temporal_stage", wrapped_dedup)
+        monkeypatch.setattr(search_index_service, "run_search_indexing_stage", wrapped_index)
+
+        manager = SimpleNamespace(
+            get_sag_embedding=AsyncMock(return_value=None),
+            process_document=AsyncMock(side_effect=AssertionError("Legacy extractor should not run")),
+        )
+
+        with pytest.raises(JobPaused):
+            await tasks._process_document_unlocked(session, job, engine_manager=manager, job_queue=fake_queue)
+
+        paused_status = await get_document_version_status(
+            session,
+            project_id="project-stage",
+            document_id=upload_res.document_id,
+            version_no=1,
+        )
+        assert paused_status.current_stage == "PAUSED"
+        assert paused_status.document_status == "paused"
+        assert paused_status.progress == 65
+
+        # Resume (Continue): must skip PARSE and DEDUP_TEMPORAL and proceed straight to INDEX_SEARCH (85%) -> COMPLETE (100%)
+        resumed_job = await resume_document(session, source, doc.id, job_queue=fake_queue)
+        resumed_job.status = JobStatus.RUNNING
+        await session.commit()
+
+        await tasks._process_document_unlocked(session, resumed_job, engine_manager=manager, job_queue=fake_queue)
+        resumed_job.status = JobStatus.SUCCEEDED
+        await session.commit()
+
+        assert parse_calls == 1
+        assert dedup_calls == 1
+        assert observed_stages == [
+            ("PARSE", 35, "loading"),
+            ("DEDUP_TEMPORAL", 65, "extracting"),
+            ("INDEX_SEARCH", 85, "extracting"),
+        ]
+
+        ready_status = await get_document_version_status(
+            session,
+            project_id="project-stage",
+            document_id=upload_res.document_id,
+            version_no=1,
+        )
+        assert ready_status.current_stage == "COMPLETE"
+        assert ready_status.progress == 100
+        assert ready_status.search_ready is True
+        assert ready_status.document_status == "ready"
+
+        # Reprocess from READY: status immediately reflects queued RECEIVE · 5%
+        await reprocess_document(session, source, doc.id, job_queue=fake_queue)
+        reprocess_status = await get_document_version_status(
+            session,
+            project_id="project-stage",
+            document_id=upload_res.document_id,
+            version_no=1,
+        )
+        assert reprocess_status.current_stage == "RECEIVE"
+        assert reprocess_status.progress == 5
+        assert reprocess_status.search_ready is False
+        assert reprocess_status.document_status == "pending"
+
+
+
+@pytest.mark.asyncio
+async def test_get_document_version_chunks_orders_units_and_enforces_partition_acl(
+    ingestion_db,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Extracted chunks endpoint returns ordered SearchUnits, falls back to CanonicalBlocks before indexing, and enforces ACLs."""
+    from sag_api.core.config import settings
+    from sag_api.core.errors import ForbiddenError
+    from sag_api.core.identity import VerifiedPrincipal
+    from sag_api.db.models.routing_rag import SearchUnit
+    from sag_api.services.canonical_service import parse_and_persist_document_content
+    from sag_api.services.document_service import (
+        get_document_version_chunks,
+        handle_document_upload,
+        revoke_project_document,
+    )
+
+    monkeypatch.setattr(settings, "upload_dir", str(tmp_path / "uploads"))
+
+    markdown_body = (
+        "# System Architecture\n\n"
+        "Multi-tenant RBAC boundary isolates project data across Cloudflare R2 and PostgreSQL.\n\n"
+        "## Sharding Strategy\n\n"
+        "| Shard | Region | Capacity |\n"
+        "| --- | --- | --- |\n"
+        "| S1 | APAC | 10 TB |\n"
+    )
+
+    async with ingestion_db() as session:
+        upload_res = await handle_document_upload(
+            session,
+            tenant_id="tenant-chunks",
+            project_id="project-chunks",
+            owner_id="user-1",
+            security_partition_id="project-chunks:default",
+            client_token="chunks-test-1",
+            file_bytes=markdown_body.encode("utf-8"),
+            original_filename="architecture-v2.md",
+            content_type="text/markdown",
+            logical_source_id="continuum:project_document:doc-chunks-1",
+        )
+
+        # Before parsing: EMPTY
+        empty_res = await get_document_version_chunks(
+            session,
+            project_id="project-chunks",
+            document_id=upload_res.document_id,
+            version_no=1,
+        )
+        assert empty_res.source_stage == "EMPTY"
+        assert empty_res.total_chunks == 0
+        assert empty_res.items == []
+
+        # After PARSE (before SearchUnit minting): returns CANONICAL_BLOCKS
+        blocks = await parse_and_persist_document_content(
+            session,
+            upload_res.version_id,
+            markdown_body,
+            page_from=1,
+            page_to=2,
+            document_title="System Architecture",
+        )
+        await session.commit()
+        assert len(blocks) >= 2
+
+        parsed_res = await get_document_version_chunks(
+            session,
+            project_id="project-chunks",
+            document_id=upload_res.document_id,
+            version_no=1,
+        )
+        assert parsed_res.source_stage == "CANONICAL_BLOCKS"
+        assert parsed_res.total_chunks == len(blocks)
+        assert "Multi-tenant RBAC" in "\n".join(item.content for item in parsed_res.items)
+
+        # After SearchUnit minting: returns SEARCH_UNITS in reading order + pagination
+        unit_a = SearchUnit(
+            id="su-first",
+            document_version_id=upload_res.version_id,
+            block_from_id=blocks[0].id,
+            block_to_id=blocks[min(1, len(blocks) - 1)].id,
+            security_partition_id="project-chunks:default",
+            content_hash="hash-a",
+            token_count=42,
+            page_from=1,
+            page_to=1,
+            section_path="System Architecture",
+        )
+        session.add(unit_a)
+        if len(blocks) > 2:
+            unit_b = SearchUnit(
+                id="su-second",
+                document_version_id=upload_res.version_id,
+                block_from_id=blocks[2].id,
+                block_to_id=blocks[-1].id,
+                security_partition_id="project-chunks:default",
+                content_hash="hash-b",
+                token_count=35,
+                page_from=2,
+                page_to=2,
+                section_path="System Architecture > Sharding Strategy",
+            )
+            session.add(unit_b)
+        await session.commit()
+
+        authorized = VerifiedPrincipal(
+            user_id="user-1",
+            tenant_id="tenant-chunks",
+            allowed_projects=frozenset({"project-chunks"}),
+            allowed_partitions=frozenset({"project-chunks:default"}),
+        )
+        indexed_res = await get_document_version_chunks(
+            session,
+            project_id="project-chunks",
+            document_id=upload_res.document_id,
+            version_no=1,
+            principal=authorized,
+        )
+        assert indexed_res.source_stage == "SEARCH_UNITS"
+        assert indexed_res.total_chunks >= 1
+        assert indexed_res.items[0].ordinal == 1
+        assert indexed_res.items[0].chunk_id == "su-first"
+        assert indexed_res.items[0].token_count == 42
+
+        # Unauthorized partition principal is blocked fail-closed
+        wrong_partition = VerifiedPrincipal(
+            user_id="user-2",
+            tenant_id="tenant-chunks",
+            allowed_projects=frozenset({"project-chunks"}),
+            allowed_partitions=frozenset({"project-chunks:restricted"}),
+        )
+        with pytest.raises(ForbiddenError):
+            await get_document_version_chunks(
+                session,
+                project_id="project-chunks",
+                document_id=upload_res.document_id,
+                version_no=1,
+                principal=wrong_partition,
+            )
+
+        # Revoked document returns EMPTY
+        await revoke_project_document(
+            session,
+            tenant_id="tenant-chunks",
+            project_id="project-chunks",
+            document_id=upload_res.document_id,
+            reason="REVOKED_BY_LEADER",
+        )
+        revoked_res = await get_document_version_chunks(
+            session,
+            project_id="project-chunks",
+            document_id=upload_res.document_id,
+            version_no=1,
+            principal=authorized,
+        )
+        assert revoked_res.source_stage == "EMPTY"
+        assert revoked_res.total_chunks == 0
+        assert revoked_res.items == []

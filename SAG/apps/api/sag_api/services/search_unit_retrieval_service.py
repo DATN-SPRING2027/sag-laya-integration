@@ -654,12 +654,38 @@ async def _query_vector(engine_manager: Any, group: _SearchGroup, query: str) ->
     else:
         embed_query = query
 
+    from sag_api.core.token_usage import (
+        extract_embedding_usage,
+        record_embedding_cache_hit,
+        record_embedding_usage,
+        token_usage_scope,
+    )
+
     cached = get_cached_text_embedding(embed_query)
+    if cached is not None:
+        record_embedding_cache_hit(
+            model=getattr(settings, "embedding_model", None),
+            count=1,
+            component="query_embedding",
+            project_id=group.project_id,
+        )
+        return cached
     if cached is not None:
         return cached
     try:
         embedding = await engine_manager.get_sag_embedding(group.source.sag_source_config_id, group.source)
-        vector = [float(value) for value in await embedding.generate(embed_query)]
+        with token_usage_scope(
+            component="query_embedding",
+            project_id=group.project_id,
+            tenant_id=group.tenant_id,
+        ):
+
+            vector = [float(value) for value in await embedding.generate(embed_query)]
+            if not getattr(embedding, "_sag_token_metered_cache_wrapped", False):
+                record_embedding_usage(
+                    model=getattr(settings, "embedding_model", None),
+                    usage=extract_embedding_usage(None, embed_query),
+                )
         if not vector or any(not math.isfinite(value) for value in vector):
             raise ValueError("invalid embedding vector")
         put_cached_text_embedding(embed_query, vector)
