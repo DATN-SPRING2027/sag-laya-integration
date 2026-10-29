@@ -98,10 +98,10 @@ async def _build_query_route(
     requested_strategy: str | None,
     requested_retrieval_mode: str | None = None,
     *,
+    requested_top_k: int | None = None,
     trace_strategy_plan: bool = False,
 ) -> _QueryRoutePlan:
     analysis = analyze_query(query, segmentation_enabled=settings.search_chinese_segmentation_enabled)
-    strategy_plan = plan_query(query, requested_mode=requested_retrieval_mode, features=analysis.features)
     route_error = False
     try:
         decision = await asyncio.to_thread(route_query, query)
@@ -111,6 +111,7 @@ async def _build_query_route(
             "is_chitchat": False,
             "need_retrieval": True,
             "suggested_strategy": "multi",
+            "answer_shape": "fact_answer",
             "confidence": 0.0,
             "model": "fallback",
             "fallback_used": True,
@@ -118,6 +119,14 @@ async def _build_query_route(
             "reason_codes": ["DECISION_ROUTE_ERROR"],
         }
         route_error = True
+
+    strategy_plan = plan_query(
+        query,
+        requested_mode=requested_retrieval_mode,
+        features=analysis.features,
+        requested_top_k=requested_top_k,
+        answer_shape=str(decision.get("answer_shape") or "") or None,
+    )
 
     confidence = decision.get("confidence", 0.0)
     try:
@@ -316,6 +325,7 @@ async def _prepare_global_search(
         body.source_ids,
         body.strategy,
         body.retrieval_mode,
+        requested_top_k=body.top_k,
         trace_strategy_plan=True,
     )
     if not route_plan.need_retrieval:
@@ -483,7 +493,12 @@ async def search(
 
         raise NotFoundError("信源不存在")
     partitioned = source.id in await versioned_source_ids(session, [source.id])
-    route_plan = await _build_query_route(body.query, [source_id], body.strategy)
+    route_plan = await _build_query_route(
+        body.query,
+        [source_id],
+        body.strategy,
+        requested_top_k=body.top_k,
+    )
     if route_plan.need_retrieval:
         if partitioned:
             from sag_api.services.search_unit_retrieval_service import retrieve_search_unit_sections
@@ -510,7 +525,7 @@ async def search(
                     engine_manager,
                     body.query,
                     {source.sag_source_config_id: source},
-                    limit=FIXED_SEARCH_TOP_K,
+                    limit=route_plan.strategy_plan.retrieval_plan.cardinality.effective_n,
                 ),
             )
         stats = _with_query_route_stats(
@@ -682,7 +697,7 @@ async def _run_one_strategy(
     partitioned_ids: set[str],
 ) -> EvalStrategyResultOut:
     """一次跑一个策略,任何失败都吸掉转成 error 字段,不让 gather 把整个对比搞崩。"""
-    top_k = FIXED_SEARCH_TOP_K
+    effective_top_k = plan_query(query, requested_top_k=top_k).retrieval_plan.cardinality.effective_n
     try:
         sections = []
         stats: dict[str, Any] = {}
@@ -701,7 +716,7 @@ async def _run_one_strategy(
                 legacy_sources,
                 query,
                 strategy=strategy,
-                top_k=top_k,
+                top_k=effective_top_k,
             )
             sections.extend(legacy.sections)
             stats["legacy"] = legacy.stats
@@ -715,7 +730,7 @@ async def _run_one_strategy(
         )
     section_outputs: list[SectionOut] = []
     sections.sort(key=lambda section: section.score, reverse=True)
-    for section in sections[:top_k]:
+    for section in sections[:effective_top_k]:
         source = source_refs.get(section.source_config_id or "")
         if source is None:
             continue

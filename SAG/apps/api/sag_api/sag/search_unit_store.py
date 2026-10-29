@@ -32,8 +32,7 @@ _TRANSIENT_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 _SPARSE_QUERY_STOPWORDS = COMMON_STOPWORDS
 _QUERY_FRAMING_STOPWORDS = frozenset(
     {
-        "assume", "utilizing", "shown", "following", "question", "answer", "response",
-        "relying", "details", "give", "discuss", "discusses", "reference", "looking",
+        "question", "answer", "response", "give", "discuss", "reference",
         "based", "according", "provide", "provided", "information", "please", "state",
         "tell", "explain", "describe", "whether",
     }
@@ -48,8 +47,8 @@ def build_sparse_query_vector(query: str) -> dict[str, list[int] | list[float]]:
     """
     normalized_q = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", query)
     normalized_q = re.sub(
-        r"\bpp(?:\s*&\s*|n)e\b",
-        "ppe ppne property plant equipment",
+        r"\b([a-z]{1,2})\s*&\s*([a-z]{1,2})\b",
+        r"\1\2",
         normalized_q,
         flags=re.IGNORECASE,
     )
@@ -63,12 +62,10 @@ def build_sparse_query_vector(query: str) -> dict[str, list[int] | list[float]]:
     filtered_tokens = [t for t in raw_tokens if t not in _SPARSE_QUERY_STOPWORDS]
     active_tokens = filtered_tokens if filtered_tokens else raw_tokens
 
-    # Expand glued alphanumeric identifiers (e.g. fy2018 -> fy2018, 2018) and standard abbreviations
+    # Expand glued alphanumeric identifiers (e.g. fy2018 -> fy2018, 2018)
     expanded_tokens: list[str] = list(active_tokens)
     for tok in active_tokens:
-        if tok in ("ppne", "ppe"):
-            expanded_tokens.extend(["ppe", "ppne", "property", "plant", "equipment"])
-        elif tok.isalnum() and not tok.isalpha() and not tok.isdigit() and len(tok) >= 3:
+        if tok.isalnum() and not tok.isalpha() and not tok.isdigit() and len(tok) >= 3:
             for sub in re.findall(r"[a-z]+|\d{2,}", tok):
                 if len(sub) >= 2 and sub not in _SPARSE_QUERY_STOPWORDS:
                     expanded_tokens.append(sub)
@@ -88,8 +85,17 @@ def build_sparse_query_vector(query: str) -> dict[str, list[int] | list[float]]:
 
         token_id = int(hashlib.md5(token.encode("utf-8")).hexdigest()[:8], 16) % 1_000_000
         sparse[token_id] = max(sparse.get(token_id, 0.0), round(float(weight), 4))
-        if len(token) >= 5 and token.endswith("s") and not token.endswith("ss"):
-            stem = token[:-1]
+        if token.isascii() and token.isalpha() and (
+            (len(token) >= 6 and (token.endswith("ing") or token.endswith("ed")))
+            or (len(token) >= 5 and token.endswith("s") and not token.endswith("ss"))
+        ):
+            stem = (
+                token[:-3]
+                if len(token) >= 6 and token.endswith("ing")
+                else token[:-2]
+                if len(token) >= 6 and token.endswith("ed")
+                else token[:-1]
+            )
             stem_id = int(hashlib.md5(stem.encode("utf-8")).hexdigest()[:8], 16) % 1_000_000
             sparse[stem_id] = max(sparse.get(stem_id, 0.0), round(float(weight) * 0.6, 4))
     indices = sorted(sparse)

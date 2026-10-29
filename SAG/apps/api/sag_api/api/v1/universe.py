@@ -49,6 +49,7 @@ from sag_api.services.search_unit_retrieval_service import _load_current_ready_v
 from sag_api.services.source_service import get_authorized_source, get_authorized_source_ids, search_source_candidates
 from sag_api.services.tree_query_snapshot_service import _aggregate_source_profiles
 from sag_api.services.universe_knowledge_service import (
+    get_verified_tree_manifest_projection,
     knowledge_universe_detail,
     knowledge_universe_page,
     load_knowledge_universe_snapshot,
@@ -66,6 +67,9 @@ from sag_api.services.universe_service import (
 from sag_api.services.universe_tree_service import enqueue_project_tree_rebuild
 
 router = APIRouter(prefix="/universe", tags=["universe"])
+
+_MANIFEST_TREE_OUTPUT_CACHE: dict[tuple[Any, ...], tuple[list[dict[str, Any]], int]] = {}
+_MANIFEST_TREE_OUTPUT_CACHE_MAX = 32
 
 
 def _stale_manifest() -> UniverseManifestOut:
@@ -114,6 +118,9 @@ async def manifest(
     if len(sources) > settings.universe_manifest_source_limit:
         raise ServiceUnavailableError("Universe exceeds the configured authorized source limit")
     ready_versions = await _load_current_ready_versions(session, sources, principal)
+    session_info = getattr(session, "info", None)
+    if isinstance(session_info, dict) and isinstance(session_info.get("_universe_req_scope"), dict):
+        session_info["_universe_req_scope"]["ready_versions"] = ready_versions
     if not ready_versions:
         return UniverseManifestOut(
             status="empty",
@@ -138,32 +145,27 @@ async def manifest(
         for state in states
         if state.active_tree_version
     ]
-    manifest_rows = (
-        await session.execute(
-            select(
-                TreeManifest,
-                TreeManifest.manifest_json["source_routing_profiles"].label("source_profile_inventory"),
-            )
-            .options(
-                load_only(
-                    TreeManifest.tree_version,
-                    TreeManifest.project_id,
-                    TreeManifest.status,
-                    TreeManifest.checksum,
-                    TreeManifest.node_count,
-                    TreeManifest.routing_recall_at_k,
-                    TreeManifest.escape_win_rate,
-                    TreeManifest.acl_blackhole_rate,
+    manifest_records = list(
+        (
+            await session.scalars(
+                select(TreeManifest)
+                .options(
+                    load_only(
+                        TreeManifest.tree_version,
+                        TreeManifest.project_id,
+                        TreeManifest.status,
+                        TreeManifest.checksum,
+                        TreeManifest.node_count,
+                        TreeManifest.routing_recall_at_k,
+                        TreeManifest.escape_win_rate,
+                        TreeManifest.acl_blackhole_rate,
+                    )
                 )
+                .where(tuple_(TreeManifest.project_id, TreeManifest.tree_version).in_(active_versions))
             )
-            .where(tuple_(TreeManifest.project_id, TreeManifest.tree_version).in_(active_versions))
-        )
-    ).all()
-    manifests_by_key = {(row.project_id, row.tree_version): row for row, _inventory in manifest_rows}
-    profile_inventories = {
-        (row.project_id, row.tree_version): inventory
-        for row, inventory in manifest_rows
-    }
+        ).all()
+    )
+    manifests_by_key = {(row.project_id, row.tree_version): row for row in manifest_records}
     active: dict[str, tuple[ProjectSearchState, TreeManifest]] = {}
     for state in states:
         version = state.active_tree_version
@@ -200,6 +202,26 @@ async def manifest(
         return _failed_manifest()
     if stale:
         return _stale_manifest()
+
+    profile_inventories: dict[tuple[str, str], Any] = {}
+    for project_id, (state, record) in active.items():
+        tree_ver = state.active_tree_version or ""
+        try:
+            projection = await get_verified_tree_manifest_projection(
+                session,
+                project_id,
+                tree_ver,
+                record.checksum,
+            )
+        except ServiceUnavailableError:
+            integrity_failed = True
+            continue
+        if projection.get("tenant_id") != principal.tenant_id:
+            integrity_failed = True
+            continue
+        profile_inventories[(project_id, tree_ver)] = projection.get("source_routing_profiles")
+    if integrity_failed:
+        return _failed_manifest()
 
     scopes = sorted(
         {
@@ -258,43 +280,54 @@ async def manifest(
         return _failed_manifest()
     if stale:
         return _stale_manifest()
-    profile_rows: list[TreeRoutingProfile] = []
+    scalar_profile_rows = []
     if scopes:
-        profile_rows = list(
-            (
-                await session.scalars(
-                    select(TreeRoutingProfile)
-                    .where(
-                        tuple_(
-                            TreeRoutingProfile.project_id,
-                            TreeRoutingProfile.source_id,
-                            TreeRoutingProfile.document_version_id,
-                            TreeRoutingProfile.partition_id,
-                        ).in_(scopes),
-                        tuple_(TreeRoutingProfile.project_id, TreeRoutingProfile.tree_version).in_(
-                            [
-                                (project_id, state.active_tree_version)
-                                for project_id, (state, _record) in active.items()
-                            ]
-                        ),
-                        TreeRoutingProfile.tenant_id == principal.tenant_id,
-                        TreeRoutingProfile.partition_id.in_(principal.allowed_partition_ids),
-                    )
-                    .order_by(
-                        TreeRoutingProfile.project_id,
-                        TreeRoutingProfile.node_id,
-                        TreeRoutingProfile.source_id,
-                    )
-                    .limit(settings.search_tree_profile_limit + 1)
+        scalar_profile_rows = (
+            await session.execute(
+                select(
+                    TreeRoutingProfile.project_id,
+                    TreeRoutingProfile.tree_version,
+                    TreeRoutingProfile.source_id,
+                    TreeRoutingProfile.document_version_id,
+                    TreeRoutingProfile.partition_id,
+                    TreeRoutingProfile.node_id,
+                    TreeRoutingProfile.profile_checksum,
+                    TreeRoutingProfile.accessible_unit_count,
                 )
-            ).all()
-        )
-    if len(profile_rows) > settings.search_tree_profile_limit:
+                .where(
+                    tuple_(
+                        TreeRoutingProfile.project_id,
+                        TreeRoutingProfile.source_id,
+                        TreeRoutingProfile.document_version_id,
+                        TreeRoutingProfile.partition_id,
+                    ).in_(scopes),
+                    tuple_(TreeRoutingProfile.project_id, TreeRoutingProfile.tree_version).in_(
+                        [
+                            (project_id, state.active_tree_version)
+                            for project_id, (state, _record) in active.items()
+                        ]
+                    ),
+                    TreeRoutingProfile.tenant_id == principal.tenant_id,
+                    TreeRoutingProfile.partition_id.in_(principal.allowed_partition_ids),
+                )
+                .order_by(
+                    TreeRoutingProfile.project_id,
+                    TreeRoutingProfile.node_id,
+                    TreeRoutingProfile.source_id,
+                    TreeRoutingProfile.document_version_id,
+                    TreeRoutingProfile.partition_id,
+                )
+                .limit(settings.search_tree_profile_limit + 1)
+            )
+        ).all()
+    if len(scalar_profile_rows) > settings.search_tree_profile_limit:
         raise ServiceUnavailableError("Active Universe tree exceeds the configured profile limit")
     observed_profile_nodes: dict[tuple[str, str, str, str], set[str]] = defaultdict(set)
-    for row in profile_rows:
+    scalars_by_project: dict[str, list[Any]] = defaultdict(list)
+    for row in scalar_profile_rows:
         scope = (row.project_id, row.source_id, row.document_version_id, row.partition_id)
         observed_profile_nodes[scope].add(row.node_id)
+        scalars_by_project[row.project_id].append(row)
     incomplete_projects = {
         project_id
         for project_id, project_scopes in expected_scopes.items()
@@ -310,112 +343,181 @@ async def manifest(
     if stale:
         return _stale_manifest()
 
-    profile_groups: dict[tuple[str, str], list[TreeRoutingProfile]] = defaultdict(list)
-    for row in profile_rows:
-        profile_groups[(row.project_id, row.partition_id)].append(row)
+    cached_tree_outputs: dict[tuple[str, str], tuple[list[dict[str, Any]], int]] = {}
+    uncached_project_versions: list[tuple[str, str | None]] = []
+    project_cache_keys: dict[tuple[str, str], tuple[Any, ...]] = {}
+    for project_id, (state, record) in sorted(active.items()):
+        project_scalars = scalars_by_project.get(project_id, [])
+        if not project_scalars:
+            continue
+        tree_ver = state.active_tree_version or ""
+        t_key = (
+            project_id,
+            tree_ver,
+            principal.tenant_id,
+            record.node_count,
+            tuple(
+                (
+                    r.source_id,
+                    r.document_version_id,
+                    r.partition_id,
+                    r.node_id,
+                    r.profile_checksum,
+                    r.accessible_unit_count,
+                )
+                for r in project_scalars
+            ),
+        )
+        project_cache_keys[(project_id, tree_ver)] = t_key
+        hit = _MANIFEST_TREE_OUTPUT_CACHE.get(t_key)
+        if hit is not None:
+            cached_tree_outputs[(project_id, tree_ver)] = hit
+        else:
+            uncached_project_versions.append((project_id, state.active_tree_version))
+
     aggregates: dict[tuple[str, str], dict[str, dict[str, Any]]] = defaultdict(dict)
     source_ids_by_project: dict[str, set[str]] = defaultdict(set)
-    for (project_id, partition_id), records in profile_groups.items():
-        state = active[project_id][0]
-        verified_profiles = _aggregate_source_profiles(
-            records,
-            project_id=project_id,
-            tenant_id=principal.tenant_id,
-            tree_version=state.active_tree_version or "",
-            source_ids=tuple(sorted({row.source_id for row in records})),
-            partition_id=partition_id,
-            document_version_ids=tuple(sorted({row.document_version_id for row in records})),
-            fingerprint="universe-manifest",
-            query="",
+    if uncached_project_versions:
+        uncached_project_set = {proj for proj, _ver in uncached_project_versions}
+        uncached_scopes = [sc for sc in scopes if sc[0] in uncached_project_set]
+        profile_rows = list(
+            (
+                await session.scalars(
+                    select(TreeRoutingProfile)
+                    .where(
+                        tuple_(
+                            TreeRoutingProfile.project_id,
+                            TreeRoutingProfile.source_id,
+                            TreeRoutingProfile.document_version_id,
+                            TreeRoutingProfile.partition_id,
+                        ).in_(uncached_scopes),
+                        tuple_(TreeRoutingProfile.project_id, TreeRoutingProfile.tree_version).in_(
+                            uncached_project_versions
+                        ),
+                        TreeRoutingProfile.tenant_id == principal.tenant_id,
+                        TreeRoutingProfile.partition_id.in_(principal.allowed_partition_ids),
+                    )
+                    .order_by(
+                        TreeRoutingProfile.project_id,
+                        TreeRoutingProfile.node_id,
+                        TreeRoutingProfile.source_id,
+                    )
+                )
+            ).all()
         )
-        if verified_profiles is None:
-            raise ServiceUnavailableError("Active Universe tree profile failed integrity validation")
-        key = (project_id, state.active_tree_version or "")
-        nodes = aggregates[key]
-        for profile in verified_profiles:
-            node = nodes.setdefault(
-                profile.node_id,
-                {
-                    "parent_id": profile.parent_id,
-                    "is_leaf": profile.is_leaf,
-                    "unit_count": 0,
-                    "sources": set(),
-                    "documents": set(),
-                    "entities": Counter(),
-                    "terms": defaultdict(float),
-                },
+        profile_groups: dict[tuple[str, str], list[TreeRoutingProfile]] = defaultdict(list)
+        for row in profile_rows:
+            profile_groups[(row.project_id, row.partition_id)].append(row)
+        for (project_id, partition_id), records in profile_groups.items():
+            state = active[project_id][0]
+            verified_profiles = _aggregate_source_profiles(
+                records,
+                project_id=project_id,
+                tenant_id=principal.tenant_id,
+                tree_version=state.active_tree_version or "",
+                source_ids=tuple(sorted({row.source_id for row in records})),
+                partition_id=partition_id,
+                document_version_ids=tuple(sorted({row.document_version_id for row in records})),
+                fingerprint="universe-manifest",
+                query="",
             )
-            if node["parent_id"] != profile.parent_id or node["is_leaf"] != profile.is_leaf:
-                raise ServiceUnavailableError("Active Universe tree has conflicting node structure")
-            node["unit_count"] += profile.accessible_unit_count
-        for row in records:
-            node = nodes[row.node_id]
-            node["sources"].add(row.source_id)
-            node["documents"].add(row.document_version_id)
-            source_ids_by_project[project_id].add(row.source_id)
-            # The legacy incremental-tree writer uses this pair for empty profiles.
-            is_empty_profile_placeholder = (
-                row.entities_json == ["TechCorp"] and row.sparse_json == [["tech", 1.0]]
-            )
-            if not is_empty_profile_placeholder:
-                for entity in row.entities_json:
-                    if entity.strip():
-                        node["entities"][entity] += 1
-                for term, weight in row.sparse_json:
-                    if term.strip():
-                        node["terms"][term] += float(weight)
+            if verified_profiles is None:
+                raise ServiceUnavailableError("Active Universe tree profile failed integrity validation")
+            key = (project_id, state.active_tree_version or "")
+            nodes = aggregates[key]
+            for profile in verified_profiles:
+                node = nodes.setdefault(
+                    profile.node_id,
+                    {
+                        "parent_id": profile.parent_id,
+                        "is_leaf": profile.is_leaf,
+                        "unit_count": 0,
+                        "sources": set(),
+                        "documents": set(),
+                        "entities": Counter(),
+                        "terms": defaultdict(float),
+                    },
+                )
+                if node["parent_id"] != profile.parent_id or node["is_leaf"] != profile.is_leaf:
+                    raise ServiceUnavailableError("Active Universe tree has conflicting node structure")
+                node["unit_count"] += profile.accessible_unit_count
+            for row in records:
+                node = nodes[row.node_id]
+                node["sources"].add(row.source_id)
+                node["documents"].add(row.document_version_id)
+                source_ids_by_project[project_id].add(row.source_id)
+                # The legacy incremental-tree writer uses this pair for empty profiles.
+                is_empty_profile_placeholder = (
+                    row.entities_json == ["TechCorp"] and row.sparse_json == [["tech", 1.0]]
+                )
+                if not is_empty_profile_placeholder:
+                    for entity in row.entities_json:
+                        if entity.strip():
+                            node["entities"][entity] += 1
+                    for term, weight in row.sparse_json:
+                        if term.strip():
+                            node["terms"][term] += float(weight)
+
+        for (project_id, tree_version), nodes in sorted(aggregates.items()):
+            if not nodes:
+                continue
+            if len(nodes) > active[project_id][1].node_count:
+                raise ServiceUnavailableError("Active Universe tree exceeds its manifest node count")
+            for node_id, node in nodes.items():
+                parent_id = node["parent_id"]
+                if parent_id is not None and parent_id not in nodes:
+                    raise ServiceUnavailableError("Active Universe tree has an incomplete parent chain")
+                seen = {node_id}
+                depth = 0
+                current = parent_id
+                while current is not None:
+                    if current in seen:
+                        raise ServiceUnavailableError("Active Universe tree contains a parent cycle")
+                    seen.add(current)
+                    depth += 1
+                    current = nodes[current]["parent_id"]
+                node["depth"] = depth
+
+            output_nodes = []
+            for node_id, node in sorted(nodes.items(), key=lambda item: (int(item[1]["depth"]), item[0])):
+                entities = node["entities"]
+                terms = node["terms"]
+                readable_entities = [value for value in entities if any(char.isalpha() for char in value)]
+                readable_terms = [value for value in terms if len(value) > 2 and any(char.isalpha() for char in value)]
+                top_entities = sorted(
+                    readable_entities,
+                    key=lambda value: (-entities[value], value.casefold(), value),
+                )[:6]
+                label = (
+                    top_entities[0]
+                    if top_entities
+                    else " · ".join(sorted(readable_terms, key=lambda value: (-terms[value], value.casefold()))[:3])
+                    if readable_terms
+                    else ""
+                )
+                output_nodes.append(
+                    {
+                        "id": node_id,
+                        "parent_id": node["parent_id"],
+                        "depth": node["depth"],
+                        "label": label,
+                        "is_leaf": node["is_leaf"],
+                        "unit_count": node["unit_count"],
+                        "source_count": len(node["sources"]),
+                        "document_count": len(node["documents"]),
+                        "top_entities": top_entities,
+                    }
+                )
+            src_count = len(source_ids_by_project[project_id])
+            cached_tree_outputs[(project_id, tree_version)] = (output_nodes, src_count)
+            t_key = project_cache_keys.get((project_id, tree_version))
+            if t_key is not None:
+                if len(_MANIFEST_TREE_OUTPUT_CACHE) >= _MANIFEST_TREE_OUTPUT_CACHE_MAX:
+                    _MANIFEST_TREE_OUTPUT_CACHE.pop(next(iter(_MANIFEST_TREE_OUTPUT_CACHE)))
+                _MANIFEST_TREE_OUTPUT_CACHE[t_key] = (output_nodes, src_count)
 
     trees = []
-    for (project_id, tree_version), nodes in sorted(aggregates.items()):
-        if not nodes:
-            continue
-        if len(nodes) > active[project_id][1].node_count:
-            raise ServiceUnavailableError("Active Universe tree exceeds its manifest node count")
-        for node_id, node in nodes.items():
-            parent_id = node["parent_id"]
-            if parent_id is not None and parent_id not in nodes:
-                raise ServiceUnavailableError("Active Universe tree has an incomplete parent chain")
-            seen = {node_id}
-            depth = 0
-            current = parent_id
-            while current is not None:
-                if current in seen:
-                    raise ServiceUnavailableError("Active Universe tree contains a parent cycle")
-                seen.add(current)
-                depth += 1
-                current = nodes[current]["parent_id"]
-            node["depth"] = depth
-
-        output_nodes = []
-        for node_id, node in sorted(nodes.items(), key=lambda item: (int(item[1]["depth"]), item[0])):
-            entities = node["entities"]
-            terms = node["terms"]
-            readable_entities = [value for value in entities if any(char.isalpha() for char in value)]
-            readable_terms = [value for value in terms if len(value) > 2 and any(char.isalpha() for char in value)]
-            top_entities = sorted(
-                readable_entities,
-                key=lambda value: (-entities[value], value.casefold(), value),
-            )[:6]
-            label = (
-                top_entities[0]
-                if top_entities
-                else " · ".join(sorted(readable_terms, key=lambda value: (-terms[value], value.casefold()))[:3])
-                if readable_terms
-                else ""
-            )
-            output_nodes.append(
-                {
-                    "id": node_id,
-                    "parent_id": node["parent_id"],
-                    "depth": node["depth"],
-                    "label": label,
-                    "is_leaf": node["is_leaf"],
-                    "unit_count": node["unit_count"],
-                    "source_count": len(node["sources"]),
-                    "document_count": len(node["documents"]),
-                    "top_entities": top_entities,
-                }
-            )
+    for (project_id, tree_version), (output_nodes, src_count) in sorted(cached_tree_outputs.items()):
         state, record = active[project_id]
         trees.append(
             {
@@ -428,7 +530,7 @@ async def manifest(
                 "acl_blackhole_rate": record.acl_blackhole_rate,
                 "node_count": len(output_nodes),
                 "unit_count": sum(node["unit_count"] for node in output_nodes if node["is_leaf"]),
-                "source_count": len(source_ids_by_project[project_id]),
+                "source_count": src_count,
                 "nodes": output_nodes,
             }
         )
@@ -484,9 +586,17 @@ async def _knowledge_snapshot(session, user, principal, project_id: str, tree_ve
         if snapshot is None:
             raise ConflictError("The knowledge source snapshot changed; refresh the universe")
         return snapshot
-    value = await manifest(session=session, user=user, principal=principal)
-    tree = _knowledge_tree(value, project_id, tree_version)
-    return await load_knowledge_universe_snapshot(session, principal, tree)
+    session_info = getattr(session, "info", None)
+    has_session_info = isinstance(session_info, dict)
+    if has_session_info:
+        session_info["_universe_req_scope"] = {}
+    try:
+        value = await manifest(session=session, user=user, principal=principal)
+        tree = _knowledge_tree(value, project_id, tree_version)
+        return await load_knowledge_universe_snapshot(session, principal, tree)
+    finally:
+        if has_session_info:
+            session_info.pop("_universe_req_scope", None)
 
 
 def _knowledge_tree(value: UniverseManifestOut, project_id: str, tree_version: str) -> UniverseTreeOut:

@@ -104,6 +104,7 @@ def test_siliconflow_decision_router_4_questions_and_legacy_backward_compat(monk
         "domain_topic",
         "memory_scope",
         "temporal_mode",
+        "answer_shape",
     }
     assert captured_payload["json"]["state"]["turn_count"] == 42
     assert res["fallback_used"] is False

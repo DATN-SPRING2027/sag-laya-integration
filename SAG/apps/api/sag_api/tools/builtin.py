@@ -126,7 +126,11 @@ class SearchContextTool(Tool):
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Câu hỏi hoặc từ khóa cần tìm"},
-                "top_k": {"type": "integer", "description": "SAG hiện truy xuất cố định 5 kết quả", "minimum": 1},
+                "top_k": {
+                    "type": "integer",
+                    "description": "Số kết quả hoặc tài liệu cần lấy (tự động điều chỉnh theo câu hỏi, mặc định 5 cho câu hỏi chuẩn)",
+                    "minimum": 1,
+                },
             },
             "required": ["query"],
         },
@@ -149,7 +153,7 @@ class SearchContextTool(Tool):
             query,
             principal=ctx.principal,
             top_k=limit,
-            query_strategy_plan=plan_query(query),
+            query_strategy_plan=plan_query(query, requested_top_k=limit),
         )
         routing_trace = outcome.stats.get("routing")
         sections = [

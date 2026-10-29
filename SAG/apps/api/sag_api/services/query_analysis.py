@@ -28,14 +28,6 @@ _QUERY_NOISE = (
     "in the document",
     "tell me",
     "search for",
-    "assume that you are a public equities analyst",
-    "assume that you are",
-    "answer the following question by utilizing the information shown in",
-    "answer the following question",
-    "give a response to the question by relying on the details shown in",
-    "give a response to the question",
-    "i'm looking for a reference that discusses",
-    "i am looking for a reference that discusses",
 )
 _QUERY_INSTRUCTION_TERMS = frozenset(
     {
@@ -53,13 +45,6 @@ _QUERY_INSTRUCTION_TERMS = frozenset(
         "whether",
         "explain",
         "describe",
-        "assume",
-        "utilizing",
-        "following",
-        "question",
-        "response",
-        "relying",
-        "shown",
     }
 )
 _CHINESE_RUN_RE = re.compile(r"[\u3400-\u9fff]+")
@@ -180,6 +165,7 @@ class QueryFeatures:
     temporal_cues: tuple[str, ...] = ()
     relation_cues: tuple[str, ...] = ()
     global_cues: tuple[str, ...] = ()
+    clauses: tuple[str, ...] = ()
     multi_hop: bool = False
 
     def as_dict(self) -> dict[str, object]:
@@ -190,6 +176,7 @@ class QueryFeatures:
             "temporal_cues": list(self.temporal_cues),
             "relation_cues": list(self.relation_cues),
             "global_cues": list(self.global_cues),
+            "clauses": list(self.clauses),
             "multi_hop": self.multi_hop,
         }
 
@@ -274,7 +261,7 @@ def extract_salient_query_terms(query: str) -> frozenset[str]:
 
 
 def extract_query_features(query: str) -> QueryFeatures:
-    """Extract bounded, non-LLM query signals for routing and trace output."""
+    """Extract bounded, domain-agnostic query signals for routing and trace output."""
 
     text = query.strip()
     lowered = text.lower()
@@ -290,7 +277,8 @@ def extract_query_features(query: str) -> QueryFeatures:
         for match in _PATH_RE.finditer(text)
         if (cleaned_path := match.group(0).rstrip(".,;:!?)]'\""))
         and len(cleaned_path) >= 3
-        and not re.fullmatch(r"\d+(?:\.\d+)+(?:[a-zA-Z%]{1,4})?", cleaned_path)
+        and not re.fullmatch(r"\d+(?:\.\d+)*(?:\.[xX*]+)?(?:[a-zA-Z%]{1,4})?", cleaned_path)
+        and not re.fullmatch(r"[A-Za-z](?:\.[A-Za-z])+", cleaned_path)
     )
     temporal_cues = _unique_values(cue for cue in _TEMPORAL_CUES if cue in lowered)
     matched_relation_cues: list[str] = []
@@ -298,11 +286,7 @@ def extract_query_features(query: str) -> QueryFeatures:
     for cue in _RELATION_CUES:
         cue_stripped = cue.strip()
         if re.fullmatch(r"[a-z ]+", cue_stripped):
-            pattern = (
-                r"(?<!root )\bcause\b"
-                if cue_stripped == "cause"
-                else rf"\b{re.escape(cue_stripped)}\b"
-            )
+            pattern = rf"\b{re.escape(cue_stripped)}\b"
             if not re.search(pattern, lowered):
                 continue
         elif cue not in lowered:
@@ -315,39 +299,16 @@ def extract_query_features(query: str) -> QueryFeatures:
     relation_cues = _unique_values(matched_relation_cues)
     global_cues = _unique_values(cue for cue in _GLOBAL_CUES if cue in lowered)
     clauses = decompose_query_clauses(text)
-    single_doc_scoped = bool(
-        re.match(
-            r"^in\s+the\s+(?:draft\s+spec|enterprise\s+[^,]{3,45}\s+runbook|[^,]{3,45}\s+(?:runbook|playbook|spec|sop|postmortem|curriculum))\s*,",
-            lowered,
-        )
-    )
-    bridge_pattern = bool(
-        (len(clauses) >= 2 and not single_doc_scoped)
-        or re.search(
-            r"\b(?:mother|father|spouse|wife|husband|child|director|founder|author|creator|ceo|birthplace|nationality)\s+of\s+(?:the\s+)?(?:director|author|founder|creator|producer|composer|film|movie|book|company)\b"
-            r"|'s\s+(?:paternal\s+|maternal\s+)?(?:father|mother|grandfather|grandmother|spouse|wife|husband|son|daughter|founder|director)\b"
-            r"|\b(?:do|were|are|did)\s+both\b|\bwhich\s+(?:film|movie|person|company|director)\b.*\bor\b"
-            r"|\bwho\s+(?:was\s+born\s+(?:first|earlier|later)|is\s+(?:older|younger))\b"
-            r"|,\s+and\s+(?:what|which|who|where|why|how\s+(?:do|does|did|should|can|could|to|will|would))\b"
-            r"|\b(?:what|which|why|how)\b[^?]{6,}\band\s+(?:what|which|who|where|why|how\s+(?:do|does|did|should|can|to))\b"
-            r"|\bwhat\b[^?]{8,},\s+[^?]{4,},\s+and\s+"
-            r"|(?:^|:\s*)(?:was|were|did)\b[^?]{3,}\bor\b"
-            r"|\b(?:dân số|diện tích|thủ đô|tên|năm|ai|ở đâu|bao nhiêu)\b[^?]{2,80}\b(?:nơi|tại nơi|mà tại đó)\b[^?]{2,80}\b(?:tọa lạc|đặt trụ sở|sinh ra|thành lập|nằm ở|diễn ra)\b"
-            r"|\b(?:ai|người nào|diễn viên nào|cầu thủ nào|đạo diễn nào|tác giả nào|ca sĩ nào|công ty nào)\s+là\b[^?]{4,90}\b(?:cũng|đồng thời)\s+(?:đóng vai|tham gia|đạo diễn|sáng lập|viết|sản xuất|thi đấu|chơi)\b"
-            r"|\b(?:ai|người nào)\s+là\s+(?:luật sư|bác sĩ|người đại diện|huấn luyện viên|đạo diễn|nhà sản xuất|tác giả|người sáng lập|vợ|chồng|cha|mẹ|con)[^?]{2,50}\bcho\s+một\s+(?:người|phụ nữ|đàn ông|công ty|tổ chức|nhóm|đội)\b"
-            r"|\b(?:nữ\s+|nam\s+)?(?:diễn viên|đạo diễn|ca sĩ|nhà văn|nhà soạn nhạc|cầu thủ|vận động viên|chính trị gia|nhà khoa học)\b[^?]{3,80}\b(?:tốt nghiệp|sinh ra|học tại|giành được giải)[^?]{3,80}\b(?:đóng vai|tham gia|đạo diễn|viết|sáng tác|phát hành)\b"
-            r"|^(?:tên gọi|được\s+(?:đổi tên|thành lập|ra mắt|phát hành|xây dựng|sáng lập)|sinh\s+(?:năm|ra\s+tại))[^,?]{4,70},\s*(?:chiếc\s+xe|bộ\s+phim|cuốn\s+sách|bài\s+hát|công\s+ty|thành\s+phố|quốc\s+gia|người|ai|tác\s+phẩm)\s+nào\b"
-            r"|\b(?:trong\s+hai\b|cả\s+hai\s+đều\b|[^?]{3,60}\bhay\s+(?:là\s+)?[a-zà-ỹ0-9]{2,})"
-            r"|\b(?:mẹ|cha|bố|vợ|chồng|con|đạo diễn|người sáng lập|nhà sáng lập|tác giả|quê hương|nơi sinh|quốc tịch|tên nhân vật)\s+của\b[^?]{2,110}\b(?:trong\s+(?:phim|bộ phim|cuộc đua|tác phẩm|vở)|đạo diễn|tác giả|người sáng lập|người chiến thắng|giải thưởng)\b"
-            r"|\b(?:một|những)\s+(?:thị trấn|thành phố|quận|huyện|tỉnh|tiểu bang|quốc gia|bảo tàng|trường|đại học|công ty|bộ phim|người|nhân vật)\s+(?:ở|tại)\b[^?]{3,80},\s*có\s+(?:một|nhiều|các)\b",
-            lowered,
-        )
-    )
-    if single_doc_scoped:
-        bridge_pattern = False
+    salient_terms = extract_salient_query_terms(text)
+
+    # Domain-agnostic structural multi-hop detection:
+    # 1. Multiple distinct relation/causal stems in the query
+    # 2. Compound multi-clause query with relational/causal/interrogative bridge across clauses
+    # 3. Explicit multi-entity relational/comparative connectors
     multi_hop = (
         len(relation_cues) >= 2
-        or bridge_pattern
+        or (len(clauses) >= 2 and (bool(relation_cues) or bool(temporal_cues) or len(salient_terms) >= 1))
+        or (bool(temporal_cues or relation_cues) and bool(re.search(r"\b(?:what|which)\b[^?]*,\s+[^,?]+,\s+and\s+", text, re.IGNORECASE)))
         or any(
             cue in lowered
             for cue in (
@@ -355,8 +316,12 @@ def extract_query_features(query: str) -> QueryFeatures:
                 "dẫn đến",
                 "vì vậy",
                 "từ đó",
+                "so sánh",
+                "khác nhau giữa",
+                "khác gì giữa",
                 "relationship between",
                 "difference between",
+                "connection between",
             )
         )
     )
@@ -367,6 +332,7 @@ def extract_query_features(query: str) -> QueryFeatures:
         temporal_cues=temporal_cues,
         relation_cues=relation_cues,
         global_cues=global_cues,
+        clauses=clauses if len(clauses) >= 2 else (),
         multi_hop=multi_hop,
     )
 
@@ -464,7 +430,7 @@ def _segmented_terms(
                 continue
             values.extend(segmenter(part))
         else:
-            values.append(part)
+            values.extend([part])
     return _split_alnum_terms(_filter_informative_tokens(values))
 
 

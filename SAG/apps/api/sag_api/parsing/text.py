@@ -18,6 +18,11 @@ _PLAIN_TEXT_SUFFIXES = {
     ".txt",
     ".text",
     ".log",
+    ".yaml",
+    ".yml",
+    ".sql",
+    ".drawio",
+    ".rtf",
 }
 _TEXT_PREVIEW_SUFFIXES = _PLAIN_TEXT_SUFFIXES | {
     ".csv",

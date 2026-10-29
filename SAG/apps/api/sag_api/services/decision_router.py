@@ -10,6 +10,10 @@ import httpx
 
 from sag_api.core.config import settings
 from sag_api.core.logging import get_logger
+from sag_api.services.retrieval_plan import (
+    VALID_ANSWER_SHAPES,
+    extract_query_cardinality_and_shape,
+)
 
 log = get_logger("decision_router")
 CHAT_HIGH_CONFIDENCE = 0.65
@@ -69,6 +73,18 @@ _DECISION_QUESTIONS = {
             "change_lineage": "Asks why, how, or when a decision/plan changed from an earlier option to a newer one",
             "past_point": "Asks specifically when something happened or what was said at a past meeting/date",
             "atemporal": "General factual, conceptual, or procedural question without temporal state transitions",
+        },
+    },
+    "answer_shape": {
+        "type": "choice",
+        "instructions": "What output shape and target unit does `query` expect?",
+        "criteria": {
+            "fact_answer": "Direct factual answer, explanation, or procedural steps from relevant passages",
+            "multi_facet_compare": "Comparison, contrast, or multi-aspect synthesis across multiple entities or options",
+            "document_list": "List, find, or show multiple relevant files, documents, policies, or reports",
+            "exhaustive_count": "Count how many files, documents, items, or records match a condition",
+            "summarize_set": "Summarize or synthesize an overview across a set of documents or topics",
+            "open_document": "Open or display a single specific file or document",
         },
     },
 }
@@ -148,6 +164,7 @@ def infer_ecce_routing_signals(query: str, *, coarse_intent: str = "AMBIGUOUS") 
 
 def _fallback_route(query: str, reason: str) -> dict[str, Any]:
     memory_scope, temporal_mode = infer_ecce_routing_signals(query, coarse_intent="AMBIGUOUS")
+    shape_signals = extract_query_cardinality_and_shape(query)
     return {
         "query": query,
         "coarse_intent": "AMBIGUOUS",
@@ -157,6 +174,7 @@ def _fallback_route(query: str, reason: str) -> dict[str, Any]:
         "domain": "general",
         "memory_scope": memory_scope,
         "temporal_mode": temporal_mode,
+        "answer_shape": shape_signals.answer_shape.value,
         "confidence": 0.0,
         "latency_ms": 0.0,
         "model": "fallback",
@@ -239,6 +257,23 @@ def _route_from_answers(
     else:
         temporal_mode = inferred_temporal
 
+    shape_signals = extract_query_cardinality_and_shape(query)
+    shape_result = answers.get("answer_shape")
+    shape_choice = (
+        str(shape_result.get("choice", "")).strip().lower()
+        if isinstance(shape_result, dict)
+        else ""
+    )
+    if (
+        shape_signals.explicit_count is not None
+        or shape_signals.answer_shape.value != "fact_answer"
+    ):
+        answer_shape = shape_signals.answer_shape.value
+    elif shape_choice in VALID_ANSWER_SHAPES:
+        answer_shape = shape_choice
+    else:
+        answer_shape = shape_signals.answer_shape.value
+
     return {
         "query": query,
         "coarse_intent": coarse_intent,
@@ -250,11 +285,13 @@ def _route_from_answers(
             or coarse_intent == "AMBIGUOUS"
             or memory_scope in {"hybrid_both", "full_session_audit"}
             or temporal_mode == "change_lineage"
+            or answer_shape in {"multi_facet_compare", "summarize_set"}
             else "vector"
         ),
         "domain": domain_choice,
         "memory_scope": memory_scope,
         "temporal_mode": temporal_mode,
+        "answer_shape": answer_shape,
         "confidence": intent_confidence,
         "latency_ms": latency_ms,
         "model": model,
@@ -277,6 +314,7 @@ def route_query(query: str, context: dict[str, Any] | None = None) -> dict[str, 
             "domain": "general",
             "memory_scope": "none",
             "temporal_mode": "atemporal",
+            "answer_shape": "fact_answer",
             "confidence": 1.0,
             "latency_ms": 0.0,
             "model": "rule",

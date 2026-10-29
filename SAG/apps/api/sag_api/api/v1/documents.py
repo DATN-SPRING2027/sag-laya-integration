@@ -49,18 +49,23 @@ from sag_api.schemas.common import Ok
 from sag_api.schemas.document import DocumentOut, IngestRequest
 from sag_api.schemas.job import JobOut
 from sag_api.schemas.routing_rag import (
+    DocumentRevokeRequest,
+    DocumentRevokeResponse,
     DocumentUploadResponse,
     DocumentVersionStatusResponse,
 )
 from sag_api.services.document_service import (
     delete_document,
     get_document_version_status,
+    get_or_create_project_source,
     get_public_document,
     handle_document_upload,
     ingest_content,
     pause_document,
     reprocess_document,
+    resolve_project_document,
     resume_document,
+    revoke_project_document,
 )
 from sag_api.services.source_operation_service import source_document_mutation
 from sag_api.services.source_service import (
@@ -160,7 +165,7 @@ def _verify_mime_signature(filename: str, file_bytes: bytes) -> None:
                 layer=ErrorLayer.CLIENT,
                 stage=ErrorStage.UPLOAD,
             )
-    elif ext in {".docx", ".pptx", ".xlsx", ".epub"}:
+    elif ext in {".docx", ".pptx", ".xlsx", ".epub", ".odt", ".ods", ".odp"}:
         if not (
             file_bytes.startswith(b"PK\x03\x04")
             or file_bytes.startswith(b"PK\x05\x06")
@@ -172,14 +177,59 @@ def _verify_mime_signature(filename: str, file_bytes: bytes) -> None:
                 layer=ErrorLayer.CLIENT,
                 stage=ErrorStage.UPLOAD,
             )
-    elif ext == ".xls":
-        if not file_bytes.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+    elif ext in {".xls", ".doc", ".ppt"}:
+        is_ole2 = file_bytes.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
+        is_rtf_doc = ext == ".doc" and file_bytes.lstrip().startswith(b"{\\rtf")
+        if not (is_ole2 or is_rtf_doc):
             raise ValidationError(
                 f"Định dạng nội dung không khớp phần mở rộng: tệp '{filename}' thiếu chữ ký OLE2 container hợp lệ",
                 layer=ErrorLayer.CLIENT,
                 stage=ErrorStage.UPLOAD,
             )
-    elif ext in {".txt", ".md", ".markdown", ".text", ".csv", ".tsv", ".json", ".html", ".htm"}:
+    elif ext == ".rtf":
+        if not file_bytes.lstrip().startswith(b"{\\rtf"):
+            raise ValidationError(
+                f"Định dạng nội dung không khớp phần mở rộng: tệp '{filename}' thiếu chữ ký RTF hợp lệ ({{\\rtf)",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            )
+    elif ext == ".png":
+        if not file_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValidationError(
+                f"Định dạng nội dung không khớp phần mở rộng: tệp '{filename}' thiếu chữ ký PNG hợp lệ",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            )
+    elif ext in {".jpg", ".jpeg"}:
+        if not file_bytes.startswith(b"\xff\xd8\xff"):
+            raise ValidationError(
+                f"Định dạng nội dung không khớp phần mở rộng: tệp '{filename}' thiếu chữ ký JPEG hợp lệ",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            )
+    elif ext == ".webp":
+        if not (len(file_bytes) >= 12 and file_bytes.startswith(b"RIFF") and file_bytes[8:12] == b"WEBP"):
+            raise ValidationError(
+                f"Định dạng nội dung không khớp phần mở rộng: tệp '{filename}' thiếu chữ ký WEBP hợp lệ",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            )
+    elif ext in {
+        ".txt",
+        ".md",
+        ".markdown",
+        ".text",
+        ".csv",
+        ".tsv",
+        ".json",
+        ".html",
+        ".htm",
+        ".yaml",
+        ".yml",
+        ".xml",
+        ".drawio",
+        ".sql",
+    }:
         if (
             file_bytes.startswith(b"MZ")
             or file_bytes.startswith(b"\x7fELF")
@@ -547,7 +597,7 @@ async def upload_document_version(
     x_continuum_user_id: str | None = Header(None, alias="X-Continuum-User-Id"),
     x_continuum_security_partition: str | None = Header(None, alias="X-Continuum-Security-Partition"),
     x_continuum_tenant_id: str | None = Header(None, alias="X-Continuum-Tenant-Id"),
-    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    principal: VerifiedPrincipal = Depends(require_project_bff_principal),
     session: AsyncSession = Depends(get_session),
     job_queue: JobQueue | None = Depends(get_job_queue),
 ) -> DocumentUploadResponse:
@@ -640,3 +690,112 @@ async def query_document_version_status(
             allowed_partitions=principal.allowed_partition_ids,
         ),
     )
+
+
+@project_router.post(
+    "/revoke",
+    response_model=DocumentRevokeResponse,
+    summary="Revoke a project document from search and knowledge indexing",
+)
+async def revoke_project_document_endpoint(
+    project_id: str,
+    payload: DocumentRevokeRequest,
+    principal: VerifiedPrincipal = Depends(require_project_bff_principal),
+    session: AsyncSession = Depends(get_session),
+) -> DocumentRevokeResponse:
+    if project_id not in principal.allowed_project_ids or not principal.tenant_id:
+        raise ForbiddenError(
+            f"Principal '{principal.subject}' is not authorized to access project '{project_id}'"
+        )
+    return await revoke_project_document(
+        session,
+        tenant_id=principal.tenant_id,
+        project_id=project_id,
+        logical_source_id=payload.logical_source_id,
+        document_id=payload.document_id,
+        reason=payload.reason,
+    )
+
+
+async def _resolve_project_document_with_source(
+    session: AsyncSession,
+    *,
+    principal: VerifiedPrincipal,
+    project_id: str,
+    document_id: str,
+):
+    if project_id not in principal.allowed_project_ids or not principal.tenant_id:
+        raise ForbiddenError(
+            f"Principal '{principal.subject}' is not authorized to access project '{project_id}'"
+        )
+    doc = await resolve_project_document(
+        session,
+        tenant_id=principal.tenant_id,
+        project_id=project_id,
+        document_id_or_logical_id=document_id,
+    )
+    if not doc.source_id:
+        source = await get_or_create_project_source(session, principal.tenant_id, project_id)
+        doc.source_id = source.id
+        await session.flush()
+    else:
+        source = await get_source(session, doc.source_id)
+    return doc, source
+
+
+@project_router.post(
+    "/{document_id}/pause",
+    response_model=JobOut,
+    summary="Pause an in-flight ingestion job for a project document",
+)
+async def pause_project_document_endpoint(
+    project_id: str,
+    document_id: str,
+    principal: VerifiedPrincipal = Depends(require_project_bff_principal),
+    session: AsyncSession = Depends(get_session),
+) -> JobOut:
+    doc, source = await _resolve_project_document_with_source(
+        session, principal=principal, project_id=project_id, document_id=document_id
+    )
+    job = await pause_document(session, source, doc.id)
+    return JobOut.model_validate(job)
+
+
+@project_router.post(
+    "/{document_id}/resume",
+    response_model=JobOut,
+    summary="Resume a paused ingestion job for a project document",
+)
+async def resume_project_document_endpoint(
+    project_id: str,
+    document_id: str,
+    principal: VerifiedPrincipal = Depends(require_project_bff_principal),
+    session: AsyncSession = Depends(get_session),
+    job_queue: JobQueue = Depends(get_job_queue),
+) -> JobOut:
+    doc, source = await _resolve_project_document_with_source(
+        session, principal=principal, project_id=project_id, document_id=document_id
+    )
+    async with source_document_mutation(SessionLocal, source.id, "document-resume"):
+        job = await resume_document(session, source, doc.id, job_queue=job_queue)
+    return JobOut.model_validate(job)
+
+
+@project_router.post(
+    "/{document_id}/reprocess",
+    response_model=JobOut,
+    summary="Reprocess a project document from failed or ready state",
+)
+async def reprocess_project_document_endpoint(
+    project_id: str,
+    document_id: str,
+    principal: VerifiedPrincipal = Depends(require_project_bff_principal),
+    session: AsyncSession = Depends(get_session),
+    job_queue: JobQueue = Depends(get_job_queue),
+) -> JobOut:
+    doc, source = await _resolve_project_document_with_source(
+        session, principal=principal, project_id=project_id, document_id=document_id
+    )
+    async with source_document_mutation(SessionLocal, source.id, "document-reprocess"):
+        job = await reprocess_document(session, source, doc.id, job_queue=job_queue)
+    return JobOut.model_validate(job)

@@ -208,8 +208,6 @@ _LEXICAL_STOPWORDS = COMMON_STOPWORDS
 def _term_matches_text(term: str, text: str) -> bool:
     if term in text:
         return True
-    if term in ("ppne", "ppe") and "propertyplantandequipment" in text:
-        return True
     if len(term) >= 5 and term.endswith("s") and not term.endswith("ss") and term[:-1] in text:
         return True
     return False
@@ -305,9 +303,9 @@ def _score_term_sequence(
         else _adjacent_proximity_score(terms, heading)
     )
     if raw_heading and terms:
-        # Check if the specific clause/article title (after "Điều X." or last separator) is 100% matched
+        # Check if the leaf heading title (after the last structural separator) is 100% matched
         # in the query and contains the query's highest-IDF distinguishing term.
-        clause_title = re.split(r"(?i:\bđiều\s+\d+[a-z]?[.:]\s*|\bsection\s+\d+[.:]\s*|\s+-\s+|\s+>\s+)", raw_heading)[-1].strip()
+        clause_title = re.split(r"(?:\s+>\s+|\s+-\s+|:\s+|\.\s+)", raw_heading)[-1].strip()
         title_terms = [
             normalize_lexical_text(w)
             for w in re.findall(r"[^\W_]+", clause_title.lower(), flags=re.UNICODE)
@@ -490,6 +488,8 @@ def rerank_sections(
         if (norm := normalize_lexical_text(term))
     )
     clauses = decompose_query_clauses(query)
+    if anchor_terms:
+        query_term_list = tuple(dict.fromkeys([*query_term_list, *sorted(anchor_terms)]))
     clause_term_lists = (
         tuple(ct for c in clauses if (ct := _terms_from_query_slice(c)))
         if len(clauses) >= 2
@@ -636,29 +636,42 @@ def rerank_sections(
         cue in query_lower
         for cue in (
             "superseded",
-            "adr-001",
-            "adr001",
+            "deprecated",
+            "obsolete",
+            "archived",
             "historical",
             "outdated",
             "earlier",
             "previous",
             "bản cũ",
+            "đã thay thế",
             "trước khi điều chỉnh",
         )
     )
     if not allows_superseded and ranked:
         def _is_superseded(sec: RetrievedSection) -> bool:
             meta = f"{sec.document_name or ''}\n{sec.section_path or ''}\n{sec.heading or ''}".lower()
-            if "superseded" in meta or "_stale" in meta:
+            if any(
+                marker in meta
+                for marker in (
+                    "superseded",
+                    "[deprecated]",
+                    "(deprecated)",
+                    "[obsolete]",
+                    "(obsolete)",
+                    "[archived]",
+                    "(archived)",
+                )
+            ):
                 return True
             body = (sec.content or "").lower()
             body_norm = normalize_lexical_text(body)
             return (
                 'status: "superseded"' in body
                 or "status: superseded" in body
+                or "status: deprecated" in body
                 or "statussuperseded" in body_norm
-                or "trangthaidathaythe" in body_norm
-                or "do not treat this document as active" in body
+                or "statusdeprecated" in body_norm
             )
 
         active_ranked = [item for item in ranked if not _is_superseded(item[5])]
@@ -715,9 +728,13 @@ def select_diverse_sections(
     limit: int | None,
     diversity_weight: float | None = None,
     near_duplicate_similarity: float | None = None,
+    per_document_limit: int | None = None,
     _cancelled: threading.Event | None = None,
 ) -> tuple[list[RetrievedSection], dict[str, Any]]:
     """Collapse near-identical text and apply deterministic MMR without dropping query anchors."""
+    if per_document_limit is not None and per_document_limit < 1:
+        raise ValueError("per_document_limit must be positive")
+    unbounded_limit = limit is None
     if limit is None:
         limit = len(candidates)
     if limit <= 0 or not candidates:
@@ -822,7 +839,7 @@ def select_diverse_sections(
             (
                 index
                 for index, coverage in enumerate(unique_coverage)
-                if anchor in coverage and index not in selected_indices
+                if anchor in coverage and index not in selected_indices and (len(unique) <= limit or float(unique[index].score or 0.0) >= min(0.55, 0.75 * float(unique[0].score or 0.0)))
             ),
             None,
         )
@@ -853,30 +870,45 @@ def select_diverse_sections(
             doc_best_score[d_key] = float(sec.score or 0.0)
 
     top_doc_score = doc_best_score.get(ordered_docs[0], 0.0) if ordered_docs else 0.0
+    admission_ratio = (
+        float(settings.search_doc_admission_ratio)
+        if unbounded_limit
+        else min(0.75, float(settings.search_doc_admission_ratio))
+        if features.multi_hop or per_document_limit == 1
+        else max(0.94, float(settings.search_doc_admission_ratio))
+    )
     admitted_docs: set[str] = {doc_key(unique[i]) for i in selected_indices}
     if ordered_docs:
         admitted_docs.add(ordered_docs[0])
-        if features.multi_hop:
-            max_initial_docs = limit
-            for rank_d, d_key in enumerate(ordered_docs[1:], start=1):
-                if len(admitted_docs) >= max_initial_docs:
-                    break
-                if rank_d < 3 and doc_best_score[d_key] >= 0.68 * top_doc_score:
-                    admitted_docs.add(d_key)
-                elif doc_best_score[d_key] >= 0.72 * top_doc_score:
-                    admitted_docs.add(d_key)
-        else:
-            second_threshold = 0.80 if diversity_weight is not None else 0.94
-            if len(ordered_docs) >= 2 and doc_best_score[ordered_docs[1]] >= second_threshold * top_doc_score:
-                admitted_docs.add(ordered_docs[1])
-            if len(ordered_docs) >= 3 and doc_best_score[ordered_docs[2]] >= 0.96 * top_doc_score:
-                admitted_docs.add(ordered_docs[2])
+        max_initial_docs = limit if (unbounded_limit or features.multi_hop or per_document_limit == 1) else min(limit, 2)
+        for doc_rank_idx, d_key in enumerate(ordered_docs[1:], start=1):
+            if len(admitted_docs) >= max_initial_docs:
+                break
+            d_score = doc_best_score.get(d_key, 0.0)
+            eff_ratio = (
+                admission_ratio
+                if (
+                    unbounded_limit
+                    or (not features.multi_hop and per_document_limit != 1)
+                    or doc_rank_idx == 1
+                    or len(unique) <= limit + 1
+                )
+                else max(admission_ratio, 0.835)
+            )
+            if d_score >= max(0.20, round(eff_ratio * top_doc_score, 6)):
+                admitted_docs.add(d_key)
+
+    def can_select_from_doc(d_key: str) -> bool:
+        if per_document_limit is None:
+            return True
+        chosen_for_doc = sum(1 for chosen in selected_indices if doc_key(unique[chosen]) == d_key)
+        return chosen_for_doc < per_document_limit
 
     initial_admitted_docs = set(admitted_docs)
     for d_key in ordered_docs:
         if len(selected_indices) >= limit:
             break
-        if d_key not in admitted_docs:
+        if d_key not in admitted_docs or not can_select_from_doc(d_key):
             continue
         if any(doc_key(unique[i]) == d_key for i in selected_indices):
             continue
@@ -885,8 +917,12 @@ def select_diverse_sections(
             selected_indices.append(b_idx)
             selected_anchors.update(unique_coverage[b_idx])
 
-    fallback_doc_floor = 0.0 if diversity_weight is not None else (0.72 if features.multi_hop else 0.86)
-    same_doc_penalty_weight = 0.08 if features.multi_hop else 0.0
+    fallback_doc_floor = max(0.20, admission_ratio * top_doc_score)
+    same_doc_penalty_weight = (
+        max(0.08, float(settings.search_same_doc_penalty_weight))
+        if features.multi_hop
+        else float(settings.search_same_doc_penalty_weight)
+    )
     compared = [0] * len(unique)
     redundancy = [0.0] * len(unique)
 
@@ -906,26 +942,31 @@ def select_diverse_sections(
             for index in range(len(unique))
             if index not in selected_indices
             and doc_key(unique[index]) in admitted_docs
+            and can_select_from_doc(doc_key(unique[index]))
             and (
                 doc_key(unique[index]) in initial_admitted_docs
                 or index == doc_best_idx.get(doc_key(unique[index]))
             )
         ]
         if not remaining:
-            all_initial_single_chunk = all(
-                doc_chunk_counts.get(d, 0) <= 1 for d in initial_admitted_docs
+            all_initial_single_chunk = (
+                per_document_limit == 1
+                or all(doc_chunk_counts.get(d, 0) <= 1 for d in initial_admitted_docs)
             )
             eff_floor = (
-                0.40
-                if (diversity_weight is None and all_initial_single_chunk)
+                max(0.20, 0.40 * top_doc_score)
+                if (per_document_limit == 1 and all_initial_single_chunk)
                 else fallback_doc_floor
+                if (unbounded_limit or per_document_limit == 1 or (features.multi_hop and len(unique) <= limit + 1))
+                else 2.0
             )
             next_doc = next(
                 (
                     d_key
                     for d_key in ordered_docs
                     if d_key not in admitted_docs
-                    and doc_best_score.get(d_key, 0.0) >= eff_floor * top_doc_score
+                    and can_select_from_doc(d_key)
+                    and doc_best_score.get(d_key, 0.0) >= eff_floor
                 ),
                 None,
             )
@@ -936,6 +977,7 @@ def select_diverse_sections(
                     for index in range(len(unique))
                     if index not in selected_indices
                     and doc_key(unique[index]) in admitted_docs
+                    and can_select_from_doc(doc_key(unique[index]))
                     and (
                         doc_key(unique[index]) in initial_admitted_docs
                         or index == doc_best_idx.get(doc_key(unique[index]))
@@ -945,7 +987,9 @@ def select_diverse_sections(
                 remaining = [
                     index
                     for index in range(len(unique))
-                    if index not in selected_indices and doc_key(unique[index]) in admitted_docs
+                    if index not in selected_indices
+                    and doc_key(unique[index]) in admitted_docs
+                    and can_select_from_doc(doc_key(unique[index]))
                 ]
             if not remaining:
                 break
@@ -1076,15 +1120,22 @@ async def retrieve_relevant_sections(
     top_k: int | None = None,
 ) -> SearchOutcome:
     """One retrieval contract for search UI and the Agent's search_context tool."""
+    from sag_api.services.retrieval_plan import TargetUnit, build_retrieval_plan, group_sections_by_document
 
-    top_k = FIXED_SEARCH_TOP_K
     total_start = time.perf_counter()
     analysis = analyze_query(
         query,
         segmentation_enabled=settings.search_chinese_segmentation_enabled,
     )
-    requested_limit = min(top_k, settings.search_unit_candidate_limit)
-    candidate_limit = min(settings.search_unit_candidate_limit, top_k * 4)
+    retrieval_plan = build_retrieval_plan(
+        query,
+        requested_top_k=top_k,
+        clauses=analysis.features.clauses,
+        multi_hop=analysis.features.multi_hop,
+    )
+    effective_top_k = retrieval_plan.cardinality.effective_n
+    requested_limit = min(effective_top_k, settings.search_unit_candidate_limit)
+    candidate_limit = min(settings.search_unit_candidate_limit, max(requested_limit * 4, 20))
     targets = [(source.sag_source_config_id, source) for source in sources]
     engine_start = time.perf_counter()
     hidden = await _hidden_document_derivatives(sources)
@@ -1126,23 +1177,34 @@ async def retrieve_relevant_sections(
     lexical_sections = [section for section in lexical if visible(section)]
     hidden_count = len(outcome.sections) + len(lexical) - len(semantic_sections) - len(lexical_sections)
     rerank_start = time.perf_counter()
+    rerank_pool_limit = (
+        candidate_limit
+        if retrieval_plan.target == TargetUnit.DOCUMENT
+        else requested_limit
+    )
     reranked = rerank_sections(
         query,
         semantic_sections,
         lexical=lexical_sections,
         exact_lexical_keys=exact_lexical_keys,
-        limit=requested_limit,
+        limit=rerank_pool_limit,
         analysis=analysis,
+    )
+    final_sections = (
+        group_sections_by_document(reranked.sections, limit=requested_limit)
+        if retrieval_plan.target == TargetUnit.DOCUMENT
+        else reranked.sections[:requested_limit]
     )
     rerank_latency_ms = round((time.perf_counter() - rerank_start) * 1000, 2)
     total_latency_ms = round((time.perf_counter() - total_start) * 1000, 2)
     stats = {
         **outcome.stats,
-        "requested_top_k": top_k,
-        "automatic_top_k": False,
-        "effective_top_k": len(reranked.sections),
+        "requested_top_k": requested_limit,
+        "automatic_top_k": top_k is None and retrieval_plan.cardinality.count_source.value != "DEFAULT",
+        "effective_top_k": len(final_sections),
+        "retrieval_plan": retrieval_plan.as_trace(),
         "budget_exhausted": (
-            len(reranked.sections) >= settings.search_unit_candidate_limit
+            len(final_sections) >= settings.search_unit_candidate_limit
             or len(outcome.sections) >= settings.search_unit_candidate_limit
             or len(lexical) >= settings.search_unit_candidate_limit
         ),
@@ -1164,7 +1226,7 @@ async def retrieve_relevant_sections(
     }
     return SearchOutcome(
         query=outcome.query or query,
-        sections=reranked.sections,
+        sections=final_sections,
         stats=stats,
     )
 
@@ -1253,18 +1315,71 @@ def fallback_search_answer(query: str, sections: list[RetrievedSection]) -> str:
     return "Based on directly relevant evidence:\n" + "\n".join(lines)
 
 
-def _validated_answer(answer: str, section_count: int) -> str | None:
+_MULTI_CITATION_BRACKET_RE = re.compile(r"\[(\d+(?:\s*[,;]\s*\d+)+)]")
+_ABSTENTION_PREFIX_RE = re.compile(
+    r"^\s*(?:insufficient[_\s-]evidence\b|"
+    r"the\s+(?:provided\s+|available\s+|retrieved\s+)?(?:evidence|documents?|context|sources?)\s+"
+    r"(?:do(?:es)?\s+not|cannot)\s+(?:contain|specify|mention|provide|include|state|answer)\b|"
+    r"based\s+on\s+the\s+(?:provided\s+|available\s+)?(?:evidence|documents?|context),\s+there\s+is\s+no\s+(?:information|mention)\b|"
+    r"(?:bằng\s+chứng|tài\s+liệu)\s+(?:được\s+cung\s+cấp\s+)?không\s+(?:chứa|đề\s+cập|nêu|có\s+thông\s+tin)\b)",
+    re.IGNORECASE,
+)
+_UNGROUNDED_REFUSAL_CUES = (
+    "does not contain",
+    "does not specify",
+    "does not mention",
+    "does not provide",
+    "do not contain",
+    "do not specify",
+    "do not mention",
+    "not mentioned in the provided",
+    "not specified in the provided",
+    "cannot be determined from the provided",
+    "insufficient evidence",
+    "không có thông tin",
+    "không đề cập",
+)
+
+
+def _normalize_citation_brackets(text: str) -> str:
+    return _MULTI_CITATION_BRACKET_RE.sub(
+        lambda m: " ".join(f"[{num.strip()}]" for num in re.split(r"[,;]", m.group(1)) if num.strip()),
+        text,
+    )
+
+
+def _is_abstention_response(answer: str) -> bool:
     text = answer.strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if "insufficient_evidence" in lowered or _ABSTENTION_PREFIX_RE.search(text):
+        return True
+    normalized = _normalize_citation_brackets(text)
+    if not _CITATION_RE.findall(normalized) and any(cue in lowered for cue in _UNGROUNDED_REFUSAL_CUES):
+        return True
+    return False
+
+
+def _validated_answer(answer: str, section_count: int) -> str | None:
+    text = _normalize_citation_brackets(answer.strip())
     if not text:
         return None
     references = [int(value) for value in _CITATION_RE.findall(text)]
-    if not references or any(value < 1 or value > section_count for value in references):
+    valid_refs = [value for value in references if 1 <= value <= section_count]
+    if not valid_refs:
         return None
+    if len(valid_refs) != len(references):
+        text = _CITATION_RE.sub(
+            lambda m: m.group(0) if 1 <= int(m.group(1)) <= section_count else "",
+            text,
+        ).strip()
     return text
 
 
 def _citations_used_by_answer(answer: str, citations: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    numbers = {int(value) for value in _CITATION_RE.findall(answer)}
+    numbers = {int(value) for value in _CITATION_RE.findall(_normalize_citation_brackets(answer))}
+
     return [citation for citation in citations if citation.get("n") in numbers]
 
 
@@ -1324,6 +1439,8 @@ async def synthesize_search_answer(
     except Exception as error:  # noqa: BLE001
         log.warning("搜索答案生成失败，回退证据摘要：%s", error)
         return SearchAnswer(fallback, _citations_used_by_answer(fallback, citations), "answered")
+    if _is_abstention_response(answer):
+        return SearchAnswer(no_answer_text(), [], "no_answer", "insufficient_evidence")
     validated = _validated_answer(answer, len(pack.sections))
     canonical = validated or fallback
     return SearchAnswer(canonical, _citations_used_by_answer(canonical, citations), "answered")
@@ -1384,7 +1501,17 @@ async def stream_synthesize_search_answer(
         )
         return
 
-    validated = _validated_answer("".join(parts), len(pack.sections))
+    raw_answer = "".join(parts)
+    if _is_abstention_response(raw_answer):
+        yield SearchAnswerUpdate(
+            kind="completed",
+            text=no_answer_text(),
+            status="no_answer",
+            no_answer_reason="insufficient_evidence",
+            citations=[],
+        )
+        return
+    validated = _validated_answer(raw_answer, len(pack.sections))
     answer = validated or fallback
     used_citations = _citations_used_by_answer(answer, citations)
     # Provider deltas remain private until citation syntax is checked against

@@ -750,25 +750,25 @@ def test_first_principles_stage1_to_stage5_architectural_upgrades() -> None:
     )
     assert blocks[0].section_path == "3M 2018 10K Note6 PPE > Consolidated Balance Sheets"
 
-    # Sparse BM25 indexes normalized numbers and expanded PP&E / alphanumeric tokens
-    sparse = compute_sparse_bm25_vector("In FY2018, 3M recorded $8,738M of PP&E.")
+    # Sparse BM25 indexes normalized thousand-separated numbers, ampersand initialisms, and alphanumeric tokens
+    sparse = compute_sparse_bm25_vector("In FY2018, R&D recorded $8,738M of capital assets.")
     assert set(build_sparse_query_vector("8738m")["indices"]) <= set(sparse["indices"])
     assert set(build_sparse_query_vector("2018")["indices"]) <= set(sparse["indices"])
-    assert set(build_sparse_query_vector("ppe")["indices"]) <= set(sparse["indices"])
+    assert set(build_sparse_query_vector("R&D")["indices"]) <= set(sparse["indices"])
 
     # 2. Stage 2: No 8-term truncation on long queries, preserve 2-char alnum ("3m", "q2"), detect relational multi-hop
     long_query = (
-        "Assume that you are a public equities analyst. Utilizing the following information, "
-        "answer the question: How much did 3M spend on capital expenditures in FY2018?"
+        "In the quarterly infrastructure review, how much did 3M spend on capital expenditures in FY2018 during Q2?"
     )
     analysis = analyze_query(long_query)
     assert "3m" in analysis.scoring_terms
     assert "capital" in analysis.scoring_terms
     assert "expenditures" in analysis.scoring_terms
     assert "2018" in analysis.scoring_terms
+    assert "q2" in analysis.scoring_terms
 
     mh_features = extract_query_features(
-        "What is the nationality of the mother of the director of the film Wojna polsko-ruska?"
+        "What caused the database failover, and how does it affect the replication lag?"
     )
     assert mh_features.multi_hop is True
 
@@ -891,7 +891,7 @@ def test_cognitive_upgrades_clause_decomposition_artifact_bridge_and_entropy_adm
     assert "gpu" in salient
 
     dispute_features = extract_query_features(
-        "INC-9821: was the degraded GPU node an OOM or intermittent driver/kernel launch stalls?"
+        "How does INC-9821 relate to the driver upgrade, and what caused the latency spike?"
     )
     assert dispute_features.multi_hop is True
 
@@ -1227,9 +1227,9 @@ def test_vietnamese_entity_lexer_multihop_and_e2_span_alignment() -> None:
     assert "18 tháng" not in ents
     assert "12 năm" not in ents
 
-    # 2. Vietnamese multi-hop query feature detection
-    mh_q1 = "Nơi sinh của người chiến thắng giải thưởng của Hiệp hội Phê bình Phim Los Angeles cho Nữ diễn viên phụ xuất sắc nhất năm 2001 là ở đâu?"
-    mh_q2 = "Một thị trấn ở Quận Waldo, Maine, có một bảo tàng mở cửa hàng ngày từ tháng 5 đến tháng 10 tên là gì?"
+    # 2. Vietnamese multi-hop query feature detection (domain-agnostic relational/comparative structure)
+    mh_q1 = "Mối liên hệ giữa dịch vụ xác thực và cổng thanh toán dẫn đến lỗi gì?"
+    mh_q2 = "Sự khác nhau giữa quy trình phê duyệt cấp 1 và quy trình khẩn cấp là gì, và khi nào cần áp dụng?"
     assert extract_query_features(mh_q1).multi_hop is True
     assert extract_query_features(mh_q2).multi_hop is True
 

@@ -324,3 +324,101 @@ async def test_verified_new_version_publishes_even_when_old_point_cleanup_fails(
         assert version.search_status == "SEARCH_READY"
         assert deleted == [["old-version"]]
         assert created_indexes == (["document_version_id"] if missing_index else [])
+
+
+@pytest.mark.asyncio
+async def test_project_upload_revoke_and_status_lifecycle(ingestion_db, tmp_path, monkeypatch):
+    from sag_api.services.document_service import (
+        get_document_version_status,
+        handle_document_upload,
+        resolve_project_document,
+        revoke_project_document,
+    )
+
+    monkeypatch.setattr(tasks.settings, "data_dir", str(tmp_path))
+    async with ingestion_db() as session:
+        upload_res = await handle_document_upload(
+            session,
+            tenant_id="tenant-2",
+            project_id="project-2",
+            owner_id="user-1",
+            security_partition_id="project-2",
+            client_token="idem-1",
+            file_bytes=b"key: value\n",
+            original_filename="config.yaml",
+            content_type="application/yaml",
+            logical_source_id="be-doc-123",
+        )
+        assert upload_res.version_no == 1
+        assert upload_res.is_duplicate is False
+
+        mapping = await session.scalar(
+            select(SourceProjectMapping).where(
+                SourceProjectMapping.organization_id == "tenant-2",
+                SourceProjectMapping.project_id == "project-2",
+                SourceProjectMapping.state == "CONFIRMED",
+            )
+        )
+        assert mapping is not None
+
+        resolved = await resolve_project_document(
+            session,
+            tenant_id="tenant-2",
+            project_id="project-2",
+            document_id_or_logical_id="be-doc-123",
+        )
+        assert resolved.id == upload_res.document_id
+        resolved.progress = 45
+        resolved.chunk_count = 7
+        await session.commit()
+
+        status_res = await get_document_version_status(
+            session,
+            project_id="project-2",
+            document_id=upload_res.document_id,
+            version_no=1,
+        )
+        assert status_res.progress == 45
+        assert status_res.chunk_count == 7
+        assert status_res.document_status == "pending"
+
+        revoke_res = await revoke_project_document(
+            session,
+            tenant_id="tenant-2",
+            project_id="project-2",
+            logical_source_id="be-doc-123",
+            reason="DOCUMENT_ARCHIVED",
+        )
+        assert revoke_res.status == "REVOKED"
+        assert revoke_res.document_id == upload_res.document_id
+
+        revoke_again = await revoke_project_document(
+            session,
+            tenant_id="tenant-2",
+            project_id="project-2",
+            logical_source_id="be-doc-123",
+        )
+        assert revoke_again.status == "ALREADY_REVOKED"
+
+        not_found = await revoke_project_document(
+            session,
+            tenant_id="tenant-2",
+            project_id="project-2",
+            logical_source_id="missing-doc",
+        )
+        assert not_found.status == "NOT_FOUND"
+
+        reupload_res = await handle_document_upload(
+            session,
+            tenant_id="tenant-2",
+            project_id="project-2",
+            owner_id="user-1",
+            security_partition_id="project-2",
+            client_token="idem-2",
+            file_bytes=b"key: value\n",
+            original_filename="config.yaml",
+            content_type="application/yaml",
+            logical_source_id="be-doc-123",
+        )
+        assert reupload_res.version_no == 2
+        assert reupload_res.is_duplicate is False

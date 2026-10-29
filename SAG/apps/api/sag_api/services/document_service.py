@@ -25,7 +25,7 @@ from sag_api.core.identity import (
 from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal as AssertionVerifiedPrincipal
 from sag_api.db.base import new_id
-from sag_api.db.models import Document, Job, Source
+from sag_api.db.models import Document, Job, Source, SourceProjectMapping
 from sag_api.db.models.routing_rag import (
     DocumentVersion,
     IngestionRun,
@@ -37,6 +37,7 @@ from sag_api.enums import ConnectorKind, DocumentStatus, JobStatus, JobType, Sou
 from sag_api.jobs import JobQueue
 from sag_api.jobs.scheduling import DELETE_PRIORITY, RESUME_PRIORITY, set_scheduler
 from sag_api.schemas.routing_rag import (
+    DocumentRevokeResponse,
     DocumentUploadResponse,
     DocumentVersionStatusResponse,
     StageProgressItem,
@@ -322,6 +323,28 @@ async def reprocess_document(
         payload=payload,
     )
     session.add(job)
+    latest_ver = await session.scalar(
+        select(DocumentVersion)
+        .where(DocumentVersion.document_id == document.id)
+        .order_by(DocumentVersion.version_no.desc())
+        .limit(1)
+    )
+    if latest_ver is not None and not requires_maintenance:
+        latest_ver.status = "RECEIVED"
+        if latest_ver.search_status in ("FAILED", "INDEX_FAILED"):
+            latest_ver.search_status = "PENDING"
+        if latest_ver.knowledge_status == "FAILED":
+            latest_ver.knowledge_status = "NOT_STARTED"
+        run_id = (payload or {}).get("run_id")
+        if isinstance(run_id, str) and run_id:
+            ing_run = await session.get(IngestionRun, run_id)
+            if ing_run is not None:
+                ing_run.status = "QUEUED"
+                ing_run.current_stage = "RECEIVE"
+                ing_run.error_layer = None
+                ing_run.error_stage = None
+                ing_run.error_code = None
+                ing_run.error_message = None
     await touch_source_revision(session, source.id)
     await session.commit()
     await session.refresh(job)
@@ -918,6 +941,51 @@ def _save_snapshot_file(payload_hash: str, original_filename: str, file_bytes: b
     return str(target_path.resolve())
 
 
+async def _ensure_project_source_mapping(
+    session: AsyncSession,
+    *,
+    source_id: str,
+    tenant_id: str,
+    project_id: str,
+) -> None:
+    if not tenant_id or not tenant_id.strip() or not project_id or not project_id.strip():
+        return
+    mapping_stmt = (
+        select(SourceProjectMapping)
+        .where(
+            SourceProjectMapping.source_id == source_id,
+            SourceProjectMapping.state.in_(("PENDING", "CONFIRMED")),
+        )
+        .limit(1)
+    )
+    mapping = (await session.execute(mapping_stmt)).scalar_one_or_none()
+    now_utc = datetime.now(UTC)
+    if mapping is None:
+        try:
+            async with session.begin_nested():
+                session.add(
+                    SourceProjectMapping(
+                        source_id=source_id,
+                        organization_id=tenant_id,
+                        project_id=project_id,
+                        state="CONFIRMED",
+                        mapping_version=1,
+                        confirmed_at=now_utc,
+                        confirmed_by="system_project_auto_provision",
+                        approval_ref=f"auto_project_{project_id}",
+                    )
+                )
+                await session.flush()
+        except IntegrityError:
+            pass
+    elif mapping.state == "PENDING":
+        mapping.state = "CONFIRMED"
+        mapping.confirmed_at = mapping.confirmed_at or now_utc
+        mapping.confirmed_by = mapping.confirmed_by or "system_project_auto_provision"
+        mapping.approval_ref = mapping.approval_ref or f"auto_project_{project_id}"
+        await session.flush()
+
+
 async def get_or_create_project_source(
     session: AsyncSession,
     tenant_id: str,
@@ -929,6 +997,9 @@ async def get_or_create_project_source(
     stmt = select(Source).where(Source.sag_source_config_id == config_id).limit(1)
     source = (await session.execute(stmt)).scalar_one_or_none()
     if source is not None:
+        await _ensure_project_source_mapping(
+            session, source_id=source.id, tenant_id=tenant_id, project_id=project_id
+        )
         return source
 
     source = Source(
@@ -951,6 +1022,9 @@ async def get_or_create_project_source(
         source = (await session.execute(stmt)).scalar_one_or_none()
         if source is None:
             raise
+    await _ensure_project_source_mapping(
+        session, source_id=source.id, tenant_id=tenant_id, project_id=project_id
+    )
     return source
 
 
@@ -1105,7 +1179,12 @@ async def handle_document_upload(
                             code="DOCUMENT_PARTITION_MISMATCH",
                             retryable=False,
                         )
-                    if latest_ver and latest_ver.file_hash == payload_hash:
+                    if (
+                        latest_ver
+                        and latest_ver.file_hash == payload_hash
+                        and latest_ver.status != "REVOKED"
+                        and doc.is_active
+                    ):
                         # Exact duplicate: Cùng hash + cùng source identity
                         # Duplicate policy: Do NOT parse again or schedule pipeline!
                         run_stmt = (
@@ -1161,6 +1240,14 @@ async def handle_document_upload(
                         supersedes_id = None
                     storage_path = _save_snapshot_file(payload_hash, original_filename, file_bytes)
                     doc.storage_path = storage_path
+                    doc.is_active = True
+                    doc.status = DocumentStatus.PENDING
+                    doc.filename = original_filename
+                    doc.content_type = content_type
+                    doc.size_bytes = len(file_bytes)
+                    doc.error = None
+                    doc.error_layer = None
+                    doc.error_stage = None
                     if source_id and not doc.source_id:
                         doc.source_id = source_id
 
@@ -1401,6 +1488,21 @@ async def get_document_version_status(
                 "message": latest_run.error_message,
             }
 
+    doc_status_str = doc.status.value if hasattr(doc.status, "value") else str(doc.status)
+    computed_progress = 100 if doc.status == DocumentStatus.READY else int(doc.progress or 0)
+    if err_info is None and doc.error:
+        err_info = {
+            "layer": doc.error_layer or "API",
+            "stage": doc.error_stage or "INGEST",
+            "code": f"{doc.error_layer or 'API'}_{doc.error_stage or 'INGEST'}_FAILED",
+            "message": doc.error,
+        }
+    if doc.status in (DocumentStatus.PAUSED, DocumentStatus.PAUSING) and current_stage not in (
+        "PAUSED",
+        "PAUSING",
+    ):
+        current_stage = "PAUSED" if doc.status == DocumentStatus.PAUSED else "PAUSING"
+
     return DocumentVersionStatusResponse(
         document_id=doc_ver.document_id,
         version_no=doc_ver.version_no,
@@ -1412,4 +1514,161 @@ async def get_document_version_status(
         current_stage=current_stage,
         stage_progress=stage_progress,
         error=err_info,
+        progress=computed_progress,
+        document_status=doc_status_str,
+        parser_provider=doc.parser_provider,
+        parser_status=doc.parser_status,
+        chunk_count=int(doc.chunk_count or 0),
+        event_count=int(doc.event_count or 0),
+        token_usage=int(doc.token_usage or 0),
     )
+
+
+async def resolve_project_document(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    project_id: str,
+    document_id_or_logical_id: str,
+) -> Document:
+    """Resolve a project-scoped Document by SAG document_id or external logical_source_id."""
+    target = (document_id_or_logical_id or "").strip()
+    if not target:
+        raise NotFoundError(f"Document not found in project {project_id}")
+
+    doc = (
+        await session.execute(
+            select(Document)
+            .where(
+                Document.tenant_id == tenant_id,
+                Document.project_id == project_id,
+                Document.id == target,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if doc is None:
+        doc = (
+            await session.execute(
+                select(Document)
+                .where(
+                    Document.tenant_id == tenant_id,
+                    Document.project_id == project_id,
+                    Document.logical_source_id == target,
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+    if doc is None:
+        raise NotFoundError(f"Document '{target}' not found in project '{project_id}'")
+    return doc
+
+
+async def revoke_project_document(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    project_id: str,
+    logical_source_id: str | None = None,
+    document_id: str | None = None,
+    reason: str | None = None,
+) -> DocumentRevokeResponse:
+    """Revoke a project document from retrieval and knowledge indexing."""
+    logical_id = (logical_source_id or "").strip()
+    doc_id = (document_id or "").strip()
+    if not logical_id and not doc_id:
+        raise ValidationError("Either logical_source_id or document_id is required to revoke a document")
+
+    doc: Document | None = None
+    if doc_id:
+        doc = (
+            await session.execute(
+                select(Document)
+                .where(
+                    Document.tenant_id == tenant_id,
+                    Document.project_id == project_id,
+                    Document.id == doc_id,
+                )
+                .with_for_update()
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+    if doc is None and logical_id:
+        doc = (
+            await session.execute(
+                select(Document)
+                .where(
+                    Document.tenant_id == tenant_id,
+                    Document.project_id == project_id,
+                    Document.logical_source_id == logical_id,
+                )
+                .with_for_update()
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
+    if doc is None:
+        return DocumentRevokeResponse(status="NOT_FOUND", document_id=None)
+
+    versions = list(
+        (
+            await session.scalars(
+                select(DocumentVersion)
+                .where(DocumentVersion.document_id == doc.id)
+                .order_by(DocumentVersion.version_no.asc())
+                .with_for_update()
+            )
+        ).all()
+    )
+
+    if not doc.is_active and all(v.status == "REVOKED" for v in versions):
+        return DocumentRevokeResponse(status="ALREADY_REVOKED", document_id=doc.id)
+
+    now_utc = datetime.now(UTC)
+    doc.is_active = False
+
+    active_jobs = list(
+        (
+            await session.scalars(
+                select(Job).where(
+                    Job.document_id == doc.id,
+                    Job.type.in_([JobType.PROCESS_DOCUMENT, JobType.REPROCESS_DOCUMENT]),
+                    Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]),
+                )
+            )
+        ).all()
+    )
+    for active_job in active_jobs:
+        active_job.payload = {**(active_job.payload or {}), "pause_requested": True}
+        if active_job.status == JobStatus.QUEUED:
+            active_job.status = JobStatus.PAUSED
+
+    if doc.status in {
+        DocumentStatus.PENDING,
+        DocumentStatus.LOADING,
+        DocumentStatus.EXTRACTING,
+    }:
+        doc.status = DocumentStatus.PAUSED
+
+    for ver in versions:
+        ver.status = "REVOKED"
+        ver.search_status = "REVOKED"
+        ver.knowledge_status = "REVOKED"
+        ver.search_ready_at = None
+        ver.knowledge_ready_at = None
+        if ver.valid_to is None or ver.valid_to > now_utc:
+            ver.valid_to = now_utc
+        meta = dict(ver.metadata_json or {})
+        meta["revoked_at"] = now_utc.isoformat()
+        if reason:
+            meta["revoke_reason"] = reason
+        ver.metadata_json = meta
+
+    if doc.source_id:
+        source = await session.get(Source, doc.source_id)
+        if source is not None:
+            await _refresh_source_counts(session, source)
+        await touch_source_revision(session, doc.source_id)
+
+    await session.commit()
+    return DocumentRevokeResponse(status="REVOKED", document_id=doc.id)

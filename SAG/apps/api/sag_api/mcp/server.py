@@ -228,7 +228,10 @@ def build_source_mcp(
         query: Annotated[str, Field(description="Câu hỏi, chủ đề hoặc từ khóa cần tìm.")],
         top_k: Annotated[
             int | None,
-            Field(description="Số bằng chứng cần lấy, tối đa 5; mặc định 5.", ge=1),
+            Field(
+                description="Số bằng chứng hoặc tài liệu cần lấy; tự động điều chỉnh theo câu hỏi (mặc định 5 cho câu hỏi chuẩn, tối đa 50 khi liệt kê tài liệu).",
+                ge=1,
+            ),
         ] = None,
         source_id: SourceId = "",
     ) -> str:
@@ -243,7 +246,8 @@ def build_source_mcp(
 
         async with SessionLocal() as session:
             partitioned_ids = await versioned_source_ids(session, [source.id for source in selected])
-        bounded_top_k = min(max(1, top_k), FIXED_SEARCH_TOP_K) if top_k is not None else FIXED_SEARCH_TOP_K
+        strategy_plan = plan_query(normalized, requested_top_k=top_k)
+        bounded_top_k = strategy_plan.retrieval_plan.cardinality.effective_n
         sections = []
         canonical_sources = [source for source in selected if source.id in partitioned_ids]
         legacy_sources = [source for source in selected if source.id not in partitioned_ids]
@@ -254,7 +258,7 @@ def build_source_mcp(
                 normalized,
                 principal=scope.principal,
                 top_k=bounded_top_k,
-                query_strategy_plan=plan_query(normalized),
+                query_strategy_plan=strategy_plan,
             )
             sections.extend(canonical.sections)
         if legacy_sources:

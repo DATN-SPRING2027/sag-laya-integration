@@ -12,7 +12,11 @@ from sag_api.schemas.insight import EntityOut, GraphRelationOut
 class SearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=4000)
     strategy: SearchStrategy | None = None
-    top_k: int | None = Field(default=None, ge=1, description="SAG retrieval currently uses fixed Top-5.")
+    top_k: int | None = Field(
+        default=None,
+        ge=1,
+        description="Optional explicit result limit; defaults to 7-axis RetrievalPlan cardinality (5 for standard passage Q&A, up to 50 for document listing).",
+    )
 
 
 class GlobalSearchRequest(BaseModel):
@@ -20,7 +24,11 @@ class GlobalSearchRequest(BaseModel):
 
     query: str = Field(min_length=1, max_length=4000)
     source_ids: list[str] | None = Field(default=None, max_length=256)
-    top_k: int | None = Field(default=None, ge=1, description="SAG retrieval currently uses fixed Top-5.")
+    top_k: int | None = Field(
+        default=None,
+        ge=1,
+        description="Optional explicit result limit; defaults to 7-axis RetrievalPlan cardinality (5 for standard passage Q&A, up to 50 for document listing).",
+    )
     strategy: SearchStrategy | None = None
     retrieval_mode: (
         Literal[
