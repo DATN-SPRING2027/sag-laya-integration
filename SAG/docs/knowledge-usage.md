@@ -1,48 +1,25 @@
-# Knowledge usage and optional project quota
+# Knowledge Foundation & Provider Token Usage Metering
 
-`tenant_id` comes from the verified Continuum organization scope. For Continuum
-login, SAG sets it to `organization_id`; it is an authorization/data-isolation
-boundary, not a provider quota or provider account identifier.
+> **Cập nhật kiến trúc 2026-10-29:** Pha **E2 LLM Enrichment** (`KnowledgeJob.kind == "E2"`, `SAG_KNOWLEDGE_E2_*`, `SAG_KNOWLEDGE_DAILY_TOKENS`) đã được **loại bỏ vĩnh viễn** sau phép đo đối chứng A/B trên toàn bộ bộ chuẩn RetrievalCI 81 tài liệu / 50 câu hỏi (`docs/adr-remove-e2-llm-enrichment.md`), nơi việc bật E2 không tăng Recall (`99.17% -> 99.17%`), làm giảm Overall Score (`93.64 -> 93.42`), giảm Precision (`80.73% -> 80.00%`) và giảm Abstention (`100% -> 80%`) nhưng làm tăng chi phí ingest gấp `3.42x` (`+151,435` LLM tokens).
+>
+> Hệ thống hiện chỉ vận hành **Phase 5A `FOUNDATION`** (`E0/E1` tất định + `DenseGraph` tái sử dụng 100% cache embedding từ Phase 2C + cây định tuyến `Leiden`).
 
-`SAG_KNOWLEDGE_DAILY_TOKENS=0` is the default: no daily E2 token cap. A positive
-value, for example `100000`, enables a separate E2 reservation cap for each
-`(tenant_id, project_id, UTC day)`. This deployment setting currently applies the
-same policy independently to all projects; per-project subscription plans are
-not implemented. Foundation extraction is not charged against this E2 cap.
+## 1. Phân tách Scope & Quản lý Hàng đợi Foundation
 
-`knowledge_queue_control.tokens_reserved` tracks conservative reservations, not
-provider-reported usage. Project keys use
-`project:{stable_id(tenant_id, project_id)}:{YYYY-MM-DD}`. Organization observation
-keys use `tenant:{tenant_id}:{YYYY-MM-DD}` and never block work. Legacy keys from
-the old organization-wide cap are retained for audit, not reused as project caps.
-Retries reserve again because they can issue additional provider requests. A
-budget-deferred job remains queued until the next UTC day; disabling the cap
-releases those jobs on the next claim. Queue capacity and concurrency protection
-remain in force independently of daily token policy.
+- `tenant_id` được lấy từ phạm vi tổ chức Continuum đã xác thực (`organization_id`), kết hợp với `project_id` và `security_partition_id` làm ranh giới phân quyền & cô lập dữ liệu.
+- `KnowledgeWorker` (`sag_api/jobs/knowledge.py`) chỉ nhận và thực thi `KnowledgeJob(kind="FOUNDATION")`, được bảo vệ bởi `SAG_KNOWLEDGE_CONCURRENCY` và `SAG_KNOWLEDGE_QUEUE_CAPACITY`, không phát sinh bất kỳ lời gọi LLM nào trong quá trình ingest.
 
-## Provider usage is separate from reservations
+## 2. Đo & Tổng hợp Token chính xác từ Provider (`sag_api/core/token_usage.py`)
 
-SiliconFlow documents actual response usage:
+Toàn bộ lượng token tiêu thụ đều được đọc trực tiếp từ `usage` do provider (SiliconFlow / OpenAI-compatible) trả về thay vì ước lượng cảm tính:
 
-- [Chat completions](https://docs.siliconflow.cn/docs/api/chat-completions-post):
-  `usage.prompt_tokens`, `usage.completion_tokens`, `usage.total_tokens`, and
-  optional cached/reasoning token details.
-- [Embeddings](https://docs.siliconflow.cn/docs/api/embeddings-post):
-  `usage.prompt_tokens` and `usage.total_tokens`.
-
-The generation client reads response usage into runtime usage events. The E2
-HTTP path currently discards response usage after reading the generated content.
-There is not yet a complete persistent per-request ledger covering generation,
-legacy extraction, E2 and embeddings. Do not use reservation totals as actual
-consumption or as a customer invoice.
-
-A billing ledger must attribute each attempt to the authenticated organization
-and project, provider/model, request/trace ID, operation, timestamp, status and
-provider-reported usage. Missing usage after a timeout must stay unknown rather
-than becoming zero. Daily organization/project reports can aggregate that ledger
-without enforcing a cap. Enforcing subscription quotas is a separate opt-in
-policy, not a side effect of collecting usage.
-
-Changes to worker settings take effect at application startup. Existing running
-workers keep their original policy; do not restart an active benchmark merely to
-change its recorded configuration.
+- **Embeddings (`Qwen/Qwen3-Embedding-0.6B`)**: ghi nhận `embedding_input_tokens` và `embedding_cache_hits` cho:
+  - `search_index_embedding` (Phase 2C lập chỉ mục `SearchUnit` & preload `CanonicalBlock`)
+  - `knowledge_foundation_embedding` (Phase 5A gắn vector `DenseGraph` cho `KnowledgeUnit` — đạt `100%` cache hit khi đi qua Phase 2C)
+  - `query_embedding` (nhúng câu truy vấn lúc tìm kiếm)
+- **Chat / Streaming Synthesis (`Qwen/Qwen3-8B`, `stream_options={"include_usage": True}`)**: ghi nhận `llm_input_tokens`, `llm_uncached_input_tokens`, `llm_cached_input_tokens`, `llm_output_tokens`, `llm_reasoning_tokens` cho:
+  - `answer_generation` (tổng hợp câu trả lời RAG qua `/api/v1/search` và `/api/v1/search/stream`)
+  - `agent_turn` (tác tử hội thoại)
+- **Lưu trữ bền vững & API**:
+  - Lưu theo từng tài liệu tại `documents.token_usage`, `documents.token_usage_json`, `document_versions.metadata_json` và `knowledge_jobs.usage_json`.
+  - Truy xuất báo cáo chi tiết từng file, từng loại token, từng thành phần và chi phí USD tại `GET /api/v1/projects/{project_id}/documents/token-usage` và `GET /api/v1/system/metrics`.

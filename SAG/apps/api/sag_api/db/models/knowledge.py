@@ -55,6 +55,7 @@ class KnowledgeJob(Base):
     # Keep validated enrichment artifacts when the derived KnowledgeUnit store is rebuilt.
     unit_id: Mapped[str | None] = mapped_column(String(36))
     result_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    usage_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     extractor_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
     tree_requested_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     tenant_id: Mapped[str] = mapped_column(String(64))

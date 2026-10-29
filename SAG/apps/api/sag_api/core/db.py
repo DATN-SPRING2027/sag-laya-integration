@@ -94,6 +94,7 @@ _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
     "documents": {
         "progress": "INTEGER NOT NULL DEFAULT 0",
         "token_usage": "BIGINT NOT NULL DEFAULT 0",
+        "token_usage_json": "JSON",
         "error_layer": "VARCHAR(16)",
         "error_stage": "VARCHAR(16)",
         "octx_installation_id": "VARCHAR(32)",
@@ -122,7 +123,7 @@ _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
     "universe_dirty_sources": {"revision": "INTEGER NOT NULL DEFAULT 1"},
     "tree_manifests": {"manifest_json": "JSON NOT NULL DEFAULT '{}'"},
     "tree_routing_profiles": {"document_version_id": "VARCHAR(128) NOT NULL DEFAULT ''"},
-    "knowledge_jobs": {"result_json": "JSON", "extractor_version": "VARCHAR(128)", "tree_requested_at": "TIMESTAMP WITH TIME ZONE"},
+    "knowledge_jobs": {"result_json": "JSON", "usage_json": "JSON", "extractor_version": "VARCHAR(128)", "tree_requested_at": "TIMESTAMP WITH TIME ZONE"},
     "knowledge_graph_builds": {"input_fingerprint": "VARCHAR(64)"},
     "canonical_blocks": {"dedup_signature_json": "JSON"},
     "research_tasks": {"execution_json": "JSON NOT NULL DEFAULT '{}'"},

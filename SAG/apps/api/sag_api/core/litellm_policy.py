@@ -191,6 +191,11 @@ def apply_litellm_completion_policy(
 
     if "reasoning_effort" in normalized and _is_openai_route(model, settings):
         _with_allowed_openai_param(normalized, "reasoning_effort")
+    if normalized.get("stream") is True:
+        if "stream_options" not in normalized:
+            normalized["stream_options"] = {"include_usage": True}
+        elif normalized["stream_options"] is None:
+            normalized.pop("stream_options", None)
     return normalized
 
 

@@ -305,11 +305,33 @@ async def _process_document_unlocked(
         if document.status in _CONTROL_TRANSITION_STATES:
             return
         document.status = DocumentStatus.LOADING
-        document.progress = max(document.progress, 10)
+        document.progress = max(document.progress, 25)
         for field, value in _parser_state_values(state).items():
             setattr(document, field, value)
         job.progress = document.progress / 100
         job.payload = {**(await refresh_payload()), "document_parser": state}
+        await session.commit()
+
+    async def _advance_canonical_stage(
+        stage_name: str,
+        min_progress: int,
+        doc_status: DocumentStatus | None = None,
+    ) -> None:
+        await session.refresh(document)
+        if document.status in _CONTROL_TRANSITION_STATES:
+            return
+        if doc_status is not None and document.status in (
+            DocumentStatus.PENDING,
+            DocumentStatus.LOADING,
+            DocumentStatus.EXTRACTING,
+        ):
+            document.status = doc_status
+        document.progress = max(int(document.progress or 0), min_progress)
+        job.progress = document.progress / 100
+        if run_id:
+            ing_run_row = await session.get(IngestionRun, run_id)
+            if ing_run_row is not None:
+                ing_run_row.current_stage = stage_name
         await session.commit()
 
     async def on_checkpoint(value: ProcessCheckpoint) -> None:
@@ -367,14 +389,22 @@ async def _process_document_unlocked(
         if paused.rowcount != 1:
             await _yield_after_document_transition_lost(session, document)
         await session.commit()
+        await session.refresh(document)
         raise JobPaused()
 
     try:
         prepared = None
         parser_stage = False
         target_storage_path = (job.payload or {}).get("storage_path") or document.storage_path
-        if not checkpoint.chunk_ids:
+        canonical_checkpoint = str((job.payload or {}).get("canonical_checkpoint_stage") or "").upper()
+        skip_initial_prepare = bool(
+            run_id
+            and not settings.document_event_extraction_enabled
+            and canonical_checkpoint in ("PARSE", "DEDUP_TEMPORAL")
+        )
+        if not checkpoint.chunk_ids and not skip_initial_prepare:
             parser_stage = True
+            await _advance_canonical_stage("PARSE", 25, DocumentStatus.LOADING)
             try:
                 prepared = await prepare_document(
                     target_storage_path,
@@ -413,95 +443,127 @@ async def _process_document_unlocked(
                     raise RuntimeError(
                         f"DocumentVersion {ing_run.document_version_id} not found for IngestionRun {run_id} (fail-closed)"
                     )
-                if True:
-                        # [P2 Fix]: Safe prepared document resolution on resume to prevent raw binary UTF-8 decoding
-                        if prepared is None:
-                            try:
-                                prepared = await prepare_document(
-                                    target_storage_path,
-                                    settings,
-                                    state=(job.payload or {}).get("document_parser"),
-                                    on_state=on_parser_state,
-                                    should_pause=should_pause,
-                                )
-                            except ParsePaused:
-                                await _pause_or_yield()
 
-                        if prepared is None or not prepared.path or not os.path.exists(prepared.path):
-                            raise RuntimeError(f"Prepared markdown path missing for document {document.id}")
+                # 2A: Parse & Persist Canonical Blocks (35%)
+                if canonical_checkpoint not in ("PARSE", "DEDUP_TEMPORAL"):
+                    if await should_pause():
+                        await _pause_or_yield()
+                    current_pipeline_stage = "PARSE"
+                    await _advance_canonical_stage("PARSE", 35, DocumentStatus.LOADING)
+                    # [P2 Fix]: Safe prepared document resolution on resume to prevent raw binary UTF-8 decoding
+                    if prepared is None:
+                        try:
+                            prepared = await prepare_document(
+                                target_storage_path,
+                                settings,
+                                state=(job.payload or {}).get("document_parser"),
+                                on_state=on_parser_state,
+                                should_pause=should_pause,
+                            )
+                        except ParsePaused:
+                            await _pause_or_yield()
 
-                        with open(prepared.path, "r", encoding="utf-8", errors="replace") as f:
-                            doc_content = f.read()
+                    if prepared is None or not prepared.path or not os.path.exists(prepared.path):
+                        raise RuntimeError(f"Prepared markdown path missing for document {document.id}")
 
-                        # 2A: Parse & Persist Canonical Blocks
-                        current_pipeline_stage = "PARSE"
-                        from sag_api.services.canonical_service import parse_and_persist_document_content
-                        await parse_and_persist_document_content(
-                            session, doc_ver.id, doc_content, run_id=run_id
-                        )
+                    with open(prepared.path, "r", encoding="utf-8", errors="replace") as f:
+                        doc_content = f.read()
 
-                        # 2B: Dedup & Temporal Lineage
-                        current_pipeline_stage = "DEDUP"
-                        from sag_api.services.dedup_and_temporal_service import run_dedup_and_temporal_stage
-                        await run_dedup_and_temporal_stage(
+                    from sag_api.services.canonical_service import parse_and_persist_document_content
+                    await parse_and_persist_document_content(
+                        session, doc_ver.id, doc_content, run_id=run_id
+                    )
+                    job.payload = {
+                        **(await refresh_payload()),
+                        "canonical_checkpoint_stage": "PARSE",
+                    }
+                    await session.commit()
+
+                # 2B: Dedup & Temporal Lineage (65%)
+                if canonical_checkpoint != "DEDUP_TEMPORAL":
+                    if await should_pause():
+                        await _pause_or_yield()
+                    current_pipeline_stage = "DEDUP"
+                    await _advance_canonical_stage("DEDUP_TEMPORAL", 65, DocumentStatus.EXTRACTING)
+                    ing_run = await session.get(IngestionRun, run_id) or ing_run
+                    doc_ver = await session.get(DocumentVersion, ing_run.document_version_id) or doc_ver
+                    from sag_api.services.dedup_and_temporal_service import run_dedup_and_temporal_stage
+                    await run_dedup_and_temporal_stage(
+                        session,
+                        document_version=doc_ver,
+                        document_id=document.id,
+                        project_id=ing_run.project_id,
+                        run_id=run_id,
+                    )
+                    job.payload = {
+                        **(await refresh_payload()),
+                        "canonical_checkpoint_stage": "DEDUP_TEMPORAL",
+                    }
+                    await session.commit()
+
+                # 2C: Embed & Search Index Units into Qdrant (85%)
+                if await should_pause():
+                    await _pause_or_yield()
+                await _advance_canonical_stage("INDEX_SEARCH", 85, DocumentStatus.EXTRACTING)
+                ing_run = await session.get(IngestionRun, run_id) or ing_run
+                doc_ver = await session.get(DocumentVersion, ing_run.document_version_id) or doc_ver
+
+                # [P1 Fix]: Fail-closed on missing security_partition_id
+                sec_partition = (doc_ver.metadata_json or {}).get("security_partition_id")
+                if not sec_partition or not str(sec_partition).strip():
+                    raise ValueError(f"Missing security_partition_id for document_version {doc_ver.id} (fail-closed)")
+
+                # [P1 Fix]: Worker passes real Qdrant client and Embedder to search index stage
+                current_pipeline_stage = "EMBED"
+                embedder = None
+                try:
+                    embedder = await engine_manager.get_sag_embedding(source.sag_source_config_id, source)
+                except Exception as emb_exc:
+                    log.warning("Could not get sag embedding client: %s", sanitize_error_message(emb_exc))
+
+                current_pipeline_stage = "INDEX"
+                from sag_api.services.search_index_service import run_search_indexing_stage
+                shared_qdrant_client = None
+                if engine_manager is not None and hasattr(engine_manager, "get_search_unit_qdrant_client"):
+                    try:
+                        shared_qdrant_client = await engine_manager.get_search_unit_qdrant_client()
+                    except Exception:
+                        shared_qdrant_client = None
+                if shared_qdrant_client is not None:
+                    search_units = await run_search_indexing_stage(
+                        session,
+                        project_id=ing_run.project_id,
+                        document_version=doc_ver,
+                        security_partition_id=sec_partition,
+                        tenant_id=ing_run.tenant_id,
+                        qdrant_client=shared_qdrant_client,
+                        embedder=embedder,
+                        run_id=run_id,
+                    )
+                else:
+                    qdrant_url = getattr(settings, "sag_qdrant_url", "http://localhost:6333").rstrip("/")
+                    qdrant_headers = {}
+                    if getattr(settings, "sag_qdrant_api_key", None):
+                        qdrant_headers["api-key"] = settings.sag_qdrant_api_key
+                    async with httpx.AsyncClient(base_url=qdrant_url, headers=qdrant_headers, timeout=30.0) as qdrant_client:
+                        search_units = await run_search_indexing_stage(
                             session,
-                            document_version=doc_ver,
-                            document_id=document.id,
                             project_id=ing_run.project_id,
+                            document_version=doc_ver,
+                            security_partition_id=sec_partition,
+                            tenant_id=ing_run.tenant_id,
+                            qdrant_client=qdrant_client,
+                            embedder=embedder,
                             run_id=run_id,
                         )
-
-                        # [P1 Fix]: Fail-closed on missing security_partition_id
-                        sec_partition = (doc_ver.metadata_json or {}).get("security_partition_id")
-                        if not sec_partition or not str(sec_partition).strip():
-                            raise ValueError(f"Missing security_partition_id for document_version {doc_ver.id} (fail-closed)")
-
-                        # [P1 Fix]: Worker passes real Qdrant client and Embedder to search index stage
-                        current_pipeline_stage = "EMBED"
-                        embedder = None
-                        try:
-                            embedder = await engine_manager.get_sag_embedding(source.sag_source_config_id, source)
-                        except Exception as emb_exc:
-                            log.warning("Could not get sag embedding client: %s", sanitize_error_message(emb_exc))
-
-                        current_pipeline_stage = "INDEX"
-                        from sag_api.services.search_index_service import run_search_indexing_stage
-                        shared_qdrant_client = None
-                        if engine_manager is not None and hasattr(engine_manager, "get_search_unit_qdrant_client"):
-                            try:
-                                shared_qdrant_client = await engine_manager.get_search_unit_qdrant_client()
-                            except Exception:
-                                shared_qdrant_client = None
-                        if shared_qdrant_client is not None:
-                            search_units = await run_search_indexing_stage(
-                                session,
-                                project_id=ing_run.project_id,
-                                document_version=doc_ver,
-                                security_partition_id=sec_partition,
-                                tenant_id=ing_run.tenant_id,
-                                qdrant_client=shared_qdrant_client,
-                                embedder=embedder,
-                                run_id=run_id,
-                            )
-                        else:
-                            qdrant_url = getattr(settings, "sag_qdrant_url", "http://localhost:6333").rstrip("/")
-                            qdrant_headers = {}
-                            if getattr(settings, "sag_qdrant_api_key", None):
-                                qdrant_headers["api-key"] = settings.sag_qdrant_api_key
-                            async with httpx.AsyncClient(base_url=qdrant_url, headers=qdrant_headers, timeout=30.0) as qdrant_client:
-                                search_units = await run_search_indexing_stage(
-                                    session,
-                                    project_id=ing_run.project_id,
-                                    document_version=doc_ver,
-                                    security_partition_id=sec_partition,
-                                    tenant_id=ing_run.tenant_id,
-                                    qdrant_client=qdrant_client,
-                                    embedder=embedder,
-                                    run_id=run_id,
-                                )
-                        await session.commit()
-            except (JobPaused, JobYielded, ParsePaused):
+                next_payload = await refresh_payload()
+                next_payload.pop("canonical_checkpoint_stage", None)
+                job.payload = next_payload
+                await session.commit()
+            except ParsePaused:
                 await _pause_or_yield()
+            except (JobPaused, JobYielded):
+                raise
             except Exception as pipe_err:
                 pipe_err_str = sanitize_error_message(pipe_err)
                 log.error("Canonical pipeline failed run_id=%s stage=%s error_type=%s cause_type=%s retryable=%s",
@@ -697,6 +759,32 @@ async def _process_document_unlocked(
         document.status = DocumentStatus.PAUSED
         await session.commit()
         raise JobPaused()
+    effective_token_usage = int(outcome.token_usage or 0)
+    if run_id and "doc_ver" in locals() and doc_ver is not None:
+        from sag_api.core.token_usage import TokenLedger, sync_document_token_usage
+
+        if effective_token_usage > 0:
+            legacy_ledger = TokenLedger()
+            legacy_ledger.record_event(
+                component="legacy_event_extraction",
+                model=getattr(settings, "llm_model", None),
+                delta={
+                    "llm_input_tokens": effective_token_usage,
+                    "total_tokens": effective_token_usage,
+                    "llm_calls": 1,
+                },
+            )
+            ver_obj = await session.get(DocumentVersion, doc_ver.id)
+            if ver_obj is not None:
+                ver_obj.metadata_json = {
+                    **(ver_obj.metadata_json or {}),
+                    "legacy_extraction_token_usage": legacy_ledger.to_summary(),
+                }
+                session.add(ver_obj)
+                await session.flush()
+        synced_usage = await sync_document_token_usage(session, doc_ver.id)
+        effective_token_usage = max(effective_token_usage, int(synced_usage["totals"]["total_tokens"]))
+
     completed = await session.execute(
         update(Document)
         .where(
@@ -715,7 +803,7 @@ async def _process_document_unlocked(
             event_count=outcome.event_count,
             sag_source_id=outcome.source_id,
             progress=100,
-            token_usage=outcome.token_usage,
+            token_usage=effective_token_usage,
             error=None,
             error_layer=None,
             error_stage=None,
@@ -755,6 +843,7 @@ async def _process_document_unlocked(
                 # knowledge_status duy trì độc lập theo hợp đồng Phase 0 (chỉ chuyển khi tree/graph hoàn tất)
                 # The independent producer owns knowledge_status, including DATA_READY/QUEUED.
     await session.commit()
+    await session.refresh(document)
     await _finalize_research_task_for_run(session, run_id)
     log.info(
         "Xử lý tài liệu hoàn thành doc=%s parser=%s cached=%s chunks=%d events=%d tokens=%d",
@@ -1107,9 +1196,9 @@ async def rebuild_universe_tree(
 
     results = []
     for index, project_id in enumerate(project_ids):
-        from sqlalchemy import select
+        from sqlalchemy import and_, or_, select
 
-        from sag_api.db.models import KnowledgeJob
+        from sag_api.db.models import KnowledgeJob, KnowledgeUnit
 
         ingesting = await session.scalar(select(Job.id).join(Document, Document.id == Job.document_id).where(
             Document.project_id == project_id, Document.tenant_id == tenant_id,
@@ -1131,13 +1220,21 @@ async def rebuild_universe_tree(
         ).limit(1))
         if undiscovered:
             raise JobDeferred()
-        pending = await session.scalar(select(KnowledgeJob.id)
+        pending = await session.scalar(
+            select(KnowledgeJob.id)
             .join(DocumentVersion, DocumentVersion.id == KnowledgeJob.document_version_id)
             .join(Document, Document.id == DocumentVersion.document_id)
-            .where(Document.project_id == project_id, Document.tenant_id == tenant_id,
-                   Document.is_active.is_(True), DocumentVersion.valid_from <= now, DocumentVersion.valid_to > now,
-                   KnowledgeJob.kind == "FOUNDATION", KnowledgeJob.status.in_(("QUEUED", "RUNNING", "RETRY")))
-            .limit(1))
+            .where(
+                Document.project_id == project_id,
+                Document.tenant_id == tenant_id,
+                Document.is_active.is_(True),
+                DocumentVersion.valid_from <= now,
+                DocumentVersion.valid_to > now,
+                KnowledgeJob.kind == "FOUNDATION",
+                KnowledgeJob.status.in_(("QUEUED", "RUNNING", "RETRY")),
+            )
+            .limit(1)
+        )
         if pending:
             raise JobDeferred()
         try:

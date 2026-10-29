@@ -39,6 +39,7 @@ class Document(IDMixin, TimestampMixin, Base):
     event_count: Mapped[int] = mapped_column(Integer, default=0)
     progress: Mapped[int] = mapped_column(Integer, default=0)
     token_usage: Mapped[int] = mapped_column(BigInteger, default=0)
+    token_usage_breakdown: Mapped[dict | None] = mapped_column("token_usage_json", JSON, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Failure attribution: responsibility layer (api/engine/llm/store) and pipeline stage (parse/chunk/extract/...),
     # facilitating debugging directly from export logs. Populated only when status=failed.

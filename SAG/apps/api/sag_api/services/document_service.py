@@ -31,6 +31,8 @@ from sag_api.db.models.routing_rag import (
     IngestionRun,
     SourceSnapshot,
     StageRun,
+    CanonicalBlock,
+    SearchUnit,
     UploadIdempotencyKey,
 )
 from sag_api.enums import ConnectorKind, DocumentStatus, JobStatus, JobType, SourceType
@@ -39,6 +41,8 @@ from sag_api.jobs.scheduling import DELETE_PRIORITY, RESUME_PRIORITY, set_schedu
 from sag_api.schemas.routing_rag import (
     DocumentRevokeResponse,
     DocumentUploadResponse,
+    DocumentExtractedChunkItem,
+    DocumentVersionChunksResponse,
     DocumentVersionStatusResponse,
     StageProgressItem,
 )
@@ -257,11 +261,15 @@ async def reprocess_document(
             if value
         }
 
+    has_legacy_checkpoint = bool(
+        latest is not None and isinstance(latest.payload, dict) and latest.payload.get("process_checkpoint")
+    )
     values: dict = {
         "status": DocumentStatus.PENDING,
         "error": None,
         "error_layer": None,
         "error_stage": None,
+        **({} if restart_from_scratch or has_legacy_checkpoint else {"progress": 0}),
     }
     if restart_from_scratch:
         values.update(
@@ -304,6 +312,7 @@ async def reprocess_document(
     payload = dict(latest.payload or {}) if latest is not None and not restart_from_scratch else {}
     payload.pop("pause_requested", None)
     payload.pop("resume_requested", None)
+    payload.pop("canonical_checkpoint_stage", None)
     if restart_from_scratch:
         payload = set_scheduler(
             {
@@ -616,7 +625,10 @@ async def resume_document(
         priority=RESUME_PRIORITY,
         blocked_reason=None,
     )
-    resumed_status = DocumentStatus.EXTRACTING if payload.get("process_checkpoint") else DocumentStatus.PENDING
+    has_resumable_checkpoint = bool(
+        payload.get("process_checkpoint") or payload.get("canonical_checkpoint_stage")
+    )
+    resumed_status = DocumentStatus.EXTRACTING if has_resumable_checkpoint else DocumentStatus.PENDING
     if not await _commit_document_job_transition(
         session,
         document,
@@ -1489,7 +1501,28 @@ async def get_document_version_status(
             }
 
     doc_status_str = doc.status.value if hasattr(doc.status, "value") else str(doc.status)
-    computed_progress = 100 if doc.status == DocumentStatus.READY else int(doc.progress or 0)
+    is_reprocessing = (
+        doc.status in (DocumentStatus.PENDING, DocumentStatus.LOADING, DocumentStatus.EXTRACTING)
+        and latest_run is not None
+        and latest_run.status == "SUCCEEDED"
+    )
+    raw_progress = int(doc.progress or 0)
+    if doc.status == DocumentStatus.READY:
+        computed_progress = 100
+    elif (
+        raw_progress == 0
+        and doc.status in (DocumentStatus.PENDING, DocumentStatus.LOADING)
+        and (
+            is_reprocessing
+            or (
+                latest_run is not None
+                and latest_run.status in ("QUEUED", "PENDING_DISPATCH", "RUNNING")
+            )
+        )
+    ):
+        computed_progress = 5
+    else:
+        computed_progress = raw_progress
     if err_info is None and doc.error:
         err_info = {
             "layer": doc.error_layer or "API",
@@ -1497,6 +1530,17 @@ async def get_document_version_status(
             "code": f"{doc.error_layer or 'API'}_{doc.error_stage or 'INGEST'}_FAILED",
             "message": doc.error,
         }
+    effective_status = doc_ver.status
+    effective_search_status = doc_ver.search_status
+    effective_search_ready = (
+        doc_ver.search_status == "SEARCH_READY" and doc_ver.search_ready_at is not None
+    )
+    if is_reprocessing:
+        current_stage = "RECEIVE"
+        effective_status = "RECEIVED"
+        effective_search_status = "PENDING"
+        effective_search_ready = False
+        stage_progress = {}
     if doc.status in (DocumentStatus.PAUSED, DocumentStatus.PAUSING) and current_stage not in (
         "PAUSED",
         "PAUSING",
@@ -1506,10 +1550,10 @@ async def get_document_version_status(
     return DocumentVersionStatusResponse(
         document_id=doc_ver.document_id,
         version_no=doc_ver.version_no,
-        status=doc_ver.status,
-        search_status=doc_ver.search_status,
+        status=effective_status,
+        search_status=effective_search_status,
         knowledge_status=doc_ver.knowledge_status,
-        search_ready=(doc_ver.search_status == "SEARCH_READY" and doc_ver.search_ready_at is not None),
+        search_ready=effective_search_ready,
         knowledge_ready=(doc_ver.knowledge_status in ("KNOWLEDGE_READY", "READY")),
         current_stage=current_stage,
         stage_progress=stage_progress,
@@ -1521,6 +1565,181 @@ async def get_document_version_status(
         chunk_count=int(doc.chunk_count or 0),
         event_count=int(doc.event_count or 0),
         token_usage=int(doc.token_usage or 0),
+    )
+
+
+def _dominant_block_type(block_types: list[str]) -> str:
+    if not block_types:
+        return "paragraph"
+    if "table" in block_types:
+        return "table"
+    if "code" in block_types:
+        return "code"
+    if all(t == "heading" for t in block_types):
+        return "heading"
+    for t in block_types:
+        if t and t != "heading":
+            return t
+    return block_types[0] or "paragraph"
+
+
+async def get_document_version_chunks(
+    session: AsyncSession,
+    *,
+    project_id: str,
+    document_id: str,
+    version_no: int,
+    principal: VerifiedPrincipal | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> DocumentVersionChunksResponse:
+    """Retrieve ordered extracted chunks (SearchUnits or CanonicalBlocks) for a document version."""
+    stmt = (
+        select(DocumentVersion, Document)
+        .join(Document, Document.id == DocumentVersion.document_id)
+        .where(
+            Document.project_id == project_id,
+            DocumentVersion.document_id == document_id,
+            DocumentVersion.version_no == version_no,
+        )
+    )
+    result = (await session.execute(stmt)).first()
+    if not result:
+        raise NotFoundError(
+            f"Document version {document_id}/v{version_no} not found in project {project_id}"
+        )
+    doc_ver, doc = result
+
+    if principal is not None:
+        if not principal.is_service:
+            if doc.tenant_id != principal.tenant_id:
+                raise ForbiddenError(
+                    f"Principal '{principal.user_id}' belongs to tenant '{principal.tenant_id}' "
+                    f"but document belongs to tenant '{doc.tenant_id}'"
+                )
+            partition = (doc_ver.metadata_json or {}).get("security_partition_id")
+            if not partition or not principal.has_partition_access(partition):
+                raise ForbiddenError(
+                    f"Principal '{principal.user_id}' is not authorized to access security partition "
+                    f"'{partition or 'NONE'}'"
+                )
+
+    if doc_ver.status == "REVOKED" or doc.status == DocumentStatus.DELETING:
+        return DocumentVersionChunksResponse(
+            document_id=doc_ver.document_id,
+            version_no=doc_ver.version_no,
+            source_stage="EMPTY",
+            total_chunks=0,
+            total_tokens=0,
+            items=[],
+        )
+
+    blocks = list(
+        (
+            await session.scalars(
+                select(CanonicalBlock)
+                .where(CanonicalBlock.document_version_id == doc_ver.id)
+                .order_by(CanonicalBlock.ordinal.asc())
+            )
+        ).all()
+    )
+    if not blocks:
+        return DocumentVersionChunksResponse(
+            document_id=doc_ver.document_id,
+            version_no=doc_ver.version_no,
+            source_stage="EMPTY",
+            total_chunks=0,
+            total_tokens=0,
+            items=[],
+        )
+
+    units = list(
+        (
+            await session.scalars(
+                select(SearchUnit).where(SearchUnit.document_version_id == doc_ver.id)
+            )
+        ).all()
+    )
+
+    safe_offset = max(0, int(offset))
+    safe_limit = max(1, min(200, int(limit)))
+
+    if units:
+        block_index_by_id = {b.id: idx for idx, b in enumerate(blocks)}
+        units.sort(
+            key=lambda u: (
+                block_index_by_id.get(u.block_from_id, 0),
+                int(u.page_from or 0),
+                str(u.id),
+            )
+        )
+        extracted_items: list[DocumentExtractedChunkItem] = []
+        total_tokens = 0
+        for unit in units:
+            start_idx = block_index_by_id.get(unit.block_from_id, 0)
+            end_idx = block_index_by_id.get(unit.block_to_id, start_idx)
+            if end_idx < start_idx:
+                start_idx, end_idx = end_idx, start_idx
+            unit_blocks = blocks[start_idx : end_idx + 1]
+            combined_text = "\n\n".join(
+                b.normalized_text.strip()
+                for b in unit_blocks
+                if b.normalized_text and b.normalized_text.strip()
+            ).strip()
+            if not combined_text:
+                continue
+            tok = int(unit.token_count or 0)
+            total_tokens += tok
+            ordinal = len(extracted_items) + 1
+            extracted_items.append(
+                DocumentExtractedChunkItem(
+                    chunk_id=str(unit.id),
+                    ordinal=ordinal,
+                    section_path=(unit.section_path or "").strip(),
+                    block_type=_dominant_block_type([b.block_type for b in unit_blocks]),
+                    page_from=int(unit.page_from or 1),
+                    page_to=int(unit.page_to or unit.page_from or 1),
+                    token_count=tok,
+                    content=combined_text,
+                )
+            )
+        return DocumentVersionChunksResponse(
+            document_id=doc_ver.document_id,
+            version_no=doc_ver.version_no,
+            source_stage="SEARCH_UNITS" if extracted_items else "EMPTY",
+            total_chunks=len(extracted_items),
+            total_tokens=total_tokens,
+            items=extracted_items[safe_offset : safe_offset + safe_limit],
+        )
+
+    block_items: list[DocumentExtractedChunkItem] = []
+    total_tokens = 0
+    for block in blocks:
+        content = (block.normalized_text or "").strip()
+        if not content:
+            continue
+        est_tokens = max(1, len(content.split()))
+        total_tokens += est_tokens
+        ordinal = len(block_items) + 1
+        block_items.append(
+            DocumentExtractedChunkItem(
+                chunk_id=str(block.id),
+                ordinal=ordinal,
+                section_path=(block.section_path or "").strip(),
+                block_type=(block.block_type or "paragraph").strip(),
+                page_from=int(block.page_from or 1),
+                page_to=int(block.page_to or block.page_from or 1),
+                token_count=est_tokens,
+                content=content,
+            )
+        )
+    return DocumentVersionChunksResponse(
+        document_id=doc_ver.document_id,
+        version_no=doc_ver.version_no,
+        source_stage="CANONICAL_BLOCKS" if block_items else "EMPTY",
+        total_chunks=len(block_items),
+        total_tokens=total_tokens,
+        items=block_items[safe_offset : safe_offset + safe_limit],
     )
 
 

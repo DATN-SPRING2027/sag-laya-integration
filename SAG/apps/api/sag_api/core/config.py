@@ -103,12 +103,8 @@ class Settings(BaseSettings):
     knowledge_foundation_timeout_seconds: float | None = Field(default=None, gt=0)
     knowledge_concurrency: int = Field(default=4, ge=1, le=16)
     knowledge_queue_capacity: int = Field(default=256, ge=1, le=10000)
-    # Optional per-project E2 reservation cap per UTC day; 0 = observe without limiting.
-    knowledge_daily_tokens: int = Field(default=0, ge=0)
-    # Optional independent OpenAI-compatible E2 endpoint; empty = E0/E1 only.
-    knowledge_e2_url: str = ""
-    knowledge_e2_api_key: str = ""
-    knowledge_e2_model: str = ""
+    # Phase 5 runs FOUNDATION (deterministic E0/E1 + DenseGraph) exclusively; E2 LLM enrichment
+    # was removed based on 81-file RetrievalCI A/B benchmark evidence (docs/adr-remove-e2-llm-enrichment.md).
     document_extract_concurrency: int = Field(default=6, ge=1, le=50)  # 单文档 chunk 抽取并发
     document_event_extraction_enabled: bool = False
     document_chunk_max_tokens: int = Field(default=1_000, ge=100, le=100_000)
