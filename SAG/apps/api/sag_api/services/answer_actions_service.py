@@ -11,7 +11,9 @@ import re
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import and_, case, delete, func, or_, select, update
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,8 +22,18 @@ from sag_api.core.config import settings
 from sag_api.core.error_taxonomy import ErrorCode
 from sag_api.core.errors import BadRequestError, ConflictError, ForbiddenError, NotFoundError
 from sag_api.core.principal_assertion import VerifiedPrincipal
-from sag_api.db.models import Agent, AnswerFeedback, AnswerShare, Message, Thread
-from sag_api.enums import MessageRole, MessageStatus
+from sag_api.db.base import new_id
+from sag_api.db.models import (
+    Agent,
+    AnswerFeedback,
+    AnswerShare,
+    Document,
+    DocumentVersion,
+    Message,
+    SearchUnit,
+    Thread,
+)
+from sag_api.enums import DocumentStatus, MessageRole, MessageStatus
 from sag_api.schemas.answer_actions import (
     AdminFeedbackPageOut,
     AdminFeedbackRowOut,
@@ -51,7 +63,7 @@ from sag_api.services.session_context import (
     IncrementalSessionIndex,
     build_ecce_context_pack,
 )
-from sag_api.services.source_service import get_authorized_source_ids
+from sag_api.services.source_service import get_authorized_source_ids, versioned_source_ids
 
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}\Z")
 _ADMIN_CURSOR_MAX_LENGTH = 1024
@@ -130,6 +142,211 @@ def _sanitize_public_citations(raw_citations: Any) -> list[dict[str, Any]]:
     return sanitized
 
 
+def _is_document_version_usable(
+    ver: DocumentVersion,
+    *,
+    doc: Document,
+    allowed_partitions: frozenset[str],
+) -> bool:
+    if (
+        ver.status == "REVOKED"
+        or ver.search_status == "REVOKED"
+        or ver.knowledge_status == "REVOKED"
+    ):
+        return False
+    meta = ver.metadata_json if isinstance(ver.metadata_json, dict) else {}
+    if meta.get("revoked_at"):
+        return False
+    sec_partition = meta.get("security_partition_id")
+    if doc.project_id is not None:
+        if not isinstance(sec_partition, str) or not sec_partition.strip():
+            return False
+        if allowed_partitions and sec_partition not in allowed_partitions:
+            return False
+    elif sec_partition is not None and allowed_partitions and sec_partition not in allowed_partitions:
+        return False
+    return True
+
+
+async def _verify_evidence_document_provenance(
+    session: AsyncSession,
+    *,
+    message: Message,
+    principal: VerifiedPrincipal,
+    authorized_source_ids: set[str],
+    extra_citations: Any = None,
+) -> bool:
+    """Verify every internal cited/matched Document and DocumentVersion is active, unrevoked, and in scope."""
+    tenant_id = (principal.tenant_id or principal.organization_id or "").strip()
+    allowed_projects = principal.allowed_project_ids
+    allowed_partitions = principal.allowed_partition_ids
+    if not tenant_id or not allowed_projects:
+        return False
+
+    evidence_items: list[Any] = []
+    if message.citations is not None:
+        if not isinstance(message.citations, list):
+            return False
+        evidence_items.extend(message.citations)
+    if extra_citations is not None:
+        if not isinstance(extra_citations, list):
+            return False
+        evidence_items.extend(extra_citations)
+
+    steps = getattr(message, "steps", None)
+    if steps is not None:
+        if not isinstance(steps, list):
+            return False
+        for step in steps:
+            if not isinstance(step, dict):
+                return False
+            details = step.get("details")
+            if isinstance(details, dict) and isinstance(details.get("matches"), list):
+                evidence_items.extend(details["matches"])
+
+    if not evidence_items:
+        return True
+
+    unversioned_source_refs: set[str] = set()
+    checked_pairs: set[tuple[str, str, str, int | None]] = set()
+
+    for item in evidence_items:
+        if not isinstance(item, dict):
+            return False
+        src_id = str(item["source_id"]).strip() if item.get("source_id") else ""
+        doc_id = str(item["document_id"]).strip() if item.get("document_id") else ""
+        ver_id = str(item["document_version_id"]).strip() if item.get("document_version_id") else ""
+        chunk_id = str(item["chunk_id"]).strip() if item.get("chunk_id") else ""
+        raw_ver_no = item.get("version_no")
+        ver_no = (
+            int(raw_ver_no)
+            if isinstance(raw_ver_no, int) and not isinstance(raw_ver_no, bool)
+            else None
+        )
+
+        if (
+            item.get("kind") == "external"
+            and not src_id
+            and not doc_id
+            and not ver_id
+            and not chunk_id
+        ):
+            continue
+
+        if src_id and src_id not in authorized_source_ids:
+            return False
+
+        if not doc_id and not ver_id and chunk_id:
+            unit = await session.get(SearchUnit, chunk_id)
+            if unit is not None:
+                ver_id = str(unit.document_version_id)
+
+        if not doc_id and not ver_id:
+            if src_id:
+                unversioned_source_refs.add(src_id)
+                continue
+            return False
+
+        pair_key = (src_id, doc_id, ver_id, ver_no)
+        if pair_key in checked_pairs:
+            continue
+        checked_pairs.add(pair_key)
+
+        ver: DocumentVersion | None = None
+        if ver_id:
+            ver = await session.get(DocumentVersion, ver_id)
+            if ver is None:
+                return False
+            if doc_id and ver.document_id != doc_id:
+                return False
+            if ver_no is not None and ver.version_no != ver_no:
+                return False
+            resolved_doc_id = ver.document_id
+        else:
+            resolved_doc_id = doc_id
+
+        doc = await session.get(Document, resolved_doc_id)
+        if doc is None and not ver_id and doc_id:
+            doc = await session.scalar(
+                select(Document)
+                .where(
+                    Document.tenant_id == tenant_id,
+                    Document.project_id.in_(allowed_projects),
+                    Document.logical_source_id == doc_id,
+                )
+                .limit(1)
+            )
+        if doc is None:
+            return False
+
+        if not doc.is_active or doc.status in (DocumentStatus.DELETING, DocumentStatus.DELETE_FAILED):
+            return False
+        if src_id and doc.source_id != src_id:
+            return False
+        if doc.source_id and doc.source_id not in authorized_source_ids:
+            return False
+
+        if doc.project_id is not None:
+            if doc.tenant_id != tenant_id or doc.project_id not in allowed_projects:
+                return False
+        else:
+            if not doc.source_id or doc.source_id not in authorized_source_ids:
+                return False
+            if doc.tenant_id not in (tenant_id, "tenant_continuum_default"):
+                return False
+
+        if ver is not None:
+            if not _is_document_version_usable(ver, doc=doc, allowed_partitions=allowed_partitions):
+                return False
+        elif ver_no is not None:
+            ver_by_no = await session.scalar(
+                select(DocumentVersion).where(
+                    DocumentVersion.document_id == doc.id,
+                    DocumentVersion.version_no == ver_no,
+                )
+            )
+            if ver_by_no is None or not _is_document_version_usable(
+                ver_by_no, doc=doc, allowed_partitions=allowed_partitions
+            ):
+                return False
+        else:
+            versions = list(
+                (
+                    await session.scalars(
+                        select(DocumentVersion).where(DocumentVersion.document_id == doc.id)
+                    )
+                ).all()
+            )
+            if doc.project_id is not None and not versions:
+                return False
+            if any(
+                not _is_document_version_usable(v, doc=doc, allowed_partitions=allowed_partitions)
+                for v in versions
+            ):
+                return False
+
+    if unversioned_source_refs:
+        # Sources carrying versioned documents require explicit document/version provenance.
+        versioned = await versioned_source_ids(session, sorted(unversioned_source_refs))
+        if unversioned_source_refs & versioned:
+            return False
+        for legacy_src_id in sorted(unversioned_source_refs):
+            docs_for_src = list(
+                (
+                    await session.scalars(
+                        select(Document).where(Document.source_id == legacy_src_id)
+                    )
+                ).all()
+            )
+            if docs_for_src and not all(
+                d.is_active and d.status not in (DocumentStatus.DELETING, DocumentStatus.DELETE_FAILED)
+                for d in docs_for_src
+            ):
+                return False
+
+    return True
+
+
 async def _ensure_authorized_assistant_message(
     session: AsyncSession,
     *,
@@ -157,6 +374,7 @@ async def _ensure_authorized_assistant_message(
     source_ids = _message_source_ids(message)
     if source_ids is None:
         raise NotFoundError("Message not found")
+    authorized: set[str] = set()
     if source_ids:
         authorized = await get_authorized_source_ids(
             session,
@@ -165,6 +383,13 @@ async def _ensure_authorized_assistant_message(
         )
         if not source_ids.issubset(authorized):
             raise NotFoundError("Message not found")
+    if not await _verify_evidence_document_provenance(
+        session,
+        message=message,
+        principal=principal,
+        authorized_source_ids=authorized,
+    ):
+        raise NotFoundError("Message not found")
     return thread, message, source_ids
 
 
@@ -194,7 +419,7 @@ async def resolve_parent_question(
         cursor_msg = prior
 
     # Legacy fallback: only succeed when the immediately preceding message in ordered thread history
-    # is unambiguously a single USER turn.
+    # is unambiguously a single USER turn with no consecutive unmatched USER turn before it.
     rows = await session.execute(
         select(Message)
         .where(
@@ -210,13 +435,28 @@ async def resolve_parent_question(
     preceding = list(rows.scalars().all())
     if not preceding or preceding[0].role != MessageRole.USER:
         raise BadRequestError("Cannot resolve an unambiguous parent question for this legacy answer")
+    if len(preceding) > 1 and preceding[1].role == MessageRole.USER:
+        raise BadRequestError("Ambiguous consecutive user questions precede this legacy answer")
     if (
         len(preceding) > 1
-        and preceding[1].role == MessageRole.USER
         and preceding[1].created_at == preceding[0].created_at
     ):
         raise BadRequestError("Ambiguous parent question timestamps for this legacy answer")
-    return preceding[0]
+
+    candidate_question = preceding[0]
+    claimed_by_other = await session.scalar(
+        select(Message.id)
+        .where(
+            Message.thread_id == thread_id,
+            Message.reply_to_message_id == candidate_question.id,
+            Message.id != cursor_msg.id,
+            Message.regenerated_from_message_id.is_(None),
+        )
+        .limit(1)
+    )
+    if claimed_by_other is not None:
+        raise BadRequestError("Candidate parent question is already bound to another answer")
+    return candidate_question
 
 
 # ── Feedback ──────────────────────────────────────────────────────────
@@ -238,9 +478,10 @@ async def get_own_feedback(
         owner_key=owner_key,
         principal=principal,
     )
+    target_message_id = str(message.id)
     row = await session.scalar(
         select(AnswerFeedback).where(
-            AnswerFeedback.message_id == message.id,
+            AnswerFeedback.message_id == target_message_id,
             AnswerFeedback.voter_subject == principal.subject,
         )
     )
@@ -266,6 +507,8 @@ async def upsert_own_feedback(
         owner_key=owner_key,
         principal=principal,
     )
+    target_message_id = str(message.id)
+    voter_subject = str(principal.subject)
     reason_category = payload.reason_category if payload.rating == "DISLIKE" else None
     reason_text = (
         payload.reason_text.strip()
@@ -274,58 +517,44 @@ async def upsert_own_feedback(
     )
     now = datetime.now(UTC)
 
-    existing = await session.scalar(
-        select(AnswerFeedback).where(
-            AnswerFeedback.message_id == message.id,
-            AnswerFeedback.voter_subject == principal.subject,
+    dialect = session.get_bind().dialect.name
+    insert_fn = postgresql_insert if dialect == "postgresql" else sqlite_insert
+    statement = (
+        insert_fn(AnswerFeedback)
+        .values(
+            id=new_id(),
+            message_id=target_message_id,
+            voter_subject=voter_subject,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            rating=payload.rating,
+            reason_category=reason_category,
+            reason_text=reason_text,
+            created_at=now,
+            updated_at=now,
         )
+        .on_conflict_do_update(
+            index_elements=[AnswerFeedback.message_id, AnswerFeedback.voter_subject],
+            set_={
+                "rating": payload.rating,
+                "reason_category": reason_category,
+                "reason_text": reason_text,
+                "tenant_id": tenant_id,
+                "project_id": project_id,
+                "updated_at": now,
+            },
+        )
+        .returning(AnswerFeedback)
+        .execution_options(populate_existing=True)
     )
-    if existing is not None:
-        existing.rating = payload.rating
-        existing.reason_category = reason_category
-        existing.reason_text = reason_text
-        existing.tenant_id = tenant_id
-        existing.project_id = project_id
-        existing.updated_at = now
-        await session.commit()
-        await session.refresh(existing)
-        return FeedbackOut.model_validate(existing)
-
-    created = AnswerFeedback(
-        message_id=message.id,
-        voter_subject=principal.subject,
-        tenant_id=tenant_id,
-        project_id=project_id,
-        rating=payload.rating,
-        reason_category=reason_category,
-        reason_text=reason_text,
-        created_at=now,
-        updated_at=now,
-    )
-    session.add(created)
     try:
+        row = (await session.scalars(statement)).one()
+        dto = FeedbackOut.model_validate(row)
         await session.commit()
-        await session.refresh(created)
-        return FeedbackOut.model_validate(created)
-    except IntegrityError:
+        return dto
+    except IntegrityError as error:
         await session.rollback()
-        winner = await session.scalar(
-            select(AnswerFeedback).where(
-                AnswerFeedback.message_id == message.id,
-                AnswerFeedback.voter_subject == principal.subject,
-            )
-        )
-        if winner is None:
-            raise
-        winner.rating = payload.rating
-        winner.reason_category = reason_category
-        winner.reason_text = reason_text
-        winner.tenant_id = tenant_id
-        winner.project_id = project_id
-        winner.updated_at = datetime.now(UTC)
-        await session.commit()
-        await session.refresh(winner)
-        return FeedbackOut.model_validate(winner)
+        raise NotFoundError("Message not found") from error
 
 
 async def delete_own_feedback(
@@ -346,15 +575,14 @@ async def delete_own_feedback(
         owner_key=owner_key,
         principal=principal,
     )
-    existing = await session.scalar(
-        select(AnswerFeedback).where(
-            AnswerFeedback.message_id == message.id,
-            AnswerFeedback.voter_subject == principal.subject,
+    target_message_id = str(message.id)
+    await session.execute(
+        delete(AnswerFeedback).where(
+            AnswerFeedback.message_id == target_message_id,
+            AnswerFeedback.voter_subject == str(principal.subject),
         )
     )
-    if existing is not None:
-        await session.delete(existing)
-        await session.commit()
+    await session.commit()
 
 
 # ── Shares ────────────────────────────────────────────────────────────
@@ -379,46 +607,60 @@ async def create_or_get_share(
     )
     question = await resolve_parent_question(session, thread_id=thread.id, answer_message=message)
 
-    existing = await session.scalar(
-        select(AnswerShare).where(
-            AnswerShare.creator_subject == principal.subject,
-            AnswerShare.message_id == message.id,
-            AnswerShare.revoked_at.is_(None),
-        )
-    )
-    if existing is not None:
-        if existing.tenant_id != tenant_id or existing.project_id != project_id:
-            raise NotFoundError("Message not found")
-        return ShareOut.model_validate(existing), False
+    creator_subject = str(principal.subject)
+    target_message_id = str(message.id)
+    question_id = str(question.id)
+    question_content = question.content or ""
+    answer_content = message.content or ""
+    sanitized_citations = _sanitize_public_citations(message.citations)
+    sorted_sources = sorted(source_ids)
 
-    share = AnswerShare(
-        creator_subject=principal.subject,
-        message_id=message.id,
-        question_id=question.id,
-        tenant_id=tenant_id,
-        project_id=project_id,
-        question_content=question.content or "",
-        answer_content=message.content or "",
-        citations=_sanitize_public_citations(message.citations),
-        source_ids=sorted(source_ids),
-    )
-    session.add(share)
-    try:
-        await session.commit()
-        await session.refresh(share)
-        return ShareOut.model_validate(share), True
-    except IntegrityError:
-        await session.rollback()
-        winner = await session.scalar(
+    for _ in range(3):
+        existing = await session.scalar(
             select(AnswerShare).where(
-                AnswerShare.creator_subject == principal.subject,
-                AnswerShare.message_id == message.id,
+                AnswerShare.creator_subject == creator_subject,
+                AnswerShare.message_id == target_message_id,
                 AnswerShare.revoked_at.is_(None),
             )
         )
-        if winner is None:
-            raise
-        return ShareOut.model_validate(winner), False
+        if existing is not None:
+            if existing.tenant_id != tenant_id or existing.project_id != project_id:
+                raise NotFoundError("Message not found")
+            return ShareOut.model_validate(existing), False
+
+        share = AnswerShare(
+            creator_subject=creator_subject,
+            message_id=target_message_id,
+            question_id=question_id,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            question_content=question_content,
+            answer_content=answer_content,
+            citations=sanitized_citations,
+            source_ids=sorted_sources,
+        )
+        session.add(share)
+        try:
+            await session.commit()
+            await session.refresh(share)
+            return ShareOut.model_validate(share), True
+        except IntegrityError:
+            await session.rollback()
+            if await session.get(Message, target_message_id) is None:
+                raise NotFoundError("Message not found") from None
+
+    winner = await session.scalar(
+        select(AnswerShare).where(
+            AnswerShare.creator_subject == creator_subject,
+            AnswerShare.message_id == target_message_id,
+            AnswerShare.revoked_at.is_(None),
+        )
+    )
+    if winner is None:
+        raise ConflictError("Share state changed concurrently; please retry")
+    if winner.tenant_id != tenant_id or winner.project_id != project_id:
+        raise NotFoundError("Message not found")
+    return ShareOut.model_validate(winner), False
 
 
 async def read_project_share(
@@ -452,6 +694,7 @@ async def read_project_share(
         or answer_msg.status != MessageStatus.OK
         or question_msg.role != MessageRole.USER
         or answer_msg.thread_id != question_msg.thread_id
+        or (answer_msg.content or "").strip() == HIDDEN_SCOPE_PLACEHOLDER
     ):
         raise NotFoundError("Shared answer not found")
 
@@ -462,6 +705,7 @@ async def read_project_share(
         str(sid) for sid in (share.source_ids or []) if isinstance(sid, str) and sid.strip()
     }
     required_sources = live_source_ids | stored_source_ids
+    authorized: set[str] = set()
     if required_sources:
         authorized = await get_authorized_source_ids(
             session,
@@ -470,6 +714,15 @@ async def read_project_share(
         )
         if not required_sources.issubset(authorized):
             raise NotFoundError("Shared answer not found")
+
+    if not await _verify_evidence_document_provenance(
+        session,
+        message=answer_msg,
+        principal=principal,
+        authorized_source_ids=authorized,
+        extra_citations=share.citations,
+    ):
+        raise NotFoundError("Shared answer not found")
 
     return SharedAnswerOut(
         share=ShareOut.model_validate(share),
@@ -506,8 +759,11 @@ async def revoke_project_share(
 
     if share.revoked_at is None:
         now = datetime.now(UTC)
-        share.revoked_at = now
-        share.updated_at = now
+        await session.execute(
+            update(AnswerShare)
+            .where(AnswerShare.id == share_id, AnswerShare.revoked_at.is_(None))
+            .values(revoked_at=now, updated_at=now)
+        )
         await session.commit()
 
 

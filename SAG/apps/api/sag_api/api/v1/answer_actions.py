@@ -12,7 +12,6 @@ from sag_api.core.principal_assertion import (
     VerifiedPrincipal,
     require_bff_service_token,
     require_project_bff_principal,
-    require_project_read_principal,
 )
 from sag_api.schemas.answer_actions import AdminFeedbackPageOut, SharedAnswerOut
 from sag_api.services import answer_actions_service as actions_svc
@@ -37,10 +36,9 @@ _ALLOWED_ADMIN_QUERY_KEYS = frozenset(
 
 
 async def require_project_share_principal(request: Request) -> VerifiedPrincipal:
-    """Authorize share read/revoke via either scoped BFF service headers or Continuum SAG session."""
-    if request.headers.getlist("X-SAG-BFF-Service-Token"):
-        return await require_project_bff_principal(request)
-    return await require_project_read_principal(request)
+    """Authorize share read/revoke strictly via BFF service authentication after live Project membership check."""
+    await require_bff_service_token(request)
+    return await require_project_bff_principal(request)
 
 
 @project_share_router.get("/{share_id}", response_model=SharedAnswerOut)

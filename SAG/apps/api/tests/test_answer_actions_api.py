@@ -40,13 +40,16 @@ from sag_api.db.base import Base
 from sag_api.db.models import (
     Agent,
     AnswerFeedback,
+    Document,
+    DocumentVersion,
     Message,
     Source,
     SourceProjectMapping,
     User,
 )
-from sag_api.enums import MessageRole, MessageStatus
+from sag_api.enums import DocumentStatus, MessageRole, MessageStatus
 from sag_api.services import answer_actions_service as actions_svc
+from sag_api.services.document_service import revoke_project_document
 from sag_api.tools import Tool, ToolContext, ToolMeta, ToolRegistry, ToolResult
 
 
@@ -244,6 +247,38 @@ async def action_env(monkeypatch: pytest.MonkeyPatch):
                     approval_ref="apr_1",
                 ),
             ]
+        )
+        await s.flush()
+        s.add(
+            Document(
+                id="doc_1",
+                tenant_id="org_alpha",
+                project_id="proj_alpha",
+                owner_id=u_owner,
+                logical_source_id="ls_spec_1",
+                source_id="src_proj_1",
+                filename="spec.md",
+                content_type="text/markdown",
+                size_bytes=128,
+                storage_path="/tmp/spec.md",
+                status=DocumentStatus.READY,
+                is_active=True,
+            )
+        )
+        await s.flush()
+        s.add(
+            DocumentVersion(
+                id="ver_1",
+                document_id="doc_1",
+                version_no=1,
+                file_hash="hash_spec_1",
+                status="READY",
+                search_status="READY",
+                knowledge_status="READY",
+                search_ready_at=datetime.now(UTC),
+                knowledge_ready_at=datetime.now(UTC),
+                metadata_json={"security_partition_id": "proj_alpha"},
+            )
         )
         await s.commit()
 
@@ -833,3 +868,360 @@ async def test_legacy_parent_question_resolution_and_recoverable_failed_answer_r
     )
     assert retry_ok.status_code == 200
     assert "run.completed" in retry_ok.text
+
+
+@pytest.mark.asyncio
+async def test_direct_sag_jwt_share_read_and_revoke_rejected_without_bff_service_token(
+    action_env,
+) -> None:
+    """Finding #1 regression: direct SAG JWT must not read or revoke shares without BFF service auth."""
+    c: httpx.AsyncClient = action_env.client
+    tid = action_env.thread_id
+    owner_jwt_hdr = _continuum_bearer(user_id=action_env.u_owner)
+    outsider_jwt_hdr = _continuum_bearer(
+        user_id=action_env.u_outsider,
+        org_id="org_alpha",
+        project_id="proj_alpha",
+    )
+
+    create_res = await c.post(
+        f"/api/v1/agents/agent_default/threads/{tid}/messages/msg_a1/shares",
+        headers=owner_jwt_hdr,
+        json={},
+    )
+    assert create_res.status_code == 201
+    share_id = create_res.json()["id"]
+    share_url = f"/api/v1/projects/proj_alpha/shares/{share_id}"
+
+    # Direct Bearer JWT without BFF service authentication MUST be rejected on both GET and DELETE
+    direct_outsider_get = await c.get(share_url, headers=outsider_jwt_hdr)
+    assert direct_outsider_get.status_code == 403
+    direct_owner_get = await c.get(share_url, headers=owner_jwt_hdr)
+    assert direct_owner_get.status_code == 403
+    direct_owner_del = await c.delete(share_url, headers=owner_jwt_hdr)
+    assert direct_owner_del.status_code == 403
+
+    # Legitimate BFF service-authenticated member read still returns 200
+    peer_bff_hdr = _bff_headers(
+        user_id=action_env.u_peer,
+        org_id="org_alpha",
+        project_id="proj_alpha",
+    )
+    assert (await c.get(share_url, headers=peer_bff_hdr)).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_share_fails_closed_after_cited_project_document_revoked(
+    action_env,
+) -> None:
+    """Finding #2 regression: revoke_project_document invalidates shares even if Source stays CONFIRMED."""
+    c: httpx.AsyncClient = action_env.client
+    tid = action_env.thread_id
+    owner_jwt_hdr = _continuum_bearer(user_id=action_env.u_owner)
+    peer_bff_hdr = _bff_headers(
+        user_id=action_env.u_peer,
+        org_id="org_alpha",
+        project_id="proj_alpha",
+    )
+
+    create_url = f"/api/v1/agents/agent_default/threads/{tid}/messages/msg_a1/shares"
+    create_res = await c.post(create_url, headers=owner_jwt_hdr, json={})
+    assert create_res.status_code == 201
+    share_id = create_res.json()["id"]
+    read_url = f"/api/v1/projects/proj_alpha/shares/{share_id}"
+
+    # Readable before document revocation
+    assert (await c.get(read_url, headers=peer_bff_hdr)).status_code == 200
+
+    # Revoke cited document (keeps SourceProjectMapping CONFIRMED, sets doc.is_active=False + ver=REVOKED)
+    async with action_env.sessions() as s:
+        rev = await revoke_project_document(
+            s,
+            tenant_id="org_alpha",
+            project_id="proj_alpha",
+            document_id="doc_1",
+            reason="ACL_REVOKED",
+        )
+        assert rev.status == "REVOKED"
+        mapping = await s.get(SourceProjectMapping, "spm_1")
+        assert mapping is not None and mapping.state == "CONFIRMED"
+
+    # Existing share read AND repeat/new share creation MUST fail closed with 404!
+    after_revoke = await c.get(read_url, headers=peer_bff_hdr)
+    assert after_revoke.status_code == 404
+    create_after_revoke = await c.post(create_url, headers=owner_jwt_hdr, json={})
+    assert create_after_revoke.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_concurrent_feedback_and_share_races_do_not_raise_500(
+    tmp_path,
+) -> None:
+    """Finding #3 regression: concurrent vote/share races never raise MissingGreenlet or StaleDataError."""
+    from sag_api.core.principal_assertion import VerifiedPrincipal
+    from sag_api.db.models import Thread
+    from sag_api.schemas.answer_actions import FeedbackUpsertIn
+
+    db_path = tmp_path / "race_actions.db"
+    race_engine = create_async_engine(f"sqlite+aiosqlite:///{db_path.as_posix()}")
+
+    @event.listens_for(race_engine.sync_engine, "connect")
+    def _race_pragmas(conn, _rec):
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=10000")
+
+    async with race_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    race_sessions = async_sessionmaker(race_engine, expire_on_commit=False)
+    u_owner = "651a2b3c4d5e6f7a8b9c0d01"
+    owner_key = f"continuum:org_alpha:proj_alpha:{u_owner}"
+    principal = VerifiedPrincipal(
+        subject=u_owner,
+        organization_id="org_alpha",
+        allowed_project_ids=frozenset({"proj_alpha"}),
+        issuer="continuum-sag-session",
+        key_id="sag-hs256-session",
+        token_id="tok_race",
+        issued_at=1,
+        expires_at=9999999999,
+        tenant_id="org_alpha",
+        allowed_partition_ids=frozenset({"proj_alpha"}),
+    )
+
+    t0 = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
+    async with race_sessions() as s:
+        s.add_all(
+            [
+                Agent(id="agent_default", name="Continuum AI", is_default=True),
+                Thread(id="thr_race", agent_id="agent_default", owner_key=owner_key, title="Race"),
+            ]
+        )
+        await s.flush()
+        s.add_all(
+            [
+                Message(
+                    id="rq_1",
+                    thread_id="thr_race",
+                    role=MessageRole.USER,
+                    content="Race question?",
+                    created_at=t0,
+                    updated_at=t0,
+                ),
+                Message(
+                    id="ra_1",
+                    thread_id="thr_race",
+                    role=MessageRole.ASSISTANT,
+                    reply_to_message_id="rq_1",
+                    content="Race answer.",
+                    citations=[],
+                    steps=[],
+                    status=MessageStatus.OK,
+                    created_at=t0 + timedelta(seconds=1),
+                    updated_at=t0 + timedelta(seconds=1),
+                ),
+            ]
+        )
+        await s.commit()
+
+    try:
+        # 1. Deterministic first-vote race: session B inserts before session A executes upsert!
+        async with race_sessions() as s_loser:
+            orig_scalars = s_loser.scalars
+            injected = False
+
+            async def _interleaved_scalars(statement, *args, **kwargs):
+                nonlocal injected
+                if not injected and "INSERT" in str(statement).upper():
+                    injected = True
+                    async with race_sessions() as s_winner:
+                        await actions_svc.upsert_own_feedback(
+                            s_winner,
+                            agent_id="agent_default",
+                            thread_id="thr_race",
+                            message_id="ra_1",
+                            owner_key=owner_key,
+                            principal=principal,
+                            payload=FeedbackUpsertIn(rating="LIKE"),
+                        )
+                return await orig_scalars(statement, *args, **kwargs)
+
+            s_loser.scalars = _interleaved_scalars  # type: ignore[method-assign]
+            res_after_race = await actions_svc.upsert_own_feedback(
+                s_loser,
+                agent_id="agent_default",
+                thread_id="thr_race",
+                message_id="ra_1",
+                owner_key=owner_key,
+                principal=principal,
+                payload=FeedbackUpsertIn(rating="DISLIKE", reasonCategory="INCOMPLETE"),
+            )
+            assert res_after_race.rating == "DISLIKE"
+            assert res_after_race.reason_category == "INCOMPLETE"
+
+        # 2. Deterministic PUT vs DELETE race + concurrent gather across separate sessions!
+        async with race_sessions() as s_updater:
+            orig_scalars_upd = s_updater.scalars
+            deleted_in_between = False
+
+            async def _delete_before_upsert(statement, *args, **kwargs):
+                nonlocal deleted_in_between
+                if not deleted_in_between and "INSERT" in str(statement).upper():
+                    deleted_in_between = True
+                    async with race_sessions() as s_deleter:
+                        await actions_svc.delete_own_feedback(
+                            s_deleter,
+                            agent_id="agent_default",
+                            thread_id="thr_race",
+                            message_id="ra_1",
+                            owner_key=owner_key,
+                            principal=principal,
+                        )
+                return await orig_scalars_upd(statement, *args, **kwargs)
+
+            s_updater.scalars = _delete_before_upsert  # type: ignore[method-assign]
+            res_put_vs_del = await actions_svc.upsert_own_feedback(
+                s_updater,
+                agent_id="agent_default",
+                thread_id="thr_race",
+                message_id="ra_1",
+                owner_key=owner_key,
+                principal=principal,
+                payload=FeedbackUpsertIn(rating="LIKE"),
+            )
+            assert res_put_vs_del.rating == "LIKE"
+
+        async def _concurrent_vote(rating: str):
+            async with race_sessions() as s_conc:
+                body = (
+                    FeedbackUpsertIn(rating="LIKE")
+                    if rating == "LIKE"
+                    else FeedbackUpsertIn(rating="DISLIKE", reasonCategory="OUTDATED")
+                )
+                return await actions_svc.upsert_own_feedback(
+                    s_conc,
+                    agent_id="agent_default",
+                    thread_id="thr_race",
+                    message_id="ra_1",
+                    owner_key=owner_key,
+                    principal=principal,
+                    payload=body,
+                )
+
+        async def _concurrent_delete():
+            async with race_sessions() as s_conc:
+                await actions_svc.delete_own_feedback(
+                    s_conc,
+                    agent_id="agent_default",
+                    thread_id="thr_race",
+                    message_id="ra_1",
+                    owner_key=owner_key,
+                    principal=principal,
+                )
+
+        await asyncio.gather(
+            _concurrent_vote("LIKE"),
+            _concurrent_delete(),
+            _concurrent_vote("DISLIKE"),
+            _concurrent_delete(),
+            _concurrent_vote("LIKE"),
+        )
+
+        # 3. Deterministic POST /shares race: session B inserts before session A commits!
+        async with race_sessions() as s_share_loser:
+            orig_share_commit = s_share_loser.commit
+            share_injected = False
+            winner_share_id = ""
+
+            async def _interleaved_share_commit():
+                nonlocal share_injected, winner_share_id
+                if not share_injected:
+                    share_injected = True
+                    async with race_sessions() as s_share_winner:
+                        winner_out, winner_created = await actions_svc.create_or_get_share(
+                            s_share_winner,
+                            agent_id="agent_default",
+                            thread_id="thr_race",
+                            message_id="ra_1",
+                            owner_key=owner_key,
+                            principal=principal,
+                        )
+                        assert winner_created is True
+                        winner_share_id = winner_out.id
+                return await orig_share_commit()
+
+            s_share_loser.commit = _interleaved_share_commit  # type: ignore[method-assign]
+            loser_out, loser_created = await actions_svc.create_or_get_share(
+                s_share_loser,
+                agent_id="agent_default",
+                thread_id="thr_race",
+                message_id="ra_1",
+                owner_key=owner_key,
+                principal=principal,
+            )
+            assert loser_created is False
+            assert loser_out.id == winner_share_id
+    finally:
+        await race_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_legacy_consecutive_user_turns_with_distinct_timestamps_rejected_400(
+    action_env,
+) -> None:
+    """Finding #4 regression: legacy q1(T), q2(T+1), a1(T+2) without reply_to_message_id must fail closed with 400."""
+    c: httpx.AsyncClient = action_env.client
+    tid = action_env.thread_id
+    owner_hdr = _continuum_bearer(user_id=action_env.u_owner)
+
+    t0 = datetime(2026, 10, 30, 11, 0, tzinfo=UTC)
+    async with action_env.sessions() as s:
+        s.add_all(
+            [
+                Message(
+                    id="amb_q1",
+                    thread_id=tid,
+                    role=MessageRole.USER,
+                    content="First overlapping legacy question?",
+                    created_at=t0,
+                    updated_at=t0,
+                ),
+                Message(
+                    id="amb_q2",
+                    thread_id=tid,
+                    role=MessageRole.USER,
+                    content="Second overlapping legacy question?",
+                    created_at=t0 + timedelta(seconds=1),
+                    updated_at=t0 + timedelta(seconds=1),
+                ),
+                Message(
+                    id="amb_a1",
+                    thread_id=tid,
+                    role=MessageRole.ASSISTANT,
+                    reply_to_message_id=None,
+                    content="Legacy answer whose parent is ambiguous.",
+                    citations=[],
+                    steps=[],
+                    status=MessageStatus.OK,
+                    created_at=t0 + timedelta(seconds=2),
+                    updated_at=t0 + timedelta(seconds=2),
+                ),
+            ]
+        )
+        await s.commit()
+
+    regen_res = await c.post(
+        f"/api/v1/agents/agent_default/threads/{tid}/messages/amb_a1/regenerate",
+        headers=owner_hdr,
+        json={},
+    )
+    assert regen_res.status_code == 400
+
+    share_res = await c.post(
+        f"/api/v1/agents/agent_default/threads/{tid}/messages/amb_a1/shares",
+        headers=owner_hdr,
+        json={},
+    )
+    assert share_res.status_code == 400
+

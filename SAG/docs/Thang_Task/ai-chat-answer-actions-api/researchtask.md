@@ -60,3 +60,24 @@ on the verified database foundation commit `4b16fc9`
   - Rollback: revert the API deployment/PR first so no application traffic hits `answer_feedback` / `answer_shares` before considering any owner-approved DB downgrade.
 - **Remaining Gaps**:
   - Staging/production end-to-end verification across deployed NestJS BFF + Next.js UI remains tracked in the BE (`feat/Thang-ai-chat-answer-actions-be-api`) and FE (`feat/Thang-ai-chat-answer-actions-fe-ui`) deliverables.
+
+## Review-fix pass (PR #53 — Findings #1, #2, #3, #4)
+
+### Verified findings and root causes
+1. **[P1] Direct SAG share read/revoke bypasses live Project membership (`sag_api/api/v1/answer_actions.py:39`)**:
+   - `require_project_share_principal` fell back to `require_project_read_principal` when `X-SAG-BFF-Service-Token` was absent, allowing a non-member with a PUBLIC-project or Org-ADMIN SAG JWT (or stale JWT after membership removal) to call `GET /api/v1/projects/{project_id}/shares/{share_id}` directly on SAG and receive `200`.
+   - Fix: Enforce `require_bff_service_token` + `require_project_bff_principal` unconditionally on `project_share_router` (`GET` and `DELETE /projects/{project_id}/shares/{share_id}`), removing the direct user JWT fallback so all share reads/revocations must pass BFF live active-member verification.
+2. **[P1] Shared answer still serves snapshot after cited Document/DocumentVersion is revoked (`sag_api/services/answer_actions_service.py:458`)**:
+   - `revoke_project_document` (`document_service.py:2325`) sets `Document.is_active = False` and marks every `DocumentVersion` (`status`, `search_status`, `knowledge_status`) `"REVOKED"` while preserving `SourceProjectMapping.CONFIRMED`. Checking only `get_authorized_source_ids` allowed revoked document snapshots/snippets to remain readable.
+   - Fix: Add `_verify_evidence_document_provenance` checking every internal citation/match across `Message.citations`, `AnswerShare.citations`, and `Message.steps[*].details.matches` against live `Document` (`is_active == True`, non-deleting status, tenant/project/source scope) and `DocumentVersion` (non-`REVOKED` `status`/`search_status`/`knowledge_status`, unrevoked metadata, and `security_partition_id` scope), failing closed (`404`) in both `_ensure_authorized_assistant_message` and `read_project_share`.
+3. **[P2] Concurrent feedback/share race causes `500` (`MissingGreenlet` / `StaleDataError`) (`sag_api/services/answer_actions_service.py:277, 349, 382`)**:
+   - Accessing expired ORM attributes after `session.rollback()` raised `MissingGreenlet`; concurrent `DELETE` between `SELECT` and ORM `UPDATE`/`DELETE` raised `StaleDataError`.
+   - Fix: Use dialect-native atomic `INSERT ... ON CONFLICT (message_id, voter_subject) DO UPDATE ... RETURNING` in `upsert_own_feedback`, atomic SQL `DELETE` in `delete_own_feedback`, atomic `UPDATE` in `revoke_project_share`, and pre-extracted plain scalar variables + savepoint/retry loop in `create_or_get_share`.
+4. **[P2] Legacy parent question fallback picks wrong user message on consecutive USER turns (`sag_api/services/answer_actions_service.py:210`)**:
+   - `resolve_parent_question` only rejected `preceding[1].role == MessageRole.USER` when timestamps were identical, mis-resolving `q1(T), q2(T+1), a1(T+2)` to `q2`.
+   - Fix: Fail closed (`400 BadRequestError`) whenever `preceding[1].role == MessageRole.USER` regardless of timestamp, or when another unlinked legacy assistant turn / explicit non-regeneration `reply_to_message_id` makes the legacy turn ambiguous.
+
+### Review-fix verification
+- `ruff check sag_api/api/v1/answer_actions.py sag_api/services/answer_actions_service.py tests/test_answer_actions_api.py` → `All checks passed!`.
+- `python -X utf8 -m pytest tests/test_answer_actions_schema.py tests/test_answer_actions_api.py -q --tb=short` → `30 passed in 9.21s` (verified RED failure on all 4 new regression suites prior to fix, then GREEN).
+- No new database migrations or environment variables introduced; builds on `4b16fc9`.
