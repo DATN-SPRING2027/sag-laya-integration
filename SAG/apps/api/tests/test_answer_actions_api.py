@@ -131,6 +131,7 @@ def _continuum_bearer(
     user_id: str,
     org_id: str = "org_alpha",
     project_id: str = "proj_alpha",
+    through_bff: bool = True,
 ) -> dict[str, str]:
     token = create_access_token(
         user_id,
@@ -142,7 +143,10 @@ def _continuum_bearer(
             "jti": secrets.token_urlsafe(16),
         },
     )
-    return {"Authorization": f"Bearer {token}"}
+    headers = {"Authorization": f"Bearer {token}"}
+    if through_bff:
+        headers["X-SAG-BFF-Service-Token"] = "test-bff-secret"
+    return headers
 
 
 def _bff_headers(
@@ -640,7 +644,7 @@ async def test_platform_admin_feedback_service_auth_totals_filters_and_cursor_bi
     action_env,
 ) -> None:
     c: httpx.AsyncClient = action_env.client
-    owner_hdr = _continuum_bearer(user_id=action_env.u_owner)
+    owner_hdr = _continuum_bearer(user_id=action_env.u_owner, through_bff=False)
     svc_hdr = _bff_headers()
 
     # Seed feedback across multiple orgs/projects/timestamps
@@ -877,16 +881,17 @@ async def test_direct_sag_jwt_share_read_and_revoke_rejected_without_bff_service
     """Finding #1 regression: direct SAG JWT must not read or revoke shares without BFF service auth."""
     c: httpx.AsyncClient = action_env.client
     tid = action_env.thread_id
-    owner_jwt_hdr = _continuum_bearer(user_id=action_env.u_owner)
+    owner_jwt_hdr = _continuum_bearer(user_id=action_env.u_owner, through_bff=False)
     outsider_jwt_hdr = _continuum_bearer(
         user_id=action_env.u_outsider,
         org_id="org_alpha",
         project_id="proj_alpha",
+        through_bff=False,
     )
 
     create_res = await c.post(
         f"/api/v1/agents/agent_default/threads/{tid}/messages/msg_a1/shares",
-        headers=owner_jwt_hdr,
+        headers=_continuum_bearer(user_id=action_env.u_owner),
         json={},
     )
     assert create_res.status_code == 201
@@ -1225,3 +1230,350 @@ async def test_legacy_consecutive_user_turns_with_distinct_timestamps_rejected_4
     )
     assert share_res.status_code == 400
 
+
+def _session_memory_step(message_ids: list[str], *, source_ids: list[str] | None = None) -> dict:
+    from sag_api.services.agent_service import _build_session_audit_step
+
+    citation = {
+        "kind": "session_memory",
+        "ref": "S1",
+        "primary_message_id": message_ids[-1] if message_ids else None,
+        "message_ids": message_ids,
+        "cited_source_ids": source_ids or [],
+        "mapped": True,
+    }
+    step = _build_session_audit_step({"mode": "on"}, used_session_citations=[citation])
+    assert step is not None
+    return step
+
+
+@pytest.mark.asyncio
+async def test_transitive_session_share_revalidates_original_document(action_env) -> None:
+    c = action_env.client
+    tid = action_env.thread_id
+    t0 = datetime(2026, 10, 30, 18, 0, tzinfo=UTC)
+    async with action_env.sessions() as s:
+        s.add_all([
+            Message(
+                id=mid, thread_id=tid, role=MessageRole.ASSISTANT,
+                reply_to_message_id="msg_q2", content="Remembered PostgreSQL [S1].",
+                citations=[], steps=[_session_memory_step([prior], source_ids=["src_proj_1"])],
+                created_at=t0 + timedelta(seconds=i), updated_at=t0,
+            )
+            for i, (mid, prior) in enumerate([("session_a", "msg_a1"), ("session_b", "session_a")])
+        ])
+        await s.commit()
+    create_url = f"/api/v1/agents/agent_default/threads/{tid}/messages/session_b/shares"
+    owner = _continuum_bearer(user_id=action_env.u_owner)
+    reader = _bff_headers(user_id=action_env.u_peer, org_id="org_alpha", project_id="proj_alpha")
+    created = await c.post(create_url, headers=owner, json={})
+    assert created.status_code == 201
+    read_url = f"/api/v1/projects/proj_alpha/shares/{created.json()['id']}"
+    assert (await c.get(read_url, headers=reader)).status_code == 200
+    async with action_env.sessions() as s:
+        await revoke_project_document(
+            s, tenant_id="org_alpha", project_id="proj_alpha", document_id="doc_1", reason="ACL_REVOKED"
+        )
+    assert (await c.get(read_url, headers=reader)).status_code == 404
+    assert (await c.post(create_url, headers=owner, json={})).status_code == 404
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "broken", ["missing", "cross_thread", "cycle", "malformed", "missing_refs", "unmapped", "depth", "source", "hidden"]
+)
+async def test_session_share_fails_closed_on_invalid_reference_graph(action_env, broken: str) -> None:
+    from sag_api.db.models import Thread
+
+    tid = action_env.thread_id
+    root_step = _session_memory_step(["msg_a1"], source_ids=["src_proj_1"])
+    nodes = []
+    if broken == "missing":
+        root_step = _session_memory_step(["missing_message"])
+    elif broken == "cross_thread":
+        nodes = [Message(id="cross_ref", thread_id="other_thread", role=MessageRole.USER, content="Private")]
+        root_step = _session_memory_step(["cross_ref"])
+    elif broken == "cycle":
+        nodes = [Message(
+            id="cycle_ref", thread_id=tid, role=MessageRole.ASSISTANT, content="Cycle",
+            citations=[], steps=[_session_memory_step(["session_root"])],
+        )]
+        root_step = _session_memory_step(["cycle_ref"])
+    elif broken == "malformed":
+        root_step["session_citations"][0]["message_ids"] = "msg_a1"
+    elif broken == "missing_refs":
+        root_step["session_citations"][0].pop("message_ids")
+        root_step["session_citations"][0].pop("primary_message_id")
+    elif broken == "unmapped":
+        root_step = _session_memory_step(["missing_message"])
+        root_step["session_citations"][0].update(mapped=False, claim_level="run")
+    elif broken == "depth":
+        nodes = [Message(
+            id=f"deep_{i}", thread_id=tid, role=MessageRole.ASSISTANT, content="History",
+            citations=[], steps=[_session_memory_step([f"deep_{i + 1}" if i < 33 else "msg_q1"])],
+        ) for i in range(34)]
+        root_step = _session_memory_step(["deep_0"])
+    elif broken == "source":
+        nodes = [Message(
+            id="denied_ref", thread_id=tid, role=MessageRole.ASSISTANT, content="Denied evidence",
+            citations=[{"source_id": "not_authorized", "document_id": "doc_1"}], steps=[],
+        )]
+        root_step = _session_memory_step(["denied_ref"], source_ids=["src_proj_1"])
+    elif broken == "hidden":
+        from sag_api.services.session_context import HIDDEN_SCOPE_PLACEHOLDER
+
+        nodes = [Message(
+            id="hidden_ref", thread_id=tid, role=MessageRole.ASSISTANT,
+            content=HIDDEN_SCOPE_PLACEHOLDER, citations=[], steps=[],
+        )]
+        root_step = _session_memory_step(["hidden_ref"])
+    async with action_env.sessions() as s:
+        if broken == "cross_thread":
+            s.add(Thread(id="other_thread", agent_id="agent_default", owner_key="different_owner", title="Other"))
+            await s.flush()
+        s.add_all(nodes)
+        s.add(Message(
+            id="session_root", thread_id=tid, role=MessageRole.ASSISTANT,
+            reply_to_message_id="msg_q2", content="Remembered answer [S1].", citations=[], steps=[root_step],
+        ))
+        await s.commit()
+    result = await action_env.client.post(
+        f"/api/v1/agents/agent_default/threads/{tid}/messages/session_root/shares",
+        headers=_continuum_bearer(user_id=action_env.u_owner), json={},
+    )
+    assert result.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_session_share_accepts_user_context_and_repeated_acyclic_references(action_env) -> None:
+    tid = action_env.thread_id
+    async with action_env.sessions() as s:
+        s.add_all([
+            Message(
+                id="user_memory", thread_id=tid, role=MessageRole.ASSISTANT,
+                reply_to_message_id="msg_q2", content="Your own earlier question [S1].", citations=[],
+                steps=[_session_memory_step(["msg_q1"])],
+            ),
+            Message(
+                id="repeat_memory", thread_id=tid, role=MessageRole.ASSISTANT,
+                reply_to_message_id="msg_q2", content="Remembered answer [S1].", citations=[],
+                steps=[_session_memory_step(["user_memory", "msg_q1"])],
+            ),
+        ])
+        await s.commit()
+    result = await action_env.client.post(
+        f"/api/v1/agents/agent_default/threads/{tid}/messages/repeat_memory/shares",
+        headers=_continuum_bearer(user_id=action_env.u_owner), json={},
+    )
+    assert result.status_code == 201
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("overlap", [False, True])
+async def test_legacy_parent_checks_complete_unanswered_prefix(action_env, overlap: bool) -> None:
+    from sag_api.core.errors import BadRequestError
+
+    tid = action_env.thread_id
+    sequence = (
+        [("old_q1", "user"), ("old_q2", "user"), ("old_a1", "assistant"),
+         ("old_q3", "user"), ("old_a2", "assistant")]
+        if overlap else
+        [("old_q1", "user"), ("old_a1", "assistant"), ("old_q2", "user"), ("old_a2", "assistant")]
+    )
+    t0 = datetime(2026, 10, 30, 19, 0, tzinfo=UTC)
+    async with action_env.sessions() as s:
+        s.add_all([Message(
+            id=mid, thread_id=tid, role=MessageRole(role), content=mid, citations=[], steps=[],
+            created_at=t0 + timedelta(seconds=i), updated_at=t0,
+        ) for i, (mid, role) in enumerate(sequence)])
+        await s.commit()
+        target = await s.get(Message, "old_a2")
+        if overlap:
+            with pytest.raises(BadRequestError):
+                await actions_svc.resolve_parent_question(s, thread_id=tid, answer_message=target)
+        else:
+            question = await actions_svc.resolve_parent_question(s, thread_id=tid, answer_message=target)
+            assert question.id == "old_q2"
+
+
+@pytest.mark.asyncio
+async def test_regeneration_lineage_limit_never_falls_back_to_legacy_guess(action_env) -> None:
+    from sag_api.core.errors import BadRequestError
+
+    tid = action_env.thread_id
+    t0 = datetime(2026, 10, 30, 21, 0, tzinfo=UTC)
+    async with action_env.sessions() as s:
+        s.add(Message(
+            id="lineage_q", thread_id=tid, role=MessageRole.USER, content="Original",
+            created_at=t0, updated_at=t0,
+        ))
+        await s.flush()
+        for i in range(33):
+            s.add(Message(
+                id=f"lineage_{i}", thread_id=tid, role=MessageRole.ASSISTANT, content="Old answer",
+                regenerated_from_message_id=f"lineage_{i - 1}" if i else None,
+                created_at=t0 + timedelta(seconds=i + 1), updated_at=t0,
+            ))
+            await s.flush()
+        await s.commit()
+        with pytest.raises(BadRequestError):
+            await actions_svc.resolve_parent_question(
+                s, thread_id=tid, answer_message=await s.get(Message, "lineage_32")
+            )
+
+
+
+async def test_answer_mutations_require_bff_even_with_valid_owner_session(action_env):
+    c = action_env.client
+    base = f"/api/v1/agents/agent_default/threads/{action_env.thread_id}/messages/msg_a1"
+    direct = _continuum_bearer(user_id=action_env.u_owner, through_bff=False)
+    operations = [
+        ("PUT", "feedback", {"rating": "LIKE"}),
+        ("DELETE", "feedback", None),
+        ("POST", "shares", {}),
+        ("POST", "regenerate", {}),
+    ]
+    for method, suffix, body in operations:
+        result = await c.request(
+            method, f"{base}/{suffix}", headers=direct, **({"json": body} if body is not None else {})
+        )
+        assert result.status_code == 403
+    trusted = _continuum_bearer(user_id=action_env.u_owner)
+    assert (await c.put(f"{base}/feedback", headers=trusted, json={"rating": "LIKE"})).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_legacy_audit_only_and_shadow_session_steps_revalidate_revoked_documents(
+    action_env,
+) -> None:
+    """Session context steps without session_citations (e.g. V0_legacy recent_turn_ids or shadow) also fail closed."""
+    from sag_api.services.agent_service import _build_session_audit_step
+
+    c = action_env.client
+    tid = action_env.thread_id
+    t0 = datetime(2026, 10, 30, 20, 0, tzinfo=UTC)
+    legacy_audit_step = _build_session_audit_step(
+        {
+            "mode": "legacy",
+            "ablation": "V0_legacy",
+            "used_recent_tokens": 18,
+            "total_output_history_tokens": 18,
+            "recent_turn_ids": ["msg_a1"],
+        }
+    )
+    missing_refs_audit_step = _build_session_audit_step(
+        {
+            "mode": "on",
+            "used_evidence_tokens": 24,
+            "total_output_history_tokens": 24,
+        }
+    )
+    assert legacy_audit_step is not None and "session_citations" not in legacy_audit_step
+    assert missing_refs_audit_step is not None
+
+    async with action_env.sessions() as s:
+        s.add_all(
+            [
+                Message(
+                    id="session_v0",
+                    thread_id=tid,
+                    role=MessageRole.ASSISTANT,
+                    reply_to_message_id="msg_q2",
+                    content="Answer derived from V0_legacy window.",
+                    citations=[],
+                    steps=[legacy_audit_step],
+                    created_at=t0,
+                    updated_at=t0,
+                ),
+                Message(
+                    id="session_missing_audit_refs",
+                    thread_id=tid,
+                    role=MessageRole.ASSISTANT,
+                    reply_to_message_id="msg_q2",
+                    content="Answer missing audit turn refs.",
+                    citations=[],
+                    steps=[missing_refs_audit_step],
+                    created_at=t0 + timedelta(seconds=1),
+                    updated_at=t0 + timedelta(seconds=1),
+                ),
+            ]
+        )
+        await s.commit()
+
+    owner = _continuum_bearer(user_id=action_env.u_owner)
+    reader = _bff_headers(user_id=action_env.u_peer, org_id="org_alpha", project_id="proj_alpha")
+
+    # Missing provenance refs despite positive session tokens -> fail closed immediately
+    assert (
+        await c.post(
+            f"/api/v1/agents/agent_default/threads/{tid}/messages/session_missing_audit_refs/shares",
+            headers=owner,
+            json={},
+        )
+    ).status_code == 404
+
+    # V0_legacy recent_turn_ids succeeds while doc_1 is active, then fails closed after revocation
+    v0_create = await c.post(
+        f"/api/v1/agents/agent_default/threads/{tid}/messages/session_v0/shares",
+        headers=owner,
+        json={},
+    )
+    assert v0_create.status_code == 201
+    read_url = f"/api/v1/projects/proj_alpha/shares/{v0_create.json()['id']}"
+    assert (await c.get(read_url, headers=reader)).status_code == 200
+
+    async with action_env.sessions() as s:
+        await revoke_project_document(
+            s,
+            tenant_id="org_alpha",
+            project_id="proj_alpha",
+            document_id="doc_1",
+            reason="ACL_REVOKED",
+        )
+    assert (await c.get(read_url, headers=reader)).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_legacy_parent_rejects_same_timestamp_uuid_tie_ambiguity(action_env) -> None:
+    """Same-timestamp concurrent legacy messages sorted by random ID must fail closed instead of misbinding."""
+    from sag_api.core.errors import BadRequestError
+
+    tid = action_env.thread_id
+    t_same = datetime(2026, 10, 30, 22, 0, tzinfo=UTC)
+    async with action_env.sessions() as s:
+        s.add_all(
+            [
+                Message(
+                    id="tie_111_q1",
+                    thread_id=tid,
+                    role=MessageRole.USER,
+                    content="Concurrent question 1",
+                    created_at=t_same,
+                    updated_at=t_same,
+                ),
+                Message(
+                    id="tie_222_a_fast",
+                    thread_id=tid,
+                    role=MessageRole.ASSISTANT,
+                    reply_to_message_id=None,
+                    content="Fast answer at identical timestamp",
+                    citations=[],
+                    steps=[],
+                    created_at=t_same,
+                    updated_at=t_same,
+                ),
+                Message(
+                    id="tie_333_q2",
+                    thread_id=tid,
+                    role=MessageRole.USER,
+                    content="Concurrent question 2 with higher ID",
+                    created_at=t_same,
+                    updated_at=t_same,
+                ),
+            ]
+        )
+        await s.commit()
+        target = await s.get(Message, "tie_222_a_fast")
+        assert target is not None
+        with pytest.raises(BadRequestError):
+            await actions_svc.resolve_parent_question(s, thread_id=tid, answer_message=target)

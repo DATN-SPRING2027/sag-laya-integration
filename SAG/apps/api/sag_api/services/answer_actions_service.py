@@ -175,8 +175,17 @@ async def _verify_evidence_document_provenance(
     principal: VerifiedPrincipal,
     authorized_source_ids: set[str],
     extra_citations: Any = None,
+    _path: frozenset[str] = frozenset(),
+    _verified: set[str] | None = None,
 ) -> bool:
     """Verify every internal cited/matched Document and DocumentVersion is active, unrevoked, and in scope."""
+    verified = _verified if _verified is not None else set()
+    message_id = message.id
+    if message_id in _path or len(_path) >= 32 or len(verified) + len(_path) >= 128:
+        return False
+    if message_id in verified:
+        return True
+    path = _path | {message_id}
     tenant_id = (principal.tenant_id or principal.organization_id or "").strip()
     allowed_projects = principal.allowed_project_ids
     allowed_partitions = principal.allowed_partition_ids
@@ -193,6 +202,8 @@ async def _verify_evidence_document_provenance(
             return False
         evidence_items.extend(extra_citations)
 
+    session_message_ids: set[str] = set()
+    cited_session_source_ids: set[str] = set()
     steps = getattr(message, "steps", None)
     if steps is not None:
         if not isinstance(steps, list):
@@ -204,7 +215,169 @@ async def _verify_evidence_document_provenance(
             if isinstance(details, dict) and isinstance(details.get("matches"), list):
                 evidence_items.extend(details["matches"])
 
+            is_session_step = step.get("kind") == "session_context" or "session_citations" in step
+            if not is_session_step:
+                continue
+
+            step_refs: set[str] = set()
+            has_session_citations = "session_citations" in step
+            if has_session_citations:
+                session_citations = step["session_citations"]
+                if not isinstance(session_citations, list) or not session_citations:
+                    return False
+                # Available but unmapped session records also reached the model context.
+                for citation in session_citations:
+                    if not isinstance(citation, dict):
+                        return False
+                    refs = citation.get("message_ids", [])
+                    if not isinstance(refs, list):
+                        return False
+                    refs = [*refs]
+                    if citation.get("primary_message_id") is not None:
+                        refs.append(citation["primary_message_id"])
+                    if not refs:
+                        return False
+                    for ref in refs:
+                        if not isinstance(ref, str) or not _SAFE_ID_RE.fullmatch(ref):
+                            return False
+                        step_refs.add(ref)
+                    raw_cited_srcs = citation.get("cited_source_ids")
+                    if raw_cited_srcs is not None:
+                        if not isinstance(raw_cited_srcs, list):
+                            return False
+                        for sid in raw_cited_srcs:
+                            if not isinstance(sid, str) or not sid.strip():
+                                return False
+                            cited_session_source_ids.add(sid.strip())
+
+            has_audit = "audit" in step
+            if has_audit:
+                audit = step["audit"]
+                if not isinstance(audit, dict):
+                    return False
+                selected_groups = audit.get("selected_groups")
+                if selected_groups is not None:
+                    if not isinstance(selected_groups, list):
+                        return False
+                    for grp in selected_groups:
+                        if not isinstance(grp, dict):
+                            return False
+                        grp_refs = grp.get("included_turn_ids", [])
+                        if not isinstance(grp_refs, list):
+                            return False
+                        grp_refs = [*grp_refs]
+                        if grp.get("primary_turn_id") is not None:
+                            grp_refs.append(grp["primary_turn_id"])
+                        if not grp_refs:
+                            return False
+                        for ref in grp_refs:
+                            if not isinstance(ref, str) or not _SAFE_ID_RE.fullmatch(ref):
+                                return False
+                            step_refs.add(ref)
+                recent_turn_ids = audit.get("recent_turn_ids")
+                if recent_turn_ids is not None:
+                    if not isinstance(recent_turn_ids, list):
+                        return False
+                    for ref in recent_turn_ids:
+                        if not isinstance(ref, str) or not _SAFE_ID_RE.fullmatch(ref):
+                            return False
+                        step_refs.add(ref)
+
+                used_session_tokens = any(
+                    isinstance(audit.get(k), (int, float))
+                    and not isinstance(audit.get(k), bool)
+                    and audit[k] > 0
+                    for k in (
+                        "used_evidence_tokens",
+                        "used_recent_tokens",
+                        "total_output_history_tokens",
+                    )
+                )
+                audit_mode = str(step.get("mode") or audit.get("mode") or "")
+                if audit_mode == "shadow":
+                    total_indexed = audit.get("total_indexed_turns", 0)
+                    if (
+                        isinstance(total_indexed, int)
+                        and not isinstance(total_indexed, bool)
+                        and total_indexed > 0
+                        and message.created_at is not None
+                    ):
+                        prior_rows = list(
+                            (
+                                await session.scalars(
+                                    select(Message.id)
+                                    .where(
+                                        Message.thread_id == message.thread_id,
+                                        Message.id != message_id,
+                                        Message.role == MessageRole.ASSISTANT,
+                                        Message.status == MessageStatus.OK,
+                                        or_(
+                                            Message.created_at < message.created_at,
+                                            and_(
+                                                Message.created_at == message.created_at,
+                                                Message.id < message_id,
+                                            ),
+                                        ),
+                                    )
+                                    .order_by(Message.created_at.desc(), Message.id.desc())
+                                    .limit(129)
+                                )
+                            ).all()
+                        )
+                        if len(prior_rows) > 128:
+                            return False
+                        step_refs.update(str(pid) for pid in prior_rows)
+                elif used_session_tokens and not step_refs:
+                    return False
+            elif not has_session_citations:
+                return False
+
+            session_message_ids.update(step_refs)
+            if len(session_message_ids) > 128:
+                return False
+
+    if cited_session_source_ids:
+        authorized_cited = await get_authorized_source_ids(
+            session,
+            principal=principal,
+            requested_source_ids=sorted(cited_session_source_ids),
+        )
+        if not cited_session_source_ids.issubset(authorized_cited):
+            return False
+
+    for ref in sorted(session_message_ids):
+        prior = await session.get(Message, ref)
+        if (
+            prior is None
+            or prior.thread_id != message.thread_id
+            or prior.role not in (MessageRole.USER, MessageRole.ASSISTANT)
+            or prior.status != MessageStatus.OK
+            or (
+                prior.role == MessageRole.ASSISTANT
+                and (prior.content or "").strip() == HIDDEN_SCOPE_PLACEHOLDER
+            )
+        ):
+            return False
+        prior_sources = _message_source_ids(prior) if prior.role == MessageRole.ASSISTANT else set()
+        if prior_sources is None:
+            return False
+        prior_authorized = await get_authorized_source_ids(
+            session, principal=principal, requested_source_ids=sorted(prior_sources)
+        ) if prior_sources else set()
+        if not prior_sources.issubset(prior_authorized):
+            return False
+        if not await _verify_evidence_document_provenance(
+            session,
+            message=prior,
+            principal=principal,
+            authorized_source_ids=prior_authorized,
+            _path=path,
+            _verified=verified,
+        ):
+            return False
+
     if not evidence_items:
+        verified.add(message_id)
         return True
 
     unversioned_source_refs: set[str] = set()
@@ -344,6 +517,7 @@ async def _verify_evidence_document_provenance(
             ):
                 return False
 
+    verified.add(message_id)
     return True
 
 
@@ -417,9 +591,10 @@ async def resolve_parent_question(
         if prior is None or prior.thread_id != thread_id or prior.role != MessageRole.ASSISTANT:
             raise BadRequestError("Original parent answer lineage is broken")
         cursor_msg = prior
+    else:
+        raise BadRequestError("Message regeneration lineage exceeds the supported depth")
 
-    # Legacy fallback: only succeed when the immediately preceding message in ordered thread history
-    # is unambiguously a single USER turn with no consecutive unmatched USER turn before it.
+    # A nearby USER is insufficient: an earlier slow legacy run may still own this answer.
     rows = await session.execute(
         select(Message)
         .where(
@@ -429,21 +604,53 @@ async def resolve_parent_question(
                 and_(Message.created_at == cursor_msg.created_at, Message.id < cursor_msg.id),
             ),
         )
-        .order_by(Message.created_at.desc(), Message.id.desc())
-        .limit(2)
+        .order_by(Message.created_at.asc(), Message.id.asc())
     )
-    preceding = list(rows.scalars().all())
+    prefix = list(rows.scalars().all())
+    preceding = list(reversed(prefix[-2:]))
     if not preceding or preceding[0].role != MessageRole.USER:
         raise BadRequestError("Cannot resolve an unambiguous parent question for this legacy answer")
     if len(preceding) > 1 and preceding[1].role == MessageRole.USER:
         raise BadRequestError("Ambiguous consecutive user questions precede this legacy answer")
-    if (
-        len(preceding) > 1
-        and preceding[1].created_at == preceding[0].created_at
+    if preceding[0].created_at == cursor_msg.created_at or (
+        len(preceding) > 1 and preceding[1].created_at == preceding[0].created_at
     ):
         raise BadRequestError("Ambiguous parent question timestamps for this legacy answer")
 
+    same_ts_sibling = await session.scalar(
+        select(Message.id)
+        .where(
+            Message.thread_id == thread_id,
+            Message.created_at == cursor_msg.created_at,
+            Message.id != cursor_msg.id,
+        )
+        .limit(1)
+    )
+    if same_ts_sibling is not None:
+        raise BadRequestError("Ambiguous concurrent message timestamps for this legacy answer")
+
+    for idx in range(1, len(prefix)):
+        prev_msg = prefix[idx - 1]
+        curr_msg = prefix[idx]
+        if (
+            prev_msg.created_at == curr_msg.created_at
+            and not curr_msg.reply_to_message_id
+            and not prev_msg.reply_to_message_id
+        ):
+            raise BadRequestError("Ambiguous concurrent message timestamps in legacy history")
+
     candidate_question = preceding[0]
+    unanswered: set[str] = set()
+    for prior in prefix:
+        if prior.role == MessageRole.USER:
+            unanswered.add(prior.id)
+        elif prior.role == MessageRole.ASSISTANT:
+            if prior.reply_to_message_id:
+                unanswered.discard(prior.reply_to_message_id)
+            elif not prior.regenerated_from_message_id and len(unanswered) == 1:
+                unanswered.clear()
+    if unanswered != {candidate_question.id}:
+        raise BadRequestError("Earlier unanswered user questions make this legacy answer ambiguous")
     claimed_by_other = await session.scalar(
         select(Message.id)
         .where(

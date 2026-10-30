@@ -81,3 +81,20 @@ on the verified database foundation commit `4b16fc9`
 - `ruff check sag_api/api/v1/answer_actions.py sag_api/services/answer_actions_service.py tests/test_answer_actions_api.py` → `All checks passed!`.
 - `python -X utf8 -m pytest tests/test_answer_actions_schema.py tests/test_answer_actions_api.py -q --tb=short` → `30 passed in 9.21s` (verified RED failure on all 4 new regression suites prior to fix, then GREEN).
 - No new database migrations or environment variables introduced; builds on `4b16fc9`.
+
+## Follow-up maintenance: transitive session evidence, full-prefix legacy overlap, and BFF mutation boundary
+
+Verified gaps at `95f549c` and fixes implemented:
+1. **[P1] Transitive session-context share provenance (`sag_api/services/answer_actions_service.py`)**:
+   - Session-backed answers persist `steps[*].session_citations` (`message_ids`, `primary_message_id`, `cited_source_ids`) and/or `steps[*].audit` (`selected_groups`, `recent_turn_ids`, `shadow` mode) while direct `citations` can be empty.
+   - Fix: `_verify_evidence_document_provenance` recursively traverses referenced prior thread messages (bounded depth `32`, node cap `128`, cycle-closed), authorizes referenced assistant sources and `cited_source_ids`, verifies underlying `Document`/`DocumentVersion` revocation state, and fails closed on missing, malformed, cross-thread, or hidden references.
+2. **[P2] Multi-turn legacy parent question overlap & timestamp ties (`sag_api/services/answer_actions_service.py`)**:
+   - Inspecting only two preceding rows missed earlier unresolved overlaps (`q1 -> q2 -> a1 -> q3 -> a2`) and same-timestamp UUID ties.
+   - Fix: `resolve_parent_question` enforces the 32-hop regeneration lineage cap without falling through, rejects equal-timestamp ambiguities, and verifies the entire preceding thread prefix leaves `{candidate_question.id}` as the sole unanswered user turn.
+3. **[P2] Direct SAG JWT answer mutations bypassing archived-project BFF guard (`sag_api/api/v1/agents.py`)**:
+   - Fix: `require_answer_mutation_principal` enforces `require_bff_service_token` alongside `require_project_read_principal` on `PUT /feedback`, `DELETE /feedback`, `POST /shares`, and `POST /regenerate` (paired with `DATN-BE` commit `5800b2c` sending `X-SAG-BFF-Service-Token` after `requireActiveProject`).
+
+### Follow-up verification
+- `ruff check sag_api/api/v1/agents.py sag_api/api/v1/answer_actions.py sag_api/services/answer_actions_service.py tests/test_answer_actions_api.py` → `All checks passed!`.
+- `python -X utf8 -m pytest tests/test_answer_actions_schema.py tests/test_answer_actions_api.py -q --tb=short` → `47 passed`.
+- No database migrations added; builds cleanly on `4b16fc9`.

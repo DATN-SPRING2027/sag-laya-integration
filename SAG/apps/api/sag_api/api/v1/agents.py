@@ -22,7 +22,11 @@ from sag_api.core.deps import (
 from sag_api.core.error_taxonomy import ErrorCode
 from sag_api.core.errors import BadRequestError, ConfigurationError, ConflictError, NotFoundError
 from sag_api.core.logging import get_logger
-from sag_api.core.principal_assertion import VerifiedPrincipal, require_project_read_principal
+from sag_api.core.principal_assertion import (
+    VerifiedPrincipal,
+    require_bff_service_token,
+    require_project_read_principal,
+)
 from sag_api.db.models import User
 from sag_api.generation import LLMClient
 from sag_api.sag import EngineManager
@@ -63,6 +67,12 @@ def _sse(event: str, payload: dict) -> dict:
 
 
 _NO_STORE_HEADERS = {"Cache-Control": "no-store"}
+
+
+async def require_answer_mutation_principal(request: Request) -> VerifiedPrincipal:
+    """Require live-authorized BFF transport while retaining the private session owner."""
+    await require_bff_service_token(request)
+    return await require_project_read_principal(request)
 
 
 async def _parse_strict_body(request: Request, model_cls, *, allow_empty: bool = False):
@@ -508,7 +518,7 @@ async def put_message_feedback(
     message_id: str,
     request: Request,
     owner_key: str = Depends(get_conversation_owner),
-    principal: VerifiedPrincipal = Depends(require_project_read_principal),
+    principal: VerifiedPrincipal = Depends(require_answer_mutation_principal),
     session: AsyncSession = Depends(get_session),
 ) -> JSONResponse:
     payload: FeedbackUpsertIn = await _parse_strict_body(request, FeedbackUpsertIn)
@@ -537,7 +547,7 @@ async def delete_message_feedback(
     thread_id: str,
     message_id: str,
     owner_key: str = Depends(get_conversation_owner),
-    principal: VerifiedPrincipal = Depends(require_project_read_principal),
+    principal: VerifiedPrincipal = Depends(require_answer_mutation_principal),
     session: AsyncSession = Depends(get_session),
 ) -> Response:
     await actions_svc.delete_own_feedback(
@@ -561,7 +571,7 @@ async def create_message_share(
     message_id: str,
     request: Request,
     owner_key: str = Depends(get_conversation_owner),
-    principal: VerifiedPrincipal = Depends(require_project_read_principal),
+    principal: VerifiedPrincipal = Depends(require_answer_mutation_principal),
     session: AsyncSession = Depends(get_session),
 ) -> JSONResponse:
     await _parse_strict_body(request, EmptyBodyIn, allow_empty=True)
@@ -587,7 +597,7 @@ async def regenerate_message(
     message_id: str,
     request: Request,
     owner_key: str = Depends(get_conversation_owner),
-    principal: VerifiedPrincipal = Depends(require_project_read_principal),
+    principal: VerifiedPrincipal = Depends(require_answer_mutation_principal),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
     llm: LLMClient = Depends(get_llm),
