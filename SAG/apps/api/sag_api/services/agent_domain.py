@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -699,6 +700,7 @@ def build_ask_context(
     source_ids: list[str] | None = None,
 ) -> AskPlan:
     """组装带系统提示的消息（不落库，对话与 OpenAI 端点复用）。是否检索由模型经工具决定。"""
+    query = unicodedata.normalize("NFC", query or "")
     messages = build_agent_messages(
         agent.name,
         agent.persona or {},
@@ -731,6 +733,7 @@ async def prepare_ask(
     """落库用户消息（含图片附件 meta）、解析历史（超上下文阈值时主动压缩），组装计划。"""
     from sag_api.api.v1.attachments import attachment_path
 
+    query = unicodedata.normalize("NFC", query or "")
     await get_thread(session, agent.id, thread.id, owner_key=owner_key)
     resolved: list[dict] = []
     for aid in attachments or []:

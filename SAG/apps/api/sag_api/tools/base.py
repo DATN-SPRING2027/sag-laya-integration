@@ -52,6 +52,7 @@ class ToolContext:
     evidence_token_budget: int | None = None
     search_context_called: bool = False
     search_context_no_answer_reason: str | None = None
+    search_context_unavailable: bool = False
 
 
 @dataclass

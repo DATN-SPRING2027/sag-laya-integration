@@ -45,7 +45,9 @@ def build_sparse_query_vector(query: str) -> dict[str, list[int] | list[float]]:
     Uses sub-linear query TF and alphanumeric/entity boosting so repeated framing words
     never drown out discriminative entity, numeric, or domain anchors.
     """
-    normalized_q = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", query)
+    import unicodedata
+
+    normalized_q = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", unicodedata.normalize("NFC", query or ""))
     normalized_q = re.sub(
         r"\b([a-z]{1,2})\s*&\s*([a-z]{1,2})\b",
         r"\1\2",
@@ -238,6 +240,16 @@ class SearchUnitQdrantStore:
                 raise SearchIndexUnavailable("Search index returned an invalid query response")
             results[idx] = self._parse_points(points)
         return results
+
+    async def count(self, collection: str, *, search_filter: dict[str, Any]) -> int:
+        """Check derived-index availability within the exact authorized scope."""
+        path = f"/collections/{quote(collection, safe='')}/points/count"
+        data = await self._request("POST", path, json={"filter": search_filter, "exact": True})
+        result = data.get("result")
+        count = result.get("count") if isinstance(result, dict) else None
+        if type(count) is not int or count < 0:
+            raise SearchIndexUnavailable("Search index returned an invalid count")
+        return count
 
     async def get_point(self, collection: str, point_id: str) -> SearchUnitHit | None:
         path = f"/collections/{quote(collection, safe='')}/points/{quote(point_id, safe='')}"

@@ -549,7 +549,7 @@ def rerank_sections(
             heading=head_norm,
             phrase=effective.normalized_phrase,
             term_weights=term_weights,
-            raw_heading=section.heading or "",
+            raw_heading=contextual_heading or section.heading or "",
         )
         clause_best = (
             max(
@@ -560,7 +560,7 @@ def rerank_sections(
                         heading=head_norm,
                         phrase="",
                         term_weights=term_weights,
-                        raw_heading=section.heading or "",
+                        raw_heading=contextual_heading or section.heading or "",
                     )
                     for ct in clause_term_lists
                 ),
@@ -877,10 +877,14 @@ def select_diverse_sections(
         if features.multi_hop or per_document_limit == 1
         else max(0.94, float(settings.search_doc_admission_ratio))
     )
+    salient_doc_terms = {
+        term for term in extract_salient_query_terms(query) if len(term) >= 3
+    }
     admitted_docs: set[str] = {doc_key(unique[i]) for i in selected_indices}
     if ordered_docs:
         admitted_docs.add(ordered_docs[0])
-        max_initial_docs = limit if (unbounded_limit or features.multi_hop or per_document_limit == 1) else min(limit, 2)
+        allow_wide_docs = unbounded_limit or features.multi_hop or per_document_limit == 1
+        max_initial_docs = limit if allow_wide_docs else min(limit, 2)
         for doc_rank_idx, d_key in enumerate(ordered_docs[1:], start=1):
             if len(admitted_docs) >= max_initial_docs:
                 break
@@ -895,7 +899,18 @@ def select_diverse_sections(
                 )
                 else max(admission_ratio, 0.835)
             )
-            if d_score >= max(0.20, round(eff_ratio * top_doc_score, 6)):
+            doc_name_tokens = {
+                normalize_lexical_text(tok)
+                for tok in re.findall(
+                    r"[^\W_]+",
+                    str(unique[doc_best_idx[d_key]].document_name or ""),
+                    flags=re.UNICODE,
+                )
+            }
+            matches_salient_doc_name = bool(salient_doc_terms and (salient_doc_terms & doc_name_tokens))
+            if d_score >= max(0.20, round(eff_ratio * top_doc_score, 6)) or (
+                matches_salient_doc_name and d_score >= max(0.35, round(0.72 * top_doc_score, 6))
+            ):
                 admitted_docs.add(d_key)
 
     def can_select_from_doc(d_key: str) -> bool:
@@ -958,7 +973,7 @@ def select_diverse_sections(
                 if (per_document_limit == 1 and all_initial_single_chunk)
                 else fallback_doc_floor
                 if (unbounded_limit or per_document_limit == 1 or (features.multi_hop and len(unique) <= limit + 1))
-                else 2.0
+                else max(0.45, 0.78 * top_doc_score)
             )
             next_doc = next(
                 (

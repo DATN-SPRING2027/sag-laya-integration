@@ -3,10 +3,34 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 from sag_api.services.search_index_service import COMMON_STOPWORDS
+
+
+def _nfc(value: str) -> str:
+    return unicodedata.normalize("NFC", value) if value else ""
+
+
+_DMY_DATE_RE = re.compile(r"\b(0?[1-9]|[12]\d|3[01])[/-](0?[1-9]|1[0-2])[/-]((?:19|20)\d{2})\b")
+_ISO_DATE_RE = re.compile(r"\b((?:19|20)\d{2})[/-](0?[1-9]|1[0-2])[/-](0?[1-9]|[12]\d|3[01])\b")
+
+
+def _extract_bridged_date_tokens(text: str) -> list[str]:
+    out: list[str] = []
+    for m in _DMY_DATE_RE.finditer(text):
+        dd, mm, yyyy = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        dmy = f"{dd:02d}/{mm:02d}/{yyyy:04d}"
+        iso = f"{yyyy:04d}-{mm:02d}-{dd:02d}"
+        out.extend((iso, dmy))
+    for m in _ISO_DATE_RE.finditer(text):
+        yyyy, mm, dd = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        iso = f"{yyyy:04d}-{mm:02d}-{dd:02d}"
+        dmy = f"{dd:02d}/{mm:02d}/{yyyy:04d}"
+        out.extend((dmy, iso))
+    return out
 
 _QUERY_NOISE = (
     "kho tri thức",
@@ -85,6 +109,8 @@ _RELATION_STEM_GROUPS: dict[str, str] = {
     "resulted in": "result_in",
     "mối liên hệ": "lien_he",
     "liên hệ": "lien_he",
+    "mối quan hệ": "quan_he",
+    "quan hệ": "quan_he",
 }
 _TEMPORAL_CUES = (
     "trước",
@@ -111,6 +137,8 @@ _TEMPORAL_CUES = (
 _RELATION_CUES = (
     "mối liên hệ",
     "liên hệ",
+    "mối quan hệ",
+    "quan hệ",
     "liên quan",
     "tương tác",
     "phụ thuộc",
@@ -192,11 +220,11 @@ class QueryAnalysis:
 
 
 def normalize_lexical_text(value: str) -> str:
-    return "".join(re.findall(r"[^\W_]+", value.lower(), flags=re.UNICODE))
+    return "".join(re.findall(r"[^\W_]+", _nfc(value).lower(), flags=re.UNICODE))
 
 
 def _remove_query_noise(query: str) -> str:
-    cleaned = query.strip().lower()
+    cleaned = _nfc(query).strip().lower()
     for phrase in _QUERY_NOISE:
         cleaned = cleaned.replace(phrase, " ")
     return cleaned
@@ -231,7 +259,7 @@ _SALIENT_PROPER_TERM_RE = re.compile(
 
 def decompose_query_clauses(query: str) -> tuple[str, ...]:
     """Split a compound multi-clause question into independent semantic sub-queries."""
-    text = query.strip()
+    text = _nfc(query).strip()
     if not text:
         return ()
     parts = [part.strip(" ,;?") for part in _CLAUSE_SPLIT_RE.split(text) if part and part.strip(" ,;?")]
@@ -243,7 +271,7 @@ def decompose_query_clauses(query: str) -> tuple[str, ...]:
 
 def extract_salient_query_terms(query: str) -> frozenset[str]:
     """Identify proper nouns, CamelCase symbols, acronyms, and alphanumeric identifiers from cased query."""
-    text = query.strip()
+    text = _nfc(query).strip()
     if not text:
         return frozenset()
     salient: set[str] = set()
@@ -263,7 +291,7 @@ def extract_salient_query_terms(query: str) -> frozenset[str]:
 def extract_query_features(query: str) -> QueryFeatures:
     """Extract bounded, domain-agnostic query signals for routing and trace output."""
 
-    text = query.strip()
+    text = _nfc(query).strip()
     lowered = text.lower()
     exact_terms = _unique_values(
         match.group(index)
@@ -271,7 +299,9 @@ def extract_query_features(query: str) -> QueryFeatures:
         for index in range(1, 6)
         if match.group(index)
     )
-    identifier_terms = _unique_values(match.group(0) for match in _IDENTIFIER_RE.finditer(text))
+    identifier_terms = _unique_values(
+        [*(match.group(0) for match in _IDENTIFIER_RE.finditer(text)), *_extract_bridged_date_tokens(text)]
+    )
     path_terms = _unique_values(
         cleaned_path
         for match in _PATH_RE.finditer(text)
@@ -405,7 +435,8 @@ def _filter_informative_tokens(tokens: list[str]) -> list[str]:
 def _legacy_query_terms(
     cleaned: str,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    raw = _LEGACY_TERM_RE.findall(cleaned)
+    bridged_dates = _extract_bridged_date_tokens(cleaned)
+    raw = [*bridged_dates, *_LEGACY_TERM_RE.findall(cleaned)]
     return _split_alnum_terms(_filter_informative_tokens(raw))
 
 
@@ -423,7 +454,7 @@ def _segmented_terms(
     cleaned: str,
     segmenter: Segmenter,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    values: list[str] = []
+    values: list[str] = list(_extract_bridged_date_tokens(cleaned))
     for part in _LEXICAL_PART_RE.findall(cleaned):
         if _CHINESE_RUN_RE.fullmatch(part):
             if len(part) < 2:
@@ -440,6 +471,7 @@ def analyze_query(
     segmentation_enabled: bool = True,
     segmenter: Segmenter | None = None,
 ) -> QueryAnalysis:
+    query = _nfc(query)
     cleaned = _remove_query_noise(query)
     phrase = normalize_lexical_text(cleaned)
     features = extract_query_features(query)

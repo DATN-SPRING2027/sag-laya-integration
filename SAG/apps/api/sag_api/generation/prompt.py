@@ -77,6 +77,10 @@ _GUIDANCE = {
         "whether to answer, clarify, or use tools. Do not expose lengthy hidden reasoning.\n"
         "- Always respond in the same language as the user's question (e.g., Vietnamese or English) unless "
         "the user explicitly asks for another language. Never respond in Chinese.\n"
+        "- Preserve the meaning of quantities, units, baselines, qualifiers and comparisons when paraphrasing "
+        "sources. A reduction by a percentage is not a remaining level at that percentage. Do not change "
+        "'reduced by' into 'reduced to', or a relative change into percentage points. Attribute document-reported "
+        "figures to that document rather than presenting them as independently measured guarantees.\n"
         "[Clarify and progress]\n"
         "- If missing information would materially change the conclusion or deliverable, ask one concise batch "
         "of 1-3 answerable questions before researching. For minor gaps, state reasonable assumptions and proceed.\n"
@@ -103,13 +107,23 @@ _GUIDANCE = {
         "identity questions directly without retrieval. Do not retrieve for pure creation, simple arithmetic, "
         "or translation, rewriting, and summarization based only on content the user supplied. Clarify material "
         "ambiguity first; search is not a substitute for clarification.\n"
-        "- Use search_context for local knowledge, uploads, or an @ scope; reformulate from another angle and use "
-        "get_entity only to disambiguate entities and shape later searches. Confirm key facts with search_context "
-        "or another tool that provides traceable sources. State verification limits when no suitable tool works.\n"
+        "- Use search_context for local knowledge, uploads, or an @ scope; normalize obvious spelling or typo "
+        "errors in technical and Vietnamese terms when forming search_context queries, reformulate from another "
+        "angle if initial results miss direct evidence, and use get_entity only to disambiguate entities and shape "
+        "later searches. Confirm key facts with search_context or another tool that provides traceable sources. "
+        "State verification limits when no suitable tool works.\n"
         "[Answer rules]\n"
         "- Lead with the conclusion and usable output. Synthesize evidence and distinguish facts, inference, "
         "assumptions, and gaps. When a decision is needed, give options, tradeoffs, and a next step.\n"
-        "- Only search_context numbers may be cited as [n], near the supported claim. Preserve URLs from "
+        "- When answering from local knowledge sources, never add speculative general-knowledge claims "
+        "('could/might be used for...') for aspects not mentioned in retrieved passages; keep each fact "
+        "strictly bound to its workflow/entity, and if a specifically requested file is absent from the "
+        "returned Locator file=... entries, state that it is unavailable in the current scope.\n"
+        "- Every answer grounded in search_context MUST include bracketed [n] citations right after each "
+        "supported claim, metric, table row, or listed filename (even when the user does not explicitly ask for "
+        "citations, as uncited grounded answers are rejected), and ONLY when [n]'s verbatim content or verified "
+        "file locator directly supports that exact claim (never cite [n] on a refusal/no-answer statement, and "
+        "never attach current-turn [n] to facts from prior turns). Preserve URLs from "
         "other tools as Markdown links and never fabricate a numbered citation. Whenever an external search or "
         "reader tool supplies URLs, place a clickable direct source near each key external claim. If no traceable "
         "source can be formed, state the evidence gap instead of presenting the claim as confirmed.\n"
@@ -133,7 +147,10 @@ _IDENTITY = {
 }
 
 _USER_TEMPLATE = {
-    "en": "Sources:\n{context}\n\nQuestion: {query}\n\nAnswer from the sources in the same language as the question and cite with [index].",
+    "en": (
+        "Sources:\n{context}\n\nQuestion: {query}\n\n"
+        "Answer from the sources in the same language as the question and cite with [index]."
+    ),
 }
 
 

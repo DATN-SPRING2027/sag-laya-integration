@@ -14,6 +14,8 @@ orthogonal 7-axis specification:
 from __future__ import annotations
 
 import re
+import unicodedata
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -232,8 +234,11 @@ _DOC_ALL_RE = re.compile(
     rf"|\b(?:all|every)\s+(?:the\s+)?(?:[a-z_-]+\s+){{0,2}}(?:{_DOC_UNIT_WORDS})\b)"
 )
 _DOC_LIST_RE = re.compile(
-    rf"(?i)(?:\b(?:liệt\s+kê|danh\s+sách|kể\s+tên|cho\s+biết\s+các|những\s+(?:{_DOC_UNIT_WORDS})\s+nào|các\s+(?:{_DOC_UNIT_WORDS})\s+nào)\b.*\b(?:{_DOC_UNIT_WORDS})?\b"
-    rf"|\b(?:liệt\s+kê|danh\s+sách|list|show\s+all|what\s+are\s+the|which)\s+(?:các\s+|những\s+|the\s+)?(?:[a-zà-ỹ_-]+\s+){{0,2}}(?:{_DOC_UNIT_WORDS})\b)"
+    rf"(?i)(?:\b(?:liệt\s+kê|danh\s+sách|kể\s+tên|cho\s+biết\s+các)\b.*\b(?:{_DOC_UNIT_WORDS})\b"
+    rf"|\b(?:những|các)\s+(?:{_DOC_UNIT_WORDS})(?:\s+[^\W\d_][\w-]*){{0,3}}\s+nào\b"
+    rf"|(?<!theo\s)(?<!trong\s)\b(?:hiện\s+có|gồm(?:\s+có)?|bao\s+gồm|có)\s+(?:những\s+|các\s+)?(?:{_DOC_UNIT_WORDS})(?:\s+[^\W\d_][\w-]*){{0,3}}\s+nào\b"
+    rf"|\b(?:liệt\s+kê|danh\s+sách|list|show\s+all|what\s+are\s+the|which)\s+(?:các\s+|những\s+|the\s+)?(?:[^\W\d_][\w-]*\s+){{0,2}}(?:{_DOC_UNIT_WORDS})\b)",
+    re.UNICODE,
 )
 _DOC_OPEN_RE = re.compile(
     rf"(?i)^\s*(?:hãy\s+|vui\s+lòng\s+|please\s+)?(?:mở|xem\s+nội\s+dung|hiển\s+thị\s+toàn\s+bộ|open|view)\s+(?:{_DOC_UNIT_WORDS})\b"
@@ -264,7 +269,7 @@ class QueryShapeSignals:
 
 def extract_query_cardinality_and_shape(query: str) -> QueryShapeSignals:
     """Deterministically extract explicit count and target/output shape from a query."""
-    cleaned = (query or "").strip()
+    cleaned = unicodedata.normalize("NFC", query or "").strip()
     if not cleaned:
         return QueryShapeSignals(
             answer_shape=AnswerShape.FACT_ANSWER,
@@ -434,6 +439,7 @@ def build_retrieval_plan(
     cursor: str | None = None,
 ) -> RetrievalPlan:
     """Compile query + routing signals into a validated 7-axis RetrievalPlan."""
+    query = unicodedata.normalize("NFC", query or "")
     signals = extract_query_cardinality_and_shape(query)
     target, output, card_mode = _shape_to_target_output(answer_shape, signals)
 
@@ -510,10 +516,15 @@ def build_retrieval_plan(
             cursor=cursor,
         )
     else:
+        effective_default_n = (
+            max_cap
+            if (target == TargetUnit.DOCUMENT and output == OutputMode.LIST and card_mode == CardinalityMode.ALL)
+            else default_n
+        )
         cardinality = CardinalitySpec(
             mode=card_mode,
             requested_n=None,
-            effective_n=default_n,
+            effective_n=effective_default_n,
             max_cap=max_cap,
             count_source=CountSource.DEFAULT,
             cursor=cursor,
@@ -531,6 +542,72 @@ def build_retrieval_plan(
         fallback_used=fallback_used,
         unsupported_reason=unsupported_reason,
     )
+
+
+_CATALOG_META_TOKENS: frozenset[str] = frozenset(
+    {
+        "liệt", "kê", "danh", "sách", "kể", "tên", "tất", "cả", "toàn", "bộ", "mọi",
+        "tài", "liệu", "file", "files", "document", "documents", "doc", "docs", "tệp",
+        "tập", "tin", "văn", "bản", "hồ", "sơ", "báo", "cáo", "spec", "specs", "runbook", "runbooks",
+        "dự", "án", "project", "projects", "workspace", "kho", "tri", "thức", "knowledge", "base",
+        "scope", "phạm", "vi", "nguồn", "source", "sources", "hiện", "tại", "có", "gồm",
+        "bao", "nhiêu", "mấy", "tổng", "cộng", "con", "số", "lượng", "đếm", "sẵn", "sàng",
+        "tra", "cứu", "tìm", "kiếm", "xem", "cho", "biết", "tôi", "hỏi", "hãy", "vui", "lòng", "please",
+        "list", "show", "all", "every", "how", "many", "available", "ready", "indexed", "searchable",
+        "search", "search_ready", "in", "the", "of", "for", "and", "or", "what", "are", "which", "current",
+        "của", "trong", "ở", "thuộc", "là", "gì", "nào", "những", "các", "đã", "chưa", "đang", "được",
+        "và", "hay", "đầy", "đủ", "cụ", "thể", "từng", "hết", "rõ", "nêu", "ra", "kèm", "trích", "dẫn",
+        "nhé", "nội", "dung", "quan", "chính", "này", "đó", "một",
+    }
+)
+_SOURCE_NAME_ALIASES: dict[str, tuple[str, ...]] = {
+    "database": ("db", "cơ", "sở", "dữ", "liệu"),
+    "design": ("thiết", "kế", "ui", "ux"),
+    "documentation": ("doc", "docs", "báo", "cáo"),
+    "frontend": ("fe",),
+    "backend": ("be",),
+    "general": ("chung",),
+    "research": ("nghiên", "cứu"),
+}
+_TOPIC_FILTER_CUES_RE = re.compile(
+    r"\b(?:nói\s+về|viết\s+về|bàn\s+về|liên\s+quan|đề\s+cập|chứa|"
+    r"about|regarding|related\s+to|concerning|containing|mentioning)\b",
+    re.IGNORECASE | re.UNICODE,
+)
+_BOUND_SCOPE_NAME_RE = re.compile(
+    r"\b(?:project|dự\s+án|workspace)\s+[\w-]+",
+    re.IGNORECASE | re.UNICODE,
+)
+
+
+def is_unfiltered_scope_catalog_query(
+    query: str,
+    source_names: Iterable[str] = (),
+) -> bool:
+    """Return True when a DOCUMENT LIST/COUNT query asks for the entire bound scope without a narrow topic filter."""
+    normalized_q = unicodedata.normalize("NFC", query or "").strip()
+    if not normalized_q:
+        return False
+    signals = extract_query_cardinality_and_shape(normalized_q)
+    if (
+        signals.target != TargetUnit.DOCUMENT
+        or signals.output not in {OutputMode.LIST, OutputMode.COUNT}
+        or signals.explicit_count is not None
+    ):
+        return False
+    if re.search(r'["“”`]|\b[\w-]+\.(?:md|pdf|docx|txt|json|ya?ml|csv|xlsx)\b', normalized_q, re.IGNORECASE):
+        return False
+    if _TOPIC_FILTER_CUES_RE.search(normalized_q):
+        return False
+    stripped_q = _BOUND_SCOPE_NAME_RE.sub(" ", normalized_q)
+    allowed = set(_CATALOG_META_TOKENS)
+    for raw_name in source_names:
+        for tok in re.findall(r"[^\W_]+", unicodedata.normalize("NFC", raw_name or "").lower(), flags=re.UNICODE):
+            allowed.add(tok)
+            allowed.update(_SOURCE_NAME_ALIASES.get(tok, ()))
+    tokens = re.findall(r"[^\W_]+", stripped_q.lower(), flags=re.UNICODE)
+    leftover = [tok for tok in tokens if tok not in allowed]
+    return len(leftover) == 0
 
 
 def group_sections_by_document(
