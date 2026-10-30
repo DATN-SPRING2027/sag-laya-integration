@@ -1162,6 +1162,18 @@ async def generate_stream(
                 output_payload: Mapping[str, Any] = payload
 
                 if event.type == EventType.RUN_STARTED:
+                    session_context_meta: dict[str, Any] | None = None
+                    if isinstance(plan_audit_trace, Mapping):
+                        raw_latency = plan_audit_trace.get("latency_ms")
+                        latency_ms = (
+                            max(0, round(float(raw_latency)))
+                            if isinstance(raw_latency, (int, float)) and not isinstance(raw_latency, bool)
+                            else 0
+                        )
+                        session_context_meta = {
+                            "mode": str(plan_audit_trace.get("mode") or ""),
+                            "ms": latency_ms,
+                        }
                     output_payload = {
                         **payload,
                         "user_message_id": plan.user_message_id,
@@ -1171,14 +1183,21 @@ async def generate_stream(
                         "tool_warnings": mcp_bundle.warnings,
                         "web_enabled": not knowledge_only,
                         "knowledge_only": knowledge_only,
+                        **({"session_context": session_context_meta} if session_context_meta is not None else {}),
                     }
                 elif event.type in (
                     EventType.TOOL_APPROVAL_REQUIRED,
                     EventType.TOOL_STARTED,
                 ):
+                    tool_name = str(payload.get("name") or "")
+                    resolved_label = payload.get("label") or _TOOL_LABELS.get(tool_name) or tool_name
                     tool_inputs[str(payload.get("tool_call_id") or "")] = {
-                        "label": payload.get("label") or payload.get("name"),
+                        "label": resolved_label,
                         "arguments": dict(payload.get("arguments") or {}),
+                    }
+                    output_payload = {
+                        **payload,
+                        "label": resolved_label,
                     }
                 elif event.type == EventType.TOOL_COMPLETED:
                     details = payload.get("details") or {}
@@ -1204,12 +1223,23 @@ async def generate_stream(
                         )
                     tool_call_id = str(payload.get("tool_call_id") or "")
                     started = tool_inputs.pop(tool_call_id, {})
+                    tool_name = str(payload.get("name") or "")
+                    resolved_label = (
+                        started.get("label")
+                        or payload.get("label")
+                        or _TOOL_LABELS.get(tool_name)
+                        or tool_name
+                    )
+                    output_payload = {
+                        **payload,
+                        "label": resolved_label,
+                    }
                     trace.append(
                         {
                             "kind": "tool",
                             "step": event.turn,
                             "name": payload["name"],
-                            "label": started.get("label") or payload.get("name"),
+                            "label": resolved_label,
                             "arguments": started.get("arguments") or {},
                             "ms": payload.get("duration_ms", 0),
                             "count": details.get("count", 0),
@@ -1220,12 +1250,23 @@ async def generate_stream(
                     error = payload.get("error") or {}
                     tool_call_id = str(payload.get("tool_call_id") or "")
                     started = tool_inputs.pop(tool_call_id, {})
+                    tool_name = str(payload.get("name") or "")
+                    resolved_label = (
+                        started.get("label")
+                        or payload.get("label")
+                        or _TOOL_LABELS.get(tool_name)
+                        or tool_name
+                    )
+                    output_payload = {
+                        **payload,
+                        "label": resolved_label,
+                    }
                     trace.append(
                         {
                             "kind": "tool",
                             "step": event.turn,
                             "name": payload["name"],
-                            "label": started.get("label") or payload.get("label") or payload.get("name"),
+                            "label": resolved_label,
                             "arguments": started.get("arguments") or {},
                             "ms": payload.get("duration_ms", 0),
                             "count": 0,
@@ -1317,6 +1358,7 @@ async def generate_stream(
                         "reply_to_message_id": plan.user_message_id,
                         "regenerated_from_message_id": getattr(plan, "regenerated_from_message_id", None),
                         "citations": canonical_citations,
+                        "steps": list(trace),
                         "answer_status": answer_status,
                         "no_answer_reason": no_answer_reason,
                         "prompt_preview": frozen_prompt_preview,
