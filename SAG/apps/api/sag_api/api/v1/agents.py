@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request, Response
+from fastapi.responses import JSONResponse
+from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
@@ -18,9 +20,13 @@ from sag_api.core.deps import (
     get_tool_registry,
 )
 from sag_api.core.error_taxonomy import ErrorCode
-from sag_api.core.errors import ConfigurationError, ConflictError, NotFoundError
+from sag_api.core.errors import BadRequestError, ConfigurationError, ConflictError, NotFoundError
 from sag_api.core.logging import get_logger
-from sag_api.core.principal_assertion import VerifiedPrincipal, require_project_read_principal
+from sag_api.core.principal_assertion import (
+    VerifiedPrincipal,
+    require_bff_service_token,
+    require_project_read_principal,
+)
 from sag_api.db.models import User
 from sag_api.generation import LLMClient
 from sag_api.sag import EngineManager
@@ -38,9 +44,18 @@ from sag_api.schemas.agent import (
     ThreadUpdate,
     ToolRejection,
 )
+from sag_api.schemas.answer_actions import (
+    EmptyBodyIn,
+    FeedbackOut,
+    FeedbackUpsertIn,
+    OwnFeedbackOut,
+    RegenerateIn,
+    ShareOut,
+)
 from sag_api.schemas.common import Ok
 from sag_api.services import agent_domain as svc
 from sag_api.services import agent_service
+from sag_api.services import answer_actions_service as actions_svc
 from sag_api.tools import ToolRegistry
 
 router = APIRouter(prefix="/agents", tags=["agents"])
@@ -49,6 +64,35 @@ log = get_logger("agents")
 
 def _sse(event: str, payload: dict) -> dict:
     return {"event": event, "data": json.dumps(payload, ensure_ascii=False)}
+
+
+_NO_STORE_HEADERS = {"Cache-Control": "no-store"}
+
+
+async def require_answer_mutation_principal(request: Request) -> VerifiedPrincipal:
+    """Require live-authorized BFF transport while retaining the private session owner."""
+    await require_bff_service_token(request)
+    return await require_project_read_principal(request)
+
+
+async def _parse_strict_body(request: Request, model_cls, *, allow_empty: bool = False):
+    raw_bytes = await request.body()
+    if not raw_bytes or not raw_bytes.strip():
+        if not allow_empty:
+            raise BadRequestError("Request JSON body is required")
+        raw_obj: object = {}
+    else:
+        try:
+            raw_obj = json.loads(raw_bytes)
+        except ValueError as exc:
+            raise BadRequestError("Malformed JSON request body") from exc
+    if not isinstance(raw_obj, dict):
+        raise BadRequestError("Request body must be a JSON object")
+    try:
+        return model_cls.model_validate(raw_obj)
+    except PydanticValidationError as exc:
+        first_msg = exc.errors()[0].get("msg", "Invalid request body") if exc.errors() else "Invalid request body"
+        raise BadRequestError(str(first_msg)) from exc
 
 
 async def _owned_run(
@@ -367,7 +411,9 @@ async def ask(
     thread = await svc.get_thread(session, agent.id, thread_id, owner_key=owner_key)
     if not llm.configured:
         raise ConfigurationError("尚未配置 LLM，无法生成回答")
-    plan = await svc.prepare_ask(
+    actions_svc.claim_thread_generation(thread.id, agent_runtime)
+    try:
+        plan = await svc.prepare_ask(
         session,
         agent=agent,
         thread=thread,
@@ -376,8 +422,11 @@ async def ask(
         source_ids=body.source_ids,
         principal=principal,
         owner_key=owner_key,
-        llm=llm,
-    )
+            llm=llm,
+        )
+    except BaseException:
+        actions_svc.release_thread_generation(thread.id)
+        raise
     web_enabled = body.effective_web_enabled
 
     async def event_gen():
@@ -421,8 +470,205 @@ async def ask(
                 EventType.RUN_FAILED.value,
                 data,
             )
+        finally:
+            actions_svc.release_thread_generation(thread.id)
 
     return EventSourceResponse(
         event_gen(),
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+
+# ── Answer Actions (Feedback, Share, Regenerate) ────────────────────
+@router.get(
+    "/{agent_id}/threads/{thread_id}/messages/{message_id}/feedback",
+    response_model=OwnFeedbackOut,
+)
+async def get_message_feedback(
+    agent_id: str,
+    thread_id: str,
+    message_id: str,
+    owner_key: str = Depends(get_conversation_owner),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
+    session: AsyncSession = Depends(get_session),
+) -> JSONResponse:
+    result = await actions_svc.get_own_feedback(
+        session,
+        agent_id=agent_id,
+        thread_id=thread_id,
+        message_id=message_id,
+        owner_key=owner_key,
+        principal=principal,
+    )
+    return JSONResponse(
+        status_code=200,
+        content=result.model_dump(mode="json"),
+        headers=_NO_STORE_HEADERS,
+    )
+
+
+@router.put(
+    "/{agent_id}/threads/{thread_id}/messages/{message_id}/feedback",
+    response_model=FeedbackOut,
+)
+async def put_message_feedback(
+    agent_id: str,
+    thread_id: str,
+    message_id: str,
+    request: Request,
+    owner_key: str = Depends(get_conversation_owner),
+    principal: VerifiedPrincipal = Depends(require_answer_mutation_principal),
+    session: AsyncSession = Depends(get_session),
+) -> JSONResponse:
+    payload: FeedbackUpsertIn = await _parse_strict_body(request, FeedbackUpsertIn)
+    result = await actions_svc.upsert_own_feedback(
+        session,
+        agent_id=agent_id,
+        thread_id=thread_id,
+        message_id=message_id,
+        owner_key=owner_key,
+        principal=principal,
+        payload=payload,
+    )
+    return JSONResponse(
+        status_code=200,
+        content=result.model_dump(mode="json"),
+        headers=_NO_STORE_HEADERS,
+    )
+
+
+@router.delete(
+    "/{agent_id}/threads/{thread_id}/messages/{message_id}/feedback",
+    status_code=204,
+)
+async def delete_message_feedback(
+    agent_id: str,
+    thread_id: str,
+    message_id: str,
+    owner_key: str = Depends(get_conversation_owner),
+    principal: VerifiedPrincipal = Depends(require_answer_mutation_principal),
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    await actions_svc.delete_own_feedback(
+        session,
+        agent_id=agent_id,
+        thread_id=thread_id,
+        message_id=message_id,
+        owner_key=owner_key,
+        principal=principal,
+    )
+    return Response(status_code=204, headers=_NO_STORE_HEADERS)
+
+
+@router.post(
+    "/{agent_id}/threads/{thread_id}/messages/{message_id}/shares",
+    response_model=ShareOut,
+)
+async def create_message_share(
+    agent_id: str,
+    thread_id: str,
+    message_id: str,
+    request: Request,
+    owner_key: str = Depends(get_conversation_owner),
+    principal: VerifiedPrincipal = Depends(require_answer_mutation_principal),
+    session: AsyncSession = Depends(get_session),
+) -> JSONResponse:
+    await _parse_strict_body(request, EmptyBodyIn, allow_empty=True)
+    share_out, created = await actions_svc.create_or_get_share(
+        session,
+        agent_id=agent_id,
+        thread_id=thread_id,
+        message_id=message_id,
+        owner_key=owner_key,
+        principal=principal,
+    )
+    return JSONResponse(
+        status_code=201 if created else 200,
+        content=share_out.model_dump(mode="json"),
+        headers=_NO_STORE_HEADERS,
+    )
+
+
+@router.post("/{agent_id}/threads/{thread_id}/messages/{message_id}/regenerate")
+async def regenerate_message(
+    agent_id: str,
+    thread_id: str,
+    message_id: str,
+    request: Request,
+    owner_key: str = Depends(get_conversation_owner),
+    principal: VerifiedPrincipal = Depends(require_answer_mutation_principal),
+    session: AsyncSession = Depends(get_session),
+    engine_manager: EngineManager = Depends(get_engine_manager),
+    llm: LLMClient = Depends(get_llm),
+    tool_registry: ToolRegistry = Depends(get_tool_registry),
+    agent_runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> EventSourceResponse:
+    body: RegenerateIn = await _parse_strict_body(request, RegenerateIn, allow_empty=True)
+    agent = await svc.get_agent(session, agent_id, owner_key=owner_key)
+    thread = await svc.get_thread(session, agent.id, thread_id, owner_key=owner_key)
+    if not llm.configured:
+        raise ConfigurationError("尚未配置 LLM，无法生成回答")
+
+    actions_svc.claim_thread_generation(thread.id, agent_runtime)
+    try:
+        plan = await actions_svc.prepare_regenerate(
+            session,
+            agent=agent,
+            thread=thread,
+            target_message_id=message_id,
+            principal=principal,
+            owner_key=owner_key,
+            llm=llm,
+        )
+    except BaseException:
+        actions_svc.release_thread_generation(thread.id)
+        raise
+
+    web_enabled = body.effective_web_enabled
+
+    async def event_gen():
+        last = None
+        try:
+            async for event in agent_service.generate_stream(
+                SessionLocal,
+                plan=plan,
+                agent=agent,
+                thread_id=thread.id,
+                engine_manager=engine_manager,
+                llm=llm,
+                tool_registry=tool_registry,
+                runtime=agent_runtime,
+                knowledge_only=not web_enabled,
+                principal=principal,
+            ):
+                last = event
+                yield _sse(event.type, event.data)
+        except Exception as e:  # noqa: BLE001
+            log.exception("regenerate 流异常终止：%s", e)
+            run_id = last.data.get("run_id", "") if last is not None else ""
+            sequence = int(last.data.get("sequence", 0)) + 1 if last is not None else 0
+            data = {
+                "version": 1,
+                "type": EventType.RUN_FAILED.value,
+                "run_id": run_id,
+                "sequence": sequence,
+                "timestamp": datetime.now(UTC).isoformat(),
+                "turn": 0,
+                "payload": {
+                    "error": {
+                        "code": ErrorCode.STREAM_ERROR,
+                        "message": f"生成中断：{getattr(e, 'message', None) or e}",
+                        "retryable": True,
+                        "details": {},
+                    }
+                },
+            }
+            yield _sse(EventType.RUN_FAILED.value, data)
+        finally:
+            actions_svc.release_thread_generation(thread.id)
+
+    return EventSourceResponse(
+        event_gen(),
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )

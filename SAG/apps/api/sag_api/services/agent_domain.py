@@ -508,6 +508,8 @@ async def filter_messages_for_scope(
         visible.append(Message(
             id=getattr(message, "id", None),
             thread_id=getattr(message, "thread_id", None),
+            reply_to_message_id=getattr(message, "reply_to_message_id", None),
+            regenerated_from_message_id=getattr(message, "regenerated_from_message_id", None),
             created_at=getattr(message, "created_at", None),
             role=MessageRole.ASSISTANT,
             content=(
@@ -615,6 +617,7 @@ class AskPlan:
     prompt_preview: str = ""
     source_ids: list[str] | None = None  # @范围：限定循环内检索工具可见的信源
     user_message_id: str | None = None
+    regenerated_from_message_id: str | None = None
     session_audit_trace: dict[str, Any] | None = None
     route_decision: dict[str, Any] | None = None
     session_citations: list[dict[str, Any]] = field(default_factory=list)
@@ -822,6 +825,8 @@ async def persist_answer(
     steps: list[dict] | None = None,
     prompt_preview: str = "",
     *,
+    reply_to_message_id: str | None = None,
+    regenerated_from_message_id: str | None = None,
     status: MessageStatus = MessageStatus.OK,
     error: dict | None = None,
 ) -> str:
@@ -829,6 +834,8 @@ async def persist_answer(
     并附带结构化 error {code, message, retryable, details}。"""
     async with session_factory() as session:
         message = Message(
+            reply_to_message_id=reply_to_message_id,
+            regenerated_from_message_id=regenerated_from_message_id,
             thread_id=thread_id,
             role=MessageRole.ASSISTANT,
             content=answer,

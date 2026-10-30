@@ -96,6 +96,13 @@ class ConflictError(ApiError):
     code = ErrorCode.CONFLICT
 
 
+class BadRequestError(ApiError):
+    """客户端请求参数非法（HTTP 400）。"""
+
+    status_code = 400
+    code = ErrorCode.VALIDATION_ERROR
+
+
 class ValidationError(ApiError):
     """输入校验失败。"""
 

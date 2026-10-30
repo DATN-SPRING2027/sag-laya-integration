@@ -1307,11 +1307,15 @@ async def generate_stream(
                             canonical_citations,
                             steps=trace,
                             prompt_preview=frozen_prompt_preview,
+                            reply_to_message_id=plan.user_message_id,
+                            regenerated_from_message_id=getattr(plan, "regenerated_from_message_id", None),
                         )
                     output_payload = {
                         **payload,
                         "output": canonical_answer,
                         "message_id": message_id,
+                        "reply_to_message_id": plan.user_message_id,
+                        "regenerated_from_message_id": getattr(plan, "regenerated_from_message_id", None),
                         "citations": canonical_citations,
                         "answer_status": answer_status,
                         "no_answer_reason": no_answer_reason,
@@ -1346,12 +1350,16 @@ async def generate_stream(
                             internal_citations,
                             steps=trace,
                             prompt_preview=frozen_prompt_preview,
+                            reply_to_message_id=plan.user_message_id,
+                            regenerated_from_message_id=getattr(plan, "regenerated_from_message_id", None),
                             status=status,
                             error=dict(error_payload) if isinstance(error_payload, Mapping) else None,
                         )
                     output_payload = {
                         **payload,
                         "message_id": message_id,
+                        "reply_to_message_id": plan.user_message_id,
+                        "regenerated_from_message_id": getattr(plan, "regenerated_from_message_id", None),
                         "partial_output": canonical_answer,
                         "prompt_preview": frozen_prompt_preview,
                     }

@@ -72,6 +72,8 @@ class MessageOut(BaseModel):
 
     id: str
     thread_id: str
+    reply_to_message_id: str | None = None
+    regenerated_from_message_id: str | None = None
     role: MessageRole
     content: str
     citations: list[dict[str, Any]]
