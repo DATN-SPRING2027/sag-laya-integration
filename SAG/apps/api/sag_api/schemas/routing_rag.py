@@ -5,9 +5,20 @@ Complies with Section 9.1 and 9.2 of phase-0-contracts-and-foundations.md.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
+
+
+class DocumentObjectIngestRequest(BaseModel):
+    source_url: str = Field(..., min_length=8, max_length=4096)
+    original_filename: str = Field(..., min_length=1, max_length=512)
+    content_type: str = Field(default="application/octet-stream", max_length=256)
+    expected_sha256: str = Field(..., pattern=r"^[a-fA-F0-9]{64}$")
+    expected_size_bytes: int = Field(..., ge=1)
+    logical_source_id: str | None = Field(default=None, max_length=512)
+    source_published_at: datetime | None = None
 
 
 class DocumentUploadResponse(BaseModel):
@@ -76,3 +87,11 @@ class DocumentRevokeRequest(BaseModel):
 class DocumentRevokeResponse(BaseModel):
     status: Literal["REVOKED", "ALREADY_REVOKED", "NOT_FOUND"]
     document_id: str | None = None
+
+
+class DocumentReprocessRequest(BaseModel):
+    source_url: str | None = Field(default=None, min_length=8, max_length=4096)
+    original_filename: str | None = Field(default=None, min_length=1, max_length=512)
+    content_type: str | None = Field(default=None, max_length=256)
+    expected_sha256: str | None = Field(default=None, pattern=r"^[a-fA-F0-9]{64}$")
+    expected_size_bytes: int | None = Field(default=None, ge=1)

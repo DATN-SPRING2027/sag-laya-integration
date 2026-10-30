@@ -222,16 +222,32 @@ class Settings(BaseSettings):
     # ── 文档解析（进入 zleap-sag 前统一转为 Markdown）─────────────────
     # auto：PDF 优先 MinerU，未配置或 MinerU 失败时回退本地 MarkItDown。
     document_parser: Literal["auto", "markitdown", "mineru"] = "auto"
-    mineru_provider: Literal["302", "official"] = "302"
-    mineru_base_url: str | None = "https://api.302ai.cn"
-    mineru_api_key: str | None = None
-    mineru_version: Literal["2.0", "2.5"] = "2.5"
+    mineru_provider: Literal["official"] = "official"
+    mineru_base_url: str | None = "https://mineru.net"
+    mineru_official_api_token: str | None = None
+
     mineru_official_model: Literal["pipeline", "vlm"] = "vlm"
     mineru_parse_method: Literal["auto", "txt", "ocr"] = "auto"
     mineru_request_timeout: float = 60.0
     mineru_poll_interval: float = 2.0
     mineru_poll_timeout: float = 300.0
     mineru_result_max_mb: int = 100
+
+    # ── R2 Object Ingest & Multi-Lane Parsing ──────────────────────────
+    object_ingest_allowed_hosts: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: [".r2.cloudflarestorage.com"]
+    )
+    object_ingest_allow_private_hosts_in_dev: bool = False
+    object_ingest_timeout_seconds: float = Field(default=120.0, ge=5.0, le=900.0)
+    local_parse_workers: int = Field(default=2, ge=1, le=16)
+    local_parse_timeout_seconds: float = Field(default=90.0, ge=5.0, le=600.0)
+    local_parse_max_tasks_per_child: int = Field(default=25, ge=1, le=500)
+    mineru_io_concurrency: int = Field(default=16, ge=1, le=128)
+    fast_parse_concurrency: int = Field(default=16, ge=1, le=128)
+    per_project_heavy_parse_limit: int = Field(default=3, ge=1, le=32)
+    excel_max_rows_per_sheet: int = Field(default=5000, ge=10, le=100_000)
+    excel_max_cols_per_sheet: int = Field(default=64, ge=4, le=512)
+    remote_snapshot_gc_enabled: bool = True
 
     # ── 检索默认 ────────────────────────────────────────────────────────
     # multi_es_fast：默认策略。相关率平均比 vector 高 ~14 个百分点；
@@ -334,7 +350,7 @@ class Settings(BaseSettings):
             data["decision_model"] = "Kev-4b"
         return data
 
-    @field_validator("cors_origins", mode="before")
+    @field_validator("cors_origins", "object_ingest_allowed_hosts", mode="before")
     @classmethod
     def _split_origins(cls, v: object) -> object:
         """允许用逗号分隔的字符串配置 CORS 源。"""
@@ -346,6 +362,36 @@ class Settings(BaseSettings):
                 return json.loads(v)
             return [o.strip() for o in v.split(",") if o.strip()]
         return v
+
+    @field_validator("mineru_provider", mode="before")
+    @classmethod
+    def _normalize_mineru_provider(cls, _value: object) -> str:
+        """系统仅使用 MinerU Official API v4；旧配置值自动归一为 official。"""
+        return "official"
+
+    @field_validator("mineru_base_url", mode="before")
+    @classmethod
+    def _normalize_mineru_base_url(cls, value: object) -> object:
+        """空串或遗留 302 端点自动迁移至 MinerU 官方地址 https://mineru.net。"""
+        if value is None:
+            return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return "https://mineru.net"
+            host = (urlsplit(stripped).hostname or "").lower()
+            if host in {"api.302ai.cn", "api.302.ai"}:
+                return "https://mineru.net"
+            return stripped
+        return value
+
+    @field_validator("mineru_official_api_token", mode="before")
+    @classmethod
+    def _blank_mineru_token_as_none(cls, value: object) -> object:
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return value
 
     @field_validator("embedding_dimensions", mode="before")
     @classmethod
@@ -499,7 +545,7 @@ class Settings(BaseSettings):
     @property
     def mineru_configured(self) -> bool:
         """MinerU 是否具备可调用的端点与密钥。"""
-        return bool(self.mineru_base_url and self.mineru_api_key)
+        return bool(self.mineru_base_url and self.mineru_official_api_token)
 
     @property
     def effective_document_parser(self) -> Literal["markitdown", "mineru"]:

@@ -583,7 +583,7 @@ async def test_canonical_stage_progress_pause_resume_and_reprocess_status(ingest
             version_no=1,
         )
         assert reprocess_status.current_stage == "RECEIVE"
-        assert reprocess_status.progress == 5
+        assert reprocess_status.progress == 0
         assert reprocess_status.search_ready is False
         assert reprocess_status.document_status == "pending"
 
@@ -748,3 +748,245 @@ async def test_get_document_version_chunks_orders_units_and_enforces_partition_a
         assert revoked_res.source_stage == "EMPTY"
         assert revoked_res.total_chunks == 0
         assert revoked_res.items == []
+
+
+
+@pytest.mark.asyncio
+async def test_revoked_resync_with_same_idempotency_key_and_project_source_control_resolution(
+    ingestion_db,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-syncing a REVOKED document with the same client_token allocates v2, and project control routes resolve project sources without 403."""
+    from sag_api.api.v1.documents import _resolve_project_document_with_source
+    from sag_api.core.config import settings
+    from sag_api.core.principal_assertion import VerifiedPrincipal as BffVerifiedPrincipal
+    from sag_api.services.document_service import (
+        handle_document_object_ingest,
+        handle_document_upload,
+        revoke_project_document,
+    )
+
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path))
+    monkeypatch.setattr(settings, "object_ingest_allowed_hosts", ["r2.example.internal"])
+
+    async with ingestion_db() as session:
+        first = await handle_document_upload(
+            session,
+            tenant_id="tenant-resync",
+            project_id="project-resync",
+            owner_id="leader-1",
+            security_partition_id="project-resync",
+            client_token="continuum:project_document:doc-9:v1:abcd1234",
+            file_bytes=b"# Spec\n\nSame content re-indexed after detach.\n",
+            original_filename="spec.md",
+            content_type="text/markdown",
+            logical_source_id="continuum:project_document:doc-9",
+        )
+        assert first.version_no == 1
+        assert first.is_duplicate is False
+
+        # Verify project-scoped control route helper resolves auto-provisioned project Source without 403
+        bff_principal = BffVerifiedPrincipal(
+            subject="leader-1",
+            organization_id="tenant-resync",
+            allowed_project_ids=frozenset({"project-resync"}),
+            issuer="continuum-bff",
+            key_id="kid-1",
+            token_id="jti-1",
+            issued_at=1_700_000_000,
+            expires_at=1_700_000_900,
+            tenant_id="tenant-resync",
+            allowed_partition_ids=frozenset({"project-resync"}),
+        )
+        resolved_doc, resolved_source = await _resolve_project_document_with_source(
+            session,
+            principal=bff_principal,
+            project_id="project-resync",
+            document_id=first.document_id,
+        )
+        assert resolved_doc.id == first.document_id
+        assert resolved_source.id == resolved_doc.source_id
+
+        # Revoke v1 -> 0% REVOKED
+        rev = await revoke_project_document(
+            session,
+            tenant_id="tenant-resync",
+            project_id="project-resync",
+            document_id=first.document_id,
+            reason="MANUAL_REVOKE",
+        )
+        assert rev.status == "REVOKED"
+
+        # Re-sync with the EXACT SAME client_token -> must allocate v2 (not return REVOKED duplicate!)
+        resynced = await handle_document_upload(
+            session,
+            tenant_id="tenant-resync",
+            project_id="project-resync",
+            owner_id="leader-1",
+            security_partition_id="project-resync",
+            client_token="continuum:project_document:doc-9:v1:abcd1234",
+            file_bytes=b"# Spec\n\nSame content re-indexed after detach.\n",
+            original_filename="spec.md",
+            content_type="text/markdown",
+            logical_source_id="continuum:project_document:doc-9",
+        )
+        assert resynced.version_no == 2
+        assert resynced.is_duplicate is False
+        assert resynced.status == "RECEIVED"
+        assert resynced.search_status == "PENDING"
+
+        # Also verify Direct-to-R2 object ingest path with same client_token after revoke
+        sha = "a" * 64
+        obj_v1 = await handle_document_object_ingest(
+            session,
+            tenant_id="tenant-resync",
+            project_id="project-resync",
+            owner_id="leader-1",
+            security_partition_id="project-resync",
+            client_token="continuum:project_document:doc-r2:v1:aaaa1111",
+            source_url="https://r2.example.internal/bucket/doc.pdf?X-Amz-Signature=1",
+            original_filename="doc.pdf",
+            expected_sha256=sha,
+            expected_size_bytes=2048,
+            content_type="application/pdf",
+            logical_source_id="continuum:project_document:doc-r2",
+        )
+        assert obj_v1.version_no == 1
+        await revoke_project_document(
+            session,
+            tenant_id="tenant-resync",
+            project_id="project-resync",
+            document_id=obj_v1.document_id,
+            reason="MANUAL_REVOKE",
+        )
+        obj_v2 = await handle_document_object_ingest(
+            session,
+            tenant_id="tenant-resync",
+            project_id="project-resync",
+            owner_id="leader-1",
+            security_partition_id="project-resync",
+            client_token="continuum:project_document:doc-r2:v1:aaaa1111",
+            source_url="https://r2.example.internal/bucket/doc.pdf?X-Amz-Signature=2",
+            original_filename="doc.pdf",
+            expected_sha256=sha,
+            expected_size_bytes=2048,
+            content_type="application/pdf",
+            logical_source_id="continuum:project_document:doc-r2",
+        )
+        assert obj_v2.version_no == 2
+        assert obj_v2.is_duplicate is False
+        assert obj_v2.status == "RECEIVED"
+        assert obj_v2.search_status == "PENDING"
+
+
+@pytest.mark.asyncio
+async def test_reprocess_ready_project_document_completes_without_legacy_engine_schema(
+    ingestion_db,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Full worker execution of REPROCESS on a READY project document skips legacy zleap-sag cleanup and reaches 100% SEARCH_READY."""
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from sqlalchemy import select
+
+    from sag_api.db.models import Document, Job, Source
+    from sag_api.enums import JobStatus, JobType
+    from sag_api.jobs import tasks
+    from sag_api.services import search_index_service
+    from sag_api.services.document_service import (
+        get_document_version_status,
+        handle_document_upload,
+        reprocess_document,
+    )
+
+    monkeypatch.setattr(tasks.settings, "data_dir", str(tmp_path))
+    monkeypatch.setattr(tasks.settings, "document_event_extraction_enabled", False)
+    monkeypatch.setattr(tasks.settings, "object_ingest_allowed_hosts", ["r2.example.internal"])
+
+    fake_queue = SimpleNamespace(
+        enqueue=AsyncMock(),
+        begin_source_maintenance=lambda *_args, **_kwargs: None,
+        source_maintenance_requested=lambda *_args, **_kwargs: False,
+        source_stop_requested=lambda *_args, **_kwargs: False,
+    )
+
+    async def fake_index(_sess, *, document_version, **_kwargs):
+        document_version.search_status = "SEARCH_READY"
+        document_version.search_ready_at = datetime.now(UTC)
+        return [SimpleNamespace(id="unit-reprocessed-1")]
+
+    monkeypatch.setattr(search_index_service, "run_search_indexing_stage", fake_index)
+
+    manager = SimpleNamespace(
+        get_sag_embedding=AsyncMock(return_value=None),
+        process_document=AsyncMock(side_effect=AssertionError("Legacy extractor should not run")),
+        delete_document_data=AsyncMock(side_effect=AssertionError("Legacy delete_document_data must not run for Phase 2-only project documents")),
+    )
+
+    async with ingestion_db() as session:
+        uploaded = await handle_document_upload(
+            session,
+            tenant_id="tenant-reproc",
+            project_id="project-reproc",
+            owner_id="leader-1",
+            security_partition_id="project-reproc",
+            client_token="continuum:project_document:reproc-1:v1:1234",
+            file_bytes=b"# Architecture\n\nReprocess worker end-to-end verification.\n",
+            original_filename="arch.md",
+            content_type="text/markdown",
+            logical_source_id="continuum:project_document:reproc-1",
+        )
+        doc = await session.get(Document, uploaded.document_id)
+        source = await session.get(Source, doc.source_id)
+        initial_job = await session.scalar(select(Job).where(Job.document_id == doc.id))
+        initial_job.status = JobStatus.RUNNING
+        await session.commit()
+
+        await tasks._process_document_unlocked(session, initial_job, engine_manager=manager, job_queue=fake_queue)
+        initial_job.status = JobStatus.SUCCEEDED
+        await session.commit()
+
+        # Trigger REPROCESS from READY (100%)
+        reproc_job = await reprocess_document(
+            session,
+            source,
+            doc.id,
+            job_queue=fake_queue,
+            remote_source_url="https://r2.example.internal/bucket/arch.md?X-Amz-Signature=fresh",
+            original_filename="arch.md",
+        )
+        assert reproc_job.type == JobType.REPROCESS_DOCUMENT
+        reproc_job.status = JobStatus.RUNNING
+        await session.commit()
+
+        await tasks._reprocess_document_task_unlocked(session, reproc_job, engine_manager=manager, job_queue=fake_queue)
+        reproc_job.status = JobStatus.SUCCEEDED
+        await session.commit()
+        assert "remote_source_url" not in (reproc_job.payload or {})
+
+        proc_job_id = (reproc_job.payload or {}).get("process_job_id")
+        assert proc_job_id
+        proc_job = await session.get(Job, proc_job_id)
+        assert proc_job is not None
+        assert proc_job.type == JobType.PROCESS_DOCUMENT
+        proc_job.status = JobStatus.RUNNING
+        await session.commit()
+
+        await tasks._process_document_unlocked(session, proc_job, engine_manager=manager, job_queue=fake_queue)
+        proc_job.status = JobStatus.SUCCEEDED
+        await session.commit()
+
+        final_status = await get_document_version_status(
+            session,
+            project_id="project-reproc",
+            document_id=doc.id,
+            version_no=1,
+        )
+        assert final_status.progress == 100
+        assert final_status.search_ready is True
+        assert final_status.current_stage == "COMPLETE"
+        assert final_status.document_status == "ready"

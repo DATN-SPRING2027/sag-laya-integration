@@ -94,16 +94,9 @@ async def _finalize_research_task_for_run(session: AsyncSession, run_id: str | N
 
 def _mineru_details(state: dict[str, Any] | None = None) -> tuple[str, str]:
     current = state or {}
-    service = current.get("mineru_service")
-    if service == "official":
-        model = current.get("mineru_model")
-        return "official", model if model in {"vlm", "pipeline"} else "vlm"
-    if service == "302":
-        version = str(current.get("mineru_version") or "").lower()
-        # The public contract predates 302's 2.0 label. "pipeline" is the
-        # closest stable representation; importantly, it does not claim 2.5.
-        return "302", "2.5" if version in {"2.5", "v2.5"} else "pipeline"
-    return "302", "2.5"
+    model = current.get("mineru_model")
+    default_model = settings.mineru_official_model if settings.mineru_official_model in {"vlm", "pipeline"} else "vlm"
+    return "official", model if model in {"vlm", "pipeline"} else default_model
 
 
 def _redact_parser_reason(value: object) -> str | None:
@@ -139,7 +132,7 @@ def _parser_state_values(state: dict[str, Any]) -> dict[str, str | None]:
         status = "uploading"
         parser_provider = provider
         fallback_from = None
-    elif raw_status in _PARSER_QUEUE_STATES or state.get("task_id") and not raw_status:
+    elif raw_status in _PARSER_QUEUE_STATES or (state.get("task_id") or state.get("batch_id")) and not raw_status:
         status = "queued"
         parser_provider = provider
         fallback_from = None
@@ -395,14 +388,83 @@ async def _process_document_unlocked(
     try:
         prepared = None
         parser_stage = False
-        target_storage_path = (job.payload or {}).get("storage_path") or document.storage_path
-        canonical_checkpoint = str((job.payload or {}).get("canonical_checkpoint_stage") or "").upper()
+        initial_payload = dict(job.payload or {})
+        target_storage_path = initial_payload.get("storage_path") or document.storage_path
+        remote_object_sourced = bool(initial_payload.get("remote_object_sourced"))
+        remote_source_url = (
+            initial_payload.get("remote_source_url")
+            if isinstance(initial_payload.get("remote_source_url"), str)
+            else None
+        )
+        job_project_id = (
+            str(initial_payload.get("project_id"))
+            if initial_payload.get("project_id")
+            else document.project_id
+        )
+        canonical_checkpoint = str(initial_payload.get("canonical_checkpoint_stage") or "").upper()
         skip_initial_prepare = bool(
             run_id
             and not settings.document_event_extraction_enabled
             and canonical_checkpoint in ("PARSE", "DEDUP_TEMPORAL")
         )
         if not checkpoint.chunk_ids and not skip_initial_prepare:
+            from sag_api.parsing.service import has_cached_prepared_document
+
+            needs_remote_fetch = bool(
+                remote_object_sourced
+                and remote_source_url
+                and not (
+                    target_storage_path
+                    and (
+                        os.path.isfile(target_storage_path)
+                        or has_cached_prepared_document(target_storage_path, settings)
+                    )
+                )
+            )
+            if needs_remote_fetch and remote_source_url:
+                import time as _time
+
+                from sag_api.parsing.remote_object import stream_remote_object_to_snapshot
+
+                await _advance_canonical_stage("RECEIVE", 10, DocumentStatus.LOADING)
+                dl_start = _time.monotonic()
+                try:
+                    target_storage_path = await stream_remote_object_to_snapshot(
+                        remote_source_url,
+                        target_path=target_storage_path,
+                        original_filename=str(
+                            initial_payload.get("original_filename") or document.filename
+                        ),
+                        expected_sha256=str(initial_payload.get("expected_sha256") or ""),
+                        expected_size_bytes=int(
+                            initial_payload.get("expected_size_bytes") or document.size_bytes or 0
+                        ),
+                        settings=settings,
+                        should_pause=should_pause,
+                    )
+                except ParsePaused:
+                    await _pause_or_yield()
+                dl_ms = round((_time.monotonic() - dl_start) * 1000, 2)
+                if run_id:
+                    session.add(
+                        StageRun(
+                            id=str(uuid.uuid4()),
+                            run_id=run_id,
+                            stage="receive",
+                            status="SUCCESS",
+                            duration_ms=dl_ms,
+                            metrics_json={
+                                "byte_size": int(
+                                    initial_payload.get("expected_size_bytes")
+                                    or document.size_bytes
+                                    or 0
+                                ),
+                                "source": "remote_object_stream",
+                            },
+                        )
+                    )
+                    await session.commit()
+
             parser_stage = True
             await _advance_canonical_stage("PARSE", 25, DocumentStatus.LOADING)
             try:
@@ -412,6 +474,8 @@ async def _process_document_unlocked(
                     state=(job.payload or {}).get("document_parser"),
                     on_state=on_parser_state,
                     should_pause=should_pause,
+                    remote_source_url=remote_source_url,
+                    project_id=job_project_id,
                 )
             except ParsePaused:
                 await _pause_or_yield()
@@ -419,6 +483,11 @@ async def _process_document_unlocked(
             parser_state = (job.payload or {}).get("document_parser")
             for field, value in _prepared_parser_values(prepared, parser_state).items():
                 setattr(document, field, value)
+            if remote_source_url:
+                scrubbed_payload = await refresh_payload()
+                if "remote_source_url" in scrubbed_payload:
+                    scrubbed_payload.pop("remote_source_url", None)
+                    job.payload = scrubbed_payload
             await session.commit()
             if prepared.fallback_from:
                 log.warning(
@@ -459,6 +528,7 @@ async def _process_document_unlocked(
                                 state=(job.payload or {}).get("document_parser"),
                                 on_state=on_parser_state,
                                 should_pause=should_pause,
+                                project_id=job_project_id,
                             )
                         except ParsePaused:
                             await _pause_or_yield()
@@ -845,6 +915,50 @@ async def _process_document_unlocked(
     await session.commit()
     await session.refresh(document)
     await _finalize_research_task_for_run(session, run_id)
+
+    # Post-index Disk GC: when the immutable raw binary lives permanently on R2,
+    # reclaim heavy binary snapshots on local SAG disk while retaining the lightweight
+    # `.parsed.<signature>.md` sidecar cache for fast re-chunking / reprocessing.
+    from sag_api.parsing.service import has_cached_prepared_document
+
+    if (
+        getattr(settings, "remote_snapshot_gc_enabled", True)
+        and remote_object_sourced
+        and target_storage_path
+        and prepared is not None
+        and prepared.path != target_storage_path
+        and os.path.splitext(target_storage_path)[1].lower() not in {".md", ".markdown"}
+        and os.path.isfile(prepared.path)
+        and os.path.isfile(target_storage_path)
+        and has_cached_prepared_document(target_storage_path, settings)
+    ):
+        try:
+            import asyncio as _asyncio
+
+            from sqlalchemy import select as _select
+
+            active_sibling = await session.scalar(
+                _select(Document.id)
+                .where(
+                    Document.storage_path == target_storage_path,
+                    Document.id != document.id,
+                    Document.status.in_(
+                        [
+                            DocumentStatus.PENDING,
+                            DocumentStatus.LOADING,
+                            DocumentStatus.EXTRACTING,
+                            DocumentStatus.PAUSED,
+                            DocumentStatus.PAUSING,
+                        ]
+                    ),
+                )
+                .limit(1)
+            )
+            if active_sibling is None:
+                await _asyncio.to_thread(os.remove, target_storage_path)
+        except Exception as gc_err:  # noqa: BLE001
+            log.debug("Skipped post-index raw snapshot GC for %s: %s", document.id, gc_err)
+
     log.info(
         "Xử lý tài liệu hoàn thành doc=%s parser=%s cached=%s chunks=%d events=%d tokens=%d",
         document.id,
@@ -905,12 +1019,12 @@ async def _delete_document_task_unlocked(
     }
     if document.sag_source_id:
         derived_source_ids.add(document.sag_source_id)
-    for derived_source_id in sorted(derived_source_ids):
-        await engine_manager.delete_document_data(
-            source.sag_source_config_id,
-            derived_source_id,
-            source=source,
-        )
+    await _cleanup_legacy_engine_document_data(
+        engine_manager,
+        source,
+        document,
+        sorted(derived_source_ids),
+    )
 
     # Phase 2 Cleanup: Delete Qdrant points for all document versions belonging to this document
     from sqlalchemy import select
@@ -944,6 +1058,26 @@ async def _delete_document_task_unlocked(
     await session.flush()
     await session.delete(document)
     await session.flush()
+    remaining_path_refs = 0
+    if path:
+        from sqlalchemy import func as sa_func
+        from sag_api.db.models.routing_rag import SourceSnapshot
+
+        doc_refs = int(
+            await session.scalar(
+                select(sa_func.count()).select_from(Document).where(Document.storage_path == path)
+            )
+            or 0
+        )
+        snap_refs = int(
+            await session.scalar(
+                select(sa_func.count())
+                .select_from(SourceSnapshot)
+                .where(SourceSnapshot.storage_uri == path)
+            )
+            or 0
+        )
+        remaining_path_refs = doc_refs + snap_refs
     from sag_api.services.document_service import _refresh_source_counts
 
     await _refresh_source_counts(session, source)
@@ -959,7 +1093,7 @@ async def _delete_document_task_unlocked(
         from sag_api.services.document_service import _enqueue_persisted_job
 
         await _enqueue_persisted_job(job_queue, tree_job.id)
-    if path:
+    if path and remaining_path_refs == 0:
         from sag_api.parsing.service import parsed_sidecar_paths
 
         for candidate in [path, *parsed_sidecar_paths(path)]:
@@ -984,6 +1118,40 @@ async def _delete_document_task_unlocked(
             # refresh scheduling transaction so the worker can still persist
             # the delete Job's SUCCEEDED terminal state and release maintenance.
             await session.rollback()
+
+
+def _should_cleanup_legacy_engine_data(document: Document) -> bool:
+    """Return True only when legacy zleap-sag relational/event records could exist for this document."""
+    if not document.project_id:
+        return True
+    if settings.document_event_extraction_enabled:
+        return True
+    return int(document.event_count or 0) > 0
+
+
+async def _cleanup_legacy_engine_document_data(
+    engine_manager: EngineManager | None,
+    source: Source,
+    document: Document,
+    derived_source_ids: list[str],
+) -> None:
+    if not derived_source_ids or engine_manager is None or not _should_cleanup_legacy_engine_data(document):
+        return
+    for derived_source_id in derived_source_ids:
+        try:
+            await engine_manager.delete_document_data(
+                source.sag_source_config_id,
+                derived_source_id,
+                source=source,
+            )
+        except Exception as cleanup_exc:
+            if document.project_id and "sag_schema_meta" in str(cleanup_exc):
+                log.warning(
+                    "Skipping legacy zleap-sag cleanup for project document %s because sag_schema_meta is uninitialized",
+                    document.id,
+                )
+                return
+            raise
 
 
 async def reprocess_document_task(
@@ -1014,12 +1182,12 @@ async def _reprocess_document_task_unlocked(
         {value.strip() for value in payload.get("derived_source_ids", []) if isinstance(value, str) and value.strip()}
     )
     if not payload.get("cleanup_completed"):
-        for derived_source_id in derived_source_ids:
-            await engine_manager.delete_document_data(
-                source.sag_source_config_id,
-                derived_source_id,
-                source=source,
-            )
+        await _cleanup_legacy_engine_document_data(
+            engine_manager,
+            source,
+            document,
+            derived_source_ids,
+        )
 
     await session.refresh(document)
     if document.status in _DELETE_CONTROL_STATES:
@@ -1059,11 +1227,28 @@ async def _reprocess_document_task_unlocked(
     process_job_payload = {
         **(process_job.payload or {}),
     }
+    if document.storage_path and "storage_path" not in process_job_payload:
+        process_job_payload["storage_path"] = document.storage_path
+    for forwarded_key in (
+        "remote_object_sourced",
+        "remote_source_url",
+        "expected_sha256",
+        "expected_size_bytes",
+        "original_filename",
+    ):
+        if forwarded_key in payload and payload[forwarded_key] is not None:
+            process_job_payload[forwarded_key] = payload[forwarded_key]
     if latest_ver and document.project_id:
         new_run_id = str(uuid.uuid4())
         tenant_id = document.tenant_id or "tenant_default"
         idempotency_key = f"reprocess:{document.id}:{latest_ver.version_no}:{new_run_id[:8]}"
         payload_hash = latest_ver.file_hash or "reprocess"
+        document.is_active = True
+        latest_ver.status = "RECEIVED"
+        latest_ver.search_status = "PENDING"
+        latest_ver.search_ready_at = None
+        if latest_ver.knowledge_status in ("FAILED", "REVOKED"):
+            latest_ver.knowledge_status = "NOT_STARTED"
         ing_run = IngestionRun(
             id=new_run_id,
             tenant_id=tenant_id,
@@ -1079,6 +1264,9 @@ async def _reprocess_document_task_unlocked(
         session.add(ing_run)
         await session.flush()
         process_job_payload["run_id"] = new_run_id
+        process_job_payload["document_version_id"] = latest_ver.id
+        process_job_payload["project_id"] = document.project_id
+        process_job_payload["tenant_id"] = tenant_id
     else:
         process_job_payload["phase2_skipped"] = True
         process_job_payload["phase2_skip_reason"] = "MISSING_PROJECT_OR_VERSION"
@@ -1090,8 +1278,10 @@ async def _reprocess_document_task_unlocked(
         )
     process_job.payload = process_job_payload
 
+    scrubbed_reprocess_payload = dict(payload)
+    scrubbed_reprocess_payload.pop("remote_source_url", None)
     job.payload = {
-        **payload,
+        **scrubbed_reprocess_payload,
         "cleanup_completed": True,
         "process_job_id": process_job.id,
     }
