@@ -1,6 +1,7 @@
 """ORM models aggregate import — ensures Base.metadata registers all tables."""
 
 from sag_api.db.models.agent import Agent, AgentBinding, Message, Thread
+from sag_api.db.models.answer_actions import AnswerFeedback, AnswerShare
 from sag_api.db.models.document import Document
 from sag_api.db.models.job import Job
 from sag_api.db.models.knowledge import (
@@ -62,6 +63,8 @@ from sag_api.db.models.user import User
 __all__ = [
     "Agent",
     "AgentBinding",
+    "AnswerFeedback",
+    "AnswerShare",
     "CanonicalBlock",
     "Document",
     "DocumentVersion",

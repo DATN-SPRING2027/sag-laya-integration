@@ -114,6 +114,8 @@ _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
     },
     "threads": {"archived": "BOOLEAN NOT NULL DEFAULT FALSE", "owner_key": "VARCHAR(64)"},
     "messages": {
+        "reply_to_message_id": "VARCHAR(32) REFERENCES messages(id) ON DELETE SET NULL",
+        "regenerated_from_message_id": "VARCHAR(32) REFERENCES messages(id) ON DELETE SET NULL",
         "attachments_json": "JSON",
         "steps_json": "JSON",
         "prompt_preview": "TEXT NOT NULL DEFAULT ''",
@@ -139,6 +141,8 @@ _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
 _INDEX_UPGRADES = (
     "CREATE UNIQUE INDEX IF NOT EXISTS ix_knowledge_graph_input ON knowledge_graph_builds (tenant_id, project_id, input_fingerprint)",
     "CREATE INDEX IF NOT EXISTS ix_messages_thread_created_id ON messages (thread_id, created_at, id)",
+    "CREATE INDEX IF NOT EXISTS ix_messages_reply_to_message_id ON messages (reply_to_message_id)",
+    "CREATE INDEX IF NOT EXISTS ix_messages_regenerated_from_message_id ON messages (regenerated_from_message_id)",
     "CREATE INDEX IF NOT EXISTS ix_agents_owner_key ON agents (owner_key)",
     "CREATE INDEX IF NOT EXISTS ix_threads_owner_key ON threads (owner_key)",
     (
