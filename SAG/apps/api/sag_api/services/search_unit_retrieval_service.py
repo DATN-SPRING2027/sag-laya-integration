@@ -20,7 +20,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from sag_api.core.config import FIXED_SEARCH_TOP_K, settings
+from sag_api.core.config import settings
 from sag_api.core.db import SessionLocal
 from sag_api.core.errors import ServiceUnavailableError
 from sag_api.core.logging import get_logger
@@ -958,10 +958,12 @@ async def _get_or_build_scope_knowledge_index(
     allowed_partitions: list[str],
 ) -> _ScopeKnowledgeIndex:
     version_ids = sorted(current_versions)
-    checksum_rows = (await session.execute(select(KnowledgeUnit.id, KnowledgeUnit.checksum, KnowledgeUnit.project_id).where(
-        KnowledgeUnit.document_version_id.in_(version_ids), KnowledgeUnit.is_current.is_(True),
-        KnowledgeUnit.security_partition_id.in_(allowed_partitions),
-    ))).all()
+    checksum_rows = (await session.execute(
+        select(KnowledgeUnit.id, KnowledgeUnit.checksum, KnowledgeUnit.project_id).where(
+            KnowledgeUnit.document_version_id.in_(version_ids), KnowledgeUnit.is_current.is_(True),
+            KnowledgeUnit.security_partition_id.in_(allowed_partitions),
+        )
+    )).all()
     checksums = {uid: value for uid, value, _project in checksum_rows}
     projects = {v.project_id for v in current_versions.values()}
     active_rows = (await session.execute(select(
@@ -1400,7 +1402,9 @@ async def _expand_multi_hop_sections(
                         continue
                     for ku in ku_list:
                         for b_ent in top_seed_entities:
-                            if (" " in b_ent or any(c.isdigit() for c in b_ent) or len(b_ent) >= 6) and b_ent in ku.entities_norm:
+                            if (
+                                " " in b_ent or any(c.isdigit() for c in b_ent) or len(b_ent) >= 6
+                            ) and b_ent in ku.entities_norm:
                                 ent_doc_versions[b_ent].add(v_id)
                             else:
                                 pat = path_patterns.get(b_ent)
@@ -1571,6 +1575,7 @@ async def retrieve_search_unit_sections(
     plan = query_strategy_plan or plan_query(query, requested_top_k=top_k)
     if top_k is not None and plan.retrieval_plan.cardinality.requested_n != top_k:
         from dataclasses import replace
+
         from sag_api.services.retrieval_plan import build_retrieval_plan
 
         plan = replace(
@@ -1883,8 +1888,23 @@ async def _retrieve_search_unit_sections(
                     task.cancel()
                 await asyncio.gather(*group_tasks, return_exceptions=True)
                 raise
+            channel_results = [item for paths, _local_error, _escape_error in path_groups for item in paths]
+            if not any(item[3] or item[4] for item in channel_results):
+                # A restored metadata database may reference versions absent from
+                # its vector accelerator. Do not report that outage as no evidence.
+                for group in groups:
+                    available = await store.count(
+                        f"search_units_{group.project_id}",
+                        search_filter=build_search_filter(
+                            project_id=group.project_id,
+                            tenant_id=group.tenant_id,
+                            partition_id=group.partition_id,
+                            document_version_ids=list(group.versions),
+                        ),
+                    )
+                    if available == 0:
+                        raise SearchIndexUnavailable("Search index is missing current document versions")
             t_retrieval_ms = round((time.perf_counter() - t_retrieval_start) * 1000, 2)
-        channel_results = [item for path_group, _local_failure, _escape_failure in path_groups for item in path_group]
         retrieval_stats["candidate_pool_saturated"] = any(
             len(item[3]) >= candidate_limit or len(item[4]) >= candidate_limit for item in channel_results
         )
@@ -2475,7 +2495,9 @@ async def _retrieve_search_unit_sections(
             "semantic_candidates": semantic_candidate_count,
             "lexical_candidates": lexical_candidate_count,
                 **rerank_stats,
-            "fusion_method": "rank_interleave_fallback" if selection_fallback_reason == "rerank_budget_exhausted" else "rrf",
+            "fusion_method": (
+                "rank_interleave_fallback" if selection_fallback_reason == "rerank_budget_exhausted" else "rrf"
+            ),
             "selection_method": selection_method,
             "cross_scope_merge": "rank_interleave",
             "coverage": coverage,

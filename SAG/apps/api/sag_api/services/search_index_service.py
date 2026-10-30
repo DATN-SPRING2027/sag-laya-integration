@@ -23,6 +23,7 @@ import httpx
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sag_api.core.config import settings
 from sag_api.core.logging import get_logger
 from sag_api.core.errors import ApiError, is_retryable_error
 from sag_api.core.error_taxonomy import ErrorLayer, ErrorStage

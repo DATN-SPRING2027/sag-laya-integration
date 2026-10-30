@@ -29,6 +29,7 @@ from sag_agent import (
 from sag_agent import (
     ToolResult as RuntimeToolResult,
 )
+from sag_api.core.errors import ServiceUnavailableError
 from sag_api.core.principal_assertion import VerifiedPrincipal
 from sag_api.enums import MessageStatus
 from sag_api.generation import LLMClient, build_prompt_preview
@@ -729,8 +730,17 @@ def _adapt_tool(host_tool, host_context: HostToolContext, citations: list[dict])
             host_context.search_context_called = True
             host_context.search_context_no_answer_reason = None
         host_context.citation_offset = max(host_context.citation_offset, _citation_number_high_water(citations))
-        result = await host_tool.invoke(dict(arguments), host_context)
+        try:
+            result = await host_tool.invoke(dict(arguments), host_context)
+        except ServiceUnavailableError:
+            if host_tool.meta.name == "search_context":
+                host_context.search_context_unavailable = True
+                raise ServiceUnavailableError(
+                    "Knowledge search is temporarily unavailable. Please try again."
+                ) from None
+            raise
         if host_tool.meta.name == "search_context":
+            host_context.search_context_unavailable = False
             reason = result.data.get("no_answer_reason")
             host_context.search_context_no_answer_reason = str(reason) if reason else None
         citations.extend(result.citations)
@@ -1113,6 +1123,20 @@ async def generate_stream(
             )
 
             async for event in handle:
+                if event.type == EventType.RUN_COMPLETED and host_context.search_context_unavailable:
+                    event = RuntimeEvent(
+                        type=EventType.RUN_FAILED,
+                        run_id=event.run_id,
+                        sequence=event.sequence,
+                        timestamp=event.timestamp,
+                        turn=event.turn,
+                        version=event.version,
+                        payload={"error": {
+                            "code": "search_unavailable",
+                            "message": "Knowledge search is temporarily unavailable. Please try again.",
+                            "retryable": True,
+                        }},
+                    )
                 payload = event.payload
                 output_payload: Mapping[str, Any] = payload
 

@@ -77,6 +77,10 @@ _GUIDANCE = {
         "whether to answer, clarify, or use tools. Do not expose lengthy hidden reasoning.\n"
         "- Always respond in the same language as the user's question (e.g., Vietnamese or English) unless "
         "the user explicitly asks for another language. Never respond in Chinese.\n"
+        "- Preserve the meaning of quantities, units, baselines, qualifiers and comparisons when paraphrasing "
+        "sources. A reduction by a percentage is not a remaining level at that percentage. Do not change "
+        "'reduced by' into 'reduced to', or a relative change into percentage points. Attribute document-reported "
+        "figures to that document rather than presenting them as independently measured guarantees.\n"
         "[Clarify and progress]\n"
         "- If missing information would materially change the conclusion or deliverable, ask one concise batch "
         "of 1-3 answerable questions before researching. For minor gaps, state reasonable assumptions and proceed.\n"
@@ -133,7 +137,10 @@ _IDENTITY = {
 }
 
 _USER_TEMPLATE = {
-    "en": "Sources:\n{context}\n\nQuestion: {query}\n\nAnswer from the sources in the same language as the question and cite with [index].",
+    "en": (
+        "Sources:\n{context}\n\nQuestion: {query}\n\n"
+        "Answer from the sources in the same language as the question and cite with [index]."
+    ),
 }
 
 
