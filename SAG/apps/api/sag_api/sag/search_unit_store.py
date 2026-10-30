@@ -45,7 +45,9 @@ def build_sparse_query_vector(query: str) -> dict[str, list[int] | list[float]]:
     Uses sub-linear query TF and alphanumeric/entity boosting so repeated framing words
     never drown out discriminative entity, numeric, or domain anchors.
     """
-    normalized_q = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", query)
+    import unicodedata
+
+    normalized_q = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", unicodedata.normalize("NFC", query or ""))
     normalized_q = re.sub(
         r"\b([a-z]{1,2})\s*&\s*([a-z]{1,2})\b",
         r"\1\2",

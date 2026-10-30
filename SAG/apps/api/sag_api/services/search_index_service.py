@@ -111,10 +111,13 @@ def compute_sparse_bm25_vector(
     """Compute true BM25 weighted sparse vector (indices, values) with length normalization and IDF."""
     import math
     import re
+    import unicodedata
     from collections import Counter
 
-    # Normalize thousand-separated numbers (1,577 -> 1577) and ampersand initialisms (R&D -> rd)
-    cleaned_text = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", text.lower())
+    # Normalize Unicode to NFC first so decomposed Vietnamese marks never split tokens,
+    # then normalize thousand-separated numbers (1,577 -> 1577) and ampersand initialisms (R&D -> rd)
+    nfc_text = unicodedata.normalize("NFC", text or "")
+    cleaned_text = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", nfc_text.lower())
     cleaned_text = re.sub(r"\b([a-z]{1,2})\s*&\s*([a-z]{1,2})\b", r"\1\2", cleaned_text)
     tokens = re.findall(r"\w+", cleaned_text)
     if not tokens:

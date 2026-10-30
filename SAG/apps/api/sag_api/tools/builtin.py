@@ -75,14 +75,21 @@ def _events_by_section(events: list | None) -> dict[tuple[str, str], list]:
     return grouped
 
 
-def _format_sections(sections: list, offset: int = 0, events: list | None = None) -> str:
+def _format_sections(
+    sections: list,
+    offset: int = 0,
+    events: list | None = None,
+    *,
+    catalog_inventory: bool = False,
+) -> str:
     if not sections:
         return "(Không tìm thấy tài liệu liên quan.)"
     event_refs = _events_by_section(events)
     blocks = []
     for i, s in enumerate(sections, start=1 + offset):
         locator = (
-            f"Locator: document={getattr(s, 'document_id', '')}; "
+            f"Locator: file={getattr(s, 'document_name', '')}; "
+            f"document={getattr(s, 'document_id', '')}; "
             f"version={getattr(s, 'document_version_id', '')}; "
             f"search_unit={getattr(s, 'search_unit_id', '') or getattr(s, 'chunk_id', '')}; "
             f"blocks={getattr(s, 'block_from_id', '')}-{getattr(s, 'block_to_id', '')}; "
@@ -108,7 +115,16 @@ def _format_sections(sections: list, offset: int = 0, events: list | None = None
             blocks.append("\n".join(lines))
             continue
         heading = getattr(s, "heading", None) or "Đoạn"
-        blocks.append(f"[{i}] {heading}\n{locator}\n{getattr(s, 'content', '')}")
+        doc_name = getattr(s, "document_name", "") or ""
+        catalog_line = (
+            f"Danh mục tài liệu SEARCH_READY đã xác minh [{i}]: {doc_name}\n"
+            if catalog_inventory and doc_name
+            else ""
+        )
+        body_text = str(getattr(s, "content", "") or "")
+        if catalog_inventory and len(body_text) > 420:
+            body_text = body_text[:420].rstrip() + "…"
+        blocks.append(f"[{i}] {heading}\n{locator}\n{catalog_line}{body_text}")
     return "\n\n".join(blocks)
 
 
@@ -118,7 +134,9 @@ class SearchContextTool(Tool):
         description=(
             "Chỉ tìm trong kho tri thức khi câu trả lời cần dữ kiện, nguyên văn hoặc nguồn trích dẫn từ kho đã gắn, tài liệu đã tải lên hoặc phạm vi @; "
             "trả về các đoạn bằng chứng có số thứ tự toàn cục (khi trích dẫn hãy dùng [n]). "
-            "Có thể gọi nhiều lần: mỗi lần hãy diễn đạt truy vấn theo góc độ khác hoặc cụ thể hơn cho đến khi đủ bằng chứng. "
+            "Khi tạo query, hãy tự sửa lỗi chính tả hiển nhiên ở thuật ngữ hoặc tiếng Việt "
+            "(ví dụ Frondend -> Frontend, framwork -> framework) sang từ khóa chuẩn. "
+            "Có thể gọi nhiều lần: nếu lần đầu chưa đủ bằng chứng trực tiếp, hãy đổi góc độ hoặc mở rộng từ khóa. "
             "Không dùng cho chào hỏi, cảm ơn, hỏi danh tính, sáng tác thuần túy, phép tính đơn giản hoặc chỉ xử lý nội dung người dùng đã cung cấp; "
             "nếu thiếu thông tin thì trước tiên hãy hỏi lại, không dùng tìm kiếm thay cho việc làm rõ."
         ),
@@ -137,7 +155,9 @@ class SearchContextTool(Tool):
     )
 
     async def invoke(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        query = (args.get("query") or "").strip()
+        import unicodedata
+
+        query = unicodedata.normalize("NFC", (args.get("query") or "")).strip()
         if not query or not ctx.sources:
             return ToolResult(content="(Không tìm thấy tài liệu liên quan.)", citations=[], data={"section_count": 0})
         persona = ctx.persona or {}
@@ -145,7 +165,24 @@ class SearchContextTool(Tool):
         limit = max(1, int(top_k)) if top_k is not None else None
         source_refs = {s.sag_source_config_id: {"id": s.id, "name": s.name} for s in ctx.sources}
         from sag_api.services.query_strategy_planner import plan_query
+        from sag_api.services.retrieval_plan import (
+            OutputMode,
+            TargetUnit,
+            is_unfiltered_scope_catalog_query,
+        )
         from sag_api.services.search_unit_retrieval_service import retrieve_search_unit_sections
+
+        auto_plan = plan_query(query)
+        unfiltered_catalog = is_unfiltered_scope_catalog_query(
+            query,
+            [str(getattr(s, "name", "") or "") for s in ctx.sources],
+        )
+        if auto_plan.retrieval_plan.target == TargetUnit.DOCUMENT and auto_plan.retrieval_plan.output in {
+            OutputMode.LIST,
+            OutputMode.COUNT,
+        }:
+            min_catalog_k = 50 if unfiltered_catalog else auto_plan.retrieval_plan.cardinality.effective_n
+            limit = max(limit or 0, min_catalog_k)
 
         outcome = await retrieve_search_unit_sections(
             ctx.engine_manager,
@@ -184,11 +221,15 @@ class SearchContextTool(Tool):
         offset = max(0, ctx.citation_offset)
 
         def render(candidate_sections: list[RetrievedSection]) -> str:
-            return _format_sections(candidate_sections, offset)
+            return _format_sections(
+                candidate_sections,
+                offset,
+                catalog_inventory=unfiltered_catalog,
+            )
 
         packed = build_tool_evidence_pack(
             sections,
-            query=query,
+            query="" if unfiltered_catalog else query,
             render=render,
             context_budget_tokens=ctx.evidence_token_budget,
         )
@@ -215,8 +256,40 @@ class SearchContextTool(Tool):
         citations = build_citations(sections, source_refs)
         for c in citations:
             c["n"] = c["n"] + offset
+        rendered_content = packed.content
+        if unfiltered_catalog:
+            unique_ids = {s.document_id for s in sections if s.document_id}
+            ready_total = int(outcome.stats.get("ready_versions") or len(unique_ids))
+            unique_packed_docs = len({s.document_id or s.document_name for s in sections})
+            manifest_lines: list[str] = []
+            seen_docs: set[str] = set()
+            for idx, sec in enumerate(sections, start=1 + offset):
+                doc_key = str(sec.document_id or sec.document_name or idx)
+                if doc_key in seen_docs:
+                    continue
+                seen_docs.add(doc_key)
+                doc_label = sec.document_name or doc_key
+                manifest_lines.append(f"- `{doc_label}` [{idx}]")
+            manifest_block = "\n".join(manifest_lines)
+            rendered_content = (
+                f"(Tổng số tài liệu sẵn sàng tra cứu trong phạm vi hiện tại: {ready_total}; "
+                f"số tài liệu đại diện kèm trích dẫn bên dưới: {unique_packed_docs}.\n"
+                f"Danh mục tệp đã xác minh kèm mã trích dẫn bắt buộc:\n{manifest_block}\n"
+                f"Khi nêu số lượng hoặc liệt kê tên tệp trong phạm vi, BẮT BUỘC gắn nhãn trích dẫn [n] "
+                f"tương ứng ngay sau mỗi tên tệp được liệt kê.)\n\n"
+                f"{rendered_content}"
+            )
+        else:
+            rendered_content = (
+                "(Bằng chứng tra cứu hợp lệ bên dưới: khi trả lời dựa trên các đoạn này, BẮT BUỘC gắn nhãn trích dẫn "
+                "[n] trong ngoặc vuông ngay sau mỗi mệnh đề, con số hoặc dòng bảng được đoạn đó hỗ trợ trực tiếp — "
+                "kể cả khi người dùng không yêu cầu trích dẫn, vì câu trả lời thiếu [n] sẽ bị cổng kiểm chứng từ chối. "
+                "Ngược lại, nếu các đoạn bên dưới KHÔNG chứa thông tin được hỏi hoặc thiếu tệp người dùng nêu đích danh, "
+                "hãy từ chối ngắn gọn và TUYỆT ĐỐI KHÔNG gắn bất kỳ nhãn [n] nào vào câu từ chối.)\n\n"
+                f"{rendered_content}"
+            )
         return ToolResult(
-            content=packed.content,
+            content=rendered_content,
             citations=citations,
             data={
                 "sections": sections,

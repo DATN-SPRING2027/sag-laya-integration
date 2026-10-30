@@ -144,8 +144,89 @@ not remove recovered Qdrant points. Any operational rollback must use only the
 recorded added IDs after owner review; never delete a whole shared collection.
 Normal live test conversations persist through the existing application flow.
 
+### Multi-document live evaluation resumed 2026-10-30
+
+- Thang assigned Codex hard/multi-document cases while Antigravity owns its
+  current Unicode/catalog/retrieval changes. Preserve those dirty changes.
+- Real authorized Frontend run retrieved both Next.js and human-chat sources,
+  but added unsupported hypothetical protocols and conflated handover audio
+  with human chat. A second run correctly rejected client-state authorization,
+  but generalized conversation-membership evidence to Project/Team access.
+- A dated-successor question abstained despite the source document containing
+  a successor notice. Retrieval coverage remains a separate unresolved issue;
+  do not disguise it by changing source data or evidence thresholds.
+- Two scoped prompt experiments were tested live on the original SSE/WebSocket
+  question: preserve workflow boundaries; then require source-specific literal
+  supporting quotes. Both still conflated handover audio with human chat and
+  attached the wrong source. Both experimental additions were removed; the
+  pre-existing Antigravity prompt edits were preserved. No successful production
+  fix is claimed for this lane. Antigravity's active test file now also targets
+  speculative answers, so Codex avoids further shared implementation edits.
+- Read-only PostgreSQL verification confirmed that the actual uploaded canonical
+  Workspace document contains the 2026-10-12 successor at ordinal 2. The dated
+  notice failure is not inferred only from a different local document revision.
+- Canonical blocks for six evaluated documents were exported to private local
+  artifacts outside Git. No schema, source, ACL or provider configuration change.
+  Test conversations were created through the normal authorized UI flow.
+- Focused tests: 28 passed in 5.66s. Full in-progress worktree: 174 passed,
+  2 failed, 1 deselected in 43.08s. The failing Antigravity tests expect a new
+  `has_prior_turns` argument and speculative-answer guidance; do not change their
+  assertions to mask incomplete implementation. Prompt lint passed.
+- Runtime gate finding: `_finalize_answer_citations` validates locator metadata
+  and citation numbers; the completion gate checks whether a claim-level citation
+  exists. These checks do not establish semantic entailment of every cited claim.
+  This explains why valid source links can accompany unsupported conclusions;
+  it is not proof that a deterministic lexical entailment heuristic would fix it.
+- Completed 10 distinct authorized UI cases across Frontend/Backend, plus two
+  failed experimental reruns: 1 safe-abstention pass, 3 partially correct cases,
+  6 failures under strict whole-answer grounding criteria. This deliberately
+  difficult sample is not a general intelligence score. Observed activity
+  durations were 14-36 seconds. Unsupported retry HTTP codes and acceptance of
+  changed payload with the same idempotency key were a concrete contract error;
+  the canonical source states that changed payload conflicts.
+- Private external evidence is in `ai-chat-multifile/hard-case-report.md`,
+  `live-results.json`, `canonical-test-evidence.json` and screenshots under the
+  current local visualization task folder. No new commit or push from this
+  evaluation. Replay the same cases and holdouts after the concurrent fixes;
+  multi-document reliability remains unaccepted.
+
 ### Review references
 
 - SAG application commit: `4646ac3`; [PR #51](https://github.com/DATN-SPRING2027/sag-laya-integration/pull/51).
 - Frontend companion commit: `ea160bc`; [PR #106](https://github.com/DATN-SPRING2027/DATN-FE/pull/106).
 - Both PRs target `main`; neither was merged or approved by this task.
+
+### Vietnamese Unicode, catalog inventory, and citation-gate follow-up (2026-10-30)
+
+- Unicode NFC normalization added across query ingress, lexical analysis, sparse/dense
+  indexing and retrieval (`agent_domain.py`, `query_analysis.py`, `retrieval_plan.py`,
+  `search_unit_retrieval_service.py`, `search_unit_store.py`, `search_index_service.py`,
+  `tools/builtin.py`) so NFD decomposed Vietnamese input matches canonical NFC text.
+- Bidirectional Vietnamese date lexical bridging (`DD/MM/YYYY` <-> `YYYY-MM-DD`) and
+  relation markers (`mối quan hệ`, `quan hệ`) added in `query_analysis.py`, alongside
+  wide-doc initial selection in `retrieval_service.py` when `per_document_limit == 1`.
+- Project catalog queries (`retrieval_plan.py`, `tools/builtin.py`): recognize named
+  project scopes (`trong project Frontend/Database/SAG`) while rejecting topic-filtered
+  lists (`về <chủ đề>`), pass empty topic query to `build_tool_evidence_pack` for
+  unfiltered catalog inventories so project acronyms do not drop ready files, and emit
+  an indexed verified manifest (`- \`file\` [n]`) with bounded per-file body preview.
+- Grounding/citation gate alignment (`agent_service.py`, `generation/prompt.py`,
+  `tools/builtin.py`): fix `_COMPOUND_CITATION_BRACKET` negative lookahead to
+  `(?!\(\s*(?:https?:|mailto:))` so `[3](note)` maps as a claim citation while
+  preserving Markdown links; scope `_CLARIFICATION_FIRST_INTENT` to first turns only
+  (`not has_prior_turns`); require inline `[n]` markers on grounded `search_context`
+  answers even when the user omits "trích dẫn" while forbidding `[n]` on refusals.
+- Companion `DATN_BE` SSE parser/type updates (`ai-chat-sse.parser.ts`, `ai-chat.types.ts`)
+  preserve `sessionCitations`, `answerStatus`, and lowercase `search_unavailable` error
+  mapping; companion `DATN_FE` updates render `sessionCitations` jump chips, GFM table
+  `tabular-nums` wrappers, and localized `no_answer` states across live/history/Copy.
+- Validation: `pytest tests -m "not ai_smoke" -q --tb=short` -> **181 passed, 1 deselected**
+  (including 13 new cases in `tests/test_vietnamese_ai_chat_reliability.py`); `DATN_BE`
+  Jest + `nest build` passed; `DATN_FE` `npm run check` and 4-viewport (`390/768/1280/1440`)
+  Visual QA passed (`0` horizontal overflow, `0` console/hydration/page exceptions).
+- Live authorized browser checks in `WDP301-SPRING-2027` (`6ad76c7d938f3bf53df7335e`)
+  verified exact framework citation (`DEV-01`), full catalog inventories (`DEV-14`: 3/3
+  Frontend, `DEV-15`: 16/16 Database, `DEV-25`: 3/3 SAG after scope switch), unaccented
+  Vietnamese (`DEV-02`), natural typos (`DEV-04`), abbreviations (`DEV-05`), colloquial
+  paraphrase (`DEV-08`), and `[FACT]/[DESIGN]/[GAP]` synthesis (`DEV-11`). Full 50-case
+  benchmark and multi-document semantic entailment calibration remain follow-up work.

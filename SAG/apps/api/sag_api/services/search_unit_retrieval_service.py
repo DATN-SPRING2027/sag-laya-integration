@@ -1570,6 +1570,9 @@ async def retrieve_search_unit_sections(
     query_strategy_plan: QueryStrategyPlan | None = None,
 ) -> SearchOutcome:
     """Return verified sections according to the 7-axis RetrievalPlan, with a bounded candidate pool."""
+    import unicodedata
+
+    query = unicodedata.normalize("NFC", query or "")
     if top_k is not None and top_k < 1:
         raise ValueError("top_k must be positive")
     plan = query_strategy_plan or plan_query(query, requested_top_k=top_k)
@@ -1660,8 +1663,11 @@ async def _retrieve_search_unit_sections(
     deadline: float,
 ) -> SearchOutcome:
     """Query only currently authorized versions with a verified Phase 2C manifest."""
+    import unicodedata
+
     from sag_api.services.retrieval_service import rerank_sections
 
+    query = unicodedata.normalize("NFC", query or "")
     requested_limit = min(top_k, settings.search_unit_candidate_limit) if top_k is not None else candidate_limit
     selection_limit = requested_limit if top_k is not None else None
     strategy_plan = query_strategy_plan or plan_query(query, requested_top_k=top_k)
@@ -2472,6 +2478,85 @@ async def _retrieve_search_unit_sections(
         graph_expansion_attempted=graph_expansion_attempted,
         graph_expanded_candidates=graph_expanded_candidates,
     )
+    from sag_api.services.retrieval_plan import OutputMode, is_unfiltered_scope_catalog_query
+
+    max_catalog_slots = selection_limit if selection_limit is not None else requested_limit
+    if (
+        per_doc_limit == 1
+        and strategy_plan.retrieval_plan.output in {OutputMode.LIST, OutputMode.COUNT}
+        and len(selected) < max_catalog_slots
+        and is_unfiltered_scope_catalog_query(query, [s.name for s in sources])
+    ):
+        represented_vids = {str(section.document_version_id or "") for section in selected}
+        missing_vids = [
+            vid
+            for vid in sorted(
+                current_versions,
+                key=lambda v: (str(getattr(current_versions[v], "document_name", "") or ""), v),
+            )
+            if vid not in represented_vids
+        ][: max(0, max_catalog_slots - len(selected))]
+        if missing_vids and (deadline - loop.time()) > 0.15:
+            try:
+                from sag_api.services.search_index_service import generate_search_unit_point_id
+
+                allowed_partitions = sorted({v.partition_id for v in current_versions.values()})
+                async with asyncio.timeout_at(deadline):
+                    async with SessionLocal() as session:
+                        k_index = await _get_or_build_scope_knowledge_index(
+                            session,
+                            current_versions,
+                            allowed_partitions,
+                        )
+                        await _ensure_versions_hydrated(
+                            session,
+                            k_index,
+                            missing_vids,
+                            current_versions,
+                            sources,
+                        )
+                    qdrant_client = await engine_manager.get_search_unit_qdrant_client()
+                    verify_store = SearchUnitQdrantStore(qdrant_client)
+                    min_existing_score = min((float(s.score or 0.35) for s in selected), default=0.35)
+                    for vid in missing_vids:
+                        if len(selected) >= max_catalog_slots:
+                            break
+                        hydrated_items = k_index.hydrated_su_by_version.get(vid, ())
+                        if not hydrated_items:
+                            continue
+                        sec_template = hydrated_items[0][0]
+                        ver = current_versions[vid]
+                        expected_point_id = generate_search_unit_point_id(
+                            f"search_units_{ver.project_id}",
+                            str(sec_template.search_unit_id or sec_template.chunk_id or ""),
+                        )
+                        point = await verify_store.get_point(
+                            f"search_units_{ver.project_id}",
+                            expected_point_id,
+                        )
+                        if point is None:
+                            continue
+                        p_load = point.payload
+                        if (
+                            point.point_id != expected_point_id
+                            or p_load.get("search_unit_id") != sec_template.search_unit_id
+                            or p_load.get("document_version_id") != vid
+                            or p_load.get("project_id") != ver.project_id
+                            or p_load.get("tenant_id") != ver.tenant_id
+                            or p_load.get("security_partition_id") != ver.partition_id
+                            or p_load.get("content_hash") != sec_template.content_hash
+                        ):
+                            continue
+                        selected.append(
+                            sec_template.model_copy(
+                                update={
+                                    "score": round(max(0.25, min_existing_score - 0.001), 6),
+                                    "rank": len(selected),
+                                }
+                            )
+                        )
+            except (TimeoutError, SQLAlchemyError, SearchIndexUnavailable):
+                pass
     selected_version_ids = {str(section.document_version_id or "") for section in selected}
     if selected_version_ids:
         try:
