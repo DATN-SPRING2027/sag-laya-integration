@@ -230,7 +230,15 @@ async def reprocess_document(
     document_id: str,
     *,
     job_queue: JobQueue,
+    remote_source_url: str | None = None,
+    expected_sha256: str | None = None,
+    expected_size_bytes: int | None = None,
+    original_filename: str | None = None,
 ) -> Job:
+    if remote_source_url:
+        from sag_api.parsing.remote_object import validate_remote_object_url
+
+        validate_remote_object_url(remote_source_url, settings)
     document = await get_document(session, source, document_id)
     if document.status in {DocumentStatus.DELETING, DocumentStatus.DELETE_FAILED}:
         raise ConflictError("Document is deleting or deletion failed, cannot reprocess")
@@ -266,6 +274,7 @@ async def reprocess_document(
     )
     values: dict = {
         "status": DocumentStatus.PENDING,
+        "is_active": True,
         "error": None,
         "error_layer": None,
         "error_stage": None,
@@ -313,16 +322,44 @@ async def reprocess_document(
     payload.pop("pause_requested", None)
     payload.pop("resume_requested", None)
     payload.pop("canonical_checkpoint_stage", None)
+    remote_payload: dict = {}
+    if remote_source_url:
+        remote_payload = {
+            "remote_object_sourced": True,
+            "remote_source_url": remote_source_url,
+            **(
+                {"expected_sha256": expected_sha256.strip().lower()}
+                if expected_sha256
+                else {}
+            ),
+            **(
+                {"expected_size_bytes": int(expected_size_bytes)}
+                if expected_size_bytes
+                else {}
+            ),
+            **(
+                {"original_filename": original_filename}
+                if original_filename
+                else {}
+            ),
+        }
     if restart_from_scratch:
         payload = set_scheduler(
             {
                 "target_document_id": document.id,
                 "derived_source_ids": sorted(derived_source_ids),
+                **remote_payload,
             },
             priority=DELETE_PRIORITY,
         )
     elif retrying_cleanup:
-        payload = set_scheduler(payload, priority=DELETE_PRIORITY, blocked_reason=None)
+        payload = set_scheduler(
+            {**payload, **remote_payload},
+            priority=DELETE_PRIORITY,
+            blocked_reason=None,
+        )
+    elif remote_payload:
+        payload = {**payload, **remote_payload}
     job = Job(
         type=(JobType.REPROCESS_DOCUMENT if requires_maintenance else JobType.PROCESS_DOCUMENT),
         source_id=source.id,
@@ -826,11 +863,28 @@ async def delete_document(
         session.add(completed)
         await session.delete(document)
         await session.flush()
+        remaining_path_refs = 0
+        if path:
+            doc_refs = int(
+                await session.scalar(
+                    select(func.count()).select_from(Document).where(Document.storage_path == path)
+                )
+                or 0
+            )
+            snap_refs = int(
+                await session.scalar(
+                    select(func.count())
+                    .select_from(SourceSnapshot)
+                    .where(SourceSnapshot.storage_uri == path)
+                )
+                or 0
+            )
+            remaining_path_refs = doc_refs + snap_refs
         await _refresh_source_counts(session, source)
         await touch_source_revision(session, source.id)
         await session.commit()
         await session.refresh(completed)
-        if path:
+        if path and remaining_path_refs == 0:
             from sag_api.parsing.service import parsed_sidecar_paths
 
             for candidate in [path, *parsed_sidecar_paths(path)]:
@@ -1114,17 +1168,29 @@ async def handle_document_upload(
                     code="IDEMPOTENCY_IDENTITY_MISMATCH",
                     retryable=False,
                 )
-        return DocumentUploadResponse(
-            document_id=doc_ver.document_id if doc_ver else "",
-            version_no=doc_ver.version_no if doc_ver else 1,
-            version_id=existing_run.document_version_id,
-            run_id=existing_run.id,
-            file_hash=payload_hash,
-            status=doc_ver.status if doc_ver else "RECEIVED",
-            search_status=doc_ver.search_status if doc_ver else "PENDING",
-            knowledge_status=doc_ver.knowledge_status if doc_ver else "NOT_STARTED",
-            is_duplicate=True,
-        )
+            is_revoked_replay = (
+                doc_ver.status == "REVOKED"
+                or doc_ver.search_status == "REVOKED"
+                or (bound_doc is not None and not bound_doc.is_active)
+            )
+        else:
+            is_revoked_replay = False
+        if is_revoked_replay:
+            idempotency_key = normalize_idempotency_key(
+                f"{client_token}:revoked_resync:{uuid.uuid4().hex}"
+            )
+        else:
+            return DocumentUploadResponse(
+                document_id=doc_ver.document_id if doc_ver else "",
+                version_no=doc_ver.version_no if doc_ver else 1,
+                version_id=existing_run.document_version_id,
+                run_id=existing_run.id,
+                file_hash=payload_hash,
+                status=doc_ver.status if doc_ver else "RECEIVED",
+                search_status=doc_ver.search_status if doc_ver else "PENDING",
+                knowledge_status=doc_ver.knowledge_status if doc_ver else "NOT_STARTED",
+                is_duplicate=True,
+            )
 
     if not source_id:
         proj_source = await get_or_create_project_source(session, tenant_id, project_id)
@@ -1254,6 +1320,7 @@ async def handle_document_upload(
                     doc.storage_path = storage_path
                     doc.is_active = True
                     doc.status = DocumentStatus.PENDING
+                    doc.progress = 0
                     doc.filename = original_filename
                     doc.content_type = content_type
                     doc.size_bytes = len(file_bytes)
@@ -1425,6 +1492,421 @@ async def handle_document_upload(
     )
 
 
+def _check_object_ingest_metadata(filename: str, expected_size_bytes: int) -> None:
+    if expected_size_bytes <= 0:
+        raise ValidationError("Object size must be positive")
+    max_size = getattr(settings, "max_upload_size_bytes", None) or (settings.max_upload_mb * 1024 * 1024)
+    if expected_size_bytes > max_size:
+        raise ValidationError(
+            f"File size exceeds maximum allowed ({max_size} bytes)",
+            layer=ErrorLayer.CLIENT,
+            stage=ErrorStage.UPLOAD,
+        )
+    allowed = settings.allowed_upload_exts
+    if allowed:
+        ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        if ext not in allowed:
+            pretty = ", ".join(sorted(e.lstrip(".") for e in allowed))
+            raise ValidationError(
+                f"Unsupported file extension. Allowed: {pretty}",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            )
+
+
+async def handle_document_object_ingest(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    project_id: str,
+    owner_id: str,
+    security_partition_id: str,
+    client_token: str,
+    source_url: str,
+    original_filename: str,
+    expected_sha256: str,
+    expected_size_bytes: int,
+    content_type: str = "application/octet-stream",
+    logical_source_id: str | None = None,
+    source_published_at: datetime | None = None,
+    job_queue: JobQueue | None = None,
+    source_id: str | None = None,
+) -> DocumentUploadResponse:
+    """Zero-buffer control-plane registration for an object already uploaded to R2.
+
+    Validates ACL partition, idempotency, extension, size budget, and R2 host allowlist,
+    then persists Document/DocumentVersion/IngestionRun/Job so the background worker
+    streams the object in 64KB chunks directly to disk.
+    """
+    from sag_api.parsing.remote_object import (
+        resolve_snapshot_target_path,
+        validate_remote_object_url,
+    )
+
+    if not security_partition_id or not security_partition_id.strip():
+        raise ValidationError(
+            "X-Continuum-Security-Partition header is required to enforce data isolation"
+        )
+    if not client_token or not client_token.strip():
+        raise ValidationError("Idempotency-Key header is required for object ingest")
+
+    safe_filename = os.path.basename(original_filename.replace("\\", "/")) or "upload"
+    _check_object_ingest_metadata(safe_filename, expected_size_bytes)
+    validate_remote_object_url(source_url, settings)
+
+    payload_hash = expected_sha256.strip().lower()
+    if len(payload_hash) != 64:
+        raise ValidationError(
+            "expected_sha256 must be a 64-character hex SHA-256 digest",
+            layer=ErrorLayer.CLIENT,
+            stage=ErrorStage.UPLOAD,
+        )
+    idempotency_key = normalize_idempotency_key(client_token)
+    logical_id = (logical_source_id or safe_filename).strip()
+
+    existing_run = await _find_upload_run(
+        session, tenant_id=tenant_id, project_id=project_id, idempotency_key=idempotency_key
+    )
+    if existing_run:
+        if existing_run.payload_hash != payload_hash:
+            raise ConflictError(
+                f"Idempotency key is already bound to a different file payload hash. "
+                f"(incoming={payload_hash}, existing={existing_run.payload_hash})",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+                code="IDEMPOTENCY_PAYLOAD_MISMATCH",
+                retryable=False,
+            )
+        doc_ver = await session.get(DocumentVersion, existing_run.document_version_id)
+        if doc_ver:
+            bound_partition = (doc_ver.metadata_json or {}).get("security_partition_id")
+            if bound_partition != security_partition_id:
+                raise ConflictError(
+                    "Idempotency key is already bound to a different security partition",
+                    layer=ErrorLayer.CLIENT,
+                    stage=ErrorStage.UPLOAD,
+                    code="IDEMPOTENCY_PARTITION_MISMATCH",
+                    retryable=False,
+                )
+            bound_doc = await session.get(Document, doc_ver.document_id)
+            if bound_doc and bound_doc.logical_source_id != logical_id:
+                raise ConflictError(
+                    f"Idempotency key is already bound to logical source '{bound_doc.logical_source_id}'.",
+                    layer=ErrorLayer.CLIENT,
+                    stage=ErrorStage.UPLOAD,
+                    code="IDEMPOTENCY_IDENTITY_MISMATCH",
+                    retryable=False,
+                )
+            is_revoked_replay = (
+                doc_ver.status == "REVOKED"
+                or doc_ver.search_status == "REVOKED"
+                or (bound_doc is not None and not bound_doc.is_active)
+            )
+        else:
+            is_revoked_replay = False
+        if is_revoked_replay:
+            idempotency_key = normalize_idempotency_key(
+                f"{client_token}:revoked_resync:{uuid.uuid4().hex}"
+            )
+        else:
+            return DocumentUploadResponse(
+                document_id=doc_ver.document_id if doc_ver else "",
+                version_no=doc_ver.version_no if doc_ver else 1,
+                version_id=existing_run.document_version_id,
+                run_id=existing_run.id,
+                file_hash=payload_hash,
+                status=doc_ver.status if doc_ver else "RECEIVED",
+                search_status=doc_ver.search_status if doc_ver else "PENDING",
+                knowledge_status=doc_ver.knowledge_status if doc_ver else "NOT_STARTED",
+                is_duplicate=True,
+            )
+
+    if not source_id:
+        proj_source = await get_or_create_project_source(session, tenant_id, project_id)
+        source_id = proj_source.id
+
+    storage_path = resolve_snapshot_target_path(
+        settings.effective_data_dir, payload_hash, safe_filename
+    )
+
+    max_retries = 3
+    duplicate_response: DocumentUploadResponse | None = None
+    for attempt in range(max_retries):
+        try:
+            async with session.begin_nested():
+                doc_stmt = (
+                    select(Document)
+                    .where(
+                        Document.tenant_id == tenant_id,
+                        Document.project_id == project_id,
+                        Document.logical_source_id == logical_id,
+                    )
+                    .with_for_update()
+                )
+                doc = (await session.execute(doc_stmt)).scalar_one_or_none()
+
+                now_utc = datetime.now(UTC)
+                is_new_doc = False
+                if not doc:
+                    is_new_doc = True
+                    doc_id = generate_doc_id(tenant_id, project_id, logical_id)
+                    doc = Document(
+                        id=doc_id,
+                        tenant_id=tenant_id,
+                        project_id=project_id,
+                        owner_id=owner_id,
+                        logical_source_id=logical_id,
+                        source_id=source_id,
+                        filename=safe_filename,
+                        content_type=content_type,
+                        size_bytes=expected_size_bytes,
+                        storage_path=storage_path,
+                        status=DocumentStatus.PENDING,
+                    )
+                    session.add(doc)
+                    await session.flush()
+                    version_no = 1
+                    supersedes_id = None
+                else:
+                    v_stmt = (
+                        select(DocumentVersion)
+                        .where(DocumentVersion.document_id == doc.id)
+                        .order_by(DocumentVersion.version_no.desc())
+                        .limit(1)
+                        .with_for_update()
+                    )
+                    latest_ver = (await session.execute(v_stmt)).scalar_one_or_none()
+                    if latest_ver is None or (
+                        (latest_ver.metadata_json or {}).get("security_partition_id")
+                        != security_partition_id
+                    ):
+                        raise ConflictError(
+                            "Logical document already belongs to a different security partition",
+                            layer=ErrorLayer.CLIENT,
+                            stage=ErrorStage.UPLOAD,
+                            code="DOCUMENT_PARTITION_MISMATCH",
+                            retryable=False,
+                        )
+                    if (
+                        latest_ver
+                        and latest_ver.file_hash == payload_hash
+                        and latest_ver.status != "REVOKED"
+                        and doc.is_active
+                    ):
+                        run_stmt = (
+                            select(IngestionRun)
+                            .where(IngestionRun.document_version_id == latest_ver.id)
+                            .order_by(IngestionRun.created_at.desc())
+                            .limit(1)
+                        )
+                        existing_run = (await session.execute(run_stmt)).scalar_one_or_none()
+                        if existing_run is None:
+                            existing_run = IngestionRun(
+                                id=str(uuid.uuid4()),
+                                tenant_id=tenant_id,
+                                project_id=project_id,
+                                document_version_id=latest_ver.id,
+                                idempotency_key=idempotency_key,
+                                payload_hash=payload_hash,
+                                content_hash=payload_hash,
+                                current_stage="DUPLICATE",
+                                status="SUCCEEDED",
+                                completed_at=now_utc,
+                            )
+                            session.add(existing_run)
+                        else:
+                            session.add(
+                                UploadIdempotencyKey(
+                                    tenant_id=tenant_id,
+                                    project_id=project_id,
+                                    idempotency_key=idempotency_key,
+                                    run_id=existing_run.id,
+                                )
+                            )
+                        await session.flush()
+                        duplicate_response = DocumentUploadResponse(
+                            document_id=doc.id,
+                            version_no=latest_ver.version_no,
+                            version_id=latest_ver.id,
+                            run_id=existing_run.id,
+                            file_hash=payload_hash,
+                            status=latest_ver.status,
+                            search_status=latest_ver.search_status,
+                            knowledge_status=latest_ver.knowledge_status,
+                            is_duplicate=True,
+                        )
+                        break
+                    elif latest_ver:
+                        latest_ver.valid_to = now_utc
+                        version_no = latest_ver.version_no + 1
+                        supersedes_id = latest_ver.id
+                    else:
+                        version_no = 1
+                        supersedes_id = None
+                    doc.storage_path = storage_path
+                    doc.is_active = True
+                    doc.status = DocumentStatus.PENDING
+                    doc.progress = 0
+                    doc.filename = safe_filename
+                    doc.content_type = content_type
+                    doc.size_bytes = expected_size_bytes
+                    doc.error = None
+                    doc.error_layer = None
+                    doc.error_stage = None
+                    if source_id and not doc.source_id:
+                        doc.source_id = source_id
+
+                version_id = generate_version_id(doc.id, version_no)
+                existing_ver = await session.get(DocumentVersion, version_id)
+                if not existing_ver:
+                    doc_version = DocumentVersion(
+                        id=version_id,
+                        document_id=doc.id,
+                        version_no=version_no,
+                        file_hash=payload_hash,
+                        supersedes_id=supersedes_id,
+                        source_published_at=source_published_at,
+                        valid_from=now_utc,
+                        valid_to=datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC),
+                        status="RECEIVED",
+                        search_status="PENDING",
+                        knowledge_status="NOT_STARTED",
+                        metadata_json={
+                            "security_partition_id": security_partition_id,
+                            "remote_object_sourced": True,
+                        },
+                    )
+                    session.add(doc_version)
+                    await session.flush()
+
+                    snapshot = SourceSnapshot(
+                        id=str(uuid.uuid4()),
+                        document_version_id=version_id,
+                        storage_uri=storage_path,
+                        original_filename=safe_filename,
+                        mime_type=content_type,
+                        byte_size=expected_size_bytes,
+                        checksum_sha256=payload_hash,
+                    )
+                    session.add(snapshot)
+                else:
+                    doc_version = existing_ver
+
+                run_id = str(uuid.uuid4())
+                initial_status = "QUEUED" if job_queue is not None else "PENDING_DISPATCH"
+                run = IngestionRun(
+                    id=run_id,
+                    tenant_id=tenant_id,
+                    project_id=project_id,
+                    document_version_id=doc_version.id,
+                    idempotency_key=idempotency_key,
+                    payload_hash=payload_hash,
+                    content_hash=payload_hash,
+                    current_stage="RECEIVE",
+                    status=initial_status,
+                )
+                session.add(run)
+
+                job = Job(
+                    type=JobType.PROCESS_DOCUMENT,
+                    source_id=doc.source_id,
+                    document_id=doc.id,
+                    status=JobStatus.QUEUED,
+                    payload={
+                        "run_id": run_id,
+                        "document_version_id": doc_version.id,
+                        "project_id": project_id,
+                        "tenant_id": tenant_id,
+                        "storage_path": storage_path,
+                        "remote_object_sourced": True,
+                        "remote_source_url": source_url,
+                        "expected_sha256": payload_hash,
+                        "expected_size_bytes": expected_size_bytes,
+                        "original_filename": safe_filename,
+                    },
+                )
+                session.add(job)
+
+                if source_id and is_new_doc:
+                    await session.execute(
+                        update(Source)
+                        .where(Source.id == source_id)
+                        .values(document_count=Source.document_count + 1)
+                    )
+                    await touch_source_revision(session, source_id)
+
+                await session.flush()
+                break
+        except IntegrityError:
+            existing = await _find_upload_run(
+                session, tenant_id=tenant_id, project_id=project_id, idempotency_key=idempotency_key
+            )
+            if existing:
+                if existing.payload_hash != payload_hash:
+                    raise ConflictError(
+                        "Idempotency key is already bound to a different file payload hash.",
+                        layer=ErrorLayer.CLIENT,
+                        stage=ErrorStage.UPLOAD,
+                        code="IDEMPOTENCY_PAYLOAD_MISMATCH",
+                        retryable=False,
+                    ) from None
+                doc_ver = await session.get(DocumentVersion, existing.document_version_id)
+                if doc_ver:
+                    if (doc_ver.metadata_json or {}).get("security_partition_id") != security_partition_id:
+                        raise ConflictError(
+                            "Idempotency key is already bound to a different security partition",
+                            layer=ErrorLayer.CLIENT,
+                            stage=ErrorStage.UPLOAD,
+                            code="IDEMPOTENCY_PARTITION_MISMATCH",
+                            retryable=False,
+                        ) from None
+                    bound_doc = await session.get(Document, doc_ver.document_id)
+                    if bound_doc and bound_doc.logical_source_id != logical_id:
+                        raise ConflictError(
+                            f"Idempotency key is already bound to logical source '{bound_doc.logical_source_id}'.",
+                            layer=ErrorLayer.CLIENT,
+                            stage=ErrorStage.UPLOAD,
+                            code="IDEMPOTENCY_IDENTITY_MISMATCH",
+                            retryable=False,
+                        ) from None
+                return DocumentUploadResponse(
+                    document_id=doc_ver.document_id if doc_ver else "",
+                    version_no=doc_ver.version_no if doc_ver else 1,
+                    version_id=existing.document_version_id,
+                    run_id=existing.id,
+                    file_hash=payload_hash,
+                    status=doc_ver.status if doc_ver else "RECEIVED",
+                    search_status=doc_ver.search_status if doc_ver else "PENDING",
+                    knowledge_status=doc_ver.knowledge_status if doc_ver else "NOT_STARTED",
+                    is_duplicate=True,
+                )
+            if attempt == max_retries - 1:
+                raise
+
+    await session.commit()
+
+    if duplicate_response is not None:
+        return duplicate_response
+
+    if job_queue is not None:
+        try:
+            await _enqueue_persisted_job(job_queue, job.id)
+        except Exception as exc:
+            log.warning("Failed to enqueue object ingest job %s to queue: %s", job.id, exc)
+
+    return DocumentUploadResponse(
+        document_id=doc.id,
+        version_no=doc_version.version_no,
+        version_id=doc_version.id,
+        run_id=run.id,
+        file_hash=payload_hash,
+        status=doc_version.status,
+        search_status=doc_version.search_status,
+        knowledge_status=doc_version.knowledge_status,
+        is_duplicate=False,
+    )
+
+
 async def get_document_version_status(
     session: AsyncSession,
     *,
@@ -1512,13 +1994,9 @@ async def get_document_version_status(
     elif (
         raw_progress == 0
         and doc.status in (DocumentStatus.PENDING, DocumentStatus.LOADING)
-        and (
-            is_reprocessing
-            or (
-                latest_run is not None
-                and latest_run.status in ("QUEUED", "PENDING_DISPATCH", "RUNNING")
-            )
-        )
+        and not is_reprocessing
+        and latest_run is not None
+        and latest_run.status in ("QUEUED", "PENDING_DISPATCH", "RUNNING")
     ):
         computed_progress = 5
     else:

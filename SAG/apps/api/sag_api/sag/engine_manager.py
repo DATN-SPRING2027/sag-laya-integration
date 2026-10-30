@@ -919,8 +919,24 @@ class EngineManager:
         The wait deliberately happens outside the job worker pool. The caller
         owns one maintenance request until ``end_document_maintenance``.
         """
+        is_project_source = bool(source is not None and (source.config or {}).get("is_project_source"))
+        if (
+            is_project_source
+            and not self._settings.document_event_extraction_enabled
+            and self._slots.get(source_config_id) is None
+        ):
+            return
         while True:
-            slot = await self._slot(source_config_id, source)
+            try:
+                slot = await self._slot(source_config_id, source)
+            except Exception as slot_exc:
+                if is_project_source and "sag_schema_meta" in str(slot_exc):
+                    log.warning(
+                        "Skipping legacy DataEngine maintenance fence for project source %s because sag_schema_meta is uninitialized",
+                        source_config_id,
+                    )
+                    return
+                raise
             registered = False
             try:
                 async with slot.state_lock:

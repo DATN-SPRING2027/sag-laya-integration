@@ -6,6 +6,7 @@ from datetime import datetime
 
 from fastapi import (
     APIRouter,
+    Body,
     Depends,
     File,
     Form,
@@ -50,6 +51,8 @@ from sag_api.schemas.common import Ok
 from sag_api.schemas.document import DocumentOut, IngestRequest
 from sag_api.schemas.job import JobOut
 from sag_api.schemas.routing_rag import (
+    DocumentObjectIngestRequest,
+    DocumentReprocessRequest,
     DocumentRevokeRequest,
     DocumentRevokeResponse,
     DocumentUploadResponse,
@@ -62,6 +65,7 @@ from sag_api.services.document_service import (
     get_document_version_status,
     get_or_create_project_source,
     get_public_document,
+    handle_document_object_ingest,
     handle_document_upload,
     ingest_content,
     pause_document,
@@ -72,6 +76,7 @@ from sag_api.services.document_service import (
 )
 from sag_api.services.source_operation_service import source_document_mutation
 from sag_api.services.source_service import (
+    get_authorized_source,
     get_authorized_source_project,
     get_source,
     list_authorized_documents,
@@ -688,6 +693,75 @@ async def upload_document_version(
     return result
 
 
+@project_router.post(
+    "/ingest-object",
+    response_model=DocumentUploadResponse,
+    summary="Zero-buffer ingest of a document version from an authorized R2/S3 presigned URL",
+)
+async def ingest_document_object_version(
+    project_id: str,
+    payload: DocumentObjectIngestRequest,
+    response: Response,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    x_continuum_user_id: str | None = Header(None, alias="X-Continuum-User-Id"),
+    x_continuum_security_partition: str | None = Header(None, alias="X-Continuum-Security-Partition"),
+    x_continuum_tenant_id: str | None = Header(None, alias="X-Continuum-Tenant-Id"),
+    principal: VerifiedPrincipal = Depends(require_project_bff_principal),
+    session: AsyncSession = Depends(get_session),
+    job_queue: JobQueue | None = Depends(get_job_queue),
+) -> DocumentUploadResponse:
+    if project_id not in principal.allowed_project_ids:
+        raise ForbiddenError(
+            f"Principal '{principal.subject}' is not authorized to access project '{project_id}'"
+        )
+    if x_continuum_user_id and x_continuum_user_id != principal.subject:
+        raise ForbiddenError("X-Continuum-User-Id does not match the signed principal")
+    if not principal.tenant_id:
+        raise ForbiddenError("The signed principal assertion has no tenant scope")
+    if x_continuum_tenant_id and x_continuum_tenant_id != principal.tenant_id:
+        raise ForbiddenError("X-Continuum-Tenant-Id does not match the signed principal")
+
+    partition = x_continuum_security_partition
+    if not partition or not partition.strip():
+        if len(principal.allowed_partition_ids) == 1:
+            partition = next(iter(principal.allowed_partition_ids))
+        else:
+            raise ValidationError(
+                "X-Continuum-Security-Partition header is required to enforce data isolation"
+            )
+    if partition not in principal.allowed_partition_ids:
+        raise ForbiddenError(
+            f"Principal '{principal.subject}' is not authorized for security partition '{partition}'"
+        )
+
+    filename = _upload_filename(payload.original_filename)
+    _check_extension(filename)
+
+    result = await handle_document_object_ingest(
+        session,
+        tenant_id=principal.tenant_id,
+        project_id=project_id,
+        owner_id=principal.subject,
+        security_partition_id=partition,
+        client_token=idempotency_key,
+        source_url=payload.source_url,
+        original_filename=filename,
+        expected_sha256=payload.expected_sha256,
+        expected_size_bytes=payload.expected_size_bytes,
+        content_type=payload.content_type or "application/octet-stream",
+        logical_source_id=payload.logical_source_id,
+        source_published_at=payload.source_published_at,
+        job_queue=job_queue,
+    )
+
+    if result.is_duplicate:
+        response.status_code = status.HTTP_200_OK
+    else:
+        response.status_code = status.HTTP_202_ACCEPTED
+
+    return result
+
+
 @project_router.get(
     "/{document_id}/versions/{version_no}/status",
     response_model=DocumentVersionStatusResponse,
@@ -728,12 +802,13 @@ async def revoke_project_document_endpoint(
     payload: DocumentRevokeRequest,
     principal: VerifiedPrincipal = Depends(require_project_bff_principal),
     session: AsyncSession = Depends(get_session),
+    job_queue: JobQueue | None = Depends(get_job_queue),
 ) -> DocumentRevokeResponse:
     if project_id not in principal.allowed_project_ids or not principal.tenant_id:
         raise ForbiddenError(
             f"Principal '{principal.subject}' is not authorized to access project '{project_id}'"
         )
-    return await revoke_project_document(
+    revoke_result = await revoke_project_document(
         session,
         tenant_id=principal.tenant_id,
         project_id=project_id,
@@ -741,6 +816,27 @@ async def revoke_project_document_endpoint(
         document_id=payload.document_id,
         reason=payload.reason,
     )
+    if (
+        (payload.reason or "").strip().upper() == "DOCUMENT_DELETED"
+        and revoke_result.document_id
+    ):
+        try:
+            doc, source = await _resolve_project_document_with_source(
+                session,
+                principal=principal,
+                project_id=project_id,
+                document_id=revoke_result.document_id,
+            )
+            async with source_document_mutation(SessionLocal, source.id, "document-delete"):
+                await delete_document(
+                    session,
+                    source,
+                    doc.id,
+                    job_queue=job_queue,
+                )
+        except NotFoundError:
+            pass
+    return revoke_result
 
 
 async def _resolve_project_document_with_source(
@@ -765,7 +861,16 @@ async def _resolve_project_document_with_source(
         doc.source_id = source.id
         await session.flush()
     else:
-        source = await get_source(session, doc.source_id)
+        source = await get_authorized_source(
+            session, principal=principal, source_id=doc.source_id
+        )
+        if source is None:
+            source = await get_or_create_project_source(
+                session, principal.tenant_id, project_id
+            )
+            if doc.source_id != source.id:
+                doc.source_id = source.id
+                await session.flush()
     return doc, source
 
 
@@ -813,6 +918,8 @@ async def resume_project_document_endpoint(
     summary="Reprocess a project document from failed or ready state",
 )
 async def reprocess_project_document_endpoint(
+    payload: DocumentReprocessRequest | None = Body(default=None),
+    *,
     project_id: str,
     document_id: str,
     principal: VerifiedPrincipal = Depends(require_project_bff_principal),
@@ -823,7 +930,16 @@ async def reprocess_project_document_endpoint(
         session, principal=principal, project_id=project_id, document_id=document_id
     )
     async with source_document_mutation(SessionLocal, source.id, "document-reprocess"):
-        job = await reprocess_document(session, source, doc.id, job_queue=job_queue)
+        job = await reprocess_document(
+            session,
+            source,
+            doc.id,
+            job_queue=job_queue,
+            remote_source_url=payload.source_url if payload else None,
+            expected_sha256=payload.expected_sha256 if payload else None,
+            expected_size_bytes=payload.expected_size_bytes if payload else None,
+            original_filename=payload.original_filename if payload else None,
+        )
     return JobOut.model_validate(job)
 
 

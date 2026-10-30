@@ -1,8 +1,7 @@
 """运行期模型与知识库配置 —— DB 覆盖层叠加在 env 默认（`settings` 单例）之上。
 
-单用户本地示范：把「模型与检索」配置存进 `settings` 表（scope=global, key=model_config）。
-启动时与保存后**就地覆盖 `settings` 单例**的相应字段，端点再重建 `LLMClient` / 重置暖引擎，
-使配置改动**无需重启即生效**。api_key 明文入库（本地单用户可接受），读取时脱敏（只返回是否已设）。
+MinerU 文档解析仅使用 MinerU Official API v4（`https://mineru.net` + `SAG_MINERU_OFFICIAL_API_TOKEN`），
+旧版 302 MinerU 覆盖项在读取与保存时会自动清理迁移，避免覆盖官方 Token。
 """
 
 from __future__ import annotations
@@ -49,8 +48,7 @@ _FIELDS = frozenset(
         "document_parser",
         "mineru_provider",
         "mineru_base_url",
-        "mineru_api_key",
-        "mineru_version",
+        "mineru_official_api_token",
         "mineru_official_model",
         "document_extract_concurrency",
         "document_chunk_max_tokens",
@@ -61,7 +59,14 @@ _FIELDS = frozenset(
         "sag_language",
     }
 )
-_SECRET_FIELDS = frozenset({"llm_api_key", "siliconflow_api_key", "embedding_api_key", "mineru_api_key"})
+_SECRET_FIELDS = frozenset(
+    {
+        "llm_api_key",
+        "siliconflow_api_key",
+        "embedding_api_key",
+        "mineru_official_api_token",
+    }
+)
 _NULLABLE_FIELDS = frozenset(
     {"llm_base_url", "embedding_base_url", "embedding_dimensions", "mineru_base_url"}
 )
@@ -84,7 +89,7 @@ _LOCKABLE_LLM_FIELDS = frozenset(
 _MODEL_CONFIG_SOURCES = {field: "default" for field in _FIELDS - _SECRET_FIELDS}
 
 _OPENAI_COMPATIBLE = get_model_provider("openai")
-
+_OFFICIAL_MINERU_BASE_URL = "https://mineru.net"
 
 QUICK_SETUP_302 = {
     "llm_provider": _OPENAI_COMPATIBLE.id,
@@ -99,9 +104,8 @@ QUICK_SETUP_302 = {
     "embedding_base_url": "https://api.302ai.cn/v1",
     "embedding_dimensions": 1024,
     "document_parser": "auto",
-    "mineru_provider": "302",
-    "mineru_base_url": "https://api.302ai.cn",
-    "mineru_version": "2.5",
+    "mineru_provider": "official",
+    "mineru_base_url": _OFFICIAL_MINERU_BASE_URL,
     "document_extract_concurrency": 30,
     "document_chunk_max_tokens": 1_000,
     "document_chunk_mode": "standard",
@@ -117,7 +121,6 @@ _LEGACY_302_BASE_URLS = {
     "https://api.siliconflow.cn": "https://api.siliconflow.com",
     "https://api.siliconflow.cn/v1": "https://api.siliconflow.com/v1",
 }
-_OFFICIAL_MINERU_BASE_URL = "https://mineru.net/api/v4"
 
 
 async def _load_row(session: AsyncSession, key: str = _KEY) -> Setting | None:
@@ -152,7 +155,7 @@ async def _reject_incompatible_embedding_change(
 
 
 def _normalize_overrides(overrides: dict) -> dict:
-    """清理持久化配置，确保已下线或非法策略不会进入运行时。"""
+    """清理持久化配置，确保已下线的 302 MinerU 或旧路由策略不会进入运行时。"""
     normalized = dict(overrides)
     decision_provider = normalized.get("decision_provider")
     legacy_provider = (
@@ -164,32 +167,33 @@ def _normalize_overrides(overrides: dict) -> dict:
         normalized["decision_provider"] = "siliconflow"
     if legacy_provider or normalized.get("decision_model") == "typesafe/jev-1.14":
         normalized["decision_model"] = "Kev-4b"
-    for obsolete_field in ("openrouter_api_key", "laya_model_path", "laya_device"):
+    for obsolete_field in (
+        "openrouter_api_key",
+        "laya_model_path",
+        "laya_device",
+        "mineru_api_key",
+        "mineru_version",
+    ):
         normalized.pop(obsolete_field, None)
-    for field in ("llm_base_url", "embedding_base_url", "mineru_base_url"):
+
+    for field in ("llm_base_url", "embedding_base_url"):
         value = normalized.get(field)
         if isinstance(value, str):
             normalized[field] = _LEGACY_302_BASE_URLS.get(value.rstrip("/"), value)
-    if normalized.get("mineru_provider") is None:
-        mineru_url = str(normalized.get("mineru_base_url") or "")
-        mineru_host = (urlparse(mineru_url).hostname or "").lower()
-        normalized["mineru_provider"] = (
-            "official" if mineru_host == "mineru.net" else "302"
-        )
-    elif (
-        normalized["mineru_provider"] == "official"
-        and str(normalized.get("mineru_base_url") or "").rstrip("/")
-        == "https://api.302ai.cn"
-    ):
-        normalized["mineru_base_url"] = _OFFICIAL_MINERU_BASE_URL
-    elif (
-        normalized["mineru_provider"] == "302"
-        and (urlparse(str(normalized.get("mineru_base_url") or "")).hostname or "").lower()
-        == "mineru.net"
-    ):
-        # 用户在设置页只粘贴了官方 URL、未切换服务商下拉框时，协议必须跟随
-        # URL 主机走官方分支，否则会把官方 v4 请求误发到 302 适配器。
+
+    if "mineru_provider" in normalized:
         normalized["mineru_provider"] = "official"
+    if "mineru_base_url" in normalized:
+        raw_mineru_url = normalized.get("mineru_base_url")
+        if not isinstance(raw_mineru_url, str) or not raw_mineru_url.strip():
+            normalized["mineru_base_url"] = _OFFICIAL_MINERU_BASE_URL
+        else:
+            mineru_host = (urlparse(raw_mineru_url.strip()).hostname or "").lower()
+            if mineru_host in {"api.302ai.cn", "api.302.ai"}:
+                normalized["mineru_base_url"] = _OFFICIAL_MINERU_BASE_URL
+            else:
+                normalized["mineru_base_url"] = raw_mineru_url.strip()
+
     strategy = normalized.get("search_strategy")
     if strategy == "atomic":
         normalized["search_strategy"] = normalize_search_strategy(strategy)
@@ -236,12 +240,10 @@ def apply_overrides(settings: Settings, overrides: dict) -> None:
 
 
 _ENV_VAR_PREFIX = "SAG_"
-# 常规字段与密钥分别比较；告警均不打印配置值。
 _ENV_COMPARABLE_FIELDS = tuple(sorted(_FIELDS - _SECRET_FIELDS))
 
 
 def _env_matches_persisted(field: str, persisted: object) -> bool | None:
-    """比对 `SAG_<FIELD>` 与持久化值：一致 True，不一致 False，未设置/无法解析返回 None。"""
     raw = os.environ.get(f"{_ENV_VAR_PREFIX}{field.upper()}")
     if raw is None or not raw.strip():
         return None
@@ -261,12 +263,6 @@ def _env_matches_persisted(field: str, persisted: object) -> bool | None:
 
 
 def _warn_persisted_beats_env(overrides: dict) -> None:
-    """env 里显式配置、但与持久化 `model_config` 不一致时，在启动时告警。
-
-    `SAG_*` 只是**首次启动的默认值**：一旦设置页保存过，持久化配置优先并静默覆盖 env。
-    此前这一优先级完全无声——运维改了 `.env` 重启后 `docker exec ... env` 看得到新值，
-    引擎却仍在用旧值，排查成本极高（见 issue #169）。
-    """
     locked_fields = _LOCKABLE_LLM_FIELDS if _settings.lock_llm_config else frozenset()
     for field in _ENV_COMPARABLE_FIELDS:
         if field not in overrides or field in locked_fields:
@@ -292,7 +288,6 @@ async def apply_startup_overrides(session_factory: async_sessionmaker) -> None:
         raw = dict(row.value) if row and isinstance(row.value, dict) else {}
         overrides = _normalize_overrides(raw)
         if row is not None and overrides != raw:
-            # JSON 列未使用 MutableDict，必须整体重新赋值才能可靠持久化。
             row.value = overrides
             await session.commit()
         _warn_persisted_beats_env(overrides)
@@ -301,8 +296,6 @@ async def apply_startup_overrides(session_factory: async_sessionmaker) -> None:
         preference_values = dict(preferences.value) if preferences and isinstance(preferences.value, dict) else {}
         timezone = preference_values.get("timezone")
         if isinstance(timezone, str):
-            # Stored values were validated on write. Settings assignment is kept
-            # explicit so model configuration and presentation preferences remain separate.
             try:
                 ZoneInfo(timezone)
             except (ZoneInfoNotFoundError, ValueError):
@@ -313,6 +306,7 @@ async def apply_startup_overrides(session_factory: async_sessionmaker) -> None:
 
 def effective_model_config() -> dict:
     """当前生效的模型配置（读 settings 单例；密钥脱敏为 *_set 布尔）。"""
+    token_set = bool(_settings.mineru_official_api_token)
     return {
         "llm_provider": _settings.llm_provider,
         "llm_base_url": _settings.llm_base_url,
@@ -332,11 +326,11 @@ def effective_model_config() -> dict:
         "embedding_api_key_set": bool(_settings.embedding_api_key),
         "document_parser": _settings.document_parser,
         "effective_document_parser": _settings.effective_document_parser,
-        "mineru_provider": _settings.mineru_provider,
+        "mineru_provider": "official",
         "mineru_base_url": _settings.mineru_base_url,
-        "mineru_version": _settings.mineru_version,
         "mineru_official_model": _settings.mineru_official_model,
-        "mineru_api_key_set": bool(_settings.mineru_api_key),
+        "mineru_official_api_token_set": token_set,
+        "mineru_api_key_set": token_set,
         "document_extract_concurrency": _settings.document_extract_concurrency,
         "document_chunk_max_tokens": _settings.document_chunk_max_tokens,
         "document_chunk_mode": _settings.document_chunk_mode,
@@ -372,29 +366,29 @@ async def save_system_preferences(session: AsyncSession, patch: dict) -> dict[st
 
 
 async def save_model_config(session: AsyncSession, patch: dict) -> dict:
-    """合并保存模型配置：入库 + 覆盖 settings 单例；返回生效配置（脱敏）。
+    """合并保存模型配置：入库 + 覆盖 settings 单例；返回生效配置（脱敏）。"""
+    effective_patch = dict(patch)
+    # 兼容 Web 设置页旧表单字段名 `mineru_api_key`，统一写入官方 Token 字段
+    legacy_ui_token = effective_patch.pop("mineru_api_key", None)
+    if legacy_ui_token and not effective_patch.get("mineru_official_api_token"):
+        effective_patch["mineru_official_api_token"] = legacy_ui_token
 
-    约定（配合 `exclude_unset`）：
-    - 字段未出现 → 保持不变；
-    - 密钥字段值为空 → 忽略（保留原密钥，避免误清空）；空值仅经显式非空覆盖；
-    - 可空字段（base_url / dimensions）值为空 → 置 None（清除）。
-    """
-    await _reject_incompatible_embedding_change(session, patch)
+    await _reject_incompatible_embedding_change(session, effective_patch)
     row = await _load_row(session)
     raw = dict(row.value) if row and isinstance(row.value, dict) else {}
     stored = _normalize_overrides(raw)
 
-    for key, value in patch.items():
+    for key, value in effective_patch.items():
         if key not in _FIELDS:
             continue
         if _settings.lock_llm_config and key in _LOCKABLE_LLM_FIELDS:
             continue
         if key in _SECRET_FIELDS:
-            if value:  # 仅非空才更新；空/None 保留原值
+            if value:
                 stored[key] = str(value)
             continue
         if key in _NULLABLE_FIELDS and (value is None or value == ""):
-            stored[key] = None
+            stored[key] = _OFFICIAL_MINERU_BASE_URL if key == "mineru_base_url" else None
             continue
         stored[key] = value
 
@@ -411,37 +405,18 @@ async def save_model_config(session: AsyncSession, patch: dict) -> dict:
 
 
 async def save_302_quick_setup(session: AsyncSession, api_key: str) -> dict:
-    """用单个 302.AI Key 写入生成、向量、MinerU 与快速检索预设。"""
+    """用 302.AI Key 写入生成与向量预设；MinerU 始终保持 Official API，不覆盖官方 Token。"""
     return await save_model_config(
         session,
         {
             **QUICK_SETUP_302,
             "llm_api_key": api_key,
             "embedding_api_key": api_key,
-            "mineru_api_key": api_key,
         },
     )
 
 
-async def save_302_mineru_setup(session: AsyncSession) -> dict:
-    """为已有 302 模型配置复用现有 Key，不把密钥回传给浏览器。"""
-    candidates = (
-        (_settings.llm_base_url, _settings.llm_api_key),
-        (_settings.effective_embedding_base_url, _settings.effective_embedding_api_key),
+async def save_302_mineru_setup(_session: AsyncSession) -> dict:
+    raise ConfigurationError(
+        "当前系统仅使用 MinerU Official API v4，请配置 SAG_MINERU_OFFICIAL_API_TOKEN"
     )
-    for base_url, api_key in candidates:
-        parsed = urlparse(base_url or "")
-        host = (parsed.hostname or "").lower()
-        if host not in {"api.302.ai", "api.302ai.cn"} or not api_key:
-            continue
-        return await save_model_config(
-            session,
-            {
-                "document_parser": "auto",
-                "mineru_provider": "302",
-                "mineru_base_url": "https://api.302ai.cn",
-                "mineru_api_key": api_key,
-                "mineru_version": "2.5",
-            },
-        )
-    raise ConfigurationError("未找到可复用的 302.AI 模型 API Key")

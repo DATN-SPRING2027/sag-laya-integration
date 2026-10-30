@@ -39,6 +39,7 @@ class ModelConfigUpdate(BaseModel):
     """模型与知识库配置的部分更新（未出现的字段保持不变）。
 
     密钥字段留空表示「保持原值」（不清空）；base_url / dimensions 留空表示清除。
+    MinerU 仅支持 Official API v4（`SAG_MINERU_OFFICIAL_API_TOKEN`）。
     """
 
     llm_provider: ModelProviderId | None = None
@@ -61,10 +62,10 @@ class ModelConfigUpdate(BaseModel):
     embedding_dimensions: int | None = Field(default=None, ge=1, le=8192)
 
     document_parser: Literal["auto", "markitdown", "mineru"] | None = None
-    mineru_provider: Literal["302", "official"] | None = None
+    mineru_provider: Literal["official"] | None = None
     mineru_base_url: str | None = Field(default=None, max_length=500)
-    mineru_api_key: str | None = Field(default=None, max_length=500)
-    mineru_version: Literal["2.0", "2.5"] | None = None
+    mineru_official_api_token: str | None = Field(default=None, max_length=2048)
+    mineru_api_key: str | None = Field(default=None, max_length=2048)
     mineru_official_model: Literal["pipeline", "vlm"] | None = None
     document_extract_concurrency: int | None = Field(default=None, ge=1, le=50)
     document_chunk_max_tokens: int | None = Field(default=None, ge=100, le=100_000)
@@ -80,10 +81,15 @@ class ModelConfigUpdate(BaseModel):
     def normalize_sag_language(cls, value: str | None) -> str | None:
         return "en" if value is not None else None
 
+    @field_validator("mineru_provider", mode="before")
+    @classmethod
+    def normalize_mineru_provider(cls, value: object) -> str:
+        if value is None:
+            raise ValueError("解析器与 MinerU 服务商/模型配置不能为 null")
+        return "official"
+
     @field_validator(
         "document_parser",
-        "mineru_provider",
-        "mineru_version",
         "mineru_official_model",
     )
     @classmethod
@@ -141,7 +147,7 @@ class ModelConfigUpdate(BaseModel):
             raise ValueError("Decision model ID 不能为空")
         return value.strip()
 
-    @field_validator("siliconflow_api_key")
+    @field_validator("siliconflow_api_key", "mineru_official_api_token", "mineru_api_key")
     @classmethod
-    def normalize_siliconflow_api_key(cls, value: str | None) -> str | None:
+    def normalize_optional_secret(cls, value: str | None) -> str | None:
         return value.strip() if value is not None else None
