@@ -143,3 +143,9 @@ policy change. Revert the application commit to roll back the code. That does
 not remove recovered Qdrant points. Any operational rollback must use only the
 recorded added IDs after owner review; never delete a whole shared collection.
 Normal live test conversations persist through the existing application flow.
+
+### Review references
+
+- SAG application commit: `4646ac3`; [PR #51](https://github.com/DATN-SPRING2027/sag-laya-integration/pull/51).
+- Frontend companion commit: `ea160bc`; [PR #106](https://github.com/DATN-SPRING2027/DATN-FE/pull/106).
+- Both PRs target `main`; neither was merged or approved by this task.
