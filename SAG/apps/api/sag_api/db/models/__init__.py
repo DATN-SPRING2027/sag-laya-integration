@@ -19,6 +19,7 @@ from sag_api.db.models.knowledge_quality import (
     KnowledgeQualityAssessment,
     KnowledgeQueryDemandDaily,
 )
+from sag_api.db.models.mind_map import ProjectMindMapSnapshot
 from sag_api.db.models.octx import (
     OctxAsset,
     OctxDocumentBinding,
@@ -92,6 +93,7 @@ __all__ = [
     "OctxRelease",
     "OctxSourceBinding",
     "OctxTransfer",
+    "ProjectMindMapSnapshot",
     "ProjectSearchState",
     "ResearchTask",
     "SearchUnit",
