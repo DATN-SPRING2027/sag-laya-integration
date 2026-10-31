@@ -1,10 +1,23 @@
 from __future__ import annotations
 
-from sqlalchemy import JSON, ForeignKey, Index, String, Text, UniqueConstraint
+from datetime import datetime
+
+from sqlalchemy import (
+    DDL,
+    JSON,
+    CheckConstraint,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    UniqueConstraint,
+    event,
+    text,
+)
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column
 
-from sag_api.db.base import Base, IDMixin, TimestampMixin
+from sag_api.db.base import Base, IDMixin, TimestampMixin, UTCDateTime
 from sag_api.enums import BindingTargetType, MessageRole, MessageStatus
 
 
@@ -37,11 +50,53 @@ class AgentBinding(IDMixin, TimestampMixin, Base):
 
 class Thread(IDMixin, TimestampMixin, Base):
     __tablename__ = "threads"
+    __table_args__ = (
+        CheckConstraint(
+            "(parent_thread_id IS NULL AND branch_point_message_id IS NULL) OR "
+            "(parent_thread_id IS NOT NULL AND branch_point_message_id IS NOT NULL)",
+            name="ck_threads_branch_pair",
+        ),
+        CheckConstraint(
+            "parent_thread_id IS NULL OR parent_thread_id <> id",
+            name="ck_threads_no_self_parent",
+        ),
+        Index(
+            "ix_threads_owner_visible",
+            "agent_id",
+            "owner_key",
+            "archived",
+            text("updated_at DESC"),
+            sqlite_where=text("deleted_by_owner_at IS NULL"),
+            postgresql_where=text("deleted_by_owner_at IS NULL"),
+        ),
+    )
 
     owner_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id", ondelete="CASCADE"), index=True)
     title: Mapped[str] = mapped_column(String(300), default="New chat")
     archived: Mapped[bool] = mapped_column(default=False, index=True)
+    parent_thread_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("threads.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    branch_point_message_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey(
+            "messages.id",
+            ondelete="RESTRICT",
+            use_alter=True,
+            name="fk_threads_branch_point_message_id",
+        ),
+        nullable=True,
+        index=True,
+    )
+    deleted_by_owner_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(),
+        default=None,
+        nullable=True,
+    )
 
 
 class Message(IDMixin, TimestampMixin, Base):
@@ -83,3 +138,127 @@ class Message(IDMixin, TimestampMixin, Base):
     error: Mapped[dict | None] = mapped_column("error_json", JSON, default=None, nullable=True)
 
 
+_SQLITE_THREADS_BRANCH_SCOPE_INS = DDL(
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_threads_branch_scope_ins
+    BEFORE INSERT ON threads
+    FOR EACH ROW
+    WHEN NEW.parent_thread_id IS NOT NULL
+    BEGIN
+        SELECT CASE
+            WHEN NOT EXISTS (
+                SELECT 1 FROM threads p
+                 WHERE p.id = NEW.parent_thread_id
+                   AND p.agent_id = NEW.agent_id
+                   AND p.owner_key IS NEW.owner_key
+            ) THEN
+                RAISE(ABORT, 'Branched thread must share agent_id and owner_key with parent_thread_id')
+            WHEN NOT EXISTS (
+                SELECT 1 FROM messages m
+                 WHERE m.id = NEW.branch_point_message_id
+                   AND m.thread_id = NEW.parent_thread_id
+            ) THEN
+                RAISE(ABORT, 'branch_point_message_id must belong directly to parent_thread_id')
+        END;
+    END;
+    """
+)
+
+_SQLITE_THREADS_BRANCH_IMMUTABLE_UPD = DDL(
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_threads_branch_scope_upd
+    BEFORE UPDATE ON threads
+    FOR EACH ROW
+    BEGIN
+        SELECT CASE
+            WHEN NEW.parent_thread_id IS NOT OLD.parent_thread_id
+              OR NEW.branch_point_message_id IS NOT OLD.branch_point_message_id THEN
+                RAISE(ABORT, 'Thread branch lineage pointers are immutable after creation')
+            WHEN (NEW.agent_id IS NOT OLD.agent_id OR NEW.owner_key IS NOT OLD.owner_key)
+              AND (
+                  OLD.parent_thread_id IS NOT NULL
+                  OR EXISTS (SELECT 1 FROM threads c WHERE c.parent_thread_id = OLD.id)
+              ) THEN
+                RAISE(ABORT, 'Thread agent_id and owner_key are immutable in a branch lineage')
+        END;
+    END;
+    """
+)
+
+_PG_THREADS_BRANCH_SCOPE_DDLS = (
+    DDL(
+        """
+        CREATE OR REPLACE FUNCTION fn_threads_branch_scope_guard()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            IF TG_OP = 'UPDATE' THEN
+                IF NEW.parent_thread_id IS DISTINCT FROM OLD.parent_thread_id
+                   OR NEW.branch_point_message_id IS DISTINCT FROM OLD.branch_point_message_id THEN
+                    RAISE EXCEPTION 'Thread branch lineage pointers are immutable after creation'
+                        USING ERRCODE = '23514';
+                END IF;
+                IF (NEW.agent_id IS DISTINCT FROM OLD.agent_id
+                    OR NEW.owner_key IS DISTINCT FROM OLD.owner_key)
+                   AND (
+                       OLD.parent_thread_id IS NOT NULL
+                       OR EXISTS (SELECT 1 FROM threads c WHERE c.parent_thread_id = OLD.id)
+                   ) THEN
+                    RAISE EXCEPTION 'Thread agent_id and owner_key are immutable in a branch lineage'
+                        USING ERRCODE = '23514';
+                END IF;
+                RETURN NEW;
+            END IF;
+
+            IF NEW.parent_thread_id IS NOT NULL THEN
+                IF NOT EXISTS (
+                    SELECT 1 FROM threads p
+                     WHERE p.id = NEW.parent_thread_id
+                       AND p.agent_id = NEW.agent_id
+                       AND p.owner_key IS NOT DISTINCT FROM NEW.owner_key
+                ) THEN
+                    RAISE EXCEPTION 'Branched thread must share agent_id and owner_key with parent_thread_id'
+                        USING ERRCODE = '23514';
+                END IF;
+
+                IF NOT EXISTS (
+                    SELECT 1 FROM messages m
+                     WHERE m.id = NEW.branch_point_message_id
+                       AND m.thread_id = NEW.parent_thread_id
+                ) THEN
+                    RAISE EXCEPTION 'branch_point_message_id must belong directly to parent_thread_id'
+                        USING ERRCODE = '23514';
+                END IF;
+            END IF;
+
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        """
+    ),
+    DDL("DROP TRIGGER IF EXISTS trg_threads_branch_scope_guard ON threads"),
+    DDL(
+        """
+        CREATE TRIGGER trg_threads_branch_scope_guard
+        BEFORE INSERT OR UPDATE ON threads
+        FOR EACH ROW
+        EXECUTE FUNCTION fn_threads_branch_scope_guard()
+        """
+    ),
+)
+
+event.listen(
+    Message.__table__,
+    "after_create",
+    _SQLITE_THREADS_BRANCH_SCOPE_INS.execute_if(dialect="sqlite"),
+)
+event.listen(
+    Message.__table__,
+    "after_create",
+    _SQLITE_THREADS_BRANCH_IMMUTABLE_UPD.execute_if(dialect="sqlite"),
+)
+for _pg_ddl in _PG_THREADS_BRANCH_SCOPE_DDLS:
+    event.listen(
+        Message.__table__,
+        "after_create",
+        _pg_ddl.execute_if(dialect="postgresql"),
+    )
