@@ -843,3 +843,257 @@ async def test_llm_client_complete_structured_output_downgrade(
     assert structured == '{"ok": true}'
     assert recorded_kwargs[1]["response_format"]["type"] == "json_schema"
     assert recorded_kwargs[2]["response_format"] == {"type": "json_object"}
+
+
+@pytest.mark.asyncio
+async def test_mind_map_get_and_post_persist_snapshot_across_project_users_until_explicit_refresh(
+    mind_map_env,
+) -> None:
+    client: httpx.AsyncClient = mind_map_env.client
+    session_factory = mind_map_env.session_factory
+    llm: FakeMindMapLLM = mind_map_env.llm
+    pid = mind_map_env.project_alpha
+    url = f"/api/v1/projects/{pid}/mind-map"
+
+    user_one = _bff_headers(user_id="651a2b3c4d5e6f7a8b9c0d01", project_id=pid)
+    user_two = _bff_headers(user_id="651a2b3c4d5e6f7a8b9c0d02", project_id=pid)
+
+    # 1. Zero ready docs -> GET returns empty immediately with 0 LLM calls
+    r_empty = await client.get(url, headers=user_one)
+    assert r_empty.status_code == 200
+    assert r_empty.json()["status"] == "empty"
+    assert r_empty.json()["cached"] is False
+    assert len(llm.calls) == 0
+
+    # 2. Seed ready doc -> GET returns uninitialized (never calls LLM)
+    async with session_factory() as s:
+        await _seed_ready_document(
+            s,
+            source_id="src_alpha_ok",
+            doc_id="doc_persist_1",
+            ver_id="ver_persist_1",
+            org_id="org_alpha",
+            project_id=pid,
+            filename="system-overview.md",
+            logical_source_id="continuum:project_document:507f1f77bcf86cd799439021",
+            sections=[("Overview > Core", "Core architecture overview text.", 1)],
+        )
+        await s.commit()
+
+    r_uninit = await client.get(url, headers=user_one)
+    assert r_uninit.status_code == 200
+    body_uninit = r_uninit.json()
+    assert body_uninit["status"] == "uninitialized"
+    assert body_uninit["tree"] is None
+    assert body_uninit["coverage"]["accessibleReadyDocumentCount"] == 1
+    assert len(llm.calls) == 0
+
+    # 3. User 1 generates overview Mind Map -> persisted to DB
+    llm.response = json.dumps(
+        {
+            "tree": {
+                "id": "root",
+                "label": "System Overview V1",
+                "summary": "Initial persisted map",
+                "citationNumbers": [],
+                "children": [
+                    {
+                        "id": "b1",
+                        "label": "Core Architecture",
+                        "summary": "Core details",
+                        "citationNumbers": [1],
+                        "children": [],
+                    }
+                ],
+            }
+        }
+    )
+    r_gen1 = await client.post(url, headers=user_one, json={})
+    assert r_gen1.status_code == 200
+    gen1_body = r_gen1.json()
+    assert gen1_body["status"] == "ready"
+    assert gen1_body["cached"] is False
+    assert gen1_body["hasSourceUpdates"] is False
+    assert gen1_body["tree"]["label"] == "System Overview V1"
+    assert len(llm.calls) == 1
+
+    # 4. User 2 opens Mind Map -> instant GET hit, cached=True, 0 extra LLM calls
+    r_get_u2 = await client.get(url, headers=user_two)
+    assert r_get_u2.status_code == 200
+    u2_body = r_get_u2.json()
+    assert u2_body["status"] == "ready"
+    assert u2_body["cached"] is True
+    assert u2_body["hasSourceUpdates"] is False
+    assert u2_body["tree"]["label"] == "System Overview V1"
+    assert len(u2_body["citations"]) == 1
+    assert len(llm.calls) == 1
+
+    # POST with refresh=False also reuses saved snapshot without calling LLM
+    r_post_cached = await client.post(url, headers=user_two, json={"refresh": False})
+    assert r_post_cached.status_code == 200
+    assert r_post_cached.json()["cached"] is True
+    assert len(llm.calls) == 1
+
+    # 5. New document uploaded -> GET still serves saved map immediately with hasSourceUpdates=True
+    async with session_factory() as s:
+        await _seed_ready_document(
+            s,
+            source_id="src_alpha_ok",
+            doc_id="doc_persist_2",
+            ver_id="ver_persist_2",
+            org_id="org_alpha",
+            project_id=pid,
+            filename="deployment-guide.md",
+            logical_source_id="continuum:project_document:507f1f77bcf86cd799439022",
+            sections=[("Deployment > Docker", "Container rollout strategy.", 1)],
+        )
+        await s.commit()
+
+    r_get_stale = await client.get(url, headers=user_two)
+    assert r_get_stale.status_code == 200
+    stale_body = r_get_stale.json()
+    assert stale_body["status"] == "ready"
+    assert stale_body["cached"] is True
+    assert stale_body["hasSourceUpdates"] is True
+    assert stale_body["coverage"]["accessibleReadyDocumentCount"] == 2
+    assert stale_body["tree"]["label"] == "System Overview V1"
+    assert len(llm.calls) == 1
+
+    # 6. Explicit user refresh (POST refresh=True) regenerates and updates saved snapshot
+    llm.response = json.dumps(
+        {
+            "tree": {
+                "id": "root",
+                "label": "System Overview V2 Refreshed",
+                "summary": "Updated with deployment docs",
+                "citationNumbers": [],
+                "children": [
+                    {
+                        "id": "b1",
+                        "label": "Core & Deployment",
+                        "summary": "Combined view",
+                        "citationNumbers": [1, 2],
+                        "children": [],
+                    }
+                ],
+            }
+        }
+    )
+    r_regen = await client.post(url, headers=user_two, json={"refresh": True})
+    assert r_regen.status_code == 200
+    regen_body = r_regen.json()
+    assert regen_body["cached"] is False
+    assert regen_body["hasSourceUpdates"] is False
+    assert regen_body["tree"]["label"] == "System Overview V2 Refreshed"
+    assert len(llm.calls) == 2
+
+    r_after_regen = await client.get(url, headers=user_one)
+    assert r_after_regen.status_code == 200
+    assert r_after_regen.json()["cached"] is True
+    assert r_after_regen.json()["hasSourceUpdates"] is False
+    assert r_after_regen.json()["tree"]["label"] == "System Overview V2 Refreshed"
+
+
+@pytest.mark.asyncio
+async def test_mind_map_saved_snapshot_auto_invalidates_when_used_document_is_revoked(
+    mind_map_env,
+) -> None:
+    client: httpx.AsyncClient = mind_map_env.client
+    session_factory = mind_map_env.session_factory
+    llm: FakeMindMapLLM = mind_map_env.llm
+    pid = mind_map_env.project_alpha
+    url = f"/api/v1/projects/{pid}/mind-map"
+    headers = _bff_headers(project_id=pid)
+
+    async with session_factory() as s:
+        await _seed_ready_document(
+            s,
+            source_id="src_alpha_ok",
+            doc_id="doc_revoke_1",
+            ver_id="ver_revoke_1",
+            org_id="org_alpha",
+            project_id=pid,
+            filename="sensitive-spec.md",
+            sections=[("Security", "Top secret token rotation details.", 1)],
+        )
+        await _seed_ready_document(
+            s,
+            source_id="src_alpha_ok",
+            doc_id="doc_keep_2",
+            ver_id="ver_keep_2",
+            org_id="org_alpha",
+            project_id=pid,
+            filename="public-readme.md",
+            sections=[("Intro", "Public project introduction.", 1)],
+        )
+        await s.commit()
+
+    llm.response = json.dumps(
+        {
+            "tree": {
+                "id": "root",
+                "label": "Combined Map",
+                "summary": "Includes sensitive spec",
+                "citationNumbers": [],
+                "children": [
+                    {
+                        "id": "sec",
+                        "label": "Top Secret Rotation",
+                        "summary": "Derived from doc_revoke_1",
+                        "citationNumbers": [1],
+                        "children": [],
+                    }
+                ],
+            }
+        }
+    )
+    r_gen = await client.post(url, headers=headers, json={})
+    assert r_gen.status_code == 200
+    assert r_gen.json()["status"] == "ready"
+
+    # Revoke ver_revoke_1 -> saved snapshot MUST be invalidated immediately on GET
+    async with session_factory() as s:
+        ver = await s.get(DocumentVersion, "ver_revoke_1")
+        assert ver is not None
+        ver.search_status = "REVOKED"
+        await s.commit()
+
+    r_after_revoke = await client.get(url, headers=headers)
+    assert r_after_revoke.status_code == 200
+    revoked_check = r_after_revoke.json()
+    assert revoked_check["status"] == "uninitialized"
+    assert revoked_check["tree"] is None
+    assert revoked_check["citations"] == []
+
+    # Mismatched partition header is rejected with 403; sibling project never sees snapshot
+    other_partition_headers = _bff_headers(project_id=pid, partition_id="isolated_partition")
+    r_other_part = await client.get(url, headers=other_partition_headers)
+    assert r_other_part.status_code == 403
+
+    beta_url = f"/api/v1/projects/{mind_map_env.project_beta}/mind-map"
+    r_beta = await client.get(beta_url, headers=_bff_headers(project_id=mind_map_env.project_beta))
+    assert r_beta.status_code == 200
+    assert r_beta.json()["status"] == "empty"
+
+
+@pytest.mark.asyncio
+async def test_mind_map_get_enforces_bff_auth_and_strict_query_validation(
+    mind_map_env,
+) -> None:
+    client: httpx.AsyncClient = mind_map_env.client
+    pid = mind_map_env.project_alpha
+    url = f"/api/v1/projects/{pid}/mind-map"
+    headers = _bff_headers(project_id=pid)
+
+    assert (await client.get(url)).status_code == 403
+    assert (
+        await client.get(url, headers=_direct_user_jwt_headers(project_id=pid))
+    ).status_code == 403
+    assert (await client.get(f"{url}?extra=1", headers=headers)).status_code == 400
+    assert (await client.get(f"{url}?topic=   ", headers=headers)).status_code == 400
+    assert (
+        await client.get(f"{url}?topic={'x' * 201}", headers=headers)
+    ).status_code == 400
+    assert (
+        await client.post(url, headers=headers, json={"refresh": "yes"})
+    ).status_code == 400

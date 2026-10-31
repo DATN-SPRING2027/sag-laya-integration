@@ -8,24 +8,36 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
+def normalize_mind_map_topic(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("topic must be a string")
+    trimmed = " ".join(value.split()).strip()
+    if not trimmed:
+        raise ValueError("topic must not be blank or whitespace-only")
+    if len(trimmed) > 200:
+        raise ValueError("topic must not exceed 200 characters")
+    return trimmed
+
+
 class MindMapGenerateIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     topic: str | None = Field(default=None)
+    refresh: bool = Field(default=True)
 
     @field_validator("topic", mode="before")
     @classmethod
     def validate_topic(cls, value: object) -> str | None:
-        if value is None:
-            return None
-        if not isinstance(value, str):
-            raise ValueError("topic must be a string")
-        trimmed = " ".join(value.split()).strip()
-        if not trimmed:
-            raise ValueError("topic must not be blank or whitespace-only")
-        if len(trimmed) > 200:
-            raise ValueError("topic must not exceed 200 characters")
-        return trimmed
+        return normalize_mind_map_topic(value)
+
+    @field_validator("refresh", mode="before")
+    @classmethod
+    def validate_refresh(cls, value: object) -> bool:
+        if not isinstance(value, bool):
+            raise ValueError("refresh must be a boolean")
+        return value
 
 
 class MindMapCoverageOut(BaseModel):
@@ -73,7 +85,7 @@ class MindMapOut(BaseModel):
 
     projectId: str = Field(min_length=1, max_length=64)
     topic: str | None = Field(default=None, max_length=200)
-    status: Literal["ready", "empty"]
+    status: Literal["ready", "empty", "uninitialized"]
     generationMode: Literal["llm", "outline_fallback", "none"]
     fallbackReason: Literal["LLM_UNAVAILABLE", "LLM_INVALID_OUTPUT"] | None = None
     scopeFingerprint: str = Field(min_length=16, max_length=128)
@@ -81,3 +93,5 @@ class MindMapOut(BaseModel):
     tree: MindMapNodeOut | None = None
     citations: list[MindMapCitationOut] = Field(default_factory=list)
     generatedAt: datetime
+    cached: bool = False
+    hasSourceUpdates: bool = False
