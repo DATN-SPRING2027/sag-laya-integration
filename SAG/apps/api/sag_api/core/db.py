@@ -112,7 +112,13 @@ _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
         "owner_id": "VARCHAR(256)",
         "logical_source_id": "VARCHAR(128)",
     },
-    "threads": {"archived": "BOOLEAN NOT NULL DEFAULT FALSE", "owner_key": "VARCHAR(64)"},
+    "threads": {
+        "archived": "BOOLEAN NOT NULL DEFAULT FALSE",
+        "owner_key": "VARCHAR(64)",
+        "parent_thread_id": "VARCHAR(32) REFERENCES threads(id) ON DELETE RESTRICT",
+        "branch_point_message_id": "VARCHAR(32) REFERENCES messages(id) ON DELETE RESTRICT",
+        "deleted_by_owner_at": "TIMESTAMP WITH TIME ZONE",
+    },
     "messages": {
         "reply_to_message_id": "VARCHAR(32) REFERENCES messages(id) ON DELETE SET NULL",
         "regenerated_from_message_id": "VARCHAR(32) REFERENCES messages(id) ON DELETE SET NULL",
@@ -145,6 +151,13 @@ _INDEX_UPGRADES = (
     "CREATE INDEX IF NOT EXISTS ix_messages_regenerated_from_message_id ON messages (regenerated_from_message_id)",
     "CREATE INDEX IF NOT EXISTS ix_agents_owner_key ON agents (owner_key)",
     "CREATE INDEX IF NOT EXISTS ix_threads_owner_key ON threads (owner_key)",
+    "CREATE INDEX IF NOT EXISTS ix_threads_parent_thread_id ON threads (parent_thread_id)",
+    "CREATE INDEX IF NOT EXISTS ix_threads_branch_point_message_id ON threads (branch_point_message_id)",
+    (
+        "CREATE INDEX IF NOT EXISTS ix_threads_owner_visible "
+        "ON threads (agent_id, owner_key, archived, updated_at DESC) "
+        "WHERE deleted_by_owner_at IS NULL"
+    ),
     (
         "CREATE INDEX IF NOT EXISTS idx_ingestion_runs_content_hash "
         "ON ingestion_runs (tenant_id, project_id, content_hash)"
