@@ -99,3 +99,36 @@ Project documents and cached only in scoped client session memory.
   - **Rollback**: Stateless API addition — reverting the `sag-laya-integration` PR cleanly removes `POST /api/v1/projects/{project_id}/mind-map` with no data migration rollback needed.
 - **Remaining Gaps**:
   - Paired BFF gateway (`DATN_BE` branch `feat/Thang-ai-chat-mind-map-be-api`) and interactive React + SVG Studio UI (`DATN_FE` branch `feat/Thang-ai-chat-mind-map-fe-ui`) are delivered in separate repositories/PRs per workspace governance. Semantic faithfulness of LLM node summaries beyond authorized citation membership requires ongoing human evaluation on real project corpora.
+
+## PR #55 review correction — 2026-10-31
+
+- **Authorization/provenance:** Thang requested fixes and push to the existing PR after reviewing FE #115, BE #121, and SAG #55. This continues the approved Mind Map task on PR head `08c4b61`; no new endpoint or contract is introduced.
+- **Verified defect:** `_select_evidence_catalog` assigned page-order row numbers and selected the first 16 SearchUnits per document before `_score_text_against_topic`. Relevant content or headings at unit 17+ could never reach the LLM.
+- **Regression evidence before implementation:** two ASGI cases (content match and heading-only match at unit 17) fail against the original code. A stronger match in a forbidden partition is included to guard the existing ACL boundary.
+- **Planned minimal change:** rank ACL-eligible SearchUnits using bounded SQL lexical scores over their canonical block spans before applying the per-document limit. Keep overview page ordering, 24-document/16-unit-per-document/60-evidence budgets, citation provenance, fallback behavior, and coverage accounting.
+- **Test matrix:** both late-unit cases, forbidden-partition exclusion, existing Mind Map ASGI suite, lint, and the API regression suite excluding opt-in live AI smoke tests.
+- **Out of scope:** schema/migrations, ingestion/index changes, model/provider configuration, BE #121, and semantic faithfulness guarantees.
+- **Impact/rollback:** no database or environment changes; revert the service/test correction to restore the previous selection behavior. Runtime acceptance with real project corpora remains separate from fixture-based tests.
+
+### Correction verification
+
+- Added two parameterized ASGI regressions for unit-17 content and heading
+  matches. Both were RED before the fix; the authorized late unit now reaches
+  the prompt, the stronger forbidden-partition unit does not, and the existing
+  16-unit/document cap and truncation count hold.
+- `pytest tests/test_mind_map_api.py -q --tb=short` -> **10 passed**.
+- `ruff check sag_api/services/mind_map_service.py tests/test_mind_map_api.py`
+  -> **All checks passed**.
+- Full API suite on CPython 3.12.13: `pytest tests -m "not ai_smoke" -q --tb=short`
+  -> **238 passed, 1 deselected**.
+- Environment evidence: the original CPython 3.11 venv produced seven
+  unrelated existing `math.sumprod` failures; that function requires 3.12.
+  An isolated 3.12 environment used the committed lockfile. Windows building
+  locked `litellm==1.92.0` failed due to Rust toolchain prerequisites, so that
+  environment was synced with `--no-install-package litellm` for the non-live
+  regression suite. No provider replacement or fake dependency was installed;
+  live provider/startup acceptance is not claimed. The repository lockfile and
+  runtime configuration remain unchanged.
+- CodeRabbit follow-up review of the correction -> **0 issues**. Final commit
+  references are recorded at handoff. No ingestion/index ownership,
+  persistence, or BFF contract changes.

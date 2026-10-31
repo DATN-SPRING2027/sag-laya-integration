@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -527,6 +527,40 @@ async def _select_evidence_catalog(
 
         start_block = aliased(CanonicalBlock)
         end_block = aliased(CanonicalBlock)
+        unit_order = (
+            SearchUnit.page_from.asc(),
+            start_block.ordinal.asc(),
+            SearchUnit.id.asc(),
+        )
+        if topic:
+            # Score the authorized unit's full block span before the per-document
+            # cap, so relevant sections after the first 16 units remain eligible.
+            topic_pattern = f"%{_escape_like(topic)}%"
+            heading_score = case(
+                (SearchUnit.section_path.ilike(topic_pattern, escape="\\"), 12.0), else_=0.0
+            )
+            block_score = case(
+                (CanonicalBlock.normalized_text.ilike(topic_pattern, escape="\\"), 8.0), else_=0.0
+            )
+            for term in terms:
+                term_pattern = f"%{_escape_like(term)}%"
+                heading_score = heading_score + case(
+                    (SearchUnit.section_path.ilike(term_pattern, escape="\\"), 3.5), else_=0.0
+                )
+                block_score = block_score + case(
+                    (CanonicalBlock.normalized_text.ilike(term_pattern, escape="\\"), 1.0), else_=0.0
+                )
+            span_score = (
+                select(func.max(block_score))
+                .where(
+                    CanonicalBlock.document_version_id == SearchUnit.document_version_id,
+                    CanonicalBlock.ordinal >= start_block.ordinal,
+                    CanonicalBlock.ordinal <= end_block.ordinal,
+                )
+                .correlate(SearchUnit, start_block, end_block)
+                .scalar_subquery()
+            )
+            unit_order = ((heading_score + func.coalesce(span_score, 0.0)).desc(), *unit_order)
         ranked_units = (
             select(
                 SearchUnit.id.label("unit_id"),
@@ -539,11 +573,7 @@ async def _select_evidence_catalog(
                 func.row_number()
                 .over(
                     partition_by=SearchUnit.document_version_id,
-                    order_by=(
-                        SearchUnit.page_from.asc(),
-                        start_block.ordinal.asc(),
-                        SearchUnit.id.asc(),
-                    ),
+                    order_by=unit_order,
                 )
                 .label("unit_rn"),
             )

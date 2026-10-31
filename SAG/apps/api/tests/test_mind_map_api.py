@@ -741,6 +741,64 @@ async def test_mind_map_coverage_reports_omitted_and_truncated_documents(mind_ma
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("match_in", ["content", "heading"])
+async def test_mind_map_topic_ranks_late_units_before_per_document_limit(
+    mind_map_env,
+    match_in: str,
+) -> None:
+    pid = mind_map_env.project_alpha
+    topic = "EmergencyKeyRotation"
+    late_marker = "LateAuthorizedEvidence"
+    hidden_marker = "ForbiddenPartitionEvidence"
+    sections = [
+        (f"General section {i}", f"Routine handbook introduction {i}.", i)
+        for i in range(1, 17)
+    ]
+    sections.extend(
+        [
+            (
+                topic if match_in == "heading" else "Credential operations",
+                f"{late_marker}: {topic if match_in == 'content' else 'This procedure'} requires two approvers.",
+                17,
+            ),
+            (topic, f"{hidden_marker}: {topic} " * 30, 18),
+        ]
+    )
+    async with mind_map_env.session_factory() as s:
+        await _seed_ready_document(
+            s,
+            source_id="src_alpha_ok",
+            doc_id="doc_late_topic",
+            ver_id="ver_late_topic",
+            org_id="org_alpha",
+            project_id=pid,
+            filename="operations-handbook.md",
+            sections=sections,
+        )
+        hidden_unit = await s.get(SearchUnit, "ver_late_topic_su_18")
+        assert hidden_unit is not None
+        hidden_unit.security_partition_id = "forbidden-partition"
+        await s.commit()
+
+    response = await mind_map_env.client.post(
+        f"/api/v1/projects/{pid}/mind-map",
+        headers=_bff_headers(project_id=pid),
+        json={"topic": topic},
+    )
+    assert response.status_code == 200
+    assert len(mind_map_env.llm.calls) == 1
+    user_prompt = mind_map_env.llm.calls[0]["messages"][1]["content"]
+    evidence_prompt = user_prompt.split("Numbered authorized evidence excerpts:", 1)[1]
+    assert late_marker in evidence_prompt
+    assert hidden_marker not in user_prompt
+    coverage = response.json()["coverage"]
+    assert coverage["accessibleReadyDocumentCount"] == 1
+    assert coverage["usedDocumentCount"] == 1
+    assert 1 <= coverage["evidenceUnitCount"] <= 16
+    assert coverage["truncatedDocumentCount"] == 1
+
+
+@pytest.mark.asyncio
 async def test_llm_client_complete_structured_output_downgrade(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
