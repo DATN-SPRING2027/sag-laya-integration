@@ -296,6 +296,21 @@ class IncrementalSessionIndex:
         self.qdrant_rebuild_pending: bool = False
         self.seen_raw_ids: set[str] = set()
         self.boundary_ts_ids: set[str] = set()
+        self.inherited_turn_count: int = 0
+        self.inherited_window_count: int = 0
+        self.inherited_episode_count: int = 0
+        self.inherited_decision_count: int = 0
+        self.force_new_episode_next: bool = False
+        self.inherited_lineage_signature: str = ""
+
+    def seal_inherited_boundary(self) -> None:
+        """Freeze inherited ancestor prefix boundaries so own units never reference ancestor Message IDs."""
+        self.inherited_turn_count = len(self.turns)
+        self.inherited_window_count = len(self.windows)
+        self.inherited_episode_count = len(self.episodes)
+        self.inherited_decision_count = len(self.decision_ledger)
+        if self.episodes:
+            self.force_new_episode_next = True
 
     @property
     def active_decisions(self) -> list[DecisionLedgerEntry]:
@@ -373,9 +388,19 @@ class IncrementalSessionIndex:
                 }
                 for t in self.turns
             ]
+            inh_k = self.inherited_turn_count
+            inh_sig = self.inherited_lineage_signature
             self.__init__(self.thread_id, scope_signature=self.scope_signature)
+            if inh_k > 0:
+                await self.append_messages(
+                    prior_records[:inh_k],
+                    embedder=None,
+                    project_aliases=project_aliases,
+                )
+                self.seal_inherited_boundary()
+                self.inherited_lineage_signature = inh_sig
             await self.append_messages(
-                [*prior_records, *pending],
+                [*prior_records[inh_k:], *pending],
                 embedder=None,
                 project_aliases=project_aliases,
             )
@@ -528,12 +553,14 @@ class IncrementalSessionIndex:
             and lex_jaccard < EPISODE_LEXICAL_JACCARD_THRESHOLD
         )
         should_split = (
-            time_gap > EPISODE_TIME_GAP_SECONDS
+            self.force_new_episode_next
+            or time_gap > EPISODE_TIME_GAP_SECONDS
             or len(cur.turn_ids) >= EPISODE_MAX_TURNS
             or drift_detected
         )
 
         if should_split:
+            self.force_new_episode_next = False
             ep_ord = len(self.episodes)
             ep = EpisodeSegment(
                 episode_id=f"{self.thread_id}:ep{ep_ord}",
