@@ -8,12 +8,13 @@ import hashlib
 import hmac
 import json
 import re
+import time
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sag_api.branding import DEFAULT_AGENT_AVATAR, DEFAULT_AGENT_NAME
@@ -26,6 +27,7 @@ from sag_api.db.models import Agent, AgentBinding, Message, Source, Thread, User
 from sag_api.enums import BindingTargetType, MessageRole, MessageStatus
 from sag_api.generation import build_agent_messages, build_prompt_preview
 from sag_api.generation.prompt import estimate_tokens
+from sag_api.schemas.agent import ThreadOut
 from sag_api.services.session_context import (
     collect_thread_persistence_projects,
     invalidate_session_thread_cache,
@@ -45,7 +47,181 @@ THREAD_PAGE_MAX = 100
 MESSAGE_PAGE_DEFAULT = 40
 MESSAGE_PAGE_MAX = 100
 MESSAGE_CURSOR_MAX_LENGTH = 2048
+MAX_LINEAGE_DEPTH = 32
 _MESSAGE_CURSOR_ID = re.compile(r"[0-9a-f]{32}\Z")
+_LAST_MONOTONIC_UTC_US: int = 0
+
+
+def _ensure_utc(dt: datetime) -> datetime:
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
+
+def _next_monotonic_utc_now() -> datetime:
+    """Return a strictly increasing microsecond UTC timestamp across rapid writes."""
+    global _LAST_MONOTONIC_UTC_US
+    now_us = time.time_ns() // 1_000
+    if now_us <= _LAST_MONOTONIC_UTC_US:
+        now_us = _LAST_MONOTONIC_UTC_US + 1
+    _LAST_MONOTONIC_UTC_US = now_us
+    sec, us = divmod(now_us, 1_000_000)
+    return datetime.fromtimestamp(sec, tz=UTC).replace(microsecond=us)
+
+
+@dataclass(frozen=True, slots=True)
+class LineageSegment:
+    thread_id: str
+    cutoff_created_at: datetime | None = None
+    cutoff_message_id: str | None = None
+    cutoff_reply_to_message_id: str | None = None
+    is_inherited: bool = False
+
+    def includes_message(self, message: Message) -> bool:
+        if message.thread_id != self.thread_id:
+            return False
+        if self.cutoff_created_at is None or self.cutoff_message_id is None:
+            return True
+        if message.created_at is None:
+            return False
+        msg_dt = _ensure_utc(message.created_at)
+        cut_dt = _ensure_utc(self.cutoff_created_at)
+        if (msg_dt, str(message.id)) > (cut_dt, self.cutoff_message_id):
+            return False
+        if (
+            self.cutoff_reply_to_message_id
+            and message.role == MessageRole.ASSISTANT
+            and message.reply_to_message_id == self.cutoff_reply_to_message_id
+            and str(message.id) != self.cutoff_message_id
+        ):
+            return False
+        return True
+
+
+def _segment_sql_filters(segment: LineageSegment) -> list[Any]:
+    filters: list[Any] = [Message.thread_id == segment.thread_id]
+    if segment.cutoff_created_at is not None and segment.cutoff_message_id is not None:
+        filters.append(
+            or_(
+                Message.created_at < segment.cutoff_created_at,
+                and_(
+                    Message.created_at == segment.cutoff_created_at,
+                    Message.id <= segment.cutoff_message_id,
+                ),
+            )
+        )
+        if segment.cutoff_reply_to_message_id:
+            filters.append(
+                or_(
+                    Message.role != MessageRole.ASSISTANT,
+                    Message.reply_to_message_id.is_(None),
+                    Message.reply_to_message_id != segment.cutoff_reply_to_message_id,
+                    Message.id == segment.cutoff_message_id,
+                )
+            )
+    return filters
+
+
+async def resolve_thread_lineage_segments(
+    session: AsyncSession,
+    thread_or_id: Thread | str,
+) -> list[LineageSegment]:
+    """Resolve root-to-leaf `LineageSegment` chain (`[ancestor_0, ..., leaf]`) with cycle/scope guards."""
+    if isinstance(thread_or_id, Thread):
+        leaf = thread_or_id
+    else:
+        leaf = await session.get(Thread, str(thread_or_id))
+        if leaf is None:
+            return [LineageSegment(thread_id=str(thread_or_id), is_inherited=False)]
+
+    if leaf.parent_thread_id is None or leaf.branch_point_message_id is None:
+        return [LineageSegment(thread_id=leaf.id, is_inherited=False)]
+
+    segments_rev: list[LineageSegment] = [LineageSegment(thread_id=leaf.id, is_inherited=False)]
+    visited: set[str] = {leaf.id}
+    cur_thread = leaf
+
+    for _ in range(MAX_LINEAGE_DEPTH):
+        parent_id = cur_thread.parent_thread_id
+        bp_msg_id = cur_thread.branch_point_message_id
+        if parent_id is None or bp_msg_id is None:
+            break
+        if parent_id in visited:
+            raise ValidationError("Detected cyclic conversation branch lineage")
+        visited.add(parent_id)
+
+        parent = await session.get(Thread, parent_id)
+        if (
+            parent is None
+            or parent.agent_id != leaf.agent_id
+            or parent.owner_key != leaf.owner_key
+        ):
+            raise ValidationError("Broken conversation branch lineage scope")
+
+        bp_msg = await session.get(Message, bp_msg_id)
+        if bp_msg is None or bp_msg.thread_id != parent.id:
+            raise ValidationError("Broken conversation branch point message")
+
+        segments_rev.append(
+            LineageSegment(
+                thread_id=parent.id,
+                cutoff_created_at=bp_msg.created_at,
+                cutoff_message_id=bp_msg.id,
+                cutoff_reply_to_message_id=bp_msg.reply_to_message_id,
+                is_inherited=True,
+            )
+        )
+        cur_thread = parent
+    else:
+        if cur_thread.parent_thread_id is not None:
+            raise ValidationError("Conversation branch lineage exceeds maximum supported depth")
+
+    return list(reversed(segments_rev))
+
+
+async def load_segment_messages_chronological(
+    session: AsyncSession,
+    segment: LineageSegment,
+    *,
+    roles: tuple[MessageRole, ...] | None = None,
+    only_ok: bool = False,
+    max_messages: int | None = None,
+) -> list[Message]:
+    """Load chronological messages inside a single `LineageSegment` via keyset batches."""
+    cap = max_messages if max_messages is not None else settings.session_context_max_messages
+    if cap <= 0:
+        return []
+    collected: list[Message] = []
+    last_dt: datetime | None = None
+    last_id: str | None = None
+
+    while len(collected) < cap:
+        batch_limit = min(500, cap - len(collected))
+        filters = _segment_sql_filters(segment)
+        if roles is not None:
+            filters.append(Message.role.in_(roles))
+        if only_ok:
+            filters.append(Message.status == MessageStatus.OK)
+        if last_dt is not None and last_id is not None:
+            filters.append(
+                or_(
+                    Message.created_at > last_dt,
+                    and_(Message.created_at == last_dt, Message.id > last_id),
+                )
+            )
+        rows = await session.execute(
+            select(Message)
+            .where(*filters)
+            .order_by(Message.created_at.asc(), Message.id.asc())
+            .limit(batch_limit)
+        )
+        batch = list(rows.scalars().all())
+        if not batch:
+            break
+        collected.extend(batch)
+        last_dt = batch[-1].created_at
+        last_id = batch[-1].id
+        if len(batch) < batch_limit:
+            break
+    return collected
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +306,85 @@ def _decode_message_cursor(thread_id: str, value: str) -> tuple[datetime, str]:
         if created_at.tzinfo is None or created_at.utcoffset() is None:
             raise ValueError("cursor timestamp must include a timezone")
         return created_at.astimezone(UTC), payload["id"]
+    except (
+        UnicodeEncodeError,
+        UnicodeDecodeError,
+        binascii.Error,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise invalid() from error
+
+
+def _encode_message_cursor_v2(thread_id: str, seg_idx: int, message: Message) -> str:
+    payload = {
+        "v": 2,
+        "kind": "messages",
+        "scope": _message_cursor_scope(thread_id),
+        "seg_idx": int(seg_idx),
+        "created_at": _ensure_utc(message.created_at).isoformat(timespec="microseconds"),
+        "id": message.id,
+    }
+    raw = json.dumps(
+        payload,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    signature = hmac.new(settings.secret_key.encode("utf-8"), raw, hashlib.sha256).digest()
+    return f"{_urlsafe_encode(raw)}.{_urlsafe_encode(signature)}"
+
+
+def _decode_message_cursor_v2(
+    thread_id: str,
+    value: str,
+    *,
+    max_seg_idx: int,
+) -> tuple[int, datetime, str]:
+    def invalid() -> ValidationError:
+        return ValidationError("Invalid message cursor", code=ErrorCode.INVALID_CURSOR)
+
+    if not value or len(value) > MESSAGE_CURSOR_MAX_LENGTH or value.count(".") != 1:
+        raise invalid()
+    try:
+        encoded_payload, encoded_signature = value.split(".", 1)
+        raw = _urlsafe_decode(encoded_payload)
+        signature = _urlsafe_decode(encoded_signature)
+        if len(raw) > 512 or len(signature) != hashlib.sha256().digest_size:
+            raise ValueError("invalid cursor size")
+        expected = hmac.new(settings.secret_key.encode("utf-8"), raw, hashlib.sha256).digest()
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError("invalid cursor signature")
+        payload = json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant)
+        if not isinstance(payload, dict) or payload.get("kind") != "messages":
+            raise ValueError("invalid cursor payload")
+        ver = payload.get("v")
+        if ver == 1 and not isinstance(ver, bool):
+            dt, msg_id = _decode_message_cursor(thread_id, value)
+            return max_seg_idx, dt, msg_id
+        expected_keys = {"v", "kind", "scope", "seg_idx", "created_at", "id"}
+        if (
+            ver != 2
+            or isinstance(ver, bool)
+            or set(payload) != expected_keys
+            or payload["scope"] != _message_cursor_scope(thread_id)
+            or not isinstance(payload["seg_idx"], int)
+            or isinstance(payload["seg_idx"], bool)
+            or not (0 <= payload["seg_idx"] <= max_seg_idx)
+            or not isinstance(payload["created_at"], str)
+            or not isinstance(payload["id"], str)
+            or _MESSAGE_CURSOR_ID.fullmatch(payload["id"]) is None
+        ):
+            raise ValueError("invalid v2 cursor scope or values")
+        created_at = datetime.fromisoformat(payload["created_at"])
+        if created_at.tzinfo is None or created_at.utcoffset() is None:
+            raise ValueError("cursor timestamp must include a timezone")
+        return payload["seg_idx"], created_at.astimezone(UTC), payload["id"]
+    except ValidationError:
+        raise
     except (
         UnicodeEncodeError,
         UnicodeDecodeError,
@@ -246,8 +501,36 @@ async def get_default_agent(session: AsyncSession) -> Agent:
 
 async def delete_agent(session: AsyncSession, agent_id: str, *, owner_key: str) -> None:
     agent = await get_agent(session, agent_id, owner_key=owner_key, write=True)
+    agent_threads = list(
+        (await session.scalars(select(Thread).where(Thread.agent_id == agent.id))).all()
+    )
+    qdrant_cleanup_targets: list[tuple[str, list[str]]] = []
+    if agent_threads:
+        by_id = {t.id: t for t in agent_threads}
+        remaining = set(by_id.keys())
+        while remaining:
+            referenced_parents = {
+                by_id[tid].parent_thread_id
+                for tid in remaining
+                if by_id[tid].parent_thread_id in remaining
+            }
+            leaves = sorted(remaining - referenced_parents) or sorted(remaining)
+            for leaf_id in leaves:
+                persisted_projects = await collect_thread_persistence_projects(
+                    session, thread_id=leaf_id
+                )
+                qdrant_cleanup_targets.append((leaf_id, persisted_projects))
+                await purge_thread_session_rows(session, thread_id=leaf_id)
+                await session.delete(by_id[leaf_id])
+                invalidate_session_thread_cache(leaf_id)
+                remaining.discard(leaf_id)
+            await session.flush()
     await session.delete(agent)
     await session.commit()
+    for gc_tid, gc_projects in qdrant_cleanup_targets:
+        await purge_thread_qdrant_points_for_projects(
+            session, thread_id=gc_tid, project_ids=gc_projects
+        )
 
 
 # ── 绑定（信源 / MCP server）────────────────────────────────────────
@@ -349,6 +632,53 @@ async def resolve_mcp_specs(session: AsyncSession, agent: Agent) -> list[tuple[s
 
 
 # ── 会话 ────────────────────────────────────────────────────────────
+async def serialize_threads_out(session: AsyncSession, threads: list[Thread]) -> list[ThreadOut]:
+    if not threads:
+        return []
+    parent_ids = sorted({t.parent_thread_id for t in threads if t.parent_thread_id})
+    parents_by_id: dict[str, Thread] = {}
+    if parent_ids:
+        parent_rows = list(
+            (await session.scalars(select(Thread).where(Thread.id.in_(parent_ids)))).all()
+        )
+        parents_by_id = {p.id: p for p in parent_rows}
+
+    result: list[ThreadOut] = []
+    for t in threads:
+        is_branched = t.parent_thread_id is not None
+        visible_parent_id: str | None = None
+        visible_parent_title: str | None = None
+        if is_branched and t.parent_thread_id:
+            parent = parents_by_id.get(t.parent_thread_id)
+            if (
+                parent is not None
+                and parent.deleted_by_owner_at is None
+                and parent.agent_id == t.agent_id
+                and parent.owner_key == t.owner_key
+            ):
+                visible_parent_id = parent.id
+                visible_parent_title = parent.title
+        result.append(
+            ThreadOut(
+                id=t.id,
+                agent_id=t.agent_id,
+                title=t.title,
+                archived=bool(t.archived),
+                is_branched=is_branched,
+                parent_thread_id=visible_parent_id,
+                parent_thread_title=visible_parent_title,
+                branch_point_message_id=t.branch_point_message_id if is_branched else None,
+                created_at=t.created_at,
+                updated_at=t.updated_at,
+            )
+        )
+    return result
+
+
+async def serialize_thread_out(session: AsyncSession, thread: Thread) -> ThreadOut:
+    return (await serialize_threads_out(session, [thread]))[0]
+
+
 async def list_threads(
     session: AsyncSession,
     agent_id: str,
@@ -360,7 +690,12 @@ async def list_threads(
 ) -> list[Thread]:
     statement = (
         select(Thread)
-        .where(Thread.agent_id == agent_id, Thread.owner_key == owner_key, Thread.archived.is_(archived))
+        .where(
+            Thread.agent_id == agent_id,
+            Thread.owner_key == owner_key,
+            Thread.archived.is_(archived),
+            Thread.deleted_by_owner_at.is_(None),
+        )
         .order_by(Thread.updated_at.desc(), Thread.id.desc())
     )
     if offset:
@@ -384,6 +719,7 @@ async def update_thread(
         thread.title = title.strip()[:200]
     if archived is not None:
         thread.archived = archived
+    thread.updated_at = _next_monotonic_utc_now()
     await session.commit()
     await session.refresh(thread)
     return thread
@@ -391,7 +727,14 @@ async def update_thread(
 
 async def create_thread(session: AsyncSession, agent: Agent, title: str = "New chat", *, owner_key: str) -> Thread:
     await get_agent(session, agent.id, owner_key=owner_key)
-    thread = Thread(agent_id=agent.id, owner_key=owner_key, title=title or "New chat")
+    ts = _next_monotonic_utc_now()
+    thread = Thread(
+        agent_id=agent.id,
+        owner_key=owner_key,
+        title=title or "New chat",
+        created_at=ts,
+        updated_at=ts,
+    )
     session.add(thread)
     await session.commit()
     await session.refresh(thread)
@@ -400,21 +743,63 @@ async def create_thread(session: AsyncSession, agent: Agent, title: str = "New c
 
 async def get_thread(session: AsyncSession, agent_id: str, thread_id: str, *, owner_key: str) -> Thread:
     thread = await session.get(Thread, thread_id)
-    if thread is None or thread.agent_id != agent_id or thread.owner_key != owner_key:
+    if (
+        thread is None
+        or thread.agent_id != agent_id
+        or thread.owner_key != owner_key
+        or thread.deleted_by_owner_at is not None
+    ):
         raise NotFoundError("Thread not found")
     return thread
 
 
 async def delete_thread(session: AsyncSession, agent_id: str, thread_id: str, *, owner_key: str) -> None:
     thread = await get_thread(session, agent_id, thread_id, owner_key=owner_key)
-    persisted_projects = await collect_thread_persistence_projects(session, thread_id=thread.id)
-    await purge_thread_session_rows(session, thread_id=thread.id)
-    await session.delete(thread)
-    invalidate_session_thread_cache(thread.id)
-    await session.commit()
-    await purge_thread_qdrant_points_for_projects(
-        session, thread_id=thread.id, project_ids=persisted_projects
+    has_child = (
+        await session.scalar(
+            select(Thread.id).where(Thread.parent_thread_id == thread.id).limit(1)
+        )
+        is not None
     )
+    if has_child:
+        thread.deleted_by_owner_at = datetime.now(UTC)
+        invalidate_session_thread_cache(thread.id)
+        await session.commit()
+        return
+
+    qdrant_cleanup_targets: list[tuple[str, list[str]]] = []
+    cur: Thread | None = thread
+    visited_gc: set[str] = set()
+    while cur is not None and cur.id not in visited_gc:
+        visited_gc.add(cur.id)
+        parent_id = cur.parent_thread_id
+        persisted_projects = await collect_thread_persistence_projects(session, thread_id=cur.id)
+        qdrant_cleanup_targets.append((cur.id, persisted_projects))
+        await purge_thread_session_rows(session, thread_id=cur.id)
+        await session.delete(cur)
+        await session.flush()
+        invalidate_session_thread_cache(cur.id)
+
+        if not parent_id:
+            break
+        parent = await session.get(Thread, parent_id)
+        if parent is None or parent.deleted_by_owner_at is None:
+            break
+        still_referenced = (
+            await session.scalar(
+                select(Thread.id).where(Thread.parent_thread_id == parent.id).limit(1)
+            )
+            is not None
+        )
+        if still_referenced:
+            break
+        cur = parent
+
+    await session.commit()
+    for gc_tid, gc_projects in qdrant_cleanup_targets:
+        await purge_thread_qdrant_points_for_projects(
+            session, thread_id=gc_tid, project_ids=gc_projects
+        )
 
 
 async def list_messages_page(
@@ -424,33 +809,59 @@ async def list_messages_page(
     limit: int = MESSAGE_PAGE_DEFAULT,
     cursor: str | None = None,
 ) -> MessagePage:
-    """返回最近一页消息，页内保持正向时间顺序。
-
-    数据库以 `(created_at, id)` 倒序做 keyset 读取，只取 `limit + 1`
-    判断是否还有更旧消息；不做 COUNT 扫描。
-    """
+    """返回最近一页消息，页内保持正向时间顺序（支持跨分支段 HMAC v2 游标分页）。"""
     if limit < 1 or limit > MESSAGE_PAGE_MAX:
         raise ValidationError(
             f"Message page limit must be between 1 and {MESSAGE_PAGE_MAX}",
             code=ErrorCode.INVALID_PAGE_LIMIT,
         )
 
-    statement = select(Message).where(Message.thread_id == thread_id)
+    segments = await resolve_thread_lineage_segments(session, thread_id)
+    max_seg_idx = len(segments) - 1
+    start_seg_idx = max_seg_idx
+    cur_created_at: datetime | None = None
+    cur_message_id: str | None = None
     if cursor:
-        created_at, message_id = _decode_message_cursor(thread_id, cursor)
-        statement = statement.where(
-            or_(
-                Message.created_at < created_at,
-                and_(Message.created_at == created_at, Message.id < message_id),
-            )
+        start_seg_idx, cur_created_at, cur_message_id = _decode_message_cursor_v2(
+            thread_id,
+            cursor,
+            max_seg_idx=max_seg_idx,
         )
-    rows = await session.execute(statement.order_by(Message.created_at.desc(), Message.id.desc()).limit(limit + 1))
-    candidates = list(rows.scalars().all())
+
+    candidates: list[tuple[int, Message]] = []
+    for seg_idx in range(start_seg_idx, -1, -1):
+        needed = (limit + 1) - len(candidates)
+        if needed <= 0:
+            break
+        seg = segments[seg_idx]
+        filters = _segment_sql_filters(seg)
+        if seg_idx == start_seg_idx and cur_created_at is not None and cur_message_id is not None:
+            filters.append(
+                or_(
+                    Message.created_at < cur_created_at,
+                    and_(Message.created_at == cur_created_at, Message.id < cur_message_id),
+                )
+            )
+        rows = await session.execute(
+            select(Message)
+            .where(*filters)
+            .order_by(Message.created_at.desc(), Message.id.desc())
+            .limit(needed)
+        )
+        for msg in rows.scalars().all():
+            candidates.append((seg_idx, msg))
+
     has_more = len(candidates) > limit
     page_desc = candidates[:limit]
-    next_cursor = _encode_message_cursor(thread_id, page_desc[-1]) if has_more and page_desc else None
+    next_cursor: str | None = None
+    if has_more and page_desc:
+        last_seg_idx, last_msg = page_desc[-1]
+        if len(segments) == 1:
+            next_cursor = _encode_message_cursor(thread_id, last_msg)
+        else:
+            next_cursor = _encode_message_cursor_v2(thread_id, last_seg_idx, last_msg)
     return MessagePage(
-        items=list(reversed(page_desc)),
+        items=[msg for _, msg in reversed(page_desc)],
         next_cursor=next_cursor,
         has_more=has_more,
     )
@@ -555,19 +966,30 @@ async def _history(
     principal: VerifiedPrincipal,
     requested_source_ids: list[str] | None,
 ) -> list[dict[str, str]]:
-    rows = await session.execute(
-        select(Message)
-        .where(
-            Message.thread_id == thread_id,
-            Message.id != exclude_id,
-            Message.role.in_((MessageRole.USER, MessageRole.ASSISTANT)),
+    segments = await resolve_thread_lineage_segments(session, thread_id)
+    collected_desc: list[Message] = []
+    for seg in reversed(segments):
+        needed = settings.history_load_limit - len(collected_desc)
+        if needed <= 0:
+            break
+        filters = _segment_sql_filters(seg)
+        filters.extend(
+            [
+                Message.id != exclude_id,
+                Message.role.in_((MessageRole.USER, MessageRole.ASSISTANT)),
+                Message.status == MessageStatus.OK,
+            ]
         )
-        .order_by(Message.created_at.desc(), Message.id.desc())
-        .limit(settings.history_load_limit)
-    )
+        rows = await session.execute(
+            select(Message)
+            .where(*filters)
+            .order_by(Message.created_at.desc(), Message.id.desc())
+            .limit(needed)
+        )
+        collected_desc.extend(rows.scalars().all())
     messages = await filter_messages_for_scope(
         session,
-        list(reversed(rows.scalars().all())),
+        list(reversed(collected_desc)),
         principal=principal,
         requested_source_ids=requested_source_ids,
     )
@@ -593,7 +1015,9 @@ async def compress_history(history: list[dict[str, str]], *, llm=None, budget_to
         return recent
 
     if llm is not None and getattr(llm, "configured", False):
-        transcript = "\n".join(f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}" for m in older)[:12000]
+        transcript = "\n".join(
+            f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}" for m in older
+        )[:12000]
         try:
             summary = await llm.complete(
                 [
@@ -794,16 +1218,20 @@ async def prepare_ask(
         }.get(ext, "image/png")
         resolved.append({"id": aid, "media_type": media_type, "path": path})
 
+    ts = _next_monotonic_utc_now()
     user_msg = Message(
         thread_id=thread.id,
         role=MessageRole.USER,
         content=query,
         citations=[],
         attachments=[{k: a[k] for k in ("id", "media_type")} for a in resolved],
+        created_at=ts,
+        updated_at=ts,
     )
     session.add(user_msg)
     if thread.title in _DEFAULT_TITLES:
         thread.title = query[:40] or "Image chat"
+    thread.updated_at = ts
     await session.commit()
     await session.refresh(user_msg)
 
@@ -854,6 +1282,34 @@ async def delete_message(
     message = await session.get(Message, message_id)
     if message is None or message.thread_id != thread.id:
         raise NotFoundError("Message not found")
+
+    child_bp_ids = list(
+        (
+            await session.scalars(
+                select(Thread.branch_point_message_id).where(
+                    Thread.parent_thread_id == thread.id,
+                    Thread.branch_point_message_id.is_not(None),
+                )
+            )
+        ).all()
+    )
+    if child_bp_ids:
+        bp_messages = list(
+            (await session.scalars(select(Message).where(Message.id.in_(child_bp_ids)))).all()
+        )
+        for bp_msg in bp_messages:
+            seg = LineageSegment(
+                thread_id=thread.id,
+                cutoff_created_at=bp_msg.created_at,
+                cutoff_message_id=bp_msg.id,
+                cutoff_reply_to_message_id=bp_msg.reply_to_message_id,
+                is_inherited=True,
+            )
+            if seg.includes_message(message):
+                raise ConflictError(
+                    "Cannot delete a message that belongs to a branched conversation's inherited history"
+                )
+
     persisted_projects = await collect_thread_persistence_projects(session, thread_id=thread.id)
     await purge_thread_session_rows(session, thread_id=thread.id)
     await session.delete(message)
@@ -880,6 +1336,7 @@ async def persist_answer(
     """写入一条 assistant 消息。失败/取消时 answer 传部分已生成文本（可为 ""），
     并附带结构化 error {code, message, retryable, details}。"""
     async with session_factory() as session:
+        ts = _next_monotonic_utc_now()
         message = Message(
             reply_to_message_id=reply_to_message_id,
             regenerated_from_message_id=regenerated_from_message_id,
@@ -891,8 +1348,11 @@ async def persist_answer(
             prompt_preview=prompt_preview,
             status=status,
             error=error,
+            created_at=ts,
+            updated_at=ts,
         )
         session.add(message)
+        await session.execute(update(Thread).where(Thread.id == thread_id).values(updated_at=ts))
         await session.commit()
         await session.refresh(message)
         return message.id

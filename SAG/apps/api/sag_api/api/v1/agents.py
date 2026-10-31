@@ -39,6 +39,7 @@ from sag_api.schemas.agent import (
     BindingOut,
     MessageOut,
     MessagePageOut,
+    ThreadBranchIn,
     ThreadCreate,
     ThreadOut,
     ThreadUpdate,
@@ -230,17 +231,15 @@ async def list_threads(
     session: AsyncSession = Depends(get_session),
 ):
     agent = await svc.get_agent(session, agent_id, owner_key=owner_key)
-    return [
-        ThreadOut.model_validate(t)
-        for t in await svc.list_threads(
-            session,
-            agent.id,
-            owner_key=owner_key,
-            archived=archived,
-            limit=limit,
-            offset=offset,
-        )
-    ]
+    threads = await svc.list_threads(
+        session,
+        agent.id,
+        owner_key=owner_key,
+        archived=archived,
+        limit=limit,
+        offset=offset,
+    )
+    return await svc.serialize_threads_out(session, threads)
 
 
 @router.post("/{agent_id}/threads", response_model=ThreadOut, status_code=201)
@@ -252,7 +251,7 @@ async def create_thread(
 ):
     agent = await svc.get_agent(session, agent_id, owner_key=owner_key)
     thread = await svc.create_thread(session, agent, body.title, owner_key=owner_key)
-    return ThreadOut.model_validate(thread)
+    return await svc.serialize_thread_out(session, thread)
 
 
 @router.patch("/{agent_id}/threads/{thread_id}", response_model=ThreadOut)
@@ -267,7 +266,7 @@ async def update_thread(
     t = await svc.update_thread(
         session, agent.id, thread_id, owner_key=owner_key, title=body.title, archived=body.archived
     )
-    return ThreadOut.model_validate(t)
+    return await svc.serialize_thread_out(session, t)
 
 
 @router.get("/{agent_id}/threads/{thread_id}/messages", response_model=MessagePageOut)
@@ -288,8 +287,13 @@ async def messages(
         page.items,
         principal=principal,
     )
+    items_out: list[MessageOut] = []
+    for message in visible_messages:
+        dto = MessageOut.model_validate(message)
+        dto.is_inherited = message.thread_id != thread.id
+        items_out.append(dto)
     return MessagePageOut(
-        items=[MessageOut.model_validate(message) for message in visible_messages],
+        items=items_out,
         next_cursor=page.next_cursor,
         has_more=page.has_more,
     )
@@ -588,6 +592,37 @@ async def create_message_share(
     return JSONResponse(
         status_code=201 if created else 200,
         content=share_out.model_dump(mode="json"),
+        headers=_NO_STORE_HEADERS,
+    )
+
+
+@router.post(
+    "/{agent_id}/threads/{thread_id}/messages/{message_id}/branch",
+    response_model=ThreadOut,
+    status_code=201,
+)
+async def branch_message_thread(
+    agent_id: str,
+    thread_id: str,
+    message_id: str,
+    request: Request,
+    owner_key: str = Depends(get_conversation_owner),
+    principal: VerifiedPrincipal = Depends(require_answer_mutation_principal),
+    session: AsyncSession = Depends(get_session),
+) -> JSONResponse:
+    body: ThreadBranchIn = await _parse_strict_body(request, ThreadBranchIn, allow_empty=True)
+    branched = await actions_svc.branch_thread_from_message(
+        session,
+        agent_id=agent_id,
+        thread_id=thread_id,
+        message_id=message_id,
+        owner_key=owner_key,
+        principal=principal,
+        title=body.title,
+    )
+    return JSONResponse(
+        status_code=201,
+        content=branched.model_dump(mode="json"),
         headers=_NO_STORE_HEADERS,
     )
 

@@ -34,6 +34,7 @@ from sag_api.db.models import (
     Thread,
 )
 from sag_api.enums import DocumentStatus, MessageRole, MessageStatus
+from sag_api.schemas.agent import ThreadOut
 from sag_api.schemas.answer_actions import (
     AdminFeedbackPageOut,
     AdminFeedbackRowOut,
@@ -47,9 +48,12 @@ from sag_api.schemas.answer_actions import (
     ShareOut,
 )
 from sag_api.services.agent_domain import (
+    MAX_LINEAGE_DEPTH,
     AskPlan,
     _message_source_ids,
+    _next_monotonic_utc_now,
     _reject_json_constant,
+    _segment_sql_filters,
     _urlsafe_decode,
     _urlsafe_encode,
     build_ask_context,
@@ -57,7 +61,10 @@ from sag_api.services.agent_domain import (
     filter_messages_for_scope,
     get_agent,
     get_thread,
+    load_segment_messages_chronological,
+    resolve_thread_lineage_segments,
     resolve_user_display_name,
+    serialize_thread_out,
 )
 from sag_api.services.session_context import (
     HIDDEN_SCOPE_PLACEHOLDER,
@@ -303,28 +310,43 @@ async def _verify_evidence_document_provenance(
                         and total_indexed > 0
                         and message.created_at is not None
                     ):
-                        prior_rows = list(
-                            (
-                                await session.scalars(
-                                    select(Message.id)
-                                    .where(
-                                        Message.thread_id == message.thread_id,
-                                        Message.id != message_id,
-                                        Message.role == MessageRole.ASSISTANT,
-                                        Message.status == MessageStatus.OK,
-                                        or_(
-                                            Message.created_at < message.created_at,
-                                            and_(
-                                                Message.created_at == message.created_at,
-                                                Message.id < message_id,
-                                            ),
+                        msg_segments = await resolve_thread_lineage_segments(
+                            session, message.thread_id
+                        )
+                        prior_rows: list[str] = []
+                        for seg in reversed(msg_segments):
+                            rem = 129 - len(prior_rows)
+                            if rem <= 0:
+                                break
+                            seg_filters = _segment_sql_filters(seg)
+                            seg_filters.extend(
+                                [
+                                    Message.id != message_id,
+                                    Message.role == MessageRole.ASSISTANT,
+                                    Message.status == MessageStatus.OK,
+                                ]
+                            )
+                            if seg.thread_id == message.thread_id:
+                                seg_filters.append(
+                                    or_(
+                                        Message.created_at < message.created_at,
+                                        and_(
+                                            Message.created_at == message.created_at,
+                                            Message.id < message_id,
                                         ),
                                     )
-                                    .order_by(Message.created_at.desc(), Message.id.desc())
-                                    .limit(129)
                                 )
-                            ).all()
-                        )
+                            prior_rows.extend(
+                                str(pid)
+                                for pid in (
+                                    await session.scalars(
+                                        select(Message.id)
+                                        .where(*seg_filters)
+                                        .order_by(Message.created_at.desc(), Message.id.desc())
+                                        .limit(rem)
+                                    )
+                                ).all()
+                            )
                         if len(prior_rows) > 128:
                             return False
                         step_refs.update(str(pid) for pid in prior_rows)
@@ -346,11 +368,16 @@ async def _verify_evidence_document_provenance(
         if not cited_session_source_ids.issubset(authorized_cited):
             return False
 
+    lineage_segments = (
+        await resolve_thread_lineage_segments(session, message.thread_id)
+        if session_message_ids
+        else []
+    )
     for ref in sorted(session_message_ids):
         prior = await session.get(Message, ref)
         if (
             prior is None
-            or prior.thread_id != message.thread_id
+            or not any(seg.includes_message(prior) for seg in lineage_segments)
             or prior.role not in (MessageRole.USER, MessageRole.ASSISTANT)
             or prior.status != MessageStatus.OK
             or (
@@ -531,12 +558,19 @@ async def _ensure_authorized_assistant_message(
     owner_key: str,
     principal: VerifiedPrincipal,
     require_non_empty: bool = False,
+    allow_inherited: bool = True,
 ) -> tuple[Thread, Message, set[str]]:
     agent = await get_agent(session, agent_id, owner_key=owner_key)
     thread = await get_thread(session, agent.id, thread_id, owner_key=owner_key)
     message = await session.get(Message, message_id)
-    if message is None or message.thread_id != thread.id:
+    if message is None:
         raise NotFoundError("Message not found")
+    if message.thread_id != thread.id:
+        segments = await resolve_thread_lineage_segments(session, thread)
+        if not any(seg.includes_message(message) for seg in segments):
+            raise NotFoundError("Message not found")
+        if not allow_inherited:
+            raise BadRequestError("Inherited messages from a parent chat cannot be modified in place")
     if message.role != MessageRole.ASSISTANT:
         raise BadRequestError("Target message must be an assistant answer")
     if message.status != MessageStatus.OK:
@@ -813,7 +847,7 @@ async def create_or_get_share(
         principal=principal,
         require_non_empty=True,
     )
-    question = await resolve_parent_question(session, thread_id=thread.id, answer_message=message)
+    question = await resolve_parent_question(session, thread_id=message.thread_id, answer_message=message)
 
     creator_subject = str(principal.subject)
     target_message_id = str(message.id)
@@ -975,6 +1009,61 @@ async def revoke_project_share(
         await session.commit()
 
 
+# ── Branch in New Chat ────────────────────────────────────────────────
+async def branch_thread_from_message(
+    session: AsyncSession,
+    *,
+    agent_id: str,
+    thread_id: str,
+    message_id: str,
+    owner_key: str,
+    principal: VerifiedPrincipal,
+    title: str | None = None,
+) -> ThreadOut:
+    """Create an O(1) child `Thread` anchored at `message_id` (`0` message or vector copies)."""
+    _resolve_single_project_scope(principal)
+    source_thread, target_msg, _ = await _ensure_authorized_assistant_message(
+        session,
+        agent_id=agent_id,
+        thread_id=thread_id,
+        message_id=message_id,
+        owner_key=owner_key,
+        principal=principal,
+        require_non_empty=False,
+        allow_inherited=True,
+    )
+    await resolve_parent_question(
+        session,
+        thread_id=target_msg.thread_id,
+        answer_message=target_msg,
+    )
+
+    origin_thread_id = str(target_msg.thread_id)
+    origin_segments = await resolve_thread_lineage_segments(session, origin_thread_id)
+    if len(origin_segments) >= MAX_LINEAGE_DEPTH:
+        raise BadRequestError("Maximum conversation branch depth reached")
+
+    resolved_title = (
+        title.strip()[:200]
+        if title is not None and title.strip()
+        else (source_thread.title or "New chat")[:200]
+    )
+    ts = _next_monotonic_utc_now()
+    branched_thread = Thread(
+        agent_id=source_thread.agent_id,
+        owner_key=owner_key,
+        title=resolved_title,
+        parent_thread_id=origin_thread_id,
+        branch_point_message_id=str(target_msg.id),
+        created_at=ts,
+        updated_at=ts,
+    )
+    session.add(branched_thread)
+    await session.commit()
+    await session.refresh(branched_thread)
+    return await serialize_thread_out(session, branched_thread)
+
+
 # ── Regenerate ("Try again") ──────────────────────────────────────────
 def _deduplicate_prior_regenerations(messages: list[Message]) -> list[Message]:
     """Keep only the latest chronological answer per parent question in prior turns."""
@@ -1009,10 +1098,15 @@ async def prepare_regenerate(
     from sag_api.services.decision_router import route_query
     from sag_api.services.session_context.runtime import _extract_visible_records
 
-    await get_thread(session, agent.id, thread.id, owner_key=owner_key)
+    thread = await get_thread(session, agent.id, thread.id, owner_key=owner_key)
+    segments = await resolve_thread_lineage_segments(session, thread)
     target = await session.get(Message, target_message_id)
-    if target is None or target.thread_id != thread.id:
+    if target is None or not any(seg.includes_message(target) for seg in segments):
         raise NotFoundError("Message not found")
+    if target.thread_id != thread.id:
+        raise BadRequestError(
+            "Inherited messages from a parent chat cannot be regenerated in place"
+        )
     if target.role != MessageRole.ASSISTANT:
         raise BadRequestError("Only assistant answers can be regenerated")
 
@@ -1037,6 +1131,17 @@ async def prepare_regenerate(
                 }
             )
 
+    ancestor_deduped: list[Message] = []
+    for anc_seg in segments[:-1]:
+        anc_msgs = await load_segment_messages_chronological(
+            session,
+            anc_seg,
+            roles=(MessageRole.USER, MessageRole.ASSISTANT),
+            only_ok=True,
+            max_messages=settings.history_load_limit,
+        )
+        ancestor_deduped.extend(_deduplicate_prior_regenerations(anc_msgs))
+
     rows = await session.execute(
         select(Message)
         .where(
@@ -1051,7 +1156,8 @@ async def prepare_regenerate(
         .order_by(Message.created_at.desc(), Message.id.desc())
         .limit(settings.history_load_limit)
     )
-    prior_chronological = _deduplicate_prior_regenerations(list(reversed(rows.scalars().all())))
+    own_deduped = _deduplicate_prior_regenerations(list(reversed(rows.scalars().all())))
+    prior_chronological = [*ancestor_deduped, *own_deduped][-settings.history_load_limit :]
     scoped_prior = await filter_messages_for_scope(
         session,
         prior_chronological,

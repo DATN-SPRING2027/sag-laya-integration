@@ -325,6 +325,70 @@ async def _resolve_scope_safe(
         raise
 
 
+async def load_ancestor_segments_visible_records(
+    session: AsyncSession,
+    *,
+    thread_id: str,
+    principal: VerifiedPrincipal,
+) -> tuple[list[tuple[str, list[dict[str, Any]]]], str, bool]:
+    """Load live ACL-filtered visible records for inherited ancestor segments (`O(1)` no-op on root threads)."""
+    from sag_api.services.agent_domain import (
+        filter_messages_for_scope,
+        load_segment_messages_chronological,
+        resolve_thread_lineage_segments,
+    )
+    from sag_api.services.session_context.extractor import normalize_session_text
+
+    try:
+        segments = await resolve_thread_lineage_segments(session, thread_id)
+    except Exception as exc:  # noqa: BLE001
+        if _is_missing_session_tables_error(exc):
+            return [], "", False
+        raise
+
+    if len(segments) <= 1:
+        return [], "", False
+
+    ancestor_segments = segments[:-1]
+    remaining_cap = settings.session_context_max_messages
+    collected_per_seg: list[tuple[str, list[dict[str, Any]]]] = []
+    hasher = hashlib.sha256()
+    any_hidden = False
+
+    for seg in ancestor_segments:
+        if remaining_cap <= 0:
+            break
+        seg_raw = await load_segment_messages_chronological(
+            session,
+            seg,
+            roles=(MessageRole.USER, MessageRole.ASSISTANT),
+            only_ok=True,
+            max_messages=remaining_cap,
+        )
+        remaining_cap -= len(seg_raw)
+        if not seg_raw:
+            continue
+        seg_scoped = await filter_messages_for_scope(
+            session,
+            seg_raw,
+            principal=principal,
+            requested_source_ids=None,
+        )
+        seg_records, seg_hidden = _extract_visible_records(seg_scoped)
+        if seg_hidden:
+            any_hidden = True
+        hasher.update(f"seg:{seg.thread_id}:".encode())
+        for rec in seg_records:
+            c_hash = hashlib.sha256(
+                normalize_session_text(str(rec["content"])).encode("utf-8")
+            ).hexdigest()
+            hasher.update(f"{rec['id']}:{c_hash}|".encode())
+        collected_per_seg.append((seg.thread_id, seg_records))
+
+    lineage_sig = hasher.hexdigest()[:32]
+    return collected_per_seg, lineage_sig, any_hidden
+
+
 async def prepare_session_context_for_ask(
     session: AsyncSession,
     *,
@@ -351,6 +415,12 @@ async def prepare_session_context_for_ask(
         owner_key=owner_key,
         principal=principal,
     )
+    ancestor_records, lineage_sig, _ = await load_ancestor_segments_visible_records(
+        session,
+        thread_id=thread_id,
+        principal=principal,
+    )
+
     index = SESSION_INDEX_CACHE.get_or_create(
         scope_key=scope_key,
         thread_id=thread_id,
@@ -359,6 +429,7 @@ async def prepare_session_context_for_ask(
 
     can_use_delta = (
         bool(index.turns)
+        and index.inherited_lineage_signature == lineage_sig
         and index.last_db_created_at is not None
         and index.last_db_id is not None
         and not index.had_hidden_acl_turns
@@ -385,7 +456,7 @@ async def prepare_session_context_for_ask(
         persisted_turns_ok = (
             not index.persistence_active
             or persisted_state is None
-            or persisted_state[0] == len(index.turns)
+            or persisted_state[0] == (len(index.turns) - index.inherited_turn_count)
         )
         if db_count < index.seen_db_count or not sources_ok or not persisted_turns_ok:
             SESSION_INDEX_CACHE.invalidate_thread(thread_id)
@@ -506,7 +577,7 @@ async def prepare_session_context_for_ask(
                             }
                             grown_ep_ord = (
                                 prev_ep_count - 1
-                                if prev_ep_count > 0
+                                if prev_ep_count > index.inherited_episode_count
                                 and len(index.episodes[prev_ep_count - 1].turn_ids) > prev_ep_last_len
                                 else None
                             )
@@ -623,6 +694,8 @@ async def prepare_session_context_for_ask(
                 embedder=active_embedder,
                 qdrant_client=qdrant_client,
                 caller_had_pending_state=caller_had_pending_state,
+                ancestor_segments_records=ancestor_records,
+                lineage_signature=lineage_sig,
             )
             if persistence_stats.status == "degraded_unpersisted":
                 evict_after_pack = True
