@@ -23,7 +23,11 @@ from sag_api.core.errors import (
     ServiceUnavailableError,
     UpstreamError,
 )
-from sag_api.core.litellm_policy import apply_litellm_completion_policy
+from sag_api.core.litellm_policy import (
+    _with_json_object,
+    apply_litellm_completion_policy,
+    should_downgrade_json_schema,
+)
 from sag_api.core.logging import get_logger
 from sag_api.core.token_usage import extract_chat_usage, record_llm_usage
 
@@ -109,6 +113,7 @@ class LLMClient:
         stream: bool = False,
         tools: list[dict] | None = None,
         tool_choice: str | dict | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> Any:
         request: dict[str, Any] = {
             "model": self._settings.routed_llm_model,
@@ -124,6 +129,8 @@ class LLMClient:
             request["tools"] = tools
             if tool_choice is not None:
                 request["tool_choice"] = tool_choice
+        if response_format is not None:
+            request["response_format"] = response_format
         if self._settings.llm_base_url:
             request["api_base"] = self._settings.llm_base_url
         normalized = apply_litellm_completion_policy(self._settings, request)
@@ -136,6 +143,26 @@ class LLMClient:
                 return await _litellm_completion(
                     **apply_litellm_completion_policy(self._settings, fallback_request)
                 )
+            if not stream and should_downgrade_json_schema(err, normalized, self._settings):
+                json_obj_req = _with_json_object(normalized)
+                try:
+                    return await _litellm_completion(**json_obj_req)
+                except Exception as inner_err:
+                    status = getattr(inner_err, "status_code", None)
+                    if status in {400, 422} and "response_format" in str(inner_err).casefold():
+                        plain_req = dict(json_obj_req)
+                        plain_req.pop("response_format", None)
+                        return await _litellm_completion(**plain_req)
+                    raise
+            if (
+                not stream
+                and "response_format" in normalized
+                and getattr(err, "status_code", None) in {400, 422}
+                and "response_format" in str(err).casefold()
+            ):
+                plain_req = dict(normalized)
+                plain_req.pop("response_format", None)
+                return await _litellm_completion(**plain_req)
             raise
 
     @staticmethod
@@ -274,10 +301,15 @@ class LLMClient:
                 except Exception as e:  # noqa: BLE001
                     log.debug("LLM 轮次流关闭失败：%s", e)
 
-    async def complete(self, messages: list[Message]) -> str:
+    async def complete(
+        self,
+        messages: list[Message],
+        *,
+        response_format: dict[str, Any] | None = None,
+    ) -> str:
         self._ensure_configured()
         try:
-            resp = await self._create_completion(messages)
+            resp = await self._create_completion(messages, response_format=response_format)
             choices = _attr(resp, "choices", []) or []
             if not choices:
                 raise UpstreamError(
