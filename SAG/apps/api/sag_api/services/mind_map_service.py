@@ -58,7 +58,7 @@ _MAX_UNITS_PER_DOC = 16
 _MAX_EVIDENCE_UNITS = 60
 _MAX_BLOCKS_PER_UNIT = 8
 _MAX_UNIT_CHARS = 1200
-_MAX_SNIPPET_CHARS = 480
+_MAX_SNIPPET_CHARS = 1100
 
 _MAX_TREE_DEPTH = 3  # depth 0..3 -> 4 levels total
 _MAX_TREE_NODES = 60
@@ -164,10 +164,13 @@ def _clean_text(raw: Any, max_len: int) -> str:
 
 
 def _clean_snippet(raw: str) -> str:
-    trimmed = raw.strip()
+    trimmed = raw.replace("\r\n", "\n").replace("\r", "\n").strip()
     if len(trimmed) <= _MAX_SNIPPET_CHARS:
         return trimmed
-    return trimmed[: _MAX_SNIPPET_CHARS - 1].rstrip() + "…"
+    clipped = trimmed[: _MAX_SNIPPET_CHARS - 5].rstrip()
+    if len(re.findall(r"(?m)^\s*```", clipped)) % 2 == 1:
+        return f"{clipped}…\n```"
+    return clipped + "…"
 
 
 def _topic_terms(topic: str | None) -> list[str]:
@@ -872,6 +875,7 @@ def _build_citation_dto(number: int, ev: _CatalogEvidence) -> MindMapCitationOut
         sourceName=src_name,
         documentId=u.doc.public_document_id,
         documentName=doc_name,
+        chunkId=u.unit_id,
         versionNo=u.doc.version_no,
         heading=heading,
         snippet=_clean_snippet(u.content),

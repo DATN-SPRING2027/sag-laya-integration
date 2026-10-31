@@ -1110,3 +1110,52 @@ async def test_mind_map_get_enforces_bff_auth_and_strict_query_validation(
     assert (
         await client.post(url, headers=headers, json={"refresh": "yes"})
     ).status_code == 400
+
+
+def test_citation_excerpt_preserves_multiline_markdown_and_closes_truncated_fences() -> None:
+    from sag_api.generation.prompt import _citation_excerpt, build_citations
+    from sag_api.sag import RetrievedSection
+
+    markdown_with_diagram = (
+        "6. Trực Quan Hóa Vũ Trụ Tri Thức 3D\n\n"
+        "> ⭐ ĐIỂM NHẤN CỐT LÕI\n"
+        "> Thay vì xem tri thức dưới dạng bảng phẳng.\n\n"
+        "```\n"
+        "┌─────────────────────────────┐\n"
+        "│ 3D KNOWLEDGE GALAXY PIPELINE│\n"
+        "└─────────────────────────────┘\n"
+        "```"
+    )
+    excerpt = _citation_excerpt(markdown_with_diagram)
+    assert "\n> ⭐ ĐIỂM NHẤN CỐT LÕI\n" in excerpt
+    assert "\n```\n┌─────────────────────────────┐\n" in excerpt
+
+    long_fenced = "Intro\n```text\n" + ("│ box row │\n" * 160) + "```"
+    truncated = _citation_excerpt(long_fenced)
+    assert truncated.endswith("…\n```")
+    assert truncated.count("```") == 2
+
+    sec = RetrievedSection(
+        chunk_id="su_hex_1",
+        search_unit_id="su_hex_1",
+        heading="Architecture > 3D Universe",
+        content=markdown_with_diagram,
+        score=0.92,
+        source_id="src_1",
+        source_config_id="cfg_1",
+        document_id="sag-uuid-doc-1",
+        public_document_id="507f1f77bcf86cd799439011",
+        document_version_id="ver_1",
+        document_name="02_FRONTEND_NEXTJS.md",
+        version_no=1,
+        page_from=1,
+        page_to=1,
+        anchor="p1-b1",
+        section_path="Architecture > 3D Universe",
+    )
+    built = build_citations([sec], {"cfg_1": {"id": "src_1", "name": "Docs"}})
+    assert len(built) == 1
+    assert built[0]["document_id"] == "sag-uuid-doc-1"
+    assert built[0]["public_document_id"] == "507f1f77bcf86cd799439011"
+    assert built[0]["chunk_id"] == "su_hex_1"
+    assert "\n```\n" in built[0]["snippet"]
