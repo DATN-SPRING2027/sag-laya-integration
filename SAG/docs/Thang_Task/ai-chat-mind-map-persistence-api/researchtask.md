@@ -19,7 +19,7 @@ Branch `feat/Thang-ai-chat-mind-map-persistence-be-api` builds on `feat/Thang-ai
 
 ## Planned files and test matrix
 
-- `SAG/apps/api/sag_api/schemas/mind_map.py`: add strict `refresh: bool = True` on `MindMapGenerateIn`; extend `MindMapOut` with `status: Literal["ready", "empty", "uninitialized"]`, `cached: bool = False`, and `hasSourceUpdates: bool = False`.
+- `SAG/apps/api/sag_api/schemas/mind_map.py`: add strict `refresh: bool = True` on `MindMapGenerateIn`; enforce `len(trimmed) <= 200 and len(trimmed.casefold()) <= 200` in `normalize_mind_map_topic` so Unicode casefold expansions (`"ß" * 101` -> `202` chars) reject with `400` before LLM synthesis or `VARCHAR(200)` `topic_key` persistence; extend `MindMapOut` with `status: Literal["ready", "empty", "uninitialized"]`, `cached: bool = False`, and `hasSourceUpdates: bool = False`.
 - `SAG/apps/api/sag_api/services/mind_map_service.py`: implement `get_saved_project_mind_map`, atomic snapshot upsert/eviction in `generate_project_mind_map`, and live `used_document_version_ids` subset verification.
 - `SAG/apps/api/sag_api/api/v1/mind_map.py`: add `GET /api/v1/projects/{project_id}/mind-map` with strict query parameter allowlist (`topic` only) and BFF principal checks.
 - `SAG/apps/api/tests/test_mind_map_api.py`: RED-first ASGI tests for `GET` uninitialized -> `POST` persist -> cross-user `GET` instant hit (`cached=True`, 0 extra LLM calls), `hasSourceUpdates=True` on new document upload without reload, revocation/deletion invalidation safety, `POST` `refresh=False` vs `refresh=True`, and strict `GET` query / BFF auth guards.

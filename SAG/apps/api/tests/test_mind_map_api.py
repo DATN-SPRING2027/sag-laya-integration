@@ -1094,6 +1094,19 @@ async def test_mind_map_get_enforces_bff_auth_and_strict_query_validation(
     assert (
         await client.get(f"{url}?topic={'x' * 201}", headers=headers)
     ).status_code == 400
+    # Unicode casefold expansion guard (101 'ß' -> 202 'ss' chars > VARCHAR(200) topic_key)
+    llm_calls_before = len(mind_map_env.llm.calls)
+    assert (
+        await client.get(f"{url}?topic={'ß' * 101}", headers=headers)
+    ).status_code == 400
+    assert (
+        await client.post(url, headers=headers, json={"topic": "ß" * 101})
+    ).status_code == 400
+    assert len(mind_map_env.llm.calls) == llm_calls_before
+    # Exactly 100 'ß' -> 200 'ss' chars fits VARCHAR(200) cleanly
+    assert (
+        await client.get(f"{url}?topic={'ß' * 100}", headers=headers)
+    ).status_code == 200
     assert (
         await client.post(url, headers=headers, json={"refresh": "yes"})
     ).status_code == 400

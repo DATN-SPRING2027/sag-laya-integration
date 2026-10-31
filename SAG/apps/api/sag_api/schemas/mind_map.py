@@ -16,8 +16,8 @@ def normalize_mind_map_topic(value: object) -> str | None:
     trimmed = " ".join(value.split()).strip()
     if not trimmed:
         raise ValueError("topic must not be blank or whitespace-only")
-    if len(trimmed) > 200:
-        raise ValueError("topic must not exceed 200 characters")
+    if len(trimmed) > 200 or len(trimmed.casefold()) > 200:
+        raise ValueError("topic must not exceed 200 characters after normalization")
     return trimmed
 
 
