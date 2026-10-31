@@ -226,6 +226,27 @@ async def test_branch_lineage_pointers_are_immutable_after_insert(database):
             )
             await session.commit()
 
+    # Attempt to mutate owner_key or agent_id on child or parent participating in a lineage
+    for target_id, bad_values in [
+        ("thread_child", {"owner_key": "owner_2"}),
+        ("thread_child", {"agent_id": "agent_b"}),
+        ("thread_root", {"owner_key": "owner_2"}),
+        ("thread_root", {"agent_id": "agent_b"}),
+    ]:
+        async with database() as session:
+            with pytest.raises(IntegrityError):
+                await session.execute(
+                    update(Thread).where(Thread.id == target_id).values(**bad_values)
+                )
+                await session.commit()
+
+    # Safe updates (title, archived, deleted_by_owner_at) remain allowed on lineage threads
+    async with database() as session:
+        await session.execute(
+            update(Thread).where(Thread.id == "thread_child").values(title="Renamed Child")
+        )
+        await session.commit()
+
 
 async def test_restrict_prevents_deleting_parent_thread_or_branch_message_until_child_removed(database):
     async with database() as session:

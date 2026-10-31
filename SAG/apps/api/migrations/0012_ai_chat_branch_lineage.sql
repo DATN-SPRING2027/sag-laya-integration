@@ -38,6 +38,15 @@ BEGIN
             RAISE EXCEPTION 'Thread branch lineage pointers are immutable after creation'
                 USING ERRCODE = '23514';
         END IF;
+        IF (NEW.agent_id IS DISTINCT FROM OLD.agent_id
+            OR NEW.owner_key IS DISTINCT FROM OLD.owner_key)
+           AND (
+               OLD.parent_thread_id IS NOT NULL
+               OR EXISTS (SELECT 1 FROM threads c WHERE c.parent_thread_id = OLD.id)
+           ) THEN
+            RAISE EXCEPTION 'Thread agent_id and owner_key are immutable in a branch lineage'
+                USING ERRCODE = '23514';
+        END IF;
         RETURN NEW;
     END IF;
 

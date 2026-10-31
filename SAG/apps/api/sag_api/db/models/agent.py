@@ -169,10 +169,18 @@ _SQLITE_THREADS_BRANCH_IMMUTABLE_UPD = DDL(
     CREATE TRIGGER IF NOT EXISTS trg_threads_branch_scope_upd
     BEFORE UPDATE ON threads
     FOR EACH ROW
-    WHEN NEW.parent_thread_id IS NOT OLD.parent_thread_id
-      OR NEW.branch_point_message_id IS NOT OLD.branch_point_message_id
     BEGIN
-        SELECT RAISE(ABORT, 'Thread branch lineage pointers are immutable after creation');
+        SELECT CASE
+            WHEN NEW.parent_thread_id IS NOT OLD.parent_thread_id
+              OR NEW.branch_point_message_id IS NOT OLD.branch_point_message_id THEN
+                RAISE(ABORT, 'Thread branch lineage pointers are immutable after creation')
+            WHEN (NEW.agent_id IS NOT OLD.agent_id OR NEW.owner_key IS NOT OLD.owner_key)
+              AND (
+                  OLD.parent_thread_id IS NOT NULL
+                  OR EXISTS (SELECT 1 FROM threads c WHERE c.parent_thread_id = OLD.id)
+              ) THEN
+                RAISE(ABORT, 'Thread agent_id and owner_key are immutable in a branch lineage')
+        END;
     END;
     """
 )
@@ -187,6 +195,15 @@ _PG_THREADS_BRANCH_SCOPE_DDLS = (
                 IF NEW.parent_thread_id IS DISTINCT FROM OLD.parent_thread_id
                    OR NEW.branch_point_message_id IS DISTINCT FROM OLD.branch_point_message_id THEN
                     RAISE EXCEPTION 'Thread branch lineage pointers are immutable after creation'
+                        USING ERRCODE = '23514';
+                END IF;
+                IF (NEW.agent_id IS DISTINCT FROM OLD.agent_id
+                    OR NEW.owner_key IS DISTINCT FROM OLD.owner_key)
+                   AND (
+                       OLD.parent_thread_id IS NOT NULL
+                       OR EXISTS (SELECT 1 FROM threads c WHERE c.parent_thread_id = OLD.id)
+                   ) THEN
+                    RAISE EXCEPTION 'Thread agent_id and owner_key are immutable in a branch lineage'
                         USING ERRCODE = '23514';
                 END IF;
                 RETURN NEW;
