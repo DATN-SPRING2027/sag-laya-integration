@@ -56,6 +56,12 @@ class ThreadUpdate(BaseModel):
     archived: bool | None = None
 
 
+class ThreadBranchIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str | None = Field(default=None, max_length=200)
+
+
 class ThreadOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -63,6 +69,10 @@ class ThreadOut(BaseModel):
     agent_id: str
     title: str
     archived: bool = False
+    is_branched: bool = False
+    parent_thread_id: str | None = None
+    parent_thread_title: str | None = None
+    branch_point_message_id: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -74,6 +84,7 @@ class MessageOut(BaseModel):
     thread_id: str
     reply_to_message_id: str | None = None
     regenerated_from_message_id: str | None = None
+    is_inherited: bool = False
     role: MessageRole
     content: str
     citations: list[dict[str, Any]]

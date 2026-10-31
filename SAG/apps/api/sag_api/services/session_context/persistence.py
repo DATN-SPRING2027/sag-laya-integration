@@ -48,6 +48,7 @@ from sag_api.services.search_index_service import (
     put_cached_text_embedding,
 )
 from sag_api.services.session_context.extractor import (
+    classify_epistemic_state,
     extract_content_terms,
     normalize_session_text,
     split_sentences_with_spans,
@@ -879,11 +880,12 @@ async def _repair_thread_qdrant_from_db_units(
     # Fast path: reuse warm `IncrementalSessionIndex` if present with matching signature & turn set
     warm_entries = SESSION_INDEX_CACHE.find_thread_entries(thread_id)
     for warm_idx in warm_entries:
+        own_warm_turns = warm_idx.turns[warm_idx.inherited_turn_count :]
         if (
             warm_idx.embedding_mode == thread_sig
-            and len(warm_idx.turns) == len(turn_units)
+            and len(own_warm_turns) == len(turn_units)
             and all(
-                warm_idx.turns[i].turn_id == turn_units[i].message_from_id
+                own_warm_turns[i].turn_id == turn_units[i].message_from_id
                 for i in range(len(turn_units))
             )
         ):
@@ -1696,7 +1698,7 @@ def _build_qdrant_items_from_index(
     ep_ord_by_id = {ep.episode_id: ep.ordinal for ep in index.episodes}
     items: list[tuple[SessionUnit, Sequence[float], dict[str, list]]] = []
 
-    for turn in index.turns:
+    for turn in index.turns[index.inherited_turn_count :]:
         u_id = generate_session_unit_id(scope.thread_id, "TURN", turn.ordinal, turn.turn_id)
         if only_unit_ids is not None and u_id not in only_unit_ids:
             continue
@@ -1710,7 +1712,7 @@ def _build_qdrant_items_from_index(
         )
         items.append((u_row, turn.dense_vector, _sparse_qdrant_dict_for_turn(turn)))
 
-    for win in index.windows:
+    for win in index.windows[index.inherited_window_count :]:
         if not win.turn_ids:
             continue
         first_tid = win.turn_ids[0]
@@ -1731,7 +1733,7 @@ def _build_qdrant_items_from_index(
         )
         items.append((w_row, win.dense_vector, _sparse_qdrant_dict_for_span(win.turn_ids, index=index)))
 
-    for ep in index.episodes:
+    for ep in index.episodes[index.inherited_episode_count :]:
         if not ep.turn_ids:
             continue
         ep_uid = generate_session_unit_id(scope.thread_id, "EPISODE", ep.ordinal, ep.turn_ids[0])
@@ -1766,7 +1768,7 @@ async def backfill_pending_qdrant_for_thread(
     caller_had_pending_state: bool = False,
 ) -> int:
     """Retry/backfill any missing or pending Qdrant `SessionUnit` points for `scope.thread_id`."""
-    if not index.turns:
+    if len(index.turns) <= index.inherited_turn_count:
         index.qdrant_sync_pending = False
         index.qdrant_rebuild_pending = False
         return 0
@@ -1777,7 +1779,12 @@ async def backfill_pending_qdrant_for_thread(
 
     collection_name = session_qdrant_collection_name(scope.project_id)
     try:
-        cited_sids = {s for t in index.turns for s in t.cited_source_ids if s}
+        cited_sids = {
+            s
+            for t in index.turns[index.inherited_turn_count :]
+            for s in t.cited_source_ids
+            if s
+        }
         if cited_sids:
             confirmed_map = await _lookup_confirmed_source_projects(
                 session,
@@ -1931,13 +1938,18 @@ async def sync_session_index_to_storage(
 
     stats = PersistenceSyncStats(status=mode)
     collection_name = session_qdrant_collection_name(scope.project_id)
+    inh_turn_k = index.inherited_turn_count
+    inh_win_k = index.inherited_window_count
+    inh_ep_k = index.inherited_episode_count
+    inh_dec_k = index.inherited_decision_count
+    inherited_turn_ids = {t.turn_id for t in index.turns[:inh_turn_k]}
     ep_ord_by_id = {ep.episode_id: ep.ordinal for ep in index.episodes}
     turn_unit_ids = {
         t.turn_id: generate_session_unit_id(scope.thread_id, "TURN", t.ordinal, t.turn_id)
-        for t in index.turns
+        for t in index.turns[inh_turn_k:]
     }
     decision_ids_by_turn: dict[str, str] = {}
-    for dec in index.decision_ledger:
+    for dec in index.decision_ledger[inh_dec_k:]:
         u_id = turn_unit_ids.get(dec.turn_id)
         if u_id:
             decision_ids_by_turn[dec.turn_id] = generate_session_decision_id(u_id, dec.topic_slot_key)
@@ -1949,13 +1961,17 @@ async def sync_session_index_to_storage(
         async with session.begin_nested():
             if mode == "rebuild":
                 await purge_thread_session_rows(session, thread_id=scope.thread_id)
-                start_turn_ordinal = 0
-                start_window_ordinal = 0
-                start_episode_ordinal = 0
-                start_decision_idx = 0
+                start_turn_ordinal = inh_turn_k
+                start_window_ordinal = inh_win_k
+                start_episode_ordinal = inh_ep_k
+                start_decision_idx = inh_dec_k
                 mutated_prior_turn_ids = set()
                 grown_episode_ordinal = None
             else:
+                start_turn_ordinal = max(start_turn_ordinal, inh_turn_k)
+                start_window_ordinal = max(start_window_ordinal, inh_win_k)
+                start_episode_ordinal = max(start_episode_ordinal, inh_ep_k)
+                start_decision_idx = max(start_decision_idx, inh_dec_k)
                 prior_unsynced_ids = set(
                     (
                         await session.execute(
@@ -1972,7 +1988,11 @@ async def sync_session_index_to_storage(
             # 1. Update newly superseded prior TURN units (`epistemic_status`, `valid_to`, dirty `qdrant_point_id`)
             for prior_tid in sorted(mutated_prior_turn_ids or ()):
                 prior_turn = index.turns_by_id.get(prior_tid)
-                if prior_turn is None or prior_turn.ordinal >= start_turn_ordinal:
+                if (
+                    prior_turn is None
+                    or prior_turn.ordinal < inh_turn_k
+                    or prior_turn.ordinal >= start_turn_ordinal
+                ):
                     continue
                 prior_uid = turn_unit_ids[prior_tid]
                 _, new_valid_to = _turn_valid_window(prior_turn, index.turns_by_id)
@@ -2044,7 +2064,10 @@ async def sync_session_index_to_storage(
                 session.add_all(new_window_units)
 
             # 4. Replace grown active EPISODE unit via DELETE + INSERT (respects immutable update trigger)
-            if grown_episode_ordinal is not None and 0 <= grown_episode_ordinal < start_episode_ordinal:
+            if (
+                grown_episode_ordinal is not None
+                and inh_ep_k <= grown_episode_ordinal < start_episode_ordinal
+            ):
                 grown_ep = index.episodes[grown_episode_ordinal]
                 grown_ep_uid = generate_session_unit_id(
                     scope.thread_id, "EPISODE", grown_ep.ordinal, grown_ep.turn_ids[0]
@@ -2132,12 +2155,23 @@ async def sync_session_index_to_storage(
                 if not u_id or turn_obj is None:
                     continue
                 dec_id = decision_ids_by_turn[entry.turn_id]
-                superseded_dec_ids = [
+                same_thread_superseded_dec_ids = [
                     decision_ids_by_turn[tid]
                     for tid in entry.supersedes_turn_ids
                     if tid in decision_ids_by_turn
                 ]
-                primary_supersedes_id = superseded_dec_ids[-1] if superseded_dec_ids else None
+                inherited_superseded_markers = [
+                    f"inherited_turn:{tid}"
+                    for tid in entry.supersedes_turn_ids
+                    if tid not in decision_ids_by_turn and tid in inherited_turn_ids
+                ]
+                superseded_dec_ids = [
+                    *same_thread_superseded_dec_ids,
+                    *inherited_superseded_markers,
+                ]
+                primary_supersedes_id = (
+                    same_thread_superseded_dec_ids[-1] if same_thread_superseded_dec_ids else None
+                )
                 valid_from = _ts_to_utc(entry.valid_from_ts)
                 ledger_kind = "OPEN_ISSUE" if entry.epistemic_status == "OPEN_ISSUE" else "DECISION"
                 companion_uids = [
@@ -2176,8 +2210,8 @@ async def sync_session_index_to_storage(
                 session.add(dec_row)
                 await session.flush()
 
-                # Close any prior decision entries superseded or confirmed by `entry.turn_id`
-                for prior_idx in range(0, dec_idx):
+                # Close any prior OWN decision entries superseded or confirmed by `entry.turn_id`
+                for prior_idx in range(inh_dec_k, dec_idx):
                     prior_entry = index.decision_ledger[prior_idx]
                     if prior_entry.superseded_by_turn_id != entry.turn_id:
                         continue
@@ -2298,10 +2332,13 @@ def _reconstruct_prefix_into_index(
     project_records: Sequence[dict[str, Any]],
     hydrated_vectors: dict[str, tuple[float, ...]],
     embedder: Any | None,
+    as_of_cutoff: bool = False,
 ) -> None:
     """Hydrate prefix `0 .. K - 1` into `IncrementalSessionIndex` without re-running NER or HTTP embedding."""
     target_mode = compute_embedding_signature(embedder)
     index.embedding_mode = target_mode
+    base_turn_ordinal = len(index.turns)
+    base_dec_idx = len(index.decision_ledger)
 
     unit_id_to_turn_id = {u.id: u.message_from_id for u in persisted_turn_units}
     dec_id_to_turn_id = {
@@ -2385,14 +2422,15 @@ def _reconstruct_prefix_into_index(
         for word, tf in term_freqs.items():
             index.doc_freqs[word] = index.doc_freqs.get(word, 0) + 1
             index.term_postings.setdefault(word, []).append((t_id, tf))
+        total_so_far = base_turn_ordinal + i + 1
         index.total_token_words += word_len
-        avg_len = index.total_token_words / max(1, i + 1)
+        avg_len = index.total_token_words / max(1, total_so_far)
 
         sparse_vec = sparse_dict_from_bm25(
             content,
             avg_doc_len=avg_len,
             corpus_doc_freqs=index.doc_freqs,
-            total_corpus_docs=max(50, i + 1),
+            total_corpus_docs=max(50, total_so_far),
         )
         content_terms = frozenset(extract_content_terms(content))
 
@@ -2402,7 +2440,7 @@ def _reconstruct_prefix_into_index(
             ep_obj = EpisodeSegment(
                 episode_id=ep_id,
                 thread_id=index.thread_id,
-                ordinal=int(u_row.episode_ordinal),
+                ordinal=len(index.episodes),
                 turn_ids=[t_id],
                 centroid=list(t_vec),
                 content_terms=set(content_terms),
@@ -2428,10 +2466,15 @@ def _reconstruct_prefix_into_index(
         if cited_sources:
             index.cached_cited_source_ids.update(cited_sources)
 
+        restored_turn_status = u_row.epistemic_status
+        if as_of_cutoff and restored_turn_status == "SUPERSEDED":
+            intrinsic_st, _, _ = classify_epistemic_state(content, role=role)
+            restored_turn_status = intrinsic_st if intrinsic_st != "FACT" else "CONFIRMED"
+
         turn_obj = IndexedTurn(
             turn_id=t_id,
             thread_id=index.thread_id,
-            ordinal=i,
+            ordinal=base_turn_ordinal + i,
             role=role,
             content=content,
             created_at_ts=ts,
@@ -2447,7 +2490,7 @@ def _reconstruct_prefix_into_index(
             sentences=tuple(sentences_list),
             term_freqs=term_freqs,
             doc_word_len=word_len,
-            epistemic_status=u_row.epistemic_status,  # type: ignore[arg-type]
+            epistemic_status=restored_turn_status,  # type: ignore[arg-type]
             topic_slot_key=u_row.topic_slot_key,
             is_anaphoric_or_short=bool(u_row.is_anaphoric_or_short),
             cited_source_ids=cited_sources,
@@ -2457,17 +2500,22 @@ def _reconstruct_prefix_into_index(
         index._refresh_window_representation(win_node)
         index._register_turn_entities(turn_obj)
 
-    # Restore decision ledger & turn supersession links
+    # Restore decision ledger & turn supersession links (with Bi-Temporal As-Of cutoff restoration)
     for d_idx, d_row in enumerate(persisted_decisions):
         t_id = unit_id_to_turn_id.get(d_row.session_unit_id)
         turn_obj = index.turns_by_id.get(t_id or "")
         if not t_id or turn_obj is None:
             continue
-        sup_turn_ids = tuple(
-            dec_id_to_turn_id[sid]
-            for sid in (d_row.supersedes_ids_json or [])
-            if sid in dec_id_to_turn_id
-        )
+        resolved_sup_tids: list[str] = []
+        for sid in (d_row.supersedes_ids_json or []):
+            sid_str = str(sid)
+            if sid_str in dec_id_to_turn_id:
+                resolved_sup_tids.append(dec_id_to_turn_id[sid_str])
+            elif sid_str.startswith("inherited_turn:"):
+                inh_tid = sid_str.removeprefix("inherited_turn:")
+                if inh_tid in index.turns_by_id:
+                    resolved_sup_tids.append(inh_tid)
+        sup_turn_ids = tuple(dict.fromkeys(resolved_sup_tids))
         if not sup_turn_ids and d_row.supersedes_id and d_row.supersedes_id in dec_id_to_turn_id:
             sup_turn_ids = (dec_id_to_turn_id[d_row.supersedes_id],)
         sup_by_turn_id = (
@@ -2481,28 +2529,65 @@ def _reconstruct_prefix_into_index(
         vf_aware = (
             d_row.valid_from if d_row.valid_from.tzinfo else d_row.valid_from.replace(tzinfo=UTC)
         )
+        dec_status = d_row.epistemic_status
         vt_ts: float | None = None
-        if not _is_open_ended(d_row.valid_to):
-            vt_aware = (
-                d_row.valid_to if d_row.valid_to.tzinfo else d_row.valid_to.replace(tzinfo=UTC)
-            )
-            vt_ts = vt_aware.timestamp()
+        if as_of_cutoff and dec_status == "SUPERSEDED" and sup_by_turn_id is None:
+            # Decision was superseded on ancestor AFTER our branch cutoff -> restore As-Of active state!
+            intrinsic_st, _, _ = classify_epistemic_state(turn_obj.content, role=turn_obj.role)
+            if d_row.ledger_kind == "OPEN_ISSUE":
+                dec_status = "OPEN_ISSUE"
+            elif intrinsic_st in {"CONFIRMED", "PROPOSED", "CONSIDERING", "OPEN_ISSUE", "NEGATED"}:
+                dec_status = intrinsic_st
+            else:
+                dec_status = "CONFIRMED"
+            turn_obj.epistemic_status = dec_status  # type: ignore[assignment]
+            turn_obj.superseded_by_turn_id = None
+            vt_ts = vf_aware.timestamp() if dec_status == "NEGATED" else None
+        else:
+            if not _is_open_ended(d_row.valid_to):
+                vt_aware = (
+                    d_row.valid_to if d_row.valid_to.tzinfo else d_row.valid_to.replace(tzinfo=UTC)
+                )
+                vt_ts = vt_aware.timestamp()
 
         turn_obj.superseded_entity_keys = tuple(
             str(k) for k in (d_row.superseded_entity_keys_json or []) if k
         )
         if sup_turn_ids:
             turn_obj.supersedes_turn_ids = sup_turn_ids
-        if sup_by_turn_id and d_row.epistemic_status == "SUPERSEDED":
+            # Apply cross-branch supersession onto inherited in-memory turns/decisions (never touches parent DB)
+            for sup_tid in sup_turn_ids:
+                prior_inh_turn = index.turns_by_id.get(sup_tid)
+                if prior_inh_turn is not None and prior_inh_turn.ordinal < base_turn_ordinal:
+                    prior_inh_turn.epistemic_status = "SUPERSEDED"
+                    prior_inh_turn.superseded_by_turn_id = t_id
+                    for prior_dec_idx, prior_dec in enumerate(index.decision_ledger):
+                        if prior_dec.turn_id == sup_tid and prior_dec.superseded_by_turn_id is None:
+                            index.decision_ledger[prior_dec_idx] = DecisionLedgerEntry(
+                                entry_id=prior_dec.entry_id,
+                                topic_slot_key=prior_dec.topic_slot_key,
+                                turn_id=prior_dec.turn_id,
+                                turn_ordinal=prior_dec.turn_ordinal,
+                                epistemic_status="SUPERSEDED",
+                                summary_text=prior_dec.summary_text,
+                                entity_keys=prior_dec.entity_keys,
+                                companion_turn_ids=prior_dec.companion_turn_ids,
+                                valid_from_ts=prior_dec.valid_from_ts,
+                                valid_to_ts=max(prior_dec.valid_from_ts, vf_aware.timestamp()),
+                                superseded_by_turn_id=t_id,
+                                supersedes_turn_ids=prior_dec.supersedes_turn_ids,
+                            )
+        if sup_by_turn_id and dec_status == "SUPERSEDED":
+            turn_obj.epistemic_status = "SUPERSEDED"
             turn_obj.superseded_by_turn_id = sup_by_turn_id
 
         index.decision_ledger.append(
             DecisionLedgerEntry(
-                entry_id=f"{index.thread_id}:dec{d_idx}",
+                entry_id=f"{index.thread_id}:dec{base_dec_idx + d_idx}",
                 topic_slot_key=d_row.topic_slot_key,
                 turn_id=t_id,
-                turn_ordinal=int(d_row.turn_ordinal),
-                epistemic_status=d_row.epistemic_status,  # type: ignore[arg-type]
+                turn_ordinal=turn_obj.ordinal,
+                epistemic_status=dec_status,  # type: ignore[arg-type]
                 summary_text=d_row.summary_text,
                 entity_keys=tuple(str(k) for k in (d_row.entity_keys_json or []) if k),
                 companion_turn_ids=comp_turn_ids,
@@ -2512,6 +2597,172 @@ def _reconstruct_prefix_into_index(
                 supersedes_turn_ids=sup_turn_ids,
             )
         )
+
+
+async def _hydrate_ancestor_segments_as_of(
+    session: AsyncSession,
+    *,
+    index: IncrementalSessionIndex,
+    ancestor_segments_records: Sequence[tuple[str, Sequence[dict[str, Any]]]],
+    lineage_signature: str,
+    scope: SessionPersistenceScope | None,
+    embedder: Any | None,
+    qdrant_client: httpx.AsyncClient | None,
+) -> int:
+    """Hydrate read-only ancestor segments As-Of their branch cutoffs (`0` HTTP re-embeds when persisted)."""
+    if not ancestor_segments_records:
+        return 0
+
+    embedding_sig = compute_embedding_signature(embedder)
+    expected_dim = declared_embedder_dim(embedder)
+    hydrated_anc_turns = 0
+
+    for anc_thread_id, seg_records in ancestor_segments_records:
+        if not seg_records:
+            continue
+        if scope is None:
+            await index.append_messages(seg_records, embedder=embedder)
+            continue
+
+        anc_units = list(
+            (
+                await session.execute(
+                    select(SessionUnit)
+                    .where(
+                        SessionUnit.tenant_id == scope.tenant_id,
+                        SessionUnit.project_id == scope.project_id,
+                        SessionUnit.thread_id == anc_thread_id,
+                        SessionUnit.unit_kind == "TURN",
+                    )
+                    .order_by(SessionUnit.ordinal.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        anc_unit_by_msg_id = {
+            str(u.message_from_id): u
+            for u in anc_units
+            if u.embedding_model_signature == embedding_sig
+        }
+        usable_units: list[SessionUnit] = []
+        for rec in seg_records:
+            cand_u = anc_unit_by_msg_id.get(str(rec["id"]))
+            if cand_u is None:
+                break
+            expected_hash = hashlib.sha256(
+                normalize_session_text(str(rec["content"])).encode("utf-8")
+            ).hexdigest()
+            if cand_u.content_hash != expected_hash:
+                break
+            usable_units.append(cand_u)
+
+        usable_k = len(usable_units)
+        if usable_k > 0:
+            anc_vecs: dict[str, tuple[float, ...]] = {}
+            if embedder is None:
+                for idx_i, u_row in enumerate(usable_units):
+                    c_norm = normalize_session_text(str(seg_records[idx_i]["content"]))
+                    anc_vecs[u_row.id] = deterministic_ngram_vector(c_norm)
+            else:
+                missing_anc: list[tuple[SessionUnit, str]] = []
+                for idx_i, u_row in enumerate(usable_units):
+                    c_norm = normalize_session_text(str(seg_records[idx_i]["content"]))
+                    cached_vec = get_cached_text_embedding(c_norm, model_signature=embedding_sig)
+                    if (
+                        cached_vec is not None
+                        and len(cached_vec) > 0
+                        and (expected_dim is None or len(cached_vec) == expected_dim)
+                    ):
+                        anc_vecs[u_row.id] = l2_normalize(cached_vec)
+                    else:
+                        missing_anc.append((u_row, c_norm))
+
+                if missing_anc:
+                    client, should_close = _open_qdrant_client_context(session, qdrant_client)
+                    if client is not None:
+                        try:
+                            q_vecs = await fetch_thread_turn_vectors_from_qdrant(
+                                client,
+                                tenant_id=scope.tenant_id,
+                                project_id=scope.project_id,
+                                thread_id=anc_thread_id,
+                                expected_embedding_sig=embedding_sig,
+                                expected_dim=expected_dim,
+                            )
+                            for u_row, c_norm in missing_anc:
+                                q_vec = q_vecs.get(u_row.id)
+                                if q_vec is not None:
+                                    anc_vecs[u_row.id] = q_vec
+                                    put_cached_text_embedding(
+                                        c_norm,
+                                        q_vec,
+                                        model_signature=embedding_sig,
+                                    )
+                        except Exception as q_exc:  # noqa: BLE001
+                            log.warning(
+                                "Ancestor Qdrant vector hydration fallback anc=%s err=%s",
+                                anc_thread_id,
+                                sanitize_error_message(q_exc),
+                            )
+                        finally:
+                            if should_close:
+                                await client.aclose()
+
+                    still_missing = [
+                        (u_row, c_norm)
+                        for u_row, c_norm in missing_anc
+                        if u_row.id not in anc_vecs
+                    ]
+                    if still_missing:
+                        f_vecs, actual_sig = await embed_texts_with_provenance(
+                            [txt for _, txt in still_missing],
+                            embedder=embedder,
+                        )
+                        if actual_sig == embedding_sig:
+                            for (u_row, _), f_vec in zip(still_missing, f_vecs, strict=True):
+                                anc_vecs[u_row.id] = f_vec
+
+            if len(anc_vecs) == usable_k:
+                usable_uids = [u.id for u in usable_units]
+                anc_decisions = list(
+                    (
+                        await session.execute(
+                            select(SessionDecisionLedger)
+                            .where(
+                                SessionDecisionLedger.tenant_id == scope.tenant_id,
+                                SessionDecisionLedger.project_id == scope.project_id,
+                                SessionDecisionLedger.thread_id == anc_thread_id,
+                                SessionDecisionLedger.session_unit_id.in_(usable_uids),
+                            )
+                            .order_by(
+                                SessionDecisionLedger.turn_ordinal.asc(),
+                                SessionDecisionLedger.created_at.asc(),
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                _reconstruct_prefix_into_index(
+                    index,
+                    persisted_turn_units=usable_units,
+                    persisted_decisions=anc_decisions,
+                    project_records=seg_records[:usable_k],
+                    hydrated_vectors=anc_vecs,
+                    embedder=embedder,
+                    as_of_cutoff=True,
+                )
+                hydrated_anc_turns += usable_k
+            else:
+                usable_k = 0
+
+        if usable_k < len(seg_records):
+            await index.append_messages(seg_records[usable_k:], embedder=embedder)
+
+    index.seal_inherited_boundary()
+    index.inherited_lineage_signature = lineage_signature
+    return hydrated_anc_turns
 
 
 async def hydrate_or_backfill_cold_session_index(
@@ -2525,6 +2776,8 @@ async def hydrate_or_backfill_cold_session_index(
     embedder: Any | None = None,
     qdrant_client: httpx.AsyncClient | None = None,
     caller_had_pending_state: bool = False,
+    ancestor_segments_records: Sequence[tuple[str, Sequence[dict[str, Any]]]] = (),
+    lineage_signature: str = "",
 ) -> PersistenceSyncStats:
     """Cold-start entrypoint: hydrate verified prefix (`0` HTTP re-embeds), lazy-backfill, or reconcile."""
     try:
@@ -2541,12 +2794,32 @@ async def hydrate_or_backfill_cold_session_index(
         raise
     except Exception as exc:  # noqa: BLE001
         if _is_missing_session_tables_error(exc):
+            if ancestor_segments_records:
+                await _hydrate_ancestor_segments_as_of(
+                    session,
+                    index=index,
+                    ancestor_segments_records=ancestor_segments_records,
+                    lineage_signature=lineage_signature,
+                    scope=None,
+                    embedder=embedder,
+                    qdrant_client=qdrant_client,
+                )
             await index.append_messages(project_records, embedder=embedder)
             return PersistenceSyncStats(status="memory_only")
         raise
 
     if scope is None:
         index.persistence_active = False
+        if ancestor_segments_records:
+            await _hydrate_ancestor_segments_as_of(
+                session,
+                index=index,
+                ancestor_segments_records=ancestor_segments_records,
+                lineage_signature=lineage_signature,
+                scope=None,
+                embedder=embedder,
+                qdrant_client=qdrant_client,
+            )
         await index.append_messages(project_records, embedder=embedder)
         return PersistenceSyncStats(status="memory_only")
 
@@ -2576,12 +2849,29 @@ async def hydrate_or_backfill_cold_session_index(
             return PersistenceSyncStats(status="memory_only")
         raise
 
+    hydrated_anc_count = 0
+    if ancestor_segments_records:
+        hydrated_anc_count = await _hydrate_ancestor_segments_as_of(
+            session,
+            index=index,
+            ancestor_segments_records=ancestor_segments_records,
+            lineage_signature=lineage_signature,
+            scope=scope,
+            embedder=embedder,
+            qdrant_client=qdrant_client,
+        )
+
+    base_turn_ordinal = index.inherited_turn_count
     k_persisted = len(persisted_turn_units)
     n_visible = len(project_records)
     embedding_sig = compute_embedding_signature(embedder)
     expected_dim = declared_embedder_dim(embedder)
 
-    # Empty visible history: purge any lingering derived state if k_persisted > 0
+    if index.turns and index.embedding_mode != embedding_sig:
+        await index.append_messages(project_records, embedder=None)
+        return PersistenceSyncStats(status="degraded_unpersisted")
+
+    # Empty own visible history: purge any lingering own derived state if k_persisted > 0
     if n_visible == 0:
         if k_persisted > 0:
             await purge_thread_session_rows(session, thread_id=scope.thread_id)
@@ -2593,8 +2883,14 @@ async def hydrate_or_backfill_cold_session_index(
                 project_ids=[scope.project_id],
                 qdrant_client=qdrant_client,
             )
-            return PersistenceSyncStats(status="reconciled_empty")
-        return PersistenceSyncStats(status="clean_empty")
+            return PersistenceSyncStats(
+                status="reconciled_empty",
+                hydrated_turns=hydrated_anc_count,
+            )
+        return PersistenceSyncStats(
+            status="clean_empty" if hydrated_anc_count == 0 else "hydrated_clean",
+            hydrated_turns=hydrated_anc_count,
+        )
 
     # Verify whether `persisted_turn_units` is an exact, unbroken prefix of `project_records`
     prefix_ok = 0 < k_persisted <= n_visible
@@ -2605,7 +2901,7 @@ async def hydrate_or_backfill_cold_session_index(
                 normalize_session_text(str(rec["content"])).encode("utf-8")
             ).hexdigest()
             if (
-                int(u_row.ordinal) != idx_i
+                int(u_row.ordinal) != base_turn_ordinal + idx_i
                 or u_row.message_from_id != str(rec["id"])
                 or u_row.content_hash != expected_hash
                 or u_row.embedding_model_signature != embedding_sig
@@ -2758,7 +3054,7 @@ async def hydrate_or_backfill_cold_session_index(
             )
         return PersistenceSyncStats(
             status="hydrated_clean",
-            hydrated_turns=k_persisted,
+            hydrated_turns=hydrated_anc_count + k_persisted,
             qdrant_points_upserted=repaired_pts,
         )
 
@@ -2789,7 +3085,8 @@ async def hydrate_or_backfill_cold_session_index(
     }
     grown_ep_ord = (
         prev_ep_count - 1
-        if prev_ep_count > 0 and len(index.episodes[prev_ep_count - 1].turn_ids) > prev_ep_last_len
+        if prev_ep_count > index.inherited_episode_count
+        and len(index.episodes[prev_ep_count - 1].turn_ids) > prev_ep_last_len
         else None
     )
 
@@ -2799,7 +3096,7 @@ async def hydrate_or_backfill_cold_session_index(
         scope=scope,
         embedding_sig=embedding_sig,
         mode="delta",
-        start_turn_ordinal=k_persisted,
+        start_turn_ordinal=base_turn_ordinal + k_persisted,
         start_window_ordinal=prev_win_count,
         start_episode_ordinal=prev_ep_count,
         start_decision_idx=prev_dec_count,
@@ -2810,7 +3107,7 @@ async def hydrate_or_backfill_cold_session_index(
         caller_had_pending_state=caller_had_pending_state,
     )
     delta_stats.status = "hydrated_delta"
-    delta_stats.hydrated_turns = k_persisted
+    delta_stats.hydrated_turns = hydrated_anc_count + k_persisted
     return delta_stats
 
 
@@ -2828,12 +3125,18 @@ async def backfill_thread_session_context(
     from sag_api.services.agent_domain import filter_messages_for_scope
     from sag_api.services.session_context.runtime import (
         _extract_visible_records,
+        load_ancestor_segments_visible_records,
         load_full_thread_messages_keyset,
         resolve_session_embedder,
     )
 
     caller_pending = bool(session.new or session.dirty or session.deleted)
     active_embedder = resolve_session_embedder(embedder)
+    ancestor_records, lineage_sig, _ = await load_ancestor_segments_visible_records(
+        session,
+        thread_id=thread_id,
+        principal=principal,
+    )
     raw_messages = await load_full_thread_messages_keyset(session, thread_id=thread_id)
     scoped_messages = await filter_messages_for_scope(
         session,
@@ -2853,4 +3156,6 @@ async def backfill_thread_session_context(
         embedder=active_embedder,
         qdrant_client=qdrant_client,
         caller_had_pending_state=caller_pending,
+        ancestor_segments_records=ancestor_records,
+        lineage_signature=lineage_sig,
     )
