@@ -958,6 +958,23 @@ async def filter_messages_for_scope(
     return visible
 
 
+def deduplicate_prior_regenerations(messages: list[Message]) -> list[Message]:
+    """Keep only the latest chronological answer per parent question in prior turns."""
+    latest_by_question: dict[str, str] = {}
+    for msg in messages:
+        if msg.role == MessageRole.ASSISTANT and msg.reply_to_message_id:
+            latest_by_question[msg.reply_to_message_id] = msg.id
+    return [
+        msg
+        for msg in messages
+        if not (
+            msg.role == MessageRole.ASSISTANT
+            and msg.reply_to_message_id
+            and latest_by_question.get(msg.reply_to_message_id) != msg.id
+        )
+    ]
+
+
 async def _history(
     session: AsyncSession,
     thread_id: str,
@@ -967,10 +984,10 @@ async def _history(
     requested_source_ids: list[str] | None,
 ) -> list[dict[str, str]]:
     segments = await resolve_thread_lineage_segments(session, thread_id)
-    collected_desc: list[Message] = []
+    collected_segments_chron: list[list[Message]] = []
+    remaining = settings.history_load_limit
     for seg in reversed(segments):
-        needed = settings.history_load_limit - len(collected_desc)
-        if needed <= 0:
+        if remaining <= 0:
             break
         filters = _segment_sql_filters(seg)
         filters.extend(
@@ -984,12 +1001,17 @@ async def _history(
             select(Message)
             .where(*filters)
             .order_by(Message.created_at.desc(), Message.id.desc())
-            .limit(needed)
+            .limit(remaining * 2 + 4)
         )
-        collected_desc.extend(rows.scalars().all())
+        seg_chron = deduplicate_prior_regenerations(list(reversed(rows.scalars().all())))
+        if seg_chron:
+            sliced = seg_chron[-remaining:]
+            collected_segments_chron.append(sliced)
+            remaining -= len(sliced)
+    chronological = [m for seg_msgs in reversed(collected_segments_chron) for m in seg_msgs]
     messages = await filter_messages_for_scope(
         session,
-        list(reversed(collected_desc)),
+        chronological,
         principal=principal,
         requested_source_ids=requested_source_ids,
     )

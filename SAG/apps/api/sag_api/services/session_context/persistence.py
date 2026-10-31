@@ -224,18 +224,40 @@ async def _collect_thread_message_source_ids(
     *,
     thread_id: str,
 ) -> set[str]:
-    """Collect all `source_id` values referenced by active `ASSISTANT` messages in `thread_id`."""
-    from sag_api.services.agent_domain import _message_source_ids
+    """Collect `source_id` values referenced by active `ASSISTANT` messages across `thread_id` lineage."""
+    from sag_api.services.agent_domain import (
+        _message_source_ids,
+        _segment_sql_filters,
+        resolve_thread_lineage_segments,
+    )
 
-    assistant_rows = (
-        await session.execute(
-            select(Message).where(
-                Message.thread_id == thread_id,
-                Message.role == MessageRole.ASSISTANT,
-                Message.status == MessageStatus.OK,
+    segments = await resolve_thread_lineage_segments(session, thread_id)
+    assistant_rows: list[Message] = []
+    if segments:
+        for seg in segments:
+            seg_filters = _segment_sql_filters(seg)
+            seg_filters.extend(
+                [
+                    Message.role == MessageRole.ASSISTANT,
+                    Message.status == MessageStatus.OK,
+                ]
             )
+            seg_rows = (await session.execute(select(Message).where(*seg_filters))).scalars().all()
+            assistant_rows.extend(seg_rows)
+    else:
+        assistant_rows = list(
+            (
+                await session.execute(
+                    select(Message).where(
+                        Message.thread_id == thread_id,
+                        Message.role == MessageRole.ASSISTANT,
+                        Message.status == MessageStatus.OK,
+                    )
+                )
+            )
+            .scalars()
+            .all()
         )
-    ).scalars().all()
     collected: set[str] = set()
     for msg in assistant_rows:
         sids = _message_source_ids(msg)
@@ -303,6 +325,31 @@ async def resolve_persistence_scope(
             raise ForbiddenError("Ambiguous persisted project scopes for thread")
         existing_project_id = next(iter(distinct_scopes))[1]
 
+    inherited_project_id: str | None = None
+    if existing_project_id is None:
+        from sag_api.services.agent_domain import resolve_thread_lineage_segments
+
+        lineage_segments = await resolve_thread_lineage_segments(session, thread_id)
+        if len(lineage_segments) > 1:
+            anc_tids = [s.thread_id for s in lineage_segments[:-1]]
+            anc_rows = (
+                await session.execute(
+                    select(SessionUnit.tenant_id, SessionUnit.project_id)
+                    .where(SessionUnit.thread_id.in_(anc_tids))
+                    .distinct()
+                )
+            ).all()
+            if anc_rows:
+                anc_scopes = {(str(r[0]), str(r[1])) for r in anc_rows}
+                if any(
+                    ex_tenant != tenant_id or ex_proj not in allowed_projects
+                    for ex_tenant, ex_proj in anc_scopes
+                ):
+                    return None
+                if len(anc_scopes) > 1:
+                    return None
+                inherited_project_id = next(iter(anc_scopes))[1]
+
     raw_thread_sids = await _collect_thread_message_source_ids(session, thread_id=thread_id)
     org_source_projects = await _lookup_confirmed_source_projects(
         session,
@@ -368,12 +415,21 @@ async def resolve_persistence_scope(
         # Multi-project principal with no existing persisted rows: require a unique confirmed project
         if len(thread_confirmed_projects) == 1:
             inferred_proj = next(iter(thread_confirmed_projects))
+            if inherited_project_id is not None and inherited_project_id != inferred_proj:
+                return None
             if clean_req_sids and (
                 len(req_source_projects) != len(clean_req_sids)
                 or not req_projects.issubset({inferred_proj})
             ):
                 return None
             project_id = inferred_proj
+        elif not thread_confirmed_projects and inherited_project_id is not None:
+            if clean_req_sids and (
+                len(req_source_projects) != len(clean_req_sids)
+                or not req_projects.issubset({inherited_project_id})
+            ):
+                return None
+            project_id = inherited_project_id
         else:
             if (
                 not clean_req_sids

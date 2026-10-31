@@ -66,6 +66,9 @@ from sag_api.services.agent_domain import (
     resolve_user_display_name,
     serialize_thread_out,
 )
+from sag_api.services.agent_domain import (
+    deduplicate_prior_regenerations as _deduplicate_prior_regenerations,
+)
 from sag_api.services.session_context import (
     HIDDEN_SCOPE_PLACEHOLDER,
     IncrementalSessionIndex,
@@ -1065,24 +1068,6 @@ async def branch_thread_from_message(
 
 
 # ── Regenerate ("Try again") ──────────────────────────────────────────
-def _deduplicate_prior_regenerations(messages: list[Message]) -> list[Message]:
-    """Keep only the latest chronological answer per parent question in prior turns."""
-    latest_by_question: dict[str, str] = {}
-    for msg in messages:
-        if msg.role == MessageRole.ASSISTANT and msg.reply_to_message_id:
-            latest_by_question[msg.reply_to_message_id] = msg.id
-    deduped: list[Message] = []
-    for msg in messages:
-        if (
-            msg.role == MessageRole.ASSISTANT
-            and msg.reply_to_message_id
-            and latest_by_question.get(msg.reply_to_message_id) != msg.id
-        ):
-            continue
-        deduped.append(msg)
-    return deduped
-
-
 async def prepare_regenerate(
     session: AsyncSession,
     *,

@@ -1033,3 +1033,99 @@ async def test_live_acl_revocation_and_inherited_answer_actions(branch_env):
     )
     post_revoke_prompt = "\n".join(str(m.get("content") or "") for m in branch_env.llm.calls[0])
     assert "Grounded secret answer" not in post_revoke_prompt
+
+
+
+async def test_inherited_scope_resolution_and_prior_regeneration_dedup(branch_env):
+    """Post-PR review regressions:
+    1) `resolve_persistence_scope` resolves single-project scope for a multi-project principal on a
+       newly branched thread (`0` own messages) via inherited ancestor citations / persisted units.
+    2) Superseded regenerated drafts in an ancestor segment are deduplicated in both ECCE memory
+       (`load_ancestor_segments_visible_records`) and legacy `_history()`.
+    """
+    from sag_api.core.principal_assertion import VerifiedPrincipal
+    from sag_api.services.agent_domain import _history
+    from sag_api.services.session_context.persistence import resolve_persistence_scope
+    from sag_api.services.session_context.runtime import load_ancestor_segments_visible_records
+
+    client: httpx.AsyncClient = branch_env.client
+    headers = _continuum_headers(user_id=branch_env.u_owner)
+
+    t_a = (
+        await client.post(
+            "/api/v1/agents/agent_default/threads",
+            headers=headers,
+            json={"title": "Dedup & Scope Root"},
+        )
+    ).json()
+
+    branch_env.llm.queue(
+        "Superseded draft v1_MARKER [1]",
+        "Active draft v2_MARKER [1]",
+        "Turn 2 anchor [1]",
+    )
+    m_a1_v1 = await _ask_turn(
+        client, agent_id="agent_default", thread_id=t_a["id"], query="Draft question", headers=headers
+    )
+    r_regen = await client.post(
+        f"/api/v1/agents/agent_default/threads/{t_a['id']}/messages/{m_a1_v1}/regenerate",
+        headers=headers,
+        json={},
+    )
+    assert r_regen.status_code == 200
+    m_a2 = await _ask_turn(
+        client, agent_id="agent_default", thread_id=t_a["id"], query="Anchor question", headers=headers
+    )
+
+    t_b = (
+        await client.post(
+            f"/api/v1/agents/agent_default/threads/{t_a['id']}/messages/{m_a2}/branch",
+            headers=headers,
+            json={},
+        )
+    ).json()
+
+    multi_proj_principal = VerifiedPrincipal(
+        subject=branch_env.u_owner,
+        organization_id="org_alpha",
+        allowed_project_ids=frozenset({"proj_alpha", "proj_beta"}),
+        issuer="continuum",
+        key_id="k1",
+        token_id="t1",
+        issued_at=1_700_000_000,
+        expires_at=1_900_000_000,
+        tenant_id="org_alpha",
+        allowed_partition_ids=frozenset({"proj_alpha", "proj_beta"}),
+    )
+
+    async with branch_env.session_factory() as s:
+        # 1) Multi-project principal inherits unambiguous `proj_alpha` persistence scope on empty Branch B
+        scope = await resolve_persistence_scope(
+            s,
+            thread_id=t_b["id"],
+            principal=multi_proj_principal,
+            owner_key=f"continuum:org_alpha:proj_alpha:{branch_env.u_owner}",
+        )
+        assert scope is not None
+        assert scope.project_id == "proj_alpha"
+
+        # 2) Ancestor visible records & legacy `_history` keep ONLY v2_MARKER and drop v1_MARKER
+        anc_segs, _, _ = await load_ancestor_segments_visible_records(
+            s,
+            thread_id=t_b["id"],
+            principal=multi_proj_principal,
+        )
+        anc_texts = "\n".join(rec["content"] for _, recs in anc_segs for rec in recs)
+        assert "Active draft v2_MARKER" in anc_texts
+        assert "Superseded draft v1_MARKER" not in anc_texts
+
+        legacy_hist = await _history(
+            s,
+            t_b["id"],
+            exclude_id="",
+            principal=multi_proj_principal,
+            requested_source_ids=None,
+        )
+        legacy_texts = "\n".join(item["content"] for item in legacy_hist)
+        assert "Active draft v2_MARKER" in legacy_texts
+        assert "Superseded draft v1_MARKER" not in legacy_texts

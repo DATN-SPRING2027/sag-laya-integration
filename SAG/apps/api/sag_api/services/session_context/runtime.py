@@ -333,6 +333,7 @@ async def load_ancestor_segments_visible_records(
 ) -> tuple[list[tuple[str, list[dict[str, Any]]]], str, bool]:
     """Load live ACL-filtered visible records for inherited ancestor segments (`O(1)` no-op on root threads)."""
     from sag_api.services.agent_domain import (
+        deduplicate_prior_regenerations,
         filter_messages_for_scope,
         load_segment_messages_chronological,
         resolve_thread_lineage_segments,
@@ -365,12 +366,13 @@ async def load_ancestor_segments_visible_records(
             only_ok=True,
             max_messages=remaining_cap,
         )
-        remaining_cap -= len(seg_raw)
-        if not seg_raw:
+        seg_deduped = deduplicate_prior_regenerations(seg_raw)
+        remaining_cap -= len(seg_deduped)
+        if not seg_deduped:
             continue
         seg_scoped = await filter_messages_for_scope(
             session,
-            seg_raw,
+            seg_deduped,
             principal=principal,
             requested_source_ids=None,
         )
