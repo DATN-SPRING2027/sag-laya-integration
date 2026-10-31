@@ -83,7 +83,7 @@ async def chat_completions(
     agent = await svc.get_agent(session, agent_id, owner_key=owner_key)
     query, history = _split_query(body.messages)
 
-    plan = svc.build_ask_context(agent=agent, query=query, history=history)
+    plan = svc.build_ask_context(agent=agent, query=query, history=history, user_name=_user.name)
     if not llm.configured:
         raise ConfigurationError("尚未配置 LLM，无法生成回答")
 

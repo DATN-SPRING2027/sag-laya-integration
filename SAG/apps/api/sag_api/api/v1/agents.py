@@ -400,6 +400,7 @@ async def ask(
     thread_id: str,
     body: AskRequest,
     owner_key: str = Depends(get_conversation_owner),
+    current_user: User = Depends(get_current_user),
     principal: VerifiedPrincipal = Depends(require_project_read_principal),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
@@ -414,15 +415,16 @@ async def ask(
     actions_svc.claim_thread_generation(thread.id, agent_runtime)
     try:
         plan = await svc.prepare_ask(
-        session,
-        agent=agent,
-        thread=thread,
-        query=body.query,
-        attachments=body.attachments,
-        source_ids=body.source_ids,
-        principal=principal,
-        owner_key=owner_key,
+            session,
+            agent=agent,
+            thread=thread,
+            query=body.query,
+            attachments=body.attachments,
+            source_ids=body.source_ids,
+            principal=principal,
+            owner_key=owner_key,
             llm=llm,
+            user_name=current_user.name,
         )
     except BaseException:
         actions_svc.release_thread_generation(thread.id)
@@ -597,6 +599,7 @@ async def regenerate_message(
     message_id: str,
     request: Request,
     owner_key: str = Depends(get_conversation_owner),
+    current_user: User = Depends(get_current_user),
     principal: VerifiedPrincipal = Depends(require_answer_mutation_principal),
     session: AsyncSession = Depends(get_session),
     engine_manager: EngineManager = Depends(get_engine_manager),
@@ -620,6 +623,7 @@ async def regenerate_message(
             principal=principal,
             owner_key=owner_key,
             llm=llm,
+            user_name=current_user.name,
         )
     except BaseException:
         actions_svc.release_thread_generation(thread.id)

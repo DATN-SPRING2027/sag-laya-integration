@@ -22,7 +22,7 @@ from sag_api.core.error_taxonomy import ErrorCode
 from sag_api.core.errors import ConflictError, ForbiddenError, NotFoundError, ValidationError
 from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal
-from sag_api.db.models import Agent, AgentBinding, Message, Source, Thread
+from sag_api.db.models import Agent, AgentBinding, Message, Source, Thread, User
 from sag_api.enums import BindingTargetType, MessageRole, MessageStatus
 from sag_api.generation import build_agent_messages, build_prompt_preview
 from sag_api.generation.prompt import estimate_tokens
@@ -155,6 +155,8 @@ async def get_agent(session: AsyncSession, agent_id: str, *, owner_key: str, wri
     agent = await session.get(Agent, agent_id)
     if agent is None or (agent.owner_key != owner_key and (write or not agent.is_default)):
         raise NotFoundError("Agent not found")
+    if not write:
+        agent = await _upgrade_legacy_default_agent_if_needed(session, agent)
     return agent
 
 
@@ -196,9 +198,28 @@ _DEFAULT_GREETING = "I am ready. Upload documents to the knowledge base, or ask 
 _DEFAULT_PERSONA = {"greeting": _DEFAULT_GREETING, "system_prompt": ""}
 
 
+_LEGACY_DEFAULT_AGENT_NAMES = frozenset({"sag", "zleap"})
+_LEGACY_DEFAULT_AGENT_AVATARS = frozenset({"s", "S", DEFAULT_AGENT_AVATAR})
+
+
 def _is_legacy_default_agent(agent: Agent) -> bool:
-    """仅识别旧版本完全未自定义的默认助手，避免覆盖用户修改。"""
-    return agent.name == "sag" and agent.avatar in {"s", "S"} and (agent.persona or {}) == _DEFAULT_PERSONA
+    """Recognize untouched legacy default assistant rows ('sag' or 'Zleap') without overwriting user edits."""
+    normalized_name = (agent.name or "").strip().casefold()
+    return (
+        bool(agent.is_default)
+        and normalized_name in _LEGACY_DEFAULT_AGENT_NAMES
+        and (agent.avatar or "") in _LEGACY_DEFAULT_AGENT_AVATARS
+        and (agent.persona or {}) == _DEFAULT_PERSONA
+    )
+
+
+async def _upgrade_legacy_default_agent_if_needed(session: AsyncSession, agent: Agent) -> Agent:
+    if _is_legacy_default_agent(agent) and not session.new and not session.dirty and not session.deleted:
+        agent.name = DEFAULT_AGENT_NAME
+        agent.avatar = DEFAULT_AGENT_AVATAR
+        await session.commit()
+        await session.refresh(agent)
+    return agent
 
 
 async def get_default_agent(session: AsyncSession) -> Agent:
@@ -694,6 +715,22 @@ async def _resolve_session_history(
         return compressed, None, None, []
 
 
+async def resolve_user_display_name(
+    session: AsyncSession,
+    *,
+    user_name: str | None = None,
+    principal: VerifiedPrincipal | None = None,
+) -> str | None:
+    if user_name is not None and user_name.strip():
+        return user_name
+    subject = getattr(principal, "subject", "") if principal is not None else ""
+    if subject:
+        user = await session.get(User, subject)
+        if user is not None and user.is_active and user.name:
+            return user.name
+    return user_name
+
+
 def build_ask_context(
     *,
     agent: Agent,
@@ -701,17 +738,20 @@ def build_ask_context(
     history: list[dict[str, str]] | None = None,
     attachments: list[dict] | None = None,
     source_ids: list[str] | None = None,
+    user_name: str | None = None,
 ) -> AskPlan:
     """组装带系统提示的消息（不落库，对话与 OpenAI 端点复用）。是否检索由模型经工具决定。"""
     query = unicodedata.normalize("NFC", query or "")
+    effective_agent_name = DEFAULT_AGENT_NAME if _is_legacy_default_agent(agent) else agent.name
     messages = build_agent_messages(
-        agent.name,
+        effective_agent_name,
         agent.persona or {},
         query,
         history=history,
         language=settings.sag_language,
         timezone=settings.timezone,
         attachments=attachments,
+        user_name=user_name,
     )
     return AskPlan(
         query=query,
@@ -732,6 +772,7 @@ async def prepare_ask(
     principal: VerifiedPrincipal,
     owner_key: str,
     llm=None,
+    user_name: str | None = None,
 ) -> AskPlan:
     """落库用户消息（含图片附件 meta）、解析历史（超上下文阈值时主动压缩），组装计划。"""
     from sag_api.api.v1.attachments import attachment_path
@@ -786,12 +827,18 @@ async def prepare_ask(
         llm=llm,
         budget_tokens=int(settings.llm_context_window * 0.4),
     )
+    effective_user_name = await resolve_user_display_name(
+        session,
+        user_name=user_name,
+        principal=principal,
+    )
     plan = build_ask_context(
         agent=agent,
         query=query,
         history=history,
         attachments=resolved or None,
         source_ids=source_ids,
+        user_name=effective_user_name,
     )
     plan.user_message_id = user_msg.id
     plan.session_audit_trace = audit_trace

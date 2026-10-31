@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import re
 import secrets
+import unicodedata
 
 from fastapi import APIRouter, Depends, Request, Response
 from sqlalchemy import func, select
@@ -70,6 +72,33 @@ async def login(
     return TokenResponse(access_token=create_access_token(user.id), user=UserOut.model_validate(user))
 
 
+def _extract_optional_continuum_display_name(raw_body: bytes) -> str | None:
+    if not raw_body or not raw_body.strip():
+        return None
+    if len(raw_body) > 4096:
+        raise ValidationError("Continuum login request body is too large")
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValidationError("Malformed Continuum login request body") from exc
+    if not isinstance(payload, dict):
+        raise ValidationError("Continuum login request body must be a JSON object")
+    raw_display_name = payload.get("displayName")
+    if raw_display_name is None:
+        raw_display_name = payload.get("display_name")
+    if raw_display_name is None:
+        return None
+    if not isinstance(raw_display_name, str):
+        raise ValidationError("Continuum display name must be a string")
+    normalized = unicodedata.normalize("NFC", raw_display_name)
+    cleaned = "".join(
+        " " if unicodedata.category(ch).startswith("C") else ch
+        for ch in normalized
+    )
+    cleaned = " ".join(cleaned.split()).strip()[:120]
+    return cleaned or None
+
+
 @router.post("/continuum-login", response_model=TokenResponse)
 async def continuum_login(
     request: Request,
@@ -79,11 +108,13 @@ async def continuum_login(
     response.headers["Cache-Control"] = "no-store"
     await require_bff_service_token(request)
     subject = required_bff_header(request, "X-Continuum-User-Id", max_length=32)
-    name = required_bff_header(request, "X-Continuum-Name", max_length=120)
+    header_name = required_bff_header(request, "X-Continuum-Name", max_length=120)
     organization_id = required_bff_header(request, "X-Continuum-Organization-Id", max_length=64)
     project_id = required_bff_header(request, "X-Continuum-Project-Id", max_length=64)
     if not re.fullmatch(r"[a-fA-F0-9]{24}", subject):
         raise ValidationError("Continuum user ID is invalid")
+    body_display_name = _extract_optional_continuum_display_name(await request.body())
+    name = body_display_name or header_name
     user = await get_or_create_continuum_user(
         session,
         subject=subject,

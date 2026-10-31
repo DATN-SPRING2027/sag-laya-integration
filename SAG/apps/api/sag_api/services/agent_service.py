@@ -61,16 +61,34 @@ _TOOL_LABELS = {
     "open_webpage": "Mở trang web",
 }
 
+_GREETING_PREFIX = (
+    r"(?:xin\s+chào|chào(?:\s+(?:bạn|cậu|anh|chị|em|mình|continuum(?:\s+ai)?))?"
+    r"|alo|hi|hello|hey|chào\s+buổi\s+(?:sáng|chiều|tối))"
+)
+_IDENTITY_QUESTION = (
+    r"(?:bạn\s+là\s+ai|(?:tên(?:\s+của)?\s+bạn|bạn\s+tên)(?:\s+là)?\s+gì"
+    r"|who\s+are\s+you|what(?:'|’|\s+is)\s+your\s+name)"
+)
+_USER_PRONOUN = r"(?:tôi|mình|em|anh|chị)"
+_USER_NAME_QUESTION = (
+    rf"(?:(?:bạn\s+(?:có\s+)?)?biết\s+(?:tên(?:\s+của)?\s+{_USER_PRONOUN}|{_USER_PRONOUN}\s+tên)(?:\s+là\s+gì)?(?:\s+không)?"
+    rf"|(?:tên(?:\s+của)?\s+{_USER_PRONOUN}|{_USER_PRONOUN}\s+tên)(?:\s+là)?\s+gì"
+    r"|what(?:'|’|\s+is)\s+my\s+name"
+    r"|do\s+you\s+know\s+my\s+name)"
+)
+_CONVERSATIONAL_SELF_OR_USER_QUERY = rf"(?:{_IDENTITY_QUESTION}|{_USER_NAME_QUESTION})"
 _DIRECT_INTENT = re.compile(
-    r"^(?:xin chào|chào(?: bạn)?|hi|hello|hey|"
-    r"chào buổi sáng|chào buổi chiều|chào buổi tối|cảm ơn(?: bạn)?|thanks|thank you|"
-    r"tạm biệt|bye|bạn là ai|tên bạn là gì|who are you|"
-    r"what(?:'|’)s your name"
-    r"|(?!.*(?:tài liệu|dự án|project|hệ thống|schema|\.md))"
-    r"(?:(?:xin chào|chào(?: bạn)?|hi|hello)[!！?？。,.，\s]+)?"
-    r"(?:hãy\s+|vui lòng\s+|bạn có thể\s+)?"
-    r"(?:giới thiệu|cho biết)[^\n]{0,60}(?:khả năng|vai trò|hỗ trợ|giúp)[^\n]{0,40}\bbạn\b[^\n]{0,25})"
-    r"[!！?？。,.，\s]*$",
+    r"^(?!"
+    r".*(?:tài\s+liệu|dự\s+án|project|hệ\s+thống|schema|file|\.md|quy\s+định|chính\s+sách|báo\s+cáo|quyền|role|nhóm|team)"
+    r")(?:"
+    rf"{_GREETING_PREFIX}"
+    r"|cảm\s+ơn(?:\s+bạn)?|thanks|thank\s+you|tạm\s+biệt|bye"
+    rf"|(?:{_GREETING_PREFIX}[!！?？。,.，\s]+)?{_CONVERSATIONAL_SELF_OR_USER_QUERY}"
+    rf"(?:(?:[!！?？。,.，;\s]+|\s+(?:và|còn|thế\s+còn|and)\s+){_CONVERSATIONAL_SELF_OR_USER_QUERY})?"
+    rf"|(?:{_GREETING_PREFIX}[!！?？。,.，\s]+)?"
+    r"(?:hãy\s+|vui\s+lòng\s+|bạn\s+có\s+thể\s+)?"
+    r"(?:giới\s+thiệu|cho\s+biết)[^\n]{0,60}(?:khả\s+năng|vai\s+trò|hỗ\s+trợ|giúp|về\s+bạn)[^\n]{0,40}\bbạn\b[^\n]{0,25}"
+    r")[!！?？。,.，\s]*$",
     re.IGNORECASE,
 )
 _DIRECT_RESPONSE_HINT = re.compile(
