@@ -11,7 +11,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from sqlalchemy import and_, case, func, or_, select
+from pydantic import ValidationError as PydanticValidationError
+from sqlalchemy import and_, case, delete, func, or_, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -19,12 +22,14 @@ from sqlalchemy.orm import aliased
 from sag_api.core.errors import ForbiddenError, ServiceUnavailableError
 from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal
+from sag_api.db.base import new_id
 from sag_api.db.models import (
     CanonicalBlock,
     Document,
     DocumentVersion,
     IngestionRun,
     Job,
+    ProjectMindMapSnapshot,
     SearchUnit,
     Source,
     SourceProjectMapping,
@@ -53,7 +58,7 @@ _MAX_UNITS_PER_DOC = 16
 _MAX_EVIDENCE_UNITS = 60
 _MAX_BLOCKS_PER_UNIT = 8
 _MAX_UNIT_CHARS = 1200
-_MAX_SNIPPET_CHARS = 480
+_MAX_SNIPPET_CHARS = 1100
 
 _MAX_TREE_DEPTH = 3  # depth 0..3 -> 4 levels total
 _MAX_TREE_NODES = 60
@@ -159,10 +164,13 @@ def _clean_text(raw: Any, max_len: int) -> str:
 
 
 def _clean_snippet(raw: str) -> str:
-    trimmed = raw.strip()
+    trimmed = raw.replace("\r\n", "\n").replace("\r", "\n").strip()
     if len(trimmed) <= _MAX_SNIPPET_CHARS:
         return trimmed
-    return trimmed[: _MAX_SNIPPET_CHARS - 1].rstrip() + "…"
+    clipped = trimmed[: _MAX_SNIPPET_CHARS - 5].rstrip()
+    if len(re.findall(r"(?m)^\s*```", clipped)) % 2 == 1:
+        return f"{clipped}…\n```"
+    return clipped + "…"
 
 
 def _topic_terms(topic: str | None) -> list[str]:
@@ -867,6 +875,7 @@ def _build_citation_dto(number: int, ev: _CatalogEvidence) -> MindMapCitationOut
         sourceName=src_name,
         documentId=u.doc.public_document_id,
         documentName=doc_name,
+        chunkId=u.unit_id,
         versionNo=u.doc.version_no,
         heading=heading,
         snippet=_clean_snippet(u.content),
@@ -1165,26 +1174,230 @@ async def _call_llm_json(llm: Any, messages: list[dict[str, str]]) -> str:
     return await llm.complete(messages)
 
 
-async def generate_project_mind_map(
+def _partition_scope_hash(principal: VerifiedPrincipal) -> str:
+    joined = "|".join(sorted(principal.allowed_partition_ids))
+    return hashlib.sha256(joined.encode()).hexdigest()
+
+
+def _topic_storage_pair(topic: str | None) -> tuple[str, str | None]:
+    if not topic:
+        return "", None
+    return topic.casefold(), topic
+
+
+async def _evict_snapshot(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    project_id: str,
+    partition_hash: str,
+    topic_key: str,
+) -> None:
+    try:
+        result = await session.execute(
+            delete(ProjectMindMapSnapshot).where(
+                ProjectMindMapSnapshot.tenant_id == tenant_id,
+                ProjectMindMapSnapshot.project_id == project_id,
+                ProjectMindMapSnapshot.partition_scope_hash == partition_hash,
+                ProjectMindMapSnapshot.topic_key == topic_key,
+            )
+        )
+        if result.rowcount:
+            await session.commit()
+    except SQLAlchemyError as error:
+        await session.rollback()
+        log.warning("mind map snapshot eviction failed error_type=%s", type(error).__name__)
+        raise ServiceUnavailableError("Mind map snapshot storage is temporarily unavailable") from error
+
+
+async def _upsert_snapshot(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    project_id: str,
+    partition_hash: str,
+    topic_key: str,
+    topic_display: str | None,
+    scope_fingerprint: str,
+    generation_mode: Literal["llm", "outline_fallback"],
+    fallback_reason: Literal["LLM_UNAVAILABLE", "LLM_INVALID_OUTPUT"] | None,
+    coverage: MindMapCoverageOut,
+    tree: MindMapNodeOut,
+    citations: list[MindMapCitationOut],
+    used_document_version_ids: list[str],
+    generated_by_subject: str,
+    generated_at: datetime,
+) -> None:
+    bind = session.get_bind()
+    dialect_name = bind.dialect.name if bind is not None else "sqlite"
+    insert_fn = pg_insert if dialect_name == "postgresql" else sqlite_insert
+
+    update_fields: dict[str, Any] = {
+        "topic_display": topic_display,
+        "scope_fingerprint": scope_fingerprint,
+        "generation_mode": generation_mode,
+        "fallback_reason": fallback_reason,
+        "coverage_json": coverage.model_dump(mode="json"),
+        "tree_json": tree.model_dump(mode="json"),
+        "citations_json": [item.model_dump(mode="json") for item in citations],
+        "used_document_version_ids": used_document_version_ids,
+        "generated_by_subject": generated_by_subject,
+        "generated_at": generated_at,
+        "updated_at": generated_at,
+    }
+    stmt = (
+        insert_fn(ProjectMindMapSnapshot)
+        .values(
+            id=new_id(),
+            tenant_id=tenant_id,
+            project_id=project_id,
+            partition_scope_hash=partition_hash,
+            topic_key=topic_key,
+            created_at=generated_at,
+            **update_fields,
+        )
+        .on_conflict_do_update(
+            index_elements=[
+                "tenant_id",
+                "project_id",
+                "partition_scope_hash",
+                "topic_key",
+            ],
+            set_=update_fields,
+        )
+    )
+    try:
+        await session.execute(stmt)
+        await session.commit()
+    except SQLAlchemyError as error:
+        await session.rollback()
+        log.warning("mind map snapshot upsert failed error_type=%s", type(error).__name__)
+        raise ServiceUnavailableError("Mind map snapshot storage is temporarily unavailable") from error
+
+
+async def _load_valid_persisted_mind_map(
     session: AsyncSession,
     *,
     principal: VerifiedPrincipal,
     project_id: str,
-    payload: MindMapGenerateIn,
-    llm: Any,
+    topic: str | None,
+    ready_docs: list[_ReadyDocumentScope],
+    pending_count: int,
+    scope_fp: str,
+    now: datetime,
+) -> MindMapOut | None:
+    tenant_id = principal.tenant_id or ""
+    partition_hash = _partition_scope_hash(principal)
+    topic_key, _ = _topic_storage_pair(topic)
+
+    try:
+        row = await session.scalar(
+            select(ProjectMindMapSnapshot).where(
+                ProjectMindMapSnapshot.tenant_id == tenant_id,
+                ProjectMindMapSnapshot.project_id == project_id,
+                ProjectMindMapSnapshot.partition_scope_hash == partition_hash,
+                ProjectMindMapSnapshot.topic_key == topic_key,
+            )
+        )
+    except SQLAlchemyError as error:
+        log.warning("mind map snapshot lookup failed error_type=%s", type(error).__name__)
+        raise ServiceUnavailableError("Mind map snapshot storage is temporarily unavailable") from error
+
+    if row is None:
+        return None
+
+    live_ver_ids = {d.document_version_id for d in ready_docs}
+    saved_ver_ids = {
+        str(vid)
+        for vid in (row.used_document_version_ids or [])
+        if isinstance(vid, str) and vid.strip()
+    }
+    if not saved_ver_ids or not saved_ver_ids.issubset(live_ver_ids):
+        await _evict_snapshot(
+            session,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            partition_hash=partition_hash,
+            topic_key=topic_key,
+        )
+        return None
+
+    try:
+        saved_coverage = MindMapCoverageOut.model_validate(row.coverage_json)
+        saved_tree = MindMapNodeOut.model_validate(row.tree_json)
+        saved_citations = [
+            MindMapCitationOut.model_validate(item) for item in (row.citations_json or [])
+        ]
+        gen_mode: Literal["llm", "outline_fallback"] = (
+            "outline_fallback" if row.generation_mode == "outline_fallback" else "llm"
+        )
+        fb_reason: Literal["LLM_UNAVAILABLE", "LLM_INVALID_OUTPUT"] | None = (
+            row.fallback_reason
+            if row.fallback_reason in ("LLM_UNAVAILABLE", "LLM_INVALID_OUTPUT")
+            else None
+        )
+    except (PydanticValidationError, TypeError, ValueError):
+        await _evict_snapshot(
+            session,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            partition_hash=partition_hash,
+            topic_key=topic_key,
+        )
+        return None
+
+    live_coverage = saved_coverage.model_copy(
+        update={
+            "accessibleReadyDocumentCount": len(ready_docs),
+            "pendingDocumentCount": pending_count,
+        }
+    )
+    generated_at = _as_utc(row.generated_at) or now
+    return MindMapOut(
+        projectId=project_id,
+        topic=row.topic_display,
+        status="ready",
+        generationMode=gen_mode,
+        fallbackReason=fb_reason,
+        scopeFingerprint=row.scope_fingerprint,
+        coverage=live_coverage,
+        tree=saved_tree,
+        citations=saved_citations,
+        generatedAt=generated_at,
+        cached=True,
+        hasSourceUpdates=(row.scope_fingerprint != scope_fp),
+    )
+
+
+async def get_saved_project_mind_map(
+    session: AsyncSession,
+    *,
+    principal: VerifiedPrincipal,
+    project_id: str,
+    topic: str | None = None,
 ) -> MindMapOut:
-    """Generate an ACL-scoped Mind Map or deterministic outline fallback for an active Project."""
+    """Return the persisted ACL-verified Project Mind Map without calling the LLM."""
     ready_docs, pending_count, scope_fp = await _load_project_scope_snapshot(
         session,
         principal=principal,
         project_id=project_id,
     )
     now = datetime.now(UTC)
+    tenant_id = principal.tenant_id or ""
+    partition_hash = _partition_scope_hash(principal)
+    topic_key, topic_display = _topic_storage_pair(topic)
 
     if not ready_docs:
+        await _evict_snapshot(
+            session,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            partition_hash=partition_hash,
+            topic_key=topic_key,
+        )
         return MindMapOut(
             projectId=project_id,
-            topic=payload.topic,
+            topic=topic_display,
             status="empty",
             generationMode="none",
             fallbackReason=None,
@@ -1200,19 +1413,127 @@ async def generate_project_mind_map(
             tree=None,
             citations=[],
             generatedAt=now,
+            cached=False,
+            hasSourceUpdates=False,
         )
+
+    persisted = await _load_valid_persisted_mind_map(
+        session,
+        principal=principal,
+        project_id=project_id,
+        topic=topic_display,
+        ready_docs=ready_docs,
+        pending_count=pending_count,
+        scope_fp=scope_fp,
+        now=now,
+    )
+    if persisted is not None:
+        return persisted
+
+    return MindMapOut(
+        projectId=project_id,
+        topic=topic_display,
+        status="uninitialized",
+        generationMode="none",
+        fallbackReason=None,
+        scopeFingerprint=scope_fp,
+        coverage=MindMapCoverageOut(
+            accessibleReadyDocumentCount=len(ready_docs),
+            usedDocumentCount=0,
+            omittedDocumentCount=0,
+            pendingDocumentCount=pending_count,
+            truncatedDocumentCount=0,
+            evidenceUnitCount=0,
+        ),
+        tree=None,
+        citations=[],
+        generatedAt=now,
+        cached=False,
+        hasSourceUpdates=False,
+    )
+
+
+async def generate_project_mind_map(
+    session: AsyncSession,
+    *,
+    principal: VerifiedPrincipal,
+    project_id: str,
+    payload: MindMapGenerateIn,
+    llm: Any,
+) -> MindMapOut:
+    """Generate and persist an ACL-scoped Mind Map or deterministic outline fallback."""
+    ready_docs, pending_count, scope_fp = await _load_project_scope_snapshot(
+        session,
+        principal=principal,
+        project_id=project_id,
+    )
+    now = datetime.now(UTC)
+    tenant_id = principal.tenant_id or ""
+    partition_hash = _partition_scope_hash(principal)
+    topic_key, topic_display = _topic_storage_pair(payload.topic)
+
+    if not ready_docs:
+        await _evict_snapshot(
+            session,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            partition_hash=partition_hash,
+            topic_key=topic_key,
+        )
+        return MindMapOut(
+            projectId=project_id,
+            topic=topic_display,
+            status="empty",
+            generationMode="none",
+            fallbackReason=None,
+            scopeFingerprint=scope_fp,
+            coverage=MindMapCoverageOut(
+                accessibleReadyDocumentCount=0,
+                usedDocumentCount=0,
+                omittedDocumentCount=0,
+                pendingDocumentCount=pending_count,
+                truncatedDocumentCount=0,
+                evidenceUnitCount=0,
+            ),
+            tree=None,
+            citations=[],
+            generatedAt=now,
+            cached=False,
+            hasSourceUpdates=False,
+        )
+
+    if payload.refresh is False:
+        persisted = await _load_valid_persisted_mind_map(
+            session,
+            principal=principal,
+            project_id=project_id,
+            topic=topic_display,
+            ready_docs=ready_docs,
+            pending_count=pending_count,
+            scope_fp=scope_fp,
+            now=now,
+        )
+        if persisted is not None:
+            return persisted
 
     catalog, coverage, outline_by_doc = await _select_evidence_catalog(
         session,
         principal=principal,
         ready_docs=ready_docs,
         pending_count=pending_count,
-        topic=payload.topic,
+        topic=topic_display,
     )
     if not catalog:
+        await _evict_snapshot(
+            session,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            partition_hash=partition_hash,
+            topic_key=topic_key,
+        )
         return MindMapOut(
             projectId=project_id,
-            topic=payload.topic,
+            topic=topic_display,
             status="empty",
             generationMode="none",
             fallbackReason=None,
@@ -1221,6 +1542,8 @@ async def generate_project_mind_map(
             tree=None,
             citations=[],
             generatedAt=now,
+            cached=False,
+            hasSourceUpdates=False,
         )
 
     generation_mode: Literal["llm", "outline_fallback"] = "llm"
@@ -1232,7 +1555,7 @@ async def generate_project_mind_map(
         fallback_reason = "LLM_UNAVAILABLE"
     else:
         messages = _render_llm_prompt(
-            topic=payload.topic,
+            topic=topic_display,
             catalog=catalog,
             outline_by_doc=outline_by_doc,
         )
@@ -1247,25 +1570,46 @@ async def generate_project_mind_map(
             if parsed_json is not None:
                 validated_result = _validate_and_normalize_llm_tree(
                     parsed_json,
-                    topic=payload.topic,
+                    topic=topic_display,
                     catalog=catalog,
                 )
             if validated_result is None:
-                log.warning("mind map LLM output failed structural/citation validation; using outline fallback")
+                log.warning(
+                    "mind map LLM output failed structural/citation validation; using outline fallback"
+                )
                 generation_mode = "outline_fallback"
                 fallback_reason = "LLM_INVALID_OUTPUT"
 
     if validated_result is None:
         tree_out, citations_out = _build_outline_fallback_tree(
-            topic=payload.topic,
+            topic=topic_display,
             catalog=catalog,
         )
     else:
         tree_out, citations_out = validated_result
 
+    used_ver_ids = sorted({item.unit.doc.document_version_id for item in catalog})
+    await _upsert_snapshot(
+        session,
+        tenant_id=tenant_id,
+        project_id=project_id,
+        partition_hash=partition_hash,
+        topic_key=topic_key,
+        topic_display=topic_display,
+        scope_fingerprint=scope_fp,
+        generation_mode=generation_mode,
+        fallback_reason=fallback_reason,
+        coverage=coverage,
+        tree=tree_out,
+        citations=citations_out,
+        used_document_version_ids=used_ver_ids,
+        generated_by_subject=principal.subject,
+        generated_at=now,
+    )
+
     return MindMapOut(
         projectId=project_id,
-        topic=payload.topic,
+        topic=topic_display,
         status="ready",
         generationMode=generation_mode,
         fallbackReason=fallback_reason,
@@ -1274,4 +1618,6 @@ async def generate_project_mind_map(
         tree=tree_out,
         citations=citations_out,
         generatedAt=now,
+        cached=False,
+        hasSourceUpdates=False,
     )

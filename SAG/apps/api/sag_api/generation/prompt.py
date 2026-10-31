@@ -2,22 +2,32 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from sag_api.branding import DEFAULT_AGENT_NAME
 from sag_api.sag import RetrievedSection
 
+_EXCESS_BLANK_LINES_RE = re.compile(r"\n{3,}")
+_FENCE_MARKER_RE = re.compile(r"(?m)^\s*```")
+
 
 def _citation_excerpt(content: str) -> str:
-    """Return a bounded source excerpt without assigning it event semantics."""
-    text = " ".join(content.split())
+    """Return a bounded source excerpt while preserving Markdown/diagram line structure."""
+    if not content:
+        return ""
+    normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.rstrip() for line in normalized.split("\n")]
+    text = _EXCESS_BLANK_LINES_RE.sub("\n\n", "\n".join(lines)).strip()
     if not text:
         return ""
-    excerpt_limit = 720
-    excerpt = text[:excerpt_limit].strip()
-    if len(text) > excerpt_limit:
-        excerpt = excerpt.rstrip("…") + "…"
-    return excerpt
+    excerpt_limit = 1200
+    if len(text) <= excerpt_limit:
+        return text
+    excerpt = text[:excerpt_limit].rstrip().rstrip("…")
+    if len(_FENCE_MARKER_RE.findall(excerpt)) % 2 == 1:
+        return f"{excerpt}…\n```"
+    return f"{excerpt}…"
 
 
 def _field(value: Any, name: str) -> Any:
@@ -319,6 +329,11 @@ def build_citations(
             citation.update(
                 {
                     "document_id": s.document_id,
+                    **(
+                        {"public_document_id": s.public_document_id}
+                        if s.public_document_id
+                        else {}
+                    ),
                     "document_version_id": s.document_version_id,
                     "document_name": s.document_name,
                     "version_no": s.version_no,

@@ -106,6 +106,19 @@ async def _select_diverse_sections(
             slot.release()
 
 
+_CONTINUUM_PUBLIC_DOC_ID_RE = re.compile(
+    r"^(?:continuum:project_document:|project-document:)?([0-9a-fA-F]{24})\Z"
+)
+
+
+def _resolve_public_document_id(logical_source_id: object) -> str | None:
+    if isinstance(logical_source_id, str) and logical_source_id.strip():
+        matched = _CONTINUUM_PUBLIC_DOC_ID_RE.fullmatch(logical_source_id.strip())
+        if matched:
+            return matched.group(1).lower()
+    return None
+
+
 def _verify_selection_scope(version_ids, previous, refreshed):
     fields = ("source_id", "project_id", "tenant_id", "partition_id", "acl_mapping_version",
               "ingestion_run_id", "index_stage_run_id", "search_manifest_checksum")
@@ -1150,6 +1163,7 @@ async def _ensure_versions_hydrated(
                 start_block.source_anchor,
                 start_block.ordinal,
                 end_block.ordinal,
+                Document.logical_source_id,
             )
             .join(DocumentVersion, DocumentVersion.id == SearchUnit.document_version_id)
             .join(Document, Document.id == DocumentVersion.document_id)
@@ -1182,7 +1196,10 @@ async def _ensure_versions_hydrated(
 
     for v_id in unhydrated_version_ids:
         k_index.hydrated_su_by_version[v_id] = []
-    for unit, doc_id, filename, source_id, version_no, anchor, s_ord, e_ord in su_rows:
+    for raw_su_row in su_rows:
+        row_tuple = tuple(raw_su_row)
+        unit, doc_id, filename, source_id, version_no, anchor, s_ord, e_ord = row_tuple[:8]
+        logical_source_id = row_tuple[8] if len(row_tuple) > 8 else None
         v_id_str = str(unit.document_version_id)
         ver = current_versions.get(v_id_str)
         if (
@@ -1222,6 +1239,7 @@ async def _ensure_versions_hydrated(
             content_hash=unit.content_hash,
             canonical_evidence_verified=True,
             document_id=str(doc_id),
+            public_document_id=_resolve_public_document_id(logical_source_id),
             document_version_id=v_id_str,
             document_name=str(filename or ""),
             version_no=int(version_no),
@@ -2088,6 +2106,7 @@ async def _retrieve_search_unit_sections(
                             start_block.source_anchor,
                             start_block.ordinal,
                             end_block.ordinal,
+                            Document.logical_source_id,
                         )
                         .join(DocumentVersion, DocumentVersion.id == SearchUnit.document_version_id)
                         .join(Document, Document.id == DocumentVersion.document_id)
@@ -2112,7 +2131,10 @@ async def _retrieve_search_unit_sections(
 
     unit_by_id: dict[str, tuple[SearchUnit, dict[str, Any]]] = {}
     unit_ordinals: dict[str, tuple[int, int]] = {}
-    for unit, document_id, filename, source_id, version_no, anchor, start_ordinal, end_ordinal in rows:
+    for raw_row in rows:
+        row_tuple = tuple(raw_row)
+        unit, document_id, filename, source_id, version_no, anchor, start_ordinal, end_ordinal = row_tuple[:8]
+        logical_source_id = row_tuple[8] if len(row_tuple) > 8 else None
         version = current_versions.get(str(unit.document_version_id))
         if (
             version is None
@@ -2130,6 +2152,7 @@ async def _retrieve_search_unit_sections(
             unit,
             {
                 "document_id": str(document_id),
+                "public_document_id": _resolve_public_document_id(logical_source_id),
                 "document_version_id": str(unit.document_version_id),
                 "document_name": str(filename or ""),
                 "version_no": int(version_no),
