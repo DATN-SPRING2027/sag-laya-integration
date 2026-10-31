@@ -4,6 +4,7 @@ from sag_api.generation.prompt import (
     build_citations,
     build_messages,
     build_prompt_preview,
+    sanitize_user_display_name,
 )
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "build_citations",
     "build_messages",
     "build_prompt_preview",
+    "sanitize_user_display_name",
 ]

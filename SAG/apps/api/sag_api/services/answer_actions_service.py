@@ -57,6 +57,7 @@ from sag_api.services.agent_domain import (
     filter_messages_for_scope,
     get_agent,
     get_thread,
+    resolve_user_display_name,
 )
 from sag_api.services.session_context import (
     HIDDEN_SCOPE_PLACEHOLDER,
@@ -1002,6 +1003,7 @@ async def prepare_regenerate(
     principal: VerifiedPrincipal,
     owner_key: str,
     llm: Any = None,
+    user_name: str | None = None,
 ) -> AskPlan:
     from sag_api.api.v1.attachments import attachment_path
     from sag_api.services.decision_router import route_query
@@ -1093,12 +1095,18 @@ async def prepare_regenerate(
         raw_history = [{"role": m.role.value, "content": m.content} for m in scoped_prior]
         history = await compress_history(raw_history, llm=llm, budget_tokens=budget_tokens)
 
+    effective_user_name = await resolve_user_display_name(
+        session,
+        user_name=user_name,
+        principal=principal,
+    )
     plan = build_ask_context(
         agent=agent,
         query=query_text,
         history=history,
         attachments=resolved_attachments or None,
         source_ids=None,
+        user_name=effective_user_name,
     )
     plan.user_message_id = question.id
     plan.regenerated_from_message_id = target.id
