@@ -99,3 +99,35 @@ this normalized RRF score, so configure it for rank-fusion semantics rather
 than as a cosine-similarity cutoff.
 
 也可以在仓库根目录运行 `make api`。开发服务器默认监听全部本机网卡，便于从局域网地址访问 Web；生产环境请通过反向代理与访问控制暴露服务。
+
+## Docker LLM/MCP compatibility
+
+The Docker build takes the `litellm` and `mcp` versions from `uv.lock` rather
+than independently resolving their latest releases. LiteLLM releases that
+import MCP v2 gateway types during ordinary function-tool calls cannot run
+with this application's MCP v1 API. Keep the SDK pair aligned when updating
+the lockfile.
+
+From the `SAG` directory, check the installed image without provider keys or
+external AI requests:
+
+```bash
+docker compose exec -T api python - < apps/api/tests/test_litellm_mcp_compatibility.py
+```
+
+This starts a loopback-only OpenAI-compatible stub, supplies ordinary function
+tools and verifies that a streamed answer completes. An HTTP 200 from the real
+`ask` route only opens the SSE stream; a later `run.failed` event still means
+generation failed. Check `docker compose logs api` for the underlying cause.
+
+### Continuum question scope
+
+Authenticated Continuum asks without explicit source selection are classified into
+public knowledge, project evidence, or live application records. Public knowledge
+can be answered without document search even when Internet is disabled. Explicit
+source selection and uncertain/failed classification retain the evidence gate.
+Application-record questions currently explain that the required data connection
+is unavailable: this change does not add task queries or browsing-history storage.
+The classifier is not an authorization mechanism and grants no backend access.
+
+Run the offline regression tests with `python -m unittest discover -s tests -p test_question_scope.py`.

@@ -43,6 +43,7 @@ from sag_api.services.agent_domain import (
     resolve_sources,
 )
 from sag_api.services.evidence_service import no_answer_text
+from sag_api.services.question_scope import classify_question_scope
 from sag_api.tools import ToolContext as HostToolContext
 from sag_api.tools import ToolRegistry
 from sag_api.tools.builtin import WebSearchTool
@@ -980,6 +981,11 @@ async def generate_stream(
     if owns_runtime:
         await active_runtime.start()
 
+    # Continuum public questions do not become document lookups merely because
+    # Internet access is off. Explicit source selection always retains grounding.
+    question_scope = "project"
+    if principal is not None and not plan.source_ids:
+        question_scope = await classify_question_scope(llm, plan.query)
     citations = list(plan.citations)
     local_evidence_required = knowledge_only or bool(plan.source_ids)
     external_references: list[dict[str, Any]] = []
@@ -1080,6 +1086,22 @@ async def generate_stream(
                     "hoặc quyết định đã trao đổi trong phiên chat, được phép trả lời trực tiếp "
                     "dựa trên bằng chứng phiên và giữ nhãn [S1], [S2]."
                 )
+            if question_scope in {"general", "application"}:
+                # No private evidence tools are available in these lanes. Application
+                # records require a separately authorized backend integration.
+                tools = ()
+                scene_notes = [
+                    "Answer in the user's language. Internet access is disabled. "
+                    "You may explain general public knowledge directly without citations. "
+                    "Never invent private project facts, live records, browsing history or tool results. "
+                    + (
+                        "This question needs live application data that is not provided in this turn. "
+                        "Clearly explain that you cannot verify it because the required application "
+                        "data connection is unavailable. Do not ask the user to upload documents."
+                        if question_scope == "application" else
+                        "This is a standalone general knowledge question, not a project document lookup."
+                    )
+                ]
             run_messages = _append_current_scene(list(plan.messages), scene_notes)
             # Freeze the actual initial input before the runtime appends model
             # output and tool-result messages. This is the only content the UI
@@ -1098,7 +1120,8 @@ async def generate_stream(
                 has_prior_turns=has_prior_turns,
             )
             local_grounding_required = (
-                local_evidence_required
+                question_scope == "project"
+                and local_evidence_required
                 and not session_grounded_scope
                 and initial_tool_choice != "none"
                 and not _TIME_ONLY_INTENT.fullmatch(" ".join(plan.query.strip().split()))

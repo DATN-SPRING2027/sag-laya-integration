@@ -9,10 +9,11 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends build-essential curl \
  && rm -rf /var/lib/apt/lists/*
 
-# 先装第三方依赖；业务代码变化不会让这一层失效。
-COPY pyproject.toml ./
+# Install dependency layers separately from application code.
+# Keep the LiteLLM/MCP SDK pair aligned with uv.lock; newer LiteLLM needs MCP v2.
+COPY pyproject.toml uv.lock ./
 RUN pip install --upgrade pip hatchling \
- && python -c 'import tomllib; p=tomllib.load(open("pyproject.toml", "rb")); deps=list(p["project"]["dependencies"])+p["project"]["optional-dependencies"]["postgres"]; print("\n".join(deps))' > /tmp/requirements.txt \
+ && python -c 'import re, tomllib; p=tomllib.load(open("pyproject.toml", "rb")); locked={pkg["name"]:pkg["version"] for pkg in tomllib.load(open("uv.lock", "rb"))["package"]}; deps=list(p["project"]["dependencies"])+p["project"]["optional-dependencies"]["postgres"]; deps=[name+"=="+locked[name] if (name:=re.match(r"[A-Za-z0-9_.-]+", dep).group()) in {"litellm", "mcp"} else dep for dep in deps]; print("\n".join(deps))' > /tmp/requirements.txt \
  && pip install -r /tmp/requirements.txt
 
 # 再安装本项目本身（无依赖解析，保持快速重建）。
