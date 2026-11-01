@@ -62,6 +62,8 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 60 * 24 * 7  # 7 天
     # continuum delegates interactive sign-in to Continuum; local/password are standalone modes.
     auth_mode: Literal["local", "password", "continuum"] = "local"
+    # Comma-separated SAG user IDs permitted to change deployment-wide model settings.
+    model_config_operator_ids: str = ""
     # 业务展示时区；数据库与 API 时间戳始终使用 UTC。
     timezone: str = "Asia/Shanghai"
     # NoDecode 让逗号分隔值先进入下方 validator，避免 settings 源强制按 JSON 解码。
