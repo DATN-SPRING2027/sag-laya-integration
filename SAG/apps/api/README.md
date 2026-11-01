@@ -30,6 +30,17 @@ uvicorn sag_api.main:app --reload --host 0.0.0.0 --port 8000
 
 文档 UI：http://localhost:8000/docs
 
+## Shared model configuration authorization
+
+In `SAG_AUTH_MODE=password` or `SAG_AUTH_MODE=continuum`, shared model settings
+are writable only by SAG users whose IDs appear in the comma-separated
+`SAG_MODEL_CONFIG_OPERATOR_IDS` environment variable. An empty value denies
+model connection tests, updates, and shared model setup. An operator can read
+their SAG user ID from the authenticated `GET /api/v1/auth/me` response. Keep
+this allowlist in trusted deployment configuration; organization and Project
+scope do not grant model-configuration authority. `SAG_AUTH_MODE=local` keeps
+the existing single-user local setup behavior.
+
 ## Evidence authorization (ACL rollout)
 
 Search, source/document reads, graph-backed source-scoped operations, agents,

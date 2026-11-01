@@ -15,7 +15,7 @@ from sag_agent import AgentRuntime
 from sag_api.core.config import settings
 from sag_api.core.db import get_session
 from sag_api.core.error_taxonomy import ErrorCode
-from sag_api.core.errors import AuthError
+from sag_api.core.errors import AuthError, ForbiddenError
 from sag_api.core.identity import VerifiedPrincipal
 from sag_api.core.principal_assertion import (
     VerifiedPrincipal as AssertionVerifiedPrincipal,
@@ -86,6 +86,23 @@ async def get_current_user(
         raise AuthError("Người dùng không tồn tại hoặc đã bị vô hiệu hóa")
     request.state.user = user
     request.state.auth_kind = "jwt"
+    return user
+
+
+async def require_model_config_operator(
+    user: User = Depends(get_current_user),
+) -> User:
+    """Restrict shared model settings to explicitly configured users in multi-user modes."""
+    if settings.auth_mode == "local":
+        return user
+
+    operator_ids = {
+        user_id.strip()
+        for user_id in settings.model_config_operator_ids.split(",")
+        if user_id.strip()
+    }
+    if str(user.id) not in operator_ids:
+        raise ForbiddenError("Người dùng không có quyền thay đổi cấu hình model dùng chung")
     return user
 
 
