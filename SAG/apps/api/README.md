@@ -123,11 +123,16 @@ generation failed. Check `docker compose logs api` for the underlying cause.
 ### Continuum question scope
 
 Authenticated Continuum asks without explicit source selection are classified into
-public knowledge, project evidence, or live application records. Public knowledge
-can be answered without document search even when Internet is disabled. Explicit
-source selection and uncertain/failed classification retain the evidence gate.
-Application-record questions currently explain that the required data connection
-is unavailable: this change does not add task queries or browsing-history storage.
-The classifier is not an authorization mechanism and grants no backend access.
+public knowledge, project evidence, or live application records. Standalone public
+knowledge is answered directly without document search even when Internet is
+disabled, while time-sensitive or explicit research public questions retain allowed
+`get_time` / `web_search` / `open_webpage` tools when Internet is enabled (never
+exposing private project or MCP tools). Scene notes reflect the turn's actual
+Internet status and preserve session-memory citations when present. Explicit source
+selection, session-grounded turns, and uncertain/failed classification retain the
+evidence gate. Application-record questions currently explain that the required
+data connection is unavailable: this change does not add task queries or
+browsing-history storage. The classifier is not an authorization mechanism and
+grants no backend access.
 
 Run the offline regression tests with `python -m unittest discover -s tests -p test_question_scope.py`.
