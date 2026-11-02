@@ -129,23 +129,43 @@ _RELATIVE_TIME_INTENT = re.compile(
     r"(?:days?|weeks?|months?|quarters?|years?)\b",
     re.IGNORECASE,
 )
-_TIME_SENSITIVE_MARKER = (
+_TIME_SENSITIVE_INTENT = re.compile(
     r"(?:gần đây|mới nhất|hiện tại|hiện hành|thời gian thực|tính đến|hôm nay|tuần này|tháng này|năm nay|vừa mới|"
     r"latest|recent|current|today|this (?:week|month|year)|as of)"
+    r".{0,40}(?:tin tức|cập nhật|phiên bản|phát hành|giá|thời tiết|xu hướng|chính sách|quy định|lịch trình|trạng thái|thay đổi|"
+    r"news|updates?|versions?|releases?|price|weather|trends?|policy|schedule|status|changes?)",
+    re.IGNORECASE,
 )
-_TIME_SENSITIVE_TOPIC = (
-    r"(?:tin tức|cập nhật|phiên bản|phát hành|giá|thời tiết|xu hướng|"
-    r"chính sách|quy định|lịch trình|trạng thái|thay đổi|"
-    r"news|updates?|versions?|releases?|price|weather|trends?|policy|schedule|status|changes?)"
+_PUBLIC_TIME_MARKER = (
+    r"\b(?:gần đây|mới nhất|hiện tại|thời gian thực|tính đến|hôm nay|tuần này|tháng này|năm nay|vừa mới|"
+    r"latest|recent|current|today|this (?:week|month|year)|as of)\b"
 )
-_TIME_SENSITIVE_INTENT = re.compile(
-    rf"(?:{_TIME_SENSITIVE_MARKER}.{{0,40}}{_TIME_SENSITIVE_TOPIC}"
-    rf"|{_TIME_SENSITIVE_TOPIC}.{{0,40}}{_TIME_SENSITIVE_MARKER})",
+_PUBLIC_TIME_TOPIC = (
+    r"\b(?:tin tức|cập nhật|phiên bản|phát hành|(?<!đánh\s)giá(?!\s+trị)|thời tiết|xu hướng|lịch trình|"
+    r"news|updates?|versions?|releases?|prices?|weather|trends?|schedules?)\b"
+)
+_PUBLIC_TIME_SENSITIVE_INTENT = re.compile(
+    rf"(?:{_PUBLIC_TIME_MARKER}.{{0,40}}{_PUBLIC_TIME_TOPIC}"
+    rf"|{_PUBLIC_TIME_TOPIC}.{{0,40}}{_PUBLIC_TIME_MARKER})",
     re.IGNORECASE,
 )
 _EXPLICIT_RESEARCH_INTENT = re.compile(
-    r"(?:tài liệu|kho tri thức|nguồn|trích dẫn|bằng chứng|dữ liệu|thống kê|nghiên cứu|báo cáo|tìm kiếm|tra cứu|xác minh|"
-    r"sources?|citations?|evidence|data|statistics|research|report|find|search|look up|verify)",
+    r"\b(?:tài liệu|kho tri thức|nguồn|trích dẫn|bằng chứng|dữ liệu|thống kê|nghiên cứu|báo cáo|"
+    r"tìm kiếm|tra cứu|xác minh|"
+    r"sources?|citations?|evidence|data|statistics|research|reports?|find|search|look up|verify)\b",
+    re.IGNORECASE,
+)
+_PUBLIC_EXTERNAL_LOOKUP_INTENT = re.compile(
+    r"\b(?:"
+    r"tra\s+cứu"
+    r"|tìm(?:\s+kiếm)?\s+(?:trên\s+(?:web|mạng|internet|google)|thông\s+tin|tin\s+tức|nguồn|bài\s+viết)"
+    r"|(?:dẫn|trích\s+dẫn|kèm)\s+(?:nguồn|link|liên\s+kết)"
+    r"|xác\s+minh\s+(?:trên\s+(?:web|mạng|internet)|thông\s+tin)"
+    r"|search\s+(?:the\s+)?(?:web|internet|online)"
+    r"|look\s+up"
+    r"|(?:cite|with|include)\s+(?:sources?|citations?|links?)"
+    r"|verify\s+(?:online|on\s+the\s+web)"
+    r")\b",
     re.IGNORECASE,
 )
 _RESEARCH_TOOL = re.compile(
@@ -185,8 +205,8 @@ def _needs_current_or_external_lookup(query: str) -> bool:
         _TIME_INTENT.search(normalized)
         or _TIME_ONLY_INTENT.search(normalized)
         or _RELATIVE_TIME_INTENT.search(normalized)
-        or _TIME_SENSITIVE_INTENT.search(normalized)
-        or _EXPLICIT_RESEARCH_INTENT.search(normalized)
+        or _PUBLIC_TIME_SENSITIVE_INTENT.search(normalized)
+        or _PUBLIC_EXTERNAL_LOOKUP_INTENT.search(normalized)
     )
 
 
@@ -223,6 +243,7 @@ async def _initial_tool_choice(
     route_decision: Mapping[str, Any] | None = None,
     session_grounded: bool = False,
     has_prior_turns: bool = False,
+    public_scope: bool = False,
 ) -> str | dict[str, Any]:
     """Apply only high-confidence first-turn routing.
 
@@ -259,6 +280,7 @@ async def _initial_tool_choice(
         or _TIME_ONLY_INTENT.search(normalized)
         or _RELATIVE_TIME_INTENT.search(normalized)
         or _TIME_SENSITIVE_INTENT.search(normalized)
+        or (public_scope and _PUBLIC_TIME_SENSITIVE_INTENT.search(normalized))
     )
     if temporal and "get_time" in names:
         return _named_tool_choice("get_time")
@@ -1232,6 +1254,7 @@ async def generate_stream(
                 route_decision=plan_route_decision,
                 session_grounded=session_grounded_scope,
                 has_prior_turns=has_prior_turns,
+                public_scope=(question_scope == "general"),
             )
             local_grounding_required = (
                 question_scope == "project"

@@ -282,6 +282,59 @@ class QuestionScopeStreamIntegrationTests(unittest.IsolatedAsyncioTestCase):
         session_llm.complete.assert_not_awaited()
         self.assertIn("[Session Memory Evidence]", session_runtime.history[0]["content"])
 
+    async def test_database_and_cs_concepts_do_not_false_match_research_lookup(self) -> None:
+        for conceptual_query in (
+            "Explain what a database index is",
+            "Explain binary search and data structures",
+            "Hiện tại bạn đánh giá kiến trúc REST API thế nào?",
+        ):
+            _, runtime, _, _ = await self._run_stream(
+                query=conceptual_query,
+                scope_response='{"scope":"general"}',
+                knowledge_only=False,
+                output="Direct conceptual answer.",
+            )
+            self.assertEqual([t.spec.name for t in runtime.definition.tools], [])
+            self.assertEqual(runtime.definition.initial_tool_choice, "auto")
+
+        # Also verify _initial_tool_choice word-boundary guard directly when tools are supplied.
+        reg = _make_registry()
+        adapted_web = tuple(
+            agent_service._adapt_tool(reg.get(n), SimpleNamespace(), [])
+            for n in ("get_time", "web_search", "open_webpage")
+        )
+        choice = await agent_service._initial_tool_choice(
+            "Explain what a database index is",
+            adapted_web,
+            knowledge_only=False,
+            scoped=False,
+            route_decision={"is_chitchat": False, "confidence": 0.1},
+        )
+        self.assertEqual(choice, "auto")
+
+    async def test_explicit_public_web_lookup_keeps_web_tools_when_internet_on(self) -> None:
+        _, runtime, _, _ = await self._run_stream(
+            query="Search the web for OpenAI DevDay announcements",
+            scope_response='{"scope":"general"}',
+            knowledge_only=False,
+        )
+        self.assertEqual(
+            [t.spec.name for t in runtime.definition.tools],
+            ["get_time", "web_search", "open_webpage"],
+        )
+        self.assertEqual(runtime.definition.initial_tool_choice, "required")
+
+    async def test_project_policy_question_with_hien_tai_prioritizes_search_context_over_get_time(self) -> None:
+        _, runtime, _, _ = await self._run_stream(
+            query="Chính sách nghỉ phép hiện tại là gì?",
+            scope_response='{"scope":"project"}',
+            knowledge_only=True,
+        )
+        self.assertEqual(
+            runtime.definition.initial_tool_choice,
+            {"type": "function", "function": {"name": "search_context"}},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

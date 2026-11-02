@@ -38,14 +38,17 @@ Verified paths on PR #62 (`8396213`):
   - Adds `_needs_current_or_external_lookup(query)` and `_should_classify_question_scope(...)` fast-path skip for deterministic greetings, arithmetic, clock-only queries, high-confidence chitchat, and `session_grounded_scope`.
   - Scopes tools and `scene_notes` accurately per `(question_scope, knowledge_only, needs_external_lookup)` while preserving `[Session Memory Evidence]` notes and skipping `resolve_mcp_specs` when `question_scope != "project"`.
 - `SAG/apps/api/README.md`: synchronizes Continuum question scope documentation with Internet-enabled public lookup and session-memory behavior.
-- `SAG/apps/api/tests/test_question_scope.py`: expands to 12 offline unit and `generate_stream` integration regression tests covering all review scenarios.
+- `SAG/apps/api/tests/test_question_scope.py`: expands to 15 offline unit and `generate_stream` integration regression tests covering all review scenarios (including word-boundary conceptual queries like `"Explain what a database index is"` and project policy routing like `"Chính sách nghỉ phép hiện tại là gì?"`).
 - `SAG/docs/Thang_Task/ai-question-routing-review-fix/researchtask.md`: records task research, scope, verification, and rollback notes.
+- Follow-up refinement after CodeRabbit review of `e8c4835`:
+  1. Added `\b` word boundaries to `_EXPLICIT_RESEARCH_INTENT` and introduced `_PUBLIC_EXTERNAL_LOOKUP_INTENT` for `general` scope so conceptual terms (`"database"`, `"binary search"`, `"data structures"`, `"đánh giá"`) do not falsely trigger external web research.
+  2. Restored `_TIME_SENSITIVE_INTENT` to its forward-only `(marker ... topic)` pattern for `project` scope and isolated bidirectional `_PUBLIC_TIME_SENSITIVE_INTENT` to `general` (`public_scope=True`), preventing `"Chính sách nghỉ phép hiện tại là gì?"` from invoking `get_time` ahead of `search_context` on turn 1.
 
 ## Verification outcomes & impact
 
-- `python -m unittest discover -s tests -p test_question_scope.py`: **12 passed**.
+- `python -m unittest discover -s tests -p test_question_scope.py`: **15 passed**.
 - `python -m unittest discover -s tests -p test_litellm_mcp_compatibility.py`: **1 passed**.
-- `python -m pytest tests/test_question_scope.py tests/test_litellm_mcp_compatibility.py tests/test_agent_retrieval_failure.py tests/test_continuum_identity_and_greeting.py tests/test_vietnamese_ai_chat_reliability.py tests/test_ecce_session_context.py tests/test_execution_trace_stream.py -q`: **71 passed**.
+- `python -m pytest tests/test_question_scope.py tests/test_litellm_mcp_compatibility.py tests/test_agent_retrieval_failure.py tests/test_continuum_identity_and_greeting.py tests/test_vietnamese_ai_chat_reliability.py tests/test_ecce_session_context.py tests/test_execution_trace_stream.py -q`: **74 passed**.
 - `ruff check` on changed Python files: **passed** (`E501` ignored only for untouched legacy long Vietnamese prompt literals in `agent_service.py`).
 - `git diff --check`: **passed**.
 - Database / Configuration / Security impact: none (no schema, migration, `.env`, or permission elevation changes). Rollback is a clean commit revert on `Tien/feat/ai-question-routing`.
