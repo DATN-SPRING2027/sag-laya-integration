@@ -990,3 +990,150 @@ async def test_reprocess_ready_project_document_completes_without_legacy_engine_
         assert final_status.search_ready is True
         assert final_status.current_stage == "COMPLETE"
         assert final_status.document_status == "ready"
+
+
+@pytest.mark.asyncio
+async def test_project_document_readiness_batch_requires_confirmed_project_mapping(ingestion_db):
+    from sag_api.core.identity import VerifiedPrincipal
+    from sag_api.schemas.routing_rag import ProjectDocumentVersionRef
+    from sag_api.services.document_service import get_project_document_readiness_batch
+
+    async with ingestion_db() as session:
+        ready_document = await session.get(Document, "document")
+        ready_document.status = DocumentStatus.READY
+        ready_document.chunk_count = 8
+        ready_version = await session.get(DocumentVersion, "version")
+        ready_version.status = "READY"
+        ready_version.search_status = "SEARCH_READY"
+        ready_version.search_ready_at = datetime.now(UTC)
+
+        session.add(Source(id="pending-source", name="Pending", sag_source_config_id="pending-config"))
+        await session.flush()
+        session.add(
+            SourceProjectMapping(
+                source_id="pending-source",
+                organization_id="tenant",
+                project_id="project",
+                state="PENDING",
+            )
+        )
+        session.add(
+            Document(
+                id="pending-document",
+                source_id="pending-source",
+                tenant_id="tenant",
+                project_id="project",
+                filename="pending.md",
+                storage_path="/tmp/pending.md",
+                status=DocumentStatus.READY,
+                chunk_count=4,
+            )
+        )
+        await session.flush()
+        session.add(
+            DocumentVersion(
+                id="pending-version",
+                document_id="pending-document",
+                version_no=1,
+                file_hash="a" * 64,
+                status="READY",
+                search_status="SEARCH_READY",
+                search_ready_at=datetime.now(UTC),
+                metadata_json={"security_partition_id": "project"},
+            )
+        )
+        await session.commit()
+
+        principal = VerifiedPrincipal(
+            user_id="user",
+            tenant_id="tenant",
+            allowed_projects=frozenset({"project"}),
+            allowed_partitions=frozenset({"project"}),
+        )
+        result = await get_project_document_readiness_batch(
+            session,
+            project_id="project",
+            documents=[
+                ProjectDocumentVersionRef(document_id="document", version_no=1),
+                ProjectDocumentVersionRef(document_id="pending-document", version_no=1),
+                ProjectDocumentVersionRef(document_id="missing-document", version_no=1),
+            ],
+            principal=principal,
+        )
+
+    assert result.items[0].found is True
+    assert result.items[0].search_ready is True
+    assert result.items[0].chunk_count == 8
+    assert result.items[1].found is False
+    assert result.items[1].search_ready is False
+    assert result.items[2].found is False
+    assert result.items[2].search_ready is False
+
+
+@pytest.mark.asyncio
+async def test_project_document_readiness_batch_route_enforces_bff_project_scope(ingestion_db):
+    import httpx
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse
+
+    from sag_api.api.v1.documents import project_router
+    from sag_api.core.db import get_session
+    from sag_api.core.errors import ApiError
+    from sag_api.core.principal_assertion import require_project_bff_principal
+
+    async with ingestion_db() as session:
+        app = FastAPI()
+        app.include_router(project_router)
+
+        @app.exception_handler(ApiError)
+        async def handle_api_error(request, exc):
+            return JSONResponse(
+                status_code=exc.status_code,
+                content=exc.to_envelope(),
+            )
+
+        principal = SimpleNamespace(
+            subject="user",
+            tenant_id="tenant",
+            allowed_project_ids=frozenset({"project"}),
+            allowed_partition_ids=frozenset({"project"}),
+        )
+        app.dependency_overrides[require_project_bff_principal] = lambda: principal
+        app.dependency_overrides[get_session] = lambda: session
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/projects/project/documents/readiness",
+                json={"documents": [{"document_id": "missing", "version_no": 1}]},
+            )
+            denied = await client.post(
+                "/projects/other/documents/readiness",
+                json={"documents": [{"document_id": "missing", "version_no": 1}]},
+            )
+            duplicate = await client.post(
+                "/projects/project/documents/readiness",
+                json={
+                    "documents": [
+                        {"document_id": "missing", "version_no": 1},
+                        {"document_id": "missing", "version_no": 1},
+                    ]
+                },
+            )
+
+    assert response.status_code == 200
+    assert response.json()["items"] == [
+        {
+            "document_id": "missing",
+            "version_no": 1,
+            "found": False,
+            "status": "NOT_FOUND",
+            "search_status": "NOT_FOUND",
+            "search_ready": False,
+            "document_status": None,
+            "chunk_count": 0,
+        }
+    ]
+    assert denied.status_code == 403
+    assert duplicate.status_code == 422

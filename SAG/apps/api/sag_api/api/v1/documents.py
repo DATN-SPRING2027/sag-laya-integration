@@ -58,12 +58,15 @@ from sag_api.schemas.routing_rag import (
     DocumentUploadResponse,
     DocumentVersionChunksResponse,
     DocumentVersionStatusResponse,
+    ProjectDocumentReadinessBatchRequest,
+    ProjectDocumentReadinessBatchResponse,
 )
 from sag_api.services.document_service import (
     delete_document,
     get_document_version_chunks,
     get_document_version_status,
     get_or_create_project_source,
+    get_project_document_readiness_batch,
     get_public_document,
     handle_document_object_ingest,
     handle_document_upload,
@@ -789,6 +792,33 @@ async def query_document_version_status(
             allowed_projects=principal.allowed_project_ids,
             allowed_partitions=principal.allowed_partition_ids,
         ),
+    )
+
+
+@project_router.post(
+    "/readiness",
+    response_model=ProjectDocumentReadinessBatchResponse,
+    summary="Read live search readiness for a bounded batch of Project document versions",
+)
+async def project_document_readiness_batch_endpoint(
+    project_id: str,
+    payload: ProjectDocumentReadinessBatchRequest,
+    principal: VerifiedPrincipal = Depends(require_project_bff_principal),
+    session: AsyncSession = Depends(get_session),
+) -> ProjectDocumentReadinessBatchResponse:
+    if project_id not in principal.allowed_project_ids or not principal.tenant_id:
+        raise ForbiddenError("The requested Project is outside the service scope")
+    local_principal = LocalVerifiedPrincipal(
+        user_id=principal.subject,
+        tenant_id=principal.tenant_id,
+        allowed_projects=principal.allowed_project_ids,
+        allowed_partitions=principal.allowed_partition_ids,
+    )
+    return await get_project_document_readiness_batch(
+        session,
+        project_id=project_id,
+        documents=payload.documents,
+        principal=local_principal,
     )
 
 
