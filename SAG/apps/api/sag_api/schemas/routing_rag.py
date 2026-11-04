@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class DocumentObjectIngestRequest(BaseModel):
@@ -56,6 +56,46 @@ class DocumentVersionStatusResponse(BaseModel):
     chunk_count: int = 0
     event_count: int = 0
     token_usage: int = 0
+
+
+class ProjectDocumentVersionRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    document_id: str = Field(min_length=1, max_length=64)
+    version_no: int = Field(ge=1)
+
+
+class ProjectDocumentReadinessBatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    documents: list[ProjectDocumentVersionRef] = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def reject_duplicate_versions(self) -> ProjectDocumentReadinessBatchRequest:
+        refs = [(item.document_id, item.version_no) for item in self.documents]
+        if len(refs) != len(set(refs)):
+            raise ValueError("Duplicate document version references are not allowed")
+        return self
+
+
+class ProjectDocumentReadinessItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    document_id: str = Field(min_length=1, max_length=64)
+    version_no: int = Field(ge=1)
+    found: bool
+    status: str = Field(max_length=32)
+    search_status: str = Field(max_length=32)
+    search_ready: bool
+    document_status: str | None = Field(default=None, max_length=32)
+    chunk_count: int = Field(ge=0)
+
+
+class ProjectDocumentReadinessBatchResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    verified_at: datetime
+    items: list[ProjectDocumentReadinessItem] = Field(max_length=100)
 
 
 class DocumentExtractedChunkItem(BaseModel):

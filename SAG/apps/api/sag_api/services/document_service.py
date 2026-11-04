@@ -8,7 +8,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from sqlalchemy import case, func, select, update
+from sqlalchemy import case, func, select, tuple_, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,23 +27,26 @@ from sag_api.core.principal_assertion import VerifiedPrincipal as AssertionVerif
 from sag_api.db.base import new_id
 from sag_api.db.models import Document, Job, Source, SourceProjectMapping
 from sag_api.db.models.routing_rag import (
+    CanonicalBlock,
     DocumentVersion,
     IngestionRun,
+    SearchUnit,
     SourceSnapshot,
     StageRun,
-    CanonicalBlock,
-    SearchUnit,
     UploadIdempotencyKey,
 )
 from sag_api.enums import ConnectorKind, DocumentStatus, JobStatus, JobType, SourceType
 from sag_api.jobs import JobQueue
 from sag_api.jobs.scheduling import DELETE_PRIORITY, RESUME_PRIORITY, set_scheduler
 from sag_api.schemas.routing_rag import (
+    DocumentExtractedChunkItem,
     DocumentRevokeResponse,
     DocumentUploadResponse,
-    DocumentExtractedChunkItem,
     DocumentVersionChunksResponse,
     DocumentVersionStatusResponse,
+    ProjectDocumentReadinessBatchResponse,
+    ProjectDocumentReadinessItem,
+    ProjectDocumentVersionRef,
     StageProgressItem,
 )
 from sag_api.services.source_operation_service import touch_source_revision
@@ -2044,6 +2047,93 @@ async def get_document_version_status(
         event_count=int(doc.event_count or 0),
         token_usage=int(doc.token_usage or 0),
     )
+
+
+async def get_project_document_readiness_batch(
+    session: AsyncSession,
+    *,
+    project_id: str,
+    documents: list[ProjectDocumentVersionRef],
+    principal: VerifiedPrincipal,
+) -> ProjectDocumentReadinessBatchResponse:
+    """Read search readiness for exact Project versions within confirmed SAG scope."""
+    if (
+        not principal.tenant_id
+        or not principal.has_project_access(project_id)
+        or not principal.allowed_partitions
+    ):
+        raise ForbiddenError("A signed tenant, Project, and partition scope are required")
+
+    refs = [(item.document_id, item.version_no) for item in documents]
+    if not refs or len(refs) > 100 or len(refs) != len(set(refs)):
+        raise ValidationError("Provide 1 to 100 distinct document version references")
+
+    now = datetime.now(UTC)
+    partition = DocumentVersion.metadata_json["security_partition_id"].as_string()
+    rows = await session.execute(
+        select(DocumentVersion, Document)
+        .join(Document, Document.id == DocumentVersion.document_id)
+        .join(SourceProjectMapping, SourceProjectMapping.source_id == Document.source_id)
+        .where(
+            tuple_(DocumentVersion.document_id, DocumentVersion.version_no).in_(refs),
+            Document.tenant_id == principal.tenant_id,
+            Document.project_id == project_id,
+            Document.is_active.is_(True),
+            Document.status.not_in([DocumentStatus.DELETING, DocumentStatus.DELETE_FAILED]),
+            SourceProjectMapping.organization_id == principal.tenant_id,
+            SourceProjectMapping.project_id == project_id,
+            SourceProjectMapping.state == "CONFIRMED",
+            partition.in_(principal.allowed_partitions),
+            DocumentVersion.valid_to > now,
+        )
+    )
+    visible_by_key: dict[tuple[str, int], tuple[DocumentVersion, Document]] = {
+        (version.document_id, version.version_no): (version, document)
+        for version, document in rows.all()
+    }
+
+    items: list[ProjectDocumentReadinessItem] = []
+    for document_id, version_no in refs:
+        match = visible_by_key.get((document_id, version_no))
+        if match is None:
+            items.append(
+                ProjectDocumentReadinessItem(
+                    document_id=document_id,
+                    version_no=version_no,
+                    found=False,
+                    status="NOT_FOUND",
+                    search_status="NOT_FOUND",
+                    search_ready=False,
+                    document_status=None,
+                    chunk_count=0,
+                )
+            )
+            continue
+
+        version, document = match
+        status_value = getattr(version.status, "value", version.status)
+        search_status_value = getattr(version.search_status, "value", version.search_status)
+        document_status_value = getattr(document.status, "value", document.status)
+        is_ready = (
+            document.status == DocumentStatus.READY
+            and version.search_status == "SEARCH_READY"
+            and version.search_ready_at is not None
+            and int(document.chunk_count or 0) > 0
+        )
+        items.append(
+            ProjectDocumentReadinessItem(
+                document_id=document_id,
+                version_no=version_no,
+                found=True,
+                status=str(status_value),
+                search_status=str(search_status_value),
+                search_ready=is_ready,
+                document_status=str(document_status_value),
+                chunk_count=int(document.chunk_count or 0),
+            )
+        )
+
+    return ProjectDocumentReadinessBatchResponse(verified_at=now, items=items)
 
 
 def _dominant_block_type(block_types: list[str]) -> str:

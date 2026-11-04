@@ -1,0 +1,158 @@
+openapi: 3.1.0
+info:
+  title: SAG Project Document Readiness (internal)
+  version: 1.0.0
+  description: Read-only, server-to-server batch contract used by Continuum BE to verify Project document search readiness.
+servers:
+  - url: /api/v1
+paths:
+  /projects/{project_id}/documents/readiness:
+    parameters:
+      - name: project_id
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 64
+      - name: X-SAG-BFF-Service-Token
+        in: header
+        required: true
+        description: Trusted BE service credential. Never forward to or expose in a browser.
+        schema:
+          type: string
+      - name: X-Continuum-User-Id
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 256
+      - name: X-Continuum-Organization-Id
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 256
+      - name: X-Continuum-Project-Id
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 256
+      - name: X-Continuum-Security-Partition
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 64
+    post:
+      operationId: getProjectDocumentReadinessBatch
+      summary: Verify search readiness for up to 100 Project document versions
+      description: >-
+        Requires the trusted Continuum BE service context to match the route
+        Project. Reads current SAG status only; it does not create, update, or
+        enqueue ingestion. Results are limited to exact versions in the same
+        tenant and Project whose Project-to-Source mapping is CONFIRMED and
+        whose security partition is in the verified principal scope. Missing,
+        revoked-mapping, and out-of-scope references are returned with found=false
+        and search_ready=false. Every distinct requested pair has one result.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProjectDocumentReadinessBatchRequest'
+      responses:
+        '200':
+          description: Current readiness result for each requested document version
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectDocumentReadinessBatchResponse'
+        '401':
+          description: Missing or invalid trusted service context
+        '403':
+          description: Service context is outside the requested Project scope
+        '422':
+          description: Invalid or duplicate version references
+        '503':
+          description: Readiness storage is unavailable
+components:
+  schemas:
+    ProjectDocumentVersionRef:
+      type: object
+      additionalProperties: false
+      required: [document_id, version_no]
+      properties:
+        document_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+        version_no:
+          type: integer
+          minimum: 1
+    ProjectDocumentReadinessBatchRequest:
+      type: object
+      additionalProperties: false
+      required: [documents]
+      properties:
+        documents:
+          type: array
+          minItems: 1
+          maxItems: 100
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/ProjectDocumentVersionRef'
+    ProjectDocumentReadinessItem:
+      type: object
+      additionalProperties: false
+      required:
+        - document_id
+        - version_no
+        - found
+        - status
+        - search_status
+        - search_ready
+        - document_status
+        - chunk_count
+      properties:
+        document_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+        version_no:
+          type: integer
+          minimum: 1
+        found:
+          type: boolean
+        status:
+          type: string
+          maxLength: 32
+        search_status:
+          type: string
+          maxLength: 32
+        search_ready:
+          type: boolean
+        document_status:
+          type: [string, 'null']
+          maxLength: 32
+        chunk_count:
+          type: integer
+          minimum: 0
+    ProjectDocumentReadinessBatchResponse:
+      type: object
+      additionalProperties: false
+      required: [verified_at, items]
+      properties:
+        verified_at:
+          type: string
+          format: date-time
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/ProjectDocumentReadinessItem'
