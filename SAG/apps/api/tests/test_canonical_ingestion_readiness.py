@@ -572,7 +572,24 @@ async def test_canonical_stage_progress_pause_resume_and_reprocess_status(ingest
         assert ready_status.current_stage == "COMPLETE"
         assert ready_status.progress == 100
         assert ready_status.search_ready is True
+        assert ready_status.knowledge_ready is False
         assert ready_status.document_status == "ready"
+
+        from sag_api.db.models.routing_rag import DocumentVersion
+
+        ver_row = await session.get(DocumentVersion, upload_res.version_id)
+        assert ver_row is not None
+        ver_row.knowledge_status = "DATA_READY"
+        await session.commit()
+
+        data_ready_status = await get_document_version_status(
+            session,
+            project_id="project-stage",
+            document_id=upload_res.document_id,
+            version_no=1,
+        )
+        assert data_ready_status.knowledge_status == "DATA_READY"
+        assert data_ready_status.knowledge_ready is True
 
         # Reprocess from READY: status immediately reflects queued RECEIVE · 5%
         await reprocess_document(session, source, doc.id, job_queue=fake_queue)
@@ -585,6 +602,8 @@ async def test_canonical_stage_progress_pause_resume_and_reprocess_status(ingest
         assert reprocess_status.current_stage == "RECEIVE"
         assert reprocess_status.progress == 0
         assert reprocess_status.search_ready is False
+        assert reprocess_status.knowledge_ready is False
+        assert reprocess_status.knowledge_status == "NOT_STARTED"
         assert reprocess_status.document_status == "pending"
 
 
