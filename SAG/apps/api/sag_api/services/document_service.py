@@ -2013,6 +2013,7 @@ async def get_document_version_status(
         }
     effective_status = doc_ver.status
     effective_search_status = doc_ver.search_status
+    effective_knowledge_status = doc_ver.knowledge_status
     effective_search_ready = (
         doc_ver.search_status == "SEARCH_READY" and doc_ver.search_ready_at is not None
     )
@@ -2020,6 +2021,7 @@ async def get_document_version_status(
         current_stage = "RECEIVE"
         effective_status = "RECEIVED"
         effective_search_status = "PENDING"
+        effective_knowledge_status = "NOT_STARTED"
         effective_search_ready = False
         stage_progress = {}
     if doc.status in (DocumentStatus.PAUSED, DocumentStatus.PAUSING) and current_stage not in (
@@ -2033,9 +2035,12 @@ async def get_document_version_status(
         version_no=doc_ver.version_no,
         status=effective_status,
         search_status=effective_search_status,
-        knowledge_status=doc_ver.knowledge_status,
+        knowledge_status=effective_knowledge_status,
         search_ready=effective_search_ready,
-        knowledge_ready=(doc_ver.knowledge_status in ("KNOWLEDGE_READY", "READY")),
+        knowledge_ready=(
+            not is_reprocessing
+            and effective_knowledge_status in ("DATA_READY", "KNOWLEDGE_READY", "READY")
+        ),
         current_stage=current_stage,
         stage_progress=stage_progress,
         error=err_info,
