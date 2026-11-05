@@ -57,6 +57,7 @@ class MindMapCitationOut(BaseModel):
     number: int = Field(ge=1)
     sourceId: str = Field(min_length=1, max_length=128)
     sourceName: str | None = Field(default=None, max_length=240)
+    projectId: str | None = Field(default=None, max_length=128)
     documentId: str = Field(min_length=1, max_length=128)
     documentName: str | None = Field(default=None, max_length=240)
     chunkId: str | None = Field(default=None, max_length=128)

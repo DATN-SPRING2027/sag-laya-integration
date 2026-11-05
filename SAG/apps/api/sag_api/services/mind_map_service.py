@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import json
+import math
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -69,33 +71,8 @@ _MAX_SUMMARY_CHARS = 320
 _PENDING_SEARCH_STATUSES = frozenset({"PENDING", "PROCESSING", "RUNNING", "QUEUED", "INDEXING"})
 _READY_SEARCH_STATUSES = frozenset({"READY", "SEARCH_READY"})
 
-_MIND_MAP_RESPONSE_FORMAT: dict[str, Any] = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "project_mind_map",
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["tree"],
-            "properties": {
-                "tree": {
-                    "type": "object",
-                    "required": ["label", "children"],
-                    "properties": {
-                        "id": {"type": "string"},
-                        "label": {"type": "string"},
-                        "summary": {"type": ["string", "null"]},
-                        "citationNumbers": {
-                            "type": "array",
-                            "items": {"type": "integer"},
-                        },
-                        "children": {"type": "array"},
-                    },
-                }
-            },
-        },
-    },
-}
+_MIND_MAP_LLM_TIMEOUT_SECONDS = 45.0
+_MIND_MAP_RESPONSE_FORMAT: dict[str, Any] = {"type": "json_object"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +87,7 @@ class _ReadyDocumentScope:
     manifest_fingerprint: str
     total_unit_count: int
     updated_sort_key: float
+    project_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,12 +246,21 @@ async def _load_project_scope_snapshot(
     project_id: str,
 ) -> tuple[list[_ReadyDocumentScope], int, str]:
     tenant_id = (principal.tenant_id or principal.organization_id or "").strip()
+    is_all_projects_scope = (
+        project_id == "all"
+        and getattr(principal, "conversation_scope", None) == "all"
+        and bool(principal.allowed_project_ids)
+    )
     if (
         not tenant_id
-        or project_id not in principal.allowed_project_ids
+        or (not is_all_projects_scope and project_id not in principal.allowed_project_ids)
         or not principal.allowed_partition_ids
     ):
         raise ForbiddenError("Principal is not authorized for the requested Project scope")
+
+    scoped_project_ids = (
+        sorted(principal.allowed_project_ids) if is_all_projects_scope else [project_id]
+    )
 
     try:
         doc_rows = (
@@ -284,9 +271,10 @@ async def _load_project_scope_snapshot(
                 .where(
                     SourceProjectMapping.state == "CONFIRMED",
                     SourceProjectMapping.organization_id == principal.organization_id,
-                    SourceProjectMapping.project_id == project_id,
+                    SourceProjectMapping.project_id.in_(scoped_project_ids),
                     Document.tenant_id == tenant_id,
-                    Document.project_id == project_id,
+                    Document.project_id.in_(scoped_project_ids),
+                    SourceProjectMapping.project_id == Document.project_id,
                     Document.is_active.is_(True),
                     Document.status.notin_(
                         [
@@ -444,6 +432,7 @@ async def _load_project_scope_snapshot(
                         manifest_fingerprint=manifest_by_ver.get(vid_str, str(chosen_ready.file_hash)),
                         total_unit_count=unit_counts[vid_str],
                         updated_sort_key=updated_dt.timestamp() if updated_dt else 0.0,
+                        project_id=str(doc.project_id or ""),
                     )
                 )
             elif (usable or not all_vers) and (
@@ -473,6 +462,41 @@ async def _load_project_scope_snapshot(
 
 def _escape_like(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _stratify_documents_across_projects(
+    ordered_docs: list[_ReadyDocumentScope],
+    limit: int,
+) -> list[_ReadyDocumentScope]:
+    """Select up to `limit` documents in round-robin across project buckets so multi-project ('all') scopes stay balanced."""
+    if len(ordered_docs) <= limit:
+        return list(ordered_docs)
+    project_buckets: dict[str, list[_ReadyDocumentScope]] = {}
+    bucket_order: list[str] = []
+    for doc in ordered_docs:
+        pkey = doc.project_id or doc.source_id or "_default"
+        if pkey not in project_buckets:
+            project_buckets[pkey] = []
+            bucket_order.append(pkey)
+        project_buckets[pkey].append(doc)
+    if len(bucket_order) <= 1:
+        return ordered_docs[:limit]
+
+    selected: list[_ReadyDocumentScope] = []
+    round_idx = 0
+    while len(selected) < limit:
+        progressed = False
+        for pkey in bucket_order:
+            bucket = project_buckets[pkey]
+            if round_idx < len(bucket):
+                selected.append(bucket[round_idx])
+                progressed = True
+                if len(selected) >= limit:
+                    break
+        if not progressed:
+            break
+        round_idx += 1
+    return selected
 
 
 async def _select_evidence_catalog(
@@ -529,7 +553,7 @@ async def _select_evidence_catalog(
                 )
             )
 
-        candidate_docs = ordered_docs[:_MAX_DOCUMENTS]
+        candidate_docs = _stratify_documents_across_projects(ordered_docs, _MAX_DOCUMENTS)
         doc_by_ver = {d.document_version_id: d for d in candidate_docs}
         target_ver_ids = sorted(doc_by_ver)
 
@@ -717,10 +741,13 @@ async def _select_evidence_catalog(
             )
         )
 
+    effective_max_units = (
+        40 if len(ordered_buckets) > 12 else _MAX_EVIDENCE_UNITS
+    )
     selected_units: list[_CandidateUnit] = []
     selected_count_by_doc: dict[str, int] = defaultdict(int)
     round_idx = 0
-    while len(selected_units) < _MAX_EVIDENCE_UNITS:
+    while len(selected_units) < effective_max_units:
         progressed = False
         for doc, cands in ordered_buckets:
             if round_idx < len(cands):
@@ -728,7 +755,7 @@ async def _select_evidence_catalog(
                 selected_units.append(chosen_unit)
                 selected_count_by_doc[doc.sag_document_id] += 1
                 progressed = True
-                if len(selected_units) >= _MAX_EVIDENCE_UNITS:
+                if len(selected_units) >= effective_max_units:
                     break
         if not progressed:
             break
@@ -763,6 +790,13 @@ async def _select_evidence_catalog(
     return catalog, coverage, outline_by_doc
 
 
+def _compact_prompt_excerpt(raw: str, max_chars: int) -> str:
+    collapsed = " ".join((raw or "").split()).strip()
+    if len(collapsed) <= max_chars:
+        return collapsed
+    return collapsed[: max_chars - 1].rstrip() + "…"
+
+
 def _render_llm_prompt(
     *,
     topic: str | None,
@@ -777,10 +811,18 @@ def _render_llm_prompt(
             continue
         seen_docs.add(doc.sag_document_id)
         headings = outline_by_doc.get(doc.sag_document_id) or []
-        heading_preview = " | ".join(headings[:8]) if headings else "(no section headings)"
+        heading_preview = " | ".join(headings[:6]) if headings else "(no section headings)"
         outline_lines.append(
             f"- {doc.document_name} (v{doc.version_no}): {heading_preview}"
         )
+
+    unit_count = len(catalog)
+    if unit_count <= 16:
+        prompt_excerpt_chars = 750
+    elif unit_count <= 28:
+        prompt_excerpt_chars = 420
+    else:
+        prompt_excerpt_chars = 280
 
     evidence_blocks: list[str] = []
     for item in catalog:
@@ -791,7 +833,12 @@ def _render_llm_prompt(
         )
         if u.section_path:
             header += f" | section={json.dumps(u.section_path, ensure_ascii=False)}"
-        evidence_blocks.append(f"{header}\n{u.content}")
+        excerpt_body = (
+            u.content
+            if unit_count <= 8
+            else _compact_prompt_excerpt(u.content, prompt_excerpt_chars)
+        )
+        evidence_blocks.append(f"{header}\n{excerpt_body}")
 
     system_prompt = (
         "You are an enterprise knowledge Mind Map synthesizer for Continuum AI. "
@@ -868,11 +915,13 @@ def _build_citation_dto(number: int, ev: _CatalogEvidence) -> MindMapCitationOut
     heading = _clean_text(u.section_path, 240) or None
     doc_name = _clean_text(u.doc.document_name, 240) or u.doc.sag_document_id
     src_name = _clean_text(u.doc.source_name, 240) or None
+    proj_id = _clean_text(u.doc.project_id, 128) or None
     label_parts = [part for part in (doc_name, heading) if part]
     return MindMapCitationOut(
         number=number,
         sourceId=u.doc.source_id,
         sourceName=src_name,
+        projectId=proj_id,
         documentId=u.doc.public_document_id,
         documentName=doc_name,
         chunkId=u.unit_id,
@@ -1133,22 +1182,67 @@ def _build_outline_fallback_tree(
         for doc, items in by_doc:
             lvl1_branches.append(_build_doc_branch(doc, items, max_sub_depth=2))
     else:
-        for doc, items in by_doc[: _MAX_CHILDREN_PER_NODE - 1]:
-            lvl1_branches.append(_build_doc_branch(doc, items, max_sub_depth=2))
-        overflow_docs = by_doc[_MAX_CHILDREN_PER_NODE - 1 :]
-        overflow_children = [
-            _build_doc_branch(doc, items, max_sub_depth=1)
-            for doc, items in overflow_docs[:_MAX_CHILDREN_PER_NODE]
-        ]
-        overflow_cits = [overflow_docs[0][1][0].index]
-        lvl1_branches.append(
-            _DraftNode(
-                label=_clean_text(f"Tài liệu khác (+{len(overflow_docs)})", _MAX_LABEL_CHARS),
-                summary="Các tài liệu bổ sung trong phạm vi dự án",
-                own_citations=overflow_cits,
-                children=overflow_children,
+        # Group by project when documents span multiple projects, or balanced chunks otherwise
+        project_groups: dict[str, list[tuple[_ReadyDocumentScope, list[_CatalogEvidence]]]] = {}
+        project_order: list[str] = []
+        for doc, items in by_doc:
+            pkey = doc.project_id or doc.source_id or "_default"
+            if pkey not in project_groups:
+                project_groups[pkey] = []
+                project_order.append(pkey)
+            project_groups[pkey].append((doc, items))
+
+        clusters: list[tuple[str, list[tuple[_ReadyDocumentScope, list[_CatalogEvidence]]]]] = []
+        if 1 < len(project_order) <= _MAX_CHILDREN_PER_NODE:
+            for idx, pkey in enumerate(project_order, start=1):
+                grp = project_groups[pkey]
+                lead_doc = grp[0][0]
+                stem = re.sub(r"\.[A-Za-z0-9]{1,6}$", "", lead_doc.document_name).strip()
+                short_stem = _clean_text(stem, 48) or f"Dự án {idx}"
+                cluster_lbl = _clean_text(f"Dự án #{idx} · {short_stem}", _MAX_LABEL_CHARS)
+                clusters.append((cluster_lbl, grp))
+        else:
+            num_clusters = min(
+                _MAX_CHILDREN_PER_NODE,
+                max(2, math.ceil(len(by_doc) / _MAX_CHILDREN_PER_NODE)),
             )
-        )
+            chunk_size = math.ceil(len(by_doc) / num_clusters)
+            for c_idx in range(num_clusters):
+                grp = by_doc[c_idx * chunk_size : (c_idx + 1) * chunk_size]
+                if not grp:
+                    continue
+                lead_doc = grp[0][0]
+                stem = re.sub(r"\.[A-Za-z0-9]{1,6}$", "", lead_doc.document_name).strip()
+                short_stem = _clean_text(stem, 48) or f"Nhóm {c_idx + 1}"
+                cluster_lbl = _clean_text(
+                    f"Cụm tài liệu {c_idx + 1} · {short_stem}",
+                    _MAX_LABEL_CHARS,
+                )
+                clusters.append((cluster_lbl, grp))
+
+        for cluster_lbl, grp in clusters[:_MAX_CHILDREN_PER_NODE]:
+            doc_nodes = [
+                _build_doc_branch(doc, items, max_sub_depth=1)
+                for doc, items in grp[:_MAX_CHILDREN_PER_NODE]
+            ]
+            cluster_cits = [grp[0][1][0].index]
+            for _doc, items in grp[1:3]:
+                if items and items[0].index not in cluster_cits:
+                    cluster_cits.append(items[0].index)
+            doc_names_preview = ", ".join(
+                _clean_text(d.document_name, 36) for d, _ in grp[:3]
+            )
+            lvl1_branches.append(
+                _DraftNode(
+                    label=cluster_lbl,
+                    summary=_clean_text(
+                        f"Tổng hợp {len(grp)} tài liệu ({doc_names_preview})",
+                        _MAX_SUMMARY_CHARS,
+                    ),
+                    own_citations=cluster_cits,
+                    children=doc_nodes,
+                )
+            )
 
     root_label = _clean_text(
         topic if topic else "Tổng quan mục lục tài liệu",
@@ -1169,9 +1263,12 @@ async def _call_llm_json(llm: Any, messages: list[dict[str, str]]) -> str:
     supports_rf = "response_format" in params or any(
         p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
     )
-    if supports_rf:
-        return await llm.complete(messages, response_format=_MIND_MAP_RESPONSE_FORMAT)
-    return await llm.complete(messages)
+    coro = (
+        llm.complete(messages, response_format=_MIND_MAP_RESPONSE_FORMAT)
+        if supports_rf
+        else llm.complete(messages)
+    )
+    return await asyncio.wait_for(coro, timeout=_MIND_MAP_LLM_TIMEOUT_SECONDS)
 
 
 def _partition_scope_hash(principal: VerifiedPrincipal) -> str:
@@ -1346,6 +1443,18 @@ async def _load_valid_persisted_mind_map(
         )
         return None
 
+    project_by_doc_id: dict[str, str] = {}
+    for d in ready_docs:
+        if d.project_id:
+            project_by_doc_id[d.public_document_id] = d.project_id
+            project_by_doc_id[d.sag_document_id] = d.project_id
+    enriched_citations = [
+        cit
+        if cit.projectId or cit.documentId not in project_by_doc_id
+        else cit.model_copy(update={"projectId": project_by_doc_id[cit.documentId]})
+        for cit in saved_citations
+    ]
+
     live_coverage = saved_coverage.model_copy(
         update={
             "accessibleReadyDocumentCount": len(ready_docs),
@@ -1362,7 +1471,7 @@ async def _load_valid_persisted_mind_map(
         scopeFingerprint=row.scope_fingerprint,
         coverage=live_coverage,
         tree=saved_tree,
-        citations=saved_citations,
+        citations=enriched_citations,
         generatedAt=generated_at,
         cached=True,
         hasSourceUpdates=(row.scope_fingerprint != scope_fp),

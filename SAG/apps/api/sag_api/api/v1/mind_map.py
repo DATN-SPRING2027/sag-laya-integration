@@ -50,7 +50,12 @@ def _verify_project_and_tenant_scope(
 ) -> None:
     if not _SAFE_PROJECT_ID_RE.fullmatch(project_id):
         raise BadRequestError("Invalid project_id format")
-    if project_id not in principal.allowed_project_ids or not principal.tenant_id:
+    is_all_projects_scope = (
+        project_id == "all"
+        and getattr(principal, "conversation_scope", None) == "all"
+        and bool(principal.allowed_project_ids)
+    )
+    if (not is_all_projects_scope and project_id not in principal.allowed_project_ids) or not principal.tenant_id:
         raise ForbiddenError(
             f"Principal '{principal.subject}' is not authorized to access project '{project_id}'"
         )
