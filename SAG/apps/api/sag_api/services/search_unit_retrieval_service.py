@@ -1238,6 +1238,7 @@ async def _ensure_versions_hydrated(
             source_config_id=ver.source.sag_source_config_id,
             content_hash=unit.content_hash,
             canonical_evidence_verified=True,
+            project_id=ver.project_id,
             document_id=str(doc_id),
             public_document_id=_resolve_public_document_id(logical_source_id),
             document_version_id=v_id_str,
@@ -2246,7 +2247,6 @@ async def _retrieve_search_unit_sections(
                     not in {
                         "source_id",
                         "source_name",
-                        "project_id",
                         "tenant_id",
                         "security_partition_id",
                         "search_unit_id",

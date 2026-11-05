@@ -394,6 +394,11 @@ def build_citations(
                         if s.public_document_id
                         else {}
                     ),
+                    **(
+                        {"project_id": s.project_id}
+                        if s.project_id
+                        else {}
+                    ),
                     "document_version_id": s.document_version_id,
                     "document_name": s.document_name,
                     "version_no": s.version_no,

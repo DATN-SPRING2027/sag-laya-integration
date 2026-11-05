@@ -1152,10 +1152,76 @@ def test_citation_excerpt_preserves_multiline_markdown_and_closes_truncated_fenc
         page_to=1,
         anchor="p1-b1",
         section_path="Architecture > 3D Universe",
+        project_id="651a2b3c4d5e6f7a8b9c0d99",
     )
     built = build_citations([sec], {"cfg_1": {"id": "src_1", "name": "Docs"}})
     assert len(built) == 1
     assert built[0]["document_id"] == "sag-uuid-doc-1"
     assert built[0]["public_document_id"] == "507f1f77bcf86cd799439011"
+    assert built[0]["project_id"] == "651a2b3c4d5e6f7a8b9c0d99"
     assert built[0]["chunk_id"] == "su_hex_1"
     assert "\n```\n" in built[0]["snippet"]
+
+
+@pytest.mark.asyncio
+async def test_mind_map_all_projects_stratifies_documents_and_populates_citation_project_id(
+    mind_map_env,
+) -> None:
+    client: httpx.AsyncClient = mind_map_env.client
+    session_factory = mind_map_env.session_factory
+    llm: FakeMindMapLLM = mind_map_env.llm
+    p_alpha = mind_map_env.project_alpha
+    p_beta = mind_map_env.project_beta
+
+    # Seed 26 docs in project_alpha and 2 docs in project_beta (newer in alpha so naive sort would starve beta)
+    async with session_factory() as s:
+        for i in range(1, 3):
+            await _seed_ready_document(
+                s,
+                source_id="src_beta_ok",
+                doc_id=f"doc_beta_strat_{i:02d}",
+                ver_id=f"ver_beta_strat_{i:02d}",
+                org_id="org_alpha",
+                project_id=p_beta,
+                logical_source_id=f"continuum:project_document:651a2b3c4d5e6f7a8b9c0b{i:02d}",
+                filename=f"beta-service-{i:02d}.md",
+                sections=[(f"Beta Section {i}", f"Beta service architecture details {i}.", 1)],
+            )
+        for i in range(1, 27):
+            await _seed_ready_document(
+                s,
+                source_id="src_alpha_ok",
+                doc_id=f"doc_alpha_strat_{i:02d}",
+                ver_id=f"ver_alpha_strat_{i:02d}",
+                org_id="org_alpha",
+                project_id=p_alpha,
+                logical_source_id=f"continuum:project_document:651a2b3c4d5e6f7a8b9c0a{i:02d}",
+                filename=f"alpha-module-{i:02d}.md",
+                sections=[(f"Alpha Section {i}", f"Alpha module implementation {i}.", 1)],
+            )
+        await s.commit()
+
+    # Force outline_fallback so all 24 stratified docs are organized into multi-project clusters
+    llm.response = ServiceUnavailableError(
+        "Rate limit",
+        code=ErrorCode.LLM_UNAVAILABLE,
+        layer=ErrorLayer.LLM,
+        stage=ErrorStage.GENERATE,
+    )
+
+    headers = {
+        **_bff_headers(project_id="all", partition_id="all"),
+        "X-Continuum-Allowed-Project-Ids": f"{p_alpha},{p_beta}",
+    }
+    resp = await client.post("/api/v1/projects/all/mind-map", headers=headers, json={})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["projectId"] == "all"
+    assert body["status"] == "ready"
+    assert body["generationMode"] == "outline_fallback"
+    assert body["coverage"]["accessibleReadyDocumentCount"] == 28
+    assert body["coverage"]["usedDocumentCount"] == 24
+    cited_projects = {c.get("projectId") for c in body["citations"]}
+    assert p_alpha in cited_projects
+    assert p_beta in cited_projects
