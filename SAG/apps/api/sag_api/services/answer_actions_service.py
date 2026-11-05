@@ -132,6 +132,14 @@ def release_thread_generation(thread_id: str) -> None:
 
 def _resolve_single_project_scope(principal: VerifiedPrincipal) -> tuple[str, str]:
     tenant_id = (principal.tenant_id or principal.organization_id or "").strip()
+    if getattr(principal, "conversation_scope", None) == "all":
+        if (
+            not tenant_id
+            or not principal.allowed_project_ids
+            or any(not pid.strip() for pid in principal.allowed_project_ids)
+        ):
+            raise ForbiddenError("Principal Project scope is empty")
+        return tenant_id, "all"
     if not tenant_id or len(principal.allowed_project_ids) != 1:
         raise ForbiddenError("Principal does not carry an exact single-Project scope")
     project_id = next(iter(principal.allowed_project_ids))
@@ -918,7 +926,12 @@ async def read_project_share(
     if not _SAFE_ID_RE.fullmatch(project_id) or not _SAFE_ID_RE.fullmatch(share_id):
         raise NotFoundError("Shared answer not found")
     tenant_id = (principal.tenant_id or principal.organization_id or "").strip()
-    if not tenant_id or project_id not in principal.allowed_project_ids:
+    is_all_projects_scope = (
+        project_id == "all"
+        and getattr(principal, "conversation_scope", None) == "all"
+        and bool(principal.allowed_project_ids)
+    )
+    if not tenant_id or (not is_all_projects_scope and project_id not in principal.allowed_project_ids):
         raise NotFoundError("Shared answer not found")
 
     share = await session.get(AnswerShare, share_id)
@@ -990,7 +1003,12 @@ async def revoke_project_share(
     if not _SAFE_ID_RE.fullmatch(project_id) or not _SAFE_ID_RE.fullmatch(share_id):
         raise NotFoundError("Shared answer not found")
     tenant_id = (principal.tenant_id or principal.organization_id or "").strip()
-    if not tenant_id or project_id not in principal.allowed_project_ids:
+    is_all_projects_scope = (
+        project_id == "all"
+        and getattr(principal, "conversation_scope", None) == "all"
+        and bool(principal.allowed_project_ids)
+    )
+    if not tenant_id or (not is_all_projects_scope and project_id not in principal.allowed_project_ids):
         raise NotFoundError("Shared answer not found")
 
     share = await session.get(AnswerShare, share_id)

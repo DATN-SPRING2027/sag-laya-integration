@@ -268,12 +268,21 @@ async def _load_project_scope_snapshot(
     project_id: str,
 ) -> tuple[list[_ReadyDocumentScope], int, str]:
     tenant_id = (principal.tenant_id or principal.organization_id or "").strip()
+    is_all_projects_scope = (
+        project_id == "all"
+        and getattr(principal, "conversation_scope", None) == "all"
+        and bool(principal.allowed_project_ids)
+    )
     if (
         not tenant_id
-        or project_id not in principal.allowed_project_ids
+        or (not is_all_projects_scope and project_id not in principal.allowed_project_ids)
         or not principal.allowed_partition_ids
     ):
         raise ForbiddenError("Principal is not authorized for the requested Project scope")
+
+    scoped_project_ids = (
+        sorted(principal.allowed_project_ids) if is_all_projects_scope else [project_id]
+    )
 
     try:
         doc_rows = (
@@ -284,9 +293,10 @@ async def _load_project_scope_snapshot(
                 .where(
                     SourceProjectMapping.state == "CONFIRMED",
                     SourceProjectMapping.organization_id == principal.organization_id,
-                    SourceProjectMapping.project_id == project_id,
+                    SourceProjectMapping.project_id.in_(scoped_project_ids),
                     Document.tenant_id == tenant_id,
-                    Document.project_id == project_id,
+                    Document.project_id.in_(scoped_project_ids),
+                    SourceProjectMapping.project_id == Document.project_id,
                     Document.is_active.is_(True),
                     Document.status.notin_(
                         [

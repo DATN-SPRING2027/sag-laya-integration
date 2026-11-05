@@ -15,7 +15,10 @@ from sag_api.db.models import User
 def conversation_owner_key(user_id: str, principal: VerifiedPrincipal) -> str:
     identity = [user_id, principal.issuer, principal.organization_id, principal.tenant_id, principal.subject]
     if principal.issuer == "continuum-sag-session":
-        identity.append(sorted(principal.allowed_project_ids))
+        if getattr(principal, "conversation_scope", None) == "all":
+            identity.append(["all"])
+        else:
+            identity.append(sorted(principal.allowed_project_ids))
     return hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
 
 

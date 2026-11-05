@@ -76,6 +76,7 @@ class VerifiedPrincipal:
     expires_at: int
     tenant_id: str = ""
     allowed_partition_ids: frozenset[str] = frozenset()
+    conversation_scope: str | None = None
 
 
 JwksLoader = Callable[[str], Awaitable[dict[str, Any]]]
@@ -446,17 +447,48 @@ async def require_project_read_principal(request: Request) -> VerifiedPrincipal:
     ):
         raise ForbiddenError("Continuum SAG session has no valid Project scope")
 
+    if project_id == "all":
+        raw_project_ids = payload.get("allowed_project_ids")
+        raw_partition_ids = payload.get("allowed_partition_ids")
+        max_projects = settings.principal_assertion_max_project_ids
+        if (
+            not isinstance(raw_project_ids, list)
+            or not raw_project_ids
+            or len(raw_project_ids) > max_projects
+            or not isinstance(raw_partition_ids, list)
+            or not raw_partition_ids
+            or len(raw_partition_ids) > max_projects
+            or any(
+                not isinstance(pid, str)
+                or not pid
+                or pid != pid.strip()
+                or len(pid) > 64
+                or pid.lower() == "all"
+                for pid in (*raw_project_ids, *raw_partition_ids)
+            )
+            or set(raw_project_ids) != set(raw_partition_ids)
+        ):
+            raise ForbiddenError("Continuum SAG session has no valid Project scope")
+        resolved_project_ids = frozenset(raw_project_ids)
+        resolved_partition_ids = frozenset(raw_partition_ids)
+        conversation_scope: str | None = "all"
+    else:
+        resolved_project_ids = frozenset({project_id})
+        resolved_partition_ids = frozenset({partition_id})
+        conversation_scope = None
+
     principal = VerifiedPrincipal(
         subject=subject,
         organization_id=organization_id,
-        allowed_project_ids=frozenset({project_id}),
+        allowed_project_ids=resolved_project_ids,
         issuer="continuum-sag-session",
         key_id="sag-hs256-session",
         token_id=token_id,
         issued_at=int(issued_at),
         expires_at=int(expires_at),
         tenant_id=tenant_id,
-        allowed_partition_ids=frozenset({partition_id}),
+        allowed_partition_ids=resolved_partition_ids,
+        conversation_scope=conversation_scope,
     )
     request.state.principal = principal
     return principal
@@ -505,18 +537,41 @@ async def require_project_bff_principal(request: Request) -> VerifiedPrincipal:
     if project_id != route_project_id or partition_id != project_id:
         raise ForbiddenError("Continuum service scope does not match the requested Project")
 
+    if project_id == "all":
+        raw_allowed = required_bff_header(
+            request,
+            "X-Continuum-Allowed-Project-Ids",
+            max_length=8192,
+        )
+        parsed_ids = [part.strip() for part in raw_allowed.split(",") if part.strip()]
+        max_projects = settings.principal_assertion_max_project_ids
+        if (
+            not parsed_ids
+            or len(parsed_ids) > max_projects
+            or any(len(pid) > 64 or pid.lower() == "all" for pid in parsed_ids)
+        ):
+            raise ForbiddenError("Invalid Continuum service context")
+        resolved_project_ids = frozenset(parsed_ids)
+        resolved_partition_ids = frozenset(parsed_ids)
+        conversation_scope: str | None = "all"
+    else:
+        resolved_project_ids = frozenset({project_id})
+        resolved_partition_ids = frozenset({partition_id})
+        conversation_scope = None
+
     issued_at = int(time.time())
     principal = VerifiedPrincipal(
         subject=subject,
         organization_id=organization_id,
-        allowed_project_ids=frozenset({project_id}),
+        allowed_project_ids=resolved_project_ids,
         issuer="continuum-be-bff",
         key_id="service-token",
         token_id=secrets.token_urlsafe(18),
         issued_at=issued_at,
         expires_at=issued_at + 60,
         tenant_id=organization_id,
-        allowed_partition_ids=frozenset({partition_id}),
+        allowed_partition_ids=resolved_partition_ids,
+        conversation_scope=conversation_scope,
     )
     request.state.principal = principal
     return principal
