@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import math
-import re
+from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import math
+import re
 from typing import Any
 
 from sqlalchemy import and_, case, func, or_, select, tuple_
@@ -55,13 +56,23 @@ class KnowledgeUniverseSnapshot:
     tenant_id: str
     scope_key: str
     scopes: set[tuple[str, str, str]]
-    members: dict[str, set[str]]
+    members: dict[str, set[str] | frozenset[str]]
     assignments: list[dict[str, Any]]
     edges: list[tuple[str, str, float]]
     edges_by_unit: dict[str, tuple[tuple[int, str, str, float], ...]] | None = None
+    cached_unit_ids: frozenset[str] | None = None
+    _runtime_cache: dict[str, Any] | None = None
 
     @property
     def unit_ids(self) -> set[str]:
+        if self.cached_unit_ids is not None:
+            return set(self.cached_unit_ids)
+        return set().union(*self.members.values())
+
+    @property
+    def allowed_unit_set(self) -> set[str] | frozenset[str]:
+        if self.cached_unit_ids is not None:
+            return self.cached_unit_ids
         return set().union(*self.members.values())
 
 
@@ -76,6 +87,8 @@ _SNAPSHOT_MEMBERSHIP_CACHE: dict[
         tuple[dict[str, Any], ...],
         tuple[tuple[str, str, float], ...],
         dict[str, tuple[tuple[int, str, str, float], ...]],
+        frozenset[str],
+        dict[str, Any],
     ],
 ] = {}
 _SNAPSHOT_MEMBERSHIP_CACHE_MAX = 32
@@ -292,18 +305,28 @@ async def load_knowledge_universe_snapshot(
 ) -> KnowledgeUniverseSnapshot:
     if tree.project_id not in principal.allowed_project_ids or not principal.tenant_id:
         raise NotFoundError("Knowledge project is unavailable")
-    digest = await session.scalar(
-        select(TreeManifest.checksum)
-        .join(ProjectSearchState, ProjectSearchState.active_tree_version == TreeManifest.tree_version)
-        .where(
-            ProjectSearchState.project_id == tree.project_id,
-            ProjectSearchState.active_search_epoch == tree.search_epoch,
-            TreeManifest.project_id == tree.project_id,
-            TreeManifest.tree_version == tree.tree_version,
-            TreeManifest.status == "ACTIVE",
-        )
-        .with_for_update(read=True, of=ProjectSearchState)
+
+    session_info = getattr(session, "info", None)
+    shared_scope = session_info.get("_universe_req_scope") if isinstance(session_info, dict) else None
+    verified_checksums = (
+        shared_scope.get("verified_checksums")
+        if isinstance(shared_scope, dict) and isinstance(shared_scope.get("verified_checksums"), dict)
+        else None
     )
+    digest = verified_checksums.get(tree.project_id) if verified_checksums is not None else None
+    if digest is None:
+        digest = await session.scalar(
+            select(TreeManifest.checksum)
+            .join(ProjectSearchState, ProjectSearchState.active_tree_version == TreeManifest.tree_version)
+            .where(
+                ProjectSearchState.project_id == tree.project_id,
+                ProjectSearchState.active_search_epoch == tree.search_epoch,
+                TreeManifest.project_id == tree.project_id,
+                TreeManifest.tree_version == tree.tree_version,
+                TreeManifest.status == "ACTIVE",
+            )
+            .with_for_update(read=True, of=ProjectSearchState)
+        )
     if digest is None:
         raise ConflictError("The knowledge snapshot changed; refresh the universe")
     raw = await get_verified_tree_manifest_projection(
@@ -315,8 +338,6 @@ async def load_knowledge_universe_snapshot(
     if raw.get("tenant_id") != principal.tenant_id or raw.get("project_id") != tree.project_id:
         raise ServiceUnavailableError("Published knowledge snapshot failed integrity validation")
 
-    session_info = getattr(session, "info", None)
-    shared_scope = session_info.get("_universe_req_scope") if isinstance(session_info, dict) else None
     if isinstance(shared_scope, dict) and shared_scope.get("ready_versions") is not None:
         versions = {
             key: value
@@ -370,19 +391,39 @@ async def load_knowledge_universe_snapshot(
     )
     cached_membership = _SNAPSHOT_MEMBERSHIP_CACHE.get(membership_key)
     if cached_membership is None:
-        members, assignments, edges = _snapshot_memberships(raw, tree, principal.tenant_id, scopes)
+        raw_members, assignments, edges = _snapshot_memberships(raw, tree, principal.tenant_id, scopes)
         edges_by_unit = _build_edges_by_unit(edges)
+        frozen_members = {node_id: frozenset(unit_set) for node_id, unit_set in raw_members.items()}
+        frozen_unit_ids = frozenset().union(*frozen_members.values()) if frozen_members else frozenset()
+        runtime_cache: dict[str, Any] = {
+            "sorted_members": {node_id: tuple(sorted(unit_set)) for node_id, unit_set in frozen_members.items()},
+            "doc_by_unit": {},
+            "cross_doc_counts": {},
+            "presented_units": {},
+            "edge_signals": {},
+            "page_cache": {},
+        }
         if len(_SNAPSHOT_MEMBERSHIP_CACHE) >= _SNAPSHOT_MEMBERSHIP_CACHE_MAX:
             _SNAPSHOT_MEMBERSHIP_CACHE.pop(next(iter(_SNAPSHOT_MEMBERSHIP_CACHE)))
         _SNAPSHOT_MEMBERSHIP_CACHE[membership_key] = (
-            {node_id: frozenset(unit_set) for node_id, unit_set in members.items()},
+            frozen_members,
             tuple(assignments),
             tuple(edges),
             edges_by_unit,
+            frozen_unit_ids,
+            runtime_cache,
         )
+        members: dict[str, set[str] | frozenset[str]] = dict(frozen_members)
     else:
-        frozen_members, tuple_assignments, tuple_edges, edges_by_unit = cached_membership
-        members = {node_id: set(unit_set) for node_id, unit_set in frozen_members.items()}
+        (
+            frozen_members,
+            tuple_assignments,
+            tuple_edges,
+            edges_by_unit,
+            frozen_unit_ids,
+            runtime_cache,
+        ) = cached_membership
+        members = dict(frozen_members)
         assignments = list(tuple_assignments)
         edges = list(tuple_edges)
     return KnowledgeUniverseSnapshot(
@@ -394,10 +435,12 @@ async def load_knowledge_universe_snapshot(
         assignments,
         edges,
         edges_by_unit=edges_by_unit,
+        cached_unit_ids=frozen_unit_ids,
+        _runtime_cache=runtime_cache,
     )
 
 
-def _unit_query(snapshot: KnowledgeUniverseSnapshot, ids: set[str] | None):
+def _unit_query(snapshot: KnowledgeUniverseSnapshot, ids: set[str] | frozenset[str] | list[str] | tuple[str, ...] | None):
     now = datetime.now(UTC)
     return (
         select(KnowledgeUnit, Document, DocumentVersion, Source)
@@ -422,6 +465,37 @@ def _unit_query(snapshot: KnowledgeUniverseSnapshot, ids: set[str] | None):
             DocumentVersion.valid_from <= now,
             DocumentVersion.valid_to > now,
         )
+    )
+
+
+def _unit_query_by_ids_fast(
+    snapshot: KnowledgeUniverseSnapshot,
+    ids: list[str] | tuple[str, ...] | set[str],
+):
+    """Primary-key indexed lookup for a small candidate slice without thousands of scope tuple bind params."""
+    now = datetime.now(UTC)
+    return (
+        select(KnowledgeUnit, Document, DocumentVersion, Source)
+        .join(DocumentVersion, DocumentVersion.id == KnowledgeUnit.document_version_id)
+        .join(Document, Document.id == DocumentVersion.document_id)
+        .join(Source, Source.id == Document.source_id)
+        .where(
+            KnowledgeUnit.id.in_(ids),
+            KnowledgeUnit.tenant_id == snapshot.tenant_id,
+            KnowledgeUnit.project_id == snapshot.tree.project_id,
+            KnowledgeUnit.is_current.is_(True),
+            KnowledgeUnit.valid_from <= now,
+            KnowledgeUnit.valid_to > now,
+            Document.tenant_id == KnowledgeUnit.tenant_id,
+            Document.project_id == KnowledgeUnit.project_id,
+            Document.source_id == KnowledgeUnit.source_id,
+            Document.is_active.is_(True),
+            DocumentVersion.knowledge_status == "DATA_READY",
+            DocumentVersion.search_status.in_(("READY", "SEARCH_READY")),
+            DocumentVersion.valid_from <= now,
+            DocumentVersion.valid_to > now,
+        )
+        .order_by(KnowledgeUnit.id)
     )
 
 
@@ -552,26 +626,50 @@ def _extract_shared_entities_and_signals(
 async def _load_persisted_edge_signals(
     session: AsyncSession,
     pairs: list[tuple[str, str]],
+    runtime_cache: dict[str, Any] | None = None,
 ) -> dict[tuple[str, str], dict[str, Any]]:
     if not pairs:
         return {}
     canonical_pairs = sorted({(min(a, b), max(a, b)) for a, b in pairs})
-    rows = (
-        await session.execute(
-            select(
-                KnowledgeUnitEdge.source_unit_id,
-                KnowledgeUnitEdge.target_unit_id,
-                KnowledgeUnitEdge.signals_json,
-            ).where(
-                tuple_(KnowledgeUnitEdge.source_unit_id, KnowledgeUnitEdge.target_unit_id).in_(canonical_pairs)
+    edge_cache = runtime_cache.get("edge_signals") if isinstance(runtime_cache, dict) else None
+    missing_pairs = (
+        [pair for pair in canonical_pairs if pair not in edge_cache]
+        if isinstance(edge_cache, dict)
+        else canonical_pairs
+    )
+    if missing_pairs:
+        rows = (
+            await session.execute(
+                select(
+                    KnowledgeUnitEdge.source_unit_id,
+                    KnowledgeUnitEdge.target_unit_id,
+                    KnowledgeUnitEdge.signals_json,
+                ).where(
+                    tuple_(KnowledgeUnitEdge.source_unit_id, KnowledgeUnitEdge.target_unit_id).in_(missing_pairs)
+                )
             )
-        )
-    ).all()
-    by_pair: dict[tuple[str, str], dict[str, Any]] = {}
-    for src, tgt, sig_json in rows:
-        if isinstance(sig_json, dict):
-            by_pair[(src, tgt)] = sig_json
-            by_pair[(tgt, src)] = sig_json
+        ).all()
+        found_map: dict[tuple[str, str], dict[str, Any] | None] = {pair: None for pair in missing_pairs}
+        for src, tgt, sig_json in rows:
+            if isinstance(sig_json, dict):
+                found_map[(min(src, tgt), max(src, tgt))] = sig_json
+        if isinstance(edge_cache, dict):
+            edge_cache.update(found_map)
+        else:
+            by_pair: dict[tuple[str, str], dict[str, Any]] = {}
+            for (u_a, u_b), val in found_map.items():
+                if val is not None:
+                    by_pair[(u_a, u_b)] = val
+                    by_pair[(u_b, u_a)] = val
+            return by_pair
+
+    by_pair = {}
+    if isinstance(edge_cache, dict):
+        for u_a, u_b in canonical_pairs:
+            val = edge_cache.get((u_a, u_b))
+            if isinstance(val, dict):
+                by_pair[(u_a, u_b)] = val
+                by_pair[(u_b, u_a)] = val
     return by_pair
 
 
@@ -582,16 +680,32 @@ async def _present_units(
 ) -> list[UniverseKnowledgeUnitOut]:
     if not rows:
         return []
+    runtime_cache = snapshot._runtime_cache if snapshot is not None else None
+    presented_cache = runtime_cache.get("presented_units") if isinstance(runtime_cache, dict) else None
+    doc_cache = runtime_cache.get("doc_by_unit") if isinstance(runtime_cache, dict) else None
+
+    if isinstance(presented_cache, dict) and all(r[0].id in presented_cache for r in rows):
+        return [presented_cache[r[0].id] for r in rows]
+
+    unseen_rows = (
+        [r for r in rows if r[0].id not in presented_cache]
+        if isinstance(presented_cache, dict)
+        else list(rows)
+    )
+
     block_ids = set()
     unit_ids = []
-    doc_by_unit: dict[str, str] = {}
-    for unit, document, _version, _source in rows:
+    doc_by_unit: dict[str, str] = dict(doc_cache) if isinstance(doc_cache, dict) else {}
+    for unit, document, _version, _source in unseen_rows:
         ids = unit.provenance_json.get("evidence_block_ids")
         if not isinstance(ids, list) or len(ids) != 1 or not isinstance(ids[0], str):
             raise ServiceUnavailableError("Knowledge unit has no canonical evidence locator")
         block_ids.add(ids[0])
         unit_ids.append(unit.id)
         doc_by_unit[unit.id] = document.id
+        if isinstance(doc_cache, dict):
+            doc_cache[unit.id] = document.id
+
     blocks = {
         block.id: block
         for block in (await session.scalars(select(CanonicalBlock).where(CanonicalBlock.id.in_(block_ids)))).all()
@@ -642,14 +756,16 @@ async def _present_units(
             ).all()
             for n_uid, n_doc_id in neighbor_doc_rows:
                 doc_by_unit[n_uid] = n_doc_id
+                if isinstance(doc_cache, dict):
+                    doc_cache[n_uid] = n_doc_id
         for uid, n_ids in neighbor_ids_by_unit.items():
             own_doc = doc_by_unit.get(uid)
             cross_doc_counts[uid] = sum(
                 1 for n_id in n_ids if doc_by_unit.get(n_id) and doc_by_unit.get(n_id) != own_doc
             )
 
-    output = []
-    for unit, document, version, source in rows:
+    newly_presented: dict[str, UniverseKnowledgeUnitOut] = {}
+    for unit, document, version, source in unseen_rows:
         provenance = unit.provenance_json
         block_id = provenance["evidence_block_ids"][0]
         block = blocks.get(block_id)
@@ -681,33 +797,37 @@ async def _present_units(
         ]
         importance = float(features.get("importance") or 0.0)
         local_confidence = float(features.get("local_confidence") or 0.0)
-        output.append(
-            UniverseKnowledgeUnitOut(
-                id=unit.id,
-                label=text[:110] or heading,
-                preview=text[:360],
-                source_id=source.id,
-                source_name=source.name,
-                document_id=document.id,
-                document_version_id=version.id,
-                document_name=document.filename,
-                version_no=version.version_no,
-                block_id=block.id,
-                heading=heading,
-                page_from=block.page_from,
-                page_to=block.page_to,
-                anchor=(block.source_anchor or provenance.get("source_anchor") or f"block-{block.ordinal}"),
-                neural_tier="E2" if is_e2 else "E0_E1",
-                importance=round(importance, 4) if math.isfinite(importance) else 0.0,
-                local_confidence=round(local_confidence, 4) if math.isfinite(local_confidence) else 0.0,
-                e2_reason=e2_reason,
-                entities=entities[:12],
-                evidence_count=ev_count,
-                cross_doc_synapse_count=cross_doc_counts.get(unit.id, 0),
-                checksum=unit.checksum or "",
-            )
+        unit_out = UniverseKnowledgeUnitOut(
+            id=unit.id,
+            label=text[:110] or heading,
+            preview=text[:360],
+            source_id=source.id,
+            source_name=source.name,
+            document_id=document.id,
+            document_version_id=version.id,
+            document_name=document.filename,
+            version_no=version.version_no,
+            block_id=block.id,
+            heading=heading,
+            page_from=block.page_from,
+            page_to=block.page_to,
+            anchor=(block.source_anchor or provenance.get("source_anchor") or f"block-{block.ordinal}"),
+            neural_tier="E2" if is_e2 else "E0_E1",
+            importance=round(importance, 4) if math.isfinite(importance) else 0.0,
+            local_confidence=round(local_confidence, 4) if math.isfinite(local_confidence) else 0.0,
+            e2_reason=e2_reason,
+            entities=entities[:12],
+            evidence_count=ev_count,
+            cross_doc_synapse_count=cross_doc_counts.get(unit.id, 0),
+            checksum=unit.checksum or "",
         )
-    return output
+        newly_presented[unit.id] = unit_out
+        if isinstance(presented_cache, dict):
+            presented_cache[unit.id] = unit_out
+
+    if isinstance(presented_cache, dict):
+        return [presented_cache[r[0].id] for r in rows]
+    return [newly_presented[r[0].id] for r in rows]
 
 
 def _cursor_after(cursor: str | None, context: dict[str, Any]) -> str:
@@ -740,7 +860,7 @@ async def knowledge_universe_page(
     ids = None if source_mode else snapshot.members[node_id]
     anchor = None
     if related_to:
-        if not source_mode and related_to not in snapshot.unit_ids:
+        if not source_mode and related_to not in snapshot.allowed_unit_set:
             raise NotFoundError("Knowledge unit is unavailable")
         anchor = (await session.execute(_unit_query(snapshot, {related_to}))).one_or_none()
         if anchor is None:
@@ -761,13 +881,46 @@ async def knowledge_universe_page(
         "node": node_id, "related": related_to,
     }
     after = _cursor_after(cursor, context)
-    query = _unit_query(snapshot, ids)
-    if source_mode:
-        query = query.where(KnowledgeUnit.source_id == node_id.removeprefix("source:"))
-    total = await session.scalar(select(func.count()).select_from(query.subquery())) or 0
-    rows = (
-        await session.execute(query.where(KnowledgeUnit.id > after).order_by(KnowledgeUnit.id).limit(limit + 1))
-    ).all()
+
+    rows = None
+    total = 0
+    runtime_cache = snapshot._runtime_cache
+    page_cache = runtime_cache.get("page_cache") if isinstance(runtime_cache, dict) else None
+    page_cache_key = (snapshot.scope_key, node_id, limit, after, related_to)
+    if isinstance(page_cache, dict):
+        cached_page = page_cache.get(page_cache_key)
+        if cached_page is not None:
+            return cached_page
+    if not source_mode and not related_to and isinstance(runtime_cache, dict) and ids is not None:
+        sorted_map = runtime_cache.get("sorted_members")
+        sorted_ids = sorted_map.get(node_id) if isinstance(sorted_map, dict) else None
+        if sorted_ids is None:
+            sorted_ids = tuple(sorted(ids))
+        start_idx = bisect_right(sorted_ids, after) if after else 0
+        candidate_slice = sorted_ids[start_idx : start_idx + limit + 1]
+        if not candidate_slice:
+            rows = []
+            total = len(sorted_ids)
+        else:
+            fast_rows = (await session.execute(_unit_query_by_ids_fast(snapshot, candidate_slice))).all()
+            scoped_fast_rows = [
+                r
+                for r in fast_rows
+                if (r[0].source_id, r[0].document_version_id, r[0].security_partition_id) in snapshot.scopes
+            ]
+            if len(scoped_fast_rows) == len(candidate_slice):
+                rows = scoped_fast_rows
+                total = len(sorted_ids)
+
+    if rows is None:
+        query = _unit_query(snapshot, ids)
+        if source_mode:
+            query = query.where(KnowledgeUnit.source_id == node_id.removeprefix("source:"))
+        total = await session.scalar(select(func.count()).select_from(query.subquery())) or 0
+        rows = (
+            await session.execute(query.where(KnowledgeUnit.id > after).order_by(KnowledgeUnit.id).limit(limit + 1))
+        ).all()
+
     has_more = len(rows) > limit
     rows = rows[:limit]
     units = await _present_units(session, rows, snapshot)
@@ -795,6 +948,7 @@ async def knowledge_universe_page(
     persisted_signals = await _load_persisted_edge_signals(
         session,
         [(source, target) for source, target, _weight in visible_triples],
+        runtime_cache=runtime_cache,
     )
     edges = []
     for source, target, weight in visible_triples:
@@ -824,7 +978,7 @@ async def knowledge_universe_page(
             )
         else:
             edges.append(UniverseKnowledgeEdgeOut(source=source, target=target, weight=weight))
-    return UniverseKnowledgePageOut(
+    page_out = UniverseKnowledgePageOut(
         project_id=snapshot.tree.project_id,
         tree_version=snapshot.tree.tree_version,
         node_id=node_id,
@@ -835,6 +989,9 @@ async def knowledge_universe_page(
         next_cursor=_encode_universe_cursor({**context, "after": units[-1].id}, settings.secret_key)
         if has_more and units else None,
     )
+    if isinstance(page_cache, dict):
+        page_cache[page_cache_key] = page_out
+    return page_out
 
 
 async def knowledge_universe_detail(
@@ -842,8 +999,22 @@ async def knowledge_universe_detail(
     snapshot: KnowledgeUniverseSnapshot,
     unit_id: str,
 ) -> UniverseKnowledgeDetailOut:
-    ids = {unit_id} if snapshot.tree.projection == "source" else {unit_id} & snapshot.unit_ids
-    row = (await session.execute(_unit_query(snapshot, ids))).one_or_none()
+    allowed_set = snapshot.allowed_unit_set
+    if snapshot.tree.projection != "source" and unit_id not in allowed_set:
+        raise NotFoundError("Knowledge unit is unavailable")
+    ids = {unit_id}
+    if snapshot._runtime_cache is not None and snapshot.tree.projection != "source":
+        fast_rows = (await session.execute(_unit_query_by_ids_fast(snapshot, [unit_id]))).all()
+        row = next(
+            (
+                r
+                for r in fast_rows
+                if (r[0].source_id, r[0].document_version_id, r[0].security_partition_id) in snapshot.scopes
+            ),
+            None,
+        )
+    else:
+        row = (await session.execute(_unit_query(snapshot, ids))).one_or_none()
     if row is None:
         raise NotFoundError("Knowledge unit is unavailable")
     unit = row[0]
@@ -877,7 +1048,7 @@ async def knowledge_universe_detail(
 
     synapses: list[UniverseKnowledgeSynapseOut] = []
     if snapshot.edges and snapshot.tree.projection != "source":
-        allowed_unit_ids = snapshot.unit_ids
+        allowed_unit_ids = snapshot.allowed_unit_set
         neighbor_weights: dict[str, float] = {}
         if snapshot.edges_by_unit is not None:
             for _idx, src, tgt, weight in snapshot.edges_by_unit.get(unit.id, ()):
@@ -892,11 +1063,19 @@ async def knowledge_universe_detail(
                 elif tgt == unit.id and src in allowed_unit_ids:
                     neighbor_weights[src] = max(neighbor_weights.get(src, 0.0), float(weight))
         if neighbor_weights:
-            top_neighbor_ids = {
+            top_neighbor_ids = [
                 nid
                 for nid, _w in sorted(neighbor_weights.items(), key=lambda item: (-item[1], item[0]))[:24]
-            }
-            neighbor_rows = (await session.execute(_unit_query(snapshot, top_neighbor_ids))).all()
+            ]
+            if snapshot._runtime_cache is not None:
+                fast_n_rows = (await session.execute(_unit_query_by_ids_fast(snapshot, top_neighbor_ids))).all()
+                neighbor_rows = [
+                    r
+                    for r in fast_n_rows
+                    if (r[0].source_id, r[0].document_version_id, r[0].security_partition_id) in snapshot.scopes
+                ]
+            else:
+                neighbor_rows = (await session.execute(_unit_query(snapshot, set(top_neighbor_ids)))).all()
             if neighbor_rows:
                 neighbor_presented = {
                     item.id: item
@@ -905,6 +1084,7 @@ async def knowledge_universe_detail(
                 persisted_signals = await _load_persisted_edge_signals(
                     session,
                     [(unit.id, r[0].id) for r in neighbor_rows],
+                    runtime_cache=snapshot._runtime_cache,
                 )
                 leaf_node_ids = [n.id for n in snapshot.tree.nodes if n.is_leaf]
                 all_node_ids = leaf_node_ids + [n.id for n in snapshot.tree.nodes if not n.is_leaf]
@@ -992,7 +1172,7 @@ async def resolve_knowledge_universe_references(
     block_refs = [ref for ref in references if ref.block_id]
     block_ids = {ref.block_id for ref in block_refs}
     if block_ids:
-        query = _unit_query(snapshot, snapshot.unit_ids).where(
+        query = _unit_query(snapshot, snapshot.allowed_unit_set).where(
             KnowledgeUnit.provenance_json["evidence_block_ids"][0].as_string().in_(block_ids)
         )
         for unit, _doc, _version, _source in (await session.execute(query)).all():
@@ -1005,7 +1185,7 @@ async def resolve_knowledge_universe_references(
                 candidate_ids.add(unit.id)
     rows = (
         await session.execute(
-            _unit_query(snapshot, candidate_ids & snapshot.unit_ids).order_by(KnowledgeUnit.id).limit(500)
+            _unit_query(snapshot, candidate_ids & snapshot.allowed_unit_set).order_by(KnowledgeUnit.id).limit(500)
         )
     ).all()
     matched_ids = {row[0].id for row in rows}
