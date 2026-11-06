@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from datetime import UTC, datetime
 from hashlib import sha256
+import time
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Path, Query
@@ -71,6 +72,13 @@ router = APIRouter(prefix="/universe", tags=["universe"])
 _MANIFEST_TREE_OUTPUT_CACHE: dict[tuple[Any, ...], tuple[list[dict[str, Any]], int]] = {}
 _MANIFEST_TREE_OUTPUT_CACHE_MAX = 32
 
+_MANIFEST_FAST_CACHE: dict[
+    tuple[Any, ...],
+    tuple[float, tuple[Any, ...], dict[str, str], UniverseManifestOut, dict[str, Any]],
+] = {}
+_MANIFEST_FAST_CACHE_MAX = 64
+_MANIFEST_FAST_CACHE_TTL_SEC = 15.0
+
 
 def _stale_manifest() -> UniverseManifestOut:
     return UniverseManifestOut(
@@ -96,14 +104,54 @@ async def manifest(
     session: AsyncSession = Depends(get_session),
     user: User = Depends(get_current_user),
     principal: VerifiedPrincipal = Depends(require_project_read_principal),
+    project_id: str | None = Query(default=None, min_length=1, max_length=128),
 ) -> UniverseManifestOut:
     del user
     if not principal.allowed_project_ids or not principal.tenant_id or not principal.allowed_partition_ids:
         return UniverseManifestOut(status="empty", as_of=datetime.now(UTC), policy=_universe_policy())
+
+    target_project_id = project_id if isinstance(project_id, str) and project_id else None
+    if target_project_id is not None and target_project_id not in principal.allowed_project_ids:
+        raise NotFoundError("Knowledge project is unavailable")
+    target_projects = (
+        frozenset([target_project_id])
+        if target_project_id is not None
+        else frozenset(principal.allowed_project_ids)
+    )
+
+    fast_cache_key = (
+        principal.tenant_id,
+        principal.organization_id,
+        target_projects,
+        frozenset(principal.allowed_partition_ids),
+    )
+    cached_fast = _MANIFEST_FAST_CACHE.get(fast_cache_key)
+    if cached_fast is not None:
+        cached_at, expected_state_sig, cached_checksums, cached_manifest, cached_ready_versions = cached_fast
+        if (time.monotonic() - cached_at) < _MANIFEST_FAST_CACHE_TTL_SEC and expected_state_sig:
+            fast_states = (
+                await session.scalars(
+                    select(ProjectSearchState)
+                    .where(ProjectSearchState.project_id.in_(sorted(target_projects)))
+                    .order_by(ProjectSearchState.project_id)
+                    .with_for_update(read=True)
+                )
+            ).all()
+            current_sig = tuple(
+                (s.project_id, s.active_tree_version, s.active_routing_slot, s.active_search_epoch)
+                for s in fast_states
+            )
+            if current_sig == expected_state_sig:
+                session_info = getattr(session, "info", None)
+                if isinstance(session_info, dict) and isinstance(session_info.get("_universe_req_scope"), dict):
+                    session_info["_universe_req_scope"]["ready_versions"] = cached_ready_versions
+                    session_info["_universe_req_scope"]["verified_checksums"] = cached_checksums
+                return cached_manifest.model_copy(update={"as_of": datetime.now(UTC)})
+
     authorized_source_ids = select(SourceProjectMapping.source_id).where(
         SourceProjectMapping.state == "CONFIRMED",
         SourceProjectMapping.organization_id == principal.organization_id,
-        SourceProjectMapping.project_id.in_(principal.allowed_project_ids),
+        SourceProjectMapping.project_id.in_(sorted(target_projects)),
     )
     sources = list(
         (
@@ -118,6 +166,10 @@ async def manifest(
     if len(sources) > settings.universe_manifest_source_limit:
         raise ServiceUnavailableError("Universe exceeds the configured authorized source limit")
     ready_versions = await _load_current_ready_versions(session, sources, principal)
+    if target_project_id is not None:
+        ready_versions = {
+            vid: ver for vid, ver in ready_versions.items() if ver.project_id == target_project_id
+        }
     session_info = getattr(session, "info", None)
     if isinstance(session_info, dict) and isinstance(session_info.get("_universe_req_scope"), dict):
         session_info["_universe_req_scope"]["ready_versions"] = ready_versions
@@ -204,12 +256,12 @@ async def manifest(
         return _stale_manifest()
 
     profile_inventories: dict[tuple[str, str], Any] = {}
-    for project_id, (state, record) in active.items():
+    for proj_id, (state, record) in active.items():
         tree_ver = state.active_tree_version or ""
         try:
             projection = await get_verified_tree_manifest_projection(
                 session,
-                project_id,
+                proj_id,
                 tree_ver,
                 record.checksum,
             )
@@ -219,7 +271,7 @@ async def manifest(
         if projection.get("tenant_id") != principal.tenant_id:
             integrity_failed = True
             continue
-        profile_inventories[(project_id, tree_ver)] = projection.get("source_routing_profiles")
+        profile_inventories[(proj_id, tree_ver)] = projection.get("source_routing_profiles")
     if integrity_failed:
         return _failed_manifest()
 
@@ -235,6 +287,7 @@ async def manifest(
             if version.project_id in active
         }
     )
+    scope_set_all = set(scopes)
     expected_scopes: dict[str, set[tuple[str, str, str]]] = defaultdict(set)
     for version in ready_versions.values():
         if version.project_id in active:
@@ -242,14 +295,14 @@ async def manifest(
                 (version.source_id, version.document_version_id, version.partition_id)
             )
     expected_profile_nodes: dict[tuple[str, str, str, str], set[str]] = defaultdict(set)
-    for project_id, scopes_for_project in expected_scopes.items():
-        state = active[project_id][0]
-        inventory = profile_inventories.get((project_id, state.active_tree_version or ""))
+    for proj_id, scopes_for_project in expected_scopes.items():
+        state = active[proj_id][0]
+        inventory = profile_inventories.get((proj_id, state.active_tree_version or ""))
         if not isinstance(inventory, list):
             stale = True
             continue
         scope_set = {
-            (project_id, source_id, version_id, partition_id)
+            (proj_id, source_id, version_id, partition_id)
             for source_id, version_id, partition_id in scopes_for_project
         }
         for item in inventory:
@@ -282,7 +335,7 @@ async def manifest(
         return _stale_manifest()
     scalar_profile_rows = []
     if scopes:
-        scalar_profile_rows = (
+        raw_scalar_rows = (
             await session.execute(
                 select(
                     TreeRoutingProfile.project_id,
@@ -295,16 +348,10 @@ async def manifest(
                     TreeRoutingProfile.accessible_unit_count,
                 )
                 .where(
-                    tuple_(
-                        TreeRoutingProfile.project_id,
-                        TreeRoutingProfile.source_id,
-                        TreeRoutingProfile.document_version_id,
-                        TreeRoutingProfile.partition_id,
-                    ).in_(scopes),
                     tuple_(TreeRoutingProfile.project_id, TreeRoutingProfile.tree_version).in_(
                         [
-                            (project_id, state.active_tree_version)
-                            for project_id, (state, _record) in active.items()
+                            (proj_id, state.active_tree_version)
+                            for proj_id, (state, _record) in active.items()
                         ]
                     ),
                     TreeRoutingProfile.tenant_id == principal.tenant_id,
@@ -320,6 +367,11 @@ async def manifest(
                 .limit(settings.search_tree_profile_limit + 1)
             )
         ).all()
+        scalar_profile_rows = [
+            row
+            for row in raw_scalar_rows
+            if (row.project_id, row.source_id, row.document_version_id, row.partition_id) in scope_set_all
+        ]
     if len(scalar_profile_rows) > settings.search_tree_profile_limit:
         raise ServiceUnavailableError("Active Universe tree exceeds the configured profile limit")
     observed_profile_nodes: dict[tuple[str, str, str, str], set[str]] = defaultdict(set)
@@ -329,11 +381,11 @@ async def manifest(
         observed_profile_nodes[scope].add(row.node_id)
         scalars_by_project[row.project_id].append(row)
     incomplete_projects = {
-        project_id
-        for project_id, project_scopes in expected_scopes.items()
+        proj_id
+        for proj_id, project_scopes in expected_scopes.items()
         if any(
-            observed_profile_nodes[(project_id, source_id, version_id, partition_id)]
-            != expected_profile_nodes[(project_id, source_id, version_id, partition_id)]
+            observed_profile_nodes[(proj_id, source_id, version_id, partition_id)]
+            != expected_profile_nodes[(proj_id, source_id, version_id, partition_id)]
             for source_id, version_id, partition_id in project_scopes
         )
     }
@@ -346,13 +398,13 @@ async def manifest(
     cached_tree_outputs: dict[tuple[str, str], tuple[list[dict[str, Any]], int]] = {}
     uncached_project_versions: list[tuple[str, str | None]] = []
     project_cache_keys: dict[tuple[str, str], tuple[Any, ...]] = {}
-    for project_id, (state, record) in sorted(active.items()):
-        project_scalars = scalars_by_project.get(project_id, [])
+    for proj_id, (state, record) in sorted(active.items()):
+        project_scalars = scalars_by_project.get(proj_id, [])
         if not project_scalars:
             continue
         tree_ver = state.active_tree_version or ""
         t_key = (
-            project_id,
+            proj_id,
             tree_ver,
             principal.tenant_id,
             record.node_count,
@@ -368,29 +420,23 @@ async def manifest(
                 for r in project_scalars
             ),
         )
-        project_cache_keys[(project_id, tree_ver)] = t_key
+        project_cache_keys[(proj_id, tree_ver)] = t_key
         hit = _MANIFEST_TREE_OUTPUT_CACHE.get(t_key)
         if hit is not None:
-            cached_tree_outputs[(project_id, tree_ver)] = hit
+            cached_tree_outputs[(proj_id, tree_ver)] = hit
         else:
-            uncached_project_versions.append((project_id, state.active_tree_version))
+            uncached_project_versions.append((proj_id, state.active_tree_version))
 
     aggregates: dict[tuple[str, str], dict[str, dict[str, Any]]] = defaultdict(dict)
     source_ids_by_project: dict[str, set[str]] = defaultdict(set)
     if uncached_project_versions:
         uncached_project_set = {proj for proj, _ver in uncached_project_versions}
-        uncached_scopes = [sc for sc in scopes if sc[0] in uncached_project_set]
-        profile_rows = list(
+        uncached_scope_set = {sc for sc in scopes if sc[0] in uncached_project_set}
+        raw_profile_rows = list(
             (
                 await session.scalars(
                     select(TreeRoutingProfile)
                     .where(
-                        tuple_(
-                            TreeRoutingProfile.project_id,
-                            TreeRoutingProfile.source_id,
-                            TreeRoutingProfile.document_version_id,
-                            TreeRoutingProfile.partition_id,
-                        ).in_(uncached_scopes),
                         tuple_(TreeRoutingProfile.project_id, TreeRoutingProfile.tree_version).in_(
                             uncached_project_versions
                         ),
@@ -405,14 +451,19 @@ async def manifest(
                 )
             ).all()
         )
+        profile_rows = [
+            row
+            for row in raw_profile_rows
+            if (row.project_id, row.source_id, row.document_version_id, row.partition_id) in uncached_scope_set
+        ]
         profile_groups: dict[tuple[str, str], list[TreeRoutingProfile]] = defaultdict(list)
         for row in profile_rows:
             profile_groups[(row.project_id, row.partition_id)].append(row)
-        for (project_id, partition_id), records in profile_groups.items():
-            state = active[project_id][0]
+        for (proj_id, partition_id), records in profile_groups.items():
+            state = active[proj_id][0]
             verified_profiles = _aggregate_source_profiles(
                 records,
-                project_id=project_id,
+                project_id=proj_id,
                 tenant_id=principal.tenant_id,
                 tree_version=state.active_tree_version or "",
                 source_ids=tuple(sorted({row.source_id for row in records})),
@@ -423,7 +474,7 @@ async def manifest(
             )
             if verified_profiles is None:
                 raise ServiceUnavailableError("Active Universe tree profile failed integrity validation")
-            key = (project_id, state.active_tree_version or "")
+            key = (proj_id, state.active_tree_version or "")
             nodes = aggregates[key]
             for profile in verified_profiles:
                 node = nodes.setdefault(
@@ -445,7 +496,7 @@ async def manifest(
                 node = nodes[row.node_id]
                 node["sources"].add(row.source_id)
                 node["documents"].add(row.document_version_id)
-                source_ids_by_project[project_id].add(row.source_id)
+                source_ids_by_project[proj_id].add(row.source_id)
                 # The legacy incremental-tree writer uses this pair for empty profiles.
                 is_empty_profile_placeholder = (
                     row.entities_json == ["TechCorp"] and row.sparse_json == [["tech", 1.0]]
@@ -458,10 +509,10 @@ async def manifest(
                         if term.strip():
                             node["terms"][term] += float(weight)
 
-        for (project_id, tree_version), nodes in sorted(aggregates.items()):
+        for (proj_id, tree_version), nodes in sorted(aggregates.items()):
             if not nodes:
                 continue
-            if len(nodes) > active[project_id][1].node_count:
+            if len(nodes) > active[proj_id][1].node_count:
                 raise ServiceUnavailableError("Active Universe tree exceeds its manifest node count")
             for node_id, node in nodes.items():
                 parent_id = node["parent_id"]
@@ -508,20 +559,20 @@ async def manifest(
                         "top_entities": top_entities,
                     }
                 )
-            src_count = len(source_ids_by_project[project_id])
-            cached_tree_outputs[(project_id, tree_version)] = (output_nodes, src_count)
-            t_key = project_cache_keys.get((project_id, tree_version))
+            src_count = len(source_ids_by_project[proj_id])
+            cached_tree_outputs[(proj_id, tree_version)] = (output_nodes, src_count)
+            t_key = project_cache_keys.get((proj_id, tree_version))
             if t_key is not None:
                 if len(_MANIFEST_TREE_OUTPUT_CACHE) >= _MANIFEST_TREE_OUTPUT_CACHE_MAX:
                     _MANIFEST_TREE_OUTPUT_CACHE.pop(next(iter(_MANIFEST_TREE_OUTPUT_CACHE)))
                 _MANIFEST_TREE_OUTPUT_CACHE[t_key] = (output_nodes, src_count)
 
     trees = []
-    for (project_id, tree_version), (output_nodes, src_count) in sorted(cached_tree_outputs.items()):
-        state, record = active[project_id]
+    for (proj_id, tree_version), (output_nodes, src_count) in sorted(cached_tree_outputs.items()):
+        state, record = active[proj_id]
         trees.append(
             {
-                "project_id": project_id,
+                "project_id": proj_id,
                 "tree_version": tree_version,
                 "search_epoch": state.active_search_epoch,
                 "active_slot": state.active_routing_slot,
@@ -541,7 +592,7 @@ async def manifest(
             for tree in trees
         ).encode()
     ).hexdigest() if trees else None
-    return UniverseManifestOut(
+    result_out = UniverseManifestOut(
         version=version,
         status="failed" if integrity_failed else "ready" if trees else "empty",
         as_of=datetime.now(UTC),
@@ -558,18 +609,43 @@ async def manifest(
         },
         policy=_universe_policy(),
     )
+    if trees and not integrity_failed and not stale:
+        state_sig = tuple(
+            (s.project_id, s.active_tree_version, s.active_routing_slot, s.active_search_epoch)
+            for s in states
+        )
+        verified_checksums = {proj_id: rec.checksum for proj_id, (_st, rec) in active.items()}
+        if isinstance(session_info, dict) and isinstance(session_info.get("_universe_req_scope"), dict):
+            session_info["_universe_req_scope"]["verified_checksums"] = verified_checksums
+        if len(_MANIFEST_FAST_CACHE) >= _MANIFEST_FAST_CACHE_MAX:
+            _MANIFEST_FAST_CACHE.pop(next(iter(_MANIFEST_FAST_CACHE)))
+        _MANIFEST_FAST_CACHE[fast_cache_key] = (
+            time.monotonic(),
+            state_sig,
+            verified_checksums,
+            result_out,
+            ready_versions,
+        )
+    return result_out
 
 
 @router.get("/knowledge/overview", response_model=UniverseManifestOut)
 async def knowledge_overview(
+    project_id: str | None = Query(default=None, min_length=1, max_length=128),
     session: AsyncSession = Depends(get_session),
     user: User = Depends(get_current_user),
     principal: VerifiedPrincipal = Depends(require_project_read_principal),
 ) -> UniverseManifestOut:
-    value = await manifest(session=session, user=user, principal=principal)
+    target_project_id = project_id if isinstance(project_id, str) and project_id else None
+    if target_project_id is not None:
+        value = await manifest(
+            session=session, user=user, principal=principal, project_id=target_project_id,
+        )
+    else:
+        value = await manifest(session=session, user=user, principal=principal)
     if value.trees:
         return value
-    snapshots = await load_source_universe_snapshots(session, principal)
+    snapshots = await load_source_universe_snapshots(session, principal, target_project_id)
     return value.model_copy(update={
         "trees": [snapshot.tree for snapshot in snapshots],
         "counts": {**value.counts, "trees": 0,
@@ -591,7 +667,7 @@ async def _knowledge_snapshot(session, user, principal, project_id: str, tree_ve
     if has_session_info:
         session_info["_universe_req_scope"] = {}
     try:
-        value = await manifest(session=session, user=user, principal=principal)
+        value = await manifest(session=session, user=user, principal=principal, project_id=project_id)
         tree = _knowledge_tree(value, project_id, tree_version)
         return await load_knowledge_universe_snapshot(session, principal, tree)
     finally:
@@ -730,6 +806,7 @@ async def node_detail(
         source_id=source_id,
     )
     return UniverseNodeDetailOut(**value)
+
 
 @router.post("/rebuild", response_model=JobOut, status_code=202)
 async def rebuild(
