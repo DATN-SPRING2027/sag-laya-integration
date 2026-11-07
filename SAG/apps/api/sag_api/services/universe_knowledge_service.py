@@ -94,6 +94,18 @@ _SNAPSHOT_MEMBERSHIP_CACHE: dict[
 _SNAPSHOT_MEMBERSHIP_CACHE_MAX = 32
 
 
+def clear_universe_knowledge_caches(project_id: str | None = None) -> None:
+    """Evict cached snapshot memberships and page projections (all or for a specific project)."""
+    if project_id is None:
+        _SNAPSHOT_MEMBERSHIP_CACHE.clear()
+        return
+    stale_keys = [
+        key for key in _SNAPSHOT_MEMBERSHIP_CACHE if isinstance(key, tuple) and len(key) > 0 and key[0] == project_id
+    ]
+    for key in stale_keys:
+        _SNAPSHOT_MEMBERSHIP_CACHE.pop(key, None)
+
+
 def _build_edges_by_unit(
     edges: list[tuple[str, str, float]] | tuple[tuple[str, str, float], ...],
 ) -> dict[str, tuple[tuple[int, str, str, float], ...]]:
@@ -887,10 +899,7 @@ async def knowledge_universe_page(
     runtime_cache = snapshot._runtime_cache
     page_cache = runtime_cache.get("page_cache") if isinstance(runtime_cache, dict) else None
     page_cache_key = (snapshot.scope_key, node_id, limit, after, related_to)
-    if isinstance(page_cache, dict):
-        cached_page = page_cache.get(page_cache_key)
-        if cached_page is not None:
-            return cached_page
+    cached_page = page_cache.get(page_cache_key) if isinstance(page_cache, dict) else None
     if not source_mode and not related_to and isinstance(runtime_cache, dict) and ids is not None:
         sorted_map = runtime_cache.get("sorted_members")
         sorted_ids = sorted_map.get(node_id) if isinstance(sorted_map, dict) else None
@@ -911,6 +920,15 @@ async def knowledge_universe_page(
             if len(scoped_fast_rows) == len(candidate_slice):
                 rows = scoped_fast_rows
                 total = len(sorted_ids)
+                if (
+                    cached_page is not None
+                    and cached_page.total == total
+                    and [u.id for u in cached_page.units] == [r[0].id for r in rows[:limit]]
+                ):
+                    return cached_page
+            elif isinstance(page_cache, dict):
+                page_cache.clear()
+                cached_page = None
 
     if rows is None:
         query = _unit_query(snapshot, ids)
@@ -920,6 +938,12 @@ async def knowledge_universe_page(
         rows = (
             await session.execute(query.where(KnowledgeUnit.id > after).order_by(KnowledgeUnit.id).limit(limit + 1))
         ).all()
+        if (
+            cached_page is not None
+            and cached_page.total == total
+            and [u.id for u in cached_page.units] == [r[0].id for r in rows[:limit]]
+        ):
+            return cached_page
 
     has_more = len(rows) > limit
     rows = rows[:limit]

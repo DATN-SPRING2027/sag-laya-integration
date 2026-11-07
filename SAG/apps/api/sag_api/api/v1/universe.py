@@ -50,6 +50,7 @@ from sag_api.services.search_unit_retrieval_service import _load_current_ready_v
 from sag_api.services.source_service import get_authorized_source, get_authorized_source_ids, search_source_candidates
 from sag_api.services.tree_query_snapshot_service import _aggregate_source_profiles
 from sag_api.services.universe_knowledge_service import (
+    clear_universe_knowledge_caches,
     get_verified_tree_manifest_projection,
     knowledge_universe_detail,
     knowledge_universe_page,
@@ -78,6 +79,42 @@ _MANIFEST_FAST_CACHE: dict[
 ] = {}
 _MANIFEST_FAST_CACHE_MAX = 64
 _MANIFEST_FAST_CACHE_TTL_SEC = 15.0
+
+
+def clear_universe_caches(project_id: str | None = None) -> None:
+    """Evict cached Universe manifest and cluster snapshot entries (all or for a specific project)."""
+    if project_id is None:
+        _MANIFEST_FAST_CACHE.clear()
+        _MANIFEST_TREE_OUTPUT_CACHE.clear()
+        clear_universe_knowledge_caches(None)
+        return
+    for key in [
+        k for k in _MANIFEST_FAST_CACHE if isinstance(k, tuple) and len(k) >= 3 and project_id in k[2]
+    ]:
+        _MANIFEST_FAST_CACHE.pop(key, None)
+    for key in [
+        k for k in _MANIFEST_TREE_OUTPUT_CACHE if isinstance(k, tuple) and len(k) > 0 and k[0] == project_id
+    ]:
+        _MANIFEST_TREE_OUTPUT_CACHE.pop(key, None)
+    clear_universe_knowledge_caches(project_id)
+
+
+def _ready_versions_signature(ready_versions: dict[str, Any]) -> tuple[tuple[Any, ...], ...]:
+    return tuple(
+        sorted(
+            (
+                str(vid),
+                getattr(ver, "project_id", None),
+                getattr(ver, "source_id", None),
+                getattr(ver, "partition_id", None),
+                getattr(ver, "acl_mapping_version", None),
+                getattr(ver, "ingestion_run_id", None),
+                getattr(ver, "index_stage_run_id", None),
+                getattr(ver, "search_manifest_checksum", None),
+            )
+            for vid, ver in ready_versions.items()
+        )
+    )
 
 
 def _stale_manifest() -> UniverseManifestOut:
@@ -125,28 +162,6 @@ async def manifest(
         target_projects,
         frozenset(principal.allowed_partition_ids),
     )
-    cached_fast = _MANIFEST_FAST_CACHE.get(fast_cache_key)
-    if cached_fast is not None:
-        cached_at, expected_state_sig, cached_checksums, cached_manifest, cached_ready_versions = cached_fast
-        if (time.monotonic() - cached_at) < _MANIFEST_FAST_CACHE_TTL_SEC and expected_state_sig:
-            fast_states = (
-                await session.scalars(
-                    select(ProjectSearchState)
-                    .where(ProjectSearchState.project_id.in_(sorted(target_projects)))
-                    .order_by(ProjectSearchState.project_id)
-                    .with_for_update(read=True)
-                )
-            ).all()
-            current_sig = tuple(
-                (s.project_id, s.active_tree_version, s.active_routing_slot, s.active_search_epoch)
-                for s in fast_states
-            )
-            if current_sig == expected_state_sig:
-                session_info = getattr(session, "info", None)
-                if isinstance(session_info, dict) and isinstance(session_info.get("_universe_req_scope"), dict):
-                    session_info["_universe_req_scope"]["ready_versions"] = cached_ready_versions
-                    session_info["_universe_req_scope"]["verified_checksums"] = cached_checksums
-                return cached_manifest.model_copy(update={"as_of": datetime.now(UTC)})
 
     authorized_source_ids = select(SourceProjectMapping.source_id).where(
         SourceProjectMapping.state == "CONFIRMED",
@@ -174,6 +189,7 @@ async def manifest(
     if isinstance(session_info, dict) and isinstance(session_info.get("_universe_req_scope"), dict):
         session_info["_universe_req_scope"]["ready_versions"] = ready_versions
     if not ready_versions:
+        _MANIFEST_FAST_CACHE.pop(fast_cache_key, None)
         return UniverseManifestOut(
             status="empty",
             as_of=datetime.now(UTC),
@@ -189,6 +205,24 @@ async def manifest(
             .with_for_update(read=True)
         )
     ).all()
+    current_state_sig = (
+        tuple(
+            (s.project_id, s.active_tree_version, s.active_routing_slot, s.active_search_epoch)
+            for s in states
+        ),
+        _ready_versions_signature(ready_versions),
+    )
+    cached_fast = _MANIFEST_FAST_CACHE.get(fast_cache_key)
+    if cached_fast is not None:
+        cached_at, expected_state_sig, cached_checksums, cached_manifest, _cached_ready_versions = cached_fast
+        if (
+            (time.monotonic() - cached_at) < _MANIFEST_FAST_CACHE_TTL_SEC
+            and expected_state_sig
+            and current_state_sig == expected_state_sig
+        ):
+            if isinstance(session_info, dict) and isinstance(session_info.get("_universe_req_scope"), dict):
+                session_info["_universe_req_scope"]["verified_checksums"] = cached_checksums
+            return cached_manifest.model_copy(update={"as_of": datetime.now(UTC)})
     states_by_project = {state.project_id: state for state in states}
     stale = set(project_ids) != set(states_by_project)
     integrity_failed = False
@@ -610,10 +644,7 @@ async def manifest(
         policy=_universe_policy(),
     )
     if trees and not integrity_failed and not stale:
-        state_sig = tuple(
-            (s.project_id, s.active_tree_version, s.active_routing_slot, s.active_search_epoch)
-            for s in states
-        )
+        state_sig = current_state_sig
         verified_checksums = {proj_id: rec.checksum for proj_id, (_st, rec) in active.items()}
         if isinstance(session_info, dict) and isinstance(session_info.get("_universe_req_scope"), dict):
             session_info["_universe_req_scope"]["verified_checksums"] = verified_checksums
