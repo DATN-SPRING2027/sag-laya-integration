@@ -2414,6 +2414,9 @@ async def revoke_project_document(
     )
 
     if not doc.is_active and all(v.status == "REVOKED" for v in versions):
+        from sag_api.api.v1.universe import clear_universe_caches
+
+        clear_universe_caches(project_id)
         return DocumentRevokeResponse(status="ALREADY_REVOKED", document_id=doc.id)
 
     now_utc = datetime.now(UTC)
@@ -2463,4 +2466,7 @@ async def revoke_project_document(
         await touch_source_revision(session, doc.source_id)
 
     await session.commit()
+    from sag_api.api.v1.universe import clear_universe_caches
+
+    clear_universe_caches(project_id)
     return DocumentRevokeResponse(status="REVOKED", document_id=doc.id)
