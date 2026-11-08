@@ -100,6 +100,14 @@ class AssistCoverageOut(StrictModel):
     truncated: bool = False
 
 
+class HandoverAssistUsageOut(StrictModel):
+    inputTokens: int = Field(default=0, ge=0)
+    cachedTokens: int = Field(default=0, ge=0)
+    outputTokens: int = Field(default=0, ge=0)
+    totalTokens: int = Field(default=0, ge=0)
+    calls: int = Field(default=0, ge=0)
+
+
 class HandoverAssistResponse(StrictModel):
     task: HandoverAssistTask
     candidates: list[ProposedCandidateOut] = Field(default_factory=list)
@@ -108,4 +116,5 @@ class HandoverAssistResponse(StrictModel):
     message: str | None = Field(default=None, max_length=1000)
     sections: list[GroundedAnswerSectionOut] = Field(default_factory=list)
     coverage: AssistCoverageOut | None = None
+    usage: HandoverAssistUsageOut | None = None
 

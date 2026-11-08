@@ -82,6 +82,16 @@ class MindMapNodeOut(BaseModel):
 MindMapNodeOut.model_rebuild()
 
 
+class MindMapUsageOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    inputTokens: int = Field(default=0, ge=0)
+    cachedTokens: int = Field(default=0, ge=0)
+    outputTokens: int = Field(default=0, ge=0)
+    totalTokens: int = Field(default=0, ge=0)
+    calls: int = Field(default=0, ge=0)
+
+
 class MindMapOut(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -97,3 +107,4 @@ class MindMapOut(BaseModel):
     generatedAt: datetime
     cached: bool = False
     hasSourceUpdates: bool = False
+    usage: MindMapUsageOut | None = None

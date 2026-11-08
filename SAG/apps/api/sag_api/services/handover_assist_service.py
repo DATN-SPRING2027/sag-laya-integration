@@ -16,6 +16,7 @@ from sag_api.core.error_taxonomy import ErrorCode, ErrorLayer, ErrorStage
 from sag_api.core.errors import ServiceUnavailableError, UpstreamError
 from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal
+from sag_api.core.token_usage import TokenLedger, extract_chat_usage, token_usage_scope
 from sag_api.generation.llm import LLMClient
 from sag_api.schemas.handover_assist import (
     AssistCoverageOut,
@@ -26,6 +27,7 @@ from sag_api.schemas.handover_assist import (
     HandoverAssistRequest,
     HandoverAssistResponse,
     HandoverAssistSourceInput,
+    HandoverAssistUsageOut,
     LocatorKind,
     ProposedCandidateOut,
     SourceRefPayload,
@@ -494,6 +496,33 @@ async def execute_handover_assist(
     catalog_text = _render_evidence_catalog(units)
     focus = (body.query or "").strip()
 
+    def _extract_usage_out(
+        ledger: TokenLedger,
+        messages: list[dict[str, str]],
+        raw_completion: str,
+    ) -> HandoverAssistUsageOut:
+        totals = ledger.to_summary().get("totals") or {}
+        llm_in = int(totals.get("llm_input_tokens", 0) or 0)
+        llm_cached = min(llm_in, int(totals.get("llm_cached_input_tokens", 0) or 0))
+        llm_out = int(totals.get("llm_output_tokens", 0) or 0)
+        llm_calls = max(1, int(totals.get("llm_calls", 0) or 1))
+        if llm_in <= 0 and llm_out <= 0:
+            est = extract_chat_usage(
+                None,
+                messages=messages,
+                completion_text=raw_completion,
+            )
+            llm_in = int(est.get("llm_input_tokens", 0) or 0)
+            llm_cached = 0
+            llm_out = int(est.get("llm_output_tokens", 0) or 0)
+        return HandoverAssistUsageOut(
+            inputTokens=max(0, llm_in - llm_cached),
+            cachedTokens=llm_cached,
+            outputTokens=llm_out,
+            totalTokens=llm_in + llm_out,
+            calls=llm_calls,
+        )
+
     if body.task == "SOURCE_PROPOSAL":
         messages = [
             {
@@ -515,7 +544,14 @@ async def execute_handover_assist(
                 ),
             },
         ]
-        parsed = _parse_llm_json(await llm.complete(messages))
+        with token_usage_scope(
+            component="handover_assist",
+            project_id=project_id,
+            tenant_id=principal.tenant_id or "",
+        ) as usage_ledger:
+            raw_completion = await llm.complete(messages)
+            usage_out = _extract_usage_out(usage_ledger, messages, raw_completion)
+        parsed = _parse_llm_json(raw_completion)
         raw_candidates = parsed.get("candidates")
         candidates: list[ProposedCandidateOut] = []
         seen_source_keys: set[tuple[str, str, int]] = set()
@@ -535,7 +571,12 @@ async def execute_handover_assist(
                     continue
                 seen_source_keys.add(src_key)
                 candidates.append(ProposedCandidateOut(source=unit.source, reason=reason))
-        return HandoverAssistResponse(task="SOURCE_PROPOSAL", candidates=candidates, coverage=coverage)
+        return HandoverAssistResponse(
+            task="SOURCE_PROPOSAL",
+            candidates=candidates,
+            coverage=coverage,
+            usage=usage_out,
+        )
 
     if body.task == "DRAFT_GENERATION":
         messages = [
@@ -560,7 +601,14 @@ async def execute_handover_assist(
                 ),
             },
         ]
-        parsed = _parse_llm_json(await llm.complete(messages))
+        with token_usage_scope(
+            component="handover_assist",
+            project_id=project_id,
+            tenant_id=principal.tenant_id or "",
+        ) as usage_ledger:
+            raw_completion = await llm.complete(messages)
+            usage_out = _extract_usage_out(usage_ledger, messages, raw_completion)
+        parsed = _parse_llm_json(raw_completion)
         raw_items = parsed.get("items")
         items: list[GeneratedDraftItemOut] = []
         if isinstance(raw_items, list):
@@ -589,7 +637,12 @@ async def execute_handover_assist(
                 layer=ErrorLayer.LLM,
                 stage=ErrorStage.GENERATE,
             )
-        return HandoverAssistResponse(task="DRAFT_GENERATION", items=items, coverage=coverage)
+        return HandoverAssistResponse(
+            task="DRAFT_GENERATION",
+            items=items,
+            coverage=coverage,
+            usage=usage_out,
+        )
 
     # QUESTION_ANSWER
     messages = [
@@ -612,7 +665,14 @@ async def execute_handover_assist(
             "content": f"Question: {focus}\n\nAuthorized published handover evidence:\n{catalog_text}",
         },
     ]
-    parsed = _parse_llm_json(await llm.complete(messages))
+    with token_usage_scope(
+        component="handover_assist",
+        project_id=project_id,
+        tenant_id=principal.tenant_id or "",
+    ) as usage_ledger:
+        raw_completion = await llm.complete(messages)
+        usage_out = _extract_usage_out(usage_ledger, messages, raw_completion)
+    parsed = _parse_llm_json(raw_completion)
     status_raw = str(parsed.get("answerStatus") or "").strip().upper()
     msg_raw = str(parsed.get("message") or "").strip()[:1000]
     raw_sections = parsed.get("sections")
@@ -639,6 +699,7 @@ async def execute_handover_assist(
             message=insufficient_msg,
             sections=[],
             coverage=coverage,
+            usage=usage_out,
         )
 
     return HandoverAssistResponse(
@@ -647,4 +708,5 @@ async def execute_handover_assist(
         message=msg_raw or "Grounded answer synthesized from authorized published handover sources.",
         sections=verified_sections,
         coverage=coverage,
+        usage=usage_out,
     )
