@@ -387,3 +387,214 @@ async def test_neural_cortex_cross_document_synapses_and_e2_tier(knowledge_db):
     assert detail_u3.synapses[0].target_document_name == "notes.md"
     assert detail_u3.synapses[0].shared_entities == ["project_alpha"]
     assert not session.new and not session.dirty and not session.deleted
+
+
+@pytest.mark.asyncio
+async def test_revoked_document_is_rejected_immediately_without_waiting_for_cache_ttl(knowledge_db, monkeypatch):
+    import hashlib
+
+    from sag_api.api.v1 import universe
+    from sag_api.db.models import (
+        IngestionRun,
+        ProjectSearchState,
+        SearchUnit,
+        SourceProjectMapping,
+        StageRun,
+        TreeManifest,
+        TreeRoutingProfile,
+    )
+    from sag_api.services import universe_knowledge_service as service
+    from sag_api.services.document_service import revoke_project_document
+    from sag_api.services.tree_publish_service import _checksum_manifest, _scoped_profile_checksum
+    from sag_api.services.tree_query_snapshot_service import _source_profile_payload
+
+    session, _ = knowledge_db
+    now = datetime.now(UTC)
+    version = await session.get(DocumentVersion, "version")
+    version.metadata_json = {"security_partition_id": "public"}
+    index_checksum = hashlib.sha256(b"search-unit").hexdigest()
+    session.add_all([
+        SearchUnit(
+            id="search-unit",
+            document_version_id=version.id,
+            block_from_id="block-u1",
+            block_to_id="block-u2",
+            security_partition_id="public",
+            content_hash=index_checksum,
+            token_count=10,
+            page_from=2,
+            page_to=2,
+            section_path="Retrieval",
+        ),
+        IngestionRun(
+            id="run",
+            tenant_id="tenant",
+            project_id="project",
+            document_version_id=version.id,
+            idempotency_key="run",
+            payload_hash=index_checksum,
+            status="COMPLETED",
+            started_at=now - timedelta(minutes=1),
+            completed_at=now,
+        ),
+        StageRun(
+            id="index",
+            run_id="run",
+            stage="INDEX_SEARCH",
+            status="SUCCESS",
+            duration_ms=10.0,
+            created_at=now,
+            metrics_json={
+                "manifest_verified": True,
+                "collection_name": "search_units_project",
+                "search_unit_count": 1,
+                "pg_count": 1,
+                "qdrant_count": 1,
+                "qdrant_indexed_count": 1,
+                "manifest_checksum": index_checksum,
+                "qdrant_checksum": index_checksum,
+            },
+        ),
+    ])
+    session.add(
+        SourceProjectMapping(
+            source_id="source",
+            organization_id="organization",
+            project_id="project",
+            state="CONFIRMED",
+            mapping_version=1,
+            confirmed_at=now,
+            confirmed_by="test",
+            approval_ref="test",
+        )
+    )
+    raw_manifest = {
+        "tenant_id": "tenant",
+        "project_id": "project",
+        "routing_profiles": [
+            {
+                "node_id": "leaf",
+                "project_id": "project",
+                "tenant_id": "tenant",
+                "partition_id": "public",
+                "unit_ids": ["u1", "u2"],
+            }
+        ],
+        "source_routing_profiles": [
+            {
+                "project_id": "project",
+                "source_id": "source",
+                "document_version_id": "version",
+                "partition_id": "public",
+                "tenant_id": "tenant",
+                "node_id": "leaf",
+            }
+        ],
+        "search_unit_assignments": [
+            {
+                "source_id": "source",
+                "document_version_id": "version",
+                "partition_id": "public",
+                "search_unit_id": "search-unit",
+                "knowledge_unit_ids": ["u1", "u2"],
+            }
+        ],
+        "edges": [["u1", "u2", 0.7]],
+    }
+    digest = _checksum_manifest(raw_manifest)
+    tree_ver = f"tree-{digest[:24]}"
+    session.add(
+        TreeManifest(
+            tree_version=tree_ver,
+            project_id="project",
+            config_version="v1",
+            node_count=1,
+            leaf_count=1,
+            max_leaf_size=2,
+            giant_ratio=0.0,
+            routing_recall_at_k=1.0,
+            escape_win_rate=0.0,
+            acl_blackhole_rate=0.0,
+            status="ACTIVE",
+            checksum=digest,
+            manifest_json=raw_manifest,
+        )
+    )
+    session.add(
+        ProjectSearchState(
+            project_id="project",
+            active_tree_version=tree_ver,
+            active_routing_slot="SLOT_A",
+            slot_a_tree_version=tree_ver,
+            active_search_epoch=2,
+        )
+    )
+    routing_profile = TreeRoutingProfile(
+        **raw_manifest["source_routing_profiles"][0],
+        tree_version=tree_ver,
+        is_leaf=True,
+        accessible_unit_count=2,
+        sparse_json=[["retrieval", 1.0]],
+        entities_json=[],
+    )
+    routing_profile.profile_checksum = _scoped_profile_checksum(tree_ver, _source_profile_payload(routing_profile))
+    session.add(routing_profile)
+    await session.commit()
+
+    principal = SimpleNamespace(
+        allowed_project_ids=frozenset({"project"}),
+        allowed_partition_ids=frozenset({"public"}),
+        tenant_id="tenant",
+        organization_id="organization",
+        subject="reader",
+    )
+    user = SimpleNamespace(id="reader")
+    monkeypatch.setattr(universe, "_MANIFEST_FAST_CACHE", {})
+    monkeypatch.setattr(universe, "_MANIFEST_TREE_OUTPUT_CACHE", {})
+    monkeypatch.setattr(service, "_SNAPSHOT_MEMBERSHIP_CACHE", {})
+    monkeypatch.setattr(service, "_VERIFIED_TREE_MANIFEST_CACHE", {})
+    fast_key = ("tenant", "organization", frozenset({"project"}), frozenset({"public"}))
+
+    # 1. Before revocation: cluster query succeeds and populates _SNAPSHOT_MEMBERSHIP_CACHE + page_cache.
+    snap_before = await universe._knowledge_snapshot(session, user, principal, "project", tree_ver)
+    page_before = await knowledge_universe_page(session, snap_before, node_id="leaf", limit=24)
+    assert [u.id for u in page_before.units] == ["u1", "u2"]
+    assert snap_before._runtime_cache is not None and len(snap_before._runtime_cache["page_cache"]) == 1
+    assert fast_key in universe._MANIFEST_FAST_CACHE
+
+    # 2. Even if a document is deactivated in DB while page_cache holds a cached page on snap_before,
+    # knowledge_universe_page must re-verify unit liveness and never serve revoked preview snippets.
+    doc = await session.get(Document, "document")
+    doc.is_active = False
+    await session.flush()
+    page_after_db_deactivate = await knowledge_universe_page(session, snap_before, node_id="leaf", limit=24)
+    assert page_after_db_deactivate.units == []
+    assert page_after_db_deactivate.total == 0
+
+    # Restore active state, warm caches again, then revoke via revoke_project_document API service.
+    doc.is_active = True
+    await session.commit()
+    snap_warm = await universe._knowledge_snapshot(session, user, principal, "project", tree_ver)
+    page_warm = await knowledge_universe_page(session, snap_warm, node_id="leaf", limit=24)
+    assert [u.id for u in page_warm.units] == ["u1", "u2"]
+
+    await session.rollback()
+    session_factory = async_sessionmaker(session.bind, expire_on_commit=False)
+    # The writer's process-local invalidation cannot reach a different reader worker.
+    with monkeypatch.context() as writer_process:
+        writer_process.setattr(universe, "clear_universe_caches", lambda _project_id: None, raising=False)
+        async with session_factory() as writer:
+            revoke_res = await revoke_project_document(
+                writer,
+                tenant_id="tenant",
+                project_id="project",
+                document_id="document",
+                reason="SECURITY_REVOKE",
+            )
+        assert revoke_res.status == "REVOKED"
+
+    # 3. A new reader still has the warm manifest but must observe the committed revocation.
+    assert fast_key in universe._MANIFEST_FAST_CACHE
+    async with session_factory() as reader:
+        with pytest.raises(NotFoundError):
+            await universe._knowledge_snapshot(reader, user, principal, "project", tree_ver)
