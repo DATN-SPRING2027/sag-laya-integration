@@ -24,6 +24,7 @@ from sqlalchemy.orm import aliased
 from sag_api.core.errors import ForbiddenError, ServiceUnavailableError
 from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal
+from sag_api.core.token_usage import extract_chat_usage, token_usage_scope
 from sag_api.db.base import new_id
 from sag_api.db.models import (
     CanonicalBlock,
@@ -44,6 +45,7 @@ from sag_api.schemas.mind_map import (
     MindMapGenerateIn,
     MindMapNodeOut,
     MindMapOut,
+    MindMapUsageOut,
 )
 
 log = get_logger("services.mind_map")
@@ -1658,6 +1660,7 @@ async def generate_project_mind_map(
     generation_mode: Literal["llm", "outline_fallback"] = "llm"
     fallback_reason: Literal["LLM_UNAVAILABLE", "LLM_INVALID_OUTPUT"] | None = None
     validated_result: tuple[MindMapNodeOut, list[MindMapCitationOut]] | None = None
+    usage_out: MindMapUsageOut | None = None
 
     if not getattr(llm, "configured", False):
         generation_mode = "outline_fallback"
@@ -1668,26 +1671,55 @@ async def generate_project_mind_map(
             catalog=catalog,
             outline_by_doc=outline_by_doc,
         )
-        try:
-            raw_output = await _call_llm_json(llm, messages)
-        except Exception as exc:  # noqa: BLE001 - authorized sources loaded cleanly; degrade gracefully to outline
-            log.warning("mind map LLM synthesis unavailable error_type=%s", type(exc).__name__)
-            generation_mode = "outline_fallback"
-            fallback_reason = "LLM_UNAVAILABLE"
-        else:
-            parsed_json = _extract_json_dict(raw_output)
-            if parsed_json is not None:
-                validated_result = _validate_and_normalize_llm_tree(
-                    parsed_json,
-                    topic=topic_display,
-                    catalog=catalog,
-                )
-            if validated_result is None:
-                log.warning(
-                    "mind map LLM output failed structural/citation validation; using outline fallback"
-                )
+        raw_output: str | None = None
+        with token_usage_scope(
+            component="mind_map",
+            project_id=project_id,
+            tenant_id=tenant_id,
+        ) as usage_ledger:
+            try:
+                raw_output = await _call_llm_json(llm, messages)
+            except Exception as exc:  # noqa: BLE001 - authorized sources loaded cleanly; degrade gracefully to outline
+                log.warning("mind map LLM synthesis unavailable error_type=%s", type(exc).__name__)
                 generation_mode = "outline_fallback"
-                fallback_reason = "LLM_INVALID_OUTPUT"
+                fallback_reason = "LLM_UNAVAILABLE"
+            else:
+                parsed_json = _extract_json_dict(raw_output)
+                if parsed_json is not None:
+                    validated_result = _validate_and_normalize_llm_tree(
+                        parsed_json,
+                        topic=topic_display,
+                        catalog=catalog,
+                    )
+                if validated_result is None:
+                    log.warning(
+                        "mind map LLM output failed structural/citation validation; using outline fallback"
+                    )
+                    generation_mode = "outline_fallback"
+                    fallback_reason = "LLM_INVALID_OUTPUT"
+            totals = usage_ledger.to_summary().get("totals") or {}
+            llm_in = int(totals.get("llm_input_tokens", 0) or 0)
+            llm_cached = min(llm_in, int(totals.get("llm_cached_input_tokens", 0) or 0))
+            llm_out = int(totals.get("llm_output_tokens", 0) or 0)
+            llm_calls = max(1, int(totals.get("llm_calls", 0) or 1))
+            if llm_in <= 0 and llm_out <= 0 and raw_output is not None:
+                est = extract_chat_usage(
+                    None,
+                    messages=messages,
+                    completion_text=raw_output,
+                )
+                llm_in = int(est.get("llm_input_tokens", 0) or 0)
+                llm_cached = 0
+                llm_out = int(est.get("llm_output_tokens", 0) or 0)
+            llm_uncached = max(0, llm_in - llm_cached)
+            if llm_in > 0 or llm_out > 0:
+                usage_out = MindMapUsageOut(
+                    inputTokens=llm_uncached,
+                    cachedTokens=llm_cached,
+                    outputTokens=llm_out,
+                    totalTokens=llm_in + llm_out,
+                    calls=llm_calls,
+                )
 
     if validated_result is None:
         tree_out, citations_out = _build_outline_fallback_tree(
@@ -1729,4 +1761,5 @@ async def generate_project_mind_map(
         generatedAt=now,
         cached=False,
         hasSourceUpdates=False,
+        usage=usage_out,
     )
