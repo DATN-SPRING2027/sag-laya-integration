@@ -321,32 +321,6 @@ async def _prepare_global_search(
     *,
     principal: VerifiedPrincipal,
 ) -> _PreparedGlobalSearch:
-    route_plan = await _build_query_route(
-        body.query,
-        body.source_ids,
-        body.strategy,
-        body.retrieval_mode,
-        requested_top_k=body.top_k,
-        trace_strategy_plan=True,
-    )
-    if not route_plan.need_retrieval:
-        stats = _with_query_route_stats(
-            {
-                "sources": 0,
-                "requested_strategy": route_plan.strategy,
-                "effective_strategy": None,
-                "fallback_used": False,
-            },
-            route_plan,
-        )
-        outcome = SearchOutcome(query=body.query, sections=[], stats=stats)
-        return _PreparedGlobalSearch(
-            sources=[],
-            outcome=outcome,
-            response=SearchResponse(query=body.query, sections=[], stats=stats, answer_status="skipped"),
-            answer_skipped=True,
-        )
-
     sources = await search_source_candidates(
         session,
         principal=principal,
@@ -358,26 +332,54 @@ async def _prepare_global_search(
     # request never occupies a pooled database connection while waiting on the
     # engine or model. SessionLocal uses expire_on_commit=False.
     await session.commit()
-    if not sources:
-        stats = _with_query_route_stats({"sources": 0}, route_plan)
-        outcome = SearchOutcome(query=body.query, sections=[], stats=stats)
-        return _PreparedGlobalSearch(
-            sources=[],
-            outcome=outcome,
-            response=SearchResponse(query=body.query, sections=[], stats=stats, answer_status="pending"),
+    resolved_project_id = _resolve_search_project_id(principal, sources)
+    with token_usage_scope(project_id=resolved_project_id, tenant_id=principal.tenant_id):
+        route_plan = await _build_query_route(
+            body.query,
+            body.source_ids,
+            body.strategy,
+            body.retrieval_mode,
+            requested_top_k=body.top_k,
+            trace_strategy_plan=True,
         )
+        if not route_plan.need_retrieval:
+            stats = _with_query_route_stats(
+                {
+                    "sources": 0,
+                    "requested_strategy": route_plan.strategy,
+                    "effective_strategy": None,
+                    "fallback_used": False,
+                },
+                route_plan,
+            )
+            outcome = SearchOutcome(query=body.query, sections=[], stats=stats)
+            return _PreparedGlobalSearch(
+                sources=[],
+                outcome=outcome,
+                response=SearchResponse(query=body.query, sections=[], stats=stats, answer_status="skipped"),
+                answer_skipped=True,
+            )
 
-    refs = {source.sag_source_config_id: source for source in sources}
-    from sag_api.services.search_unit_retrieval_service import retrieve_search_unit_sections
+        if not sources:
+            stats = _with_query_route_stats({"sources": 0}, route_plan)
+            outcome = SearchOutcome(query=body.query, sections=[], stats=stats)
+            return _PreparedGlobalSearch(
+                sources=[],
+                outcome=outcome,
+                response=SearchResponse(query=body.query, sections=[], stats=stats, answer_status="pending"),
+            )
 
-    outcome = await retrieve_search_unit_sections(
-        engine_manager,
-        sources,
-        body.query,
-        principal=principal,
-        top_k=body.top_k,
-        query_strategy_plan=route_plan.strategy_plan,
-    )
+        refs = {source.sag_source_config_id: source for source in sources}
+        from sag_api.services.search_unit_retrieval_service import retrieve_search_unit_sections
+
+        outcome = await retrieve_search_unit_sections(
+            engine_manager,
+            sources,
+            body.query,
+            principal=principal,
+            top_k=body.top_k,
+            query_strategy_plan=route_plan.strategy_plan,
+        )
     permitted_config_ids = set(refs)
     permitted_sections = [
         section
