@@ -6,6 +6,7 @@ upstream gateway omits ``usage``) across all SAG stages:
   - ``knowledge_foundation_embedding``: Phase 5A Foundation KnowledgeUnit dense embedding
   - ``knowledge_e2_enrichment``: Historical Phase 5B E2 bucket (removed from active pipeline; kept for legacy DB rows)
   - ``legacy_event_extraction``: Optional legacy event extraction token usage
+  - ``decision_router``: Pre-retrieve SystemOne / Kev-4b decision routing
   - ``query_embedding``: Search/RAG query vectorization
   - ``answer_generation``: Grounded RAG answer synthesis (streaming & non-streaming)
   - ``agent_turn`` / ``llm_completion``: Agent tool-calling turns and auxiliary LLM calls
@@ -34,6 +35,11 @@ DEFAULT_MODEL_PRICING_PER_1M_USD: dict[str, dict[str, float]] = {
     "baai/bge-large-zh-v1.5": {"embedding_input_per_1m": 0.01},
     "text-embedding-3-small": {"embedding_input_per_1m": 0.02},
     "text-embedding-3-large": {"embedding_input_per_1m": 0.13},
+    "kev-4b": {
+        "llm_input_per_1m": 0.04,
+        "llm_cached_input_per_1m": 0.04,
+        "llm_output_per_1m": 0.04,
+    },
     "qwen/qwen3-8b": {
         "llm_input_per_1m": 0.06,
         "llm_cached_input_per_1m": 0.06,
