@@ -7,6 +7,7 @@ import math
 import re
 import threading
 import time
+import unicodedata
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -203,14 +204,103 @@ def _section_key(section: RetrievedSection) -> tuple[str, str]:
 from sag_api.services.search_index_service import COMMON_STOPWORDS
 
 _LEXICAL_STOPWORDS = COMMON_STOPWORDS
+_CONTINUOUS_SCRIPT_TERM_RE = re.compile(
+    r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+    r"\u0e00-\u0e7f\u0e80-\u0eff\u1780-\u17ff\u1000-\u109f]"
+)
 
 
-def _term_matches_text(term: str, text: str) -> bool:
+def _normalize_spaced_lexical_text(value: str) -> str:
+    tokens = re.findall(r"[^\W_]+", unicodedata.normalize("NFC", value or "").lower(), flags=re.UNICODE)
+    return f" {' '.join(tokens)} " if tokens else ""
+
+
+def _ascii_lexical_root(word: str) -> str:
+    if not (len(word) >= 5 and word.isascii() and word.isalpha()):
+        return word
+    w = word
+    if len(w) >= 6 and w.endswith("ies"):
+        w = w[:-3] + "y"
+    elif len(w) >= 5 and w.endswith("s") and not w.endswith(("ss", "us", "is")):
+        w = w[:-1]
+    for suffix in ("ations", "ation", "ingly", "edly", "ing", "ed"):
+        if len(w) >= len(suffix) + 4 and w.endswith(suffix) and not w.endswith("eed"):
+            w = w[: -len(suffix)]
+            break
+    if len(w) >= 5 and w.endswith("e") and not w.endswith(("ee", "le")):
+        w = w[:-1]
+    return w if len(w) >= 4 else word
+
+
+def _extract_ascii_roots(spaced_text: str) -> frozenset[str]:
+    if not spaced_text:
+        return frozenset()
+    return frozenset(
+        _ascii_lexical_root(tok)
+        for tok in spaced_text.split()
+        if len(tok) >= 4 and tok.isascii() and tok.isalpha()
+    )
+
+
+def _normalize_query_term(term: str) -> str:
+    if not term:
+        return ""
+    if _CONTINUOUS_SCRIPT_TERM_RE.search(term) or any(ch.isdigit() for ch in term):
+        return normalize_lexical_text(term)
+    spaced = _normalize_spaced_lexical_text(term).strip()
+    return spaced if spaced else normalize_lexical_text(term)
+
+
+def _term_matches_text(
+    term: str,
+    text: str,
+    *,
+    spaceless_text: str | None = None,
+    root_tokens: frozenset[str] | None = None,
+) -> bool:
+    if not term or not text:
+        return False
+    # Continuous scripts (CJK/Kana/Thai) or digit-bearing / glued identifiers match spaceless haystack
+    if _CONTINUOUS_SCRIPT_TERM_RE.search(term) or any(ch.isdigit() for ch in term):
+        compact = spaceless_text if spaceless_text is not None else text.replace(" ", "")
+        return term in compact
+    if text.startswith(" ") and text.endswith(" "):
+        if f" {term} " in text:
+            return True
+        if " " in term:
+            glued = term.replace(" ", "")
+            return bool(glued) and f" {glued} " in text
+        if (
+            len(term) >= 5
+            and term.endswith("s")
+            and not term.endswith(("ss", "us", "is"))
+            and f" {term[:-1]} " in text
+        ):
+            return True
+        if len(term) >= 4 and not term.endswith("s") and f" {term}s " in text:
+            return True
+        if len(term) >= 5 and term.isascii() and term.isalpha():
+            t_root = _ascii_lexical_root(term)
+            effective_roots = root_tokens if root_tokens is not None else _extract_ascii_roots(text)
+            if t_root in effective_roots:
+                return True
+        return False
     if term in text:
         return True
-    if len(term) >= 5 and term.endswith("s") and not term.endswith("ss") and term[:-1] in text:
+    if len(term) >= 5 and term.endswith("s") and not term.endswith(("ss", "us", "is")) and term[:-1] in text:
         return True
     return False
+
+
+def _phrase_matches_text(phrase: str, spaced_phrase: str, text: str, *, spaceless_text: str | None = None) -> bool:
+    if not phrase or len(phrase) < 2 or not text:
+        return False
+    if _CONTINUOUS_SCRIPT_TERM_RE.search(phrase):
+        compact = spaceless_text if spaceless_text is not None else text.replace(" ", "")
+        return phrase in compact
+    if spaced_phrase and text.startswith(" ") and text.endswith(" "):
+        return spaced_phrase in text
+    return phrase in text
 
 
 def _lexical_relevance(
@@ -223,26 +313,39 @@ def _lexical_relevance(
         query,
         segmentation_enabled=settings.search_chinese_segmentation_enabled,
     )
-    heading = normalize_lexical_text(section.heading)
-    content = normalize_lexical_text(section.content)
-    text = f"{heading}{content}"
+    heading = _normalize_spaced_lexical_text(section.heading)
+    content = _normalize_spaced_lexical_text(section.content)
+    text = f"{heading}{content[1:]}" if heading and content else (heading or content)
     if not text:
         return 0.0
+    heading_compact = heading.replace(" ", "")
+    text_compact = text.replace(" ", "")
+    heading_roots = _extract_ascii_roots(heading)
+    text_roots = _extract_ascii_roots(text)
 
-    raw_terms = [normalize_lexical_text(term) for term in effective.scoring_terms]
+    raw_terms = [_normalize_query_term(term) for term in effective.scoring_terms]
     raw_terms = [term for term in raw_terms if term]
     filtered_terms = [term for term in raw_terms if term not in _LEXICAL_STOPWORDS]
     terms = filtered_terms if filtered_terms else raw_terms
+    from sag_api.services.query_analysis import _remove_query_noise
+
     phrase = effective.normalized_phrase
+    spaced_phrase = _normalize_spaced_lexical_text(_remove_query_noise(query))
 
     score = 0.0
-    if phrase and len(phrase) >= 2 and phrase in text:
+    if _phrase_matches_text(phrase, spaced_phrase, text, spaceless_text=text_compact):
         score += 0.55
-        if phrase in heading:
+        if _phrase_matches_text(phrase, spaced_phrase, heading, spaceless_text=heading_compact):
             score += 0.2
     if terms:
-        matched = sum(_term_matches_text(term, text) for term in terms)
-        heading_matched = sum(_term_matches_text(term, heading) for term in terms)
+        matched = sum(
+            _term_matches_text(term, text, spaceless_text=text_compact, root_tokens=text_roots)
+            for term in terms
+        )
+        heading_matched = sum(
+            _term_matches_text(term, heading, spaceless_text=heading_compact, root_tokens=heading_roots)
+            for term in terms
+        )
         score += 0.35 * matched / len(terms)
         score += 0.15 * heading_matched / len(terms)
     return min(1.0, score)
@@ -253,26 +356,37 @@ def _terms_from_query_slice(slice_text: str) -> tuple[str, ...]:
         slice_text,
         segmentation_enabled=settings.search_chinese_segmentation_enabled,
     )
-    raw = [normalize_lexical_text(term) for term in analyzed.scoring_terms]
+    raw = [_normalize_query_term(term) for term in analyzed.scoring_terms]
     raw = [term for term in raw if term]
     filtered = [term for term in raw if term not in _LEXICAL_STOPWORDS]
     return tuple(filtered if filtered else raw)
 
 
-def _adjacent_proximity_score(terms: tuple[str, ...], text: str) -> float:
+def _adjacent_proximity_score(terms: tuple[str, ...], text: str, *, spaceless_text: str | None = None) -> float:
     if not text or len(terms) < 2:
         return 0.0
+    compact = spaceless_text if spaceless_text is not None else text.replace(" ", "")
+    is_spaced = text.startswith(" ") and text.endswith(" ")
     hits = 0.0
     pairs = len(terms) - 1
     for idx in range(pairs):
         t1, t2 = terms[idx], terms[idx + 1]
-        if f"{t1}{t2}" in text or f"{t2}{t1}" in text:
-            hits += 1.0
-            continue
-        pos1 = text.find(t1)
-        pos2 = text.find(t2)
-        if pos1 != -1 and pos2 != -1 and abs(pos1 - pos2) <= max(48, len(t1) + len(t2) + 24):
-            hits += 0.65
+        if is_spaced and not (_CONTINUOUS_SCRIPT_TERM_RE.search(t1) or _CONTINUOUS_SCRIPT_TERM_RE.search(t2)):
+            if f" {t1} {t2} " in text or f" {t2} {t1} " in text:
+                hits += 1.0
+                continue
+            pos1 = text.find(f" {t1} ")
+            pos2 = text.find(f" {t2} ")
+            if pos1 != -1 and pos2 != -1 and abs(pos1 - pos2) <= max(56, len(t1) + len(t2) + 32):
+                hits += 0.65
+        else:
+            if f"{t1}{t2}" in compact or f"{t2}{t1}" in compact:
+                hits += 1.0
+                continue
+            pos1 = compact.find(t1)
+            pos2 = compact.find(t2)
+            if pos1 != -1 and pos2 != -1 and abs(pos1 - pos2) <= max(48, len(t1) + len(t2) + 24):
+                hits += 0.65
     return min(1.0, hits / pairs)
 
 
@@ -282,25 +396,42 @@ def _score_term_sequence(
     text: str,
     heading: str,
     phrase: str,
+    spaced_phrase: str = "",
     term_weights: dict[str, float],
     raw_heading: str = "",
+    spaceless_text: str | None = None,
+    spaceless_heading: str | None = None,
+    text_roots: frozenset[str] | None = None,
+    heading_roots: frozenset[str] | None = None,
 ) -> float:
     if not text or not terms:
         return 0.0
+    text_compact = spaceless_text if spaceless_text is not None else text.replace(" ", "")
+    head_compact = spaceless_heading if spaceless_heading is not None else heading.replace(" ", "")
+    eff_text_roots = text_roots if text_roots is not None else _extract_ascii_roots(text)
+    eff_head_roots = heading_roots if heading_roots is not None else _extract_ascii_roots(heading)
     total_w = sum(term_weights.get(t, 1.0) for t in terms) or 1.0
-    matched_w = sum(term_weights.get(t, 1.0) for t in terms if _term_matches_text(t, text))
-    head_w = sum(term_weights.get(t, 1.0) for t in terms if _term_matches_text(t, heading))
+    matched_w = sum(
+        term_weights.get(t, 1.0)
+        for t in terms
+        if _term_matches_text(t, text, spaceless_text=text_compact, root_tokens=eff_text_roots)
+    )
+    head_w = sum(
+        term_weights.get(t, 1.0)
+        for t in terms
+        if _term_matches_text(t, heading, spaceless_text=head_compact, root_tokens=eff_head_roots)
+    )
     cov_text = matched_w / total_w
     cov_head = head_w / total_w
     prox_text = (
         1.0
-        if (phrase and len(phrase) >= 2 and phrase in text)
-        else _adjacent_proximity_score(terms, text)
+        if _phrase_matches_text(phrase, spaced_phrase, text, spaceless_text=text_compact)
+        else _adjacent_proximity_score(terms, text, spaceless_text=text_compact)
     )
     prox_head = (
         1.0
-        if (phrase and len(phrase) >= 2 and phrase in heading)
-        else _adjacent_proximity_score(terms, heading)
+        if _phrase_matches_text(phrase, spaced_phrase, heading, spaceless_text=head_compact)
+        else _adjacent_proximity_score(terms, heading, spaceless_text=head_compact)
     )
     if raw_heading and terms:
         # Check if the leaf heading title (after the last structural separator) is 100% matched
@@ -311,7 +442,11 @@ def _score_term_sequence(
             for w in re.findall(r"[^\W_]+", clause_title.lower(), flags=re.UNICODE)
         ]
         title_informative = [t for t in title_terms if len(t) >= 2 and t not in _LEXICAL_STOPWORDS]
-        if len(title_informative) >= 2 and set(title_informative) <= set(terms):
+        expanded_single_terms = set(terms)
+        for t in terms:
+            if " " in t:
+                expanded_single_terms.update(t.split())
+        if len(title_informative) >= 2 and set(title_informative) <= expanded_single_terms:
             max_w = max((term_weights.get(t, 1.0) for t in terms), default=1.0)
             if any(term_weights.get(t, 1.0) >= 0.62 * max_w for t in title_informative):
                 cov_head = max(cov_head, 0.96)
@@ -473,7 +608,7 @@ def rerank_sections(
             ),
         )
 
-    raw_terms = [normalize_lexical_text(term) for term in effective.scoring_terms]
+    raw_terms = [_normalize_query_term(term) for term in effective.scoring_terms]
     raw_terms = [term for term in raw_terms if term]
     filtered_terms = [term for term in raw_terms if term not in _LEXICAL_STOPWORDS]
     query_term_list = tuple(filtered_terms if filtered_terms else raw_terms)
@@ -485,7 +620,7 @@ def rerank_sections(
             *effective.features.identifier_terms,
             *effective.features.path_terms,
         )
-        if (norm := normalize_lexical_text(term))
+        if (norm := _normalize_query_term(term))
     )
     clauses = decompose_query_clauses(query)
     if anchor_terms:
@@ -496,35 +631,79 @@ def rerank_sections(
         else ()
     )
 
-    doc_texts: dict[str, str] = {}
-    section_norm_cache: dict[tuple[str, str], tuple[str, str]] = {}
+    doc_texts: dict[str, tuple[str, str, set[str]]] = {}
+    section_norm_cache: dict[
+        tuple[str, str], tuple[str, str, str, str, frozenset[str], frozenset[str]]
+    ] = {}
     for key, section in merged.items():
         contextual_heading = " ".join(
             part
             for part in (section.document_name, section.section_path, section.heading)
             if part
         )
-        head_norm = normalize_lexical_text(contextual_heading or section.heading)
-        body_norm = normalize_lexical_text(section.content)
-        full_norm = f"{head_norm}{body_norm}"
-        section_norm_cache[key] = (head_norm, full_norm)
+        head_spaced = _normalize_spaced_lexical_text(contextual_heading or section.heading)
+        body_spaced = _normalize_spaced_lexical_text(section.content)
+        full_spaced = (
+            f"{head_spaced}{body_spaced[1:]}"
+            if head_spaced and body_spaced
+            else (head_spaced or body_spaced)
+        )
+        head_compact = head_spaced.replace(" ", "")
+        full_compact = full_spaced.replace(" ", "")
+        head_roots = _extract_ascii_roots(head_spaced)
+        full_roots = _extract_ascii_roots(full_spaced)
+        section_norm_cache[key] = (
+            head_spaced,
+            full_spaced,
+            head_compact,
+            full_compact,
+            head_roots,
+            full_roots,
+        )
         d_id = _document_identity(section)
-        doc_texts[d_id] = f"{doc_texts.get(d_id, '')}{full_norm}"
+        prev_spaced, prev_compact, prev_roots = doc_texts.get(d_id, ("", "", set()))
+        next_spaced = (
+            f"{prev_spaced}{full_spaced[1:]}"
+            if prev_spaced and full_spaced
+            else (prev_spaced or full_spaced)
+        )
+        prev_roots.update(full_roots)
+        doc_texts[d_id] = (next_spaced, f"{prev_compact}{full_compact}", prev_roots)
 
+    doc_frozen_roots: dict[str, frozenset[str]] = {
+        d_id: frozenset(d_roots) for d_id, (_s, _c, d_roots) in doc_texts.items()
+    }
     all_distinct_terms = set(query_term_list)
     for ct in clause_term_lists:
         all_distinct_terms.update(ct)
     n_docs = max(1, len(doc_texts))
     term_weights: dict[str, float] = {}
     for term in all_distinct_terms:
-        df = sum(1 for d_txt in doc_texts.values() if _term_matches_text(term, d_txt))
+        df = sum(
+            1
+            for d_id, (d_spaced, d_compact, _r) in doc_texts.items()
+            if _term_matches_text(
+                term,
+                d_spaced,
+                spaceless_text=d_compact,
+                root_tokens=doc_frozen_roots[d_id],
+            )
+        )
         idf = math.log(1.0 + (n_docs - df + 0.5) / (df + 0.5)) + 1.0
-        if term in anchor_terms or any(term in a or a in term for a in anchor_terms if len(a) >= 4):
+        term_compact = term.replace(" ", "")
+        if term in anchor_terms or any(
+            term_compact in a.replace(" ", "") or a.replace(" ", "") in term_compact
+            for a in anchor_terms
+            if len(a) >= 4
+        ):
             idf *= 1.65
-        elif term in salient_terms or any(c.isdigit() for c in term):
+        elif term in salient_terms or term_compact in salient_terms or any(c.isdigit() for c in term):
             idf *= 1.45
         term_weights[term] = idf
 
+    from sag_api.services.query_analysis import _remove_query_noise
+
+    spaced_query_phrase = _normalize_spaced_lexical_text(_remove_query_noise(query))
     top_semantic_score = max(semantic_scores.values(), default=0.0)
     lexical_scores: dict[tuple[str, str], float] = {}
     for key, section in merged.items():
@@ -542,25 +721,35 @@ def rerank_sections(
             _lexical_relevance(query, section, analysis=effective),
             _lexical_relevance(query, contextual_section, analysis=effective),
         )
-        head_norm, full_norm = section_norm_cache[key]
+        head_spaced, full_spaced, head_compact, full_compact, head_roots, full_roots = section_norm_cache[key]
         interaction_full = _score_term_sequence(
             query_term_list,
-            text=full_norm,
-            heading=head_norm,
+            text=full_spaced,
+            heading=head_spaced,
             phrase=effective.normalized_phrase,
+            spaced_phrase=spaced_query_phrase,
             term_weights=term_weights,
             raw_heading=contextual_heading or section.heading or "",
+            spaceless_text=full_compact,
+            spaceless_heading=head_compact,
+            text_roots=full_roots,
+            heading_roots=head_roots,
         )
         clause_best = (
             max(
                 (
                     _score_term_sequence(
                         ct,
-                        text=full_norm,
-                        heading=head_norm,
+                        text=full_spaced,
+                        heading=head_spaced,
                         phrase="",
+                        spaced_phrase="",
                         term_weights=term_weights,
                         raw_heading=contextual_heading or section.heading or "",
+                        spaceless_text=full_compact,
+                        spaceless_heading=head_compact,
+                        text_roots=full_roots,
+                        heading_roots=head_roots,
                     )
                     for ct in clause_term_lists
                 ),
@@ -897,7 +1086,7 @@ def select_diverse_sections(
                     or doc_rank_idx == 1
                     or len(unique) <= limit + 1
                 )
-                else max(admission_ratio, 0.835)
+                else max(admission_ratio, 0.82)
             )
             doc_name_tokens = {
                 normalize_lexical_text(tok)
@@ -907,9 +1096,19 @@ def select_diverse_sections(
                     flags=re.UNICODE,
                 )
             }
-            matches_salient_doc_name = bool(salient_doc_terms and (salient_doc_terms & doc_name_tokens))
+            salient_doc_matches = salient_doc_terms & doc_name_tokens if salient_doc_terms else set()
+            matches_salient_doc_name = (
+                bool(salient_doc_matches)
+                if allow_wide_docs
+                else len(salient_doc_matches) >= 2
+            )
+            salient_doc_floor = (
+                max(0.35, round(0.72 * top_doc_score, 6))
+                if allow_wide_docs
+                else max(0.55, round(0.88 * top_doc_score, 6))
+            )
             if d_score >= max(0.20, round(eff_ratio * top_doc_score, 6)) or (
-                matches_salient_doc_name and d_score >= max(0.35, round(0.72 * top_doc_score, 6))
+                matches_salient_doc_name and d_score >= salient_doc_floor
             ):
                 admitted_docs.add(d_key)
 
@@ -968,12 +1167,20 @@ def select_diverse_sections(
                 per_document_limit == 1
                 or all(doc_chunk_counts.get(d, 0) <= 1 for d in initial_admitted_docs)
             )
+            allow_wide_sample = (
+                unbounded_limit
+                or features.multi_hop
+                or per_document_limit == 1
+                or len(unique) <= limit + 1
+            )
             eff_floor = (
                 max(0.20, 0.40 * top_doc_score)
                 if (per_document_limit == 1 and all_initial_single_chunk)
                 else fallback_doc_floor
                 if (unbounded_limit or per_document_limit == 1 or (features.multi_hop and len(unique) <= limit + 1))
                 else max(0.45, 0.78 * top_doc_score)
+                if allow_wide_sample
+                else max(0.55, 0.88 * top_doc_score)
             )
             next_doc = next(
                 (
@@ -998,7 +1205,7 @@ def select_diverse_sections(
                         or index == doc_best_idx.get(doc_key(unique[index]))
                     )
                 ]
-            else:
+            elif allow_wide_sample:
                 remaining = [
                     index
                     for index in range(len(unique))

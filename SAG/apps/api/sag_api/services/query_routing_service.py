@@ -206,8 +206,11 @@ async def capture_routing_decisions(
     planner_trace: dict[str, object],
     principal: object | None = None,
     timeout_seconds: float | None = None,
+    query_vector_tasks_by_scope: Mapping[str, Any] | None = None,
 ) -> dict[tuple[str, str, str, str], RouteDecision]:
     """Capture all per-Project profiles in one provider call for request consistency."""
+    import inspect
+
     scopes = [routing_scope_for_group(group) for group in groups]
     expected = {scope_fingerprint(scope): scope for scope in scopes}
     acl_fingerprint = principal_acl_fingerprint(principal)
@@ -217,12 +220,33 @@ async def capture_routing_decisions(
     provider = getattr(engine_manager, "get_routing_snapshot", None)
     if callable(provider):
         request_snapshot_id: str | None = None
+        provider_kwargs: dict[str, Any] = {
+            "query": query,
+            "scopes": scopes,
+            "planner": planner_trace,
+        }
+        if query_vector_tasks_by_scope is not None or timeout_seconds is not None:
+            try:
+                sig = inspect.signature(provider)
+                has_varkw = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                )
+                if query_vector_tasks_by_scope is not None and (
+                    "query_vector_tasks_by_scope" in sig.parameters or has_varkw
+                ):
+                    provider_kwargs["query_vector_tasks_by_scope"] = query_vector_tasks_by_scope
+                if timeout_seconds is not None and (
+                    "timeout_seconds" in sig.parameters or has_varkw
+                ):
+                    provider_kwargs["timeout_seconds"] = timeout_seconds
+            except (TypeError, ValueError):
+                pass
         try:
             if timeout_seconds is None:
-                raw = await provider(query=query, scopes=scopes, planner=planner_trace)
+                raw = await provider(**provider_kwargs)
             else:
                 async with asyncio.timeout(max(0.01, float(timeout_seconds))):
-                    raw = await provider(query=query, scopes=scopes, planner=planner_trace)
+                    raw = await provider(**provider_kwargs)
             if raw is not None:
                 if isinstance(raw, Mapping):
                     candidate_id = raw.get("snapshot_id")

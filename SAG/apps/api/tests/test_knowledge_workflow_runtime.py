@@ -830,3 +830,387 @@ async def test_tree_defers_for_pending_foundation_and_ignores_removed_e2(
         assert rebuilt.await_count == 1
 
 
+def test_dedup_lsh_never_falls_back_to_quadratic_full_scan(monkeypatch):
+    from sag_api.services import dedup_and_temporal_service as dedup
+
+    rng = random.Random(20261111)
+    prior = [
+        SimpleNamespace(
+            id=f"prior-{i}",
+            normalized_text=f"distinctive_alpha_{i} beta_{i * 17} gamma_{i * 31} delta_{i * 53} epsilon_{i * 97}",
+            content_hash=f"h-prior-{i}",
+            block_type="paragraph",
+            document_version_id="v-old",
+            document_id="doc-old",
+        )
+        for i in range(200)
+    ]
+    current = [
+        SimpleNamespace(
+            id=f"curr-{j}",
+            normalized_text=f"unrelated_omega_{j} sigma_{j * 19} theta_{j * 41} kappa_{j * 67} lambda_{j * 89}",
+            content_hash=f"h-curr-{j}",
+            block_type="paragraph",
+            document_version_id="v-new",
+            document_id="doc-new",
+        )
+        for j in range(10)
+    ]
+    signatures = {
+        b.id: dedup.compute_minhash_signature(dedup.tokenize_for_minhash(b.normalized_text))
+        for b in prior + current
+    }
+
+    minhash_eval_calls = 0
+    orig_est = dedup.estimate_minhash_similarity
+
+    def counted_est(s1, s2):
+        nonlocal minhash_eval_calls
+        minhash_eval_calls += 1
+        return orig_est(s1, s2)
+
+    monkeypatch.setattr(dedup, "estimate_minhash_similarity", counted_est)
+    exact, candidates = dedup._dedup_candidates(current, prior, signatures, {}, "v-new")
+    assert exact == 0 and candidates == []
+    # Without LSH collisions and without embeddings, O(N^2) fallback must NEVER trigger
+    assert minhash_eval_calls == 0
+
+    # With Tier-4 dense vectors, SimHash hyperplane LSH finds cosine >= 0.90 in sub-quadratic calls
+    cosine_calls = 0
+    orig_cos = dedup.compute_cosine_similarity
+
+    def counted_cos(v1, v2):
+        nonlocal cosine_calls
+        cosine_calls += 1
+        return orig_cos(v1, v2)
+
+    monkeypatch.setattr(dedup, "compute_cosine_similarity", counted_cos)
+    base_vec = [rng.uniform(-1.0, 1.0) for _ in range(64)]
+    near_vec = [x + rng.uniform(-0.02, 0.02) for x in base_vec]
+    embeddings = {
+        pb.id: [rng.uniform(-1.0, 1.0) for _ in range(64)]
+        for pb in prior
+    }
+    embeddings["prior-42"] = base_vec
+    embeddings["curr-0"] = near_vec
+
+    exact2, candidates2 = dedup._dedup_candidates([current[0]], prior, signatures, embeddings, "v-new")
+    assert exact2 == 0 and len(candidates2) == 1
+    assert candidates2[0]["target_block_id"] == "prior-42"
+    assert cosine_calls < 120
+
+
+def test_multilingual_minhash_shingles_detect_cjk_and_thai_near_duplicates():
+    from sag_api.services import dedup_and_temporal_service as dedup
+
+    zh_a = "本系统严格禁止在未经管理员书面批准的情况下自动合并存在冲突的证据记录以确保多租户知识库的审计追踪完整性与数据安全性"
+    zh_b = "本系统严格禁止在未经管理员正式批准的情况下自动合并存在冲突的证据记录以确保多租户知识库的审计追踪完整性与数据安全性"
+    zh_unrelated = "分布式向量检索引擎通过倒排索引与稠密嵌入融合实现毫秒级低延迟语义召回和跨语言排序优化"
+
+    ja_a = "個人情報保護方針に基づき顧客データは暗号化されたストレージ領域に九十日間保管された後に自動的に削除されます"
+    ja_b = "個人情報保護方針に基づき顧客データは暗号化されたストレージ領域に九十日間保存された後に自動的に削除されます"
+
+    th_a = "ระบบรักษาความปลอดภัยของฐานข้อมูลองค์กรกำหนดให้ผู้ใช้งานทุกคนต้องยืนยันตัวตนแบบสองปัจจัยก่อนเข้าถึงเอกสารลับทุกครั้ง"
+    th_b = "ระบบรักษาความปลอดภัยของฐานข้อมูลองค์กรกำหนดให้พนักงานทุกคนต้องยืนยันตัวตนแบบสองปัจจัยก่อนเข้าถึงเอกสารลับทุกครั้ง"
+
+    assert dedup.compute_text_similarity(zh_a, zh_b) >= 0.80
+    assert dedup.compute_text_similarity(zh_a, zh_unrelated) < 0.15
+    assert dedup.compute_text_similarity(ja_a, ja_b) >= 0.85
+    assert dedup.compute_text_similarity(th_a, th_b) >= 0.80
+
+
+def test_symmetric_structural_diff_eliminates_false_positives_and_classifies_quant_and_polarity():
+    from sag_api.services.dedup_and_temporal_service import (
+        classify_relation_candidate,
+        detect_semantic_signals,
+    )
+
+    # 1. Shared pre-existing negation must NOT trigger false CONTRADICTS
+    contra, supp, sup = detect_semantic_signals(
+        "System does not allow root SSH login; session timeout is 30s in production.",
+        "System does not allow root SSH login; session timeout is 30s.",
+    )
+    assert (contra, supp, sup) == (False, False, False)
+    assert classify_relation_candidate(0.92, contra, sup, supp) == "EQUIVALENT"
+
+    # 2. Appended modifier clause containing "without" must NOT trigger false CONTRADICTS
+    contra, supp, sup = detect_semantic_signals(
+        "Workers execute tasks asynchronously on the background queue without blocking HTTP threads.",
+        "Workers execute tasks asynchronously on the background queue.",
+    )
+    assert (contra, supp, sup) == (False, False, False)
+
+    # 3. Double negation / contraction equivalence ("not enabled" == "disabled", "can't" == "cannot")
+    assert detect_semantic_signals("TLS 1.3 is not enabled.", "TLS 1.3 is disabled.") == (False, False, False)
+    assert detect_semantic_signals("Caching can't be used.", "Caching cannot be used.") == (False, False, False)
+
+    # 4. Thousand-separator formatting difference ("1,000" == "1000") must NOT trigger conflict
+    assert detect_semantic_signals(
+        "Rate limit is 1,000 requests per minute.",
+        "Rate limit is 1000 requests per minute.",
+    ) == (False, False, False)
+
+    # 5. Quantitative/threshold replacement: SUPERSEDES on same_document=True, CONTRADICTS on cross-document
+    contra_same, _, sup_same = detect_semantic_signals(
+        "The upload size limit is 25 MiB.",
+        "The upload size limit is 10 MiB.",
+        same_document=True,
+    )
+    assert sup_same is True and contra_same is False
+    assert classify_relation_candidate(0.93, contra_same, sup_same, False) == "SUPERSEDES"
+
+    contra_cross, _, sup_cross = detect_semantic_signals(
+        "The upload size limit is 25 MiB.",
+        "The upload size limit is 10 MiB.",
+        same_document=False,
+    )
+    assert contra_cross is True and sup_cross is False
+    assert classify_relation_candidate(0.93, contra_cross, sup_cross, False) == "CONTRADICTS"
+
+    # Japanese quantitative conflict (30 days vs 90 days)
+    assert detect_semantic_signals(
+        "ログの保存期間は90日間とする",
+        "ログの保存期間は30日間とする",
+        same_document=True,
+    ) == (False, False, True)
+    assert detect_semantic_signals(
+        "ログの保存期間は90日間とする",
+        "ログの保存期間は30日間とする",
+        same_document=False,
+    ) == (True, False, False)
+
+    # Scale-unit conflict next to identical numeral (10 MiB vs 10 GiB)
+    assert detect_semantic_signals(
+        "The upload size limit is 10 GiB.",
+        "The upload size limit is 10 MiB.",
+        same_document=False,
+    ) == (True, False, False)
+
+    # 6. Multilingual localized polarity flips (EN, VI, ZH, TH, morphological prefix)
+    for t_pos, t_neg in (
+        ("System allows guest access.", "System does not allow guest access."),
+        ("Token signature is valid.", "Token signature is invalid."),
+        ("TLS inspection is enabled.", "TLS inspection is disabled."),
+        ("Được phép truy cập cơ sở dữ liệu nội bộ.", "Không được phép truy cập cơ sở dữ liệu nội bộ."),
+        ("允许外部服务访问内部数据库接口", "不允许外部服务访问内部数据库接口"),
+        ("อนุญาตให้เข้าถึงระบบฐานข้อมูลภายในองค์กร", "ไม่อนุญาตให้เข้าถึงระบบฐานข้อมูลภายในองค์กร"),
+    ):
+        c, _, s = detect_semantic_signals(t_neg, t_pos, same_document=False)
+        assert c is True and s is False, f"Expected CONTRADICTS for ({t_pos!r}, {t_neg!r})"
+
+
+@pytest.mark.asyncio
+async def test_dedup_stage_scopes_out_revoked_and_superseded_prior_versions(ingestion_db):
+    from datetime import timedelta
+
+    from sag_api.db.models.document import Document
+    from sag_api.services.dedup_and_temporal_service import run_dedup_and_temporal_stage
+
+    now = datetime.now(UTC)
+    max_to = datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC)
+    shared_prefix = "Multi-tenant enterprise gateway enforces strict mTLS certificate validation with payload limit"
+
+    async with ingestion_db() as session:
+        # Mark fixture's initial active version on `document` ("version") with 10 MiB block
+        base_ver = await session.get(DocumentVersion, "version")
+        base_ver.search_status = "SEARCH_READY"
+        base_ver.valid_from = now - timedelta(days=5)
+        base_ver.valid_to = max_to
+        session.add(
+            CanonicalBlock(
+                id="b-active-v1",
+                document_version_id="version",
+                ordinal=0,
+                block_type="paragraph",
+                page_from=1,
+                page_to=1,
+                normalized_text=f"{shared_prefix} 10 MiB per request in production.",
+                content_hash="hash-active-v1",
+                section_path="Policy",
+                source_anchor="p1",
+            )
+        )
+
+        # Historical superseded v0 on the same document (valid_to in the past -> must be ignored)
+        superseded_ver = DocumentVersion(
+            id="version-superseded",
+            document_id=base_ver.document_id,
+            version_no=0,
+            file_hash="fh-0",
+            status="READY",
+            search_status="SEARCH_READY",
+            valid_from=now - timedelta(days=30),
+            valid_to=now - timedelta(days=5),
+        )
+        session.add(superseded_ver)
+        session.add(
+            CanonicalBlock(
+                id="b-superseded-v0",
+                document_version_id="version-superseded",
+                ordinal=0,
+                block_type="paragraph",
+                page_from=1,
+                page_to=1,
+                normalized_text="Exact match text only present in superseded historical version.",
+                content_hash="hash-only-in-superseded",
+                section_path="Legacy",
+                source_anchor="p0",
+            )
+        )
+
+        # Revoked document in the same project (is_active=False -> must be ignored)
+        base_doc = await session.get(Document, base_ver.document_id)
+        revoked_doc = Document(
+            id="doc-revoked",
+            tenant_id=base_doc.tenant_id,
+            project_id=base_doc.project_id,
+            source_id=base_doc.source_id,
+            filename="revoked.md",
+            storage_path="/tmp/revoked.md",
+            is_active=False,
+        )
+        session.add(revoked_doc)
+        session.add(
+            DocumentVersion(
+                id="version-revoked",
+                document_id="doc-revoked",
+                version_no=1,
+                file_hash="fh-rev",
+                status="READY",
+                search_status="SEARCH_READY",
+                valid_from=now - timedelta(days=2),
+                valid_to=max_to,
+            )
+        )
+        session.add(
+            CanonicalBlock(
+                id="b-revoked",
+                document_version_id="version-revoked",
+                ordinal=0,
+                block_type="paragraph",
+                page_from=1,
+                page_to=1,
+                normalized_text="Exact match text only present in revoked document.",
+                content_hash="hash-only-in-revoked",
+                section_path="Revoked",
+                source_anchor="prev",
+            )
+        )
+
+        # New v2 of `base_doc` updating 10 MiB -> 25 MiB (same document -> SUPERSEDES)
+        v2 = DocumentVersion(
+            id="version-v2",
+            document_id=base_ver.document_id,
+            version_no=2,
+            file_hash="fh-v2",
+            status="RECEIVED",
+            search_status="PENDING",
+            valid_from=now,
+            valid_to=max_to,
+        )
+        session.add(v2)
+        session.add_all([
+            CanonicalBlock(
+                id="b-v2-check-superseded",
+                document_version_id="version-v2",
+                ordinal=0,
+                block_type="paragraph",
+                page_from=1,
+                page_to=1,
+                normalized_text="Exact match text only present in superseded historical version.",
+                content_hash="hash-only-in-superseded",
+                section_path="Legacy",
+                source_anchor="c0",
+            ),
+            CanonicalBlock(
+                id="b-v2-check-revoked",
+                document_version_id="version-v2",
+                ordinal=1,
+                block_type="paragraph",
+                page_from=1,
+                page_to=1,
+                normalized_text="Exact match text only present in revoked document.",
+                content_hash="hash-only-in-revoked",
+                section_path="Revoked",
+                source_anchor="c1",
+            ),
+            CanonicalBlock(
+                id="b-v2-quant-update",
+                document_version_id="version-v2",
+                ordinal=2,
+                block_type="paragraph",
+                page_from=1,
+                page_to=1,
+                normalized_text=f"{shared_prefix} 25 MiB per request in production.",
+                content_hash="hash-v2-25mib",
+                section_path="Policy",
+                source_anchor="c2",
+            ),
+        ])
+        await session.flush()
+
+        res_same = await run_dedup_and_temporal_stage(
+            session,
+            document_version=v2,
+            document_id=base_ver.document_id,
+            project_id=base_doc.project_id,
+        )
+        # Superseded and revoked hashes were scoped out -> 0 exact block matches!
+        assert res_same["exact_block_matches"] == 0
+        assert len(res_same["near_duplicate_candidates"]) == 1
+        cand_same = res_same["near_duplicate_candidates"][0]
+        assert cand_same["target_block_id"] == "b-active-v1"
+        assert cand_same["relation_type"] == "SUPERSEDES"
+        assert cand_same["auto_merged"] is False
+
+        # Cross-document upload with conflicting 50 MiB limit -> CONTRADICTS
+        peer_doc = Document(
+            id="doc-peer",
+            tenant_id=base_doc.tenant_id,
+            project_id=base_doc.project_id,
+            source_id=base_doc.source_id,
+            filename="peer.md",
+            storage_path="/tmp/peer.md",
+            is_active=True,
+        )
+        peer_ver = DocumentVersion(
+            id="version-peer",
+            document_id="doc-peer",
+            version_no=1,
+            file_hash="fh-peer",
+            status="RECEIVED",
+            search_status="PENDING",
+            valid_from=now,
+            valid_to=max_to,
+        )
+        session.add_all([
+            peer_doc,
+            peer_ver,
+            CanonicalBlock(
+                id="b-peer-conflict",
+                document_version_id="version-peer",
+                ordinal=0,
+                block_type="paragraph",
+                page_from=1,
+                page_to=1,
+                normalized_text=f"{shared_prefix} 50 MiB per request in production.",
+                content_hash="hash-peer-50mib",
+                section_path="Policy",
+                source_anchor="p-peer",
+            ),
+        ])
+        await session.flush()
+
+        res_cross = await run_dedup_and_temporal_stage(
+            session,
+            document_version=peer_ver,
+            document_id="doc-peer",
+            project_id=base_doc.project_id,
+        )
+        assert len(res_cross["near_duplicate_candidates"]) == 1
+        cand_cross = res_cross["near_duplicate_candidates"][0]
+        assert cand_cross["relation_type"] == "CONTRADICTS"
+        assert cand_cross["auto_merged"] is False
+
+
+

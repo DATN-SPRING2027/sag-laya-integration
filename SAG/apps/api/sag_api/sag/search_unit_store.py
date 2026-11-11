@@ -120,19 +120,19 @@ def build_sparse_query_vector(query: str) -> dict[str, list[int] | list[float]]:
 
         token_id = int(hashlib.md5(token.encode("utf-8")).hexdigest()[:8], 16) % 1_000_000
         sparse[token_id] = max(sparse.get(token_id, 0.0), round(float(weight), 4))
-        if token.isascii() and token.isalpha() and (
-            (len(token) >= 6 and (token.endswith("ing") or token.endswith("ed")))
-            or (len(token) >= 5 and token.endswith("s") and not token.endswith("ss"))
-        ):
+        if token.isascii() and token.isalpha():
             stem = (
                 token[:-3]
-                if len(token) >= 6 and token.endswith("ing")
+                if len(token) >= 7 and token.endswith("ing")
                 else token[:-2]
-                if len(token) >= 6 and token.endswith("ed")
+                if len(token) >= 6 and token.endswith("ed") and not token.endswith("eed")
                 else token[:-1]
+                if len(token) >= 5 and token.endswith("s") and not token.endswith(("ss", "us", "is"))
+                else None
             )
-            stem_id = int(hashlib.md5(stem.encode("utf-8")).hexdigest()[:8], 16) % 1_000_000
-            sparse[stem_id] = max(sparse.get(stem_id, 0.0), round(float(weight) * 0.6, 4))
+            if stem and len(stem) >= 4:
+                stem_id = int(hashlib.md5(stem.encode("utf-8")).hexdigest()[:8], 16) % 1_000_000
+                sparse[stem_id] = max(sparse.get(stem_id, 0.0), round(float(weight) * 0.6, 4))
     indices = sorted(sparse)
     return {"indices": indices, "values": [sparse[index] for index in indices]}
 

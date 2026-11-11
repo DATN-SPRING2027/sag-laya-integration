@@ -12,6 +12,7 @@ Follows Ponytail minimalism:
 from __future__ import annotations
 
 import asyncio
+import difflib
 import hashlib
 import re
 import uuid
@@ -83,9 +84,28 @@ def compute_minhash_signature(tokens: Sequence[str], num_perm: int = 128) -> lis
     return signature
 
 
+_MINHASH_TOKEN_RE = re.compile(
+    r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u0e00-\u0eff\u1780-\u17ff\u1000-\u109f]"
+    r"|\w+"
+)
+
+
+def tokenize_for_minhash(text: str) -> list[str]:
+    """Tokenize text into universal lexical units for 5-shingle MinHash.
+
+    Continuous scripts without whitespace word boundaries (CJK, Kana, Thai,
+    Lao, Khmer, Myanmar) emit individual characters so k=5 forms overlapping
+    5-character shingles; spaced scripts emit alphanumeric word tokens so k=5
+    forms overlapping 5-word shingles.
+    """
+    if not text:
+        return []
+    return _MINHASH_TOKEN_RE.findall(text.casefold())
+
+
 _MINHASH_CACHE: OrderedDict[str, list[int]] = OrderedDict()
 _MINHASH_LOCKS = WeakKeyDictionary()
-_MINHASH_ALGORITHM = "md5-128-k5-v1"
+_MINHASH_ALGORITHM = "md5-128-k5-v2"
 
 
 async def _block_signatures(blocks, *, persist_ids):
@@ -151,63 +171,390 @@ def compute_cosine_similarity(vec1: Sequence[float], vec2: Sequence[float]) -> f
 
 
 def compute_text_similarity(text1: str, text2: str) -> float:
-    """Compute lexical similarity using tokenization and MinHash signature estimator."""
-    t1 = re.findall(r"\w+", text1.lower())
-    t2 = re.findall(r"\w+", text2.lower())
+    """Compute lexical similarity using universal tokenization and MinHash estimator.
+
+    For short/medium passages (< 80 tokens) where a 1-token edit invalidates up to
+    k=5 overlapping shingles (artificially depressing 5-shingle Jaccard to (N-9)/(N+1)),
+    applies exact token-sequence alignment when MinHash already confirms >= 0.35 overlap.
+    """
+    t1 = tokenize_for_minhash(text1)
+    t2 = tokenize_for_minhash(text2)
     if not t1 or not t2:
         return 0.0
     sig1 = compute_minhash_signature(t1, num_perm=128)
     sig2 = compute_minhash_signature(t2, num_perm=128)
-    return estimate_minhash_similarity(sig1, sig2)
+    sim = estimate_minhash_similarity(sig1, sig2)
+    if 0.35 <= sim < 0.85 and min(len(t1), len(t2)) < 80:
+        sim = max(sim, difflib.SequenceMatcher(None, t1, t2, autojunk=False).ratio())
+    return sim
 
 
-NEGATION_WORDS = {
-    "not", "no", "never", "none", "neither", "nor", "cannot", "can't", "without",
-    "không", "chẳng", "chưa", "không phải", "đối lập", "ngược lại", "phủ nhận",
-    "contrary", "contradicts", "false", "deprecated", "prohibited", "bị cấm",
+# ---------------------------------------------------------------------------
+# Pillar 3: Symmetric Structural Diff (Delta) for Relation Classification
+# ---------------------------------------------------------------------------
+_THOUSANDS_COMMA_RE = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
+_EN_WON_T_RE = re.compile(r"\bwon['’]t\b")
+_EN_CAN_T_RE = re.compile(r"\b(?:can['’]t|cannot)\b")
+_EN_N_T_RE = re.compile(r"\b(\w+?)n['’]t\b")
+_DIFF_TOKEN_RE = re.compile(
+    r"v\d+(?:\.\d+)+"
+    r"|\d+(?:[./:-]\d+)+%?"
+    r"|\d+(?:\.\d+)?%?"
+    r"|[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u0e00-\u0eff\u1780-\u17ff\u1000-\u109f]"
+    r"|\w+"
+)
+_QUANT_TOKEN_RE = re.compile(r"^(?:v\d+(?:\.\d+)+|\d+(?:[./:-]\d+)*%?)$")
+
+_SCALE_UNITS: dict[str, str] = {
+    "b": "b", "bytes": "b", "byte": "b",
+    "kb": "kb", "kib": "kib",
+    "mb": "mb", "megabyte": "mb", "megabytes": "mb", "mib": "mib",
+    "gb": "gb", "gigabyte": "gb", "gigabytes": "gb", "gib": "gib",
+    "tb": "tb", "tib": "tib",
+    "ms": "ms", "millisecond": "ms", "milliseconds": "ms",
+    "s": "s", "sec": "s", "secs": "s", "second": "s", "seconds": "s", "giây": "s", "秒": "s",
+    "m": "min", "min": "min", "mins": "min", "minute": "min", "minutes": "min", "phút": "min", "分": "min",
+    "h": "hr", "hr": "hr", "hrs": "hr", "hour": "hr", "hours": "hr", "giờ": "hr", "時間": "hr", "小时": "hr",
+    "d": "day", "day": "day", "days": "day", "ngày": "day", "日": "day", "天": "day",
 }
 
-SUPPORT_MARKERS = {
-    "đồng thuận", "chứng minh", "xác nhận", "cụ thể", "minh chứng", "phù hợp",
-    "supports", "confirms", "verifies", "proves", "endorses", "consistent with",
-    "furthermore", "moreover", "in addition", "đồng thời",
-}
+# Compact universal polarity operators evaluated ONLY inside narrow edit hunks
+_POLARITY_PARTICLES: frozenset[str] = frozenset({
+    "not", "no", "never", "non", "none", "neither", "nor", "without",
+    "không", "chẳng", "chưa", "cấm",
+    "не", "ни", "без", "нет",
+    "nicht", "kein", "keine", "keinen", "keinem", "keiner", "ohne",
+    "pas", "jamais", "sans", "aucun", "aucune",
+    "nunca", "jamás", "jamas", "sin",
+    "mai", "senza", "niet", "geen", "nie", "bez",
+    "لا", "غير", "بدون", "नहीं", "बिना",
+    "ไม่", "ห้าม", "មិន", "ឥត", "မ",
+    "不", "非", "無", "无", "未", "勿", "莫", "否",
+    "안", "못", "불", "비", "무", "미",
+})
 
-SUPERSEDE_MARKERS = {
-    "thay thế", "thay bằng", "bãi bỏ", "supersedes", "replaces", "deprecated by",
-}
+_CONTINUOUS_NEG_MARKERS: frozenset[str] = frozenset({
+    "ไม่", "ไม่ได้", "ห้าม", "មិន", "ឥត",
+    "不", "非", "無", "无", "未", "否", "不可", "不得", "禁止", "严禁", "嚴禁",
+    "불", "비", "무", "미", "불가", "금지",
+})
+
+_NEUTRAL_AUX: frozenset[str] = frozenset({
+    "is", "are", "was", "were", "be", "been", "being", "am",
+    "can", "could", "will", "would", "shall", "should", "must", "may", "might",
+    "do", "does", "did", "have", "has", "had",
+    "được", "bị", "có", "là", "đã", "sẽ", "đang", "phải",
+})
+
+_NEG_MORPH_PREFIXES: tuple[str, ...] = (
+    "non", "dis", "un", "in", "im", "il", "ir", "не", "без", "бес", "des",
+)
+
+_STATE_ANTONYM_PAIRS: frozenset[tuple[str, str]] = frozenset(
+    pair
+    for a, b in (
+        ("true", "false"),
+        ("enable", "disable"),
+        ("enabled", "disabled"),
+        ("allow", "deny"),
+        ("allow", "forbid"),
+        ("allow", "prohibit"),
+        ("allowed", "denied"),
+        ("allowed", "forbidden"),
+        ("allowed", "prohibited"),
+        ("permitted", "prohibited"),
+        ("permitted", "forbidden"),
+        ("permitted", "denied"),
+        ("mandatory", "optional"),
+        ("required", "prohibited"),
+        ("required", "forbidden"),
+        ("active", "inactive"),
+        ("on", "off"),
+        ("yes", "no"),
+        ("cho", "cấm"),
+    )
+    for pair in ((a, b), (b, a))
+)
+
+_CONTINUOUS_ANTONYM_PAIRS: frozenset[tuple[str, str]] = frozenset(
+    pair
+    for a, b in (
+        ("允许", "禁止"), ("允许", "不允许"), ("允许", "严禁"),
+        ("允許", "禁止"), ("允許", "不允許"),
+        ("可", "不可"), ("可能", "不可能"),
+        ("有效", "无效"), ("有効", "無効"),
+        ("許可", "禁止"), ("許可", "不許可"),
+        ("合法", "非法"), ("合法", "不合法"),
+        ("必須", "不要"), ("必须", "禁止"),
+        ("อนุญาต", "ห้าม"), ("อนุญาต", "ไม่อนุญาต"),
+    )
+    for pair in ((a, b), (b, a))
+)
+
+_LIFECYCLE_SUPERSEDE_TOKENS: frozenset[str] = frozenset({
+    "deprecated", "superseded", "supersedes", "replaces", "obsolete",
+})
+_LIFECYCLE_SUPERSEDE_JOINED: frozenset[str] = frozenset({
+    "thaythế", "bãibỏ", "hếthiệulực", "廃止", "已废弃", "已废止", "废止",
+})
 
 
-def detect_semantic_signals(text1: str, text2: str) -> tuple[bool, bool, bool]:
-    """Detect contradiction, support, or supersede signals between two texts.
+def _tokenize_for_diff(text: str) -> list[str]:
+    norm = _THOUSANDS_COMMA_RE.sub("", text.casefold())
+    norm = _EN_WON_T_RE.sub("will not", norm)
+    norm = _EN_CAN_T_RE.sub("can not", norm)
+    norm = _EN_N_T_RE.sub(r"\1 not", norm)
+    return _DIFF_TOKEN_RE.findall(norm)
+
+
+def _same_inflected_stem(w1: str, w2: str) -> bool:
+    if w1 == w2:
+        return True
+    short, long = (w1, w2) if len(w1) <= len(w2) else (w2, w1)
+    if len(short) < 3:
+        return False
+    if long in (f"{short}s", f"{short}es", f"{short}d", f"{short}ed"):
+        return True
+    if short.endswith("y") and long in (f"{short[:-1]}ies", f"{short[:-1]}ied"):
+        return True
+    return False
+
+
+def _is_negation_prefix_pair(w1: str, w2: str) -> bool:
+    short, long = (w1, w2) if len(w1) <= len(w2) else (w2, w1)
+    if len(short) >= 4:
+        for pfx in _NEG_MORPH_PREFIXES:
+            if long == f"{pfx}{short}":
+                return True
+    # Shared root with en-/dis- (e.g. enable/disable, enabled/disabled)
+    for a, b in ((w1, w2), (w2, w1)):
+        if a.startswith("en") and b.startswith("dis") and len(a) >= 6 and a[2:] == b[3:]:
+            return True
+    return False
+
+
+def _decompose_polarity_hunk(tokens: list[str]) -> tuple[int, list[str]]:
+    sign = 1
+    rem: list[str] = []
+    for tok in tokens:
+        if tok in _POLARITY_PARTICLES:
+            sign *= -1
+        elif tok in _NEUTRAL_AUX:
+            continue
+        else:
+            rem.append(tok)
+    return sign, rem
+
+
+def _hunk_is_polarity_flip(h1: list[str], h2: list[str]) -> bool:
+    """Check whether a localized SequenceMatcher edit hunk inverts predicate polarity."""
+    if not h1 and not h2:
+        return False
+    if max(len(h1), len(h2)) > 5:
+        return False
+
+    j1 = "".join(h1)
+    j2 = "".join(h2)
+    if (not h1 and j2 in _CONTINUOUS_NEG_MARKERS) or (not h2 and j1 in _CONTINUOUS_NEG_MARKERS):
+        return True
+    if (j1, j2) in _CONTINUOUS_ANTONYM_PAIRS:
+        return True
+
+    if max(len(h1), len(h2)) > 3:
+        return False
+
+    sign1, rem1 = _decompose_polarity_hunk(h1)
+    sign2, rem2 = _decompose_polarity_hunk(h2)
+    if not rem1 and not rem2:
+        return sign1 != sign2
+    if len(rem1) == 1 and len(rem2) == 1:
+        w1, w2 = rem1[0], rem2[0]
+        if _same_inflected_stem(w1, w2):
+            return sign1 != sign2
+        if _is_negation_prefix_pair(w1, w2) or (w1, w2) in _STATE_ANTONYM_PAIRS:
+            return sign1 != (sign2 * -1)
+    return False
+
+
+def _hunk_has_lifecycle_supersede(h1: list[str], h2: list[str]) -> bool:
+    if len(h1) > 6 or len(h2) > 6:
+        return False
+    s1 = any(t in _LIFECYCLE_SUPERSEDE_TOKENS for t in h1) or "".join(h1) in _LIFECYCLE_SUPERSEDE_JOINED
+    s2 = any(t in _LIFECYCLE_SUPERSEDE_TOKENS for t in h2) or "".join(h2) in _LIFECYCLE_SUPERSEDE_JOINED
+    return s1 != s2
+
+
+def detect_semantic_signals(
+    text1: str,
+    text2: str,
+    *,
+    same_document: bool | None = None,
+) -> tuple[bool, bool, bool]:
+    """Detect contradiction, support, or supersede signals via Symmetric Structural Diff (Delta).
+
+    Evaluates ONLY the localized SequenceMatcher edit hunks between two high-similarity
+    passages so pre-existing negations or appended clauses never cause false positives:
+    1. Quantitative / version / scale-unit replacement in aligned slots:
+       - `SUPERSEDES` when `same_document is True` (version threshold/date update)
+       - `CONTRADICTS` when cross-document or unspecified
+    2. Multiplicative polarity inversion on localized hunks (`CONTRADICTS`).
+    3. Explicit lifecycle deprecation/supersede marker newly added in diff (`SUPERSEDES`).
 
     Returns:
         (is_contradiction, is_support, is_supersede)
     """
-    t1_lower = text1.lower()
-    t2_lower = text2.lower()
-    words1 = set(re.findall(r"\w+", t1_lower))
-    words2 = set(re.findall(r"\w+", t2_lower))
-
-    # Detect polarity / negation flip: one text negates a claim present in the other
-    neg1 = words1 & NEGATION_WORDS
-    neg2 = words2 & NEGATION_WORDS
+    toks1 = _tokenize_for_diff(text1)
+    toks2 = _tokenize_for_diff(text2)
+    if not toks1 or not toks2:
+        return False, False, False
 
     is_contradiction = False
-    if (neg1 and not neg2) or (neg2 and not neg1):
-        is_contradiction = True
-    elif any(kw in t1_lower or kw in t2_lower for kw in ["contradicts", "trái ngược", "đối lập"]):
-        is_contradiction = True
-
     is_support = False
-    if any(m in t1_lower or m in t2_lower for m in SUPPORT_MARKERS):
-        is_support = True
-
     is_supersede = False
-    if any(kw in t1_lower or kw in t2_lower for kw in SUPERSEDE_MARKERS):
-        is_supersede = True
+
+    matcher = difflib.SequenceMatcher(None, toks1, toks2, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        h1 = toks1[i1:i2]
+        h2 = toks2[j1:j2]
+
+        if tag == "replace":
+            q1 = [t for t in h1 if _QUANT_TOKEN_RE.fullmatch(t)]
+            q2 = [t for t in h2 if _QUANT_TOKEN_RE.fullmatch(t)]
+            quant_changed = bool(q1 and q2 and q1 != q2)
+            if (
+                not quant_changed
+                and len(h1) == 1
+                and len(h2) == 1
+                and i1 > 0
+                and _QUANT_TOKEN_RE.fullmatch(toks1[i1 - 1])
+                and h1[0] in _SCALE_UNITS
+                and h2[0] in _SCALE_UNITS
+                and _SCALE_UNITS[h1[0]] != _SCALE_UNITS[h2[0]]
+            ):
+                quant_changed = True
+
+            if quant_changed:
+                if same_document is True:
+                    is_supersede = True
+                else:
+                    is_contradiction = True
+
+        if _hunk_is_polarity_flip(h1, h2):
+            is_contradiction = True
+
+        if _hunk_has_lifecycle_supersede(h1, h2):
+            is_supersede = True
 
     return is_contradiction, is_support, is_supersede
+
+
+# ---------------------------------------------------------------------------
+# Pillar 1: Sub-Quadratic MinHash LSH + Random-Hyperplane SimHash Vector LSH
+# ---------------------------------------------------------------------------
+_SIMHASH_PLANES_CACHE: dict[tuple[int, int, int], tuple[tuple[tuple[int, float], ...], ...]] = {}
+
+
+def _simhash_sparse_planes(
+    dim: int,
+    *,
+    total_planes: int = 32,
+    max_sample_coords: int = 128,
+) -> tuple[tuple[tuple[int, float], ...], ...]:
+    """Build deterministic rotational-invariant hyperplane projections for SimHash LSH."""
+    key = (dim, total_planes, max_sample_coords)
+    cached = _SIMHASH_PLANES_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    sample_len = min(dim, max_sample_coords)
+    stride = max(1, dim // sample_len)
+    planes: list[tuple[tuple[int, float], ...]] = []
+    for p in range(total_planes):
+        entries: list[tuple[int, float]] = []
+        seen_idx: set[int] = set()
+        block_idx = 0
+        coord_cursor = (p * 37) % dim
+        while len(entries) < sample_len:
+            digest = hashlib.sha256(f"dedup-simhash:{dim}:{p}:{block_idx}".encode()).digest()
+            block_idx += 1
+            for offset in range(0, 32, 4):
+                if len(entries) >= sample_len:
+                    break
+                while coord_cursor in seen_idx:
+                    coord_cursor = (coord_cursor + 1) % dim
+                seen_idx.add(coord_cursor)
+                val = (
+                    digest[offset]
+                    + digest[offset + 1]
+                    + digest[offset + 2]
+                    + digest[offset + 3]
+                    - 510.0
+                )
+                entries.append((coord_cursor, val if val != 0.0 else 0.5))
+                coord_cursor = (coord_cursor + stride) % dim
+        planes.append(tuple(entries))
+
+    result = tuple(planes)
+    _SIMHASH_PLANES_CACHE[key] = result
+    return result
+
+
+def _compute_simhash_bits(
+    vec: Sequence[float],
+    planes: tuple[tuple[tuple[int, float], ...], ...],
+) -> tuple[int, ...]:
+    return tuple(
+        1 if sum(float(vec[idx]) * weight for idx, weight in plane) >= 0.0 else 0
+        for plane in planes
+    )
+
+
+def build_vector_lsh_index(
+    embeddings_by_id: dict[str, Sequence[float]],
+    *,
+    num_bands: int = 8,
+    bits_per_band: int = 4,
+) -> dict[int, dict[tuple[int, tuple[int, ...]], list[str]]]:
+    """Index dense vectors by dimension into multi-band SimHash hyperplane buckets."""
+    by_dim: dict[int, dict[tuple[int, tuple[int, ...]], list[str]]] = {}
+    total_planes = num_bands * bits_per_band
+    for item_id, vec in embeddings_by_id.items():
+        if not vec:
+            continue
+        dim = len(vec)
+        planes = _simhash_sparse_planes(dim, total_planes=total_planes)
+        bits = _compute_simhash_bits(vec, planes)
+        buckets = by_dim.setdefault(dim, {})
+        for b in range(num_bands):
+            band_key = (b, bits[b * bits_per_band : (b + 1) * bits_per_band])
+            buckets.setdefault(band_key, []).append(item_id)
+    return by_dim
+
+
+def query_vector_lsh_candidates(
+    query_vec: Sequence[float],
+    vector_lsh_by_dim: dict[int, dict[tuple[int, tuple[int, ...]], list[str]]],
+    *,
+    num_bands: int = 8,
+    bits_per_band: int = 4,
+) -> set[str]:
+    """Retrieve candidate IDs colliding in at least one SimHash hyperplane band."""
+    if not query_vec:
+        return set()
+    dim = len(query_vec)
+    buckets = vector_lsh_by_dim.get(dim)
+    if not buckets:
+        return set()
+    planes = _simhash_sparse_planes(dim, total_planes=num_bands * bits_per_band)
+    bits = _compute_simhash_bits(query_vec, planes)
+    candidates: set[str] = set()
+    for b in range(num_bands):
+        band_key = (b, bits[b * bits_per_band : (b + 1) * bits_per_band])
+        if band_key in buckets:
+            candidates.update(buckets[band_key])
+    return candidates
 
 
 def build_lsh_band_index(
@@ -485,14 +832,22 @@ def _dedup_candidates(curr_blocks, prior_blocks, signatures, block_embeddings, c
     exact_block_matches = 0
     near_dup_candidates = []
     prior_hashes = {b.content_hash for b in prior_blocks if b.content_hash}
-    # Precompute MinHash signatures once for all prior blocks and build LSH index
+    # Precompute MinHash + optional SimHash vector indices once for sub-quadratic O(1) lookup
     prior_sig_by_id: dict[str, list[int]] = {}
     prior_by_id: dict[str, CanonicalBlock] = {}
+    prior_vec_by_id: dict[str, Sequence[float]] = {}
     for pb in prior_blocks:
         prior_by_id[pb.id] = pb
         prior_sig_by_id[pb.id] = signatures[pb.id]
+        if block_embeddings and pb.id in block_embeddings and block_embeddings[pb.id]:
+            prior_vec_by_id[pb.id] = block_embeddings[pb.id]
 
-    lsh_index = build_lsh_band_index(prior_sig_by_id, num_bands=16, rows_per_band=8)
+    lsh_index = build_lsh_band_index(prior_sig_by_id, num_bands=32, rows_per_band=4)
+    vector_lsh_index = (
+        build_vector_lsh_index(prior_vec_by_id, num_bands=8, bits_per_band=4)
+        if prior_vec_by_id
+        else {}
+    )
 
     for b in curr_blocks:
         if b.content_hash and b.content_hash in prior_hashes:
@@ -501,13 +856,22 @@ def _dedup_candidates(curr_blocks, prior_blocks, signatures, block_embeddings, c
             threshold = get_block_type_threshold(b.block_type)
             b_sig = signatures[b.id]
 
-            # Query bounded candidates using LSH bands
-            candidate_ids = query_lsh_candidates(b_sig, lsh_index, num_bands=16, rows_per_band=8)
-            cand_blocks = [prior_by_id[cid] for cid in candidate_ids if cid in prior_by_id]
-            # Fall back to prior_blocks if LSH finds no lexical collisions, enabling Tier 4 semantic cosine check
-            eval_blocks = cand_blocks if cand_blocks else prior_blocks
+            # Sub-quadratic candidate union: lexical MinHash LSH + Tier-4 SimHash Vector LSH (never O(N^2) full scan)
+            candidate_ids = query_lsh_candidates(b_sig, lsh_index, num_bands=32, rows_per_band=4)
+            if vector_lsh_index and block_embeddings and b.id in block_embeddings:
+                candidate_ids |= query_vector_lsh_candidates(
+                    block_embeddings[b.id],
+                    vector_lsh_index,
+                    num_bands=8,
+                    bits_per_band=4,
+                )
+            eval_blocks = [prior_by_id[cid] for cid in candidate_ids if cid in prior_by_id]
+            if not eval_blocks:
+                continue
 
-            # Score all candidates and rank deterministically to select the best match
+            b_doc_id = getattr(b, "document_id", None)
+            b_tokens: list[str] | None = None
+            # Score bounded LSH candidates and rank deterministically to select the best match
             block_candidates: list[dict[str, Any]] = []
             for pb in eval_blocks:
                 pb_sig = prior_sig_by_id.get(pb.id)
@@ -516,16 +880,32 @@ def _dedup_candidates(curr_blocks, prior_blocks, signatures, block_embeddings, c
                     if pb_sig
                     else compute_text_similarity(b.normalized_text, pb.normalized_text)
                 )
+                if pb_sig and 0.35 <= sim < threshold:
+                    if b_tokens is None:
+                        b_tokens = tokenize_for_minhash(b.normalized_text)
+                    if 0 < len(b_tokens) < 80:
+                        pb_tokens = tokenize_for_minhash(pb.normalized_text)
+                        if 0 < len(pb_tokens) < 80:
+                            sim = max(
+                                sim,
+                                difflib.SequenceMatcher(None, b_tokens, pb_tokens, autojunk=False).ratio(),
+                            )
 
                 cosine_sim = 0.0
-                if b.id in block_embeddings and pb.id in block_embeddings:
+                if block_embeddings and b.id in block_embeddings and pb.id in block_embeddings:
                     cosine_sim = compute_cosine_similarity(block_embeddings[b.id], block_embeddings[pb.id])
 
                 is_lexical_match = sim >= threshold
                 is_semantic_match = cosine_sim >= 0.90
 
                 if is_lexical_match or is_semantic_match:
-                    is_contra, is_supp, is_super = detect_semantic_signals(b.normalized_text, pb.normalized_text)
+                    pb_doc_id = getattr(pb, "document_id", None)
+                    same_doc = (b_doc_id == pb_doc_id) if (b_doc_id and pb_doc_id) else None
+                    is_contra, is_supp, is_super = detect_semantic_signals(
+                        b.normalized_text,
+                        pb.normalized_text,
+                        same_document=same_doc,
+                    )
                     effective_sim = max(sim, cosine_sim)
                     rel = classify_relation_candidate(
                         effective_sim,
@@ -598,10 +978,10 @@ async def run_dedup_and_temporal_stage(
         )
     ).scalars().all()
 
-    # Prior blocks fetched across the authorized project scope (Tier 2 cross-document dedup)
-    prior_blocks = (
+    # Prior blocks scoped strictly to active, non-superseded, non-failed versions in project
+    prior_rows = (
         await session.execute(
-            select(CanonicalBlock)
+            select(CanonicalBlock, DocumentVersion.document_id)
             .join(DocumentVersion, CanonicalBlock.document_version_id == DocumentVersion.id)
             .join(Document, Document.id == DocumentVersion.document_id)
             .where(
@@ -610,18 +990,44 @@ async def run_dedup_and_temporal_stage(
                     Document.id == document_id,
                 ) if project_id else (Document.id == document_id),
                 DocumentVersion.id != document_version.id,
+                Document.is_active.is_(True),
+                DocumentVersion.status != "FAILED",
+                DocumentVersion.search_status != "FAILED",
+                DocumentVersion.valid_to > start_time,
             )
         )
-    ).scalars().all()
+    ).all()
+    prior_blocks = [row[0] for row in prior_rows]
+    prior_doc_by_block_id = {row[0].id: row[1] for row in prior_rows}
 
     signatures = await _block_signatures(prior_blocks + curr_blocks, persist_ids={b.id for b in curr_blocks})
 
     if not prior_blocks or not curr_blocks:
         exact_block_matches, near_dup_candidates = 0, []
     else:
-        # Optional Tier 4: Precompute embeddings for semantic similarity if embedder available
+        # Optional Tier 4: Precompute embeddings if embedder available, or reuse $0-cost RAM cache
         block_embeddings: dict[str, list[float]] = {}
-        if embedder is not None:
+        if embedder is None:
+            try:
+                from sag_api.services.search_index_service import get_cached_text_embedding
+
+                curr_cached = {
+                    b.id: vec
+                    for b in curr_blocks
+                    if (vec := get_cached_text_embedding(b.normalized_text)) is not None
+                }
+                if curr_cached:
+                    prior_cached = {
+                        pb.id: vec
+                        for pb in prior_blocks
+                        if (vec := get_cached_text_embedding(pb.normalized_text)) is not None
+                    }
+                    if prior_cached:
+                        block_embeddings.update(curr_cached)
+                        block_embeddings.update(prior_cached)
+            except Exception:
+                pass
+        else:
             try:
                 from sag_api.services.search_index_service import (
                     get_cached_text_embedding,
@@ -668,8 +1074,14 @@ async def run_dedup_and_temporal_stage(
         from sag_api.services.cpu_worker import run_cpu
         fields = ("id", "normalized_text", "content_hash", "block_type", "document_version_id")
         exact_block_matches, near_dup_candidates = await run_cpu("dedup_candidates", {
-            "current": [{key: getattr(b, key) for key in fields} for b in curr_blocks],
-            "prior": [{key: getattr(b, key) for key in fields} for b in prior_blocks],
+            "current": [
+                {**{key: getattr(b, key) for key in fields}, "document_id": document_id}
+                for b in curr_blocks
+            ],
+            "prior": [
+                {**{key: getattr(pb, key) for key in fields}, "document_id": prior_doc_by_block_id.get(pb.id)}
+                for pb in prior_blocks
+            ],
             "signatures": signatures, "embeddings": block_embeddings, "version_id": document_version.id,
         })
 

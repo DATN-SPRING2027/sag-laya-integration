@@ -304,27 +304,30 @@ def _route_from_answers(
 _LIVE_KEV4B_CACHE: dict[str, dict[str, Any]] | None = None
 
 
-def _get_live_kev4b_cache() -> dict[str, dict[str, Any]]:
-    global _LIVE_KEV4B_CACHE
-    if _LIVE_KEV4B_CACHE is not None:
-        return _LIVE_KEV4B_CACHE
-    import json
-    from pathlib import Path
+from collections import OrderedDict
+from threading import RLock
 
-    cache: dict[str, dict[str, Any]] = {}
-    try:
-        cache_path = Path(__file__).resolve().parents[6] / "Dataset" / "reports" / "siliconflow_kev4b_live_cache.jsonl"
-        if cache_path.exists():
-            for line in cache_path.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                obj = json.loads(line)
-                if isinstance(obj.get("answers"), dict) and not obj.get("error"):
-                    cache[str(obj.get("query") or "").strip()] = obj
-    except Exception:  # noqa: BLE001
-        pass
-    _LIVE_KEV4B_CACHE = cache
-    return cache
+_DECISION_ROUTE_CACHE: OrderedDict[tuple[str, str], tuple[dict[str, Any], str]] = OrderedDict()
+_DECISION_ROUTE_CACHE_MAX = 512
+_DECISION_ROUTE_CACHE_LOCK = RLock()
+
+
+def _get_cached_decision_answers(model: str, query_text: str) -> tuple[dict[str, Any], str] | None:
+    key = (model, query_text)
+    with _DECISION_ROUTE_CACHE_LOCK:
+        hit = _DECISION_ROUTE_CACHE.get(key)
+        if hit is not None:
+            _DECISION_ROUTE_CACHE.move_to_end(key)
+        return hit
+
+
+def _put_cached_decision_answers(model: str, query_text: str, answers: dict[str, Any], resolved_model: str) -> None:
+    key = (model, query_text)
+    with _DECISION_ROUTE_CACHE_LOCK:
+        _DECISION_ROUTE_CACHE[key] = (dict(answers), resolved_model)
+        _DECISION_ROUTE_CACHE.move_to_end(key)
+        while len(_DECISION_ROUTE_CACHE) > _DECISION_ROUTE_CACHE_MAX:
+            _DECISION_ROUTE_CACHE.popitem(last=False)
 
 
 def _record_decision_token_usage(model: str, raw_usage: Any, query_text: str) -> None:
@@ -380,13 +383,23 @@ def route_query(query: str, context: dict[str, Any] | None = None) -> dict[str, 
         return _fallback_route(query, "siliconflow_api_key_missing")
 
     start_time = time.perf_counter()
-    if httpx.post is _ORIG_HTTPX_POST and not context and settings.siliconflow_api_key != "sf-test-key":
-        cached = _get_live_kev4b_cache().get(cleaned)
-        if cached is not None and isinstance(cached.get("answers"), dict):
-            model = str(cached.get("model") or settings.decision_model)
-            _record_decision_token_usage(model, cached.get("usage"), cleaned)
-            latency_ms = float(cached.get("latency_ms") or round((time.perf_counter() - start_time) * 1000, 2))
-            return _route_from_answers(query, cached["answers"], model, latency_ms, "siliconflow")
+    use_in_memory_cache = (
+        httpx.post is _ORIG_HTTPX_POST
+        and not context
+        and settings.siliconflow_api_key != "sf-test-key"
+    )
+    if use_in_memory_cache:
+        cached = _get_cached_decision_answers(settings.decision_model, cleaned)
+        if cached is not None:
+            cached_answers, cached_model = cached
+            try:
+                from sag_api.core.token_usage import record_llm_cache_hit
+
+                record_llm_cache_hit(model=cached_model, count=1, component="decision_router")
+            except Exception:  # noqa: BLE001
+                pass
+            latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
+            return _route_from_answers(query, cached_answers, cached_model, latency_ms, "siliconflow")
 
     try:
         response = httpx.post(
@@ -406,6 +419,8 @@ def route_query(query: str, context: dict[str, Any] | None = None) -> dict[str, 
         latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
         model = str(payload.get("model") or settings.decision_model)
         _record_decision_token_usage(model, payload.get("usage"), cleaned)
+        if use_in_memory_cache:
+            _put_cached_decision_answers(settings.decision_model, cleaned, answers, model)
         return _route_from_answers(query, answers, model, latency_ms, "siliconflow")
     except httpx.HTTPStatusError as exc:
         # Status codes help diagnose provider configuration without exposing

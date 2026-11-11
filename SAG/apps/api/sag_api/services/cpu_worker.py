@@ -29,12 +29,14 @@ def _calculate(operation, payload):
             payload["version_id"],
         )
     if operation == "minhash":
-        import re
-
-        from sag_api.services.dedup_and_temporal_service import compute_minhash_signature
+        from sag_api.services.dedup_and_temporal_service import (
+            compute_minhash_signature,
+            tokenize_for_minhash,
+        )
 
         return {
-            key: compute_minhash_signature(re.findall(r"\w+", text.lower())) for key, text in payload["texts"].items()
+            key: compute_minhash_signature(tokenize_for_minhash(text))
+            for key, text in payload["texts"].items()
         }
     if operation == "graph":
         from sag_api.services.knowledge_service import KnowledgeConfig, graph_payload

@@ -32,6 +32,7 @@ from sag_api.db.models import (
     IngestionRun,
     Job,
     KnowledgeGraphBuild,
+    KnowledgeGraphEdge,
     KnowledgeUnit,
     KnowledgeUnitEdge,
     ProjectSearchState,
@@ -524,6 +525,39 @@ def _groups(versions: dict[str, _ReadyVersion]) -> list[_SearchGroup]:
     ]
 
 
+def _interleave_hit_lists(hit_lists: list[list[SearchUnitHit]], *, limit: int) -> list[SearchUnitHit]:
+    non_empty = [lst for lst in hit_lists if lst]
+    if not non_empty:
+        return []
+    if len(non_empty) == 1:
+        return non_empty[0][:limit]
+    list_maxes = [max((max(0.0, float(h.score)) for h in lst), default=0.0) for lst in non_empty]
+    base_scale = max(list_maxes, default=1.0) or 1.0
+    by_point: dict[str, tuple[int, float, SearchUnitHit]] = {}
+    max_len = max(len(lst) for lst in non_empty)
+    out_order = 0
+    for rank_idx in range(max_len):
+        for lst_idx, lst in enumerate(non_empty):
+            if rank_idx >= len(lst):
+                continue
+            hit = lst[rank_idx]
+            l_max = list_maxes[lst_idx]
+            scaled_score = (max(0.0, float(hit.score)) / l_max) * base_scale if l_max > 0.0 else 0.0
+            scaled_hit = (
+                SearchUnitHit(point_id=hit.point_id, score=scaled_score, payload=hit.payload)
+                if scaled_score != hit.score
+                else hit
+            )
+            prev = by_point.get(hit.point_id)
+            if prev is None:
+                by_point[hit.point_id] = (out_order, scaled_score, scaled_hit)
+                out_order += 1
+            elif scaled_score > prev[1]:
+                by_point[hit.point_id] = (prev[0], scaled_score, scaled_hit)
+    merged = [item[2] for item in sorted(by_point.values(), key=lambda entry: (entry[0], -entry[1]))]
+    return merged[: max(limit, min(limit * 2, len(merged)))]
+
+
 async def _query_group(
     group: _SearchGroup,
     *,
@@ -532,6 +566,7 @@ async def _query_group(
     store: SearchUnitQdrantStore,
     query_vector: list[float],
     route: RouteDecision | None = None,
+    sub_sparse_queries: tuple[dict[str, list[int] | list[float]], ...] = (),
 ) -> tuple[_SearchGroup, list[SearchUnitHit], list[SearchUnitHit]]:
     collection = f"search_units_{group.project_id}"
     use_tree_route = bool(
@@ -555,23 +590,33 @@ async def _query_group(
             raise ValueError("invalid embedding vector")
         sparse_query = build_sparse_query_vector(query)
         if hasattr(store, "search_batch"):
-            semantic, lexical = await store.search_batch(
-                collection,
-                searches=[
-                    {
-                        "vector_name": "content_vector",
-                        "query": vector,
-                        "search_filter": search_filter,
-                        "limit": limit,
-                    },
+            sub_limit = max(8, limit // 2)
+            searches: list[dict[str, Any]] = [
+                {
+                    "vector_name": "content_vector",
+                    "query": vector,
+                    "search_filter": search_filter,
+                    "limit": limit,
+                },
+                {
+                    "vector_name": "bm25_sparse",
+                    "query": sparse_query,
+                    "search_filter": search_filter,
+                    "limit": limit,
+                },
+            ]
+            for sub_sparse in sub_sparse_queries:
+                searches.append(
                     {
                         "vector_name": "bm25_sparse",
-                        "query": sparse_query,
+                        "query": sub_sparse,
                         "search_filter": search_filter,
-                        "limit": limit,
-                    },
-                ],
-            )
+                        "limit": sub_limit,
+                    }
+                )
+            batch_res = await store.search_batch(collection, searches=searches)
+            semantic = batch_res[0]
+            lexical = _interleave_hit_lists([batch_res[1], *batch_res[2:]], limit=limit)
         else:
             semantic_task = asyncio.create_task(
                 store.search(
@@ -616,6 +661,8 @@ async def _query_routed_group_batch(
     store: SearchUnitQdrantStore,
     query_vector: list[float],
     route: RouteDecision,
+    escape_limit: int | None = None,
+    sub_sparse_queries: tuple[dict[str, list[int] | list[float]], ...] = (),
 ) -> tuple[list[SearchUnitHit], list[SearchUnitHit], list[SearchUnitHit], list[SearchUnitHit]]:
     """Execute branch_local + global_escape hybrid queries in 1 Qdrant batch round-trip."""
     collection = f"search_units_{group.project_id}"
@@ -638,16 +685,37 @@ async def _query_routed_group_batch(
     if not vector or any(not math.isfinite(value) for value in vector):
         raise ValueError("invalid embedding vector")
     sparse_query = build_sparse_query_vector(query)
-    batch = await store.search_batch(
-        collection,
-        searches=[
-            {"vector_name": "content_vector", "query": vector, "search_filter": local_filter, "limit": limit},
-            {"vector_name": "bm25_sparse", "query": sparse_query, "search_filter": local_filter, "limit": limit},
-            {"vector_name": "content_vector", "query": vector, "search_filter": escape_filter, "limit": limit},
-            {"vector_name": "bm25_sparse", "query": sparse_query, "search_filter": escape_filter, "limit": limit},
-        ],
+    eff_escape_limit = escape_limit if escape_limit is not None else limit
+    searches: list[dict[str, Any]] = [
+        {"vector_name": "content_vector", "query": vector, "search_filter": local_filter, "limit": limit},
+        {"vector_name": "bm25_sparse", "query": sparse_query, "search_filter": local_filter, "limit": limit},
+        {"vector_name": "content_vector", "query": vector, "search_filter": escape_filter, "limit": eff_escape_limit},
+        {"vector_name": "bm25_sparse", "query": sparse_query, "search_filter": escape_filter, "limit": eff_escape_limit},
+    ]
+    local_sub_cnt = 0
+    if sub_sparse_queries:
+        sub_local_lim = max(8, limit // 2)
+        sub_esc_lim = max(8, eff_escape_limit // 2)
+        for sub_sparse in sub_sparse_queries:
+            searches.append(
+                {"vector_name": "bm25_sparse", "query": sub_sparse, "search_filter": local_filter, "limit": sub_local_lim}
+            )
+            local_sub_cnt += 1
+        for sub_sparse in sub_sparse_queries:
+            searches.append(
+                {"vector_name": "bm25_sparse", "query": sub_sparse, "search_filter": escape_filter, "limit": sub_esc_lim}
+            )
+    batch = await store.search_batch(collection, searches=searches)
+    if not sub_sparse_queries:
+        return batch[0], batch[1], batch[2], batch[3]
+    local_sub_hits = batch[4 : 4 + local_sub_cnt]
+    esc_sub_hits = batch[4 + local_sub_cnt :]
+    return (
+        batch[0],
+        _interleave_hit_lists([batch[1], *local_sub_hits], limit=limit),
+        batch[2],
+        _interleave_hit_lists([batch[3], *esc_sub_hits], limit=eff_escape_limit),
     )
-    return batch[0], batch[1], batch[2], batch[3]
 
 
 _QWEN3_QUERY_INSTRUCT = (
@@ -944,6 +1012,12 @@ class _ScopeKnowledgeIndex:
     edges_by_ku: dict[str, list[tuple[str, float]]]
     ent_exact_versions: dict[str, set[str]]
     hydrated_su_by_version: dict[str, list[tuple[RetrievedSection, int, int]]]
+    # Maps (seed_version_id, seed_ordinal) -> [(target_version_id, target_s_ord, target_e_ord, weight, relation)]
+    lineage_by_version_ordinal: dict[tuple[str, int], list[tuple[str, int, int, float, str]]] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.lineage_by_version_ordinal is None:
+            self.lineage_by_version_ordinal = {}
 
 
 _SCOPE_KNOWLEDGE_INDEX_CACHE: dict[str, _ScopeKnowledgeIndex] = {}
@@ -1004,8 +1078,22 @@ async def _get_or_build_scope_knowledge_index(
                 candidates.append((build_id in active_graphs, len(relevant), build_id))
         if candidates:
             graph_ids.append(max(candidates)[2])
+    kg_edge_ids = sorted(
+        str(eid)
+        for (eid,) in (
+            await session.execute(
+                select(KnowledgeGraphEdge.id).where(
+                    KnowledgeGraphEdge.project_id.in_(projects),
+                    KnowledgeGraphEdge.edge_type.in_(("CONTRADICTS", "SUPERSEDES")),
+                )
+            )
+        ).all()
+    )
     digest = hashlib.sha256(repr((
-        _scope_knowledge_digest(current_versions), sorted(checksums.items()), sorted(graph_ids),
+        _scope_knowledge_digest(current_versions),
+        sorted(checksums.items()),
+        sorted(graph_ids),
+        kg_edge_ids,
     )).encode()).hexdigest()
     cached = _SCOPE_KNOWLEDGE_INDEX_CACHE.get(digest)
     if cached is not None:
@@ -1125,12 +1213,164 @@ async def _get_or_build_scope_knowledge_index(
         for k_id in edges_by_ku:
             edges_by_ku[k_id].sort(key=lambda item: (-item[1], item[0]))
 
+    lineage_by_version_ordinal: dict[tuple[str, int], list[tuple[str, int, int, float, str]]] = defaultdict(list)
+    ver_meta_rows = (
+        await session.execute(
+            select(DocumentVersion.id, DocumentVersion.metadata_json).where(
+                DocumentVersion.id.in_(version_ids)
+            )
+        )
+    ).all()
+    raw_block_cands: list[tuple[str, str, str, str, str]] = []
+    cand_block_ids: set[str] = set()
+    for v_id_raw, meta_json in ver_meta_rows:
+        if not isinstance(meta_json, dict):
+            continue
+        dedup_cands = meta_json.get("dedup_candidates")
+        if not isinstance(dedup_cands, list):
+            continue
+        for cand in dedup_cands:
+            if not isinstance(cand, dict):
+                continue
+            rel_type = str(cand.get("relation_type") or cand.get("relation") or "")
+            if rel_type not in {"CONTRADICTS", "SUPERSEDES"}:
+                continue
+            sb_id = str(cand.get("source_block_id") or "")
+            tb_id = str(cand.get("target_block_id") or "")
+            sv_id = str(cand.get("source_version_id") or v_id_raw or "")
+            tv_id = str(cand.get("target_version_id") or "")
+            if (
+                not sb_id
+                or not tb_id
+                or sv_id not in current_versions
+                or tv_id not in current_versions
+                or current_versions[sv_id].tenant_id != current_versions[tv_id].tenant_id
+                or current_versions[sv_id].project_id != current_versions[tv_id].project_id
+            ):
+                continue
+            cand_block_ids.add(sb_id)
+            cand_block_ids.add(tb_id)
+            raw_block_cands.append((sb_id, tb_id, sv_id, tv_id, rel_type))
+
+    if cand_block_ids:
+        blk_ord_rows = (
+            await session.execute(
+                select(
+                    CanonicalBlock.id,
+                    CanonicalBlock.document_version_id,
+                    CanonicalBlock.ordinal,
+                ).where(CanonicalBlock.id.in_(sorted(cand_block_ids)))
+            )
+        ).all()
+        ord_by_block = {
+            (str(b_id), str(b_ver)): int(b_ord)
+            for b_id, b_ver, b_ord in blk_ord_rows
+        }
+        for sb_id, tb_id, sv_id, tv_id, rel_type in raw_block_cands:
+            s_ord_val = ord_by_block.get((sb_id, sv_id))
+            t_ord_val = ord_by_block.get((tb_id, tv_id))
+            if s_ord_val is None or t_ord_val is None:
+                continue
+            if rel_type == "CONTRADICTS":
+                lineage_by_version_ordinal[(sv_id, s_ord_val)].append(
+                    (tv_id, t_ord_val, t_ord_val, 0.92, "CONTRADICTS")
+                )
+                lineage_by_version_ordinal[(tv_id, t_ord_val)].append(
+                    (sv_id, s_ord_val, s_ord_val, 0.92, "CONTRADICTS")
+                )
+            elif rel_type == "SUPERSEDES":
+                lineage_by_version_ordinal[(tv_id, t_ord_val)].append(
+                    (sv_id, s_ord_val, s_ord_val, 0.94, "SUPERSEDED_BY")
+                )
+                lineage_by_version_ordinal[(sv_id, s_ord_val)].append(
+                    (tv_id, t_ord_val, t_ord_val, 0.88, "SUPERSEDES")
+                )
+
+    if kg_edge_ids:
+        src_su = aliased(SearchUnit)
+        tgt_su = aliased(SearchUnit)
+        src_b_from = aliased(CanonicalBlock)
+        src_b_to = aliased(CanonicalBlock)
+        tgt_b_from = aliased(CanonicalBlock)
+        tgt_b_to = aliased(CanonicalBlock)
+        kg_rows = (
+            await session.execute(
+                select(
+                    KnowledgeGraphEdge.edge_type,
+                    src_su.document_version_id,
+                    src_su.security_partition_id,
+                    src_b_from.ordinal,
+                    src_b_to.ordinal,
+                    tgt_su.document_version_id,
+                    tgt_su.security_partition_id,
+                    tgt_b_from.ordinal,
+                    tgt_b_to.ordinal,
+                )
+                .join(src_su, src_su.id == KnowledgeGraphEdge.source_unit_id)
+                .join(tgt_su, tgt_su.id == KnowledgeGraphEdge.target_unit_id)
+                .join(src_b_from, src_b_from.id == src_su.block_from_id)
+                .join(src_b_to, src_b_to.id == src_su.block_to_id)
+                .join(tgt_b_from, tgt_b_from.id == tgt_su.block_from_id)
+                .join(tgt_b_to, tgt_b_to.id == tgt_su.block_to_id)
+                .where(
+                    KnowledgeGraphEdge.id.in_(kg_edge_ids),
+                    src_su.document_version_id.in_(version_ids),
+                    tgt_su.document_version_id.in_(version_ids),
+                    src_su.security_partition_id.in_(allowed_partitions),
+                    tgt_su.security_partition_id.in_(allowed_partitions),
+                )
+            )
+        ).all()
+        for (
+            edge_type_val,
+            sv_raw,
+            s_part,
+            s_from_ord,
+            s_to_ord,
+            tv_raw,
+            t_part,
+            t_from_ord,
+            t_to_ord,
+        ) in kg_rows:
+            sv_id, tv_id = str(sv_raw), str(tv_raw)
+            if (
+                sv_id not in current_versions
+                or tv_id not in current_versions
+                or current_versions[sv_id].partition_id != str(s_part)
+                or current_versions[tv_id].partition_id != str(t_part)
+                or current_versions[sv_id].tenant_id != current_versions[tv_id].tenant_id
+                or current_versions[sv_id].project_id != current_versions[tv_id].project_id
+            ):
+                continue
+            ss_lo, ss_hi = min(int(s_from_ord), int(s_to_ord)), max(int(s_from_ord), int(s_to_ord))
+            tt_lo, tt_hi = min(int(t_from_ord), int(t_to_ord)), max(int(t_from_ord), int(t_to_ord))
+            e_type = str(edge_type_val)
+            if e_type == "CONTRADICTS":
+                for o_val in range(ss_lo, ss_hi + 1):
+                    lineage_by_version_ordinal[(sv_id, o_val)].append(
+                        (tv_id, tt_lo, tt_hi, 0.92, "CONTRADICTS")
+                    )
+                for o_val in range(tt_lo, tt_hi + 1):
+                    lineage_by_version_ordinal[(tv_id, o_val)].append(
+                        (sv_id, ss_lo, ss_hi, 0.92, "CONTRADICTS")
+                    )
+            elif e_type == "SUPERSEDES":
+                for o_val in range(tt_lo, tt_hi + 1):
+                    lineage_by_version_ordinal[(tv_id, o_val)].append(
+                        (sv_id, ss_lo, ss_hi, 0.94, "SUPERSEDED_BY")
+                    )
+                for o_val in range(ss_lo, ss_hi + 1):
+                    lineage_by_version_ordinal[(sv_id, o_val)].append(
+                        (tv_id, tt_lo, tt_hi, 0.88, "SUPERSEDES")
+                    )
+
     index = _ScopeKnowledgeIndex(
         ku_by_version=dict(ku_by_version),
         ku_by_id=ku_by_id,
         edges_by_ku=dict(edges_by_ku),
         ent_exact_versions=dict(ent_exact_versions),
         hydrated_su_by_version={},
+        lineage_by_version_ordinal=dict(lineage_by_version_ordinal),
     )
     if len(_SCOPE_KNOWLEDGE_INDEX_CACHE) >= _SCOPE_KNOWLEDGE_INDEX_CACHE_MAX:
         _SCOPE_KNOWLEDGE_INDEX_CACHE.pop(next(iter(_SCOPE_KNOWLEDGE_INDEX_CACHE)))
@@ -1257,6 +1497,7 @@ async def _hydrate_sibling_sections_for_top_versions(
     current_versions: dict[str, _ReadyVersion],
     sources: list[SearchableSource],
     limit: int,
+    index_holder: list[_ScopeKnowledgeIndex] | None = None,
 ) -> list[RetrievedSection]:
     """Hydrate sibling SearchUnits of top admitted documents so context completion stays coherent."""
     if not sections or not current_versions:
@@ -1282,6 +1523,8 @@ async def _hydrate_sibling_sections_for_top_versions(
                 current_versions,
                 allowed_partitions,
             )
+            if index_holder is not None:
+                index_holder.append(k_index)
             await _ensure_versions_hydrated(
                 session,
                 k_index,
@@ -1314,6 +1557,21 @@ async def _hydrate_sibling_sections_for_top_versions(
         return []
 
 
+_CONTINUOUS_ENTITY_CHAR_RE = re.compile(
+    r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\u0e00-\u0eff\u1780-\u17ff\u1000-\u109f]"
+)
+_CONFLICT_LINEAGE_CUE_RE = re.compile(
+    r"(?<!\w)(?:contradict\w*|conflict\w*|discrepanc\w*|mismatch\w*|inconsisten\w*|"
+    r"differ\w*|versus|vs\.?|compare|comparison|reconcil\w*|"
+    r"mâu\s+thuẫn|xung\s+đột|khác\s+nhau|sai\s+lệch|đối\s+chiếu|so\s+sánh)(?!\w)",
+    flags=re.IGNORECASE | re.UNICODE,
+)
+
+
+def _is_cjk_or_continuous_entity(text: str) -> bool:
+    return bool(_CONTINUOUS_ENTITY_CHAR_RE.search(text))
+
+
 async def _expand_multi_hop_sections(
     *,
     seed_sections: list[RetrievedSection],
@@ -1323,9 +1581,15 @@ async def _expand_multi_hop_sections(
     sources: list[SearchableSource],
     existing_pool_scores: dict[str, float] | None = None,
     limit: int,
+    lineage_only: bool = False,
+    query: str = "",
+    allow_contradiction_lineage: bool = True,
+    preloaded_k_index: _ScopeKnowledgeIndex | None = None,
 ) -> list[RetrievedSection]:
-    """HippoRAG 2 associative passage expansion over ACL-scoped KnowledgeUnitEdge + Artifact Bridges."""
+    """HippoRAG 2 associative passage expansion over ACL-scoped KnowledgeUnitEdge + Artifact Bridges + Stage 2B Lineage."""
     if not seed_sections or not current_versions:
+        return []
+    if lineage_only and preloaded_k_index is not None and not preloaded_k_index.lineage_by_version_ordinal:
         return []
     pool_scores = existing_pool_scores or {}
     seed_ranges: list[tuple[str, int, int, float]] = []
@@ -1348,13 +1612,42 @@ async def _expand_multi_hop_sections(
 
     seed_version_ids = {str(item[0]) for item in seed_ranges}
     allowed_partitions = sorted({v.partition_id for v in current_versions.values()})
+    query_folded = re.sub(r"[\s_-]+", " ", (query or "").lower()).strip()
+    query_single_words = set(re.findall(r"[^\W_]+", query_folded, flags=re.UNICODE))
+    allowed_lineage_kinds = (
+        {"SUPERSEDED_BY", "CONTRADICTS"}
+        if (not lineage_only or allow_contradiction_lineage or bool(_CONFLICT_LINEAGE_CUE_RE.search(query or "")))
+        else {"SUPERSEDED_BY"}
+    )
     try:
-        async with SessionLocal() as session:
-            k_index = await _get_or_build_scope_knowledge_index(
-                session,
-                current_versions,
-                allowed_partitions,
-            )
+        k_index = preloaded_k_index
+        if k_index is None:
+            async with SessionLocal() as session:
+                k_index = await _get_or_build_scope_knowledge_index(
+                    session,
+                    current_versions,
+                    allowed_partitions,
+                )
+        valid_neighbors: dict[str, list[tuple[int, float]]] = defaultdict(list)
+
+        # 1. Stage 2B / KnowledgeGraphEdge Lineage Expansion (CONTRADICTS & SUPERSEDES)
+        if k_index.lineage_by_version_ordinal:
+            for v_id, s_ord, e_ord, s_score in seed_ranges:
+                for ord_cursor in range(s_ord, e_ord + 1):
+                    for tgt_ver, t_lo, t_hi, rel_weight, rel_kind in k_index.lineage_by_version_ordinal.get(
+                        (v_id, ord_cursor), ()
+                    ):
+                        if lineage_only and rel_kind not in allowed_lineage_kinds:
+                            continue
+                        if tgt_ver not in current_versions:
+                            continue
+                        if tgt_ver == v_id and not (t_hi < s_ord or t_lo > e_ord):
+                            continue
+                        lin_score = s_score * rel_weight
+                        for t_ord in range(t_lo, t_hi + 1):
+                            valid_neighbors[tgt_ver].append((t_ord, lin_score))
+
+        if not lineage_only:
             seed_ku_scores: dict[str, float] = {}
             top_seed_entities: dict[str, float] = {}
             max_seed_score = max((item[3] for item in seed_ranges), default=0.5)
@@ -1365,12 +1658,22 @@ async def _expand_multi_hop_sections(
                         if idx_r < 2 or s_score >= 0.85 * max_seed_score:
                             for ent in ku.entities_raw:
                                 ent_clean = re.sub(r"[\s_-]+", " ", ent.lower()).strip()
-                                if len(ent_clean) < 3:
+                                is_cont = _is_cjk_or_continuous_entity(ent_clean)
+                                if len(ent_clean) < (2 if is_cont else 3):
                                     continue
                                 if re.fullmatch(r"\d+(?:\.\d+)?%?(?:\s*[a-z]{1,6})?", ent_clean):
                                     continue
+                                # Single non-digit words already in the user query are direct lexical terms, not Hop-1->Hop-2 bridges
                                 if (
-                                    " " not in ent_clean
+                                    not is_cont
+                                    and " " not in ent_clean
+                                    and not any(c.isdigit() for c in ent_clean)
+                                    and ent_clean in query_single_words
+                                ):
+                                    continue
+                                if (
+                                    not is_cont
+                                    and " " not in ent_clean
                                     and not any(c.isdigit() for c in ent_clean)
                                     and not any(c.isupper() for c in ent[1:])
                                     and len(ent_clean) < 6
@@ -1389,175 +1692,198 @@ async def _expand_multi_hop_sections(
                                 top_seed_entities[ent_norm] = max(
                                     top_seed_entities.get(ent_norm, 0.0), doc_ref_score
                                 )
-            if not seed_ku_scores:
-                return []
-
-            neighbor_scores: dict[str, float] = {}
-            seed_edges = sorted(
-                (
-                    (s_score, tgt_id, w)
-                    for s_ku_id, s_score in seed_ku_scores.items()
-                    for tgt_id, w in k_index.edges_by_ku.get(s_ku_id, ())
-                    if tgt_id not in seed_ku_scores
-                ),
-                key=lambda item: -item[2],
-            )[:limit]
-            for s_score, tgt_id, w in seed_edges:
-                tgt_ku = k_index.ku_by_id.get(tgt_id)
-                if tgt_ku is None or tgt_ku.document_version_id in seed_version_ids:
-                    continue
-                neighbor_scores[tgt_id] = max(neighbor_scores.get(tgt_id, 0.0), s_score * w)
-
-            # HippoRAG 2 Bridge Entity Activation using pre-indexed scope knowledge units
-            if top_seed_entities:
-                ent_doc_versions: dict[str, set[str]] = defaultdict(set)
-                path_patterns: dict[str, re.Pattern[str]] = {
-                    b_ent: re.compile(rf"\b{re.escape(b_ent)}\b")
-                    for b_ent in top_seed_entities
-                    if len(b_ent) >= 5
-                }
-                for v_id, ku_list in k_index.ku_by_version.items():
-                    if v_id in seed_version_ids:
+            if seed_ku_scores:
+                neighbor_scores: dict[str, float] = {}
+                seed_edges = sorted(
+                    (
+                        (s_score, tgt_id, w)
+                        for s_ku_id, s_score in seed_ku_scores.items()
+                        for tgt_id, w in k_index.edges_by_ku.get(s_ku_id, ())
+                        if tgt_id not in seed_ku_scores
+                    ),
+                    key=lambda item: -item[2],
+                )[:limit]
+                for s_score, tgt_id, w in seed_edges:
+                    tgt_ku = k_index.ku_by_id.get(tgt_id)
+                    if tgt_ku is None or tgt_ku.document_version_id in seed_version_ids:
                         continue
-                    for ku in ku_list:
-                        for b_ent in top_seed_entities:
-                            if (
-                                " " in b_ent or any(c.isdigit() for c in b_ent) or len(b_ent) >= 6
-                            ) and b_ent in ku.entities_norm:
-                                ent_doc_versions[b_ent].add(v_id)
-                            else:
-                                pat = path_patterns.get(b_ent)
-                                if (
-                                    pat is not None
-                                    and b_ent in ku.sec_path_norm
-                                    and pat.search(ku.sec_path_norm)
-                                ):
-                                    ent_doc_versions[b_ent].add(v_id)
+                    neighbor_scores[tgt_id] = max(neighbor_scores.get(tgt_id, 0.0), s_score * w)
 
-                max_bridge_df = max(3, min(10, math.ceil(0.08 * max(1, len(current_versions)))))
-                specific_seed_entities = {
-                    b_ent: b_score
-                    for b_ent, b_score in top_seed_entities.items()
-                    if 1
-                    <= len(ent_doc_versions.get(b_ent, ()))
-                    <= (max_bridge_df if (" " in b_ent or any(c.isdigit() for c in b_ent)) else 1)
-                }
-                if specific_seed_entities:
-                    candidate_ver_ids = {
-                        v_id
-                        for b_ent in specific_seed_entities
-                        for v_id in ent_doc_versions.get(b_ent, ())
-                        if v_id not in seed_version_ids
+                # HippoRAG 2 Bridge Entity Activation using pre-indexed scope knowledge units
+                if top_seed_entities:
+                    ent_doc_versions: dict[str, set[str]] = defaultdict(set)
+                    cont_entities = {
+                        b_ent for b_ent in top_seed_entities if _is_cjk_or_continuous_entity(b_ent)
                     }
-                    for v_id in candidate_ver_ids:
-                        for ku in k_index.ku_by_version.get(v_id, ()):
-                            if ku.id in seed_ku_scores:
-                                continue
-                            matched_scores: list[float] = []
-                            path_matched = False
-                            for b_ent, b_score in specific_seed_entities.items():
-                                ent_hit = (
-                                    (" " in b_ent or any(c.isdigit() for c in b_ent) or len(b_ent) >= 6)
-                                    and b_ent in ku.entities_norm
-                                )
-                                pat = path_patterns.get(b_ent)
-                                path_hit = (
-                                    pat is not None
-                                    and b_ent in ku.sec_path_norm
-                                    and bool(pat.search(ku.sec_path_norm))
-                                )
-                                if path_hit or (ent_hit and _ARTIFACT_CODE_RE.fullmatch(b_ent)):
-                                    path_matched = True
-                                if ent_hit or path_hit:
-                                    matched_scores.append(b_score)
-                            if matched_scores:
-                                best_b = max(matched_scores)
-                                mult = 0.88 if path_matched else min(0.75, 0.70 + 0.03 * (len(matched_scores) - 1))
-                                neighbor_scores[ku.id] = max(neighbor_scores.get(ku.id, 0.0), best_b * mult)
+                    path_patterns: dict[str, re.Pattern[str]] = {
+                        b_ent: re.compile(rf"\b{re.escape(b_ent)}\b")
+                        for b_ent in top_seed_entities
+                        if b_ent not in cont_entities and len(b_ent) >= 5
+                    }
+                    for v_id, ku_list in k_index.ku_by_version.items():
+                        if v_id in seed_version_ids:
+                            continue
+                        for ku in ku_list:
+                            for b_ent in top_seed_entities:
+                                is_cont = b_ent in cont_entities
+                                if (
+                                    is_cont or " " in b_ent or any(c.isdigit() for c in b_ent) or len(b_ent) >= 6
+                                ) and b_ent in ku.entities_norm:
+                                    ent_doc_versions[b_ent].add(v_id)
+                                elif is_cont and len(b_ent) >= 2 and b_ent in ku.sec_path_norm:
+                                    ent_doc_versions[b_ent].add(v_id)
+                                else:
+                                    pat = path_patterns.get(b_ent)
+                                    if (
+                                        pat is not None
+                                        and b_ent in ku.sec_path_norm
+                                        and pat.search(ku.sec_path_norm)
+                                    ):
+                                        ent_doc_versions[b_ent].add(v_id)
 
-            # Bounded 2-hop propagation over canonical artifact codes (e.g. Confluence -> PR-19422 -> SUP-18510)
-            if neighbor_scores:
-                hop2_artifact_entities: dict[str, float] = {}
-                for ku_id, n_score in list(neighbor_scores.items()):
-                    if n_score < 0.65 * max_seed_score:
-                        continue
-                    ku = k_index.ku_by_id.get(ku_id)
-                    if ku is None:
-                        continue
-                    for ent_norm in ku.entities_norm:
-                        if _ARTIFACT_CODE_RE.fullmatch(ent_norm) and ent_norm not in top_seed_entities:
-                            hop2_artifact_entities[ent_norm] = max(
-                                hop2_artifact_entities.get(ent_norm, 0.0), n_score
-                            )
-                for art_code, h1_score in hop2_artifact_entities.items():
-                    target_vers = k_index.ent_exact_versions.get(art_code, set()) - seed_version_ids
-                    if 1 <= len(target_vers) <= 3:
-                        for v_id in target_vers:
-                            for ku in k_index.ku_by_version.get(v_id, ()):
-                                if art_code in ku.entities_norm or art_code in ku.sec_path_norm:
-                                    neighbor_scores[ku.id] = max(
-                                        neighbor_scores.get(ku.id, 0.0),
-                                        h1_score * 0.92,
-                                    )
-
-            if not neighbor_scores:
-                return []
-
-            valid_neighbors: dict[str, list[tuple[int, float]]] = defaultdict(list)
-            for ku_id, n_score in neighbor_scores.items():
-                ku = k_index.ku_by_id.get(ku_id)
-                if ku is None or ku.document_version_id in seed_version_ids:
-                    continue
-                valid_neighbors[ku.document_version_id].append((ku.ordinal, n_score))
-            if not valid_neighbors:
-                return []
-
-            neighbor_version_ids = sorted(valid_neighbors)
-            await _ensure_versions_hydrated(
-                session,
-                k_index,
-                neighbor_version_ids,
-                current_versions,
-                sources,
-            )
-
-            expanded: list[RetrievedSection] = []
-            for v_id_str in neighbor_version_ids:
-                ord_scores = valid_neighbors.get(v_id_str, ())
-                ver_candidates: list[RetrievedSection] = []
-                for sec_template, s_ord, e_ord in k_index.hydrated_su_by_version.get(v_id_str, ()):
-                    if sec_template.search_unit_id in existing_unit_ids:
-                        continue
-                    best_score = max(
-                        (score for ku_ord, score in ord_scores if s_ord <= ku_ord <= e_ord),
-                        default=0.0,
-                    )
-                    if best_score <= 0.0:
-                        continue
-                    ver_candidates.append(
-                        sec_template.model_copy(
-                            update={
-                                "score": round(best_score, 4),
-                                "rank": len(seed_sections) + len(expanded),
-                            }
+                    max_bridge_df = max(3, min(10, math.ceil(0.08 * max(1, len(current_versions)))))
+                    specific_seed_entities = {
+                        b_ent: b_score
+                        for b_ent, b_score in top_seed_entities.items()
+                        if 1
+                        <= len(ent_doc_versions.get(b_ent, ()))
+                        <= (
+                            max_bridge_df
+                            if (b_ent in cont_entities or " " in b_ent or any(c.isdigit() for c in b_ent))
+                            else 1
                         )
-                    )
-                ver_candidates.sort(
-                    key=lambda s: (
-                        -s.score,
-                        -pool_scores.get(str(s.search_unit_id or s.chunk_id or ""), 0.0),
-                        s.chunk_id or "",
+                    }
+                    if specific_seed_entities:
+                        candidate_ver_ids = {
+                            v_id
+                            for b_ent in specific_seed_entities
+                            for v_id in ent_doc_versions.get(b_ent, ())
+                            if v_id not in seed_version_ids
+                        }
+                        for v_id in candidate_ver_ids:
+                            for ku in k_index.ku_by_version.get(v_id, ()):
+                                if ku.id in seed_ku_scores:
+                                    continue
+                                matched_scores: list[float] = []
+                                path_matched = False
+                                for b_ent, b_score in specific_seed_entities.items():
+                                    is_cont = b_ent in cont_entities
+                                    is_code = _ARTIFACT_CODE_RE.fullmatch(b_ent) is not None
+                                    ent_hit = (
+                                        (is_cont or " " in b_ent or any(c.isdigit() for c in b_ent) or len(b_ent) >= 6)
+                                        and b_ent in ku.entities_norm
+                                    )
+                                    if is_cont:
+                                        path_hit = len(b_ent) >= 2 and b_ent in ku.sec_path_norm
+                                    else:
+                                        pat = path_patterns.get(b_ent)
+                                        path_hit = (
+                                            pat is not None
+                                            and b_ent in ku.sec_path_norm
+                                            and bool(pat.search(ku.sec_path_norm))
+                                        )
+                                    if is_code and (ent_hit or path_hit):
+                                        path_matched = True
+                                    elif (
+                                        path_hit
+                                        and (is_cont or " " in b_ent or any(c.isdigit() for c in b_ent))
+                                        and (not query_folded or b_ent not in query_folded)
+                                    ):
+                                        path_matched = True
+                                    if ent_hit or path_hit:
+                                        matched_scores.append(b_score)
+                                if matched_scores:
+                                    best_b = max(matched_scores)
+                                    mult = (
+                                        0.88
+                                        if path_matched
+                                        else min(0.85, 0.72 + 0.04 * (len(matched_scores) - 1))
+                                    )
+                                    neighbor_scores[ku.id] = max(neighbor_scores.get(ku.id, 0.0), best_b * mult)
+
+                # Bounded 2-hop propagation over canonical artifact codes (e.g. Confluence -> PR-19422 -> SUP-18510)
+                if neighbor_scores:
+                    hop2_artifact_entities: dict[str, float] = {}
+                    for ku_id, n_score in list(neighbor_scores.items()):
+                        if n_score < 0.65 * max_seed_score:
+                            continue
+                        ku = k_index.ku_by_id.get(ku_id)
+                        if ku is None:
+                            continue
+                        for ent_norm in ku.entities_norm:
+                            if _ARTIFACT_CODE_RE.fullmatch(ent_norm) and ent_norm not in top_seed_entities:
+                                hop2_artifact_entities[ent_norm] = max(
+                                    hop2_artifact_entities.get(ent_norm, 0.0), n_score
+                                )
+                    for art_code, h1_score in hop2_artifact_entities.items():
+                        target_vers = k_index.ent_exact_versions.get(art_code, set()) - seed_version_ids
+                        if 1 <= len(target_vers) <= 3:
+                            for v_id in target_vers:
+                                for ku in k_index.ku_by_version.get(v_id, ()):
+                                    if art_code in ku.entities_norm or art_code in ku.sec_path_norm:
+                                        neighbor_scores[ku.id] = max(
+                                            neighbor_scores.get(ku.id, 0.0),
+                                            h1_score * 0.92,
+                                        )
+
+                for ku_id, n_score in neighbor_scores.items():
+                    ku = k_index.ku_by_id.get(ku_id)
+                    if ku is None or ku.document_version_id in seed_version_ids:
+                        continue
+                    valid_neighbors[ku.document_version_id].append((ku.ordinal, n_score))
+
+        if not valid_neighbors:
+            return []
+
+        neighbor_version_ids = sorted(valid_neighbors)
+        if any(v not in k_index.hydrated_su_by_version for v in neighbor_version_ids):
+            async with SessionLocal() as session:
+                await _ensure_versions_hydrated(
+                    session,
+                    k_index,
+                    neighbor_version_ids,
+                    current_versions,
+                    sources,
+                )
+
+        per_version_cap = max(2, limit // 4)
+        expanded: list[RetrievedSection] = []
+        for v_id_str in neighbor_version_ids:
+            ord_scores = valid_neighbors.get(v_id_str, ())
+            ver_candidates: list[RetrievedSection] = []
+            for sec_template, s_ord, e_ord in k_index.hydrated_su_by_version.get(v_id_str, ()):
+                if sec_template.search_unit_id in existing_unit_ids:
+                    continue
+                best_score = max(
+                    (score for ku_ord, score in ord_scores if s_ord <= ku_ord <= e_ord),
+                    default=0.0,
+                )
+                if best_score <= 0.0:
+                    continue
+                ver_candidates.append(
+                    sec_template.model_copy(
+                        update={
+                            "score": round(best_score, 4),
+                            "rank": len(seed_sections) + len(expanded),
+                        }
                     )
                 )
-                expanded.extend(ver_candidates[:limit])
-            expanded.sort(
+            ver_candidates.sort(
                 key=lambda s: (
                     -s.score,
                     -pool_scores.get(str(s.search_unit_id or s.chunk_id or ""), 0.0),
                     s.chunk_id or "",
                 )
             )
-            return expanded[:limit]
+            expanded.extend(ver_candidates[:per_version_cap])
+        expanded.sort(
+            key=lambda s: (
+                -s.score,
+                -pool_scores.get(str(s.search_unit_id or s.chunk_id or ""), 0.0),
+                s.chunk_id or "",
+            )
+        )
+        return expanded[:limit]
     except Exception as error:  # noqa: BLE001 - associative expansion is best-effort within ACL bounds
         log.warning("multi-hop knowledge graph expansion skipped error_type=%s", type(error).__name__)
         return []
@@ -1764,20 +2090,39 @@ async def _retrieve_search_unit_sections(
             client = await engine_manager.get_search_unit_qdrant_client()
             store = SearchUnitQdrantStore(client)
             semaphore = asyncio.Semaphore(max(1, settings.search_source_concurrency))
+            from sag_api.services.tree_query_snapshot_service import _MANIFEST_NODE_FEATURES_CACHE
+
+            base_snapshot_timeout = float(settings.search_tree_snapshot_timeout)
+            if not _MANIFEST_NODE_FEATURES_CACHE:
+                base_snapshot_timeout = max(base_snapshot_timeout, 4.5)
             snapshot_budget = min(
-                float(settings.search_tree_snapshot_timeout),
+                base_snapshot_timeout,
                 max(
                     0.05,
                     deadline - loop.time() - float(settings.search_tree_escape_reserve_seconds),
                 ),
             )
             t_route_start = time.perf_counter()
+            scope_vector_tasks: dict[str, asyncio.Task[list[float]]] = {}
             for group in groups:
                 config_key = group.source.sag_source_config_id or group.source.id
                 if config_key not in vector_tasks:
                     vector_tasks[config_key] = asyncio.create_task(
                         _query_vector(engine_manager, group, query)
                     )
+                scope_vector_tasks[scope_fingerprint(routing_scope_for_group(group))] = vector_tasks[
+                    config_key
+                ]
+            raw_subqueries = strategy_plan.retrieval_plan.decomposition.subqueries
+            sub_sparse_queries: tuple[dict[str, list[int] | list[float]], ...] = (
+                tuple(
+                    sq_vec
+                    for sq in raw_subqueries[:3]
+                    if sq.strip() and sq.strip() != query.strip() and (sq_vec := build_sparse_query_vector(sq))["indices"]
+                )
+                if len(raw_subqueries) >= 2
+                else ()
+            )
             decisions = await capture_routing_decisions(
                 engine_manager,
                 groups,
@@ -1785,6 +2130,7 @@ async def _retrieve_search_unit_sections(
                 planner_trace=strategy_plan.as_trace(),
                 principal=principal,
                 timeout_seconds=snapshot_budget,
+                query_vector_tasks_by_scope=scope_vector_tasks,
             )
             t_route_ms = round((time.perf_counter() - t_route_start) * 1000, 2)
 
@@ -1814,6 +2160,7 @@ async def _retrieve_search_unit_sections(
                             limit=candidate_limit,
                             store=store,
                             query_vector=vector,
+                            sub_sparse_queries=sub_sparse_queries,
                         )
                         return [(group, route, "global_only", result[1], result[2])], None, None
 
@@ -1827,6 +2174,15 @@ async def _retrieve_search_unit_sections(
                     )
                     local_deadline = deadline - local_reserve
                     escape_deadline = deadline - 0.05
+                    confident_local = (
+                        not route.broad_route
+                        and route.reason_code == "ROUTE_DESCENDED"
+                        and float(route.margin or 0.0) >= 0.22
+                        and not strategy_plan.multi_hop_eligible
+                        and strategy_plan.primary_strategy.value not in {"MULTI_HOP", "GLOBAL_SUMMARY"}
+                        and strategy_plan.retrieval_plan.target.value != "DOCUMENT"
+                    )
+                    eff_escape_limit = max(8, candidate_limit // 2) if confident_local else candidate_limit
 
                     if hasattr(store, "search_batch"):
                         try:
@@ -1838,6 +2194,8 @@ async def _retrieve_search_unit_sections(
                                     store=store,
                                     query_vector=vector,
                                     route=route,
+                                    escape_limit=eff_escape_limit,
+                                    sub_sparse_queries=sub_sparse_queries,
                                 )
                             return (
                                 [
@@ -1858,6 +2216,7 @@ async def _retrieve_search_unit_sections(
                                     limit=candidate_limit,
                                     store=store,
                                     query_vector=vector,
+                                    sub_sparse_queries=sub_sparse_queries,
                                 )
                             return [(group, route, "global_escape", esc_res[1], esc_res[2])], local_failure, None
 
@@ -2289,9 +2648,13 @@ async def _retrieve_search_unit_sections(
     )
     rerank_remaining = deadline - loop.time()
     t_rerank_start = time.perf_counter()
+    scope_k_index_holder: list[_ScopeKnowledgeIndex] = []
+    diversity_stats: dict[str, Any] = {}
+    initial_pool: list[RetrievedSection] = []
     if rerank_remaining <= settings.search_rerank_min_remaining_seconds:
         selection_fallback_reason = "rerank_budget_exhausted"
         fallback_pool = _fair_rank_merge([semantic, lexical])
+        initial_pool = fallback_pool
         if per_doc_limit == 1 and selection_limit is not None:
             from sag_api.services.retrieval_plan import group_sections_by_document
 
@@ -2340,6 +2703,7 @@ async def _retrieve_search_unit_sections(
                 current_versions=current_versions,
                 sources=sources,
                 limit=requested_limit,
+                index_holder=scope_k_index_holder,
             )
             if not is_multi_hop_query and requested_limit > 1 and fused.sections and per_doc_limit != 1
             else []
@@ -2391,11 +2755,16 @@ async def _retrieve_search_unit_sections(
     graph_expanded_candidates = 0
     graph_skip_reason: str | None = None
     t_graph_expansion_ms = 0.0
-    if effective_plan.primary_strategy.value == "MULTI_HOP" or effective_plan.multi_hop_eligible:
+    is_multi_hop_mode = (
+        effective_plan.primary_strategy.value == "MULTI_HOP" or effective_plan.multi_hop_eligible
+    )
+    if is_multi_hop_mode or requested_limit > 1:
         if selection_fallback_reason is not None or (deadline - loop.time()) <= 0.08:
-            graph_skip_reason = "budget_exhausted"
+            if is_multi_hop_mode:
+                graph_skip_reason = "budget_exhausted"
         else:
-            graph_expansion_attempted = True
+            if is_multi_hop_mode:
+                graph_expansion_attempted = True
             seed_pool = selected if selected else (fused.sections if not selection_fallback_reason else [])
             # Keep unselected candidates available for bridge re-scoring within the current breadth.
             existing_ids = {
@@ -2408,6 +2777,7 @@ async def _retrieve_search_unit_sections(
                 for s in initial_pool
                 if (s.search_unit_id or s.chunk_id)
             }
+            has_required_anchors = int((diversity_stats or {}).get("required_anchor_count", 0) or 0) > 0
             t_graph_start = time.perf_counter()
             expanded_sections = await _expand_multi_hop_sections(
                 seed_sections=list(seed_pool),
@@ -2417,17 +2787,21 @@ async def _retrieve_search_unit_sections(
                 sources=sources,
                 existing_pool_scores=existing_pool_scores,
                 limit=min(settings.search_unit_candidate_limit, max(8, requested_limit * 2)),
+                lineage_only=not is_multi_hop_mode,
+                query=query,
+                allow_contradiction_lineage=has_required_anchors,
+                preloaded_k_index=(scope_k_index_holder[0] if scope_k_index_holder else None),
             )
             t_graph_expansion_ms = round((time.perf_counter() - t_graph_start) * 1000, 2)
             graph_expanded_candidates = len(expanded_sections)
             if expanded_sections:
+                graph_expansion_attempted = True
                 t_div_start = time.perf_counter()
                 top_seed_score = max((float(s.score or 0.0) for s in list(seed_pool)[:1]), default=1.0)
                 seed_doc_ids = {str(s.document_id or "") for s in list(seed_pool) if s.document_id}
-                has_required_anchors = int(diversity_stats.get("required_anchor_count", 0) or 0) > 0
                 hop2_cap = (
                     max(0.05, top_seed_score - 0.005)
-                    if (is_multi_hop_query or has_required_anchors)
+                    if (is_multi_hop_query or has_required_anchors or not is_multi_hop_mode)
                     else max(0.05, top_seed_score * 0.88)
                 )
                 expanded_by_id = {str(s.search_unit_id or s.chunk_id or ""): s for s in expanded_sections}
@@ -2439,27 +2813,23 @@ async def _retrieve_search_unit_sections(
                     if exp_match is not None:
                         seen_exp_ids.add(f_id)
                         exp_score = float(exp_match.score or 0.0)
-                        is_cross_doc_multi_hop = (
-                            (
-                                effective_plan.primary_strategy.value == "MULTI_HOP"
-                                or effective_plan.multi_hop_eligible
-                            )
-                            and bool(seed_doc_ids)
-                            and str(f_sec.document_id or "") not in seed_doc_ids
-                        )
-                        is_strong_bridge = exp_score >= 0.85 * top_seed_score
+                        is_cross_doc_multi_hop = bool(seed_doc_ids) and str(f_sec.document_id or "") not in seed_doc_ids
+                        is_strong_bridge = exp_score >= 0.82 * top_seed_score
                         bonus = 0.08 if (is_cross_doc_multi_hop and is_strong_bridge) else 0.0
                         raw_boost = max(float(f_sec.score or 0.0), exp_score + bonus)
                         boosted_score = max(float(f_sec.score or 0.0), min(hop2_cap, raw_boost))
                         boosted_fused.append(f_sec.model_copy(update={"score": round(boosted_score, 6)}))
                     else:
                         boosted_fused.append(f_sec)
-                unconfirmed_cap = min(hop2_cap, max(0.05, top_seed_score * 0.85))
+                unconfirmed_cap = min(
+                    hop2_cap,
+                    max(0.05, top_seed_score * (0.90 if not is_multi_hop_mode else 0.85)),
+                )
                 new_expanded = [
                     s.model_copy(update={"score": round(min(unconfirmed_cap, float(s.score or 0.0)), 6)})
                     for s in expanded_sections
                     if str(s.search_unit_id or s.chunk_id or "") not in seen_exp_ids
-                    and float(s.score or 0.0) >= 0.85 * top_seed_score
+                    and float(s.score or 0.0) >= 0.78 * top_seed_score
                 ]
                 combined_pool = boosted_fused + new_expanded
                 try:
