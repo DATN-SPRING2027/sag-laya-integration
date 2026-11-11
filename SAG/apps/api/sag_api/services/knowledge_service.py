@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
 import asyncio
+import hashlib
 import json
 import math
 import re
+import unicodedata
 import uuid
 from bisect import bisect_left
 from collections import Counter, defaultdict
@@ -35,74 +36,47 @@ from sag_api.db.models import (
     SourceProjectMapping,
     SourceSnapshot,
 )
-from sag_api.services.search_index_service import COMMON_STOPWORDS
 
 
 class KnowledgeConfig(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    # extra="allow" preserves exact input_checksum digests when validating legacy v1 persisted rows
+    # while keeping v2 completely free of deprecated E2 fields.
+    model_config = ConfigDict(frozen=True, extra="allow")
 
-    version: str = "knowledge-v1"
+    version: str = "knowledge-v2"
     max_evidence_per_unit: int = Field(default=64, ge=1, le=256)
     max_terms: int = Field(default=64, ge=1, le=256)
     candidate_limit: int = Field(default=96, ge=1, le=256)
     posting_limit: int = Field(default=24, ge=1, le=64)
     max_degree: int = Field(default=32, ge=1, le=64)
     edge_min_score: float = Field(default=0.55, ge=0, le=1)
-    e2_low_confidence: float = Field(default=0.65, ge=0, le=1)
-    e2_importance_min: float = Field(default=0.5, ge=0, le=1)
     # Project-local dictionary: alias -> canonical label. No global entity linking.
     aliases: tuple[tuple[str, str], ...] = ()
 
 
 SIGNAL_WEIGHTS = {"semantic": 0.4, "lexical": 0.2, "entity": 0.15, "structure": 0.1, "temporal": 0.1, "citation": 0.05}
-_UPPER_CHAR = (
-    r"A-ZÀ-ÖØ-ÞĀĂĄĆĈĊČĎĐĒĔĖĘĚĜĞĠĢĤĦĨĪĬĮİĲĴĶĹĻĽĿŁŃŅŇŊŌŎŐŒŔŖŘŚŜŞŠŢŤŦ"
-    r"ŨŪŬŮŰŲŴŶŸŹŻŽƠƯẠẢẤẦẨẪẬẮẰẲẴẶẸẺẼẾỀỂỄỆỈỊỌỎỐỒỔỖỘỚỜỞỠỢỤỦỨỪỬỮỰỲỴỶỸ"
+
+# Universal, script-independent structural & Unicode patterns (zero language-specific wordlists)
+_CONTINUOUS_SCRIPT_RUN_RE = re.compile(
+    r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u0e00-\u0eff\u1780-\u17ff\u1000-\u109f]+"
 )
-_LOWER_CHAR = (
-    r"a-zß-öø-ÿāăąćĉċčďđēĕėęěĝğġģĥħĩīĭįıĳĵķĸĺļľŀłńņňŉŋōŏőœŕŗřśŝşšţťŧ"
-    r"ũūŭůűųŵŷźżžơưạảấầẩẫậắằẳẵặẹẻẽếềểễệỉịọỏốồổỗộớờởỡợụủứừửữựỳỵỷỹ"
+_WORD_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+_URI_RE = re.compile(r"(?:https?|[a-z][a-z0-9+.-]*):\/\/[^\s<>\]\)]*[^\s<>\]\).,;:!?]")
+_EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
+_UUID_IPV4_RE = re.compile(r"\b(?:[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}|(?:\d{1,3}\.){3}\d{1,3})\b")
+_DATE_OR_DOC_CODE_RE = re.compile(
+    r"\b(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{4}|\d{1,6}(?:/[\w-]+){1,4})\b",
+    re.UNICODE,
 )
-_WORD_CONT = _UPPER_CHAR + _LOWER_CHAR + r"0-9_-"
-_ENTITY_RE = re.compile(
-    r"(?:https?|[a-z][a-z0-9+.-]*):\/\/[^\s<>\]\)]*[^\s<>\]\).,;:!?]|[\w.+-]+@[\w.-]+\.\w+|\b(?:\d{1,3}\.){3}\d{1,3}\b|"
-    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}\b|\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}[-/]\d{1,2}[-/]\d{4}\b|"
-    r"\b\d{1,4}/\d{4}/[A-ZĐa-zđ0-9-]+\b|"
-    r"\b(?:(?i:ngày)[ \t]+\d{1,2}[ \t]+)?(?i:tháng)[ \t]+\d{1,2}(?:[ \t]+(?i:năm)[ \t]+\d{4})?\b|"
-    rf"\b(?i:Dự án|Phiên bản|Điều|Khoản|Mục|Chương)[ \t]+[{_UPPER_CHAR}0-9](?:[.{_WORD_CONT}]*[{_WORD_CONT}])?\b|"
-    rf"\b[{_UPPER_CHAR}][{_WORD_CONT}]*(?:[ \t]+(?:(?i:tàng|hải|án|sự|đẳng|học|viện|phủ|tỉnh|thành|phố|quận|huyện|thị|trấn|sông|vịnh|đảo|mũi|núi|hồ|cảng|đường|de|von|van)[ \t]+)?[{_UPPER_CHAR}][{_WORD_CONT}]*)+\b|"
-    rf"(?<=[{_LOWER_CHAR},(\[\"'«][ \t])\b[{_UPPER_CHAR}][{_LOWER_CHAR}][{_WORD_CONT}]{{1,}}\b|"
-    rf"(?<=\()[{_UPPER_CHAR}][{_WORD_CONT}]{{1,}}(?=\))|"
-    r"\b(?:v?\d+\.\d+(?:\.\d+)?|[A-Z][A-Z0-9_]+(?:-[A-Z0-9]+)*)\b|(?<![\w$])/(?:[\w.{}-]+/)+[\w{}-]*|"
-    r"\b\d+(?:\.\d+)?[ \t]*(?:%|(?:percent|ms|seconds|minutes|hours|days|answers|tokens|chunks|units|"
-    r"ngày|giờ|phút|giây|tuần|tháng|năm|điểm|câu|lần)\b(?![ \t]*\d))"
+_API_PATH_RE = re.compile(r"(?<![\w$:/])/(?:[\w.{}-]+/)+[\w.{}-]*", re.UNICODE)
+_NUMERIC_CODE_RE = re.compile(
+    r"\b(?:[A-Z]{2,12}-\d[\w-]*\b|v\d+(?:\.\d+){1,3}\b|\d+(?:\.\d+)?%(?!\w)|\d+\.\d+(?:\.\d+)*\b|(?:19|20)\d{2}\b)"
 )
-_ENTITY_LEADING_STOP_RE = re.compile(
-    r"^(?:(?i:The|A|An|In|On|At|By|For|With|From|Before|After|During|Since|Until|Under|Over|Between|Through|Within|Without|If|When|While|Every|Each|All|Both|This|That|These|Those|"
-    r"Theo|Tại|Trong|Các|Những|Một|Khi|Nếu|Về|Từ|Do|Để|Với|Vào|Ở|Là|Và|Hoặc|Nhưng|Tuy|Vì|Nên|Của|Cho)[ \t]+)+"
-)
-_VI_COMPOUND_TAIL_RE = re.compile(
-    rf"^.*\b(?i:tàng|hải|án|sự|đẳng|học|viện|phủ|tỉnh|thành|phố|quận|huyện|thị|trấn|sông|vịnh|đảo|mũi|núi|hồ|cảng|đường)[ \t]+([{_UPPER_CHAR}][{_WORD_CONT}]{{3,}}(?:[ \t]+[{_UPPER_CHAR}][{_WORD_CONT}]+)*)$"
-)
-_SINGLE_WORD_STOP_ENTITIES = frozenset(
-    {
-        "the", "this", "that", "these", "those", "there", "their", "they", "them", "then",
-        "when", "where", "which", "while", "what", "who", "whom", "whose", "why", "how",
-        "here", "have", "has", "had", "will", "would", "could", "should", "must", "shall",
-        "may", "might", "can", "each", "every", "some", "many", "most", "more", "other",
-        "another", "such", "only", "also", "even", "still", "both", "either", "neither",
-        "after", "before", "during", "since", "until", "under", "over", "between", "through",
-        "within", "without", "against", "among", "around", "because", "although", "though",
-        "however", "therefore", "moreover", "furthermore", "meanwhile", "otherwise", "instead",
-        "ngoài", "trong", "trên", "dưới", "giữa", "trước", "sau", "khi", "nếu", "vì", "do",
-        "để", "với", "từ", "về", "theo", "tại", "các", "những", "một", "mỗi", "mọi", "nhiều",
-        "nhưng", "hoặc", "cùng", "cũng", "được", "không", "chỉ", "còn", "đang", "đã", "sẽ",
-        "này", "đó", "đây", "ấy", "ông", "bà", "cô", "anh", "chị", "họ", "nó", "tôi", "chúng",
-        "phim", "bộ", "cuộc", "chiếc", "người", "năm", "tháng", "ngày", "quý", "mùa", "tập",
-        "phần", "loạt", "chương", "điều", "khoản", "mục", "luật", "nghị", "thông", "văn",
-    }
-)
-_SENTENCE_SPLIT_RE = re.compile(r"(?:[^.!?\n]|\d+\.\d+)+(?:[.!?](?!\d)|$)")
+_BACKTICK_CODE_RE = re.compile(r"`([^`\n]{2,80})`")
+_CJK_BRACKET_RE = re.compile(r"[《「『【]([^》」』】\n]{2,80})[》」』】]")
+_KATAKANA_RE = re.compile(r"[\u30a0-\u30ffー]{2,40}")
+_LINE_RE = re.compile(r"[^\r\n]+")
+_LINE_WORD_RE = re.compile(r"[^\W_]+(?:[-'’][^\W_]+)*", re.UNICODE)
 
 
 def checksum(value: object) -> str:
@@ -129,8 +103,35 @@ async def knowledge_lock(session, key: str):
     )
 
 
+def _is_continuous_script_char(ch: str) -> bool:
+    cp = ord(ch)
+    return (
+        0x3040 <= cp <= 0x30FF
+        or 0x3400 <= cp <= 0x4DBF
+        or 0x4E00 <= cp <= 0x9FFF
+        or 0xF900 <= cp <= 0xFAFF
+        or 0x0E00 <= cp <= 0x0EFF
+        or 0x1780 <= cp <= 0x17FF
+        or 0x1000 <= cp <= 0x109F
+    )
+
+
 def terms(text: str) -> Counter:
-    return Counter(word for word in re.findall(r"\w+", text.casefold()) if word not in COMMON_STOPWORDS)
+    """Language-agnostic lexical counter: character bigrams for continuous scripts + Unicode words."""
+    folded = text.casefold()
+    counts: Counter[str] = Counter()
+    for c_match in _CONTINUOUS_SCRIPT_RUN_RE.finditer(folded):
+        run = c_match.group(0)
+        if len(run) == 1:
+            counts[run] += 1
+        else:
+            for i in range(len(run) - 1):
+                counts[run[i : i + 2]] += 1
+    non_cont = _CONTINUOUS_SCRIPT_RUN_RE.sub(" ", folded)
+    for word in _WORD_TOKEN_RE.findall(non_cont):
+        if len(word) >= 2 or word.isdigit():
+            counts[word] += 1
+    return counts
 
 
 def _fact(
@@ -149,6 +150,213 @@ def _fact(
     }
 
 
+def _overlaps_any(span: tuple[int, int], protected: list[tuple[int, int]]) -> bool:
+    s, e = span
+    return any(ps < e and s < pe for ps, pe in protected)
+
+
+def _is_upper_word(token: str) -> bool:
+    return bool(token) and unicodedata.category(token[0]) in {"Lu", "Lt"}
+
+
+def _is_all_caps_code(token: str) -> bool:
+    if len(token) < 2:
+        return False
+    has_lu = False
+    alnum_caps = 0
+    for ch in token:
+        cat = unicodedata.category(ch)
+        if cat == "Ll":
+            return False
+        if cat == "Lu":
+            has_lu = True
+            alnum_caps += 1
+        elif cat == "Nd":
+            alnum_caps += 1
+    return has_lu and alnum_caps >= 2
+
+
+def _is_lower_word(token: str) -> bool:
+    if not token or unicodedata.category(token[0]) != "Ll":
+        return False
+    return not any(unicodedata.category(ch) in {"Lu", "Lt"} for ch in token[1:])
+
+
+def _is_short_num(token: str) -> bool:
+    return token.isdigit() and len(token) <= 4
+
+
+def _label_boundary_pattern(label: str) -> re.Pattern[str]:
+    left = "" if _is_continuous_script_char(label[0]) or not (label[0].isalnum() or label[0] == "_") else r"(?<!\w)"
+    right = "" if _is_continuous_script_char(label[-1]) or not (label[-1].isalnum() or label[-1] == "_") else r"(?!\w)"
+    return re.compile(left + re.escape(label) + right, re.IGNORECASE | re.UNICODE)
+
+
+def _extract_universal_anchors(text: str, section_path: str) -> list[tuple[str, str, int, int, float]]:
+    """Extract universal structural & Unicode-script anchors with zero language-specific wordlists.
+
+    Returns tuples of ``(tier, extractor_version, start, end, confidence)`` where
+    ``label == text[start:end]``.
+    """
+    anchors: list[tuple[str, str, int, int, float]] = []
+    seen_spans: set[tuple[int, int]] = set()
+    protected: list[tuple[int, int]] = []
+
+    def _emit(tier: str, ver: str, start: int, end: int, conf: float, *, protect_span: tuple[int, int] | None = None) -> None:
+        if start < 0 or end <= start or end > len(text):
+            return
+        span = (start, end)
+        if span not in seen_spans:
+            seen_spans.add(span)
+            anchors.append((tier, ver, start, end, conf))
+        if protect_span is not None:
+            protected.append(protect_span)
+
+    # Pass 1: Script-independent structural identifiers & CJK/inline-code delimiters
+    for m in _URI_RE.finditer(text):
+        _emit("E0", "e0-structural-v2", *m.span(), 0.96, protect_span=m.span())
+    for m in _EMAIL_RE.finditer(text):
+        if not _overlaps_any(m.span(), protected):
+            _emit("E0", "e0-structural-v2", *m.span(), 0.96, protect_span=m.span())
+    for m in _UUID_IPV4_RE.finditer(text):
+        if not _overlaps_any(m.span(), protected):
+            _emit("E0", "e0-structural-v2", *m.span(), 0.95, protect_span=m.span())
+    for m in _BACKTICK_CODE_RE.finditer(text):
+        if not _overlaps_any(m.span(), protected):
+            _emit("E1", "e1-structural-v2", *m.span(1), 0.80, protect_span=m.span())
+    for m in _CJK_BRACKET_RE.finditer(text):
+        if not _overlaps_any(m.span(), protected):
+            _emit("E0", "e0-unicode-v2", *m.span(1), 0.92, protect_span=m.span())
+    for m in _DATE_OR_DOC_CODE_RE.finditer(text):
+        if _overlaps_any(m.span(), protected):
+            continue
+        raw = m.group(0)
+        # Slash codes require either >= 2 slashes (e.g. 15/2026/NĐ-CP, 18/12/2015) or an alphabetic segment
+        if "/" in raw and raw.count("/") == 1 and not any(ch.isalpha() for ch in raw):
+            continue
+        _emit("E0", "e0-structural-v2", *m.span(), 0.95, protect_span=m.span())
+    for m in _API_PATH_RE.finditer(text):
+        if not _overlaps_any(m.span(), protected):
+            _emit("E0", "e0-structural-v2", *m.span(), 0.94, protect_span=m.span())
+    for m in _NUMERIC_CODE_RE.finditer(text):
+        if not _overlaps_any(m.span(), protected):
+            _emit("E0", "e0-structural-v2", *m.span(), 0.92, protect_span=m.span())
+    for m in _KATAKANA_RE.finditer(text):
+        if not _overlaps_any(m.span(), protected):
+            _emit("E0", "e0-unicode-v2", *m.span(), 0.88)
+
+    # Pass 2: Wordlist-free Unicode bicameral (Lu/Lt/Ll/Nd) line-by-line proper-span automaton
+    sec_folded = (section_path or "").casefold()
+    for line_m in _LINE_RE.finditer(text):
+        line_start = line_m.start()
+        line = line_m.group(0)
+        tokens: list[tuple[int, int, str, bool, bool]] = []
+        prev_end = 0
+        for idx, wm in enumerate(_LINE_WORD_RE.finditer(line)):
+            ls, le = wm.span()
+            gs, ge = line_start + ls, line_start + le
+            tok = wm.group(0)
+            between = line[prev_end:ls]
+            at_sent_start = idx == 0 or any(ch in ".!?。！？…:;" for ch in between)
+            is_prot = _overlaps_any((gs, ge), protected)
+            tokens.append((gs, ge, tok, at_sent_start, is_prot))
+            prev_end = le
+
+        n_toks = len(tokens)
+        i = 0
+        while i < n_toks:
+            gs, ge, tok, sent_start, is_prot = tokens[i]
+            if is_prot or not _is_upper_word(tok):
+                i += 1
+                continue
+
+            chain = [i]
+            consec_uppers = 1
+            upper_count = 1
+            has_lower_bridge = False
+
+            while len(chain) < 7:
+                cur = chain[-1]
+                if cur + 1 >= n_toks:
+                    break
+                cur_ge = tokens[cur][1]
+                nxt_gs, _, nxt_tok, _, nxt_prot = tokens[cur + 1]
+                if nxt_prot or text[cur_ge:nxt_gs] not in {" ", "  ", "\t"}:
+                    break
+
+                if _is_upper_word(nxt_tok):
+                    chain.append(cur + 1)
+                    consec_uppers += 1
+                    upper_count += 1
+                    continue
+
+                if _is_short_num(nxt_tok) and _is_upper_word(tokens[cur][2]):
+                    chain.append(cur + 1)
+                    # Stop extending past a numbered clause/version designator (e.g. "Điều 5", "Section 6")
+                    break
+
+                # Single lowercase syllable/connector bridge between Capitalized words
+                # (e.g. "Bảo tàng Hàng hải Penobscot", "Dự án A", "Rio de Janeiro", "Bank of America")
+                if (
+                    _is_lower_word(nxt_tok)
+                    and len(nxt_tok) <= 6
+                    and cur + 2 < n_toks
+                    and not tokens[cur + 2][4]
+                    and text[tokens[cur + 1][1] : tokens[cur + 2][0]] in {" ", "  ", "\t"}
+                    and _is_upper_word(tokens[cur + 2][2])
+                ):
+                    # Do not bridge across conjunctions after >=2 consecutive Upper words ("Đà Nẵng and Tây Ninh")
+                    can_bridge = consec_uppers == 1 or (sent_start and len(chain) == 2 and consec_uppers == 2)
+                    if can_bridge and sent_start and len(chain) == 1:
+                        # At sentence start ("Before the Evidence Gate" vs "Bảo tàng Hàng hải Penobscot"),
+                        # only bridge token 0 if a second compound bridge follows OR the phrase is in section_path
+                        has_second_bridge = (
+                            cur + 4 < n_toks
+                            and not tokens[cur + 3][4]
+                            and not tokens[cur + 4][4]
+                            and text[tokens[cur + 2][1] : tokens[cur + 3][0]] in {" ", "  ", "\t"}
+                            and text[tokens[cur + 3][1] : tokens[cur + 4][0]] in {" ", "  ", "\t"}
+                            and _is_lower_word(tokens[cur + 3][2])
+                            and _is_upper_word(tokens[cur + 4][2])
+                        )
+                        cand_phrase = text[gs : tokens[cur + 2][1]].casefold()
+                        if not (has_second_bridge or (sec_folded and cand_phrase in sec_folded)):
+                            can_bridge = False
+                    if can_bridge:
+                        chain.append(cur + 1)
+                        chain.append(cur + 2)
+                        consec_uppers = 1
+                        upper_count += 1
+                        has_lower_bridge = True
+                        continue
+                break
+
+            first_idx, last_idx = chain[0], chain[-1]
+            span_start, span_end = tokens[first_idx][0], tokens[last_idx][1]
+            if len(chain) == 1:
+                if _is_all_caps_code(tok) or (not sent_start and len(tok) >= 2):
+                    _emit("E0", "e0-unicode-v2", span_start, span_end, 0.92)
+            else:
+                _emit("E0", "e0-unicode-v2", span_start, span_end, 0.95)
+                # Sentence-initial determiner/preposition strip without wordlists ("The Knowledge Governance Team" -> "Knowledge Governance Team")
+                if sent_start and not _is_all_caps_code(tok) and _is_upper_word(tokens[chain[1]][2]):
+                    sub_chain = chain[1:]
+                    if len(sub_chain) >= 2 or _is_all_caps_code(tokens[sub_chain[0]][2]):
+                        _emit("E0", "e0-unicode-v2", tokens[sub_chain[0]][0], span_end, 0.94)
+                # Trailing proper-name tail after lowercase compound connector ("Tòa án Quân sự Nürnberg" -> "Nürnberg")
+                if has_lower_bridge:
+                    last_lower_pos = max(pos for pos, tidx in enumerate(chain) if _is_lower_word(tokens[tidx][2]))
+                    tail_indices = chain[last_lower_pos + 1 :]
+                    if tail_indices:
+                        t_start, t_end = tokens[tail_indices[0]][0], tokens[tail_indices[-1]][1]
+                        if (t_start, t_end) != (span_start, span_end) and (len(tail_indices) >= 2 or (t_end - t_start) >= 3):
+                            _emit("E0", "e0-unicode-v2", t_start, t_end, 0.92)
+
+            i = last_idx + 1
+
+    return anchors
+
+
 def extract_e0_e1(
     block: CanonicalBlock,
     config: KnowledgeConfig = KnowledgeConfig(),
@@ -158,48 +366,18 @@ def extract_e0_e1(
 ) -> tuple[list[dict], dict]:
     text, anchor = block.normalized_text, (block.source_anchor or "").strip() or f"block-{block.ordinal}"
     facts: list[dict] = []
-    for match in _ENTITY_RE.finditer(text):
-        m_start, m_end = match.span()
-        span_text = text[m_start:m_end]
-        stop_m = _ENTITY_LEADING_STOP_RE.match(span_text)
-        if stop_m:
-            m_start += len(stop_m.group(0))
-            span_text = text[m_start:m_end]
-            if " " not in span_text and not re.fullmatch(r"[A-Z][A-Z0-9_]+(?:-[A-Z0-9]+)*", span_text):
-                continue
-        if " " not in span_text and (
-            span_text.casefold() in _SINGLE_WORD_STOP_ENTITIES
-            or span_text.casefold() in COMMON_STOPWORDS
-        ):
-            continue
+    for tier, ver, m_start, m_end, conf in _extract_universal_anchors(text, block.section_path or ""):
         facts.append(
             {
-                "tier": "E0",
-                "extractor_version": "e0-lexer-v1",
-                **_fact("entity", text, m_start, m_end, block.id, anchor, 0.95, label=span_text),
+                "tier": tier,
+                "extractor_version": ver,
+                **_fact("entity", text, m_start, m_end, block.id, anchor, conf, label=text[m_start:m_end]),
             }
         )
-        tail_m = _VI_COMPOUND_TAIL_RE.match(span_text)
-        if tail_m:
-            t_rel_start, t_rel_end = tail_m.span(1)
-            t_start, t_end = m_start + t_rel_start, m_start + t_rel_end
-            t_label = text[t_start:t_end]
-            if (
-                t_label != span_text
-                and t_label.casefold() not in _SINGLE_WORD_STOP_ENTITIES
-                and t_label.casefold() not in COMMON_STOPWORDS
-            ):
-                facts.append(
-                    {
-                        "tier": "E0",
-                        "extractor_version": "e0-lexer-v1",
-                        **_fact("entity", text, t_start, t_end, block.id, anchor, 0.92, label=t_label),
-                    }
-                )
     for alias, label in config.aliases:
         if not alias.strip() or not label.strip():
             raise ValueError("Alias dictionary requires non-empty labels")
-        for match in re.finditer(r"(?<!\w)" + re.escape(alias) + r"(?!\w)", text, re.IGNORECASE):
+        for match in _label_boundary_pattern(alias.strip()).finditer(text):
             facts.append(
                 {
                     "tier": "E0",
@@ -207,44 +385,14 @@ def extract_e0_e1(
                     **_fact("alias", text, *match.span(), block.id, anchor, 0.9, label=label, alias=match[0]),
                 }
             )
-    # Keep code/table boundaries; narrative statements retain exact character spans without splitting decimals.
-    sentence_spans: list[tuple[int, int]] = []
-    claim_matches = (
-        re.finditer(r"[^\n]+", text)
-        if block.block_type in {"code", "table", "list"}
-        else _SENTENCE_SPLIT_RE.finditer(text)
-    )
-    for match in claim_matches:
-        s_start, s_end = match.span()
-        if match[0].strip():
-            sentence_spans.append((s_start, s_end))
-        if match[0].strip() and len(match[0].strip()) >= 12:
-            facts.append(
-                {
-                    "tier": "E0",
-                    "extractor_version": "e0-statements-v1",
-                    **_fact("claim", text, s_start, s_end, block.id, anchor, 0.55),
-                }
-            )
-    # Bounded lightweight E1 candidates, as allowed by the dependency-pattern tier.
-    for match in re.finditer(r"`([^`\n]{2,80})`", text):
-        facts.append(
-            {
-                "tier": "E1",
-                "extractor_version": "e1-domain-patterns-v1",
-                **_fact("entity", text, *match.span(1), block.id, anchor, 0.7, label=match[1]),
-            }
-        )
+
+    # Structural heading titles from Canonical section_path + optional Dual-Level SAG-Engine entities
     heading_entities: list[str] = []
     if block.section_path:
-        for h_match in re.finditer(rf"\b[{_UPPER_CHAR}][{_WORD_CONT}]{{4,}}\b", block.section_path):
-            h_tok = h_match.group(0)
-            if (
-                h_tok.casefold() not in _SINGLE_WORD_STOP_ENTITIES
-                and h_tok.casefold() not in COMMON_STOPWORDS
-                and h_tok not in heading_entities
-            ):
-                heading_entities.append(h_tok)
+        for raw_seg in block.section_path.split(">"):
+            seg = raw_seg.strip()
+            if 2 <= len(seg) <= 80 and seg not in heading_entities:
+                heading_entities.append(seg)
     combined_extra = tuple(dict.fromkeys([*extra_entities, *heading_entities]))
     if combined_extra:
         seen_spans = {(f["start"], f["end"]) for f in facts if f["kind"] in {"entity", "alias"}}
@@ -252,7 +400,7 @@ def extract_e0_e1(
             label = str(raw_name or "").strip()
             if len(label) < 2 or len(label) > 120:
                 continue
-            for match in re.finditer(r"(?<!\w)" + re.escape(label) + r"(?!\w)", text, re.IGNORECASE):
+            for match in _label_boundary_pattern(label).finditer(text):
                 span = match.span()
                 if span in seen_spans or any(s <= span[0] and span[1] <= e for s, e in seen_spans):
                     continue
@@ -264,78 +412,46 @@ def extract_e0_e1(
                         **_fact("entity", text, *span, block.id, anchor, 0.88, label=label),
                     }
                 )
+
     facts = facts[: config.max_evidence_per_unit]
     entity_facts = sorted(
         (f for f in facts if f["kind"] in {"entity", "alias"}),
         key=lambda f: (f["start"], f["end"]),
     )
     labels = sorted({str(f["label"]) for f in entity_facts})
-    seen_relations: set[tuple[str, str]] = set()
-    for s_start, s_end in sentence_spans or [(0, len(text))]:
-        s_labels: list[str] = []
-        for ef in entity_facts:
-            if ef["start"] >= s_start and ef["end"] <= s_end:
-                lbl = str(ef["label"])
-                if lbl not in s_labels:
-                    s_labels.append(lbl)
-        for idx in range(len(s_labels) - 1):
-            if len(facts) >= config.max_evidence_per_unit:
-                break
-            subj, obj = s_labels[idx], s_labels[idx + 1]
-            pair_key = (subj, obj)
-            if pair_key in seen_relations:
-                continue
-            seen_relations.add(pair_key)
-            facts.append(
-                {
-                    "tier": "E1",
-                    "extractor_version": "e1-domain-patterns-v1",
-                    **_fact(
-                        "relation",
-                        text,
-                        s_start,
-                        s_end,
-                        block.id,
-                        anchor,
-                        0.4,
-                        subject=subj,
-                        predicate="CO_OCCURS",
-                        object=obj,
-                    ),
-                }
-            )
+
+    # Guarantee at least one anchored quote per KnowledgeUnit for provenance/contradiction verification
+    # without bloating KnowledgeEvidence with per-sentence claims or synthetic CO_OCCURS pairs.
+    if not facts and text:
+        end_idx = min(len(text), 240)
+        facts.append(
+            {
+                "tier": "E0",
+                "extractor_version": "e0-anchor-v2",
+                **_fact("passage", text, 0, end_idx, block.id, anchor, 0.55),
+            }
+        )
+
     dense_list = [float(v) for v in dense] if dense else []
     if any(not math.isfinite(v) for v in dense_list):
         raise ValueError("Knowledge dense features must be finite")
-    tokens = terms(block.section_path + " " + text)
-    sparse = sorted(tokens.items(), key=lambda item: (-item[1], item[0]))[: config.max_terms]
-    confidence = max((f["confidence"] for f in facts if f["kind"] in {"entity", "alias"}), default=0.55)
-    causal = bool(
-        re.search(
-            r"\b(?:because|therefore|due to|must|shall|vì|do đó|nếu|phải|từ chối|bắt buộc)\b",
-            text,
-            re.IGNORECASE,
-        )
-    )
+    tokens = terms((block.section_path or "") + " " + text)
+    sparse = sorted(tokens.items(), key=lambda item: (-item[1], -min(len(item[0]), 12), item[0]))[: config.max_terms]
+    confidence = max((f["confidence"] for f in entity_facts), default=0.55)
     importance = min(
         1.0,
         0.25
         + 0.1 * len(labels)
-        + (0.25 if block.block_type in {"code", "table"} else 0)
-        + (0.25 if causal else 0),
+        + (0.25 if block.block_type in {"code", "table"} else 0.0)
+        + min(0.30, len(tokens) / 48.0),
     )
     return facts, {
-        # Foundation stage: deterministic E0/E1 extraction + DenseGraph embeddings (100% cache-reused
-        # from Phase 2C). Phase 5B E2 LLM enrichment was permanently removed after 81-file RetrievalCI
-        # A/B evaluation showed 0 recall gain, -0.73% precision, -20% abstention, and +242% ingest cost
-        # (see docs/adr-remove-e2-llm-enrichment.md).
         "dense": dense_list,
         "sparse": sparse,
         "entities": labels,
-        "citations": sorted(set(re.findall(r"(?:https?|[a-z][a-z0-9+.-]*):\/\/[^\s<>\]\)]*[^\s<>\]\).,;:!?]", text))),
+        "citations": sorted(set(_URI_RE.findall(text))),
         "local_confidence": confidence,
         "importance": importance,
-        "e2_reason": None,
     }
 
 

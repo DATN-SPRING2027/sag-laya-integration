@@ -32,6 +32,237 @@ _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
 # Regex nhận diện danh sách
 _LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+(.+)$")
 
+# Dải ký tự chữ viết không khoảng trắng (CJK, Hiragana, Katakana, Hangul, Thái, Lào, Khmer, Myanmar)
+_CONTINUOUS_SCRIPT_CHAR_RE = re.compile(
+    r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af"
+    r"\u0e00-\u0e7f\u0e80-\u0eff\u1780-\u17ff\u1000-\u109f]"
+)
+
+# Ngắt câu đa ngôn ngữ bảo toàn số thập phân (3.14) và mã hiệu
+_MULTILINGUAL_SENTENCE_SPLIT_RE = re.compile(
+    r"(?:(?<=[.!?。！？；;])\s+(?=\S))|(?:\n+)"
+)
+_MULTILINGUAL_CLAUSE_SPLIT_RE = re.compile(
+    r"(?:(?<=[,，、:：；;])\s*)|(?:\s+(?=[\(\[（]))"
+)
+
+
+def estimate_unicode_tokens(text: str) -> int:
+    """Ước lượng số lượng token độc lập ngôn ngữ (hỗ trợ cả chữ Latin/Cyrillic/Ả Rập có dấu cách
+    lẫn chữ Hán/Nhật/Hàn/Thái/Lào/Khmer không khoảng trắng) mà không tốn chi phí gọi model."""
+    if not text:
+        return 0
+    continuous_chars = len(_CONTINUOUS_SCRIPT_CHAR_RE.findall(text))
+    stripped_other = _CONTINUOUS_SCRIPT_CHAR_RE.sub(" ", text)
+    spaced_words = len(stripped_other.split())
+    return max(1, continuous_chars + spaced_words)
+
+
+def _split_atomic_spans(text: str, *, max_span_tokens: int) -> list[str]:
+    """Tách văn bản thành các câu tự nhiên đa ngôn ngữ; chỉ hạ xuống ranh giới mệnh đề nếu 1 câu đơn quá dài."""
+    import math as _math  # noqa: F401
+
+    raw_parts = [p.strip() for p in _MULTILINGUAL_SENTENCE_SPLIT_RE.split(text) if p and p.strip()]
+    if not raw_parts:
+        return [text.strip()] if text.strip() else []
+
+    # Gộp các mảnh đánh số đầu mục quá ngắn (VD: "1.", "Điều 5.") vào câu ngay sau nó
+    merged_sentences: list[str] = []
+    idx = 0
+    while idx < len(raw_parts):
+        cur = raw_parts[idx]
+        if idx + 1 < len(raw_parts) and len(cur) <= 12 and estimate_unicode_tokens(cur) <= 3:
+            merged_sentences.append(f"{cur} {raw_parts[idx + 1]}")
+            idx += 2
+        else:
+            merged_sentences.append(cur)
+            idx += 1
+
+    final_spans: list[str] = []
+    for sent in merged_sentences:
+        if estimate_unicode_tokens(sent) <= max_span_tokens:
+            final_spans.append(sent)
+            continue
+        clauses = [c.strip() for c in _MULTILINGUAL_CLAUSE_SPLIT_RE.split(sent) if c and c.strip()]
+        if len(clauses) <= 1:
+            final_spans.append(sent)
+            continue
+        buf: list[str] = []
+        buf_toks = 0
+        for cl in clauses:
+            cl_toks = estimate_unicode_tokens(cl)
+            if buf and buf_toks + cl_toks > max_span_tokens // 2:
+                final_spans.append(" ".join(buf))
+                buf = [cl]
+                buf_toks = cl_toks
+            else:
+                buf.append(cl)
+                buf_toks += cl_toks
+        if buf:
+            final_spans.append(" ".join(buf))
+    return final_spans
+
+
+def segment_prose_by_information_cohesion(
+    text: str,
+    *,
+    max_block_tokens: int = 360,
+    min_block_tokens: int = 48,
+) -> list[str]:
+    """Phân đoạn chủ đề bằng Lý thuyết Thông tin (C99 Local-Rank Self-Similarity + Dynamic Programming).
+
+    - Không gọi AI / Embedding ($0 chi phí), không dùng từ điển hay Regex ngôn ngữ.
+    - Biểu diễn mỗi câu bằng phân phối Character 3/4-grams có trọng số Lượng tin riêng (Self-Information)
+      nội tại I(g) = log(1 + M / df(g)): hư từ xuất hiện đều tự động có I(g) thấp, thuật ngữ chủ đề
+      cục bộ tự động có I(g) cao trên mọi hệ chữ viết.
+    - Làm mượt ngữ cảnh cục bộ Hearst [0.25, 1.0, 0.25], chuẩn hóa ma trận hạng cục bộ C99 (Choi, NAACL 2000),
+      và giải Quy hoạch động tìm các đoạn gắn kết nội bộ tối đa.
+    """
+    import math
+    from collections import Counter
+
+    cleaned = text.strip()
+    if not cleaned or estimate_unicode_tokens(cleaned) <= max_block_tokens:
+        return [cleaned] if cleaned else []
+
+    spans = _split_atomic_spans(cleaned, max_span_tokens=max_block_tokens)
+    m = len(spans)
+    if m <= 1:
+        return [cleaned]
+
+    span_tokens = [estimate_unicode_tokens(s) for s in spans]
+    prefix_tokens = [0] * (m + 1)
+    for i, t_cnt in enumerate(span_tokens):
+        prefix_tokens[i + 1] = prefix_tokens[i] + t_cnt
+
+    # 1. Trích xuất Character 3-grams & 4-grams chuẩn hóa Unicode (không phụ thuộc khoảng trắng)
+    raw_counters: list[Counter[str]] = []
+    df_counts: Counter[str] = Counter()
+    for s in spans:
+        compact = re.sub(r"\s+", " ", s.casefold()).strip()
+        grams: Counter[str] = Counter()
+        padded = f" {compact} "
+        plen = len(padded)
+        if plen >= 3:
+            for k in (3, 4):
+                if plen >= k:
+                    for pos in range(plen - k + 1):
+                        grams[padded[pos : pos + k]] += 1
+        else:
+            grams[compact] += 1
+        raw_counters.append(grams)
+        for g in grams:
+            df_counts[g] += 1
+
+    # 2. Trọng số Self-Information nội tại I(g) = log(1 + M / df(g))
+    idf_map = {g: math.log(1.0 + m / df) for g, df in df_counts.items()}
+    weighted_vecs: list[dict[str, float]] = []
+    for grams in raw_counters:
+        weighted_vecs.append({g: cnt * idf_map[g] for g, cnt in grams.items()})
+
+    # 3. Làm mượt cửa sổ lân cận Hearst [0.25, 1.0, 0.25] để câu chuyển ý ngắn không bị tách rời
+    smoothed: list[dict[str, float]] = []
+    norms: list[float] = []
+    for i in range(m):
+        vec: dict[str, float] = dict(weighted_vecs[i])
+        if i > 0:
+            for g, val in weighted_vecs[i - 1].items():
+                vec[g] = vec.get(g, 0.0) + 0.25 * val
+        if i + 1 < m:
+            for g, val in weighted_vecs[i + 1].items():
+                vec[g] = vec.get(g, 0.0) + 0.25 * val
+        norm = math.sqrt(math.fsum(v * v for v in vec.values())) or 1.0
+        smoothed.append(vec)
+        norms.append(norm)
+
+    # 4. Ma trận tương đồng Cosine đối xứng S (M x M)
+    sim = [[0.0] * m for _ in range(m)]
+    for i in range(m):
+        sim[i][i] = 1.0
+        vi, ni = smoothed[i], norms[i]
+        for j in range(i + 1, m):
+            vj, nj = smoothed[j], norms[j]
+            if len(vi) > len(vj):
+                dot = math.fsum(val * vi[g] for g, val in vj.items() if g in vi)
+            else:
+                dot = math.fsum(val * vj[g] for g, val in vi.items() if g in vj)
+            c = max(0.0, min(1.0, dot / (ni * nj)))
+            sim[i][j] = sim[j][i] = c
+
+    # 5. Chuẩn hóa hạng cục bộ C99 (cửa sổ bán kính r=2 -> lân cận 5x5) làm sắc nét biên chủ đề
+    rank_mat = [[0.0] * m for _ in range(m)]
+    radius = 2
+    for i in range(m):
+        r_lo, r_hi = max(0, i - radius), min(m, i + radius + 1)
+        for j in range(m):
+            c_lo, c_hi = max(0, j - radius), min(m, j + radius + 1)
+            target = sim[i][j]
+            lower_cnt = 0
+            total_cnt = 0
+            for ri in range(r_lo, r_hi):
+                row_ri = sim[ri]
+                for cj in range(c_lo, c_hi):
+                    if ri == i and cj == j:
+                        continue
+                    total_cnt += 1
+                    if row_ri[cj] < target:
+                        lower_cnt += 1
+            rank_mat[i][j] = (lower_cnt / total_cnt) if total_cnt > 0 else target
+
+    # Tổng tiền tố 2D để tính mật độ gắn kết nội bộ của mọi đoạn [a, b) trong O(1)
+    ps2d = [[0.0] * (m + 1) for _ in range(m + 1)]
+    for i in range(m):
+        row_ps = ps2d[i + 1]
+        prev_ps = ps2d[i]
+        r_row = rank_mat[i]
+        running = 0.0
+        for j in range(m):
+            running += r_row[j]
+            row_ps[j + 1] = prev_ps[j + 1] + running
+
+    def _rect_sum(a: int, b: int) -> float:
+        return ps2d[b][b] - ps2d[a][b] - ps2d[b][a] + ps2d[a][a]
+
+    # 6. Quy hoạch động phân đoạn tối ưu (Optimal Topic Partitioning)
+    neg_inf = -1e18
+    dp = [neg_inf] * (m + 1)
+    prev_cut = [0] * (m + 1)
+    dp[0] = 0.0
+
+    for b in range(1, m + 1):
+        best_val = neg_inf
+        best_a = b - 1
+        for a in range(b - 1, -1, -1):
+            seg_toks = prefix_tokens[b] - prefix_tokens[a]
+            if seg_toks > max_block_tokens and b - a > 1:
+                break
+            cnt = b - a
+            mean_cohesion = _rect_sum(a, b) / (cnt * cnt)
+            # Phạt nhẹ nếu đoạn quá vụn (< min_block_tokens) để tránh cắt lẻ 1 câu chuyển ý
+            short_penalty = (
+                0.18 * (min_block_tokens - seg_toks)
+                if seg_toks < min_block_tokens and m > 2
+                else 0.0
+            )
+            # Chi phí mở đoạn mới nhỏ giúp ưu tiên giữ chung 1 đoạn khi mật độ gắn kết đồng nhất
+            seg_score = dp[a] + (seg_toks * mean_cohesion) - short_penalty - 4.5
+            if seg_score > best_val:
+                best_val = seg_score
+                best_a = a
+        dp[b] = best_val
+        prev_cut[b] = best_a
+
+    cuts: list[tuple[int, int]] = []
+    cur = m
+    while cur > 0:
+        a = prev_cut[cur]
+        cuts.append((a, cur))
+        cur = a
+    cuts.reverse()
+
+    segments = [" ".join(spans[a:b]).strip() for a, b in cuts if " ".join(spans[a:b]).strip()]
+    return segments if segments else [cleaned]
+
 
 @dataclass(frozen=True, slots=True)
 class ExtractedBlock:
@@ -361,24 +592,31 @@ def extract_canonical_blocks(
 
         raw_para = "\n".join(para_lines)
         normalized_para = normalize_text(raw_para)
-        chash = compute_content_hash(normalized_para)
         section_path = " > ".join(h for _, h in current_section_stack) or "Root"
-        is_bp = is_boilerplate_text(normalized_para)
-
-        blocks.append(
-            ExtractedBlock(
-                ordinal=ordinal,
-                block_type="paragraph",
-                normalized_text=normalized_para,
-                content_hash=chash,
-                page_from=current_page,
-                page_to=current_page,
-                section_path=section_path,
-                source_anchor=f"p-{ordinal}",
-                is_boilerplate=is_bp,
-                metadata={"is_boilerplate": is_bp} if is_bp else {},
-            )
+        para_segments = (
+            segment_prose_by_information_cohesion(normalized_para, max_block_tokens=360)
+            if estimate_unicode_tokens(normalized_para) > 360
+            else [normalized_para]
         )
-        ordinal += 1
+        for seg_text in para_segments:
+            if not seg_text:
+                continue
+            chash = compute_content_hash(seg_text)
+            is_bp = is_boilerplate_text(seg_text)
+            blocks.append(
+                ExtractedBlock(
+                    ordinal=ordinal,
+                    block_type="paragraph",
+                    normalized_text=seg_text,
+                    content_hash=chash,
+                    page_from=current_page,
+                    page_to=current_page,
+                    section_path=section_path,
+                    source_anchor=f"p-{ordinal}",
+                    is_boilerplate=is_bp,
+                    metadata={"is_boilerplate": is_bp} if is_bp else {},
+                )
+            )
+            ordinal += 1
 
     return blocks
