@@ -71,13 +71,26 @@ _QUERY_INSTRUCTION_TERMS = frozenset(
         "describe",
     }
 )
-_CHINESE_RUN_RE = re.compile(r"[\u3400-\u9fff]+")
+_CHINESE_RUN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
+_CONTINUOUS_NON_CHINESE_RUN_RE = re.compile(
+    r"[\u3040-\u30ff\u0e00-\u0e7f\u0e80-\u0eff\u1780-\u17ff\u1000-\u109f]+"
+)
+_ANY_CONTINUOUS_SCRIPT_RE = re.compile(
+    r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+    r"\u0e00-\u0e7f\u0e80-\u0eff\u1780-\u17ff\u1000-\u109f]"
+)
 _LEXICAL_PART_RE = re.compile(
-    r"[^\W_](?:[^\W_]|[_.+-]){1,31}|[\u3400-\u9fff]+",
+    r"[^\W_](?:[^\W_]|[_.+-]){1,31}|[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u0e00-\u0eff\u1780-\u17ff\u1000-\u109f]+",
     re.UNICODE,
 )
 _LEGACY_TERM_RE = re.compile(
-    r"[^\W_](?:[^\W_]|[_.+-]){1,31}|[\u3400-\u9fff]{2,16}",
+    r"[^\W_](?:[^\W_]|[_.+-]){1,31}|[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u0e00-\u0eff\u1780-\u17ff\u1000-\u109f]{2,16}",
+    re.UNICODE,
+)
+_QUERY_NOISE_RE = re.compile(
+    r"(?<!\w)(?:"
+    + "|".join(re.escape(phrase) for phrase in sorted(_QUERY_NOISE, key=len, reverse=True))
+    + r")(?!\w)",
     re.UNICODE,
 )
 # Letter and digit runs inside a single lexical token. A glued query such as
@@ -113,14 +126,16 @@ _RELATION_STEM_GROUPS: dict[str, str] = {
     "quan hệ": "quan_he",
 }
 _TEMPORAL_CUES = (
-    "trước",
-    "sau",
-    "từ",
-    "đến",
-    "khi",
+    "trước khi",
+    "sau khi",
+    "khi nào",
+    "từ năm",
+    "từ ngày",
     "hiện tại",
+    "hiện hành",
     "lúc đó",
     "phiên bản",
+    "lịch sử",
     "version",
     "release",
     "năm",
@@ -133,6 +148,10 @@ _TEMPORAL_CUES = (
     "during",
     "current",
     "historical",
+)
+_STRUCTURAL_TEMPORAL_RE = re.compile(
+    r"(?:\b(?:19|20)\d{2}\b|\b\d{4}-\d{2}(?:-\d{2})?\b|\b(?:fy|q)[1-4]?\d{2,4}\b|\bq[1-4]\b|\bv\d+(?:\.\d+)+\b|\d{4}年|\d{1,2}月\d{1,2}日)",
+    re.IGNORECASE,
 )
 _RELATION_CUES = (
     "mối liên hệ",
@@ -225,9 +244,7 @@ def normalize_lexical_text(value: str) -> str:
 
 def _remove_query_noise(query: str) -> str:
     cleaned = _nfc(query).strip().lower()
-    for phrase in _QUERY_NOISE:
-        cleaned = cleaned.replace(phrase, " ")
-    return cleaned
+    return _QUERY_NOISE_RE.sub(" ", cleaned)
 
 
 def _unique_values(values: Iterable[str], *, limit: int = 8) -> tuple[str, ...]:
@@ -249,7 +266,8 @@ _CLAUSE_SPLIT_RE = re.compile(
     r"(?:,\s+and\s+(?=(?:what|which|who|where|why|how|when|is|are|was|were|did|does|do|should|can)\b)"
     r"|\s+and\s+(?=(?:what|which|who|where|why|how\s+(?:do|does|did|should|can|could|to|will|would|is|are|was|were))\b)"
     r"|,\s*và\s+(?=(?:ai|cái\s+gì|gì|ở\s+đâu|đâu|khi\s+nào|như\s+thế\s+nào|bao\s+nhiêu|nào|có\s+phải|là)\b)"
-    r"|;\s+)",
+    r"|[?？]\s+(?=\S)"
+    r"|[;；]\s*)",
     re.IGNORECASE,
 )
 _SALIENT_PROPER_TERM_RE = re.compile(
@@ -262,10 +280,10 @@ def decompose_query_clauses(query: str) -> tuple[str, ...]:
     text = _nfc(query).strip()
     if not text:
         return ()
-    parts = [part.strip(" ,;?") for part in _CLAUSE_SPLIT_RE.split(text) if part and part.strip(" ,;?")]
+    parts = [part.strip(" ,;?？；") for part in _CLAUSE_SPLIT_RE.split(text) if part and part.strip(" ,;?？；")]
     if len(parts) <= 1:
         return (text,)
-    valid = [p for p in parts if len(p) >= 8]
+    valid = [p for p in parts if len(p) >= 8 or (_ANY_CONTINUOUS_SCRIPT_RE.search(p) and len(p) >= 4)]
     return tuple(valid) if len(valid) >= 2 else (text,)
 
 
@@ -310,7 +328,13 @@ def extract_query_features(query: str) -> QueryFeatures:
         and not re.fullmatch(r"\d+(?:\.\d+)*(?:\.[xX*]+)?(?:[a-zA-Z%]{1,4})?", cleaned_path)
         and not re.fullmatch(r"[A-Za-z](?:\.[A-Za-z])+", cleaned_path)
     )
-    temporal_cues = _unique_values(cue for cue in _TEMPORAL_CUES if cue in lowered)
+    matched_temporal = [
+        cue
+        for cue in _TEMPORAL_CUES
+        if re.search(rf"(?<!\w){re.escape(cue)}(?!\w)", lowered, flags=re.UNICODE)
+    ]
+    matched_temporal.extend(m.group(0) for m in _STRUCTURAL_TEMPORAL_RE.finditer(text))
+    temporal_cues = _unique_values(matched_temporal)
     matched_relation_cues: list[str] = []
     seen_relation_stems: set[str] = set()
     for cue in _RELATION_CUES:
@@ -432,11 +456,33 @@ def _filter_informative_tokens(tokens: list[str]) -> list[str]:
     return filtered if filtered else tokens
 
 
+def _expand_non_chinese_continuous_runs(tokens: Iterable[str]) -> list[str]:
+    out: list[str] = []
+    for tok in tokens:
+        if not _CONTINUOUS_NON_CHINESE_RUN_RE.search(tok):
+            out.append(tok)
+            continue
+        last_end = 0
+        for match in _CONTINUOUS_NON_CHINESE_RUN_RE.finditer(tok):
+            if match.start() > last_end:
+                out.append(tok[last_end : match.start()])
+            run = match.group(0)
+            if len(run) <= 2:
+                out.append(run)
+            else:
+                for pos in range(len(run) - 1):
+                    out.append(run[pos : pos + 2])
+            last_end = match.end()
+        if last_end < len(tok):
+            out.append(tok[last_end:])
+    return out
+
+
 def _legacy_query_terms(
     cleaned: str,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     bridged_dates = _extract_bridged_date_tokens(cleaned)
-    raw = [*bridged_dates, *_LEGACY_TERM_RE.findall(cleaned)]
+    raw = [*bridged_dates, *_expand_non_chinese_continuous_runs(_LEGACY_TERM_RE.findall(cleaned))]
     return _split_alnum_terms(_filter_informative_tokens(raw))
 
 
@@ -460,6 +506,8 @@ def _segmented_terms(
             if len(part) < 2:
                 continue
             values.extend(segmenter(part))
+        elif _CONTINUOUS_NON_CHINESE_RUN_RE.search(part):
+            values.extend(_expand_non_chinese_continuous_runs([part]))
         else:
             values.extend([part])
     return _split_alnum_terms(_filter_informative_tokens(values))

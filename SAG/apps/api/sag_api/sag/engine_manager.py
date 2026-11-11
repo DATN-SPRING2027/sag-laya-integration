@@ -314,12 +314,19 @@ class EngineManager:
         query: str,
         scopes: list[dict[str, object]],
         planner: dict[str, object],
+        query_vector_tasks_by_scope: Any = None,
+        timeout_seconds: float | None = None,
     ) -> Any:
         """Capture durable tree/search/ACL pins for one complete request."""
         del planner  # The immutable tree snapshot is independent of strategy planning.
         from sag_api.services.tree_query_snapshot_service import acquire_tree_query_snapshot
 
-        return await acquire_tree_query_snapshot(query=query, scopes=scopes)
+        return await acquire_tree_query_snapshot(
+            query=query,
+            scopes=scopes,
+            query_vector_tasks_by_scope=query_vector_tasks_by_scope,
+            timeout_seconds=timeout_seconds,
+        )
 
     async def release_routing_snapshot(self, snapshot_id: str) -> None:
         """Release request leases after the Qdrant reads using their pinned slot finish."""

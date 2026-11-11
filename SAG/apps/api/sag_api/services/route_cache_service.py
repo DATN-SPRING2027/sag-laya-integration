@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from sag_api.services.query_routing_service import GroupRoutingSnapshot, RoutingPolicy
 
 ROUTE_CACHE_KEY_VERSION = "route-cache-key-v1"
-ROUTE_DECISION_MODEL_VERSION = "profile-query-signal-v1"
+ROUTE_DECISION_MODEL_VERSION = "profile-query-signal-v2"
 
 
 def _canonical_digest(value: object) -> str:

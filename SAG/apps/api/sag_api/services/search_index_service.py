@@ -200,14 +200,14 @@ def compute_sparse_bm25_vector(
         if word.isascii() and word.isalpha():
             stem = (
                 word[:-3]
-                if len(word) >= 6 and word.endswith("ing")
+                if len(word) >= 7 and word.endswith("ing")
                 else word[:-2]
-                if len(word) >= 6 and word.endswith("ed")
+                if len(word) >= 6 and word.endswith("ed") and not word.endswith("eed")
                 else word[:-1]
-                if len(word) >= 5 and word.endswith("s") and not word.endswith("ss")
+                if len(word) >= 5 and word.endswith("s") and not word.endswith(("ss", "us", "is"))
                 else None
             )
-            if stem and len(stem) >= 3:
+            if stem and len(stem) >= 4:
                 stem_idx = int(hashlib.md5(stem.encode("utf-8")).hexdigest()[:8], 16) % 1000000
                 sparse_map[stem_idx] = max(sparse_map.get(stem_idx, 0.0), round(bm25_weight * 0.55, 4))
 

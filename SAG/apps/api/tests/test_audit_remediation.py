@@ -1242,3 +1242,162 @@ def test_vietnamese_entity_lexer_and_multihop_detection() -> None:
     mh_q2 = "Sự khác nhau giữa quy trình phê duyệt cấp 1 và quy trình khẩn cấp là gì, và khi nào cần áp dụng?"
     assert extract_query_features(mh_q1).multi_hop is True
     assert extract_query_features(mh_q2).multi_hop is True
+
+
+@pytest.mark.asyncio
+async def test_four_pillar_retrieval_and_semantic_routing_upgrade() -> None:
+    """Verify semantic+temporal tree routing, word-boundary reranking, stemming alignment, and subquery interleaving."""
+    from datetime import UTC, datetime
+
+    from sag_api.sag import RetrievedSection
+    from sag_api.sag.search_unit_store import SearchUnitHit, build_sparse_query_vector
+    from sag_api.services.query_analysis import (
+        analyze_query,
+        decompose_query_clauses,
+        extract_query_features,
+    )
+    from sag_api.services.query_routing_service import (
+        GroupRoutingSnapshot,
+        route_snapshot,
+        scope_fingerprint,
+    )
+    from sag_api.services.retrieval_service import _lexical_relevance
+    from sag_api.services.search_index_service import compute_sparse_bm25_vector
+    from sag_api.services.search_unit_retrieval_service import (
+        _interleave_hit_lists,
+        _is_cjk_or_continuous_entity,
+    )
+    from sag_api.services.tree_query_snapshot_service import (
+        _build_query_node_profiles,
+        _extract_manifest_node_features,
+        _normalize_unit_vector,
+    )
+
+    # Pillar 1: Semantic dense_medoid + temporal tree routing on zero-lexical-overlap paraphrase query
+    manifest_json = {
+        "routing_profiles": [
+            {
+                "partition_id": "public",
+                "node_id": "root",
+                "dense_medoid": [0.70, 0.70, 0.10, 0.10],
+                "temporal_from": "2024-01-01T00:00:00Z",
+                "temporal_to": "2026-12-31T00:00:00Z",
+            },
+            {
+                "partition_id": "public",
+                "node_id": "leaf-auth",
+                "dense_medoid": [0.95, 0.25, 0.10, 0.05],
+                "temporal_from": "2026-01-01T00:00:00Z",
+                "temporal_to": "2026-12-31T00:00:00Z",
+            },
+            {
+                "partition_id": "public",
+                "node_id": "leaf-billing",
+                "dense_medoid": [0.35, 0.90, 0.15, 0.10],
+                "temporal_from": "2024-01-01T00:00:00Z",
+                "temporal_to": "2024-12-31T00:00:00Z",
+            },
+        ]
+    }
+    m_features = _extract_manifest_node_features(manifest_json)
+    fp = scope_fingerprint(
+        {
+            "project_id": "proj-sem",
+            "source_ids": ["src-1"],
+            "document_version_ids": ["ver-1"],
+            "tenant_id": "tenant-1",
+            "partition_id": "public",
+        }
+    )
+    cached_nodes = [
+        ("root", None, False, 6, [["credential", 3.0], ["invoice", 3.0]], []),
+        ("leaf-auth", "root", True, 3, [["credential", 5.0], ["mfa", 4.0]], []),
+        ("leaf-billing", "root", True, 3, [["invoice", 5.0], ["ledger", 4.0]], []),
+    ]
+    # Paraphrase query has ZERO lexical overlap with ["credential", "mfa", "invoice", "ledger"]
+    q_paraphrase = "How do users verify identity at sign-in during 2026?"
+    q_vec = _normalize_unit_vector([0.96, 0.22, 0.08, 0.05])
+    node_profiles = _build_query_node_profiles(
+        cached_nodes,
+        project_id="proj-sem",
+        tenant_id="tenant-1",
+        tree_version="tree-1",
+        source_ids=("src-1",),
+        partition_id="public",
+        document_version_ids=("ver-1",),
+        fingerprint=fp,
+        query=q_paraphrase,
+        manifest_features=m_features,
+        query_unit_vector=q_vec,
+    )
+    snap = GroupRoutingSnapshot(
+        snapshot_id="snap-sem",
+        captured_at=datetime.now(UTC),
+        project_id="proj-sem",
+        source_ids=("src-1",),
+        document_version_ids=("ver-1",),
+        tenant_id="tenant-1",
+        partition_id="public",
+        scope_fingerprint=fp,
+        tree_version="tree-1",
+        tree_config_version="v1",
+        routing_slot="SLOT_A",
+        search_epoch=1,
+        manifest_status="ACTIVE",
+        manifest_checksum="b" * 64,
+        manifest_verified=True,
+        profiles=node_profiles,
+    )
+    sem_decision = route_snapshot(snap)
+    assert sem_decision.routed is True
+    assert sem_decision.broad_route is False
+    assert sem_decision.reason_code == "ROUTE_DESCENDED"
+    assert sem_decision.selected_nodes == ("leaf-auth",)
+
+    # Pillar 2: Word-boundary lexical reranking + safe secondary stemming + multilingual query analysis
+    sec_false_sub = RetrievedSection(
+        chunk_id="c-smart",
+        document_id="d-smart",
+        heading="Smart Configuration",
+        content="Smart configuration manages chart partitions.",
+        score=0.5,
+        rank=0,
+        source_id="src-1",
+    )
+    assert _lexical_relevance("art", sec_false_sub, analysis=analyze_query("art")) == 0.0
+
+    # Safe secondary stemming alignment between index and query (no false truncation of string/during/status/exceed)
+    for word in ("string", "during", "status", "exceed"):
+        # Unstemmable words emit exactly 1 bucket (no corrupted stem bucket)
+        assert len(build_sparse_query_vector(word)["indices"]) == 1
+        assert build_sparse_query_vector(word)["indices"] == compute_sparse_bm25_vector(word)["indices"]
+    # True inflections share stem bucket between index and query
+    assert set(build_sparse_query_vector("configurations")["indices"]) & set(
+        compute_sparse_bm25_vector("configuration")["indices"]
+    )
+
+    # Spatial Vietnamese prepositions ("từ ... đến ...") must NOT trigger false temporal cue, whereas structural dates do
+    assert bool(extract_query_features("Khoảng cách từ Hà Nội đến Đà Nẵng là bao nhiêu?").temporal_cues) is False
+    assert bool(extract_query_features("Chính sách năm 2026 quy định gì?").temporal_cues) is True
+    assert bool(extract_query_features("2026年4月の監査基準は何ですか？").temporal_cues) is True
+
+    # Multi-question interrogative decomposition & continuous-script CJK/Japanese/Thai entity detection
+    clauses = decompose_query_clauses("What is the audit log retention period? What port does the metrics exporter use?")
+    assert len(clauses) == 2
+    assert _is_cjk_or_continuous_entity("証拠台帳") is True
+    assert _is_cjk_or_continuous_entity("個人情報") is True
+    assert _is_cjk_or_continuous_entity("policy") is False
+
+    # Pillar 3: Subquery sparse hit rank-interleaving preserves top hits from every clause without duplicate votes
+    main_hits = [
+        SearchUnitHit(point_id="p-clause1-a", score=18.0, payload={}),
+        SearchUnitHit(point_id="p-clause1-b", score=15.0, payload={}),
+    ]
+    sub2_hits = [
+        SearchUnitHit(point_id="p-clause2-a", score=6.0, payload={}),
+        SearchUnitHit(point_id="p-clause1-a", score=2.0, payload={}),
+    ]
+    interleaved = _interleave_hit_lists([main_hits, sub2_hits], limit=4)
+    assert [h.point_id for h in interleaved] == ["p-clause1-a", "p-clause2-a", "p-clause1-b"]
+    assert interleaved[1].score == pytest.approx(18.0)
+
