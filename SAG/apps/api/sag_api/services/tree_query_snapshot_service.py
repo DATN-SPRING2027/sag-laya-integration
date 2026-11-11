@@ -30,6 +30,7 @@ from sag_api.services.query_routing_service import (
 from sag_api.services.query_routing_service import (
     RoutingSnapshot as QueryRoutingSnapshot,
 )
+from sag_api.sag.search_unit_store import _expand_continuous_script_tokens
 from sag_api.services.search_index_service import COMMON_STOPWORDS
 from sag_api.services.tree_publish_service import _database_now, _scoped_profile_checksum
 
@@ -42,7 +43,7 @@ _AGGREGATED_SCOPE_NODE_CACHE_MAX = 128
 
 
 def _query_signal_scores(query: str, profile: dict[str, Any]) -> dict[str, float]:
-    raw_query_terms = set(_TOKEN_PATTERN.findall(query.casefold()))
+    raw_query_terms = set(_expand_continuous_script_tokens(_TOKEN_PATTERN.findall(query.casefold())))
     informative_terms = {
         t for t in raw_query_terms if t not in COMMON_STOPWORDS and (len(t) >= 2 or t.isdigit())
     }

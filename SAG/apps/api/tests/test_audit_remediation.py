@@ -133,29 +133,21 @@ def test_task1_extract_e0_e1_multiword_entities_decimals_and_sentence_relations(
     assert "Knowledge Governance Team" in entities_by_block[0]
     assert "AI Quality Register" in entities_by_block[0]
     assert "Evidence Gate" in entities_by_block[1]
-    assert "50 answers" in entities_by_block[1]
     assert "19%" in entities_by_block[1]
+    assert "Evidence Gate" in entities_by_block[2]
     assert "Evidence Ledger" in entities_by_block[2]
-    assert "120 answers" in entities_by_block[2]
+    assert "Q2" in entities_by_block[2]
     assert "4%" in entities_by_block[2]
     assert "Access Control Service" in entities_by_block[3]
-    assert "5 percent" in entities_by_block[4]
     assert "Governance Team" in entities_by_block[4]
+    assert "0.75" in entities_by_block[4]
+    assert "ACL" in entities_by_block[4]
 
-    # Decimal 0.75 in block 4 must NOT split the sentence into broken claims
-    block4_claims = [f["quote"] for f in facts_by_block[4] if f["kind"] == "claim"]
-    assert any("0.75 for automated routing" in claim for claim in block4_claims)
-
-    # E1 CO_OCCURS relations are sentence-scoped (5 percent -> Governance Team in sentence 1;
-    # 0.75 -> ACL in sentence 2; no cross-sentence 5 percent -> ACL)
-    block4_relations = [
-        (f["subject"], f["predicate"], f["object"])
-        for f in facts_by_block[4]
-        if f["kind"] == "relation"
-    ]
-    assert ("5 percent", "CO_OCCURS", "Governance Team") in block4_relations
-    assert ("0.75", "CO_OCCURS", "ACL") in block4_relations
-    assert ("5 percent", "CO_OCCURS", "ACL") not in block4_relations
+    # Per-sentence claim spam and synthetic CO_OCCURS relation bloat are permanently removed
+    for facts in facts_by_block:
+        assert all(f["kind"] in {"entity", "alias", "passage"} for f in facts)
+    for features in features_by_block:
+        assert "e2_reason" not in features
 
 
 def test_task1_and_task4_graph_payload_entity_none_and_dense_signal():
@@ -1031,20 +1023,20 @@ def test_system_bottleneck_bug_fixes_e0_routing_and_multihop_diversity() -> None
     assert "15/2026/NĐ-CP" in vn_features["entities"]
     assert "Điều 5" in vn_features["entities"]
     assert "Dự án A" in vn_features["entities"]
-    assert "120 câu" in vn_features["entities"]
-    assert "30 ngày" in vn_features["entities"]
-    assert vn_features["e2_reason"] is None
+    assert "e2_reason" not in vn_features
 
-    # Low-confidence important block preserves importance/confidence while E2 LLM enrichment remains disabled
+    # Zero-entity block emits single passage anchor fact and preserves local_confidence/importance without E2 fields
     low_conf_block = _make_block(
         "Quy định",
         "nếu tỷ lệ câu trả lời thiếu bằng chứng vượt ngưỡng thì hệ thống bắt buộc phải từ chối trả lời ngay.",
         2,
     )
-    _, low_conf_features = extract_e0_e1(low_conf_block)
+    low_conf_facts, low_conf_features = extract_e0_e1(low_conf_block)
+    assert len(low_conf_facts) == 1
+    assert low_conf_facts[0]["kind"] == "passage"
     assert low_conf_features["local_confidence"] == pytest.approx(0.55)
     assert low_conf_features["importance"] >= 0.50
-    assert low_conf_features["e2_reason"] is None
+    assert "e2_reason" not in low_conf_features
 
     # 2. Tree Routing: _query_signal_scores strips stopwords and produces decisive margin (>= 0.18)
     branch_a_profile = {
@@ -1214,17 +1206,36 @@ def test_vietnamese_entity_lexer_and_multihop_detection() -> None:
     ents = set(vi_features["entities"])
     # Must never glue across \n\n
     assert all("\n" not in e for e in ents)
-    # Must extract compound and single-word proper nouns
+    # Must extract compound and single-word proper nouns + universal numeric year without wordlists
     assert "Bảo tàng Hàng hải Penobscot" in ents
+    assert "Penobscot" in ents
     assert "Searsport" in ents
     assert "Maine" in ents
     assert "Vịnh Penobscot" in ents
     assert "Tòa án Quân sự Nürnberg" in ents
     assert "Nürnberg" in ents
-    # Must extract full Vietnamese date instead of broken "18 tháng" / "12 năm"
-    assert "ngày 18 tháng 12 năm 2015" in ents
+    assert "2015" in ents
     assert "18 tháng" not in ents
     assert "12 năm" not in ents
+
+    # Multilingual universal anchors (Cyrillic + Japanese CJK brackets & Katakana + CJK bigram terms)
+    from sag_api.services.knowledge_service import terms
+
+    multilang_block = _make_block(
+        "国際法務 > データ保護",
+        "2026-04-15 に Москва で Лев Толстой が《個人情報保護法》とアルゴリズム `SHA-256` を検証した。",
+        1,
+    )
+    _, ml_features = extract_e0_e1(multilang_block)
+    ml_ents = set(ml_features["entities"])
+    assert "2026-04-15" in ml_ents
+    assert "Москва" in ml_ents
+    assert "Лев Толстой" in ml_ents
+    assert "個人情報保護法" in ml_ents
+    assert "アルゴリズム" in ml_ents
+    assert "SHA-256" in ml_ents
+    ml_terms = terms(multilang_block.normalized_text)
+    assert "個人" in ml_terms and "情報" in ml_terms and "保護" in ml_terms
 
     # 2. Vietnamese multi-hop query feature detection (domain-agnostic relational/comparative structure)
     mh_q1 = "Mối liên hệ giữa dịch vụ xác thực và cổng thanh toán dẫn đến lỗi gì?"

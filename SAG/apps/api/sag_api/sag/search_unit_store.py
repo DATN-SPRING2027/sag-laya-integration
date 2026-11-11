@@ -28,6 +28,10 @@ class SearchUnitHit:
 
 
 _TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
+_CONTINUOUS_SCRIPT_RUN_RE = re.compile(
+    r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+    r"\u0e00-\u0e7f\u0e80-\u0eff\u1780-\u17ff\u1000-\u109f]+"
+)
 _TRANSIENT_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 _SPARSE_QUERY_STOPWORDS = COMMON_STOPWORDS
 _QUERY_FRAMING_STOPWORDS = frozenset(
@@ -37,6 +41,33 @@ _QUERY_FRAMING_STOPWORDS = frozenset(
         "tell", "explain", "describe", "whether",
     }
 )
+
+
+def _expand_continuous_script_tokens(tokens: list[str]) -> list[str]:
+    """Split unspaced CJK/Thai/Lao/Khmer/Myanmar runs into overlapping character bigrams."""
+    out: list[str] = []
+    for tok in tokens:
+        if not _CONTINUOUS_SCRIPT_RUN_RE.search(tok):
+            out.append(tok)
+            continue
+        last_end = 0
+        for match in _CONTINUOUS_SCRIPT_RUN_RE.finditer(tok):
+            if match.start() > last_end:
+                prefix = tok[last_end : match.start()]
+                if prefix:
+                    out.append(prefix)
+            run = match.group(0)
+            if len(run) == 1:
+                out.append(run)
+            else:
+                for pos in range(len(run) - 1):
+                    out.append(run[pos : pos + 2])
+            last_end = match.end()
+        if last_end < len(tok):
+            suffix = tok[last_end:]
+            if suffix:
+                out.append(suffix)
+    return out
 
 
 def build_sparse_query_vector(query: str) -> dict[str, list[int] | list[float]]:
@@ -61,6 +92,8 @@ def build_sparse_query_vector(query: str) -> dict[str, list[int] | list[float]]:
         if idx > 0 and any(ch.isupper() for ch in tok) and len(tok) >= 2
     }
     raw_tokens = [tok.lower() for tok in orig_tokens]
+    if _CONTINUOUS_SCRIPT_RUN_RE.search(normalized_q):
+        raw_tokens = _expand_continuous_script_tokens(raw_tokens)
     filtered_tokens = [t for t in raw_tokens if t not in _SPARSE_QUERY_STOPWORDS]
     active_tokens = filtered_tokens if filtered_tokens else raw_tokens
 

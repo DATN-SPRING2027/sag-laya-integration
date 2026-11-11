@@ -12,16 +12,40 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from sag_api.services.knowledge_service import (
-    _LOWER_CHAR,
-    _SENTENCE_SPLIT_RE,
-    _SINGLE_WORD_STOP_ENTITIES,
-    _UPPER_CHAR,
-    _WORD_CONT,
     KnowledgeConfig,
     extract_e0_e1,
 )
 from sag_api.services.search_index_service import COMMON_STOPWORDS
 from sag_api.services.session_context.models import EntityMention, EpistemicStatus
+
+_UPPER_CHAR = (
+    r"A-ZÀ-ÖØ-ÞĀĂĄĆĈĊČĎĐĒĔĖĘĚĜĞĠĢĤĦĨĪĬĮİĲĴĶĹĻĽĿŁŃŅŇŊŌŎŐŒŔŖŘŚŜŞŠŢŤŦ"
+    r"ŨŪŬŮŰŲŴŶŸŹŻŽƠƯẠẢẤẦẨẪẬẮẰẲẴẶẸẺẼẾỀỂỄỆỈỊỌỎỐỒỔỖỘỚỜỞỠỢỤỦỨỪỬỮỰỲỴỶỸ"
+)
+_LOWER_CHAR = (
+    r"a-zß-öø-ÿāăąćĉċčďđēĕėęěĝğġģĥħĩīĭįıĳĵķĸĺļľŀłńņňŉŋōŏőœŕŗřśŝşšţťŧ"
+    r"ũūŭůűųŵŷźżžơưạảấầẩẫậắằẳẵặẹẻẽếềểễệỉịọỏốồổỗộớờởỡợụủứừửữựỳỵỷỹ"
+)
+_WORD_CONT = _UPPER_CHAR + _LOWER_CHAR + r"0-9_-"
+_SINGLE_WORD_STOP_ENTITIES = frozenset(
+    {
+        "the", "this", "that", "these", "those", "there", "their", "they", "them", "then",
+        "when", "where", "which", "while", "what", "who", "whom", "whose", "why", "how",
+        "here", "have", "has", "had", "will", "would", "could", "should", "must", "shall",
+        "may", "might", "can", "each", "every", "some", "many", "most", "more", "other",
+        "another", "such", "only", "also", "even", "still", "both", "either", "neither",
+        "after", "before", "during", "since", "until", "under", "over", "between", "through",
+        "within", "without", "against", "among", "around", "because", "although", "though",
+        "however", "therefore", "moreover", "furthermore", "meanwhile", "otherwise", "instead",
+        "ngoài", "trong", "trên", "dưới", "giữa", "trước", "sau", "khi", "nếu", "vì", "do",
+        "để", "với", "từ", "về", "theo", "tại", "các", "những", "một", "mỗi", "mọi", "nhiều",
+        "nhưng", "hoặc", "cùng", "cũng", "được", "không", "chỉ", "còn", "đang", "đã", "sẽ",
+        "này", "đó", "đây", "ấy", "ông", "bà", "cô", "anh", "chị", "họ", "nó", "tôi", "chúng",
+        "phim", "bộ", "cuộc", "chiếc", "người", "năm", "tháng", "ngày", "quý", "mùa", "tập",
+        "phần", "loạt", "chương", "điều", "khoản", "mục", "luật", "nghị", "thông", "văn",
+    }
+)
+_SENTENCE_SPLIT_RE = re.compile(r"(?:[^.!?\n]|\d+\.\d+)+(?:[.!?](?!\d)|$)")
 
 _HONORIFIC_WORDS = (
     "anh|chị|em|bạn|thầy|cô|sếp|ông|bà|team|nhóm|bên|mảng|module|service|dịch vụ|hệ thống"

@@ -421,13 +421,15 @@ class KnowledgeWorker:
                         log.warning("Fallback knowledge embedder unavailable: %s", error)
                 if embedder is not None:
                     async with self.sessions() as session:
+                        from sag_api.services.search_index_service import contextualize_block_text
+
                         _, blocks, provenance, actual = await version_input(
                             session, job.document_version_id, self.config
                         )
                         if actual != job.input_checksum:
                             raise ValueError("Stale foundation input")
                         non_heading_blocks = [
-                            (b.id, b.normalized_text)
+                            (b.id, contextualize_block_text(b.section_path, b.normalized_text))
                             for b in blocks
                             if b.block_type != "heading" and b.normalized_text.strip()
                         ]
