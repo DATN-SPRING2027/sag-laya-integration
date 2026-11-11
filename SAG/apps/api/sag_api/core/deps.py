@@ -89,21 +89,11 @@ async def get_current_user(
     return user
 
 
-async def require_model_config_operator(
+async def require_platform_configuration_operator(
     user: User = Depends(get_current_user),
 ) -> User:
-    """Restrict shared model settings to explicitly configured users in multi-user modes."""
-    if settings.auth_mode == "local":
-        return user
-
-    operator_ids = {
-        user_id.strip()
-        for user_id in settings.model_config_operator_ids.split(",")
-        if user_id.strip()
-    }
-    if str(user.id) not in operator_ids:
-        raise ForbiddenError("Người dùng không có quyền thay đổi cấu hình model dùng chung")
-    return user
+    """Fail closed until SAG can verify a current platform permission from IAM."""
+    raise ForbiddenError("Thao tác cấu hình nền tảng đang bị khóa vì chưa có quyền IAM hiện hành")
 
 
 async def get_current_user_or_connector(

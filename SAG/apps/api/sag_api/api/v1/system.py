@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.config import settings
 from sag_api.core.db import SessionLocal, get_session
-from sag_api.core.deps import get_current_user, get_current_user_or_connector, require_model_config_operator
+from sag_api.core.deps import get_current_user, get_current_user_or_connector, require_platform_configuration_operator
 from sag_api.core.errors import ApiError, ConflictError, ForbiddenError
 from sag_api.core.logging import get_logger
 from sag_api.core.model_providers import model_provider_catalog
@@ -361,7 +361,7 @@ async def discover_dsh_connection(
 @router.get("/dsh/export")
 async def export_dsh_connection(
     request: Request,
-    _user: User = Depends(get_current_user),
+    _user: User = Depends(require_platform_configuration_operator),
     session: AsyncSession = Depends(get_session),
 ) -> Response:
     """Download the connector descriptor after normal SAG authentication."""
@@ -377,7 +377,7 @@ async def export_dsh_connection(
 @router.put("/dsh/settings", response_model=DshCapabilityDescriptor)
 async def update_dsh_settings(
     body: DshIntegrationUpdate,
-    _user: User = Depends(get_current_user),
+    _user: User = Depends(require_platform_configuration_operator),
     session: AsyncSession = Depends(get_session),
 ) -> DshCapabilityDescriptor:
     """Select the source used by DSH when a request omits one."""
@@ -390,7 +390,7 @@ async def update_dsh_settings(
 
 @router.post("/dsh/regenerate", response_model=DshCapabilityDescriptor)
 async def regenerate_dsh_connection_token(
-    _user: User = Depends(get_current_user),
+    _user: User = Depends(require_platform_configuration_operator),
     session: AsyncSession = Depends(get_session),
 ) -> DshCapabilityDescriptor:
     """Rotate the connector credential without returning the new secret."""
@@ -425,7 +425,7 @@ async def get_system_preferences(
 @router.put("/preferences")
 async def update_system_preferences(
     body: SystemPreferencesUpdate,
-    _user: User = Depends(get_current_user),
+    _user: User = Depends(require_platform_configuration_operator),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, str]:
     return await settings_service.save_system_preferences(
@@ -482,7 +482,7 @@ async def knowledge_mcp_descriptor(
 async def quick_setup_302(
     body: QuickModelSetupRequest,
     request: Request,
-    _user: User = Depends(require_model_config_operator),
+    _user: User = Depends(require_platform_configuration_operator),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """只接收一个 302.AI Key，写入生成、向量、MinerU 与检索预设。"""
@@ -499,7 +499,7 @@ async def quick_setup_302(
 async def update_model_config(
     body: ModelConfigUpdate,
     request: Request,
-    _user: User = Depends(require_model_config_operator),
+    _user: User = Depends(require_platform_configuration_operator),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """保存运行期配置；仅在模型/向量配置实际变化时安全重建引擎。"""
@@ -533,7 +533,7 @@ async def update_model_config(
 @router.post("/model-config/mineru/302")
 async def configure_302_mineru(
     request: Request,
-    _user: User = Depends(require_model_config_operator),
+    _user: User = Depends(require_platform_configuration_operator),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """已有 302 LLM/Embedding 用户一键复用服务端保存的 Key 启用 MinerU。"""
@@ -546,7 +546,7 @@ async def configure_302_mineru(
 async def test_model_config(
     request: Request,
     body: ModelConfigUpdate | None = None,
-    _user: User = Depends(require_model_config_operator),
+    _user: User = Depends(require_platform_configuration_operator),
 ) -> dict:
     """连接测试：优先验证表单草稿，不持久化也不修改运行期单例。"""
     llm: LLMClient

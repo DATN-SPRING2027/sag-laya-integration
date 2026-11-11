@@ -32,15 +32,19 @@ uvicorn sag_api.main:app --reload --host 0.0.0.0 --port 8000
 
 ## Shared model configuration authorization
 
-In `SAG_AUTH_MODE=password` or `SAG_AUTH_MODE=continuum`, shared model settings
-are writable only by SAG users whose IDs appear in the comma-separated
-`SAG_MODEL_CONFIG_OPERATOR_IDS` environment variable. An empty value denies
-model connection tests, updates, and shared model setup. An operator can read
-their SAG user ID from the authenticated `GET /api/v1/auth/me` response. Keep
-this allowlist in trusted deployment configuration; organization and Project
-scope do not grant model-configuration authority. `SAG_AUTH_MODE=local` keeps
-the existing single-user local setup behavior.
+In every SAG_AUTH_MODE, platform-wide model
+configuration, provider connection tests, and DSH credential operations return
+403. SAG does not yet verify a current platform configuration permission from
+Continuum IAM. A deployment allowlist of SAG user IDs is not an IAM permission
+check and cannot grant access. This fail-closed state also applies to signed-in
+users whose client displays an administrator role. Local mode is included because
+its name-based sign-in does not establish an operator identity. This temporarily
+disables global configuration in standalone deployments too.
 
+Do not re-enable these operations through an environment allowlist. Operator
+access can be restored after IAM provides an exact server-to-server permission
+contract and SAG verifies it before every operation. Organization and Project
+membership alone will not grant platform configuration authority.
 ## Evidence authorization (ACL rollout)
 
 Search, source/document reads, graph-backed source-scoped operations, agents,
