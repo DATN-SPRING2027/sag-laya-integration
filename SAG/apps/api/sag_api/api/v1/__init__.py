@@ -16,6 +16,7 @@ from sag_api.api.v1 import (
     mind_map,
     octx,
     openai,
+    platform_operations,
     search,
     sources,
     system,
@@ -47,6 +48,7 @@ api_router.include_router(handover.router)
 api_router.include_router(mind_map.router)
 api_router.include_router(answer_actions.project_share_router)
 api_router.include_router(answer_actions.platform_feedback_router)
+api_router.include_router(platform_operations.router)
 api_router.include_router(search.global_router)
 
 __all__ = ["api_router"]
