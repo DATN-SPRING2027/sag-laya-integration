@@ -32,14 +32,11 @@ uvicorn sag_api.main:app --reload --host 0.0.0.0 --port 8000
 
 ## Shared model configuration authorization
 
-In `SAG_AUTH_MODE=password` or `SAG_AUTH_MODE=continuum`, shared model settings
-are writable only by SAG users whose IDs appear in the comma-separated
-`SAG_MODEL_CONFIG_OPERATOR_IDS` environment variable. An empty value denies
-model connection tests, updates, and shared model setup. An operator can read
-their SAG user ID from the authenticated `GET /api/v1/auth/me` response. Keep
-this allowlist in trusted deployment configuration; organization and Project
-scope do not grant model-configuration authority. `SAG_AUTH_MODE=local` keeps
-the existing single-user local setup behavior.
+Continuum operators call the IAM gateway with a Continuum access token. IAM checks a dedicated grant for the target instance/environment, authenticates the BFF to SAG over HTTPS, and signs one RS256 assertion for the exact action. The assertion expires within five minutes or earlier when the original session token or grant expires. SAG pins the issuer, public key and audience. Both DSH credential operations require verified, session-bound MFA and an uncached HTTPS decision from IAM. Missing trust or an unavailable decision service denies the operation.
+
+Configure matching SAG_OPERATOR_INSTANCE, SAG_OPERATOR_ENVIRONMENT, SAG_OPERATOR_ISSUER and SAG_OPERATOR_BFF_CREDENTIAL on both services. Provide the verification PEM through SAG_OPERATOR_PUBLIC_KEY. Set SAG_OPERATOR_DECISION_URL to the private IAM HTTPS decision endpoint and SAG_OPERATOR_DECISION_CREDENTIAL to its distinct service secret. Inject credentials from the deployment secret store. Local/password user sessions cannot authorize platform operations.
+
+In production or Continuum mode, the HTTP DSH discovery endpoint is disabled even for loopback peers. Deny this path on public proxies as well. Provision the connector through the existing atomically published DSH descriptor file, mounted for the connector service identity only. After rotation the connector must reopen that file. Limit file ACLs and its parent directory to the API and connector service accounts.
 
 ## Evidence authorization (ACL rollout)
 

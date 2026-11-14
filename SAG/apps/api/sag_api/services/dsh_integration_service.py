@@ -17,7 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.errors import NotFoundError
-from sag_api.db.models import Setting, Source, User
+from sag_api.db.models import Setting, Source
 
 _SCOPE = "global"
 _KEY = "dsh_integration"
@@ -117,17 +117,19 @@ async def get_or_create_state(session: AsyncSession) -> DshIntegrationState:
     return _state_from_row(row)
 
 
-async def authenticate_connector(session: AsyncSession, token: str) -> User | None:
-    """Return the first active user when the supplied connector token matches."""
+@dataclass(frozen=True)
+class DshConnectorIdentity:
+    id: str = "service:dsh-connector"
+
+
+async def authenticate_connector(session: AsyncSession, token: str) -> DshConnectorIdentity | None:
+    """Authenticate the installed connector independently of human SAG accounts."""
+    if not token.startswith("sag_local_") or not token.isascii():
+        return None
     state = await get_or_create_state(session)
     if not secrets.compare_digest(state.token, token):
         return None
-    return await session.scalar(
-        select(User)
-        .where(User.is_active.is_(True))
-        .order_by(User.created_at.asc(), User.id.asc())
-        .limit(1)
-    )
+    return DshConnectorIdentity()
 
 
 async def update_default_source(

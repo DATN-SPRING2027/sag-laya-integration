@@ -11,10 +11,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.config import settings
 from sag_api.core.db import SessionLocal, get_session
-from sag_api.core.deps import get_current_user, get_current_user_or_connector, require_model_config_operator
-from sag_api.core.errors import ApiError, ConflictError, ForbiddenError
+from sag_api.core.deps import get_current_user, get_current_user_or_connector
+from sag_api.core.errors import ConflictError, ForbiddenError
 from sag_api.core.logging import get_logger
 from sag_api.core.model_providers import model_provider_catalog
+from sag_api.core.operator import require_platform_configuration_operator
 from sag_api.core.principal_assertion import VerifiedPrincipal, require_principal_assertion
 from sag_api.db.models import User
 from sag_api.generation import LLMClient
@@ -352,7 +353,7 @@ async def discover_dsh_connection(
     session: AsyncSession = Depends(get_session),
 ) -> DshConnectionDescriptor:
     """Return the local connector credential only to a loopback peer."""
-    if not _request_can_discover_dsh(request):
+    if settings.environment == "prod" or settings.auth_mode == "continuum" or not _request_can_discover_dsh(request):
         raise ForbiddenError("仅允许本机访问 DSH 连接配置")
     state = await dsh_integration_service.get_or_create_state(session)
     return _dsh_connection_descriptor(request, state)
@@ -361,7 +362,7 @@ async def discover_dsh_connection(
 @router.get("/dsh/export")
 async def export_dsh_connection(
     request: Request,
-    _user: User = Depends(get_current_user),
+    _operator: str = Depends(require_platform_configuration_operator),
     session: AsyncSession = Depends(get_session),
 ) -> Response:
     """Download the connector descriptor after normal SAG authentication."""
@@ -370,14 +371,14 @@ async def export_dsh_connection(
     return Response(
         content=descriptor.model_dump_json(),
         media_type="application/json",
-        headers={"Content-Disposition": 'attachment; filename="sag-dsh.json"'},
+        headers={"Content-Disposition": 'attachment; filename="sag-dsh.json"', "Cache-Control": "no-store"},
     )
 
 
 @router.put("/dsh/settings", response_model=DshCapabilityDescriptor)
 async def update_dsh_settings(
     body: DshIntegrationUpdate,
-    _user: User = Depends(get_current_user),
+    _operator: str = Depends(require_platform_configuration_operator),
     session: AsyncSession = Depends(get_session),
 ) -> DshCapabilityDescriptor:
     """Select the source used by DSH when a request omits one."""
@@ -390,7 +391,7 @@ async def update_dsh_settings(
 
 @router.post("/dsh/regenerate", response_model=DshCapabilityDescriptor)
 async def regenerate_dsh_connection_token(
-    _user: User = Depends(get_current_user),
+    _operator: str = Depends(require_platform_configuration_operator),
     session: AsyncSession = Depends(get_session),
 ) -> DshCapabilityDescriptor:
     """Rotate the connector credential without returning the new secret."""
@@ -425,7 +426,7 @@ async def get_system_preferences(
 @router.put("/preferences")
 async def update_system_preferences(
     body: SystemPreferencesUpdate,
-    _user: User = Depends(get_current_user),
+    _operator: str = Depends(require_platform_configuration_operator),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, str]:
     return await settings_service.save_system_preferences(
@@ -482,7 +483,7 @@ async def knowledge_mcp_descriptor(
 async def quick_setup_302(
     body: QuickModelSetupRequest,
     request: Request,
-    _user: User = Depends(require_model_config_operator),
+    _operator: str = Depends(require_platform_configuration_operator),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """只接收一个 302.AI Key，写入生成、向量、MinerU 与检索预设。"""
@@ -499,7 +500,7 @@ async def quick_setup_302(
 async def update_model_config(
     body: ModelConfigUpdate,
     request: Request,
-    _user: User = Depends(require_model_config_operator),
+    _operator: str = Depends(require_platform_configuration_operator),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """保存运行期配置；仅在模型/向量配置实际变化时安全重建引擎。"""
@@ -533,7 +534,7 @@ async def update_model_config(
 @router.post("/model-config/mineru/302")
 async def configure_302_mineru(
     request: Request,
-    _user: User = Depends(require_model_config_operator),
+    _operator: str = Depends(require_platform_configuration_operator),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """已有 302 LLM/Embedding 用户一键复用服务端保存的 Key 启用 MinerU。"""
@@ -546,7 +547,7 @@ async def configure_302_mineru(
 async def test_model_config(
     request: Request,
     body: ModelConfigUpdate | None = None,
-    _user: User = Depends(require_model_config_operator),
+    _operator: str = Depends(require_platform_configuration_operator),
 ) -> dict:
     """连接测试：优先验证表单草稿，不持久化也不修改运行期单例。"""
     llm: LLMClient
@@ -555,11 +556,11 @@ async def test_model_config(
         llm = request.app.state.llm
     else:
         patch = body.model_dump(exclude_unset=True)
-        updates = {
-            key: (None if key in {"llm_base_url"} and value == "" else value)
-            for key, value in patch.items()
-            if not (key == "llm_api_key" and not value)
-        }
+        # Provider-test grants may use only the configured destination and model.
+        for name in ("llm_base_url", "llm_provider", "llm_model"):
+            if name in patch and patch[name] != getattr(settings, name):
+                raise ForbiddenError("Save the new provider configuration before testing it")
+        updates = {"llm_api_key": patch["llm_api_key"]} if patch.get("llm_api_key") else {}
         active = settings.model_copy(update=updates)
         llm = LLMClient(active)
     if not llm.configured:
@@ -570,7 +571,5 @@ async def test_model_config(
             "ok": True,
             "message": f"连接成功 · {active.llm_provider} / {active.llm_model}",
         }
-    except ApiError as e:
-        return {"ok": False, "message": e.message}
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "message": str(e)}
+    except Exception:  # Provider error text can contain credentials.
+        return {"ok": False, "message": "Provider connection failed"}

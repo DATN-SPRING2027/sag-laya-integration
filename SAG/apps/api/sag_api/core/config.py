@@ -62,8 +62,6 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 60 * 24 * 7  # 7 天
     # continuum delegates interactive sign-in to Continuum; local/password are standalone modes.
     auth_mode: Literal["local", "password", "continuum"] = "local"
-    # Comma-separated SAG user IDs permitted to change deployment-wide model settings.
-    model_config_operator_ids: str = ""
     # 业务展示时区；数据库与 API 时间戳始终使用 UTC。
     timezone: str = "Asia/Shanghai"
     # NoDecode 让逗号分隔值先进入下方 validator，避免 settings 源强制按 JSON 解码。
@@ -84,6 +82,13 @@ class Settings(BaseSettings):
     principal_assertion_max_project_ids: int = Field(default=256, ge=1, le=4096)
     # Shared only between Continuum BE and this API for project-scoped BFF calls.
     bff_service_token: str | None = None
+    operator_public_key: str | None = None
+    operator_issuer: str | None = None
+    operator_bff_credential: str | None = None
+    operator_instance: str | None = None
+    operator_environment: str | None = None
+    operator_decision_url: str | None = None
+    operator_decision_credential: str | None = None
     # 供桌面端启动时写入本地 DSH 连接文件的公开地址与可选文件位置。
     dsh_public_url: str = "http://127.0.0.1:8000"
     dsh_connection_file: str | None = None

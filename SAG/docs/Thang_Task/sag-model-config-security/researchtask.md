@@ -77,3 +77,14 @@ those deployment conditions; do not claim a demonstrated production exploit.
 Continuum and password deployments must set `SAG_MODEL_CONFIG_OPERATOR_IDS`
 before their designated operator can use the shared model settings UI/API;
 until then, those writes/tests return 403 by design.
+
+## Superseded by SEC-01 (2026-11)
+
+The environment allowlist procedure described above is retired. SAG currently
+has no verified IAM permission contract for platform configuration, and local
+name-based sign-in does not establish an operator identity. All platform-wide
+configuration and DSH credential operations therefore fail closed with 403 in
+every auth mode until the exact server-to-server IAM permission contract is
+implemented and verified. Do not configure `SAG_MODEL_CONFIG_OPERATOR_IDS`;
+that setting has been removed. Standalone local configuration is temporarily
+unavailable as part of this containment.
