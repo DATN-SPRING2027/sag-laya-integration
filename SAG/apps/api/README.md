@@ -32,19 +32,12 @@ uvicorn sag_api.main:app --reload --host 0.0.0.0 --port 8000
 
 ## Shared model configuration authorization
 
-In every SAG_AUTH_MODE, platform-wide model
-configuration, provider connection tests, and DSH credential operations return
-403. SAG does not yet verify a current platform configuration permission from
-Continuum IAM. A deployment allowlist of SAG user IDs is not an IAM permission
-check and cannot grant access. This fail-closed state also applies to signed-in
-users whose client displays an administrator role. Local mode is included because
-its name-based sign-in does not establish an operator identity. This temporarily
-disables global configuration in standalone deployments too.
+Continuum operators call the IAM gateway with a Continuum access token. IAM checks a dedicated grant for the target instance/environment, authenticates the BFF to SAG over HTTPS, and signs one RS256 assertion for the exact action. The assertion expires within five minutes or earlier when the original session token or grant expires. SAG pins the issuer, public key and audience. Both DSH credential operations require verified, session-bound MFA and an uncached HTTPS decision from IAM. Missing trust or an unavailable decision service denies the operation.
 
-Do not re-enable these operations through an environment allowlist. Operator
-access can be restored after IAM provides an exact server-to-server permission
-contract and SAG verifies it before every operation. Organization and Project
-membership alone will not grant platform configuration authority.
+Configure matching SAG_OPERATOR_INSTANCE, SAG_OPERATOR_ENVIRONMENT, SAG_OPERATOR_ISSUER and SAG_OPERATOR_BFF_CREDENTIAL on both services. Provide the verification PEM through SAG_OPERATOR_PUBLIC_KEY. Set SAG_OPERATOR_DECISION_URL to the private IAM HTTPS decision endpoint and SAG_OPERATOR_DECISION_CREDENTIAL to its distinct service secret. Inject credentials from the deployment secret store. Local/password user sessions cannot authorize platform operations.
+
+In production or Continuum mode, the HTTP DSH discovery endpoint is disabled even for loopback peers. Deny this path on public proxies as well. Provision the connector through the existing atomically published DSH descriptor file, mounted for the connector service identity only. After rotation the connector must reopen that file. Limit file ACLs and its parent directory to the API and connector service accounts.
+
 ## Evidence authorization (ACL rollout)
 
 Search, source/document reads, graph-backed source-scoped operations, agents,

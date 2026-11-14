@@ -15,7 +15,7 @@ from sag_agent import AgentRuntime
 from sag_api.core.config import settings
 from sag_api.core.db import get_session
 from sag_api.core.error_taxonomy import ErrorCode
-from sag_api.core.errors import AuthError, ForbiddenError
+from sag_api.core.errors import AuthError
 from sag_api.core.identity import VerifiedPrincipal
 from sag_api.core.principal_assertion import (
     VerifiedPrincipal as AssertionVerifiedPrincipal,
@@ -30,7 +30,7 @@ from sag_api.generation import LLMClient
 from sag_api.jobs import JobQueue
 from sag_api.sag import EngineManager
 from sag_api.services.auth_service import get_user
-from sag_api.services.dsh_integration_service import authenticate_connector
+from sag_api.services.dsh_integration_service import DshConnectorIdentity, authenticate_connector
 
 _bearer = HTTPBearer(auto_error=False)
 _AuthKind = Literal["jwt", "connector"]
@@ -52,7 +52,7 @@ async def _get_bearer_token(
 async def _authenticate_user_principal(
     session: AsyncSession,
     token: str,
-) -> tuple[User, _AuthKind] | None:
+) -> tuple[User | DshConnectorIdentity, _AuthKind] | None:
     try:
         payload = decode_token(token)
     except jwt.PyJWTError:
@@ -64,7 +64,7 @@ async def _authenticate_user_principal(
     return (user, "jwt") if user is not None and user.is_active else None
 
 
-async def authenticate_user_token(session: AsyncSession, token: str) -> User | None:
+async def authenticate_user_token(session: AsyncSession, token: str) -> User | DshConnectorIdentity | None:
     """Authenticate either token kind for user-only callers such as MCP."""
     principal = await _authenticate_user_principal(session, token)
     return principal[0] if principal is not None else None
@@ -89,18 +89,11 @@ async def get_current_user(
     return user
 
 
-async def require_platform_configuration_operator(
-    user: User = Depends(get_current_user),
-) -> User:
-    """Fail closed until SAG can verify a current platform permission from IAM."""
-    raise ForbiddenError("Thao tác cấu hình nền tảng đang bị khóa vì chưa có quyền IAM hiện hành")
-
-
 async def get_current_user_or_connector(
     request: Request,
     token: str = Depends(_get_bearer_token),
     session: AsyncSession = Depends(get_session),
-) -> User:
+) -> User | DshConnectorIdentity:
     """Authenticate approved knowledge operations with JWT or local connector token."""
     principal = await _authenticate_user_principal(session, token)
     if principal is None:

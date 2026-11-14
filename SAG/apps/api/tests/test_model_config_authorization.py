@@ -11,8 +11,8 @@ from fastapi.responses import JSONResponse
 
 from sag_api.api.v1 import system
 from sag_api.core.config import settings
-from sag_api.core.deps import get_current_user, get_session, require_platform_configuration_operator
-from sag_api.core.errors import ApiError, ForbiddenError
+from sag_api.core.deps import get_current_user, get_session
+from sag_api.core.errors import ApiError
 
 
 def _app_for_user(user_id: str) -> FastAPI:
@@ -111,14 +111,6 @@ async def test_user_without_platform_permission_cannot_access_shared_model_setti
     assert response.json()["error"]["code"] == "forbidden"
 
 
-async def test_legacy_allowlist_does_not_grant_platform_permission(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "auth_mode", "continuum")
-    monkeypatch.setenv("SAG_MODEL_CONFIG_OPERATOR_IDS", "other-id, operator-id")
-
-    with pytest.raises(ForbiddenError):
-        await require_platform_configuration_operator(SimpleNamespace(id="operator-id"))
-
-
 @pytest.mark.parametrize("auth_mode", ["local", "continuum", "password"])
 @pytest.mark.parametrize(
     ("method", "path", "body"),
@@ -161,10 +153,3 @@ async def test_user_without_current_platform_permission_has_no_side_effects(
     assert all(spy.await_count == 0 for spy in spies.values())
     assert app.state.knowledge_runtime.apply_settings.await_count == 0
     assert app.state.session_opened == 0
-
-
-async def test_local_mode_is_denied_without_a_platform_permission(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "auth_mode", "local")
-
-    with pytest.raises(ForbiddenError):
-        await require_platform_configuration_operator(SimpleNamespace(id="local-user-id"))
