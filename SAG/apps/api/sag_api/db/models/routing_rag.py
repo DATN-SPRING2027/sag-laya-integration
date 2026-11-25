@@ -195,14 +195,21 @@ class SearchUnit(Base):
     document_version_id: Mapped[str] = mapped_column(
         ForeignKey("document_versions.id", ondelete="CASCADE"), nullable=False
     )
-    block_from_id: Mapped[str] = mapped_column(ForeignKey("canonical_blocks.id"), nullable=False)
-    block_to_id: Mapped[str] = mapped_column(ForeignKey("canonical_blocks.id"), nullable=False)
+    block_from_id: Mapped[str] = mapped_column(
+        ForeignKey("canonical_blocks.id", ondelete="CASCADE"), nullable=False
+    )
+    block_to_id: Mapped[str] = mapped_column(
+        ForeignKey("canonical_blocks.id", ondelete="CASCADE"), nullable=False
+    )
     security_partition_id: Mapped[str] = mapped_column(String(64), nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     token_count: Mapped[int] = mapped_column(Integer, nullable=False)
     page_from: Mapped[int] = mapped_column(Integer, nullable=False)
     page_to: Mapped[int] = mapped_column(Integer, nullable=False)
     section_path: Mapped[str] = mapped_column(String(512), nullable=False)
+    char_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    char_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    text_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime(), server_default=func.now(), nullable=False
     )

@@ -134,6 +134,11 @@ _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
     "knowledge_jobs": {"result_json": "JSON", "usage_json": "JSON", "extractor_version": "VARCHAR(128)", "tree_requested_at": "TIMESTAMP WITH TIME ZONE"},
     "knowledge_graph_builds": {"input_fingerprint": "VARCHAR(64)"},
     "canonical_blocks": {"dedup_signature_json": "JSON"},
+    "search_units": {
+        "char_start": "INTEGER",
+        "char_end": "INTEGER",
+        "text_snapshot": "TEXT",
+    },
     "research_tasks": {"execution_json": "JSON NOT NULL DEFAULT '{}'"},
     "ingestion_runs": {
         "content_hash": "VARCHAR(64)",
@@ -333,6 +338,154 @@ async def _ensure_document_schema_widths() -> None:
         )
 
 
+async def _ensure_search_unit_cascade_fks(conn) -> None:  # noqa: ANN001
+    """Ensure search_units.block_from_id and block_to_id have ON DELETE CASCADE."""
+    dialect_name = conn.dialect.name
+    if dialect_name == "postgresql":
+        await conn.exec_driver_sql(
+            """
+            DO $$
+            DECLARE
+                fk RECORD;
+            BEGIN
+                IF to_regclass('search_units') IS NOT NULL
+                   AND to_regclass('canonical_blocks') IS NOT NULL THEN
+                    FOR fk IN
+                        SELECT
+                            c.conname,
+                            local_col.attname AS column_name
+                        FROM pg_constraint c
+                        CROSS JOIN LATERAL unnest(c.conkey, c.confkey) AS keys(local_attnum, target_attnum)
+                        JOIN pg_attribute local_col
+                            ON local_col.attrelid = c.conrelid AND local_col.attnum = keys.local_attnum
+                        WHERE c.contype = 'f'
+                          AND c.conrelid = 'search_units'::regclass
+                          AND c.confrelid = 'canonical_blocks'::regclass
+                          AND c.confdeltype <> 'c'
+                          AND local_col.attname IN ('block_from_id', 'block_to_id')
+                    LOOP
+                        EXECUTE format('ALTER TABLE search_units DROP CONSTRAINT %I', fk.conname);
+                        EXECUTE format(
+                            'ALTER TABLE search_units ADD CONSTRAINT %I '
+                            'FOREIGN KEY (%I) REFERENCES canonical_blocks(id) ON DELETE CASCADE',
+                            fk.conname,
+                            fk.column_name
+                        );
+                    END LOOP;
+                END IF;
+            END $$;
+            """
+        )
+        return
+
+    if dialect_name != "sqlite":
+        return
+
+    has_table = (
+        await conn.exec_driver_sql(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='search_units'"
+        )
+    ).scalar_one_or_none()
+    if not has_table:
+        return
+
+    fk_rows = (await conn.exec_driver_sql("PRAGMA foreign_key_list('search_units')")).all()
+    cb_fks = {row[3]: str(row[6]).upper() for row in fk_rows if row[2] == "canonical_blocks"}
+    if (
+        cb_fks.get("block_from_id") == "CASCADE"
+        and cb_fks.get("block_to_id") == "CASCADE"
+    ):
+        return
+
+    col_rows = (await conn.exec_driver_sql("PRAGMA table_info('search_units')")).all()
+    existing_cols = {row[1] for row in col_rows}
+
+    def _col_expr(name: str) -> str:
+        return name if name in existing_cols else f"NULL AS {name}"
+
+    managed_tx = not conn.in_transaction()
+    await conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+    try:
+        if managed_tx:
+            await conn.exec_driver_sql("BEGIN")
+        await conn.exec_driver_sql(
+            """
+            CREATE TABLE _search_units_cascade_new (
+                id VARCHAR(36) NOT NULL,
+                document_version_id VARCHAR(36) NOT NULL,
+                block_from_id VARCHAR(36) NOT NULL,
+                block_to_id VARCHAR(36) NOT NULL,
+                security_partition_id VARCHAR(64) NOT NULL,
+                content_hash VARCHAR(64) NOT NULL,
+                token_count INTEGER NOT NULL,
+                page_from INTEGER NOT NULL,
+                page_to INTEGER NOT NULL,
+                section_path VARCHAR(512) NOT NULL,
+                char_start INTEGER,
+                char_end INTEGER,
+                text_snapshot TEXT,
+                created_at DATETIME DEFAULT (CURRENT_TIMESTAMP) NOT NULL,
+                PRIMARY KEY (id),
+                FOREIGN KEY(document_version_id) REFERENCES document_versions (id) ON DELETE CASCADE,
+                FOREIGN KEY(block_from_id) REFERENCES canonical_blocks (id) ON DELETE CASCADE,
+                FOREIGN KEY(block_to_id) REFERENCES canonical_blocks (id) ON DELETE CASCADE
+            )
+            """
+        )
+        await conn.exec_driver_sql(
+            f"""
+            INSERT INTO _search_units_cascade_new (
+                id,
+                document_version_id,
+                block_from_id,
+                block_to_id,
+                security_partition_id,
+                content_hash,
+                token_count,
+                page_from,
+                page_to,
+                section_path,
+                char_start,
+                char_end,
+                text_snapshot,
+                created_at
+            )
+            SELECT
+                id,
+                document_version_id,
+                block_from_id,
+                block_to_id,
+                security_partition_id,
+                content_hash,
+                token_count,
+                page_from,
+                page_to,
+                section_path,
+                {_col_expr("char_start")},
+                {_col_expr("char_end")},
+                {_col_expr("text_snapshot")},
+                created_at
+            FROM search_units
+            """
+        )
+        await conn.exec_driver_sql("DROP TABLE search_units")
+        await conn.exec_driver_sql("ALTER TABLE _search_units_cascade_new RENAME TO search_units")
+        await conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_search_units_version ON search_units (document_version_id)"
+        )
+        await conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_search_units_security ON search_units (security_partition_id)"
+        )
+        if managed_tx:
+            await conn.exec_driver_sql("COMMIT")
+    except Exception:
+        if managed_tx and conn.in_transaction():
+            await conn.exec_driver_sql("ROLLBACK")
+        raise
+    finally:
+        await conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+
+
 async def init_db() -> None:
     """Initialize tables in development (production uses Alembic). Import models to register into metadata."""
     from sag_api.db import models  # noqa: F401
@@ -354,6 +507,13 @@ async def init_db() -> None:
             await conn.run_sync(Base.metadata.create_all)
     await _ensure_columns()
     await _ensure_document_schema_widths()
+    if engine.dialect.name == "postgresql":
+        async with engine.begin() as conn:
+            await _ensure_search_unit_cascade_fks(conn)
+    else:
+        async with engine.connect() as raw_conn:
+            conn = await raw_conn.execution_options(isolation_level="AUTOCOMMIT")
+            await _ensure_search_unit_cascade_fks(conn)
     await _ensure_indexes()
 
 
