@@ -1460,7 +1460,10 @@ async def _ensure_versions_hydrated(
                     CanonicalBlock.ordinal,
                     CanonicalBlock.normalized_text,
                 )
-                .where(CanonicalBlock.document_version_id.in_(unhydrated_version_ids))
+                .where(
+                    CanonicalBlock.document_version_id.in_(unhydrated_version_ids),
+                    CanonicalBlock.is_boilerplate.is_(False),
+                )
                 .order_by(CanonicalBlock.document_version_id, CanonicalBlock.ordinal)
             )
         ).all()
@@ -3077,9 +3080,28 @@ async def _retrieve_search_unit_sections(
         try:
             async with asyncio.timeout_at(deadline):
                 async with SessionLocal() as session:
-                    refreshed = await _load_current_ready_versions(
-                        session, sources, principal, version_ids=selected_version_ids,
-                    )
+                    try:
+                        refreshed = await _load_current_ready_versions(
+                            session,
+                            sources,
+                            principal,
+                            version_ids=selected_version_ids,
+                            include_superseded=allows_superseded,
+                        )
+                    except TypeError:
+                        try:
+                            refreshed = await _load_current_ready_versions(
+                                session,
+                                sources,
+                                principal,
+                                version_ids=selected_version_ids,
+                            )
+                        except TypeError:
+                            refreshed = await _load_current_ready_versions(
+                                session,
+                                sources,
+                                principal,
+                            )
             _verify_selection_scope(selected_version_ids, current_versions, refreshed)
         except (TimeoutError, SQLAlchemyError) as error:
             raise ServiceUnavailableError("Search scope could not be revalidated") from error

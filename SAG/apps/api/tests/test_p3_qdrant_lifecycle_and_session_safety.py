@@ -292,14 +292,26 @@ async def test_reconcile_orphan_search_units_prunes_inactive_superseded_and_pres
         async with httpx.AsyncClient(
             base_url="http://qdrant.local", transport=httpx.MockTransport(handler)
         ) as q_client:
+            # Default preserves active superseded SEARCH_READY versions for change_lineage/past_point
             stats = await search_index_service.reconcile_orphan_search_units(
                 session, q_client, project_id="proj-rec"
+            )
+            assert set(deleted_ids) == {"pt-fail", "pt-inact", "pt-missing"}
+            assert meta_id not in deleted_ids
+            assert "pt-ready" not in deleted_ids
+            assert "pt-sup" not in deleted_ids
+            assert stats["orphans_deleted"] == 3
+
+            # Explicit prune_superseded (preserve_superseded=False) also prunes superseded points
+            deleted_ids.clear()
+            stats_prune = await search_index_service.reconcile_orphan_search_units(
+                session, q_client, project_id="proj-rec", preserve_superseded=False
             )
 
         assert set(deleted_ids) == {"pt-sup", "pt-fail", "pt-inact", "pt-missing"}
         assert meta_id not in deleted_ids
         assert "pt-ready" not in deleted_ids
-        assert stats["orphans_deleted"] == 4
+        assert stats_prune["orphans_deleted"] == 4
 
 
 @pytest.mark.asyncio

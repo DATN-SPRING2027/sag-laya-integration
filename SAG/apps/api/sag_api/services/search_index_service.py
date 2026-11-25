@@ -16,11 +16,11 @@ from __future__ import annotations
 import hashlib
 import uuid
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.bm25_tokenizer import (
@@ -687,6 +687,7 @@ def resolve_search_unit_text(unit: Any, unit_blocks: Sequence[Any]) -> str:
         str(getattr(b, "normalized_text", "") or "")
         for b in unit_blocks
         if getattr(b, "normalized_text", None)
+        and not bool(getattr(b, "is_boilerplate", False))
     )
 
 
@@ -797,6 +798,11 @@ def build_search_units_from_blocks(
                 prefix = table_header_lines if table_header_lines else []
                 body_text = "\n".join(cur_lines)
                 sub_entries.append(("\n".join([*prefix, *cur_lines]), body_text))
+            if not sub_entries and table_header_lines:
+                header_text = "\n".join(table_header_lines)
+                sub_entries.append((header_text, header_text))
+            elif not sub_entries and norm_text.strip():
+                sub_entries.append((norm_text, norm_text))
         else:
             atomic_spans = _split_atomic_spans(norm_text, max_span_tokens=max_tokens_per_unit)
             cur_spans: list[str] = []
@@ -1034,7 +1040,13 @@ async def precompute_canonical_block_embeddings(
         token_usage_scope,
     )
 
-    non_heading = [b for b in blocks if b.block_type != "heading" and (b.normalized_text or "").strip()]
+    non_heading = [
+        b
+        for b in blocks
+        if b.block_type != "heading"
+        and not bool(getattr(b, "is_boilerplate", False))
+        and (b.normalized_text or "").strip()
+    ]
     if not non_heading or embedder is None:
         return {}, TokenLedger().to_summary()
 
@@ -1137,7 +1149,11 @@ async def index_search_units_to_qdrant(
                         unit_blocks = [b1]
                     else:
                         lo, hi = min(b1.ordinal, b2.ordinal), max(b1.ordinal, b2.ordinal)
-                        unit_blocks = [b for b in ordered_blocks if lo <= b.ordinal <= hi] or [b1, b2]
+                        unit_blocks = [
+                            b
+                            for b in ordered_blocks
+                            if lo <= b.ordinal <= hi and not bool(getattr(b, "is_boilerplate", False))
+                        ] or [b1, b2]
                     t = resolve_search_unit_text(u, unit_blocks)
         raw_t = t or u.section_path or u.content_hash
         texts.append(raw_t)
@@ -1171,7 +1187,9 @@ async def index_search_units_to_qdrant(
                     body_ids = [
                         b.id
                         for b in ordered_blocks
-                        if lo <= b.ordinal <= hi and b.block_type != "heading"
+                        if lo <= b.ordinal <= hi
+                        and b.block_type != "heading"
+                        and not bool(getattr(b, "is_boilerplate", False))
                     ]
             if (
                 not is_subblock
@@ -1232,7 +1250,11 @@ async def index_search_units_to_qdrant(
                 extra_block_texts: list[str] = []
                 seen_texts = set(contextual_texts)
                 for blk in blocks_by_id.values():
-                    if blk.block_type == "heading" or not (blk.normalized_text or "").strip():
+                    if (
+                        blk.block_type == "heading"
+                        or bool(getattr(blk, "is_boilerplate", False))
+                        or not (blk.normalized_text or "").strip()
+                    ):
                         continue
                     bt = contextualize_block_text(blk.section_path, blk.normalized_text)
                     if (
@@ -1375,11 +1397,17 @@ async def reconcile_orphan_search_units(
     qdrant_client: httpx.AsyncClient,
     *,
     project_id: str,
+    preserve_superseded: bool = True,
+    inflight_grace_minutes: int = 15,
+    request_timeout: float = 30.0,
 ) -> dict[str, int]:
-    """Identify and delete orphan Qdrant points (missing, inactive, non-ready, or superseded)."""
+    """Identify and delete orphan Qdrant points while protecting in-flight indexing and active history."""
     from sag_api.db.models.document import Document
 
     collection_name = f"search_units_{project_id}"
+    timeout_sec = max(30.0, float(request_timeout))
+    reconcile_timeout = httpx.Timeout(timeout_sec, connect=min(10.0, timeout_sec))
+
     all_points: list[dict[str, Any]] = []
     next_offset = None
     while True:
@@ -1390,9 +1418,17 @@ async def reconcile_orphan_search_units(
         }
         if next_offset is not None:
             payload["offset"] = next_offset
-        res = await qdrant_client.post(f"/collections/{collection_name}/points/scroll", json=payload)
+        res = await qdrant_client.post(
+            f"/collections/{collection_name}/points/scroll",
+            json=payload,
+            timeout=reconcile_timeout,
+        )
         if not res.is_success:
-            break
+            if res.status_code == 404 and next_offset is None and not all_points:
+                return {"scanned": 0, "orphans_deleted": 0}
+            raise RuntimeError(
+                f"Failed to scroll Qdrant collection {collection_name}: HTTP {res.status_code} - {res.text}"
+            )
         data = res.json().get("result", {})
         points = data.get("points", [])
         all_points.extend(points)
@@ -1404,7 +1440,7 @@ async def reconcile_orphan_search_units(
     if not all_points:
         return {"scanned": 0, "orphans_deleted": 0}
 
-    point_unit_map: dict[Any, Any] = {}
+    point_entries: list[tuple[Any, Any, Any]] = []
     for p in all_points:
         pid = p.get("id")
         if not pid:
@@ -1412,12 +1448,32 @@ async def reconcile_orphan_search_units(
         pt_payload = p.get("payload") or {}
         if pt_payload.get("_collection_meta") is True:
             continue
-        point_unit_map[pid] = pt_payload.get("search_unit_id")
+        point_entries.append(
+            (pid, pt_payload.get("search_unit_id"), pt_payload.get("document_version_id"))
+        )
+
+    now = datetime.now(UTC)
+    grace_cutoff = now - timedelta(minutes=max(0, int(inflight_grace_minutes)))
 
     valid_unit_ids: set[str] = set()
-    unit_ids = [uid for uid in point_unit_map.values() if uid]
+    unit_ids = sorted({str(uid) for _pid, uid, _vid in point_entries if uid})
     if unit_ids:
-        now = datetime.now(UTC)
+        ready_condition = (
+            DocumentVersion.search_status.in_(("SEARCH_READY", "READY"))
+            if preserve_superseded
+            else (
+                DocumentVersion.search_status.in_(("SEARCH_READY", "READY"))
+                & (DocumentVersion.valid_to > now)
+            )
+        )
+        inflight_or_grace = or_(
+            DocumentVersion.search_status.in_(("INDEXING", "PENDING")),
+            ready_condition,
+            (
+                DocumentVersion.search_status.notin_(("INDEX_FAILED", "SEARCH_READY", "READY"))
+                & (DocumentVersion.created_at >= grace_cutoff)
+            ),
+        )
         for i in range(0, len(unit_ids), 500):
             batch = unit_ids[i : i + 500]
             rows = (
@@ -1428,15 +1484,44 @@ async def reconcile_orphan_search_units(
                     .where(
                         SearchUnit.id.in_(batch),
                         Document.is_active.is_(True),
-                        DocumentVersion.search_status.in_(("SEARCH_READY", "READY")),
-                        DocumentVersion.valid_to > now,
+                        DocumentVersion.status.notin_(("FAILED", "REVOKED")),
+                        inflight_or_grace,
                     )
                 )
             ).scalars().all()
-            valid_unit_ids.update(rows)
+            valid_unit_ids.update(str(row) for row in rows)
+
+    # Also protect uncommitted SearchUnit points whose DocumentVersion is actively INDEXING/PENDING
+    inflight_version_ids: set[str] = set()
+    candidate_vids = sorted(
+        {
+            str(vid)
+            for _pid, uid, vid in point_entries
+            if vid and (not uid or str(uid) not in valid_unit_ids)
+        }
+    )
+    if candidate_vids:
+        for i in range(0, len(candidate_vids), 500):
+            v_batch = candidate_vids[i : i + 500]
+            v_rows = (
+                await session.execute(
+                    select(DocumentVersion.id)
+                    .join(Document, Document.id == DocumentVersion.document_id)
+                    .where(
+                        DocumentVersion.id.in_(v_batch),
+                        Document.is_active.is_(True),
+                        DocumentVersion.status.notin_(("FAILED", "REVOKED")),
+                        DocumentVersion.search_status.in_(("INDEXING", "PENDING")),
+                    )
+                )
+            ).scalars().all()
+            inflight_version_ids.update(str(row) for row in v_rows)
 
     orphan_point_ids = [
-        pid for pid, uid in point_unit_map.items() if not uid or uid not in valid_unit_ids
+        pid
+        for pid, uid, vid in point_entries
+        if not uid
+        or (str(uid) not in valid_unit_ids and (not vid or str(vid) not in inflight_version_ids))
     ]
     if orphan_point_ids:
         for i in range(0, len(orphan_point_ids), 500):
@@ -1444,6 +1529,7 @@ async def reconcile_orphan_search_units(
             del_res = await qdrant_client.post(
                 f"/collections/{collection_name}/points/delete?wait=true",
                 json={"points": batch_ids},
+                timeout=reconcile_timeout,
             )
             if del_res.status_code >= 400 and del_res.status_code != 404:
                 raise RuntimeError(f"Failed to delete orphan points: {del_res.text}")

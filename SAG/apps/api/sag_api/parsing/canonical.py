@@ -23,7 +23,10 @@ BlockType = Literal["heading", "paragraph", "table", "code", "list", "caption"]
 
 # Regex phát hiện boilerplate phổ biến: tiêu đề / chân trang đánh số trang
 _BOILERPLATE_PATTERNS = [
-    re.compile(r"^(?:trang|page|p\.?|pg\.?|tr\.?)\s*\d+(?:\s*(?:/|of)\s*\d+)?$", re.IGNORECASE),
+    re.compile(
+        r"^(?:(?:trang|page)\s+|(?:p|pg|tr)\.\s*)\d+(?:\s*(?:/|of)\s*\d+)?$",
+        re.IGNORECASE,
+    ),
     re.compile(r"^[-—–]\s*\d+\s*[-—–]$"),
 ]
 
@@ -343,8 +346,20 @@ def _is_setext_heading(lines: list[str], idx: int) -> re.Match[str] | None:
     return _SETEXT_UNDERLINE_RE.match(lines[idx + 1].strip())
 
 
+def _parse_html_span(raw_val: Any, *, max_span: int = 100) -> int:
+    if raw_val is None:
+        return 1
+    try:
+        parsed = int(str(raw_val).strip())
+    except (TypeError, ValueError):
+        return 1
+    if parsed <= 0:
+        return max_span
+    return min(parsed, max_span)
+
+
 def _html_table_to_markdown(raw_html: str) -> str:
-    """Convert MinerU HTML <table>...</table> into a clean Markdown pipe table."""
+    """Convert MinerU HTML <table>...</table> into a clean Markdown pipe table honoring colspan/rowspan."""
     from bs4 import BeautifulSoup
 
     try:
@@ -353,17 +368,49 @@ def _html_table_to_markdown(raw_html: str) -> str:
         soup = BeautifulSoup(raw_html, "html.parser")
 
     table_el = soup.find("table") or soup
-    rows: list[list[str]] = []
-    for tr in table_el.find_all("tr"):
-        cells = tr.find_all(["th", "td"])
+    tr_els = table_el.find_all("tr")
+    grid: dict[int, dict[int, str]] = {}
+    max_col = 0
+    total_rows = len(tr_els)
+
+    for row_idx, tr in enumerate(tr_els):
+        cells = tr.find_all(["th", "td"], recursive=False) or tr.find_all(["th", "td"])
         if not cells:
             continue
-        row_vals = [
-            " ".join(cell.get_text(" ", strip=True).split()).replace("|", "\\|")
-            for cell in cells
-        ]
-        if any(row_vals):
-            rows.append(row_vals)
+        row_map = grid.setdefault(row_idx, {})
+        col_idx = 0
+        for cell in cells:
+            while col_idx in row_map:
+                col_idx += 1
+            text = " ".join(cell.get_text(" ", strip=True).split()).replace("|", "\\|")
+            colspan = _parse_html_span(cell.get("colspan"), max_span=100)
+            raw_rowspan = cell.get("rowspan")
+            rowspan = (
+                max(1, total_rows - row_idx)
+                if raw_rowspan is not None and str(raw_rowspan).strip() == "0"
+                else _parse_html_span(raw_rowspan, max_span=max(1, total_rows - row_idx))
+            )
+            end_row = min(total_rows, row_idx + rowspan)
+            is_header = getattr(cell, "name", "").lower() == "th"
+            for r in range(row_idx, end_row):
+                target_row = grid.setdefault(r, {})
+                for c in range(col_idx, col_idx + colspan):
+                    if c in target_row:
+                        continue
+                    if (r == row_idx and c == col_idx) or is_header or (r > row_idx and c == col_idx):
+                        target_row[c] = text
+                    else:
+                        target_row[c] = ""
+            col_idx += colspan
+            max_col = max(max_col, col_idx)
+
+    rows: list[list[str]] = []
+    if max_col > 0:
+        for row_idx in sorted(grid.keys()):
+            row_map = grid[row_idx]
+            row_vals = [row_map.get(c, "") for c in range(max_col)]
+            if any(row_vals):
+                rows.append(row_vals)
 
     if rows:
         col_count = max(len(r) for r in rows)

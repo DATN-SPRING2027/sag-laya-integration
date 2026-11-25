@@ -1620,6 +1620,40 @@ async def rebuild_universe_tree(
     await session.commit()
 
 
+class _TimeoutBoundQdrantClient:
+    """Delegate Qdrant HTTP calls with a >=30s reconcile timeout without mutating a shared client."""
+
+    def __init__(self, client: httpx.AsyncClient, timeout: httpx.Timeout) -> None:
+        self._client = client
+        self.timeout = timeout
+        self.base_url = getattr(client, "base_url", "")
+        self.headers = getattr(client, "headers", {})
+
+    async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+        kwargs.setdefault("timeout", self.timeout)
+        return await self._client.get(url, **kwargs)
+
+    async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+        kwargs.setdefault("timeout", self.timeout)
+        return await self._client.post(url, **kwargs)
+
+    async def put(self, url: str, **kwargs: Any) -> httpx.Response:
+        kwargs.setdefault("timeout", self.timeout)
+        return await self._client.put(url, **kwargs)
+
+    async def delete(self, url: str, **kwargs: Any) -> httpx.Response:
+        kwargs.setdefault("timeout", self.timeout)
+        return await self._client.delete(url, **kwargs)
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _reconcile_qdrant_timeout() -> httpx.Timeout:
+    timeout_sec = max(30.0, float(getattr(settings, "search_source_timeout", 30.0) or 30.0))
+    return httpx.Timeout(timeout_sec, connect=min(10.0, timeout_sec))
+
+
 async def reconcile_search_index(
     session: AsyncSession,
     job: Job,
@@ -1631,35 +1665,20 @@ async def reconcile_search_index(
     from sag_api.services.search_index_service import reconcile_orphan_search_units
 
     payload = dict(job.payload or {})
-    requested_pid = payload.get("project_id")
-    if isinstance(requested_pid, str) and requested_pid.strip():
-        project_ids = [requested_pid.strip()]
-    else:
-        rows = (
-            await session.scalars(
-                select(Document.project_id)
-                .where(Document.project_id.is_not(None))
-                .distinct()
-            )
-        ).all()
-        project_ids = sorted({str(pid).strip() for pid in rows if isinstance(pid, str) and pid.strip()})
+    reconcile_timeout = _reconcile_qdrant_timeout()
 
-    if not project_ids:
-        job.progress = 1.0
-        job.payload = {**payload, "scanned": 0, "orphans_deleted": 0, "projects": []}
-        await session.commit()
-        return
-
-    qdrant_client = None
+    qdrant_client: Any = None
     should_close = False
     if engine_manager is not None and hasattr(engine_manager, "get_search_unit_qdrant_client"):
-        qdrant_client = await engine_manager.get_search_unit_qdrant_client()
+        base_client = await engine_manager.get_search_unit_qdrant_client()
+        if base_client is not None:
+            qdrant_client = _TimeoutBoundQdrantClient(base_client, reconcile_timeout)
     elif settings.sag_vector_provider == "qdrant":
         q_headers = {"api-key": settings.sag_qdrant_api_key} if settings.sag_qdrant_api_key else {}
         qdrant_client = httpx.AsyncClient(
             base_url=settings.sag_qdrant_url.rstrip("/"),
             headers=q_headers,
-            timeout=30.0,
+            timeout=reconcile_timeout,
         )
         should_close = True
 
@@ -1673,8 +1692,61 @@ async def reconcile_search_index(
     total_deleted = 0
     per_project: dict[str, dict[str, int]] = {}
     try:
+        requested_pid = payload.get("project_id")
+        if isinstance(requested_pid, str) and requested_pid.strip():
+            project_ids = [requested_pid.strip()]
+        else:
+            rows = (
+                await session.scalars(
+                    select(Document.project_id)
+                    .where(Document.project_id.is_not(None))
+                    .distinct()
+                )
+            ).all()
+            discovered_pids: set[str] = {
+                str(pid).strip() for pid in rows if isinstance(pid, str) and pid.strip()
+            }
+            try:
+                col_res = await qdrant_client.get("/collections", timeout=reconcile_timeout)
+                if col_res.is_success:
+                    raw_cols = col_res.json()
+                    cols = (
+                        (raw_cols.get("result") or {}).get("collections")
+                        if isinstance(raw_cols, dict)
+                        else None
+                    )
+                    if isinstance(cols, list):
+                        prefix = "search_units_"
+                        for item in cols:
+                            col_name = item.get("name") if isinstance(item, dict) else None
+                            if isinstance(col_name, str) and col_name.startswith(prefix):
+                                pid_from_col = col_name[len(prefix) :].strip()
+                                if pid_from_col:
+                                    discovered_pids.add(pid_from_col)
+            except (httpx.HTTPError, TimeoutError, OSError, ValueError, TypeError) as col_exc:
+                log.warning(
+                    "Could not list Qdrant collections during reconcile (using DB projects): %s",
+                    sanitize_error_message(col_exc),
+                )
+            project_ids = sorted(discovered_pids)
+
+        if not project_ids:
+            job.progress = 1.0
+            job.payload = {**payload, "scanned": 0, "orphans_deleted": 0, "projects": []}
+            await session.commit()
+            return
+
+        explicit_prune_superseded = payload.get("prune_superseded") is True
         for idx, pid in enumerate(project_ids):
-            stats = await reconcile_orphan_search_units(session, qdrant_client, project_id=pid)
+            if explicit_prune_superseded:
+                stats = await reconcile_orphan_search_units(
+                    session,
+                    qdrant_client,
+                    project_id=pid,
+                    preserve_superseded=False,
+                )
+            else:
+                stats = await reconcile_orphan_search_units(session, qdrant_client, project_id=pid)
             per_project[pid] = stats
             total_scanned += int(stats.get("scanned", 0))
             total_deleted += int(stats.get("orphans_deleted", 0))
