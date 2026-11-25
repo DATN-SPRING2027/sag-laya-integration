@@ -160,12 +160,15 @@ async def embed_texts_with_provenance(
         return [deterministic_ngram_vector(t) for t in texts], "deterministic-ngram-v1"
 
     emb_sig = compute_embedding_signature(embedder)
+    from sag_api.services.search_index_service import build_embedding_model_signature
+
+    cache_sig = build_embedding_model_signature(embedder)
     expected_dim = declared_embedder_dim(embedder)
     results: list[tuple[float, ...] | None] = [None] * len(texts)
     missing_indices: list[int] = []
     missing_texts: list[str] = []
     for idx, txt in enumerate(texts):
-        cached = get_cached_text_embedding(txt, model_signature=emb_sig)
+        cached = get_cached_text_embedding(txt, model_signature=cache_sig)
         if (
             cached is not None
             and len(cached) > 0
@@ -188,7 +191,7 @@ async def embed_texts_with_provenance(
                     raise ValueError(
                         f"Embedder {emb_sig} returned dim={len(raw_vec)}, expected {expected_dim}"
                     )
-                put_cached_text_embedding(txt, raw_vec, model_signature=emb_sig)
+                put_cached_text_embedding(txt, raw_vec, model_signature=cache_sig)
                 results[idx] = l2_normalize(raw_vec)
         except Exception:  # noqa: BLE001 - fail-open to deterministic local projection if HTTP embedder errors
             return [deterministic_ngram_vector(t) for t in texts], "deterministic-ngram-v1"
@@ -210,7 +213,7 @@ async def embed_texts_with_provenance(
                     raise ValueError("Inconsistent vector dimensions within single embedder batch")
                 rebuilt: list[tuple[float, ...]] = []
                 for txt, raw_vec in zip(texts, recomputed, strict=True):
-                    put_cached_text_embedding(txt, raw_vec, model_signature=emb_sig)
+                    put_cached_text_embedding(txt, raw_vec, model_signature=cache_sig)
                     rebuilt.append(l2_normalize(raw_vec))
                 return rebuilt, emb_sig
             except Exception:  # noqa: BLE001

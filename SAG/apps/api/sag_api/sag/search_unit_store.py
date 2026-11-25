@@ -300,6 +300,38 @@ class SearchUnitQdrantStore:
             raise SearchIndexUnavailable("Search index returned an invalid point")
         return SearchUnitHit(str(point.get("id") or point_id), score, point["payload"])
 
+    async def validate_collection_metadata(
+        self,
+        collection: str,
+        *,
+        expected_signature: str,
+    ) -> None:
+        """Verify collection metadata marker point matches expected embedding signature when present."""
+        from sag_api.services.search_index_service import collection_meta_point_id
+
+        meta_id = collection_meta_point_id(collection)
+        path = f"/collections/{quote(collection, safe='')}/points/{quote(meta_id, safe='')}"
+        try:
+            response = await self._client.get(
+                path,
+                params={"with_payload": "true", "with_vector": "false"},
+            )
+        except httpx.RequestError as error:
+            raise SearchIndexUnavailable("Search index metadata check failed") from error
+        if response.status_code == 404:
+            return
+        if response.is_error:
+            raise SearchIndexUnavailable("Search index metadata query failed")
+        data = response.json()
+        point = data.get("result") if isinstance(data, dict) else None
+        payload = point.get("payload") if isinstance(point, dict) else None
+        if isinstance(payload, dict) and payload.get("_collection_meta") is True:
+            existing_sig = str(payload.get("embedding_signature") or "").strip()
+            if existing_sig and existing_sig != expected_signature:
+                raise SearchIndexUnavailable(
+                    f"Search index embedding signature mismatch: {existing_sig!r} != {expected_signature!r}"
+                )
+
     async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         for attempt in range(self._max_retries + 1):
             try:

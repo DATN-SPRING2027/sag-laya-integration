@@ -175,12 +175,17 @@ def build_engine_config(settings: Settings, *, overrides: dict[str, Any] | None 
         max_retries=settings.llm_max_retries,
         structured_output_mode=_structured_output_mode(settings),
     )
+    from sag_api.services.search_index_service import resolve_embedding_dimensions
+
     emb_kwargs: dict[str, Any] = {
         "model": settings.embedding_model,
         "base_url": settings.effective_embedding_base_url,
         "api_key": settings.effective_embedding_api_key or _PLACEHOLDER,
-        # 当前引擎以该值预建向量 schema；未显式配置时保持既有 1024 维默认值。
-        "dimensions": settings.embedding_dimensions or 1024,
+        # Resolve dimensions from explicit config or known model registry (default 1024).
+        "dimensions": resolve_embedding_dimensions(
+            settings.embedding_model,
+            settings.embedding_dimensions,
+        ),
         "timeout": settings.embedding_timeout,
     }
     if "max_tokens" in getattr(EmbeddingConfig, "model_fields", {}):

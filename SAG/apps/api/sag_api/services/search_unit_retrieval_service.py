@@ -725,52 +725,62 @@ _QWEN3_QUERY_INSTRUCT = (
 
 
 async def _query_vector(engine_manager: Any, group: _SearchGroup, query: str) -> list[float]:
-    from sag_api.services.search_index_service import (
-        get_cached_text_embedding,
-        put_cached_text_embedding,
-    )
-
-    model_name = (getattr(settings, "embedding_model", "") or "").lower()
-    if "qwen3-embedding" in model_name and not query.startswith("Instruct:"):
-        embed_query = f"{_QWEN3_QUERY_INSTRUCT}{query}"
-    else:
-        embed_query = query
-
     from sag_api.core.token_usage import (
         extract_embedding_usage,
         record_embedding_cache_hit,
         record_embedding_usage,
         token_usage_scope,
     )
+    from sag_api.services.search_index_service import (
+        build_embedding_model_signature,
+        get_cached_text_embedding,
+        put_cached_text_embedding,
+    )
 
-    cached = get_cached_text_embedding(embed_query)
+    settings_obj = getattr(engine_manager, "_settings", None) or settings
+    embedding = None
+    emb_exc: Exception | None = None
+    try:
+        embedding = await engine_manager.get_sag_embedding(group.source.sag_source_config_id, group.source)
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:  # noqa: BLE001 - upstream details may contain private URLs or credentials
+        emb_exc = error
+
+    emb_model = getattr(embedding, "model", None) or getattr(settings_obj, "embedding_model", "") or ""
+    model_name = str(emb_model).lower()
+    if "qwen3-embedding" in model_name and not query.startswith("Instruct:"):
+        embed_query = f"{_QWEN3_QUERY_INSTRUCT}{query}"
+    else:
+        embed_query = query
+
+    emb_sig = build_embedding_model_signature(embedding, settings_obj=settings_obj)
+    cached = get_cached_text_embedding(embed_query, model_signature=emb_sig)
     if cached is not None:
         record_embedding_cache_hit(
-            model=getattr(settings, "embedding_model", None),
+            model=emb_model or None,
             count=1,
             component="query_embedding",
             project_id=group.project_id,
         )
         return cached
-    if cached is not None:
-        return cached
     try:
-        embedding = await engine_manager.get_sag_embedding(group.source.sag_source_config_id, group.source)
+        if emb_exc is not None:
+            raise emb_exc
         with token_usage_scope(
             component="query_embedding",
             project_id=group.project_id,
             tenant_id=group.tenant_id,
         ):
-
             vector = [float(value) for value in await embedding.generate(embed_query)]
             if not getattr(embedding, "_sag_token_metered_cache_wrapped", False):
                 record_embedding_usage(
-                    model=getattr(settings, "embedding_model", None),
+                    model=emb_model or None,
                     usage=extract_embedding_usage(None, embed_query),
                 )
         if not vector or any(not math.isfinite(value) for value in vector):
             raise ValueError("invalid embedding vector")
-        put_cached_text_embedding(embed_query, vector)
+        put_cached_text_embedding(embed_query, vector, model_signature=emb_sig)
         return vector
     except asyncio.CancelledError:
         raise
@@ -2335,6 +2345,11 @@ async def _retrieve_search_unit_sections(
         tuple[str, str, str, str, str, str],
         list[tuple[str, SearchUnitHit]],
     ] = defaultdict(list)
+    from sag_api.services.search_index_service import build_embedding_model_signature
+
+    active_emb_sig = build_embedding_model_signature(
+        settings_obj=getattr(engine_manager, "_settings", None) or settings
+    )
     max_dense_raw_score = 0.0
     max_sparse_raw_score = 0.0
     for group, _route, origin, semantic_hits, lexical_hits in channel_results:
@@ -2345,6 +2360,18 @@ async def _retrieve_search_unit_sections(
             else:
                 max_sparse_raw_score = max(max_sparse_raw_score, max_score)
             for rank, hit in enumerate(channel_hits):
+                hit_emb_sig = hit.payload.get("embedding_model_signature")
+                if (
+                    isinstance(hit_emb_sig, str)
+                    and hit_emb_sig.strip()
+                    and hit_emb_sig.strip() != active_emb_sig
+                ):
+                    log.warning(
+                        "Qdrant hit embedding_model_signature mismatch: index=%r active=%r",
+                        hit_emb_sig,
+                        active_emb_sig,
+                    )
+                    raise ServiceUnavailableError("Canonical search index embedding model mismatch")
                 unit_id = str(hit.payload.get("search_unit_id") or "")
                 if (
                     not unit_id

@@ -602,24 +602,51 @@ class EngineManager:
                 inner_emb = getattr(emb, attr_name, None)
                 if inner_emb is not None and getattr(inner_emb, "max_tokens", 512) <= 512:
                     inner_emb.max_tokens = 8192
-        from sag_api.core.token_usage import wrap_embedding_client_with_cache_and_metering
-        wrap_embedding_client_with_cache_and_metering(emb, default_model=self._settings.embedding_model)
-        if emb is not None and not getattr(emb, "_sag_shared_cache_wrapped", False):
-            from sag_api.services.search_index_service import (
-                get_cached_text_embedding,
-                put_cached_text_embedding,
-            )
 
+        if self._settings.embedding_dimensions is None:
+            hostname = (urlparse(self._settings.effective_embedding_base_url or "").hostname or "").lower()
+            model = self._settings.embedding_model.strip().lower()
+            if hostname in ("api.siliconflow.com", "api.siliconflow.cn") and model == "baai/bge-m3":
+                if emb is not None:
+                    from sag_api.services.search_index_service import resolve_embedding_dimensions
+
+                    resolved_schema_dim = (
+                        getattr(emb, "schema_dimensions", None)
+                        or getattr(emb, "dimensions", None)
+                        or resolve_embedding_dimensions(self._settings.embedding_model, None)
+                    )
+                    emb.schema_dimensions = int(resolved_schema_dim)
+                    emb.dimensions = None
+                    inner = getattr(emb, "inner", None)
+                    if inner is not None:
+                        inner.schema_dimensions = int(resolved_schema_dim)
+                        inner.dimensions = None
+
+        from sag_api.core.token_usage import wrap_embedding_client_with_cache_and_metering
+        from sag_api.services.search_index_service import (
+            build_embedding_model_signature,
+            get_cached_text_embedding,
+            put_cached_text_embedding,
+        )
+
+        emb_sig = build_embedding_model_signature(emb, settings_obj=self._settings)
+        wrap_embedding_client_with_cache_and_metering(
+            emb,
+            default_model=self._settings.embedding_model,
+            settings_obj=self._settings,
+            model_signature=emb_sig,
+        )
+        if emb is not None and not getattr(emb, "_sag_shared_cache_wrapped", False):
             orig_generate = emb.generate
             orig_batch_generate = emb.batch_generate
 
             async def _cached_generate(text: str) -> list[float]:
-                cached = get_cached_text_embedding(text)
+                cached = get_cached_text_embedding(text, model_signature=emb_sig)
                 if cached is not None:
                     return cached
                 vec = await orig_generate(text)
                 if vec:
-                    put_cached_text_embedding(text, vec)
+                    put_cached_text_embedding(text, vec, model_signature=emb_sig)
                 return vec
 
             async def _cached_batch_generate(texts: list[str]) -> list[list[float]]:
@@ -628,7 +655,7 @@ class EngineManager:
                 results: list[list[float] | None] = [None] * len(texts)
                 missing_by_text: dict[str, list[int]] = {}
                 for idx, txt in enumerate(texts):
-                    cached = get_cached_text_embedding(txt)
+                    cached = get_cached_text_embedding(txt, model_signature=emb_sig)
                     if cached is not None:
                         results[idx] = cached
                     else:
@@ -638,7 +665,7 @@ class EngineManager:
                     fetched = await orig_batch_generate(unique_missing)
                     for txt, vec in zip(unique_missing, fetched, strict=True):
                         if vec:
-                            put_cached_text_embedding(txt, vec)
+                            put_cached_text_embedding(txt, vec, model_signature=emb_sig)
                         for m_idx in missing_by_text[txt]:
                             results[m_idx] = vec
                 return [vec or [] for vec in results]
@@ -646,18 +673,6 @@ class EngineManager:
             emb.generate = _cached_generate
             emb.batch_generate = _cached_batch_generate
             emb._sag_shared_cache_wrapped = True
-
-        if self._settings.embedding_dimensions is not None:
-            return
-        hostname = (urlparse(self._settings.effective_embedding_base_url or "").hostname or "").lower()
-        model = self._settings.embedding_model.strip().lower()
-        if hostname not in ("api.siliconflow.com", "api.siliconflow.cn") or model != "baai/bge-m3":
-            return
-        if emb is not None:
-            emb.dimensions = None
-            inner = getattr(emb, "inner", None)
-            if inner is not None:
-                inner.dimensions = None
 
     async def _ensure_engine_schema(self, engine: DataEngine) -> None:
         if self._schema_ready:

@@ -37,9 +37,110 @@ from sag_api.db.models.routing_rag import (
 
 log = get_logger("sag.search_index")
 
-# Bounded LRU cache mapping sha256([model_signature + NUL +] text) -> dense vector
+# Bounded LRU cache mapping sha256(model_signature + NUL + text) -> dense vector
 _SHARED_TEXT_EMBEDDING_CACHE: dict[str, list[float]] = {}
 _SHARED_TEXT_EMBEDDING_CACHE_MAX = 16384
+
+_KNOWN_EMBEDDING_DIMENSIONS: dict[str, int] = {
+    "bge-large-en-v1.5": 1024,
+    "baai/bge-large-en-v1.5": 1024,
+    "baai/bge-m3": 1024,
+    "bge-m3": 1024,
+    "qwen/qwen3-embedding-4b": 1024,
+    "qwen3-embedding-4b": 1024,
+    "qwen/qwen3-embedding-0.6b": 1024,
+    "qwen3-embedding-0.6b": 1024,
+    "qwen/qwen3-embedding-8b": 4096,
+    "qwen3-embedding-8b": 4096,
+    "text-embedding-3-small": 1536,
+    "openai/text-embedding-3-small": 1536,
+    "text-embedding-3-large": 3072,
+    "openai/text-embedding-3-large": 3072,
+    "text-embedding-ada-002": 1536,
+    "openai/text-embedding-ada-002": 1536,
+    "nomic-embed-text": 768,
+    "mxbai-embed-large": 1024,
+}
+
+
+def resolve_embedding_dimensions(
+    model_name: str | None = None,
+    configured_dimensions: int | None = None,
+) -> int:
+    """Resolve embedding vector dimensions from explicit config or model registry (default 1024)."""
+    if configured_dimensions is not None and configured_dimensions != "":
+        if isinstance(configured_dimensions, bool):
+            raise ValueError(f"Invalid embedding dimensions: {configured_dimensions!r}")
+        dim = int(configured_dimensions)
+        if dim <= 0:
+            raise ValueError(f"Embedding dimensions must be positive, got {dim}")
+        return dim
+    normalized = str(model_name or "").strip().lower()
+    if normalized in _KNOWN_EMBEDDING_DIMENSIONS:
+        return _KNOWN_EMBEDDING_DIMENSIONS[normalized]
+    return 1024
+
+
+def _attr_from_embedder_or_delegates(embedder: Any | None, *names: str) -> Any:
+    if embedder is None:
+        return None
+    candidates: list[Any] = [embedder]
+    cfg = getattr(embedder, "config", None)
+    if cfg is not None:
+        candidates.append(cfg)
+    for delegate_attr in ("inner", "_inner", "client", "_client", "_delegate"):
+        delegate = getattr(embedder, delegate_attr, None)
+        if delegate is not None:
+            candidates.append(delegate)
+            d_cfg = getattr(delegate, "config", None)
+            if d_cfg is not None:
+                candidates.append(d_cfg)
+    for obj in candidates:
+        for name in names:
+            val = getattr(obj, name, None)
+            if val is not None and val != "":
+                return val
+    return None
+
+
+def build_embedding_model_signature(
+    embedder: Any | None = None,
+    *,
+    settings_obj: Any | None = None,
+    model: str | None = None,
+    base_url: str | None = None,
+    dimensions: int | None = None,
+) -> str:
+    """Build canonical cache/index signature capturing base_url, model, and resolved dimensions."""
+    s = settings_obj if settings_obj is not None else settings
+    emb_model = (
+        model
+        if isinstance(model, str) and model.strip()
+        else _attr_from_embedder_or_delegates(embedder, "model", "_model", "model_name")
+    )
+    settings_model = str(getattr(s, "embedding_model", "") or "").strip()
+    resolved_model = str(emb_model or settings_model).strip()
+
+    emb_base_url = (
+        base_url
+        if isinstance(base_url, str) and base_url.strip()
+        else _attr_from_embedder_or_delegates(embedder, "base_url", "_base_url")
+    )
+    settings_base_url = getattr(s, "effective_embedding_base_url", None) or getattr(s, "embedding_base_url", None)
+    resolved_base_url = str(emb_base_url or settings_base_url or "").strip().rstrip("/").lower()
+
+    raw_dim: Any = dimensions
+    if raw_dim is None:
+        raw_dim = _attr_from_embedder_or_delegates(embedder, "schema_dimensions", "dimensions", "dim")
+    if raw_dim is None and (not emb_model or str(emb_model).strip() == settings_model):
+        raw_dim = getattr(s, "embedding_dimensions", None)
+    resolved_dim = resolve_embedding_dimensions(resolved_model, raw_dim)
+    return f"emb:{resolved_base_url}|{resolved_model}|{resolved_dim}"
+
+
+def collection_meta_point_id(collection_name: str) -> str:
+    """Deterministic UUIDv5 point ID for Qdrant collection embedding identity metadata."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"sag:qdrant:collection_meta:{collection_name}"))
 
 
 def contextualize_block_text(section_path: str | None, text: str) -> str:
@@ -51,13 +152,15 @@ def contextualize_block_text(section_path: str | None, text: str) -> str:
     return raw_t
 
 
-def _embedding_cache_key(text: str, model_signature: str = "") -> str:
+def _embedding_cache_key(text: str, model_signature: str) -> str:
+    if not isinstance(model_signature, str) or not model_signature.strip():
+        raise ValueError("model_signature must be a non-empty string for _SHARED_TEXT_EMBEDDING_CACHE")
     sig = model_signature.strip()
-    payload = f"{sig}\x00{text}" if sig else text
+    payload = f"{sig}\x00{text}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def get_cached_text_embedding(text: str, *, model_signature: str = "") -> list[float] | None:
+def get_cached_text_embedding(text: str, *, model_signature: str) -> list[float] | None:
     key = _embedding_cache_key(text, model_signature)
     vec = _SHARED_TEXT_EMBEDDING_CACHE.get(key)
     return list(vec) if vec is not None else None
@@ -67,7 +170,7 @@ def put_cached_text_embedding(
     text: str,
     vector: Sequence[float],
     *,
-    model_signature: str = "",
+    model_signature: str,
 ) -> None:
     key = _embedding_cache_key(text, model_signature)
     if (
@@ -238,18 +341,44 @@ PAYLOAD_INDEX_FIELDS = [
     ("secondary_node_ids_b", "keyword"),
 ]
 
-_VERIFIED_CLIENT_COLLECTIONS: WeakKeyDictionary[Any, set[tuple[str, int]]] = WeakKeyDictionary()
+_VERIFIED_CLIENT_COLLECTIONS: WeakKeyDictionary[Any, set[tuple[str, int, str]]] = WeakKeyDictionary()
 _CLIENT_COLLECTION_LOCKS: WeakKeyDictionary[Any, dict[str, asyncio.Lock]] = WeakKeyDictionary()
 
 
 async def ensure_qdrant_collection_and_indexes(
     qdrant_client: httpx.AsyncClient,
     collection_name: str,
-    vector_dim: int = 1536,
+    vector_dim: int | None = None,
+    *,
+    embedding_signature: str | None = None,
+    embedding_model: str | None = None,
+    embedding_base_url: str | None = None,
 ) -> None:
-    """Ensure per-project collection exists with dense+sparse config and pre-provisioned payload indexes."""
+    """Ensure per-project collection exists with dense+sparse config, model metadata, and payload indexes."""
+    if vector_dim is None or isinstance(vector_dim, bool) or int(vector_dim) <= 0:
+        raise ValueError(
+            f"Qdrant collection {collection_name} requires a positive vector_dim, got {vector_dim!r}"
+        )
+    vector_dim = int(vector_dim)
+    resolved_model = (embedding_model or getattr(settings, "embedding_model", "") or "").strip()
+    resolved_base_url = (
+        embedding_base_url
+        or getattr(settings, "effective_embedding_base_url", None)
+        or getattr(settings, "embedding_base_url", None)
+        or ""
+    ).strip().rstrip("/").lower()
+    resolved_sig = (
+        embedding_signature.strip()
+        if isinstance(embedding_signature, str) and embedding_signature.strip()
+        else build_embedding_model_signature(
+            model=resolved_model,
+            base_url=resolved_base_url,
+            dimensions=vector_dim,
+        )
+    )
+
     verified_set = _VERIFIED_CLIENT_COLLECTIONS.get(qdrant_client)
-    if verified_set is not None and (collection_name, vector_dim) in verified_set:
+    if verified_set is not None and (collection_name, vector_dim, resolved_sig) in verified_set:
         return
 
     locks_by_col = _CLIENT_COLLECTION_LOCKS.get(qdrant_client)
@@ -263,7 +392,7 @@ async def ensure_qdrant_collection_and_indexes(
 
     async with col_lock:
         verified_set = _VERIFIED_CLIENT_COLLECTIONS.get(qdrant_client)
-        if verified_set is not None and (collection_name, vector_dim) in verified_set:
+        if verified_set is not None and (collection_name, vector_dim, resolved_sig) in verified_set:
             return
 
         # 0. Check if collection already exists to verify vector dimension compatibility and existing indexes
@@ -373,13 +502,66 @@ async def ensure_qdrant_collection_and_indexes(
                 *(_create_payload_index(fname, fschema) for fname, fschema in missing_index_fields)
             )
 
+        # 3. Validate or record deterministic collection embedding metadata marker point
+        meta_id = collection_meta_point_id(collection_name)
+        meta_exists_matching = False
+        meta_res = await qdrant_client.get(
+            f"/collections/{collection_name}/points/{meta_id}",
+            params={"with_payload": "true", "with_vector": "false"},
+        )
+        if meta_res.is_success:
+            meta_result = meta_res.json().get("result")
+            meta_payload = meta_result.get("payload") if isinstance(meta_result, dict) else None
+            if isinstance(meta_payload, dict) and meta_payload.get("_collection_meta") is True:
+                existing_sig = str(meta_payload.get("embedding_signature") or "").strip()
+                if existing_sig and existing_sig != resolved_sig:
+                    raise ValueError(
+                        f"Qdrant collection {collection_name} embedding model signature mismatch: "
+                        f"existing {existing_sig!r} vs required {resolved_sig!r}"
+                    )
+                if existing_sig == resolved_sig:
+                    meta_exists_matching = True
+        elif meta_res.status_code != 404:
+            raise RuntimeError(
+                f"Failed to inspect collection metadata marker for {collection_name}: "
+                f"HTTP {meta_res.status_code} - {meta_res.text}"
+            )
+
+        if not meta_exists_matching:
+            meta_put = await qdrant_client.put(
+                f"/collections/{collection_name}/points?wait=true",
+                json={
+                    "points": [
+                        {
+                            "id": meta_id,
+                            "payload": {
+                                "_collection_meta": True,
+                                "payload_only": True,
+                                "embedding_model": resolved_model,
+                                "embedding_base_url": resolved_base_url,
+                                "embedding_dimensions": vector_dim,
+                                "embedding_signature": resolved_sig,
+                            },
+                            "vector": {
+                                "content_vector": [0.0] * vector_dim,
+                            },
+                        }
+                    ]
+                },
+            )
+            if meta_put.status_code >= 400:
+                raise RuntimeError(
+                    f"Failed to write collection metadata marker for {collection_name}: "
+                    f"HTTP {meta_put.status_code} - {meta_put.text}"
+                )
+
         if collection_verified:
             try:
                 vset = _VERIFIED_CLIENT_COLLECTIONS.get(qdrant_client)
                 if vset is None:
                     vset = set()
                     _VERIFIED_CLIENT_COLLECTIONS[qdrant_client] = vset
-                vset.add((collection_name, vector_dim))
+                vset.add((collection_name, vector_dim, resolved_sig))
             except TypeError:
                 pass
 
@@ -807,6 +989,7 @@ def build_qdrant_payload(
     block_from_id: str | None = None,
     block_to_id: str | None = None,
     source_anchor: str | None = None,
+    embedding_model_signature: str | None = None,
 ) -> dict[str, Any]:
     """Build Qdrant point payload including pre-provisioned tree routing fields and retrieval locators."""
     valid_from_ts = int(version.valid_from.timestamp()) if version.valid_from else None
@@ -837,6 +1020,7 @@ def build_qdrant_payload(
         "page_to": unit.page_to,
         "content_hash": unit.content_hash,
         "content": content or getattr(unit, "_text_content", ""),
+        "embedding_model_signature": embedding_model_signature,
         # Pre-provisioned fields for Tree Routing (Phases 6/8)
         "primary_node_a": None,
         "secondary_node_ids_a": [],
@@ -903,6 +1087,7 @@ async def precompute_canonical_block_embeddings(
 
     use_cache = hasattr(embedder, "batch_generate")
     emb_model = getattr(embedder, "model", None) or getattr(settings, "embedding_model", None)
+    emb_sig = build_embedding_model_signature(embedder, settings_obj=settings)
     block_ctx_by_id: dict[str, str] = {
         b.id: contextualize_block_text(b.section_path, b.normalized_text)
         for b in non_heading
@@ -914,7 +1099,7 @@ async def precompute_canonical_block_embeddings(
 
     if use_cache:
         for txt in unique_texts:
-            cached = get_cached_text_embedding(txt)
+            cached = get_cached_text_embedding(txt, model_signature=emb_sig)
             if cached is not None:
                 resolved_by_text[txt] = cached
                 cache_hits += 1
@@ -937,7 +1122,7 @@ async def precompute_canonical_block_embeddings(
             for txt, vec in zip(missing_texts, fetched_vecs, strict=True):
                 vec_f = [float(x) for x in vec]
                 if use_cache:
-                    put_cached_text_embedding(txt, vec_f)
+                    put_cached_text_embedding(txt, vec_f, model_signature=emb_sig)
                 resolved_by_text[txt] = vec_f
         pre_ledger.set_metadata(
             canonical_block_texts_count=len(unique_texts),
@@ -1014,6 +1199,7 @@ async def index_search_units_to_qdrant(
     _preload_est_tokens = 0
     use_cache = hasattr(embedder, "batch_generate")
     emb_model = getattr(embedder, "model", None) or getattr(settings, "embedding_model", None)
+    emb_sig = build_embedding_model_signature(embedder, settings_obj=settings)
 
     if block_vectors:
         resolved_vectors: dict[int, list[float]] = {}
@@ -1054,7 +1240,7 @@ async def index_search_units_to_qdrant(
                         [block_vectors[bid] for bid in body_ids],
                         weights,
                     )
-            elif use_cache and (cached_v := get_cached_text_embedding(ctx_t)) is not None:
+            elif use_cache and (cached_v := get_cached_text_embedding(ctx_t, model_signature=emb_sig)) is not None:
                 resolved_vectors[idx] = cached_v
                 cache_hits += 1
             else:
@@ -1076,7 +1262,7 @@ async def index_search_units_to_qdrant(
                     for idx, txt, vec in zip(fallback_indices, fallback_texts, fetched, strict=True):
                         vec_f = [float(x) for x in vec]
                         if use_cache:
-                            put_cached_text_embedding(txt, vec_f)
+                            put_cached_text_embedding(txt, vec_f, model_signature=emb_sig)
                         resolved_vectors[idx] = vec_f
             combined_ledger.merge_summary(extra_ledger.to_summary())
 
@@ -1096,7 +1282,11 @@ async def index_search_units_to_qdrant(
                     if blk.block_type == "heading" or not (blk.normalized_text or "").strip():
                         continue
                     bt = contextualize_block_text(blk.section_path, blk.normalized_text)
-                    if bt and bt not in seen_texts and get_cached_text_embedding(bt) is None:
+                    if (
+                        bt
+                        and bt not in seen_texts
+                        and get_cached_text_embedding(bt, model_signature=emb_sig) is None
+                    ):
                         seen_texts.add(bt)
                         extra_block_texts.append(bt)
                 _preload_block_count = len(extra_block_texts)
@@ -1104,13 +1294,13 @@ async def index_search_units_to_qdrant(
                 combined_batch = list(contextual_texts) + extra_block_texts
                 all_vectors = await compute_unit_embeddings(embedder, combined_batch)
                 for txt, vec in zip(combined_batch, all_vectors, strict=True):
-                    put_cached_text_embedding(txt, vec)
+                    put_cached_text_embedding(txt, vec, model_signature=emb_sig)
                 vectors = all_vectors[: len(contextual_texts)]
             else:
                 vectors = await compute_unit_embeddings(embedder, contextual_texts)
                 if use_cache:
                     for txt, vec in zip(contextual_texts, vectors, strict=True):
-                        put_cached_text_embedding(txt, vec)
+                        put_cached_text_embedding(txt, vec, model_signature=emb_sig)
         combined_ledger.merge_summary(direct_ledger.to_summary())
 
     combined_ledger.set_metadata(
@@ -1123,10 +1313,31 @@ async def index_search_units_to_qdrant(
         setattr(version, "_last_search_index_token_usage", combined_ledger.to_summary())
     except Exception:
         pass
-    vector_dim = len(vectors[0]) if vectors and len(vectors[0]) > 0 else 1536
+    if not vectors or not vectors[0] or len(vectors[0]) <= 0:
+        raise ValueError(
+            "Cannot index SearchUnits to Qdrant: embedding vectors are empty or zero-dimensional"
+        )
+    vector_dim = len(vectors[0])
+    if any(len(vec) != vector_dim for vec in vectors):
+        raise ValueError(
+            f"Cannot index SearchUnits to Qdrant: inconsistent vector dimensions (expected {vector_dim})"
+        )
 
-    # 1. Ensure collection exists and payload indexes are created
-    await ensure_qdrant_collection_and_indexes(qdrant_client, collection_name, vector_dim=vector_dim)
+    # 1. Ensure collection exists, model metadata matches, and payload indexes are created
+    emb_base_url = _attr_from_embedder_or_delegates(embedder, "base_url", "_base_url")
+    emb_sig_for_collection = build_embedding_model_signature(
+        embedder,
+        settings_obj=settings,
+        dimensions=vector_dim,
+    )
+    await ensure_qdrant_collection_and_indexes(
+        qdrant_client,
+        collection_name,
+        vector_dim=vector_dim,
+        embedding_signature=emb_sig_for_collection,
+        embedding_model=emb_model,
+        embedding_base_url=emb_base_url,
+    )
 
     # 2. Build points with both dense and sparse representations (Qdrant native IDF modifier handles IDF)
     points = []
@@ -1149,6 +1360,7 @@ async def index_search_units_to_qdrant(
             block_from_id=unit.block_from_id,
             block_to_id=unit.block_to_id,
             source_anchor=s_anchor,
+            embedding_model_signature=emb_sig_for_collection,
         )
         sparse_vec = compute_sparse_bm25_vector(
             ctx_text,

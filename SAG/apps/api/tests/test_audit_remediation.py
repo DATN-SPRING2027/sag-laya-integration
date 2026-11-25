@@ -694,9 +694,16 @@ async def test_canonical_pipeline_reuses_search_units_and_shared_embedding_cache
             )
         await session.commit()
 
-    # Pre-warm shared cache for one text and verify wrapper avoids network call for cached text
+    # Pre-warm shared cache for one text and verify wrapper avoids network call for cached text.
+    # Pass explicit model_signature matching Settings() per S3-01 universal cache key isolation.
+    from sag_api.services.search_index_service import build_embedding_model_signature
+
     cached_text = f"{METRIC_PARTITION_UNIVERSE_BLOCKS[0][0]}\n{METRIC_PARTITION_UNIVERSE_BLOCKS[0][1]}"
-    put_cached_text_embedding(cached_text, [0.25, 0.5, 0.75])
+    put_cached_text_embedding(
+        cached_text,
+        [0.25, 0.5, 0.75],
+        model_signature=build_embedding_model_signature(settings_obj=Settings()),
+    )
 
     api_calls: list[list[str]] = []
 

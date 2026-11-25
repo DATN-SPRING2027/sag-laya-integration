@@ -66,16 +66,19 @@ async def _embed_blocks(embed, non_heading_blocks: Sequence[tuple[str, str]]) ->
     metered = bool(getattr(embed, "_sag_token_metered_cache_wrapped", False))
     texts = [text for _, text in non_heading_blocks]
     if hasattr(embed, "batch_generate"):
+        from sag_api.core.config import settings as sag_settings
         from sag_api.services.search_index_service import (
+            build_embedding_model_signature,
             get_cached_text_embedding,
             put_cached_text_embedding,
         )
 
+        emb_sig = build_embedding_model_signature(embed, settings_obj=sag_settings)
         cached_by_idx: dict[int, list[float]] = {}
         missing_indices: list[int] = []
         missing_texts: list[str] = []
         for idx, t in enumerate(texts):
-            cached = get_cached_text_embedding(t)
+            cached = get_cached_text_embedding(t, model_signature=emb_sig)
             if cached is not None:
                 cached_by_idx[idx] = cached
             else:
@@ -93,7 +96,7 @@ async def _embed_blocks(embed, non_heading_blocks: Sequence[tuple[str, str]]) ->
                 )
             for idx, txt, vec in zip(missing_indices, missing_texts, fetched, strict=True):
                 vec_f = [float(v) for v in vec]
-                put_cached_text_embedding(txt, vec_f)
+                put_cached_text_embedding(txt, vec_f, model_signature=emb_sig)
                 cached_by_idx[idx] = vec_f
         vecs = [cached_by_idx[i] for i in range(len(texts))]
     elif hasattr(embed, "generate"):

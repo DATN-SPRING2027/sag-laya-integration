@@ -467,6 +467,9 @@ async def ensure_session_qdrant_collection(
     Because `session_units_{project_id}` is 100% derived from raw PostgreSQL `messages`,
     any embedding dimension change safely recreates the derived collection.
     """
+    if vector_dim is None or isinstance(vector_dim, bool) or int(vector_dim) <= 0:
+        raise ValueError(f"Session Qdrant collection requires positive vector_dim, got {vector_dim!r}")
+    vector_dim = int(vector_dim)
     collection_name = session_qdrant_collection_name(project_id)
     transport = getattr(qdrant_client, "_transport", None)
     transport_tag = (
@@ -591,7 +594,9 @@ async def upsert_session_units_to_qdrant(
     if not items:
         return 0
     first_vec = items[0][1]
-    vector_dim = len(first_vec) if first_vec else FALLBACK_VECTOR_DIM
+    if not first_vec or len(first_vec) <= 0:
+        raise ValueError("Cannot upsert session units to Qdrant without positive-dimension vectors")
+    vector_dim = len(first_vec)
     collection_name = await ensure_session_qdrant_collection(
         qdrant_client,
         project_id=project_id,
@@ -2475,8 +2480,11 @@ async def _reconstruct_prefix_into_index(
             s_start = max(0, int(s_meta.get("start", 0)))
             s_end = min(len(content), max(s_start, int(s_meta.get("end", len(content)))))
             s_text = content[s_start:s_end].strip() or content
+            from sag_api.services.search_index_service import build_embedding_model_signature
+
+            cache_s_sig = build_embedding_model_signature(embedder) if embedder is not None else ""
             cached_s_vec = (
-                get_cached_text_embedding(s_text, model_signature=target_mode)
+                get_cached_text_embedding(s_text, model_signature=cache_s_sig)
                 if embedder is not None
                 else None
             )
@@ -2765,10 +2773,13 @@ async def _hydrate_ancestor_segments_as_of(
                     c_norm = normalize_session_text(str(seg_records[idx_i]["content"]))
                     anc_vecs[u_row.id] = deterministic_ngram_vector(c_norm)
             else:
+                from sag_api.services.search_index_service import build_embedding_model_signature
+
+                cache_anc_sig = build_embedding_model_signature(embedder)
                 missing_anc: list[tuple[SessionUnit, str]] = []
                 for idx_i, u_row in enumerate(usable_units):
                     c_norm = normalize_session_text(str(seg_records[idx_i]["content"]))
-                    cached_vec = get_cached_text_embedding(c_norm, model_signature=embedding_sig)
+                    cached_vec = get_cached_text_embedding(c_norm, model_signature=cache_anc_sig)
                     if (
                         cached_vec is not None
                         and len(cached_vec) > 0
@@ -2797,7 +2808,7 @@ async def _hydrate_ancestor_segments_as_of(
                                     put_cached_text_embedding(
                                         c_norm,
                                         q_vec,
-                                        model_signature=embedding_sig,
+                                        model_signature=cache_anc_sig,
                                     )
                         except Exception as q_exc:  # noqa: BLE001
                             log.warning(
@@ -3047,10 +3058,13 @@ async def hydrate_or_backfill_cold_session_index(
             content_norm = normalize_session_text(str(project_records[idx_i]["content"]))
             hydrated_vectors[u_row.id] = deterministic_ngram_vector(content_norm)
     else:
+        from sag_api.services.search_index_service import build_embedding_model_signature
+
+        cache_hyd_sig = build_embedding_model_signature(embedder)
         missing_units: list[tuple[SessionUnit, str]] = []
         for idx_i, u_row in enumerate(persisted_turn_units):
             content_norm = normalize_session_text(str(project_records[idx_i]["content"]))
-            cached_vec = get_cached_text_embedding(content_norm, model_signature=embedding_sig)
+            cached_vec = get_cached_text_embedding(content_norm, model_signature=cache_hyd_sig)
             if (
                 cached_vec is not None
                 and len(cached_vec) > 0
@@ -3079,7 +3093,7 @@ async def hydrate_or_backfill_cold_session_index(
                             put_cached_text_embedding(
                                 content_norm,
                                 q_vec,
-                                model_signature=embedding_sig,
+                                model_signature=cache_hyd_sig,
                             )
                         else:
                             qdrant_missing_during_hydration = True

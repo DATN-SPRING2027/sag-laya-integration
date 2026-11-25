@@ -570,16 +570,28 @@ def record_embedding_cache_hit(
     )
 
 
-def wrap_embedding_client_with_cache_and_metering(emb: Any, *, default_model: str | None = None) -> None:
+def wrap_embedding_client_with_cache_and_metering(
+    emb: Any,
+    *,
+    default_model: str | None = None,
+    settings_obj: Any | None = None,
+    model_signature: str | None = None,
+) -> None:
     """Idempotently attach shared text-embedding cache and exact provider token metering."""
     if emb is None or getattr(emb, "_sag_token_metered_cache_wrapped", False):
         return
     from sag_api.services.search_index_service import (
+        build_embedding_model_signature,
         get_cached_text_embedding,
         put_cached_text_embedding,
     )
 
     emb_model = getattr(emb, "model", None) or default_model
+    emb_sig = (
+        model_signature.strip()
+        if isinstance(model_signature, str) and model_signature.strip()
+        else build_embedding_model_signature(emb, settings_obj=settings_obj, model=emb_model)
+    )
     raw_client = emb if hasattr(emb, "_create_embeddings") else None
     if raw_client is None:
         for attr_name in ("inner", "_inner", "client", "_client", "_delegate"):
@@ -610,7 +622,7 @@ def wrap_embedding_client_with_cache_and_metering(emb: Any, *, default_model: st
     emb._sag_orig_batch_generate = orig_batch_generate
 
     async def _cached_generate(text: str) -> list[float]:
-        cached = get_cached_text_embedding(text)
+        cached = get_cached_text_embedding(text, model_signature=emb_sig)
         if cached is not None:
             record_embedding_cache_hit(model=emb_model, count=1)
             return cached
@@ -621,7 +633,7 @@ def wrap_embedding_client_with_cache_and_metering(emb: Any, *, default_model: st
                 usage=extract_embedding_usage(None, text),
             )
         if vec:
-            put_cached_text_embedding(text, vec)
+            put_cached_text_embedding(text, vec, model_signature=emb_sig)
         return vec
 
     async def _cached_batch_generate(texts: list[str]) -> list[list[float]]:
@@ -631,7 +643,7 @@ def wrap_embedding_client_with_cache_and_metering(emb: Any, *, default_model: st
         missing_by_text: dict[str, list[int]] = {}
         cache_hits = 0
         for idx, txt in enumerate(texts):
-            cached = get_cached_text_embedding(txt)
+            cached = get_cached_text_embedding(txt, model_signature=emb_sig)
             if cached is not None:
                 results[idx] = cached
                 cache_hits += 1
@@ -649,7 +661,7 @@ def wrap_embedding_client_with_cache_and_metering(emb: Any, *, default_model: st
                 )
             for txt, vec in zip(unique_missing, fetched, strict=True):
                 if vec:
-                    put_cached_text_embedding(txt, vec)
+                    put_cached_text_embedding(txt, vec, model_signature=emb_sig)
                 for m_idx in missing_by_text[txt]:
                     results[m_idx] = vec
         return [vec or [] for vec in results]

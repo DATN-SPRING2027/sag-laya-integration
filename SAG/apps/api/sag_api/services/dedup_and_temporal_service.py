@@ -1009,18 +1009,23 @@ async def run_dedup_and_temporal_stage(
         block_embeddings: dict[str, list[float]] = {}
         if embedder is None:
             try:
-                from sag_api.services.search_index_service import get_cached_text_embedding
+                from sag_api.core.config import settings as sag_settings
+                from sag_api.services.search_index_service import (
+                    build_embedding_model_signature,
+                    get_cached_text_embedding,
+                )
 
+                emb_sig = build_embedding_model_signature(None, settings_obj=sag_settings)
                 curr_cached = {
                     b.id: vec
                     for b in curr_blocks
-                    if (vec := get_cached_text_embedding(b.normalized_text)) is not None
+                    if (vec := get_cached_text_embedding(b.normalized_text, model_signature=emb_sig)) is not None
                 }
                 if curr_cached:
                     prior_cached = {
                         pb.id: vec
                         for pb in prior_blocks
-                        if (vec := get_cached_text_embedding(pb.normalized_text)) is not None
+                        if (vec := get_cached_text_embedding(pb.normalized_text, model_signature=emb_sig)) is not None
                     }
                     if prior_cached:
                         block_embeddings.update(curr_cached)
@@ -1029,11 +1034,14 @@ async def run_dedup_and_temporal_stage(
                 pass
         else:
             try:
+                from sag_api.core.config import settings as sag_settings
                 from sag_api.services.search_index_service import (
+                    build_embedding_model_signature,
                     get_cached_text_embedding,
                     put_cached_text_embedding,
                 )
 
+                emb_sig = build_embedding_model_signature(embedder, settings_obj=sag_settings)
                 texts_to_embed = [b.normalized_text for b in curr_blocks] + [pb.normalized_text for pb in prior_blocks]
                 ids_to_embed = [b.id for b in curr_blocks] + [pb.id for pb in prior_blocks]
                 if texts_to_embed:
@@ -1042,7 +1050,7 @@ async def run_dedup_and_temporal_stage(
                         missing_indices: list[int] = []
                         missing_texts: list[str] = []
                         for idx, txt in enumerate(texts_to_embed):
-                            cached = get_cached_text_embedding(txt)
+                            cached = get_cached_text_embedding(txt, model_signature=emb_sig)
                             if cached is not None:
                                 vecs_by_idx[idx] = cached
                             else:
@@ -1052,7 +1060,7 @@ async def run_dedup_and_temporal_stage(
                             fetched = await embedder.batch_generate(missing_texts)
                             for m_idx, txt, vec in zip(missing_indices, missing_texts, fetched, strict=False):
                                 if vec:
-                                    put_cached_text_embedding(txt, vec)
+                                    put_cached_text_embedding(txt, vec, model_signature=emb_sig)
                                 vecs_by_idx[m_idx] = vec
                         vecs = [vecs_by_idx.get(i, []) for i in range(len(texts_to_embed))]
                     elif hasattr(embedder, "generate"):

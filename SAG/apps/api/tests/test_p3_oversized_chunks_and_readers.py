@@ -355,7 +355,11 @@ async def test_index_search_units_to_qdrant_rehydrated_fallback_uses_slices(p3_r
             blocks_by_id={b.id: b for b in blocks},
         )
         assert count == len(rehydrated_units)
-        by_id = {pt["payload"]["search_unit_id"]: pt["payload"] for pt in upserted_points}
+        by_id = {
+            pt["payload"]["search_unit_id"]: pt["payload"]
+            for pt in upserted_points
+            if not pt.get("payload", {}).get("_collection_meta")
+        }
         for u in rehydrated_units:
             payload = by_id[str(u.id)]
             assert hashlib.sha256(payload["content"].encode("utf-8")).hexdigest() == u.content_hash

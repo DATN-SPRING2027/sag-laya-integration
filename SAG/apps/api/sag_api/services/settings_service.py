@@ -18,7 +18,7 @@ from sag_api.core.config import settings as _settings
 from sag_api.core.errors import ConfigurationError, ConflictError
 from sag_api.core.logging import get_logger
 from sag_api.core.model_providers import get_model_provider
-from sag_api.db.models import Document, Setting
+from sag_api.db.models import Document, DocumentVersion, SearchUnit, Setting
 from sag_api.enums import SEARCH_STRATEGIES, normalize_search_strategy
 
 _SCOPE = "global"
@@ -127,19 +127,41 @@ async def _load_row(session: AsyncSession, key: str = _KEY) -> Setting | None:
     return await session.scalar(select(Setting).where(Setting.scope == _SCOPE, Setting.key == key))
 
 
-def _embedding_identity(settings: Settings, patch: dict) -> tuple[str, int]:
-    model = str(patch.get("embedding_model", settings.embedding_model))
-    dimensions = patch.get("embedding_dimensions", settings.embedding_dimensions)
-    return model, int(dimensions or 1024)
+def _normalized_embedding_base_url(raw: object) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    mapped = _LEGACY_302_BASE_URLS.get(value.rstrip("/"), value)
+    return mapped.strip().rstrip("/").lower()
+
+
+def _embedding_identity(settings: Settings, patch: dict) -> tuple[str, str, int]:
+    from sag_api.services.search_index_service import resolve_embedding_dimensions
+
+    model = str(patch.get("embedding_model", settings.embedding_model) or "").strip()
+    base_url = _normalized_embedding_base_url(
+        patch.get("embedding_base_url", settings.embedding_base_url)
+    )
+    raw_dim = patch.get("embedding_dimensions", settings.embedding_dimensions)
+    if raw_dim == "":
+        raw_dim = None
+    dimensions = resolve_embedding_dimensions(model, raw_dim)
+    return base_url, model, dimensions
 
 
 async def _reject_incompatible_embedding_change(
     session: AsyncSession,
     patch: dict,
 ) -> None:
-    if _embedding_identity(_settings, patch) == _embedding_identity(_settings, {}):
+    if not ({"embedding_model", "embedding_base_url", "embedding_dimensions"} & patch.keys()):
         return
-    indexed_document_id = await session.scalar(
+    try:
+        new_identity = _embedding_identity(_settings, patch)
+    except ValueError as err:
+        raise ConfigurationError(str(err)) from err
+    if new_identity == _embedding_identity(_settings, {}):
+        return
+    has_legacy_indexed = await session.scalar(
         select(Document.id)
         .where(
             Document.is_active.is_(True),
@@ -147,9 +169,23 @@ async def _reject_incompatible_embedding_change(
         )
         .limit(1)
     )
-    if indexed_document_id is not None:
+    has_ready_version = await session.scalar(
+        select(DocumentVersion.id)
+        .join(Document, Document.id == DocumentVersion.document_id)
+        .where(
+            Document.is_active.is_(True),
+            DocumentVersion.search_status.in_(("SEARCH_READY", "READY")),
+        )
+        .limit(1)
+    )
+    has_search_unit = await session.scalar(select(SearchUnit.id).limit(1))
+    if (
+        has_legacy_indexed is not None
+        or has_ready_version is not None
+        or has_search_unit is not None
+    ):
         raise ConflictError(
-            "当前知识库已有入库文档，更换 Embedding 模型或维度会导致现有向量失效；"
+            "当前知识库已有入库文档，更换 Embedding 模型、端点或维度会导致现有向量失效；"
             "请先清理并重新入库文档，或等待向量重建功能。"
         )
 
