@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 
 from fastapi import APIRouter, Depends
@@ -66,6 +67,30 @@ def _split_query(messages: list[ChatMessage]) -> tuple[str, list[dict[str, str]]
     return query, history
 
 
+_COMPLETE_CITATION_BRACKET_RE = re.compile(
+    r"[ \t]*\[\s*[sS]?\d+(?:\s*[,;、]\s*[sS]?\d+)*\s*\]"
+)
+_INCOMPLETE_CITATION_TAIL_RE = re.compile(
+    r"[ \t]*\[\s*(?:(?:[sS]?\d+(?:\s*[,;、]\s*[sS]?\d+)*\s*[,;、]\s*[sS]?)|(?:[sS]?\d*)|[sS])?\s*$"
+)
+
+
+def _split_unbuffered_citation_tail(text: str) -> tuple[str, str]:
+    """Hold syntactic citation brackets (or incomplete prefixes) until RUN_COMPLETED resolves them."""
+    if not text:
+        return "", ""
+    complete_match = _COMPLETE_CITATION_BRACKET_RE.search(text)
+    if complete_match:
+        return text[: complete_match.start()], text[complete_match.start() :]
+    incomplete_match = _INCOMPLETE_CITATION_TAIL_RE.search(text)
+    if incomplete_match:
+        return text[: incomplete_match.start()], text[incomplete_match.start() :]
+    stripped = text.rstrip(" \t")
+    if len(stripped) < len(text):
+        return stripped, text[len(stripped) :]
+    return text, ""
+
+
 @router.post("/{agent_id}/chat/completions")
 async def chat_completions(
     agent_id: str,
@@ -111,6 +136,7 @@ async def chat_completions(
         async def gen():
             streamed_parts: list[str] = []
             buffered_parts: list[str] = []
+            pending_bracket = ""
             should_buffer = bool(plan.citations or plan.session_citations)
             errored = False
 
@@ -130,9 +156,15 @@ async def chat_completions(
                 if event.type == EventType.RUN_STARTED.value:
                     if payload.get("grounding_required"):
                         should_buffer = True
+                        if pending_bracket:
+                            buffered_parts.append(pending_bracket)
+                            pending_bracket = ""
                 elif event.type == EventType.TOOL_STARTED.value:
                     if payload.get("name") in {"search_context", "get_entity"}:
                         should_buffer = True
+                        if pending_bracket:
+                            buffered_parts.append(pending_bracket)
+                            pending_bracket = ""
                 elif event.type == EventType.MESSAGE_DELTA.value:
                     delta = str(payload.get("delta") or "")
                     if not delta:
@@ -140,11 +172,19 @@ async def chat_completions(
                     if should_buffer:
                         buffered_parts.append(delta)
                     else:
-                        streamed_parts.append(delta)
-                        yield chunk({"content": delta})
+                        if pending_bracket and _COMPLETE_CITATION_BRACKET_RE.search(pending_bracket):
+                            pending_bracket += delta
+                        else:
+                            flush_text, pending_bracket = _split_unbuffered_citation_tail(
+                                pending_bracket + delta
+                            )
+                            if flush_text:
+                                streamed_parts.append(flush_text)
+                                yield chunk({"content": flush_text})
                 elif event.type == EventType.RUN_COMPLETED.value:
                     canonical = str(payload.get("output") or "")
                     streamed = "".join(streamed_parts)
+                    pending_bracket = ""
                     if should_buffer:
                         if canonical:
                             yield chunk({"content": canonical})
@@ -153,6 +193,7 @@ async def chat_completions(
                         if suffix:
                             yield chunk({"content": suffix})
                 elif event.type in (EventType.RUN_FAILED.value, EventType.RUN_CANCELLED.value):
+                    pending_bracket = ""
                     error = payload.get("error") or {}
                     err_msg = str(error.get("message") or "Generation failed")
                     err_code = str(error.get("code") or "stream_error")
@@ -184,11 +225,18 @@ async def chat_completions(
     parts: list[str] = []
     final_output = ""
     completed_seen = False
+    grounding_active = bool(plan.citations or plan.session_citations)
     citations = plan.citations
     usage: dict = {}
     async for event in _events():
         payload = event.data.get("payload") or {}
-        if event.type == EventType.MESSAGE_DELTA.value:
+        if event.type == EventType.RUN_STARTED.value:
+            if payload.get("grounding_required"):
+                grounding_active = True
+        elif event.type == EventType.TOOL_STARTED.value:
+            if payload.get("name") in {"search_context", "get_entity"}:
+                grounding_active = True
+        elif event.type == EventType.MESSAGE_DELTA.value:
             parts.append(payload["delta"])
         elif event.type == EventType.RUN_COMPLETED.value:
             completed_seen = True
@@ -209,7 +257,11 @@ async def chat_completions(
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": final_output if completed_seen else "".join(parts),
+                    "content": (
+                        final_output
+                        if completed_seen
+                        else ("" if grounding_active else "".join(parts))
+                    ),
                 },
                 "finish_reason": "stop",
             }
