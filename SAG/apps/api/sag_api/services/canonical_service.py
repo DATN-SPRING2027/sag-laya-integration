@@ -72,10 +72,11 @@ async def persist_canonical_blocks(
             block_type=b.block_type,
             page_from=b.page_from,
             page_to=b.page_to,
-            section_path=b.section_path,
+            section_path=(b.section_path or "")[:512],
             source_anchor=b.source_anchor,
             normalized_text=b.normalized_text,
             content_hash=b.content_hash,
+            is_boilerplate=bool(b.is_boilerplate),
         )
         session.add(db_block)
         db_blocks.append(db_block)

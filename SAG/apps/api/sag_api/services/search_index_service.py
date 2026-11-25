@@ -715,8 +715,10 @@ def build_search_units_from_blocks(
     from sag_api.parsing.canonical import _split_atomic_spans, estimate_unicode_tokens
 
     units: list[SearchUnit] = []
-    if not blocks:
+    filtered_blocks = [b for b in blocks if not bool(getattr(b, "is_boilerplate", False))]
+    if not filtered_blocks:
         return units
+    has_body_blocks = any(b.block_type != "heading" for b in filtered_blocks)
 
     def _emit_group(group: Sequence[CanonicalBlock], *, is_subblock_split: bool = False) -> None:
         if not group:
@@ -859,7 +861,8 @@ def build_search_units_from_blocks(
         if not lead_headings and not section_body:
             return
         if not section_body:
-            _emit_group(lead_headings)
+            if not has_body_blocks:
+                _emit_group(lead_headings)
             lead_headings = []
             return
 
@@ -878,28 +881,31 @@ def build_search_units_from_blocks(
                 seg_tok_sum = sum(body_toks[a:b])
                 if (lead_toks + seg_tok_sum) <= max_tokens_per_unit:
                     seg_blocks = [*lead_headings, *seg_blocks]
-                else:
-                    _emit_group(lead_headings)
             _emit_group(seg_blocks)
         lead_headings = []
         section_body = []
 
-    for block in blocks:
+    for block in filtered_blocks:
         block_tokens = max(1, estimate_unicode_tokens(block.normalized_text))
         if block.block_type == "heading":
             if section_body:
                 _flush_section()
             if block_tokens > max_tokens_per_unit:
-                if lead_headings:
-                    _emit_group(lead_headings)
-                    lead_headings = []
-                _emit_oversized_block(block)
+                if not has_body_blocks:
+                    if lead_headings:
+                        _emit_group(lead_headings)
+                        lead_headings = []
+                    _emit_oversized_block(block)
             else:
                 lead_headings.append(block)
             continue
 
         if block_tokens > max_tokens_per_unit:
-            _flush_section()
+            if section_body:
+                _flush_section()
+            else:
+                # Section heading is already attached via block.section_path; never emit a heading-only unit.
+                lead_headings = []
             _emit_oversized_block(block)
             continue
 

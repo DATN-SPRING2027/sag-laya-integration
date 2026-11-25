@@ -944,10 +944,11 @@ def test_symmetric_structural_diff_eliminates_false_positives_and_classifies_qua
     assert detect_semantic_signals("TLS 1.3 is not enabled.", "TLS 1.3 is disabled.") == (False, False, False)
     assert detect_semantic_signals("Caching can't be used.", "Caching cannot be used.") == (False, False, False)
 
-    # 4. Thousand-separator formatting difference ("1,000" == "1000") must NOT trigger conflict
+    # 4. Multi-group thousand-separator formatting ("1,000,000" == "1000000") must NOT trigger conflict,
+    # whereas P4 removes single-comma _THOUSANDS_COMMA_RE so Vietnamese decimal "1,500" (=1.5) stays distinct.
     assert detect_semantic_signals(
-        "Rate limit is 1,000 requests per minute.",
-        "Rate limit is 1000 requests per minute.",
+        "Rate limit is 1,000,000 requests per minute.",
+        "Rate limit is 1000000 requests per minute.",
     ) == (False, False, False)
 
     # 5. Quantitative/threshold replacement: SUPERSEDES on same_document=True, CONTRADICTS on cross-document

@@ -150,6 +150,8 @@ class _ReadyVersion:
     ingestion_run_id: str = ""
     index_stage_run_id: str = ""
     search_manifest_checksum: str = ""
+    valid_to: datetime | None = None
+    is_superseded: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,6 +282,7 @@ async def _load_current_ready_versions(
     principal: VerifiedPrincipal,
     *,
     version_ids: set[str] | list[str] | tuple[str, ...] | None = None,
+    include_superseded: bool = False,
 ) -> dict[str, _ReadyVersion]:
     try:
         return await _load_current_ready_versions_checked(
@@ -287,6 +290,7 @@ async def _load_current_ready_versions(
             sources,
             principal,
             version_ids=version_ids,
+            include_superseded=include_superseded,
         )
     except SQLAlchemyError as error:
         log.warning("canonical scope lookup unavailable error_type=%s", type(error).__name__)
@@ -329,6 +333,7 @@ async def _load_current_ready_versions_checked(
     principal: VerifiedPrincipal,
     *,
     version_ids: set[str] | list[str] | tuple[str, ...] | None = None,
+    include_superseded: bool = False,
 ) -> dict[str, _ReadyVersion]:
     """Recheck mappings and collect only versions from each version's latest verified attempt."""
     if not sources or not principal.tenant_id or not principal.allowed_partition_ids:
@@ -356,6 +361,7 @@ async def _load_current_ready_versions_checked(
         await session.execute(
             select(
                 DocumentVersion.id.label("document_version_id"),
+                DocumentVersion.valid_to.label("valid_to"),
                 Document.source_id,
                 Document.project_id,
                 Document.tenant_id,
@@ -386,7 +392,7 @@ async def _load_current_ready_versions_checked(
                 DocumentVersion.search_status.in_(("READY", "SEARCH_READY")),
                 DocumentVersion.valid_from <= current_time,
                 DocumentVersion.search_ready_at.is_not(None),
-                DocumentVersion.valid_to > current_time,
+                True if include_superseded else (DocumentVersion.valid_to > current_time),
                 partition_expression.in_(partition_ids),
                 unit_exists_clause,
             )
@@ -457,6 +463,11 @@ async def _load_current_ready_versions_checked(
             or not _verified_manifest(stage.metrics_json, project_id=str(row.project_id))
         ):
             continue
+        row_valid_to = getattr(row, "valid_to", None)
+        is_sup = False
+        if isinstance(row_valid_to, datetime):
+            vt_utc = row_valid_to.replace(tzinfo=UTC) if row_valid_to.tzinfo is None else row_valid_to.astimezone(UTC)
+            is_sup = vt_utc <= current_time
         versions[version_id] = _ReadyVersion(
             document_version_id=version_id,
             source_id=str(row.source_id),
@@ -468,6 +479,8 @@ async def _load_current_ready_versions_checked(
             index_stage_run_id=str(stage.id),
             search_manifest_checksum=str(stage.metrics_json["manifest_checksum"]),
             source=source,
+            valid_to=row_valid_to,
+            is_superseded=is_sup,
         )
     return versions
 
@@ -1502,6 +1515,8 @@ async def _ensure_versions_hydrated(
             page_from=int(unit.page_from),
             page_to=int(unit.page_to),
             anchor=anchor.strip(),
+            valid_to=ver.valid_to,
+            is_superseded=ver.is_superseded,
         )
         k_index.hydrated_su_by_version[v_id_str].append((sec_template, int(s_ord), int(e_ord)))
 
@@ -2014,9 +2029,10 @@ async def _retrieve_search_unit_sections(
     """Query only currently authorized versions with a verified Phase 2C manifest."""
     import unicodedata
 
-    from sag_api.services.retrieval_service import rerank_sections
+    from sag_api.services.retrieval_service import _query_allows_superseded, rerank_sections
 
-    query = unicodedata.normalize("NFC", query or "")
+    query = normalize_text(query or "")
+    allows_superseded = _query_allows_superseded(query)
     requested_limit = min(top_k, settings.search_unit_candidate_limit) if top_k is not None else candidate_limit
     selection_limit = requested_limit if top_k is not None else None
     strategy_plan = query_strategy_plan or plan_query(query, requested_top_k=top_k)
@@ -2054,7 +2070,15 @@ async def _retrieve_search_unit_sections(
     try:
         async with asyncio.timeout_at(deadline):
             async with SessionLocal() as session:
-                ready_versions = await _load_current_ready_versions(session, sources, principal)
+                try:
+                    ready_versions = await _load_current_ready_versions(
+                        session,
+                        sources,
+                        principal,
+                        include_superseded=allows_superseded,
+                    )
+                except TypeError:
+                    ready_versions = await _load_current_ready_versions(session, sources, principal)
     except TimeoutError as error:
         log.warning("canonical search authorization exceeded query budget")
         raise ServiceUnavailableError("Canonical search exceeded the query budget") from error
@@ -2482,6 +2506,7 @@ async def _retrieve_search_unit_sections(
                         sources,
                         principal,
                         version_ids=candidate_version_ids,
+                        include_superseded=allows_superseded,
                     )
                     current_versions = {
                         vid: ver
@@ -2566,6 +2591,8 @@ async def _retrieve_search_unit_sections(
                 "project_id": version.project_id,
                 "tenant_id": version.tenant_id,
                 "security_partition_id": version.partition_id,
+                "valid_to": version.valid_to,
+                "is_superseded": version.is_superseded,
             },
         )
 

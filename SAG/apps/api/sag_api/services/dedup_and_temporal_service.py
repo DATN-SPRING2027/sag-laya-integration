@@ -31,7 +31,6 @@ from sag_api.db.models.document import Document
 from sag_api.db.models.routing_rag import (
     CanonicalBlock,
     DocumentVersion,
-    KnowledgeGraphEdge,
     StageRun,
 )
 
@@ -193,18 +192,19 @@ def compute_text_similarity(text1: str, text2: str) -> float:
 # ---------------------------------------------------------------------------
 # Pillar 3: Symmetric Structural Diff (Delta) for Relation Classification
 # ---------------------------------------------------------------------------
-_THOUSANDS_COMMA_RE = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
+# Multi-group thousands separator only (e.g. 1,000,000 -> 1000000); never corrupt single-comma decimals like 1,500.
+_MULTI_GROUP_THOUSANDS_RE = re.compile(r"\b\d{1,3}(?:,\d{3}){2,}\b")
 _EN_WON_T_RE = re.compile(r"\bwon['’]t\b")
 _EN_CAN_T_RE = re.compile(r"\b(?:can['’]t|cannot)\b")
 _EN_N_T_RE = re.compile(r"\b(\w+?)n['’]t\b")
 _DIFF_TOKEN_RE = re.compile(
     r"v\d+(?:\.\d+)+"
-    r"|\d+(?:[./:-]\d+)+%?"
+    r"|\d+(?:[.,/:-]\d+)+%?"
     r"|\d+(?:\.\d+)?%?"
     r"|[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u0e00-\u0eff\u1780-\u17ff\u1000-\u109f]"
     r"|\w+"
 )
-_QUANT_TOKEN_RE = re.compile(r"^(?:v\d+(?:\.\d+)+|\d+(?:[./:-]\d+)*%?)$")
+_QUANT_TOKEN_RE = re.compile(r"^(?:v\d+(?:\.\d+)+|\d+(?:[.,/:-]\d+)*%?)$")
 
 _SCALE_UNITS: dict[str, str] = {
     "b": "b", "bytes": "b", "byte": "b",
@@ -301,7 +301,10 @@ _LIFECYCLE_SUPERSEDE_JOINED: frozenset[str] = frozenset({
 
 
 def _tokenize_for_diff(text: str) -> list[str]:
-    norm = _THOUSANDS_COMMA_RE.sub("", normalize_text(text).casefold())
+    norm = _MULTI_GROUP_THOUSANDS_RE.sub(
+        lambda m: m.group(0).replace(",", ""),
+        normalize_text(text).casefold(),
+    )
     norm = _EN_WON_T_RE.sub("will not", norm)
     norm = _EN_CAN_T_RE.sub("can not", norm)
     norm = _EN_N_T_RE.sub(r"\1 not", norm)
@@ -410,7 +413,6 @@ def detect_semantic_signals(
         return False, False, False
 
     is_contradiction = False
-    is_support = False
     is_supersede = False
 
     matcher = difflib.SequenceMatcher(None, toks1, toks2, autojunk=False)
@@ -448,7 +450,7 @@ def detect_semantic_signals(
         if _hunk_has_lifecycle_supersede(h1, h2):
             is_supersede = True
 
-    return is_contradiction, is_support, is_supersede
+    return is_contradiction, False, is_supersede
 
 
 # ---------------------------------------------------------------------------
@@ -624,49 +626,7 @@ def classify_relation_candidate(
         return RELATION_SUPPORTS
     if sim_score >= 0.85:
         return RELATION_EQUIVALENT
-    if sim_score >= 0.50:
-        return RELATION_RELATED
     return RELATION_RELATED
-
-
-async def register_relation_candidate(
-    session: AsyncSession,
-    *,
-    project_id: str,
-    source_unit_id: str,
-    target_unit_id: str,
-    edge_type: str,
-    weight: float,
-    evidence_mapping: dict[str, Any] | None = None,
-) -> KnowledgeGraphEdge:
-    """Record a semantic edge candidate.
-
-    Enforces that CONTRADICTS and SUPERSEDES relations remain isolated candidates
-    with provenance evidence, without destructive auto-merge.
-    """
-    if edge_type not in VALID_RELATIONS:
-        raise ValueError(f"Invalid relation type: {edge_type}. Must be one of {VALID_RELATIONS}")
-
-    metadata = evidence_mapping or {}
-    metadata.setdefault("is_candidate", True)
-    metadata.setdefault("auto_merged", False)
-
-    # In case of CONTRADICTS / SUPERSEDES, record strict audit trail
-    if edge_type in {RELATION_CONTRADICTS, RELATION_SUPERSEDES}:
-        metadata["requires_human_or_eval_resolution"] = True
-
-    edge = KnowledgeGraphEdge(
-        id=str(uuid.uuid4()),
-        project_id=project_id,
-        source_unit_id=source_unit_id,
-        target_unit_id=target_unit_id,
-        edge_type=edge_type,
-        weight=weight,
-        calibrated_weight=weight,
-        metadata_json=metadata,
-    )
-    session.add(edge)
-    return edge
 
 
 async def resolve_temporal_supersedes(
@@ -994,6 +954,7 @@ async def run_dedup_and_temporal_stage(
                 Document.is_active.is_(True),
                 DocumentVersion.status != "FAILED",
                 DocumentVersion.search_status != "FAILED",
+                DocumentVersion.valid_from <= start_time,
                 DocumentVersion.valid_to > start_time,
             )
         )

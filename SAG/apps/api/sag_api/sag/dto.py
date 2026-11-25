@@ -36,6 +36,8 @@ class RetrievedSection(BaseModel):
     page_from: int | None = None
     page_to: int | None = None
     anchor: str | None = None
+    valid_to: datetime | None = None
+    is_superseded: bool = False
 
     @classmethod
     def from_section(cls, s: Any) -> RetrievedSection:

@@ -10,6 +10,7 @@ import time
 import unicodedata
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from sag_api.core.config import FIXED_SEARCH_TOP_K, settings
@@ -490,12 +491,12 @@ def _compute_document_aware_effective_ranks(
 
 
 def _is_boilerplate(section: RetrievedSection) -> bool:
-    text = unicodedata.normalize("NFC", f"{section.heading}\n{section.content}").lower()
+    text = normalize_text(f"{section.heading}\n{section.content}").lower()
     return sum(marker in text for marker in _BOILERPLATE) >= 2
 
 
 def _query_allows_superseded(query: str) -> bool:
-    query_lower = unicodedata.normalize("NFC", query or "").lower()
+    query_lower = normalize_text(query or "").lower()
     return any(
         cue in query_lower
         for cue in (
@@ -515,7 +516,16 @@ def _query_allows_superseded(query: str) -> bool:
 
 
 def _is_superseded_section(sec: RetrievedSection) -> bool:
-    meta = f"{sec.document_name or ''}\n{sec.section_path or ''}\n{sec.heading or ''}".lower()
+    if bool(getattr(sec, "is_superseded", False)):
+        return True
+    valid_to = getattr(sec, "valid_to", None)
+    if isinstance(valid_to, datetime):
+        vt_utc = valid_to.replace(tzinfo=UTC) if valid_to.tzinfo is None else valid_to.astimezone(UTC)
+        if vt_utc <= datetime.now(UTC):
+            return True
+    meta = normalize_text(
+        f"{sec.document_name or ''}\n{sec.section_path or ''}\n{sec.heading or ''}"
+    ).lower()
     if any(
         marker in meta
         for marker in (
@@ -529,7 +539,7 @@ def _is_superseded_section(sec: RetrievedSection) -> bool:
         )
     ):
         return True
-    body = (sec.content or "").lower()
+    body = normalize_text(sec.content or "", preserve_code=True).lower()
     body_norm = normalize_lexical_text(body)
     return (
         'status: "superseded"' in body
@@ -881,9 +891,7 @@ def rerank_sections(
         )
 
     if not _query_allows_superseded(query) and ranked:
-        active_ranked = [item for item in ranked if not _is_superseded_section(item[5])]
-        if active_ranked:
-            ranked = active_ranked
+        ranked = [item for item in ranked if not _is_superseded_section(item[5])]
 
     ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3], item[4]))
     selected = [
