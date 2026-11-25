@@ -292,8 +292,11 @@ def test_minhash_optimization_preserves_all_permutations():
         ["thần", "kinh", "tri", "thức", "não", "bộ"],
         [str(rng.randrange(100)) for _ in range(500)],
     ):
-        k = min(5, len(tokens))
-        shingles = {" ".join(tokens[i : i + k]) for i in range(len(tokens) - k + 1)} if tokens else set()
+        shingles = (
+            set(tokens)
+            if len(tokens) < 5
+            else {" ".join(tokens[i : i + 5]) for i in range(len(tokens) - 4)}
+        ) if tokens else set()
         expected = [
             min((int(hashlib.md5(f"{i}:{s}".encode()).hexdigest()[:8], 16) for s in shingles), default=0)
             for i in range(128)

@@ -56,13 +56,16 @@ _MINHASH_PREFIXES = tuple(hashlib.md5(f"{i}:".encode()) for i in range(256))
 
 
 def compute_minhash_signature(tokens: Sequence[str], num_perm: int = 128) -> list[int]:
-    """Compute 128-permutation MinHash signature for token k-shingles (k=5 per Phase 2B plan)."""
+    """Compute 128-permutation MinHash signature (unigrams for <5 tokens, k=5 shingles otherwise)."""
     if not tokens:
         return [0] * num_perm
-    k = min(5, len(tokens))
-    shingles = {" ".join(tokens[i : i + k]) for i in range(len(tokens) - k + 1)}
-    if not shingles:
+    if len(tokens) < 5:
         shingles = set(tokens)
+    else:
+        k = 5
+        shingles = {" ".join(tokens[i : i + k]) for i in range(len(tokens) - k + 1)}
+        if not shingles:
+            shingles = set(tokens)
 
     encoded = [shingle.encode() for shingle in shingles]
     from_bytes = int.from_bytes
@@ -105,7 +108,7 @@ def tokenize_for_minhash(text: str) -> list[str]:
 
 _MINHASH_CACHE: OrderedDict[str, list[int]] = OrderedDict()
 _MINHASH_LOCKS = WeakKeyDictionary()
-_MINHASH_ALGORITHM = "md5-128-k5-v2"
+_MINHASH_ALGORITHM = "md5-128-k5-v3"
 
 
 async def _block_signatures(blocks, *, persist_ids):
@@ -247,8 +250,9 @@ _NEUTRAL_AUX: frozenset[str] = frozenset({
     "được", "bị", "có", "là", "đã", "sẽ", "đang", "phải",
 })
 
+# Only unambiguous productive negation prefixes (avoid blind in-/dis-/un- collisions like formation/information)
 _NEG_MORPH_PREFIXES: tuple[str, ...] = (
-    "non", "dis", "un", "in", "im", "il", "ir", "не", "без", "бес", "des",
+    "non", "не",
 )
 
 _STATE_ANTONYM_PAIRS: frozenset[tuple[str, str]] = frozenset(
@@ -267,12 +271,78 @@ _STATE_ANTONYM_PAIRS: frozenset[tuple[str, str]] = frozenset(
         ("permitted", "forbidden"),
         ("permitted", "denied"),
         ("mandatory", "optional"),
+        ("required", "optional"),
         ("required", "prohibited"),
         ("required", "forbidden"),
         ("active", "inactive"),
+        ("valid", "invalid"),
+        ("visible", "invisible"),
+        ("compatible", "incompatible"),
+        ("complete", "incomplete"),
+        ("consistent", "inconsistent"),
+        ("correct", "incorrect"),
+        ("direct", "indirect"),
+        ("secure", "insecure"),
+        ("sufficient", "insufficient"),
+        ("accessible", "inaccessible"),
+        ("accurate", "inaccurate"),
+        ("eligible", "ineligible"),
+        ("reversible", "irreversible"),
+        ("mutable", "immutable"),
+        ("possible", "impossible"),
+        ("probable", "improbable"),
+        ("legal", "illegal"),
+        ("logical", "illogical"),
+        ("regular", "irregular"),
+        ("relevant", "irrelevant"),
+        ("available", "unavailable"),
+        ("authorized", "unauthorized"),
+        ("authenticated", "unauthenticated"),
+        ("encrypted", "unencrypted"),
+        ("verified", "unverified"),
+        ("safe", "unsafe"),
+        ("trusted", "untrusted"),
+        ("known", "unknown"),
+        ("locked", "unlocked"),
+        ("masked", "unmasked"),
+        ("signed", "unsigned"),
+        ("supported", "unsupported"),
+        ("restricted", "unrestricted"),
+        ("limited", "unlimited"),
+        ("changed", "unchanged"),
+        ("modified", "unmodified"),
+        ("stable", "unstable"),
+        ("healthy", "unhealthy"),
+        ("connect", "disconnect"),
+        ("connected", "disconnected"),
+        ("continued", "discontinued"),
+        ("approved", "disapproved"),
+        ("agreed", "disagreed"),
+        ("pass", "fail"),
+        ("passed", "failed"),
+        ("accept", "reject"),
+        ("accepted", "rejected"),
+        ("grant", "revoke"),
+        ("granted", "revoked"),
+        ("public", "private"),
+        ("open", "closed"),
         ("on", "off"),
-        ("yes", "no"),
-        ("cho", "cấm"),
+        ("bật", "tắt"),
+    )
+    for pair in ((a, b), (b, a))
+)
+
+# Direct phrase/particle antonym pairs evaluated before polarity-particle stripping
+_PHRASE_ANTONYM_PAIRS: frozenset[tuple[tuple[str, ...], tuple[str, ...]]] = frozenset(
+    pair
+    for a, b in (
+        (("yes",), ("no",)),
+        (("cho", "phép"), ("cấm",)),
+        (("được", "phép"), ("cấm",)),
+        (("cho",), ("cấm",)),
+        (("bắt", "buộc"), ("tùy", "chọn")),
+        (("bắt", "buộc"), ("cấm",)),
+        (("hợp", "lệ"), ("bất", "hợp", "lệ")),
     )
     for pair in ((a, b), (b, a))
 )
@@ -366,6 +436,13 @@ def _hunk_is_polarity_flip(h1: list[str], h2: list[str]) -> bool:
 
     if max(len(h1), len(h2)) > 3:
         return False
+
+    if (tuple(h1), tuple(h2)) in _PHRASE_ANTONYM_PAIRS:
+        return True
+    core1 = tuple(tok for tok in h1 if tok not in _NEUTRAL_AUX)
+    core2 = tuple(tok for tok in h2 if tok not in _NEUTRAL_AUX)
+    if (core1, core2) in _PHRASE_ANTONYM_PAIRS:
+        return True
 
     sign1, rem1 = _decompose_polarity_hunk(h1)
     sign2, rem2 = _decompose_polarity_hunk(h2)
@@ -629,6 +706,14 @@ def classify_relation_candidate(
     return RELATION_RELATED
 
 
+def _as_utc(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
 async def resolve_temporal_supersedes(
     session: AsyncSession,
     *,
@@ -653,9 +738,8 @@ async def resolve_temporal_supersedes(
     all_prev = list(res.scalars().all())
 
     now_utc = datetime.now(UTC)
-    cur_start = current_version.source_published_at or current_version.observed_at or now_utc
-    if cur_start.tzinfo is None:
-        cur_start = cur_start.replace(tzinfo=UTC)
+    cur_start = _as_utc(current_version.source_published_at or current_version.observed_at or now_utc)
+    assert cur_start is not None
 
     max_valid_to = datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC)
 
@@ -668,6 +752,7 @@ async def resolve_temporal_supersedes(
 
     # Find the version active at cur_start: valid_from <= cur_start < valid_to
     active_at_start = None
+    active_v_from: datetime | None = None
     for v in all_prev:
         raw_from = (
             getattr(v, "source_published_at", None)
@@ -675,21 +760,21 @@ async def resolve_temporal_supersedes(
             or getattr(v, "valid_from", None)
             or getattr(v, "created_at", None)
         )
-        v_from = raw_from.replace(tzinfo=UTC) if raw_from and raw_from.tzinfo is None else raw_from
-        raw_to = v.valid_to or max_valid_to
-        v_to = raw_to.replace(tzinfo=UTC) if raw_to and raw_to.tzinfo is None else raw_to
+        v_from = _as_utc(raw_from)
+        v_to = _as_utc(v.valid_to or max_valid_to)
         if v_from and v_to and v_from <= cur_start < v_to:
             active_at_start = v
+            active_v_from = v_from
             break
 
     if active_at_start is not None:
         # Normal newer or mid-timeline version: current supersedes active_at_start
-        orig_active_valid_to = active_at_start.valid_to or max_valid_to
+        orig_active_valid_to = _as_utc(active_at_start.valid_to) or max_valid_to
         current_version.supersedes_id = active_at_start.id
         current_version.valid_from = cur_start
         current_version.valid_to = orig_active_valid_to
-        if v_from:
-            active_at_start.valid_from = v_from
+        if active_v_from is not None:
+            active_at_start.valid_from = active_v_from
         active_at_start.valid_to = cur_start
         session.add(active_at_start)
 
@@ -702,7 +787,7 @@ async def resolve_temporal_supersedes(
                     or getattr(v, "observed_at", None)
                     or getattr(v, "valid_from", None)
                 )
-                v_start = raw_v.replace(tzinfo=UTC) if raw_v and raw_v.tzinfo is None else raw_v
+                v_start = _as_utc(raw_v)
                 if v_start and v_start >= cur_start:
                     v.supersedes_id = current_version.id
                     session.add(v)
@@ -712,8 +797,7 @@ async def resolve_temporal_supersedes(
             (
                 v
                 for v in all_prev
-                if v.valid_to
-                and (v.valid_to.replace(tzinfo=UTC) if v.valid_to.tzinfo is None else v.valid_to) >= max_valid_to
+                if (v_end := _as_utc(v.valid_to)) is not None and v_end >= max_valid_to
             ),
             current_version,
         )
@@ -729,9 +813,8 @@ async def resolve_temporal_supersedes(
                 or getattr(v, "valid_from", None)
                 or getattr(v, "created_at", None)
             )
-            vf = raw_from.replace(tzinfo=UTC) if raw_from and raw_from.tzinfo is None else raw_from
-            raw_to = v.valid_to or max_valid_to
-            vt = raw_to.replace(tzinfo=UTC) if raw_to and raw_to.tzinfo is None else raw_to
+            vf = _as_utc(raw_from)
+            vt = _as_utc(v.valid_to or max_valid_to)
             if vf and vf > cur_start:
                 future_vers.append((v, vf))
             elif vt and vt <= cur_start:
@@ -755,23 +838,36 @@ async def resolve_temporal_supersedes(
             current_version.valid_to = max_valid_to
 
         action = "OUT_OF_ORDER_ARCHIVED"
-        active_v = next((v for v in all_prev if v.valid_to and v.valid_to >= max_valid_to), current_version)
+        active_v = next(
+            (
+                v
+                for v in all_prev
+                if (v_end := _as_utc(v.valid_to)) is not None and v_end >= max_valid_to
+            ),
+            current_version,
+        )
         active_id = active_v.id
 
-    # Strictly guarantee non-overlapping intervals across all versions
+    # Strictly guarantee non-overlapping intervals across all non-empty versions
+    c_from = _as_utc(current_version.valid_from)
+    c_to = _as_utc(current_version.valid_to)
     for v in all_prev:
-        if v.id == current_version.id:
+        if v.id == current_version.id or v.id == current_version.supersedes_id:
             continue
-        v_from = v.valid_from.replace(tzinfo=UTC) if v.valid_from and v.valid_from.tzinfo is None else v.valid_from
-        v_to = v.valid_to.replace(tzinfo=UTC) if v.valid_to and v.valid_to.tzinfo is None else v.valid_to
-        c_from = current_version.valid_from
-        c_to = current_version.valid_to
+        v_from = _as_utc(v.valid_from)
+        v_to = _as_utc(v.valid_to)
+        if v_from is None or v_to is None or c_from is None or c_to is None:
+            continue
+        if v_from >= v_to:
+            # Empty/closed superseded interval cannot overlap [c_from, c_to)
+            continue
 
         if v_from < c_from and v_to > c_from:
             v.valid_to = c_from
             session.add(v)
         elif c_from <= v_from < c_to:
             current_version.valid_to = v_from
+            c_to = v_from
 
     # Enrichment freezes validity/lineage; changed predecessors/successors need a new knowledge input.
     for version in [*all_prev, current_version]:
