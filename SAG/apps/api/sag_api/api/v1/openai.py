@@ -71,7 +71,7 @@ _COMPLETE_CITATION_BRACKET_RE = re.compile(
     r"[ \t]*\[\s*[sS]?\d+(?:\s*[,;、]\s*[sS]?\d+)*\s*\]"
 )
 _INCOMPLETE_CITATION_TAIL_RE = re.compile(
-    r"[ \t]*\[\s*(?:(?:[sS]?\d+(?:\s*[,;、]\s*[sS]?\d+)*\s*[,;、]\s*[sS]?)|(?:[sS]?\d*)|[sS])?\s*$"
+    r"[ \t]*\[\s*(?:(?:[sS]?\d+(?:\s*[,;、]\s*[sS]?\d+)*\s*[,;、]\s*(?:[sS]?\d*)?)|(?:[sS]?\d*)|[sS])?\s*$"
 )
 
 

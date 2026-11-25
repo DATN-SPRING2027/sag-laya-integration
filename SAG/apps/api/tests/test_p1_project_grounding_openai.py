@@ -405,3 +405,156 @@ async def test_openai_nonstream_incomplete_grounded_does_not_leak_raw_parts(monk
         agent_runtime=SimpleNamespace(),
     )
     assert non_stream_res["choices"][0]["message"]["content"] == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("deltas", "canonical_output"),
+    [
+        (["Hello", " [", "1", ",", " 2", "]", " world"], "Hello world"),
+        (["Hello [1, S2", "] world"], "Hello world"),
+        (["Hello [1, 2 ", "] world"], "Hello world"),
+    ],
+)
+async def test_openai_sse_ungrounded_compound_citation_tail_does_not_leak(
+    monkeypatch, deltas: list[str], canonical_output: str
+):
+    """PROBE-5C: Split and token-by-token compound citations must be held until RUN_COMPLETED resolves them."""
+    import json as _json
+
+    agent = SimpleNamespace(id="agent-1", name="Tester", persona={})
+    monkeypatch.setattr(openai_api.svc, "get_agent", AsyncMock(return_value=agent))
+    monkeypatch.setattr(
+        openai_api.svc,
+        "build_ask_context",
+        lambda **_kwargs: AskPlan(
+            query="q",
+            user_message_id="u-1",
+            messages=[{"role": "user", "content": "q"}],
+            citations=[],
+            session_citations=[],
+        ),
+    )
+
+    async def fake_stream(*_args, **_kwargs):
+        yield AgentStreamEvent(
+            type=EventType.RUN_STARTED.value,
+            data={"payload": {"grounding_required": False}},
+        )
+        for piece in deltas:
+            yield AgentStreamEvent(
+                type=EventType.MESSAGE_DELTA.value,
+                data={"payload": {"delta": piece}},
+            )
+        yield AgentStreamEvent(
+            type=EventType.RUN_COMPLETED.value,
+            data={"payload": {"output": canonical_output, "citations": []}},
+        )
+
+    monkeypatch.setattr(openai_api.agent_service, "generate_stream", fake_stream)
+    req = openai_api.ChatCompletionRequest(
+        messages=[openai_api.ChatMessage(role="user", content="q")],
+        stream=True,
+    )
+    resp = await openai_api.chat_completions(
+        agent_id="agent-1",
+        body=req,
+        _user=SimpleNamespace(name="User"),
+        owner_key="owner-1",
+        principal=_principal(),
+        session=SimpleNamespace(),
+        engine_manager=SimpleNamespace(),
+        llm=SimpleNamespace(configured=True),
+        tool_registry=SimpleNamespace(),
+        agent_runtime=SimpleNamespace(),
+    )
+    chunks = [chunk async for chunk in resp.body_iterator]
+    body_text = "".join(c.decode() if isinstance(c, bytes) else c for c in chunks)
+
+    assembled = []
+    for line in body_text.splitlines():
+        if line.startswith("data: ") and line != "data: [DONE]":
+            obj = _json.loads(line[6:])
+            delta_content = (obj.get("choices") or [{}])[0].get("delta", {}).get("content")
+            if delta_content:
+                assembled.append(delta_content)
+
+    assert "[1, 2]" not in body_text
+    assert "[1, S2]" not in body_text
+    assert "".join(assembled) == canonical_output
+
+
+@pytest.mark.asyncio
+async def test_openai_sse_ungrounded_markdown_link_streams_immediately(monkeypatch):
+    """PROBE-5C: Markdown links in ungrounded SSE must stream immediately without getting stuck."""
+    import json as _json
+
+    agent = SimpleNamespace(id="agent-1", name="Tester", persona={})
+    monkeypatch.setattr(openai_api.svc, "get_agent", AsyncMock(return_value=agent))
+    monkeypatch.setattr(
+        openai_api.svc,
+        "build_ask_context",
+        lambda **_kwargs: AskPlan(
+            query="q",
+            user_message_id="u-1",
+            messages=[{"role": "user", "content": "q"}],
+            citations=[],
+            session_citations=[],
+        ),
+    )
+
+    emitted_before_completion: list[str] = []
+    completed_emitted = False
+
+    async def fake_stream(*_args, **_kwargs):
+        nonlocal completed_emitted
+        yield AgentStreamEvent(
+            type=EventType.RUN_STARTED.value,
+            data={"payload": {"grounding_required": False}},
+        )
+        yield AgentStreamEvent(
+            type=EventType.MESSAGE_DELTA.value,
+            data={"payload": {"delta": "See [docs](https://example.com) now."}},
+        )
+        completed_emitted = True
+        yield AgentStreamEvent(
+            type=EventType.RUN_COMPLETED.value,
+            data={"payload": {"output": "See [docs](https://example.com) now.", "citations": []}},
+        )
+
+    monkeypatch.setattr(openai_api.agent_service, "generate_stream", fake_stream)
+    req = openai_api.ChatCompletionRequest(
+        messages=[openai_api.ChatMessage(role="user", content="q")],
+        stream=True,
+    )
+    resp = await openai_api.chat_completions(
+        agent_id="agent-1",
+        body=req,
+        _user=SimpleNamespace(name="User"),
+        owner_key="owner-1",
+        principal=_principal(),
+        session=SimpleNamespace(),
+        engine_manager=SimpleNamespace(),
+        llm=SimpleNamespace(configured=True),
+        tool_registry=SimpleNamespace(),
+        agent_runtime=SimpleNamespace(),
+    )
+    # Consume chunks one-by-one and verify the markdown link arrives before RUN_COMPLETED
+    it = resp.body_iterator.__aiter__()
+    while True:
+        try:
+            raw = await it.__anext__()
+        except StopAsyncIteration:
+            break
+        text = raw.decode() if isinstance(raw, bytes) else raw
+        for line in text.splitlines():
+            if line.startswith("data: ") and line != "data: [DONE]":
+                obj = _json.loads(line[6:])
+                choice = (obj.get("choices") or [{}])[0]
+                delta_content = choice.get("delta", {}).get("content")
+                if delta_content:
+                    assert not completed_emitted
+                    emitted_before_completion.append(delta_content)
+
+    assert emitted_before_completion == ["See [docs](https://example.com) now."]
+
