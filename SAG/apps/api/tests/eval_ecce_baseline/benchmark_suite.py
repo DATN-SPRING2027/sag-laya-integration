@@ -1,4 +1,11 @@
-"""12-Scenario Vietnamese & Multi-Step Benchmark + Ablation Evaluator (V0 -> V5) for SAG-ECCE."""
+"""SYNTHETIC OFFLINE BENCHMARK — 12-Scenario Vietnamese & Multi-Step Ablation Evaluator (V0 -> V5).
+
+IMPORTANT: This suite runs against an offline, deterministic synthetic 236-turn corpus using
+simulated routing (`route_dec`), deterministic 256-d n-gram fallback embeddings, `StructuredExtractorTestLLM`,
+and an explicit `session_context_mode="on"` override (production default is `session_context_mode="off"`).
+Metrics reported here validate deterministic ECCE ablation logic only and do NOT represent default
+production configuration or live LLM/Qdrant/PostgreSQL behavior.
+"""
 
 from __future__ import annotations
 

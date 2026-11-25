@@ -162,6 +162,7 @@ def _capabilities() -> dict:
         "vector_provider": settings.sag_vector_provider,
         "language": settings.sag_language,
         "search_strategy": settings.search_strategy,
+        "canonical_search_strategy": "canonical_hybrid",
         "search_strategies": strategy_report["enabled"],
         "search_strategies_disabled": strategy_report["disabled"],
         "timezone": settings.timezone,

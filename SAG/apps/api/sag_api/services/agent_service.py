@@ -51,7 +51,7 @@ from sag_api.tools import ToolRegistry
 from sag_api.tools.builtin import WebSearchTool
 from sag_api.tools.mcp import open_agent_mcp_tools
 
-AGENT_MAX_STEPS = 4
+AGENT_MAX_STEPS = 6
 
 _KNOWLEDGE_TOOLS = ["search_context", "get_entity"]
 _WEB_TOOLS = ["web_search", "open_webpage"]

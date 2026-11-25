@@ -138,7 +138,6 @@ class IncrementalDocumentProcessor:
         document_title: str | None = None,
         max_entities_per_event: int = 20,
         write_event_entity_vectors: bool = False,
-        enable_strict_filtering: bool = False,
         event_entity_attempts: int = 2,
         extraction_profile: str = "concise",
         document_version_id: str | None = None,
@@ -159,11 +158,8 @@ class IncrementalDocumentProcessor:
         self._configured_language = configured_language
         self._detected_language: str | None = None
 
-        # 0.8.2 已内置契约与修复重试,以下 0.7.1 参数仅保留接口兼容:
-        # - enable_strict_filtering → zleap 无对应开关(REQ 待对齐),忽略并记录;
+        # 0.8.2 已内置契约与修复重试:
         # - event_entity_attempts → zleap ExtractionOptions.max_retries(默认 5)接管。
-        if enable_strict_filtering:
-            log.warning("0.8.2 无严格过滤开关,忽略 enable_strict_filtering(REQ 待对齐)")
         self._event_entity_attempts = max(1, min(3, event_entity_attempts))
 
     async def _sample_language(self, path: str | Path | None) -> None:

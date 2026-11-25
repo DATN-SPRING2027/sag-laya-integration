@@ -1,5 +1,8 @@
 # Báo Cáo Baseline & Chuỗi Thực Nghiệm Ablation (`V0 → V5`) Trên `SAG main` (`3411d16`)
 
+> **[SYNTHETIC OFFLINE BENCHMARK — KHÔNG PHẢI CẤU HÌNH MẶC ĐỊNH PRODUCTION]**
+> Báo cáo dưới đây đo trên tập hội thoại tổng hợp (synthetic corpus) offline hoàn toàn với định tuyến mô phỏng (`route_dec`), vector băm 256-d tất định và cờ `session_context_mode="on"` được bật riêng trong test harness. Trên production, `Settings.session_context_mode` mặc định là `"off"` (opt-in); các con số này không đại diện cho hiệu năng hay cấu hình mặc định khi triển khai thực tế.
+
 - **Ngày thực hiện:** 2026-10-28
 - **Nhánh:** `feat/Thang-ecce-baseline-harness-be-api` (tách trực tiếp từ `origin/main` @ `3411d16`)
 - **Bộ chạy kiểm chứng:** `SAG/apps/api/tests/eval_ecce_baseline/benchmark_suite.py` & `SAG/apps/api/tests/test_ecce_ablation_benchmark.py`

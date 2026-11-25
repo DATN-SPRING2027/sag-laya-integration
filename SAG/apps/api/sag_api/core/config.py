@@ -114,9 +114,6 @@ class Settings(BaseSettings):
     document_extraction_profile: Literal["standard", "concise"] = "concise"
     document_write_event_entity_vectors: bool = False
     document_event_entity_attempts: int = Field(default=2, ge=1, le=3)
-    # 上传文档已有独立的知识型过滤要求；默认关闭上游基于标题/摘要的严格过滤，
-    # 避免无摘要或标题缺失的书籍正文被误判为噪音。
-    document_strict_filtering: bool = False
     job_max_attempts: int = 3  # 可重试失败的最大尝试次数（含首次）
     engine_cache_size: int = 16  # 引擎槽 LRU 上限（超限逐出最久未用）
     engine_warmup_count: int = 4  # 启动时预热最近使用的信源引擎数
@@ -246,9 +243,9 @@ class Settings(BaseSettings):
     excel_max_cols_per_sheet: int = Field(default=64, ge=4, le=512)
 
     # ── 检索默认 ────────────────────────────────────────────────────────
-    # multi_es_fast：默认策略。相关率平均比 vector 高 ~14 个百分点；
-    # vector store 不支持 lexical(pgvector/qdrant/oceanbase) 时由 engine_manager 自动降级为 vector。
-    search_strategy: SearchStrategy = "multi_es_fast"
+    # multi：默认策略（canonical search 实际执行 canonical_hybrid dense + BM25；
+    # legacy zleap-sag 引擎在 vector store 不支持 lexical 时自动降级为 vector）。
+    search_strategy: SearchStrategy = "multi"
     search_top_k: int = Field(default=8, ge=1)  # Initial adaptive search breadth, not a final result cap.
     # Optional scope budget rejects oversized scopes instead of silently truncating sources.
     search_source_candidate_limit: int = Field(default=0, ge=0)  # 0 = all authorized sources.
@@ -305,6 +302,8 @@ class Settings(BaseSettings):
     history_keep_recent: int = 8  # 历史压缩时原文保留的最近消息数
     # 只装载最近有界窗口；更旧对话应进入滚动摘要，不做全表回放。
     history_load_limit: int = Field(default=200, ge=1, le=1000)
+    # Opt-in ECCE session memory; production default is "off" (legacy bounded history).
+    # Offline ECCE benchmark suites override this to "on" on a synthetic corpus.
     session_context_mode: Literal["off", "shadow", "on"] = "off"
     session_context_scope: Literal["thread", "project_owner"] = "thread"
     session_context_embedding_mode: Literal["zero_cost_local", "configured_http"] = "zero_cost_local"

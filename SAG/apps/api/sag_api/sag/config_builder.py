@@ -100,14 +100,14 @@ _zleap_registry.register("relational", "postgres", PostgresRelationalStore)
 
 
 def _build_vector(settings: Settings) -> Any:
+    """Build initial zleap-sag VectorConfig union member before Qdrant model_copy replacement."""
     provider = settings.sag_vector_provider
     if provider == "es":
-        # 0.8.2 要求 hosts;SAG 未提供 ES 地址配置时退回本地默认。
-        # TODO(REQ-7/配置):新增 SAG_ES_HOSTS 设置项,生产显式配置。
+        # zleap-sag requires explicit hosts on ElasticsearchVectorConfig; default to local ES.
         return ElasticsearchVectorConfig(hosts=["http://localhost:9200"])
     if provider == "qdrant":
-        # zleap-sag 0.12's EngineConfig has no Qdrant model; the validated
-        # config is replaced with QdrantVectorConfig after construction below.
+        # zleap-sag 0.12's EngineConfig union lacks a Qdrant model; pass a valid
+        # ElasticsearchVectorConfig placeholder here and swap in QdrantVectorConfig below.
         return ElasticsearchVectorConfig(hosts=[settings.sag_qdrant_url])
     if provider == "pgvector":
         conn = PostgresConnectionConfig(

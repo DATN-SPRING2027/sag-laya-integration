@@ -101,9 +101,13 @@ def _record_from_point(point: dict[str, Any]) -> VectorRecord:
 class QdrantVectorStore:
     """Qdrant adapter using the stable REST API and named vectors."""
 
-    # zleap-sag 0.12's schema facade recognizes these built-in storage modes.
-    # The actual selected provider remains qdrant in EngineConfig/registry.
+    # zleap.sag.core.storage.schema.prepare_vector_schema (schema.py:80) skips
+    # all schema validation/creation unless adapter.provider is in
+    # ("lancedb", "es", "pgvector", "oceanbase"). Keep "es" solely as the
+    # zleap-sag schema-facade whitelist token; backend_provider & EngineConfig
+    # identify the actual Qdrant backend.
     provider = "es"
+    backend_provider = "qdrant"
     capabilities = frozenset({Capability.VECTOR_KNN, Capability.FILTERED_KNN})
 
     def __init__(

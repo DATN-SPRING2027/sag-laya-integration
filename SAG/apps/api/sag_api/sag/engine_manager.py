@@ -1100,7 +1100,6 @@ class EngineManager:
                             8 if self._settings.document_extraction_profile == "concise" else 20
                         ),
                         write_event_entity_vectors=self._settings.document_write_event_entity_vectors,
-                        enable_strict_filtering=self._settings.document_strict_filtering,
                         event_entity_attempts=self._settings.document_event_entity_attempts,
                         extraction_profile=self._settings.document_extraction_profile,
                         document_version_id=document_version_id,

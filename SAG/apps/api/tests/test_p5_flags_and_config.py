@@ -128,3 +128,79 @@ async def test_incremental_processor_extract_honors_language_and_zleap_boundary(
     assert proc._detected_language == detected
     assert captured["pm_language"] == expected_pm_lang
     assert len(captured["guidance_rules"]) >= 1
+
+
+def test_dead_strict_filtering_removed_and_agent_max_steps_unified():
+    """S2-06/Focus C: dead document_strict_filtering/enable_strict_filtering removed; AGENT_MAX_STEPS == 6."""
+    import inspect
+
+    from sag_api.services import agent_service
+
+    assert "document_strict_filtering" not in Settings.model_fields
+    assert not hasattr(Settings(), "document_strict_filtering")
+    sig = inspect.signature(IncrementalDocumentProcessor.__init__)
+    assert "enable_strict_filtering" not in sig.parameters
+
+    assert Settings().agent_max_steps == 6
+    assert agent_service.AGENT_MAX_STEPS == 6
+
+
+def test_search_strategy_default_capabilities_and_qdrant_provider_clarity():
+    """S3-09/S4-08: search_strategy defaults to 'multi'; /capabilities reports canonical_hybrid; Qdrant clarity."""
+    from pathlib import Path
+
+    from sag_api.api.v1 import system as system_api
+    from sag_api.sag import config_builder
+    from sag_api.sag.qdrant_store import QdrantVectorStore
+
+    assert Settings().search_strategy == "multi"
+    assert settings_service.QUICK_SETUP_302["search_strategy"] == "multi"
+
+    caps = system_api._capabilities()
+    assert caps["canonical_search_strategy"] == "canonical_hybrid"
+    assert caps["search_strategy"] in {"multi", "vector"}
+
+    assert QdrantVectorStore.backend_provider == "qdrant"
+    # zleap.sag.core.storage.schema.prepare_vector_schema skips Qdrant unless provider == "es".
+    assert QdrantVectorStore.provider == "es"
+    cb_source = Path(config_builder.__file__).read_text(encoding="utf-8")
+    assert "TODO(REQ-7" not in cb_source
+
+
+@pytest.mark.asyncio
+async def test_canonical_search_reports_effective_strategy_canonical_hybrid():
+    """S4-08: retrieve_search_unit_sections sets effective_strategy='canonical_hybrid' and search.py propagates it."""
+    from sag_api.api.v1 import search as search_api
+    from sag_api.services.search_unit_retrieval_service import retrieve_search_unit_sections
+
+    outcome = await retrieve_search_unit_sections(
+        engine_manager=SimpleNamespace(),
+        sources=[],
+        query="test query",
+        principal=None,
+    )
+    assert outcome.stats["effective_strategy"] == "canonical_hybrid"
+
+    plan = search_api._QueryRoutePlan(
+        strategy="multi_es_fast",
+        need_retrieval=True,
+        trace={"effective_strategy": "multi_es_fast", "degraded": False},
+        strategy_plan=SimpleNamespace(),
+    )
+    merged = search_api._with_query_route_stats(outcome.stats, plan)
+    assert merged["query_route"]["effective_strategy"] == "canonical_hybrid"
+
+
+def test_session_context_off_default_and_ecce_synthetic_disclaimers():
+    """S4-12/S5-15/Focus C: session_context_mode defaults to 'off' and ECCE benchmark docs/code mark synthetic."""
+    from pathlib import Path
+
+    from tests import test_ecce_ablation_benchmark
+    from tests.eval_ecce_baseline import benchmark_suite
+
+    assert Settings().session_context_mode == "off"
+    bench_src = Path(benchmark_suite.__file__).read_text(encoding="utf-8")
+    test_src = Path(test_ecce_ablation_benchmark.__file__).read_text(encoding="utf-8")
+    assert "SYNTHETIC OFFLINE BENCHMARK" in bench_src
+    assert "SYNTHETIC OFFLINE BENCHMARK" in test_src
+

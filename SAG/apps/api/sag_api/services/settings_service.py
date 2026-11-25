@@ -110,7 +110,7 @@ QUICK_SETUP_302 = {
     "document_chunk_max_tokens": 1_000,
     "document_chunk_mode": "standard",
     "document_extraction_profile": "standard",
-    "search_strategy": "multi_es_fast",
+    "search_strategy": "multi",
     "search_top_k": 8,
     "sag_language": "en",
 }

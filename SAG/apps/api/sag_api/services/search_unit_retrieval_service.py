@@ -2036,6 +2036,7 @@ async def _retrieve_search_unit_sections(
     strategy_plan = query_strategy_plan or plan_query(query, requested_top_k=top_k)
     per_doc_limit = strategy_plan.retrieval_plan.per_document_limit
     retrieval_stats = {
+        "effective_strategy": "canonical_hybrid",
         "requested_top_k": requested_limit,
         "candidate_top_k": candidate_limit,
         "candidate_unit_pool_limit": settings.search_unit_candidate_limit,
