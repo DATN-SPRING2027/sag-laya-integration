@@ -273,6 +273,7 @@ class Settings(BaseSettings):
     # 精确模式（multi）含查询侧 LLM 往返；超时/失败/空结果自动回退快速模式（vector）。
     search_source_timeout: float = 25.0
     search_fallback_vector: bool = True
+    search_reconcile_interval_seconds: int = Field(default=3600, ge=0, le=86400)
 
     # ── 检索评测 ────────────────────────────────────────────────────────
     # LLM-as-judge 在评测端点/CLI 里默认开启；线上或不想烧 token 时可临时关闭。

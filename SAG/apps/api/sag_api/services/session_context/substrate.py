@@ -19,6 +19,7 @@ from typing import Any
 
 import igraph as ig
 
+from sag_api.core.logging import get_logger
 from sag_api.generation.prompt import estimate_tokens
 from sag_api.services.search_index_service import (
     COMMON_STOPWORDS,
@@ -44,6 +45,7 @@ from sag_api.services.session_context.models import (
 )
 
 FALLBACK_VECTOR_DIM = 256
+log = get_logger("sag.session_context.substrate")
 EPISODE_TIME_GAP_SECONDS = 1800.0  # 30 minutes
 EPISODE_CENTROID_COS_THRESHOLD = 0.72
 EPISODE_LEXICAL_JACCARD_THRESHOLD = 0.18
@@ -193,7 +195,12 @@ async def embed_texts_with_provenance(
                     )
                 put_cached_text_embedding(txt, raw_vec, model_signature=cache_sig)
                 results[idx] = l2_normalize(raw_vec)
-        except Exception:  # noqa: BLE001 - fail-open to deterministic local projection if HTTP embedder errors
+        except Exception as exc:  # noqa: BLE001 - fail-open to deterministic local projection if HTTP embedder errors
+            log.warning(
+                "Session embedder failed during batch embed (sig=%s); falling back to deterministic-ngram-v1: %s",
+                emb_sig,
+                type(exc).__name__,
+            )
             return [deterministic_ngram_vector(t) for t in texts], "deterministic-ngram-v1"
 
     finalized = [
@@ -216,7 +223,12 @@ async def embed_texts_with_provenance(
                     put_cached_text_embedding(txt, raw_vec, model_signature=cache_sig)
                     rebuilt.append(l2_normalize(raw_vec))
                 return rebuilt, emb_sig
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "Session embedder failed during dimension-drift recompute (sig=%s); falling back to deterministic-ngram-v1: %s",
+                    emb_sig,
+                    type(exc).__name__,
+                )
                 return [deterministic_ngram_vector(t) for t in texts], "deterministic-ngram-v1"
 
     return finalized, emb_sig
@@ -307,6 +319,8 @@ class IncrementalSessionIndex:
         self.inherited_lineage_signature: str = ""
         self.extraction_degraded: bool = False
         self.extraction_degraded_reason: str | None = None
+        self.embedding_degraded: bool = False
+        self.embedding_degraded_reason: str | None = None
 
     def seal_inherited_boundary(self) -> None:
         """Freeze inherited ancestor prefix boundaries so own units never reference ancestor Message IDs."""
@@ -385,6 +399,11 @@ class IncrementalSessionIndex:
 
         # Single batch embedding call across all new turns + sentences (with provenance verification)
         all_vectors, actual_sig = await embed_texts_with_provenance(texts_to_embed, embedder=embedder)
+        if embedder is not None and actual_sig == "deterministic-ngram-v1":
+            self.embedding_degraded = True
+            self.embedding_degraded_reason = (
+                self.embedding_degraded_reason or "http_embedder_fallback_deterministic_ngram"
+            )
         if self.turns and actual_sig != self.embedding_mode:
             # HTTP embedder degraded mid-thread -> re-project entire thread in uniform fallback space
             prior_records = [
@@ -399,7 +418,14 @@ class IncrementalSessionIndex:
             ]
             inh_k = self.inherited_turn_count
             inh_sig = self.inherited_lineage_signature
+            was_emb_degraded = self.embedding_degraded
+            emb_degraded_reason = self.embedding_degraded_reason
             self.__init__(self.thread_id, scope_signature=self.scope_signature)
+            if was_emb_degraded or actual_sig == "deterministic-ngram-v1":
+                self.embedding_degraded = True
+                self.embedding_degraded_reason = (
+                    emb_degraded_reason or "http_embedder_degraded_mid_thread"
+                )
             if inh_k > 0:
                 await self.append_messages(
                     prior_records[:inh_k],

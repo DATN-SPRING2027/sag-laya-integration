@@ -115,6 +115,7 @@ class KnowledgeRuntime:
         self._warmup_started = False
         self._mcp_handle: Any | None = None
         self._mcp_started = False
+        self._reconcile_task: asyncio.Task | None = None
 
     @property
     def ready(self) -> bool:
@@ -148,6 +149,18 @@ class KnowledgeRuntime:
                 await self._job_queue.start()
                 self._warmup_task = self._factory.start_warmup(self._engine_manager)
                 self._warmup_started = True
+                if (
+                    int(getattr(self._settings, "search_reconcile_interval_seconds", 0) or 0) > 0
+                    and getattr(self._settings, "sag_vector_provider", None) == "qdrant"
+                ):
+                    self._reconcile_task = asyncio.create_task(
+                        _periodic_search_reconcile(
+                            self._session_factory,
+                            self._job_queue,
+                            interval_seconds=int(self._settings.search_reconcile_interval_seconds),
+                        ),
+                        name="sag-search-index-reconcile",
+                    )
                 self._mcp_handle = await self._factory.start_mcp(app)
                 self._mcp_started = True
 
@@ -199,6 +212,7 @@ class KnowledgeRuntime:
                 self._agent_runtime is not None,
                 self._job_queue is not None,
                 self._warmup_started,
+                self._reconcile_task is not None,
                 self._mcp_started,
             )
         )
@@ -214,6 +228,12 @@ class KnowledgeRuntime:
                 failures.append(error)
             else:
                 release()
+
+        if self._reconcile_task is not None:
+            await teardown(
+                lambda: self._factory.stop_warmup(self._reconcile_task),
+                lambda: setattr(self, "_reconcile_task", None),
+            )
 
         if self._mcp_started:
             await teardown(
@@ -312,3 +332,35 @@ async def _warmup_engines(engine_manager: EngineManager, settings: Any, session_
         raise
     except Exception as error:  # noqa: BLE001
         log.warning("引擎预热任务异常：%s", error)
+
+
+async def _periodic_search_reconcile(
+    session_factory: Any,
+    job_queue: Any,
+    *,
+    interval_seconds: int,
+) -> None:
+    """Periodically enqueue `RECONCILE_SEARCH_INDEX` jobs to prune orphan Qdrant points."""
+    from sag_api.db.base import new_id
+    from sag_api.db.models import Job
+    from sag_api.enums import JobStatus, JobType
+
+    while True:
+        await asyncio.sleep(max(1, interval_seconds))
+        try:
+            async with session_factory() as session:
+                job = Job(
+                    id=new_id(),
+                    type=JobType.RECONCILE_SEARCH_INDEX,
+                    status=JobStatus.QUEUED,
+                    payload={"reason": "periodic_reconcile"},
+                )
+                session.add(job)
+                await session.commit()
+                job_id = job.id
+            if job_queue is not None and hasattr(job_queue, "enqueue_durably"):
+                await job_queue.enqueue_durably(job_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001
+            log.warning("周期性检索索引对账调度异常：%s", error)

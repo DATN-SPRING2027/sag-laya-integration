@@ -1423,14 +1423,16 @@ async def reconcile_orphan_search_units(
     *,
     project_id: str,
 ) -> dict[str, int]:
-    """Identify and delete orphan Qdrant points that no longer exist in PostgreSQL."""
+    """Identify and delete orphan Qdrant points (missing, inactive, non-ready, or superseded)."""
+    from sag_api.db.models.document import Document
+
     collection_name = f"search_units_{project_id}"
     all_points: list[dict[str, Any]] = []
     next_offset = None
     while True:
         payload: dict[str, Any] = {
             "limit": 500,
-            "with_payload": ["search_unit_id", "document_version_id"],
+            "with_payload": ["search_unit_id", "document_version_id", "_collection_meta"],
             "with_vector": False,
         }
         if next_offset is not None:
@@ -1441,21 +1443,42 @@ async def reconcile_orphan_search_units(
         data = res.json().get("result", {})
         points = data.get("points", [])
         all_points.extend(points)
+        prev_offset = next_offset
         next_offset = data.get("next_page_offset")
-        if next_offset is None or not points:
+        if next_offset is None or not points or next_offset == prev_offset:
             break
 
     if not all_points:
         return {"scanned": 0, "orphans_deleted": 0}
 
-    point_unit_map = {p["id"]: p.get("payload", {}).get("search_unit_id") for p in all_points if p.get("id")}
-    valid_unit_ids = set()
+    point_unit_map: dict[Any, Any] = {}
+    for p in all_points:
+        pid = p.get("id")
+        if not pid:
+            continue
+        pt_payload = p.get("payload") or {}
+        if pt_payload.get("_collection_meta") is True:
+            continue
+        point_unit_map[pid] = pt_payload.get("search_unit_id")
+
+    valid_unit_ids: set[str] = set()
     unit_ids = [uid for uid in point_unit_map.values() if uid]
     if unit_ids:
+        now = datetime.now(UTC)
         for i in range(0, len(unit_ids), 500):
             batch = unit_ids[i : i + 500]
             rows = (
-                await session.execute(select(SearchUnit.id).where(SearchUnit.id.in_(batch)))
+                await session.execute(
+                    select(SearchUnit.id)
+                    .join(DocumentVersion, DocumentVersion.id == SearchUnit.document_version_id)
+                    .join(Document, Document.id == DocumentVersion.document_id)
+                    .where(
+                        SearchUnit.id.in_(batch),
+                        Document.is_active.is_(True),
+                        DocumentVersion.search_status.in_(("SEARCH_READY", "READY")),
+                        DocumentVersion.valid_to > now,
+                    )
+                )
             ).scalars().all()
             valid_unit_ids.update(rows)
 
@@ -1463,12 +1486,14 @@ async def reconcile_orphan_search_units(
         pid for pid, uid in point_unit_map.items() if not uid or uid not in valid_unit_ids
     ]
     if orphan_point_ids:
-        del_res = await qdrant_client.post(
-            f"/collections/{collection_name}/points/delete?wait=true",
-            json={"points": orphan_point_ids},
-        )
-        if del_res.status_code >= 400 and del_res.status_code != 404:
-            raise RuntimeError(f"Failed to delete orphan points: {del_res.text}")
+        for i in range(0, len(orphan_point_ids), 500):
+            batch_ids = orphan_point_ids[i : i + 500]
+            del_res = await qdrant_client.post(
+                f"/collections/{collection_name}/points/delete?wait=true",
+                json={"points": batch_ids},
+            )
+            if del_res.status_code >= 400 and del_res.status_code != 404:
+                raise RuntimeError(f"Failed to delete orphan points: {del_res.text}")
 
     return {"scanned": len(all_points), "orphans_deleted": len(orphan_point_ids)}
 
@@ -1731,6 +1756,8 @@ async def run_search_indexing_stage(
         # Strict fail-closed manifest verification: checksum must match
         manifest_verified = (qdrant_checksum == manifest_checksum)
 
+    prune_degraded = False
+    prune_degraded_reason: str | None = None
     if manifest_verified and units:
         from sag_api.services.dedup_and_temporal_service import resolve_temporal_supersedes
 
@@ -1757,10 +1784,36 @@ async def run_search_indexing_stage(
                     document_version_ids=[str(superseded_version_id)],
                 )
             except Exception as exc:
+                prune_degraded = True
+                prune_degraded_reason = f"superseded_version_prune_failed:{superseded_version_id}"
+                err_safe = sanitize_error_message(exc)
                 log.warning(
-                    "Failed to prune superseded version %s from Qdrant: %s",
+                    "Failed to prune superseded version %s from Qdrant (marking degraded & scheduling reconcile): %s",
                     superseded_version_id,
-                    exc,
+                    err_safe,
+                )
+                document_version.metadata_json = {
+                    **(document_version.metadata_json or {}),
+                    "qdrant_prune_degraded": True,
+                    "qdrant_prune_degraded_reason": prune_degraded_reason,
+                    "qdrant_prune_error": err_safe,
+                }
+                from sag_api.db.models import Job
+                from sag_api.enums import JobStatus, JobType
+
+                session.add(
+                    Job(
+                        id=str(uuid.uuid4()),
+                        type=JobType.RECONCILE_SEARCH_INDEX,
+                        status=JobStatus.QUEUED,
+                        source_id=doc.source_id if doc else None,
+                        document_id=document_version.document_id,
+                        payload={
+                            "project_id": project_id,
+                            "reason": "superseded_prune_failed",
+                            "superseded_version_id": str(superseded_version_id),
+                        },
+                    )
                 )
         document_version.search_status = "SEARCH_READY"
         document_version.search_ready_at = datetime.now(UTC)
@@ -1810,6 +1863,8 @@ async def run_search_indexing_stage(
                 "manifest_checksum": manifest_checksum,
                 "qdrant_checksum": qdrant_checksum,
                 "manifest_verified": manifest_verified,
+                "degraded": prune_degraded,
+                "degraded_reason": prune_degraded_reason,
                 "collection_name": collection_name,
                 "token_usage": _idx_token_usage,
                 "error": (

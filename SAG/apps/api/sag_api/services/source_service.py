@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 
+import httpx
 from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -471,13 +472,111 @@ async def delete_source(
     engine_manager: EngineManager,
     upload_dir: str,
     job_queue: JobQueue | None = None,
+    qdrant_client: httpx.AsyncClient | None = None,
 ) -> None:
-    """删除信源并收尾：移除悬挂绑定、关闭引擎槽、清理上传文件。"""
+    """删除信源并收尾：先清理 Qdrant 向量，再移除数据库记录、悬挂绑定、引擎槽与上传文件。"""
+    from sag_api.db.models.routing_rag import IngestionRun
+    from sag_api.services.search_index_service import delete_document_points_from_qdrant
+
     source = await get_source(session, source_id)
     sag_id = source.sag_source_config_id
     tree_scopes = (await session.execute(select(
         SourceProjectMapping.organization_id, SourceProjectMapping.project_id,
     ).where(SourceProjectMapping.source_id == source_id, SourceProjectMapping.state == "CONFIRMED"))).all()
+
+    doc_rows = (
+        await session.execute(
+            select(
+                Document.project_id,
+                DocumentVersion.id,
+                Document.sag_source_id,
+            )
+            .outerjoin(DocumentVersion, DocumentVersion.document_id == Document.id)
+            .where(Document.source_id == source_id)
+        )
+    ).all()
+
+    version_ids: list[str] = []
+    seen_versions: set[str] = set()
+    project_ids: list[str] = []
+    seen_projects: set[str] = set()
+    legacy_sag_ids: set[str] = set()
+
+    def _add_project(pid: object) -> None:
+        if isinstance(pid, str):
+            clean = pid.strip()
+            if clean and clean not in seen_projects:
+                seen_projects.add(clean)
+                project_ids.append(clean)
+
+    for doc_pid, ver_id, doc_sag_id in doc_rows:
+        _add_project(doc_pid)
+        if isinstance(ver_id, str) and ver_id and ver_id not in seen_versions:
+            seen_versions.add(ver_id)
+            version_ids.append(ver_id)
+        if isinstance(doc_sag_id, str) and doc_sag_id.strip():
+            legacy_sag_ids.add(doc_sag_id.strip())
+
+    if version_ids:
+        run_pids = (
+            await session.scalars(
+                select(IngestionRun.project_id)
+                .where(IngestionRun.document_version_id.in_(version_ids))
+                .distinct()
+            )
+        ).all()
+        for pid in run_pids:
+            _add_project(pid)
+
+    mapping_pids = (
+        await session.scalars(
+            select(SourceProjectMapping.project_id)
+            .where(SourceProjectMapping.source_id == source_id)
+            .distinct()
+        )
+    ).all()
+    for pid in mapping_pids:
+        _add_project(pid)
+
+    # Clean canonical Qdrant points BEFORE deleting Source so retries never orphan points.
+    if version_ids and project_ids:
+        resolved_client = qdrant_client
+        should_close_client = False
+        if resolved_client is None and hasattr(engine_manager, "get_search_unit_qdrant_client"):
+            resolved_client = await engine_manager.get_search_unit_qdrant_client()
+        if resolved_client is None and settings.sag_vector_provider == "qdrant":
+            bind = session.get_bind()
+            dialect_name = getattr(getattr(bind, "dialect", None), "name", "") if bind is not None else ""
+            if dialect_name != "sqlite":
+                q_headers = {"api-key": settings.sag_qdrant_api_key} if settings.sag_qdrant_api_key else {}
+                resolved_client = httpx.AsyncClient(
+                    base_url=settings.sag_qdrant_url.rstrip("/"),
+                    headers=q_headers,
+                    timeout=30.0,
+                )
+                should_close_client = True
+        if resolved_client is not None:
+            try:
+                for pid in project_ids:
+                    await delete_document_points_from_qdrant(
+                        resolved_client,
+                        project_id=pid,
+                        document_version_ids=version_ids,
+                    )
+            finally:
+                if should_close_client:
+                    await resolved_client.aclose()
+
+    if legacy_sag_ids and hasattr(engine_manager, "_slot"):
+        from sag_api.services.octx_gc_service import delete_source_partition
+
+        for legacy_sid in sorted(legacy_sag_ids):
+            slot = await engine_manager._slot(legacy_sid, source)
+            await delete_source_partition(
+                legacy_sid,
+                sag_session_factory=slot.engine.resources.relational.session_factory(),
+                vector_client=slot.engine.resources.vector,
+            )
 
     # 悬挂绑定清理（target_id 为普通字符串，无 FK 级联）
     await session.execute(

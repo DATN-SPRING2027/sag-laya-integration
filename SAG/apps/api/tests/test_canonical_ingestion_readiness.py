@@ -324,6 +324,13 @@ async def test_verified_new_version_publishes_even_when_old_point_cleanup_fails(
         assert version.search_status == "SEARCH_READY"
         assert deleted == [["old-version"]]
         assert created_indexes == (["document_version_id"] if missing_index else [])
+        if prune_fails:
+            assert (version.metadata_json or {}).get("qdrant_prune_degraded") is True
+            reconcile_job = await session.scalar(
+                select(Job).where(Job.type == JobType.RECONCILE_SEARCH_INDEX)
+            )
+            assert reconcile_job is not None
+            assert (reconcile_job.payload or {}).get("superseded_version_id") == "old-version"
 
 
 @pytest.mark.asyncio

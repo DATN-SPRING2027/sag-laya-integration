@@ -66,6 +66,7 @@ class JobType(StrEnum):
     SYNC_SOURCE = "sync_source"
     INDEX_UNIVERSE = "index_universe"
     REBUILD_UNIVERSE_TREE = "rebuild_universe_tree"
+    RECONCILE_SEARCH_INDEX = "reconcile_search_index"
     OCTX_PREFLIGHT = "octx_preflight"
     OCTX_IMPORT = "octx_import"
     OCTX_EXPORT = "octx_export"

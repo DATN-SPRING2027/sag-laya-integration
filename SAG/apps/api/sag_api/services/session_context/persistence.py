@@ -136,9 +136,12 @@ def clear_verified_session_collections_cache() -> None:
 
 
 def session_qdrant_collection_name(project_id: str) -> str:
-    """Return canonical per-project Qdrant collection name for session units."""
-    safe_proj = re.sub(r"[^A-Za-z0-9_\-]", "_", str(project_id).strip())
-    return f"session_units_{safe_proj}"
+    """Return canonical per-project Qdrant collection name for session units (collision-safe)."""
+    raw_proj = str(project_id).strip()
+    safe_proj = re.sub(r"[^A-Za-z0-9_\-]", "_", raw_proj)
+    sha8 = hashlib.sha256(raw_proj.encode("utf-8")).hexdigest()[:8]
+    prefix = safe_proj[:48] or "proj"
+    return f"session_units_{prefix}_{sha8}"
 
 
 def _ts_to_utc(ts: float | None) -> datetime:
@@ -472,9 +475,7 @@ async def ensure_session_qdrant_collection(
     vector_dim = int(vector_dim)
     collection_name = session_qdrant_collection_name(project_id)
     transport = getattr(qdrant_client, "_transport", None)
-    transport_tag = (
-        "http" if isinstance(transport, httpx.AsyncHTTPTransport) else f"mock:{id(transport)}"
-    )
+    transport_tag = f"t:{id(transport)}"
     cache_key = (transport_tag, str(qdrant_client.base_url), collection_name)
     if not force_verify and _VERIFIED_SESSION_COLLECTIONS.get(cache_key) == vector_dim:
         return collection_name
@@ -492,16 +493,10 @@ async def ensure_session_qdrant_collection(
         if existing_dim == vector_dim:
             needs_create = False
         elif existing_dim and existing_dim != vector_dim:
-            log.info(
-                "Recreating derived Qdrant collection %s on dimension change (%s -> %s)",
-                collection_name,
-                existing_dim,
-                vector_dim,
+            raise ValueError(
+                f"Session Qdrant collection {collection_name} dimension mismatch: "
+                f"existing {existing_dim} vs required {vector_dim}; refusing destructive collection drop"
             )
-            del_col = await qdrant_client.delete(f"/collections/{collection_name}")
-            if del_col.status_code >= 400 and del_col.status_code != 404:
-                del_col.raise_for_status()
-            needs_create = True
 
     if needs_create:
         col_res = await qdrant_client.put(
@@ -592,6 +587,16 @@ async def upsert_session_units_to_qdrant(
 ) -> int:
     """Upsert dense + BM25 sparse vectors for `SessionUnit` rows into `session_units_{project_id}`."""
     if not items:
+        return 0
+    if any(
+        getattr(unit, "embedding_model_signature", None) == "deterministic-ngram-v1"
+        for unit, _, _ in items
+    ):
+        log.warning(
+            "Skipping Qdrant upsert for deterministic-ngram-v1 fallback vectors (project=%s, count=%d)",
+            project_id,
+            len(items),
+        )
         return 0
     first_vec = items[0][1]
     if not first_vec or len(first_vec) <= 0:
@@ -994,8 +999,11 @@ async def _repair_thread_qdrant_from_db_units(
 
     turn_texts = [msg_by_id[u.message_from_id] for u in turn_units]
     if thread_sig == "deterministic-ngram-v1":
-        computed_vecs = [deterministic_ngram_vector(txt) for txt in turn_texts]
-        actual_sig = "deterministic-ngram-v1"
+        log.warning(
+            "Skipping Qdrant repair for thread=%s with deterministic-ngram-v1 fallback vectors",
+            thread_id,
+        )
+        return 0
     else:
         from sag_api.services.session_context.runtime import resolve_session_embedder
 
@@ -1929,6 +1937,13 @@ async def backfill_pending_qdrant_for_thread(
             missing_ids = db_unsynced_ids | (all_expected_ids - present_uids)
             items_to_upsert = [item for item in all_items if item[0].id in missing_ids]
 
+        if embedding_sig == "deterministic-ngram-v1":
+            log.warning(
+                "Skipping Qdrant backfill for deterministic-ngram-v1 fallback vectors project=%s thread=%s",
+                scope.project_id,
+                scope.thread_id,
+            )
+            return 0
         upserted = 0
         if items_to_upsert:
             upserted = await upsert_session_units_to_qdrant(
@@ -2336,6 +2351,15 @@ async def sync_session_index_to_storage(
             ]
 
     # 8. Sync derived vectors to Qdrant `session_units_{project_id}` (durable retry via qdrant_point_id IS NULL)
+    if embedding_sig == "deterministic-ngram-v1":
+        log.warning(
+            "Skipping Qdrant session sync for deterministic-ngram-v1 fallback vectors project=%s thread=%s",
+            scope.project_id,
+            scope.thread_id,
+        )
+        stats.qdrant_points_upserted = 0
+        return stats
+
     client, should_close = _open_qdrant_client_context(session, qdrant_client)
     if client is not None:
         if mode == "rebuild":

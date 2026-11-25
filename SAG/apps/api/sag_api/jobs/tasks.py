@@ -1468,6 +1468,79 @@ async def rebuild_universe_tree(
     await session.commit()
 
 
+async def reconcile_search_index(
+    session: AsyncSession,
+    job: Job,
+    *,
+    engine_manager: EngineManager | None = None,
+    job_queue=None,
+) -> None:
+    """Reconcile orphan Qdrant points against PostgreSQL SearchUnit/DocumentVersion truth."""
+    from sag_api.services.search_index_service import reconcile_orphan_search_units
+
+    payload = dict(job.payload or {})
+    requested_pid = payload.get("project_id")
+    if isinstance(requested_pid, str) and requested_pid.strip():
+        project_ids = [requested_pid.strip()]
+    else:
+        rows = (
+            await session.scalars(
+                select(Document.project_id)
+                .where(Document.project_id.is_not(None))
+                .distinct()
+            )
+        ).all()
+        project_ids = sorted({str(pid).strip() for pid in rows if isinstance(pid, str) and pid.strip()})
+
+    if not project_ids:
+        job.progress = 1.0
+        job.payload = {**payload, "scanned": 0, "orphans_deleted": 0, "projects": []}
+        await session.commit()
+        return
+
+    qdrant_client = None
+    should_close = False
+    if engine_manager is not None and hasattr(engine_manager, "get_search_unit_qdrant_client"):
+        qdrant_client = await engine_manager.get_search_unit_qdrant_client()
+    elif settings.sag_vector_provider == "qdrant":
+        q_headers = {"api-key": settings.sag_qdrant_api_key} if settings.sag_qdrant_api_key else {}
+        qdrant_client = httpx.AsyncClient(
+            base_url=settings.sag_qdrant_url.rstrip("/"),
+            headers=q_headers,
+            timeout=30.0,
+        )
+        should_close = True
+
+    if qdrant_client is None:
+        job.progress = 1.0
+        job.payload = {**payload, "scanned": 0, "orphans_deleted": 0, "skipped": "no_qdrant_client"}
+        await session.commit()
+        return
+
+    total_scanned = 0
+    total_deleted = 0
+    per_project: dict[str, dict[str, int]] = {}
+    try:
+        for idx, pid in enumerate(project_ids):
+            stats = await reconcile_orphan_search_units(session, qdrant_client, project_id=pid)
+            per_project[pid] = stats
+            total_scanned += int(stats.get("scanned", 0))
+            total_deleted += int(stats.get("orphans_deleted", 0))
+            job.progress = (idx + 1) / len(project_ids)
+    finally:
+        if should_close:
+            await qdrant_client.aclose()
+
+    job.progress = 1.0
+    job.payload = {
+        **payload,
+        "scanned": total_scanned,
+        "orphans_deleted": total_deleted,
+        "projects": per_project,
+    }
+    await session.commit()
+
+
 TASK_HANDLERS: dict[JobType, TaskHandler] = {
     JobType.PROCESS_DOCUMENT: process_document,
     JobType.REPROCESS_DOCUMENT: reprocess_document_task,
@@ -1475,6 +1548,7 @@ TASK_HANDLERS: dict[JobType, TaskHandler] = {
     JobType.SYNC_SOURCE: sync_source,
     JobType.INDEX_UNIVERSE: index_universe,
     JobType.REBUILD_UNIVERSE_TREE: rebuild_universe_tree,
+    JobType.RECONCILE_SEARCH_INDEX: reconcile_search_index,
     JobType.OCTX_PREFLIGHT: preflight_octx,
     JobType.OCTX_IMPORT: import_octx,
     JobType.OCTX_EXPORT: export_octx,
