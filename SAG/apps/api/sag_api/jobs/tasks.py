@@ -1736,9 +1736,24 @@ async def reconcile_search_index(
             await session.commit()
             return
 
+        raw_superseded_vid = payload.get("superseded_version_id")
+        targeted_superseded_vids = (
+            [raw_superseded_vid.strip()]
+            if isinstance(raw_superseded_vid, str) and raw_superseded_vid.strip()
+            else []
+        )
+        is_superseded_prune_failure = payload.get("reason") == "superseded_prune_failed"
         explicit_prune_superseded = payload.get("prune_superseded") is True
         for idx, pid in enumerate(project_ids):
-            if explicit_prune_superseded:
+            if targeted_superseded_vids and (is_superseded_prune_failure or explicit_prune_superseded):
+                stats = await reconcile_orphan_search_units(
+                    session,
+                    qdrant_client,
+                    project_id=pid,
+                    preserve_superseded=True,
+                    prune_version_ids=targeted_superseded_vids,
+                )
+            elif explicit_prune_superseded or is_superseded_prune_failure:
                 stats = await reconcile_orphan_search_units(
                     session,
                     qdrant_client,

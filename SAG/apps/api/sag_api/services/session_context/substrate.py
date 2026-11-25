@@ -423,9 +423,14 @@ class IncrementalSessionIndex:
             ]
             inh_k = self.inherited_turn_count
             inh_sig = self.inherited_lineage_signature
+            saved_tenant = self.tenant_id
             was_emb_degraded = self.embedding_degraded
             emb_degraded_reason = self.embedding_degraded_reason
-            self.__init__(self.thread_id, scope_signature=self.scope_signature)
+            self.__init__(
+                self.thread_id,
+                scope_signature=self.scope_signature,
+                tenant_id=saved_tenant,
+            )
             if was_emb_degraded or actual_sig == "deterministic-ngram-v1":
                 self.embedding_degraded = True
                 self.embedding_degraded_reason = (
@@ -437,6 +442,7 @@ class IncrementalSessionIndex:
                     embedder=None,
                     llm=llm,
                     project_aliases=project_aliases,
+                    tenant_id=eff_tenant,
                 )
                 self.seal_inherited_boundary()
                 self.inherited_lineage_signature = inh_sig
@@ -445,6 +451,7 @@ class IncrementalSessionIndex:
                 embedder=None,
                 llm=llm,
                 project_aliases=project_aliases,
+                tenant_id=eff_tenant,
             )
             return len(pending)
         self.embedding_mode = actual_sig

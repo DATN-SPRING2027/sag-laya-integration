@@ -945,18 +945,15 @@ def rerank_sections(
         )
         _hs, full_spaced, _hc, full_compact, _hr, full_roots = section_norm_cache[key]
         has_anchor_match = bool(
-            (exact_lexical_keys is not None and key in exact_lexical_keys)
-            or (
-                anchor_terms
-                and any(
-                    _term_matches_text(
-                        anchor,
-                        full_spaced,
-                        spaceless_text=full_compact,
-                        root_tokens=full_roots,
-                    )
-                    for anchor in anchor_terms
+            anchor_terms
+            and any(
+                _term_matches_text(
+                    anchor,
+                    full_spaced,
+                    spaceless_text=full_compact,
+                    root_tokens=full_roots,
                 )
+                for anchor in anchor_terms
             )
         )
         dense_known_ood = raw_dense is not None and raw_dense < min_dense
@@ -1061,24 +1058,29 @@ def select_diverse_sections(
 
     features = extract_query_features(query)
     effective_multi_hop = bool(multi_hop) if multi_hop is not None else features.multi_hop
-    required = tuple(
-        dict.fromkeys(
-            value
-            for term in (*features.exact_terms, *features.identifier_terms, *features.path_terms)
-            if (value := normalize_lexical_text(term))
+    required_groups: list[tuple[str, ...]] = []
+    seen_groups: set[tuple[str, ...]] = set()
+    for raw_group in features.anchor_groups:
+        norm_group = tuple(
+            dict.fromkeys(value for term in raw_group if (value := normalize_lexical_text(term)))
         )
-    )
+        if norm_group and norm_group not in seen_groups:
+            seen_groups.add(norm_group)
+            required_groups.append(norm_group)
+    required = tuple(required_groups)
 
-    def anchor_coverage(section: RetrievedSection) -> frozenset[str]:
+    def anchor_coverage(section: RetrievedSection) -> frozenset[int]:
         text = normalize_lexical_text(
             f"{section.document_name or ''}\n{section.section_path or ''}\n{section.heading}\n{section.content}"
         )
-        matched: set[str] = set()
-        for term in required:
-            if term in text:
-                matched.add(term)
-            elif (m_num := re.search(r"\d{4,}", term)) and m_num.group(0) in text:
-                matched.add(term)
+        matched: set[int] = set()
+        for group_idx, group in enumerate(required):
+            if any(
+                variant in text
+                or ((m_num := re.search(r"\d{4,}", variant)) is not None and m_num.group(0) in text)
+                for variant in group
+            ):
+                matched.add(group_idx)
         return frozenset(matched)
 
     def representative_key(section: RetrievedSection) -> tuple[Any, ...]:
@@ -1102,7 +1104,7 @@ def select_diverse_sections(
     )
     unique: list[RetrievedSection] = []
     unique_shingles: list[frozenset[str]] = []
-    unique_coverage: list[frozenset[str]] = []
+    unique_coverage: list[frozenset[int]] = []
     def check_cancelled() -> None:
         if _cancelled is not None and _cancelled.is_set():
             raise InterruptedError("Diversity selection cancelled")
@@ -1136,15 +1138,21 @@ def select_diverse_sections(
         )
 
     selected_indices: list[int] = []
-    selected_anchors: set[str] = set()
-    for anchor in required:
-        if anchor in selected_anchors or len(selected_indices) >= limit:
+    selected_anchors: set[int] = set()
+    for anchor_idx in range(len(required)):
+        if anchor_idx in selected_anchors or len(selected_indices) >= limit:
             continue
         best = next(
             (
                 index
                 for index, coverage in enumerate(unique_coverage)
-                if anchor in coverage and index not in selected_indices and (len(unique) <= limit or float(unique[index].score or 0.0) >= min(0.55, 0.75 * float(unique[0].score or 0.0)))
+                if anchor_idx in coverage
+                and index not in selected_indices
+                and (
+                    len(unique) <= limit
+                    or float(unique[index].score or 0.0)
+                    >= min(0.55, 0.75 * float(unique[0].score or 0.0))
+                )
             ),
             None,
         )
@@ -1369,7 +1377,7 @@ def select_diverse_sections(
             "not_required"
             if not required
             else "complete"
-            if set(required) <= covered
+            if len(covered) == len(required)
             else "missing_required_anchor"
         ),
     }
@@ -1389,15 +1397,20 @@ async def _lexical_sections(
         return [], set()
 
     semaphore = asyncio.Semaphore(max(1, settings.search_source_concurrency))
-    expanded_keys = {
+    anchor_keys = {
         normalize_lexical_text(term)
-        for term in analysis.expanded_terms
+        for term in (
+            *analysis.features.exact_terms,
+            *analysis.features.identifier_terms,
+            *analysis.features.path_terms,
+        )
+        if normalize_lexical_text(term)
     }
 
     async def one(
         source: SearchSource,
         term: str,
-    ) -> tuple[list[RetrievedSection], bool]:
+    ) -> tuple[list[RetrievedSection], str | None]:
         async with semaphore:
             try:
                 options: dict[str, Any] = {
@@ -1429,7 +1442,7 @@ async def _lexical_sections(
                     source.id,
                     type(exc).__name__,
                 )
-                return [], False
+                return [], None
         sections = [
             RetrievedSection(
                 chunk_id=row.get("chunk_id"),
@@ -1442,15 +1455,17 @@ async def _lexical_sections(
             )
             for index, row in enumerate(rows)
         ]
-        return sections, normalize_lexical_text(term) not in expanded_keys
+        term_key = normalize_lexical_text(term)
+        return sections, term_key if (anchor_keys and term_key in anchor_keys) else None
 
     groups = await asyncio.gather(*(one(source, term) for source in sources for term in terms))
-    sections = [section for group, _strong in groups for section in group]
+    sections = [section for group, _anchor_key in groups for section in group]
     exact_keys = {
         _section_key(section)
-        for group, strong in groups
-        if strong
+        for group, anchor_key in groups
+        if anchor_key
         for section in group
+        if anchor_key in normalize_lexical_text(f"{section.heading}\n{section.content}")
     }
     return sections, exact_keys
 

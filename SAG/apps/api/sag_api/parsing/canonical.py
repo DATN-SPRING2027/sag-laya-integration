@@ -357,7 +357,7 @@ def _parse_html_span(raw_val: Any, *, max_span: int = 100) -> int:
     except (TypeError, ValueError):
         return 1
     if parsed <= 0:
-        return max_span
+        return 1
     return min(parsed, max_span)
 
 

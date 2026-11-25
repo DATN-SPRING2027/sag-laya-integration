@@ -957,13 +957,21 @@ async def _project_publish_lock(project_id: str) -> AsyncIterator[None]:
 
             release_task = asyncio.create_task(_release_lock())
             try:
-                unlocked = await asyncio.shield(asyncio.wait_for(release_task, timeout=5.0))
+                unlocked = await asyncio.wait_for(asyncio.shield(release_task), timeout=5.0)
             except BaseException as unlock_exc:
                 log.exception("Could not release PostgreSQL tree publish lock; invalidating connection")
                 unlocked = False
                 if not release_task.done():
                     release_task.cancel()
-                    release_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(release_task, return_exceptions=True),
+                            timeout=1.0,
+                        )
+                    except BaseException:
+                        release_task.add_done_callback(
+                            lambda t: t.exception() if not t.cancelled() else None
+                        )
                 try:
                     await connection.invalidate()
                     invalidated = True

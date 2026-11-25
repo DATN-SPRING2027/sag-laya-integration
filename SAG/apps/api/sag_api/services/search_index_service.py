@@ -33,9 +33,9 @@ from sag_api.core.bm25_tokenizer import (
     COMMON_STOPWORDS as COMMON_STOPWORDS,
 )
 from sag_api.core.config import settings
-from sag_api.core.logging import get_logger
-from sag_api.core.errors import ApiError, is_retryable_error
 from sag_api.core.error_taxonomy import ErrorLayer, ErrorStage
+from sag_api.core.errors import ApiError, is_retryable_error
+from sag_api.core.logging import get_logger
 from sag_api.core.sanitizer import sanitize_error_message
 from sag_api.db.models.routing_rag import (
     CanonicalBlock,
@@ -1398,6 +1398,7 @@ async def reconcile_orphan_search_units(
     *,
     project_id: str,
     preserve_superseded: bool = True,
+    prune_version_ids: Sequence[str] | None = None,
     inflight_grace_minutes: int = 15,
     request_timeout: float = 30.0,
 ) -> dict[str, int]:
@@ -1455,17 +1456,23 @@ async def reconcile_orphan_search_units(
     now = datetime.now(UTC)
     grace_cutoff = now - timedelta(minutes=max(0, int(inflight_grace_minutes)))
 
+    targeted_prune_ids = {
+        str(vid).strip() for vid in (prune_version_ids or ()) if str(vid).strip()
+    }
     valid_unit_ids: set[str] = set()
     unit_ids = sorted({str(uid) for _pid, uid, _vid in point_entries if uid})
     if unit_ids:
-        ready_condition = (
-            DocumentVersion.search_status.in_(("SEARCH_READY", "READY"))
-            if preserve_superseded
-            else (
-                DocumentVersion.search_status.in_(("SEARCH_READY", "READY"))
-                & (DocumentVersion.valid_to > now)
+        if preserve_superseded:
+            if targeted_prune_ids:
+                ready_condition = DocumentVersion.search_status.in_(("SEARCH_READY", "READY")) & (
+                    DocumentVersion.id.notin_(targeted_prune_ids) | (DocumentVersion.valid_to > now)
+                )
+            else:
+                ready_condition = DocumentVersion.search_status.in_(("SEARCH_READY", "READY"))
+        else:
+            ready_condition = DocumentVersion.search_status.in_(("SEARCH_READY", "READY")) & (
+                DocumentVersion.valid_to > now
             )
-        )
         inflight_or_grace = or_(
             DocumentVersion.search_status.in_(("INDEXING", "PENDING")),
             ready_condition,
@@ -1854,6 +1861,7 @@ async def run_search_indexing_stage(
                         "project_id": project_id,
                         "reason": "superseded_prune_failed",
                         "superseded_version_id": str(superseded_version_id),
+                        "prune_superseded": True,
                     },
                 )
                 session.add(reconcile_job)

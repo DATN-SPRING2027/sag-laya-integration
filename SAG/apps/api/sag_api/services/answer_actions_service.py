@@ -1175,8 +1175,9 @@ async def prepare_regenerate(
 
     if settings.session_context_mode == "on" and scoped_prior:
         prior_records, _ = _extract_visible_records(scoped_prior)
-        ephemeral_index = IncrementalSessionIndex(thread.id)
-        await ephemeral_index.append_messages(prior_records, llm=llm)
+        principal_tenant = getattr(principal, "tenant_id", None)
+        ephemeral_index = IncrementalSessionIndex(thread.id, tenant_id=principal_tenant or "")
+        await ephemeral_index.append_messages(prior_records, llm=llm, tenant_id=principal_tenant)
         allowed_turns = set(ephemeral_index.turns_by_id.keys())
         prior_turns_payload = [
             {"role": str(rec.get("role") or ""), "content": str(rec.get("content") or "")}

@@ -106,7 +106,11 @@ def _prepared_candidate_from_manifest(
             if (
                 not isinstance(raw_ku_ids, (list, tuple))
                 or not raw_ku_ids
-                or any(not isinstance(ku_id, str) or not ku_id for ku_id in raw_ku_ids)
+                or any(
+                    not isinstance(ku_id, str) or not ku_id.strip()
+                    for ku_id in raw_ku_ids
+                )
+                or len(set(raw_ku_ids)) != len(raw_ku_ids)
             ):
                 raise PublishVerificationError("Retained tree search unit assignment knowledge_unit_ids is malformed")
             normalized_item = {**item, "knowledge_unit_ids": tuple(raw_ku_ids)}
