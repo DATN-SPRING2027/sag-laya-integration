@@ -90,6 +90,70 @@ def test_markdown_structural_parser_frontmatter_setext_fences_tables_and_boilerp
     assert all(len(b.section_path) <= 512 for b in deep_blocks)
 
 
+def test_hyphenated_page_footer_boilerplate_not_hijacked_by_list_parser():
+    def _to_canonical_blocks(extracted, version_id: str) -> list[CanonicalBlock]:
+        return [
+            CanonicalBlock(
+                id=f"{version_id}-blk-{b.ordinal}",
+                document_version_id=version_id,
+                ordinal=b.ordinal,
+                block_type=b.block_type,
+                page_from=b.page_from,
+                page_to=b.page_to,
+                section_path=b.section_path or "Root",
+                normalized_text=b.normalized_text,
+                content_hash=b.content_hash,
+                is_boilerplate=b.is_boilerplate,
+            )
+            for b in extracted
+        ]
+
+    # Case 1: standalone hyphenated page footer "- 5 -"
+    blocks_standalone = extract_canonical_blocks("- 5 -\n\nNội dung thật.", version_id="v-dash-1")
+    dash_blocks = [b for b in blocks_standalone if "- 5 -" in b.normalized_text]
+    assert len(dash_blocks) == 1
+    assert dash_blocks[0].is_boilerplate is True
+    assert dash_blocks[0].block_type == "paragraph"
+    assert any(b.normalized_text == "Nội dung thật." and not b.is_boilerplate for b in blocks_standalone)
+
+    units_standalone = search_index_service.build_search_units_from_blocks(
+        _to_canonical_blocks(blocks_standalone, "v-dash-1"),
+        document_version_id="v-dash-1",
+        security_partition_id="part-1",
+    )
+    assert len(units_standalone) == 1
+    assert "- 5 -" not in getattr(units_standalone[0], "_text_content", "")
+    assert "Nội dung thật." in getattr(units_standalone[0], "_text_content", "")
+
+    # Case 2: list immediately followed by hyphenated page footer "- 5 -"
+    blocks_after_list = extract_canonical_blocks("- item 1\n- 5 -\n\nNội dung thật.", version_id="v-dash-2")
+    list_blocks = [b for b in blocks_after_list if b.block_type == "list"]
+    assert len(list_blocks) == 1
+    assert list_blocks[0].normalized_text == "- item 1"
+    dash_blocks_2 = [b for b in blocks_after_list if b.normalized_text == "- 5 -"]
+    assert len(dash_blocks_2) == 1
+    assert dash_blocks_2[0].is_boilerplate is True
+
+    units_after_list = search_index_service.build_search_units_from_blocks(
+        _to_canonical_blocks(blocks_after_list, "v-dash-2"),
+        document_version_id="v-dash-2",
+        security_partition_id="part-1",
+    )
+    combined_units_text = "\n".join(getattr(u, "_text_content", "") for u in units_after_list)
+    assert "- item 1" in combined_units_text
+    assert "Nội dung thật." in combined_units_text
+    assert "- 5 -" not in combined_units_text
+
+    # Case 3: boilerplate followed by Setext underline or immediate body line without blank line
+    blocks_tight = extract_canonical_blocks("Page 2 of 10\n---\n\n- 5 -\nNội dung thật.", version_id="v-dash-3")
+    assert all(b.block_type != "heading" for b in blocks_tight)
+    bp_texts = [b.normalized_text for b in blocks_tight if b.is_boilerplate]
+    assert "Page 2 of 10" in bp_texts
+    assert "- 5 -" in bp_texts
+    assert any(b.normalized_text == "Nội dung thật." and not b.is_boilerplate for b in blocks_tight)
+
+
+
 @pytest.mark.asyncio
 async def test_canonical_persist_boilerplate_and_search_units_filter_and_no_heading_only():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")

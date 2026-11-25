@@ -342,7 +342,7 @@ def _is_setext_heading(lines: list[str], idx: int) -> re.Match[str] | None:
         return None
     line = lines[idx]
     stripped = line.strip()
-    if not stripped or _PAGE_MARKER_RE.match(stripped):
+    if not stripped or _PAGE_MARKER_RE.match(stripped) or is_boilerplate_text(stripped):
         return None
     if (
         _FENCE_OPEN_RE.match(line)
@@ -665,13 +665,17 @@ def extract_canonical_blocks(
             continue
 
         # 4. Khối Danh sách (List)
-        if _LIST_ITEM_RE.match(stripped):
+        if _LIST_ITEM_RE.match(stripped) and not is_boilerplate_text(stripped):
             list_lines = [line]
             idx += 1
             while idx < total_lines:
                 curr = lines[idx]
                 curr_stripped = curr.strip()
-                if not curr_stripped or _PAGE_MARKER_RE.match(curr_stripped):
+                if (
+                    not curr_stripped
+                    or _PAGE_MARKER_RE.match(curr_stripped)
+                    or is_boilerplate_text(curr_stripped)
+                ):
                     break
                 if _LIST_ITEM_RE.match(curr_stripped) or curr.startswith(("  ", "\t")):
                     list_lines.append(curr)
@@ -702,7 +706,7 @@ def extract_canonical_blocks(
         # 5. Khối Đoạn văn bản thông thường (Paragraph)
         para_lines = [line]
         idx += 1
-        while idx < total_lines:
+        while idx < total_lines and not is_boilerplate_text(stripped):
             curr = lines[idx]
             curr_stripped = curr.strip()
             if not curr_stripped:
