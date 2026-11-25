@@ -321,24 +321,114 @@ class GetEntityTool(Tool):
     )
 
     async def invoke(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        name = (args.get("name") or "").strip()
+        import unicodedata
+
+        from sqlalchemy.exc import SQLAlchemyError
+
+        import sag_api.core.db as core_db
+        from sag_api.services.query_strategy_planner import plan_query
+        from sag_api.services.search_unit_retrieval_service import retrieve_search_unit_sections
+        from sag_api.services.source_service import versioned_source_ids
+
+        name = unicodedata.normalize("NFC", (args.get("name") or "")).strip()
         if not name or not ctx.sources:
             return ToolResult(content="(Không tìm thấy thực thể này.)")
+
+        try:
+            async with core_db.SessionLocal() as session:
+                partitioned_ids = await versioned_source_ids(
+                    session, [s.id for s in ctx.sources]
+                )
+        except SQLAlchemyError as error:
+            log.warning(
+                "get_entity failed closed on versioned_source_ids lookup (%s)",
+                type(error).__name__,
+            )
+            return ToolResult(content="(Không tìm thấy thực thể này.)")
+
+        canonical_sources = [s for s in ctx.sources if s.id in partitioned_ids]
+        legacy_sources = [s for s in ctx.sources if s.id not in partitioned_ids]
+
+        content_parts: list[str] = []
+        citations: list[dict[str, Any]] = []
+        data_payload: dict[str, Any] = {}
+
+        if canonical_sources and ctx.principal is not None:
+            outcome = await retrieve_search_unit_sections(
+                ctx.engine_manager,
+                canonical_sources,
+                name,
+                principal=ctx.principal,
+                top_k=6,
+                query_strategy_plan=plan_query(name, requested_top_k=6),
+            )
+            sections = [
+                section
+                for section in outcome.sections
+                if section.canonical_evidence_verified and has_traceable_locator(section)
+            ]
+            if sections:
+                offset = max(0, ctx.citation_offset)
+                packed = build_tool_evidence_pack(
+                    sections,
+                    query=name,
+                    render=lambda candidate_sections: _format_sections(
+                        candidate_sections, offset
+                    ),
+                    context_budget_tokens=ctx.evidence_token_budget,
+                )
+                if packed.status == "sufficient" and packed.sections:
+                    source_refs = {
+                        s.sag_source_config_id: {"id": s.id, "name": s.name}
+                        for s in canonical_sources
+                    }
+                    citations = build_citations(packed.sections, source_refs)
+                    for citation in citations:
+                        citation["n"] = citation["n"] + offset
+                    content_parts.append(packed.content)
+                    data_payload.update(
+                        {
+                            "sections": packed.sections,
+                            "section_count": len(packed.sections),
+                            "entity_query": name,
+                            "source_ids": [s.id for s in canonical_sources],
+                            "_graph": SourceGraphInfo(),
+                        }
+                    )
+
         lowered = name.lower()
-        for source in ctx.sources:
+        for source in legacy_sources:
             scid = source.sag_source_config_id
             entities = await ctx.engine_manager.list_entities(scid, source=source, limit=200)
             match = next((e for e in entities if (e.name or "").lower() == lowered), None)
             if match is None:
                 match = next((e for e in entities if lowered in (e.name or "").lower()), None)
             if match is not None:
-                snippets = await ctx.engine_manager.entity_context(scid, match.id, source=source, limit=6)
-                body = "\n\n".join(snippets) if snippets else match.description or ""
-                return ToolResult(
-                    content=f"Thực thể “{match.name}” ({match.type}):\n{body}".strip(),
-                    data={"entity_id": match.id, "source_id": source.id},
+                snippets = await ctx.engine_manager.entity_context(
+                    scid, match.id, source=source, limit=6
                 )
-        return ToolResult(content="(Không tìm thấy thực thể này.)")
+                body = "\n\n".join(snippets) if snippets else match.description or ""
+                source_label = getattr(source, "name", None) or source.id
+                content_parts.append(
+                    f"Nguồn: {source_label}\nThực thể “{match.name}” ({match.type}):\n{body}".strip()
+                )
+                if "entity_id" not in data_payload:
+                    data_payload.update(
+                        {
+                            "entity_id": match.id,
+                            "source_id": source.id,
+                            "source_name": source_label,
+                        }
+                    )
+                break
+
+        if not content_parts:
+            return ToolResult(content="(Không tìm thấy thực thể này.)")
+        return ToolResult(
+            content="\n\n".join(content_parts),
+            citations=citations,
+            data=data_payload,
+        )
 
 
 class GetTimeTool(Tool):

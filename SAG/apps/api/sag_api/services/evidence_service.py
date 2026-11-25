@@ -251,7 +251,7 @@ async def resolve_traceable_evidence(
             "Exact evidence locator lookup unavailable; answer generation will fail closed (%s)",
             type(error).__name__,
         )
-        return list(sections)
+        return []
 
     by_key: dict[tuple[str, str], dict[str, Any]] = {}
     for (

@@ -40,6 +40,67 @@ async def outline(
     """文档大纲：标题 + chunk_id，按阅读顺序排列。"""
     source = await get_source(session, source_id)
     document = await get_public_document(session, source, document_id, principal=principal)
+    if source.id in await versioned_source_ids(session, [source.id]):
+        from datetime import UTC, datetime
+
+        from sqlalchemy import select
+
+        from sag_api.db.models import CanonicalBlock, DocumentVersion
+
+        if not principal.allowed_partition_ids:
+            raise NotFoundError("文档尚无大纲，可能仍在处理中")
+        now = datetime.now(UTC)
+        partition_expr = DocumentVersion.metadata_json["security_partition_id"].as_string()
+        version_id = (
+            await session.execute(
+                select(DocumentVersion.id)
+                .where(
+                    DocumentVersion.document_id == document.id,
+                    DocumentVersion.search_status.in_(("READY", "SEARCH_READY")),
+                    DocumentVersion.search_ready_at.is_not(None),
+                    DocumentVersion.valid_from <= now,
+                    DocumentVersion.valid_to > now,
+                    partition_expr.in_(sorted(principal.allowed_partition_ids)),
+                )
+                .order_by(DocumentVersion.version_no.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if not version_id:
+            raise NotFoundError("文档尚无大纲，可能仍在处理中")
+        blocks = (
+            await session.scalars(
+                select(CanonicalBlock)
+                .where(CanonicalBlock.document_version_id == version_id)
+                .order_by(CanonicalBlock.ordinal.asc())
+            )
+        ).all()
+        heading_blocks = [b for b in blocks if b.block_type == "heading"]
+        outline_rows: list[dict[str, object]] = []
+        if heading_blocks:
+            for rank, blk in enumerate(heading_blocks):
+                heading_text = (blk.normalized_text or blk.section_path or "").strip()
+                if heading_text:
+                    outline_rows.append(
+                        {"rank": rank, "heading": heading_text, "chunk_id": blk.id}
+                    )
+        else:
+            seen_paths: set[str] = set()
+            for blk in blocks:
+                sp = (blk.section_path or "").strip()
+                if sp and sp not in seen_paths:
+                    seen_paths.add(sp)
+                    outline_rows.append(
+                        {"rank": len(outline_rows), "heading": sp, "chunk_id": blk.id}
+                    )
+        if not outline_rows:
+            raise NotFoundError("文档尚无大纲，可能仍在处理中")
+        return OutlineOut(
+            document_id=document.id,
+            filename=document.filename,
+            outline=outline_rows,
+        )
+
     if not document.sag_source_id:
         raise NotFoundError("文档尚无大纲，可能仍在处理中")
     rows = await engine_manager.list_chunk_headings(
