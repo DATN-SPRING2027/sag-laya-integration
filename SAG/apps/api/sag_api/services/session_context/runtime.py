@@ -766,6 +766,7 @@ async def prepare_session_context_for_ask(
             has_sources=(requested_source_ids is None or bool(requested_source_ids)),
             scoped=bool(requested_source_ids),
             context=route_ctx,
+            llm_client=llm if settings.decision_provider == "llm" else None,
         )
     ).to_dict()
 

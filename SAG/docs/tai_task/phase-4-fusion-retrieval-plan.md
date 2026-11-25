@@ -1,5 +1,7 @@
 # Kế hoạch Thực thi: DATN-67 Phase 4 Fusion & Retrieval Regression
 
+> **SUPERSEDED / HISTORICAL NOTE (2026-11-25):** Tài liệu kế hoạch lịch sử. Trong runtime hiện tại (`sag_api/services/retrieval_service.py`), điểm số hybrid sử dụng công thức tuyến tính `min(1.0, 0.56 * fused_rrf + 0.32 * lexical_score + 0.12 * relative_semantic_score)` kèm ngưỡng cosine tuyệt đối (`search_min_dense_score`), số lượng kết quả do `RetrievalPlan` thích ứng (`5`–`50`) điều phối trên tập ứng viên ban đầu (`search_top_k=8`), và các bộ test cũ (`tests/test_phase_4_fusion_retrieval.py`, `tests/test_retrieval_relevance.py`, `tests/test_search_unit_retrieval_service.py`, `tests/test_search_strategy.py`, `tests/test_search_stream.py` — *[historical — removed from repo]*) đã được thay thế bởi `tests/test_p1_grounding_retrieval.py`, `tests/test_p2_retrieval_plan_and_query_analysis.py`, `tests/test_adaptive_retrieval.py`, `tests/test_search_index_consistency.py` và `tests/test_audit_remediation.py`.
+>
 > **Nguồn chuẩn:** `SAG/tasks/plan.md` (Phase 4, Task P4.2 & P4.4, Checkpoints P4.2 / P4 Complete) và `SAG/tasks/todo.md` (Phase 4).  
 > **Nhánh làm việc:** `feat/Tai-DATN-67-phase-4-fusion-retrieval`  
 > **Nguyên tắc Ponytail:** Tối giản tối đa diff code, chỉ giải quyết đúng yêu cầu bài toán, không viết code thừa, tập trung vào tính bao phủ và sự vững chắc của test hồi quy.

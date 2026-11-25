@@ -44,7 +44,7 @@ Trong quá trình phát triển ban đầu của `sag-laya-integration`:
 
 1. **Shim di trú ngược một chiều (Backward-Compatibility):**
    - Giữ lại `_migrate_legacy_decision_config` (`core/config.py`) và `_normalize_overrides` (`services/settings_service.py`) để tự động chuyển dữ liệu/cấu hình cũ (`"laya"`, `"openrouter"`, `"typesafe/jev-1.14"`) sang `"siliconflow"` / `"Kev-4b"` và loại bỏ khóa `openrouter_api_key`, `laya_model_path`, `laya_device` khi đọc từ DB cũ lúc khởi động.
-   - Trong `reprocess_document`, xóa phòng vệ các khóa `remote_object_sourced` / `remote_source_url` nếu còn tồn đọng trong `Job.payload` cũ.
+   - Trong `reprocess_document` (`document_service.py:319-340`), khi `restart_from_scratch=True` hệ thống khởi tạo lại payload mới (không kế thừa payload cũ), và runtime không còn đọc bất kỳ khóa `remote_object_sourced` / `remote_source_url` nào nếu có trong `Job.payload` lịch sử.
 2. **Cập nhật cấu hình & tài liệu:**
    - Xóa các biến Laya/OpenRouter/E2/R2 chết khỏi `SAG/.env`, `SAG/.env.example`, và `SAG/compose.yaml`.
    - Đánh dấu `> **SUPERSEDED (2026-11-25):**` ở đầu các tài liệu lịch sử (`README.md` gốc, `SAG/docs/phase-0-contracts-and-foundations.md`, `SAG/docs/phase-1-2-report.md`, `SAG/docs/phase-3-review-report.md`, `SAG/docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1.md`, `SAG/tasks/plan.md`, `SAG/tasks/todo.md`) và cập nhật `SAG/README.md` trỏ tới ADR này cùng `docs/adr-remove-e2-llm-enrichment.md`.

@@ -1093,7 +1093,8 @@ async def test_http_model_a_to_http_model_b_drift_with_warm_cache_and_provenance
         assert len(model_a.batches) >= 1
         assert qdrant.collections[col_name]["vectors"]["content_vector"]["size"] == 64
 
-        # 2. Switch to same-dim HTTP Model B (`dim=64`) WITHOUT clearing `_SHARED_TEXT_EMBEDDING_CACHE` or `SESSION_INDEX_CACHE`!
+        # 2. Switch to same-dim HTTP Model B (`dim=64`) WITHOUT clearing
+        #    `_SHARED_TEXT_EMBEDDING_CACHE` or `SESSION_INDEX_CACHE`!
         #    S3-04: collection is never dropped on dimension mismatch; same-dim model swap updates points cleanly.
         model_b = _CountingHttpModelEmbedder(model="provider/model-B", dim=64)
         pack_b = await prepare_session_context_for_ask(
@@ -2015,3 +2016,79 @@ async def test_reconcile_orphan_session_units_enforces_acl_and_purges_revoked_un
 
     await q_client.aclose()
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_prepare_session_context_forwards_llm_client_to_route_query_async(monkeypatch):
+    from sag_api.services.decision_router import IntentFlags, UnifiedRouteDecision
+    from sag_api.services.session_context import runtime as sc_runtime
+
+    engine = await _make_fk_sqlite_engine()
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    principal = _principal(project_id="proj-llm-fwd")
+    owner_key = "owner-llm-fwd"
+    captured_calls: list[dict[str, Any]] = []
+
+    async def fake_route_query_async(query: str, **kwargs):
+        captured_calls.append({"query": query, **kwargs})
+        return UnifiedRouteDecision(
+            query=query,
+            coarse_intent="KNOWLEDGE",
+            question_scope="project",
+            memory_scope="project_documents",
+            temporal_mode="current_effective",
+            answer_shape="fact_answer",
+            intent_flags=IntentFlags(needs_retrieval=True),
+            domain="general",
+            confidence=0.95,
+        )
+
+    monkeypatch.setattr(sc_runtime, "route_query_async", fake_route_query_async)
+    custom_llm = StructuredExtractorTestLLM()
+
+    try:
+        async with session_factory() as session:
+            agent = Agent(owner_key=owner_key, name="LLM Fwd Agent")
+            session.add(agent)
+            await session.flush()
+            thread = Thread(agent_id=agent.id, owner_key=owner_key, title="LLM Fwd Thread")
+            session.add(thread)
+            await session.flush()
+            msg = Message(
+                id="msg-llm-fwd",
+                thread_id=thread.id,
+                role=MessageRole.USER,
+                content="Chính sách bảo mật là gì?",
+            )
+            session.add(msg)
+            await session.commit()
+
+            monkeypatch.setattr(sc_runtime.settings, "decision_provider", "llm")
+            await prepare_session_context_for_ask(
+                session,
+                thread_id=thread.id,
+                exclude_message_id=msg.id,
+                query=msg.content,
+                principal=principal,
+                owner_key=owner_key,
+                requested_source_ids=None,
+                budget_tokens=900,
+                llm=custom_llm,
+            )
+            assert captured_calls[-1]["llm_client"] is custom_llm
+
+            monkeypatch.setattr(sc_runtime.settings, "decision_provider", "siliconflow")
+            await prepare_session_context_for_ask(
+                session,
+                thread_id=thread.id,
+                exclude_message_id=msg.id,
+                query=msg.content,
+                principal=principal,
+                owner_key=owner_key,
+                requested_source_ids=None,
+                budget_tokens=900,
+                llm=custom_llm,
+            )
+            assert captured_calls[-1]["llm_client"] is None
+    finally:
+        await engine.dispose()

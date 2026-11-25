@@ -15,7 +15,10 @@ class SearchRequest(BaseModel):
     top_k: int | None = Field(
         default=None,
         ge=1,
-        description="Optional explicit result limit; defaults to 7-axis RetrievalPlan cardinality (5 for standard passage Q&A, up to 50 for document listing).",
+        description=(
+            "Optional explicit result limit; defaults to 7-axis RetrievalPlan cardinality "
+            "(5 for standard passage Q&A, up to 50 for document listing)."
+        ),
     )
 
 
@@ -27,7 +30,10 @@ class GlobalSearchRequest(BaseModel):
     top_k: int | None = Field(
         default=None,
         ge=1,
-        description="Optional explicit result limit; defaults to 7-axis RetrievalPlan cardinality (5 for standard passage Q&A, up to 50 for document listing).",
+        description=(
+            "Optional explicit result limit; defaults to 7-axis RetrievalPlan cardinality "
+            "(5 for standard passage Q&A, up to 50 for document listing)."
+        ),
     )
     strategy: SearchStrategy | None = None
     retrieval_mode: (
@@ -61,10 +67,9 @@ class SectionOut(BaseModel):
     content: str
     score: float = Field(
         description=(
-            "Normalized reciprocal-rank fusion (RRF) score in [0, 1]. "
-            "When dense and lexical retrieval are both active, a top-ranked candidate "
-            "returned by only one retriever can score 0.5. This is not cosine "
-            "similarity or a relevance probability."
+            "Hybrid relevance score in [0, 1] computed as "
+            "min(1.0, 0.56 * fused_rrf + 0.32 * lexical_score + 0.12 * relative_semantic_score). "
+            "This is not raw cosine similarity or a calibrated relevance probability."
         )
     )
     rank: int
@@ -146,7 +151,14 @@ class EvalCompareRequest(BaseModel):
     query: str = Field(min_length=1, max_length=4000)
     strategies: list[SearchStrategy] = Field(min_length=2, max_length=4)
     source_ids: list[str] | None = Field(default=None, max_length=256)
-    top_k: int | None = Field(default=None, ge=1, description="SAG retrieval currently uses fixed Top-5.")
+    top_k: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Optional explicit result limit; defaults to adaptive RetrievalPlan cardinality "
+            "(5–50) over search_top_k (default 8) initial candidates."
+        ),
+    )
     judge: bool = True  # 前端可临时关掉;是否真的调 LLM 还看后台 settings 开关
 
 

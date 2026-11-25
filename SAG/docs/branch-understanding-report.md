@@ -76,8 +76,8 @@ docker compose -f compose.yaml -f compose.postgres.yaml up -d --build
 - Ruff cho OCTX model/service: **pass**.
 - OCTX focused tests: **12 passed, 1 deselected**.
 - Import `sag_api.main` với SQLite test environment: **pass**.
-- Qdrant adapter có test HTTP mock tại
-  `apps/api/tests/test_qdrant_vector_store.py`.
+- Qdrant adapter từng được kiểm chứng bởi HTTP mock tại
+  `apps/api/tests/test_qdrant_vector_store.py` *[historical — removed from repo; thay thế bởi `tests/test_p3_embedding_integrity.py`, `tests/test_p3_qdrant_lifecycle_and_session_safety.py`, và `tests/test_live_integration.py`]*.
 - Pyrefly được cấu hình trỏ về `apps/api/.venv`.
 
 ## Điểm còn tồn tại
