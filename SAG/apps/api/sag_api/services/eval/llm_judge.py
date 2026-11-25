@@ -53,8 +53,7 @@ def _format_sections(sections: list[RetrievedSection]) -> str:
     for index, section in enumerate(trimmed, 1):
         heading = _clip(section.heading, 120) or "(Untitled)"
         content = _clip(section.content)
-        score = f"{float(section.score or 0.0):.3f}"
-        lines.append(f"[{index}] score={score} Heading: {heading}\n    Excerpt: {content}")
+        lines.append(f"[{index}] Heading: {heading}\n    Excerpt: {content}")
     return "\n".join(lines)
 
 
@@ -65,19 +64,19 @@ def build_pairwise_prompt(
     b_label: str,
     b_sections: list[RetrievedSection],
 ) -> list[dict[str, str]]:
-    """Build chat messages for the pairwise retrieval judge."""
-
+    """Build blind chat messages (Option 1 / Option 2) without leaking strategy names or scores."""
+    del a_label, b_label
     system = (
-        "You are a retrieval quality evaluator. Given a user question and two sets of retrieved evidence, "
-        "determine which set better supports an accurate answer to the question. "
+        "You are a retrieval quality evaluator. Given a user question and two anonymized sets of retrieved evidence "
+        "(Option 1 and Option 2), determine which option better supports an accurate answer to the question. "
         "Evaluate only the provided evidence; do not introduce external knowledge. "
-        'Output strictly in JSON: {"winner": "A" | "B" | "tie", "reason": "One-sentence explanation"}. '
-        "Prefer higher coverage, stronger relevance, and less noise; choose tie if neither set can answer."
+        'Output strictly in JSON: {"winner": "Option 1" | "Option 2" | "tie", "reason": "One-sentence explanation"}. '
+        "Prefer higher coverage, stronger relevance, and less noise; choose tie if neither option can answer."
     )
     user = (
         f"Question: {query.strip()}\n\n"
-        f"=== Result A (strategy: {a_label}) ===\n{_format_sections(a_sections)}\n\n"
-        f"=== Result B (strategy: {b_label}) ===\n{_format_sections(b_sections)}\n"
+        f"=== Option 1 ===\n{_format_sections(a_sections)}\n\n"
+        f"=== Option 2 ===\n{_format_sections(b_sections)}\n"
     )
     return [
         {"role": "system", "content": system},
@@ -86,33 +85,32 @@ def build_pairwise_prompt(
 
 
 def _parse_verdict(text: str) -> tuple[str, str] | None:
-    """Extract winner/reason from raw LLM text; return None on parse or schema error."""
+    """Extract normalized option winner ('1' | '2' | 'tie') and reason; return None on parse/schema error."""
     data = decode_json_object(text or "")
     if not isinstance(data, dict):
         return None
-    raw_winner = str(data.get("winner", "")).strip().upper()
-    if raw_winner not in {"A", "B", "TIE"}:
+    raw_winner = " ".join(str(data.get("winner", "")).strip().upper().split())
+    if raw_winner in {"OPTION 1", "OPTION_1", "1", "A"}:
+        winner = "1"
+    elif raw_winner in {"OPTION 2", "OPTION_2", "2", "B"}:
+        winner = "2"
+    elif raw_winner == "TIE":
+        winner = "tie"
+    else:
         return None
     reason = str(data.get("reason", "") or "").strip() or "judge did not provide a reason"
-    return raw_winner.lower() if raw_winner == "TIE" else raw_winner, reason
+    return winner, reason
 
 
-async def judge_pairwise(
+async def _run_judge_pass(
     llm: Any,
     query: str,
-    a_label: str,
-    a_sections: list[RetrievedSection],
-    b_label: str,
-    b_sections: list[RetrievedSection],
-) -> JudgeVerdict | None:
-    """跑一次 pairwise judge;LLM 未配置、调用失败或 JSON 无效返回 None。
-
-    None 语义:调用方应把结果视为「未打分」,不要伪装成 tie 混入胜率统计。
-    """
-
-    if llm is None or not getattr(llm, "configured", False):
-        return None
-    messages = build_pairwise_prompt(query, a_label, a_sections, b_label, b_sections)
+    first_label: str,
+    first_sections: list[RetrievedSection],
+    second_label: str,
+    second_sections: list[RetrievedSection],
+) -> tuple[str, str, str] | None:
+    messages = build_pairwise_prompt(query, first_label, first_sections, second_label, second_sections)
     try:
         raw = await llm.complete(messages, response_format={"type": "json_object"})
     except Exception as error:  # noqa: BLE001
@@ -123,10 +121,48 @@ async def judge_pairwise(
         log.warning("LLM judge returned invalid/unparseable JSON verdict; returning None")
         return None
     winner, reason = parsed
+    return winner, reason, raw
+
+
+async def judge_pairwise(
+    llm: Any,
+    query: str,
+    a_label: str,
+    a_sections: list[RetrievedSection],
+    b_label: str,
+    b_sections: list[RetrievedSection],
+) -> JudgeVerdict | None:
+    """Run blind bidirectional A/B + B/A pairwise judge; return None on error, bad JSON, or position bias.
+
+    None semantics: callers must treat the pair as unscored/invalid rather than coercing to tie.
+    """
+    if llm is None or not getattr(llm, "configured", False):
+        return None
+
+    forward = await _run_judge_pass(llm, query, a_label, a_sections, b_label, b_sections)
+    if forward is None:
+        return None
+    reverse = await _run_judge_pass(llm, query, b_label, b_sections, a_label, a_sections)
+    if reverse is None:
+        return None
+
+    fwd_choice, fwd_reason, fwd_raw = forward
+    rev_choice, _rev_reason, rev_raw = reverse
+
+    fwd_mapped = {"1": "A", "2": "B", "tie": "tie"}[fwd_choice]
+    rev_mapped = {"1": "B", "2": "A", "tie": "tie"}[rev_choice]
+    if fwd_mapped != rev_mapped:
+        log.warning(
+            "LLM judge disagreed across swapped A/B order (forward=%s, reverse=%s); returning None",
+            fwd_mapped,
+            rev_mapped,
+        )
+        return None
+
     return JudgeVerdict(
-        winner=winner,
-        reason=reason,
-        raw=raw,
+        winner=fwd_mapped,
+        reason=fwd_reason,
+        raw=f"forward: {fwd_raw}\nreverse: {rev_raw}",
         a_label=a_label,
         b_label=b_label,
     )
