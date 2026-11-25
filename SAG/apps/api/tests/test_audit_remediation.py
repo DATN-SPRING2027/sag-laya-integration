@@ -749,9 +749,11 @@ def test_first_principles_stage1_to_stage5_architectural_upgrades() -> None:
     )
     assert blocks[0].section_path == "3M 2018 10K Note6 PPE > Consolidated Balance Sheets"
 
-    # Sparse BM25 indexes normalized thousand-separated numbers, ampersand initialisms, and alphanumeric tokens
+    # P4 (S2-07): Sparse BM25 drops _THOUSANDS_COMMA_RE (which corrupted Vietnamese decimal "1,500")
+    # and drops r&d->rd rewrite; "$8,738M" tokenizes as "8" and "738m" consistently between index and query.
     sparse = compute_sparse_bm25_vector("In FY2018, R&D recorded $8,738M of capital assets.")
-    assert set(build_sparse_query_vector("8738m")["indices"]) <= set(sparse["indices"])
+    assert set(build_sparse_query_vector("8,738M")["indices"]) <= set(sparse["indices"])
+    assert set(build_sparse_query_vector("738m")["indices"]) <= set(sparse["indices"])
     assert set(build_sparse_query_vector("2018")["indices"]) <= set(sparse["indices"])
     assert set(build_sparse_query_vector("R&D")["indices"]) <= set(sparse["indices"])
 

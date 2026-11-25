@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import math
-import re
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any
@@ -13,7 +11,14 @@ from urllib.parse import quote
 
 import httpx
 
-from sag_api.services.search_index_service import COMMON_STOPWORDS
+from sag_api.core.bm25_tokenizer import (
+    BM25_STEM_WEIGHT,
+    COMMON_STOPWORDS,
+    english_stem,
+    expand_continuous_script_tokens,
+    token_hash_bucket,
+    tokenize_bm25_tokens,
+)
 
 
 class SearchIndexUnavailable(RuntimeError):
@@ -27,11 +32,6 @@ class SearchUnitHit:
     payload: dict[str, Any]
 
 
-_TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
-_CONTINUOUS_SCRIPT_RUN_RE = re.compile(
-    r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
-    r"\u0e00-\u0e7f\u0e80-\u0eff\u1780-\u17ff\u1000-\u109f]+"
-)
 _TRANSIENT_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 _SPARSE_QUERY_STOPWORDS = COMMON_STOPWORDS
 _QUERY_FRAMING_STOPWORDS = frozenset(
@@ -45,94 +45,40 @@ _QUERY_FRAMING_STOPWORDS = frozenset(
 
 def _expand_continuous_script_tokens(tokens: list[str]) -> list[str]:
     """Split unspaced CJK/Thai/Lao/Khmer/Myanmar runs into overlapping character bigrams."""
-    out: list[str] = []
-    for tok in tokens:
-        if not _CONTINUOUS_SCRIPT_RUN_RE.search(tok):
-            out.append(tok)
-            continue
-        last_end = 0
-        for match in _CONTINUOUS_SCRIPT_RUN_RE.finditer(tok):
-            if match.start() > last_end:
-                prefix = tok[last_end : match.start()]
-                if prefix:
-                    out.append(prefix)
-            run = match.group(0)
-            if len(run) == 1:
-                out.append(run)
-            else:
-                for pos in range(len(run) - 1):
-                    out.append(run[pos : pos + 2])
-            last_end = match.end()
-        if last_end < len(tok):
-            suffix = tok[last_end:]
-            if suffix:
-                out.append(suffix)
-    return out
+    return expand_continuous_script_tokens(tokens)
 
 
 def build_sparse_query_vector(query: str) -> dict[str, list[int] | list[float]]:
-    """Encode query terms with Phase 2C's tokenizer and stable MD5 buckets.
+    """Encode query terms with the unified Unicode BM25 tokenizer and stable MD5 buckets.
 
     Uses sub-linear query TF and alphanumeric/entity boosting so repeated framing words
     never drown out discriminative entity, numeric, or domain anchors.
     """
-    import unicodedata
+    tokenized = tokenize_bm25_tokens(query, filter_stopwords=True)
+    if not tokenized.expanded_tokens:
+        return {"indices": [], "values": []}
 
-    normalized_q = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", unicodedata.normalize("NFC", query or ""))
-    normalized_q = re.sub(
-        r"\b([a-z]{1,2})\s*&\s*([a-z]{1,2})\b",
-        r"\1\2",
-        normalized_q,
-        flags=re.IGNORECASE,
-    )
-    orig_tokens = _TOKEN_PATTERN.findall(normalized_q)
-    proper_tokens = {
-        tok.lower()
-        for idx, tok in enumerate(orig_tokens)
-        if idx > 0 and any(ch.isupper() for ch in tok) and len(tok) >= 2
-    }
-    raw_tokens = [tok.lower() for tok in orig_tokens]
-    if _CONTINUOUS_SCRIPT_RUN_RE.search(normalized_q):
-        raw_tokens = _expand_continuous_script_tokens(raw_tokens)
-    filtered_tokens = [t for t in raw_tokens if t not in _SPARSE_QUERY_STOPWORDS]
-    active_tokens = filtered_tokens if filtered_tokens else raw_tokens
-
-    # Expand glued alphanumeric identifiers (e.g. fy2018 -> fy2018, 2018)
-    expanded_tokens: list[str] = list(active_tokens)
-    for tok in active_tokens:
-        if tok.isalnum() and not tok.isalpha() and not tok.isdigit() and len(tok) >= 3:
-            for sub in re.findall(r"[a-z]+|\d{2,}", tok):
-                if len(sub) >= 2 and sub not in _SPARSE_QUERY_STOPWORDS:
-                    expanded_tokens.append(sub)
-
-    counts = Counter(expanded_tokens)
-    is_long_query = len(active_tokens) >= 6
+    counts = Counter(tokenized.expanded_tokens)
+    is_long_query = len(tokenized.tokens) >= 6
     sparse: dict[int, float] = {}
     for token, frequency in counts.items():
-        # Sub-linear TF saturation prevents repeated corpus-title words from dominating
         base_tf = 1.0 + 0.35 * math.log(frequency) if frequency > 1 else 1.0
         if is_long_query and token in _QUERY_FRAMING_STOPWORDS:
             weight = base_tf * 0.2
-        elif is_long_query and (any(ch.isdigit() for ch in token) or token in proper_tokens):
+        elif is_long_query and (any(ch.isdigit() for ch in token) or token in tokenized.proper_tokens):
             weight = base_tf * 2.2
         else:
             weight = base_tf
 
-        token_id = int(hashlib.md5(token.encode("utf-8")).hexdigest()[:8], 16) % 1_000_000
+        token_id = token_hash_bucket(token)
         sparse[token_id] = max(sparse.get(token_id, 0.0), round(float(weight), 4))
-        if token.isascii() and token.isalpha():
-            stem = (
-                token[:-3]
-                if len(token) >= 7 and token.endswith("ing")
-                else token[:-2]
-                if len(token) >= 6 and token.endswith("ed") and not token.endswith("eed")
-                else token[:-1]
-                if len(token) >= 5 and token.endswith("s") and not token.endswith(("ss", "us", "is"))
-                else None
+        stem = english_stem(token)
+        if stem:
+            stem_id = token_hash_bucket(stem)
+            sparse[stem_id] = max(
+                sparse.get(stem_id, 0.0),
+                round(float(weight) * BM25_STEM_WEIGHT, 4),
             )
-            if stem and len(stem) >= 4:
-                stem_id = int(hashlib.md5(stem.encode("utf-8")).hexdigest()[:8], 16) % 1_000_000
-                sparse[stem_id] = max(sparse.get(stem_id, 0.0), round(float(weight) * 0.6, 4))
     indices = sorted(sparse)
     return {"indices": indices, "values": [sparse[index] for index in indices]}
 

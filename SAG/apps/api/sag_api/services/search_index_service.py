@@ -23,6 +23,15 @@ import httpx
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sag_api.core.bm25_tokenizer import (
+    BM25_STEM_WEIGHT,
+    english_stem,
+    token_hash_bucket,
+    tokenize_bm25_tokens,
+)
+from sag_api.core.bm25_tokenizer import (
+    COMMON_STOPWORDS as COMMON_STOPWORDS,
+)
 from sag_api.core.config import settings
 from sag_api.core.logging import get_logger
 from sag_api.core.errors import ApiError, is_retryable_error
@@ -193,24 +202,6 @@ def generate_search_unit_point_id(collection_name: str, unit_id: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"sag:qdrant:{collection_name}:{unit_id}"))
 
 
-COMMON_STOPWORDS: frozenset[str] = frozenset(
-    {
-        # English function words & question particles
-        "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with",
-        "by", "from", "up", "about", "into", "over", "after", "is", "are", "was", "were",
-        "be", "been", "being", "have", "has", "had", "do", "does", "did", "can", "could",
-        "this", "that", "these", "those", "it", "its", "as",
-        "what", "when", "where", "who", "whom", "whose", "which", "why", "how",
-        # Vietnamese function words, prepositions, conjunctions & question particles
-        "là", "và", "của", "cho", "với", "trong", "được", "có", "đã", "đang", "sẽ",
-        "các", "những", "một", "này", "đó", "tại", "về", "từ", "theo", "khi", "như",
-        "bởi", "vì", "nếu", "thì", "mà", "để", "đến", "tới", "ra", "vào", "lên", "xuống",
-        "cũng", "vẫn", "đều", "chỉ", "rất", "quá", "lắm", "rồi", "hay", "hoặc", "nhưng",
-        "gì", "nào", "ai", "đâu", "sao", "thế", "bao", "nhiêu", "không", "chưa", "phải",
-    }
-)
-
-
 def compute_sparse_bm25_vector(
     text: str,
     *,
@@ -220,68 +211,19 @@ def compute_sparse_bm25_vector(
     corpus_doc_freqs: dict[str, int] | None = None,
     total_corpus_docs: int = 1000,
 ) -> dict[str, list]:
-    """Compute BM25 saturated term-frequency sparse vector (relying on Qdrant native IDF when corpus_doc_freqs is None)."""
+    """Compute BM25 saturated term-frequency sparse vector using the unified Unicode tokenizer."""
     import math
-    import re
-    import unicodedata
     from collections import Counter
 
-    continuous_script_re = re.compile(
-        r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
-        r"\u0e00-\u0e7f\u0e80-\u0eff\u1780-\u17ff\u1000-\u109f]+"
-    )
-
-    # Normalize Unicode to NFC first so decomposed Vietnamese marks never split tokens,
-    # then normalize thousand-separated numbers (1,577 -> 1577) and ampersand initialisms (R&D -> rd)
-    nfc_text = unicodedata.normalize("NFC", text or "")
-    cleaned_text = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", nfc_text.lower())
-    cleaned_text = re.sub(r"\b([a-z]{1,2})\s*&\s*([a-z]{1,2})\b", r"\1\2", cleaned_text)
-    raw_word_tokens = re.findall(r"\w+", cleaned_text)
-    if not raw_word_tokens:
+    tokenized = tokenize_bm25_tokens(text, filter_stopwords=True)
+    if not tokenized.tokens:
         return {"indices": [], "values": []}
 
-    if continuous_script_re.search(cleaned_text):
-        tokens: list[str] = []
-        for tok in raw_word_tokens:
-            if not continuous_script_re.search(tok):
-                tokens.append(tok)
-                continue
-            last_end = 0
-            for match in continuous_script_re.finditer(tok):
-                if match.start() > last_end:
-                    prefix = tok[last_end : match.start()]
-                    if prefix:
-                        tokens.append(prefix)
-                run = match.group(0)
-                if len(run) == 1:
-                    tokens.append(run)
-                else:
-                    for pos in range(len(run) - 1):
-                        tokens.append(run[pos : pos + 2])
-                last_end = match.end()
-            if last_end < len(tok):
-                suffix = tok[last_end:]
-                if suffix:
-                    tokens.append(suffix)
-    else:
-        tokens = raw_word_tokens
-
-    # Expand glued alphanumeric tokens (e.g. fy2018 -> fy2018, 2018) so years/codes match either form
-    expanded_tokens: list[str] = list(tokens)
-    for tok in tokens:
-        if tok.isalnum() and not tok.isalpha() and not tok.isdigit() and len(tok) >= 3:
-            for sub in re.findall(r"[a-z]+|\d{2,}", tok):
-                if len(sub) >= 2:
-                    expanded_tokens.append(sub)
-
-    doc_len = len(tokens)
-    counts = Counter(expanded_tokens)
+    doc_len = len(tokenized.tokens)
+    counts = Counter(tokenized.expanded_tokens)
     sparse_map: dict[int, float] = {}
 
     for word, tf in counts.items():
-        # When corpus_doc_freqs is explicitly provided, apply Robertson-Spärck Jones IDF locally;
-        # otherwise emit pure BM25 length-normalized TF so Qdrant's native `modifier: "idf"` computes
-        # exact corpus-wide IDF across every language without hardcoded stopword distortion.
         if corpus_doc_freqs is not None:
             if word in corpus_doc_freqs:
                 df = corpus_doc_freqs[word]
@@ -291,28 +233,19 @@ def compute_sparse_bm25_vector(
         else:
             idf = 1.0
 
-        # BM25 term saturation with document-length normalization
         len_norm = 1.0 - b + b * (doc_len / avg_doc_len)
         tf_weight = (tf * (k1 + 1.0)) / (tf + k1 * len_norm)
         bm25_weight = idf * tf_weight
 
-        # Deterministic 32-bit token hash index for Qdrant sparse vector
-        token_idx = int(hashlib.md5(word.encode("utf-8")).hexdigest()[:8], 16) % 1000000
-        # Deduplicate indices and preserve highest weight on hash collision for Qdrant uniqueness
+        token_idx = token_hash_bucket(word)
         sparse_map[token_idx] = max(sparse_map.get(token_idx, 0.0), round(bm25_weight, 4))
-        if word.isascii() and word.isalpha():
-            stem = (
-                word[:-3]
-                if len(word) >= 7 and word.endswith("ing")
-                else word[:-2]
-                if len(word) >= 6 and word.endswith("ed") and not word.endswith("eed")
-                else word[:-1]
-                if len(word) >= 5 and word.endswith("s") and not word.endswith(("ss", "us", "is"))
-                else None
+        stem = english_stem(word)
+        if stem:
+            stem_idx = token_hash_bucket(stem)
+            sparse_map[stem_idx] = max(
+                sparse_map.get(stem_idx, 0.0),
+                round(bm25_weight * BM25_STEM_WEIGHT, 4),
             )
-            if stem and len(stem) >= 4:
-                stem_idx = int(hashlib.md5(stem.encode("utf-8")).hexdigest()[:8], 16) % 1000000
-                sparse_map[stem_idx] = max(sparse_map.get(stem_idx, 0.0), round(bm25_weight * 0.55, 4))
 
     sorted_indices = sorted(sparse_map.keys())
     return {

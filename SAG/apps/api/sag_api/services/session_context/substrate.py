@@ -19,6 +19,7 @@ from typing import Any
 
 import igraph as ig
 
+from sag_api.core.bm25_tokenizer import tokenize_bm25_tokens
 from sag_api.core.logging import get_logger
 from sag_api.core.text_utils import normalize_text
 from sag_api.generation.prompt import estimate_tokens
@@ -101,17 +102,10 @@ def deterministic_ngram_vector(text: str, dim: int = FALLBACK_VECTOR_DIM) -> tup
 
 def tokenize_bm25_terms(text: str) -> tuple[dict[str, int], int]:
     """Tokenize text identically to search_index_service.compute_sparse_bm25_vector for dynamic corpus IDF."""
-    cleaned_text = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", normalize_session_text(text).lower())
-    tokens = re.findall(r"\w+", cleaned_text)
-    if not tokens:
+    tokenized = tokenize_bm25_tokens(text, filter_stopwords=True)
+    if not tokenized.tokens:
         return {}, 1
-    expanded_tokens: list[str] = list(tokens)
-    for tok in tokens:
-        if tok.isalnum() and not tok.isalpha() and not tok.isdigit() and len(tok) >= 3:
-            for sub in re.findall(r"[a-z]+|\d{2,}", tok):
-                if len(sub) >= 2:
-                    expanded_tokens.append(sub)
-    return dict(Counter(expanded_tokens)), max(1, len(tokens))
+    return dict(Counter(tokenized.expanded_tokens)), max(1, len(tokenized.tokens))
 
 
 def declared_embedder_dim(embedder: Any | None) -> int | None:
