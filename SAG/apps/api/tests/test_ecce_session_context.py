@@ -927,7 +927,7 @@ async def test_pr46_compound_citations_and_recent_turn_provenance() -> None:
     ]
     raw_answer = (
         "Tài liệu [1, 2], phiên [S1, S2], hỗn hợp [1, S1], suy diễn [S2, S99], "
-        "khoảng số [1, 100], và mã nguồn `[1, S99]`.\n```txt\n[S99, 99]\n```"
+        "trích dẫn lẫn mã ảo [1, 100], và mã nguồn `[1, S99]`.\n```txt\n[S99, 99]\n```"
     )
     after_doc, verified_docs = agent_service._finalize_answer_citations(raw_answer, doc_pool)
     final_text, verified_session, has_explicit = agent_service._finalize_session_citations(
@@ -941,7 +941,9 @@ async def test_pr46_compound_citations_and_recent_turn_provenance() -> None:
     assert "[1, S1]" in final_text
     assert "[S2]" in final_text
     assert "S99]" not in final_text.split("`")[0]
-    assert "[1, 100]" in final_text
+    # S5-01 fix: compound numeric brackets filter out untraceable numbers individually ([1, 100] -> [1]).
+    assert "[1, 100]" not in final_text
+    assert "trích dẫn lẫn mã ảo [1]," in final_text
     assert "`[1, S99]`" in final_text
 
     step_entry = agent_service._build_session_audit_step(

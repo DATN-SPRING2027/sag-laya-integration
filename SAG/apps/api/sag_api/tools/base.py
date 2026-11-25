@@ -53,6 +53,7 @@ class ToolContext:
     search_context_called: bool = False
     search_context_no_answer_reason: str | None = None
     search_context_unavailable: bool = False
+    citation_numbers_by_call_id: dict[str, set[int]] = field(default_factory=dict)
 
 
 @dataclass

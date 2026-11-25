@@ -441,7 +441,7 @@ def _finalize_answer_citations(
             return match.group(0)
         if len(raw_items) == 1:
             token = raw_items[0]
-            if token.startswith("S"):
+            if token[:1].upper() == "S" and token[1:].isdigit():
                 return match.group(0)
             number = int(token)
             if number not in traceable:
@@ -450,18 +450,22 @@ def _finalize_answer_citations(
                 used.append(number)
             return match.group(0)
 
-        has_session_token = any(item.startswith("S") for item in raw_items)
+        has_session_token = any(
+            item[:1].upper() == "S" and item[1:].isdigit() for item in raw_items
+        )
         if not has_session_token:
             numbers = [int(item) for item in raw_items]
-            if all(num in traceable for num in numbers):
-                for num in numbers:
+            kept_nums: list[str] = []
+            for num in numbers:
+                if num in traceable:
                     if num not in used:
                         used.append(num)
-            return match.group(0)
+                    kept_nums.append(str(num))
+            return f"[{', '.join(kept_nums)}]" if kept_nums else ""
 
         kept: list[str] = []
         for item in raw_items:
-            if item.startswith("S"):
+            if item[:1].upper() == "S" and item[1:].isdigit():
                 kept.append(item)
             else:
                 num = int(item)
@@ -507,11 +511,13 @@ def _finalize_session_citations(
 
     def _replace_session_bracket(match: re.Match[str]) -> str:
         raw_items = [part.strip() for part in re.split(r"[,;、]", match.group(1)) if part.strip()]
-        if not raw_items or not any(item.startswith("S") for item in raw_items):
+        if not raw_items or not any(
+            item[:1].upper() == "S" and item[1:].isdigit() for item in raw_items
+        ):
             return match.group(0)
         kept: list[str] = []
         for item in raw_items:
-            if item.startswith("S"):
+            if item[:1].upper() == "S" and item[1:].isdigit():
                 num_val = int(item[1:])
                 ref = f"S{num_val}" if num_val > 0 else ""
                 if ref and ref in valid_by_ref:
@@ -816,6 +822,27 @@ def _enabled_tool_names(agent, *, has_sources: bool = False, knowledge_only: boo
     return list(dict.fromkeys([*_ALWAYS_TOOLS, *knowledge_tools, *_WEB_TOOLS, *configured]))
 
 
+def _filter_visible_citations_for_context(
+    fitted: list[Mapping[str, Any]],
+    citations: list[dict[str, Any]],
+    host_context: HostToolContext,
+) -> list[dict[str, Any]]:
+    """Retain only citations whose originating search_context/get_entity tool call survived context pruning."""
+    visible_citations: set[int] = set()
+    for message in fitted:
+        if message.get("role") == "tool" and message.get("name") in {"search_context", "get_entity"}:
+            call_id = str(message.get("tool_call_id") or "").strip()
+            if call_id:
+                visible_citations.update(
+                    host_context.citation_numbers_by_call_id.get(call_id, ())
+                )
+    return [
+        citation
+        for citation in citations
+        if isinstance(citation.get("n"), int) and citation.get("n") in visible_citations
+    ]
+
+
 def _adapt_tool(host_tool, host_context: HostToolContext, citations: list[dict]) -> AgentTool:
     async def execute(
         arguments: Mapping[str, Any],
@@ -839,6 +866,15 @@ def _adapt_tool(host_tool, host_context: HostToolContext, citations: list[dict])
             host_context.search_context_unavailable = False
             reason = result.data.get("no_answer_reason")
             host_context.search_context_no_answer_reason = str(reason) if reason else None
+        if host_tool.meta.name in {"search_context", "get_entity"} and result.citations:
+            call_id = str(getattr(context, "tool_call_id", "") or "").strip()
+            call_citations = {
+                int(c["n"])
+                for c in result.citations
+                if isinstance(c.get("n"), int) and not isinstance(c.get("n"), bool)
+            }
+            if call_id and call_citations:
+                host_context.citation_numbers_by_call_id[call_id] = call_citations
         citations.extend(result.citations)
         host_context.citation_offset = max(
             host_context.citation_offset,
@@ -1276,19 +1312,11 @@ async def generate_stream(
                     reserved_output_tokens=settings.llm_max_tokens,
                 )
                 host_context.evidence_token_budget = evidence_budget
-                visible_citations = {
-                    int(number)
-                    for message in fitted
-                    if message.get("role") == "tool" and message.get("name") == "search_context"
-                    for number in _CITATION_REFERENCE.findall(str(message.get("content") or ""))
-                }
                 had_citations = bool(citations)
-                if host_context.search_context_called:
-                    citations[:] = [
-                        citation
-                        for citation in citations
-                        if isinstance(citation.get("n"), int) and citation.get("n") in visible_citations
-                    ]
+                if host_context.search_context_called or host_context.citation_numbers_by_call_id:
+                    citations[:] = _filter_visible_citations_for_context(
+                        fitted, citations, host_context
+                    )
                     if had_citations and not citations:
                         host_context.search_context_no_answer_reason = "context_budget"
                 return fitted
