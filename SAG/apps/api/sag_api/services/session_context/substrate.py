@@ -277,9 +277,10 @@ def min_max_normalize(scores: dict[str, float]) -> dict[str, float]:
 class IncrementalSessionIndex:
     """Append-only multi-view session memory substrate (O(Delta) per turn, 0 full-cache resets)."""
 
-    def __init__(self, thread_id: str, *, scope_signature: str = "") -> None:
+    def __init__(self, thread_id: str, *, scope_signature: str = "", tenant_id: str = "") -> None:
         self.thread_id = thread_id
         self.scope_signature = scope_signature
+        self.tenant_id = tenant_id
         self.embedding_mode: str = "unset"
         self.turns: list[IndexedTurn] = []
         self.turns_by_id: dict[str, IndexedTurn] = {}
@@ -342,12 +343,13 @@ class IncrementalSessionIndex:
         embedder: Any | None = None,
         llm: Any | None = None,
         project_aliases: Sequence[tuple[str, str]] = (),
+        tenant_id: str | None = None,
     ) -> int:
         """Incrementally index only unseen messages in chronological order."""
         target_mode = compute_embedding_signature(embedder)
         if self.embedding_mode not in {"unset", target_mode}:
             # Vector space changed -> rebuild cleanly in the new vector space
-            self.__init__(self.thread_id, scope_signature=self.scope_signature)
+            self.__init__(self.thread_id, scope_signature=self.scope_signature, tenant_id=self.tenant_id)
 
         pending: list[dict[str, Any]] = []
         for msg in raw_messages:
@@ -366,13 +368,20 @@ class IncrementalSessionIndex:
                 self.embedding_mode = target_mode
             return 0
 
-        # Structured LLM turn analysis (batched & cached) + structural E0/E1 spans
+        # Structured LLM turn analysis (batched & tenant/thread-scoped cached) + structural E0/E1 spans
         base_ordinal = len(self.turns)
+        eff_tenant = (
+            str(tenant_id or self.tenant_id or (f"scope:{self.scope_signature}" if self.scope_signature else ""))
+            .strip()
+            or None
+        )
         analyses, batch_degraded, batch_degraded_reason = await extract_turns_structured_batch(
             pending,
             llm=llm,
             project_aliases=project_aliases,
             base_ordinal=base_ordinal,
+            tenant_id=eff_tenant,
+            thread_id=self.thread_id,
         )
         if batch_degraded:
             self.extraction_degraded = True

@@ -287,7 +287,7 @@ def extract_structural_entities_and_sentences(
     return mentions, sentences
 
 
-_TURN_EXTRACTION_CACHE: OrderedDict[tuple[str, str, str], dict[str, Any]] = OrderedDict()
+_TURN_EXTRACTION_CACHE: OrderedDict[tuple[str, str, str, str, str], dict[str, Any]] = OrderedDict()
 _TURN_EXTRACTION_CACHE_MAX = 2048
 _TURN_EXTRACTION_CACHE_LOCK = RLock()
 
@@ -297,12 +297,21 @@ def clear_turn_extraction_cache() -> None:
         _TURN_EXTRACTION_CACHE.clear()
 
 
-def _turn_cache_key(normalized_content: str, role: str, model_sig: str) -> tuple[str, str, str]:
+def _turn_cache_key(
+    normalized_content: str,
+    role: str,
+    model_sig: str,
+    *,
+    tenant_id: str,
+    thread_id: str = "",
+) -> tuple[str, str, str, str, str]:
+    if not isinstance(tenant_id, str) or not tenant_id.strip():
+        raise ValueError("tenant_id must be a non-empty string for _turn_cache_key")
     digest = hashlib.sha256(normalized_content.encode("utf-8")).hexdigest()
-    return (digest, role, model_sig)
+    return (tenant_id.strip(), str(thread_id or "").strip(), digest, role, model_sig)
 
 
-def _get_cached_turn_raw(key: tuple[str, str, str]) -> dict[str, Any] | None:
+def _get_cached_turn_raw(key: tuple[str, str, str, str, str]) -> dict[str, Any] | None:
     with _TURN_EXTRACTION_CACHE_LOCK:
         hit = _TURN_EXTRACTION_CACHE.get(key)
         if hit is not None:
@@ -311,7 +320,7 @@ def _get_cached_turn_raw(key: tuple[str, str, str]) -> dict[str, Any] | None:
         return None
 
 
-def _put_cached_turn_raw(key: tuple[str, str, str], value: dict[str, Any]) -> None:
+def _put_cached_turn_raw(key: tuple[str, str, str, str, str], value: dict[str, Any]) -> None:
     with _TURN_EXTRACTION_CACHE_LOCK:
         _TURN_EXTRACTION_CACHE[key] = dict(value)
         _TURN_EXTRACTION_CACHE.move_to_end(key)
@@ -469,17 +478,21 @@ async def extract_turns_structured_batch(
     project_aliases: Sequence[tuple[str, str]] = (),
     batch_size: int = 16,
     base_ordinal: int = 0,
+    tenant_id: str | None = None,
+    thread_id: str | None = None,
 ) -> tuple[list[ExtractedTurnAnalysis], bool, str | None]:
     """Batch-extract epistemic state, slots, entities, and supersession via structured LLM output.
 
     Zero semantic regex fallbacks: when ``llm`` is absent/unconfigured or fails, returns
     explicit ``degraded=True`` with ``epistemic_status="FACT"`` and structural E0/E1 only.
+    Cache entries are strictly scoped by ``(tenant_id, thread_id)``; calls without a non-empty
+    ``tenant_id`` fail closed and bypass the in-memory extraction cache.
     """
     if not turns:
         return [], False, None
 
     model_sig = f"{_EXTRACTOR_VERSION}:{getattr(settings, 'llm_model', 'default')}"
-    prepared: list[tuple[int, str, str, str, tuple[str, str, str]]] = []
+    prepared: list[tuple[int, str, str, str, tuple[str, str, str, str, str] | None]] = []
     resolved_raw: dict[int, dict[str, Any]] = {}
     uncached_indices: list[int] = []
 
@@ -487,7 +500,13 @@ async def extract_turns_structured_batch(
         t_id = str(item.get("id") or item.get("turn_id") or f"turn-{idx}")
         role = str(item.get("role") or "user")
         norm = normalize_session_text(str(item.get("content") or ""))
-        ckey = _turn_cache_key(norm, role, model_sig)
+        eff_tenant = str(tenant_id or item.get("tenant_id") or "").strip()
+        eff_thread = str(thread_id or item.get("thread_id") or "").strip()
+        ckey = (
+            _turn_cache_key(norm, role, model_sig, tenant_id=eff_tenant, thread_id=eff_thread)
+            if eff_tenant
+            else None
+        )
         prepared.append((idx, t_id, role, norm, ckey))
         if not norm:
             resolved_raw[idx] = {
@@ -500,7 +519,7 @@ async def extract_turns_structured_batch(
                 "superseded_entities": [],
             }
             continue
-        cached = _get_cached_turn_raw(ckey)
+        cached = _get_cached_turn_raw(ckey) if ckey is not None else None
         if cached is not None:
             resolved_raw[idx] = cached
         else:
@@ -631,7 +650,7 @@ async def extract_turns_structured_batch(
                 )
             )
             continue
-        if norm and idx in uncached_indices:
+        if norm and idx in uncached_indices and ckey is not None:
             _put_cached_turn_raw(ckey, raw_item)
         results.append(merged)
 

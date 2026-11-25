@@ -116,6 +116,11 @@ class KnowledgeRuntime:
         self._mcp_handle: Any | None = None
         self._mcp_started = False
         self._reconcile_task: asyncio.Task | None = None
+        self._knowledge_worker: Any | None = None
+
+    def attach_knowledge_worker(self, worker: Any | None) -> None:
+        """Bind KnowledgeWorker so hot-reloaded settings/engine resets never leave a stale embedder."""
+        self._knowledge_worker = worker
 
     @property
     def ready(self) -> bool:
@@ -203,6 +208,14 @@ class KnowledgeRuntime:
                 setattr(self._settings, field_name, getattr(refreshed, field_name))
             if reset_engines and self._engine_manager is not None:
                 await self._engine_manager.aclose_all()
+            worker = self._knowledge_worker
+            if worker is None and self._app is not None:
+                worker = getattr(self._app.state, "knowledge_worker", None)
+            if worker is not None:
+                if reset_engines and hasattr(worker, "reset_embedder"):
+                    await worker.reset_embedder(settings=self._settings)
+                elif hasattr(worker, "settings"):
+                    worker.settings = self._settings
 
     def _has_started_resources(self) -> bool:
         return any(

@@ -72,11 +72,14 @@ async def lifespan(app: FastAPI):
         async with principal_assertion_lifespan():
             await runtime.start(app)
             knowledge_worker.job_queue = app.state.job_queue
-            if getattr(app.state, "engine_manager", None) is not None and knowledge_worker.embed is None:
+            knowledge_worker.engine_manager = getattr(app.state, "engine_manager", None)
+            app.state.knowledge_worker = knowledge_worker
+            runtime.attach_knowledge_worker(knowledge_worker)
+            if knowledge_worker.engine_manager is not None and knowledge_worker.embed is None:
                 try:
-                    knowledge_worker.embed = await app.state.engine_manager.get_sag_embedding()
+                    await knowledge_worker.engine_manager.get_sag_embedding()
                 except Exception as error:  # noqa: BLE001
-                    log.warning("Failed to initialize knowledge worker embedder: %s", error)
+                    log.warning("Failed to warm knowledge worker embedder: %s", error)
             if settings.knowledge_worker_enabled:
                 await knowledge_worker.start()
             from sag_api.services.universe_knowledge_service import warm_active_tree_manifest_cache

@@ -85,10 +85,11 @@ async def run_rollback_tree(project_id: str, target_tree_version: str) -> bool:
         data = {
             "status": "success",
             "project_id": result.project_id,
-            "active_slot": result.active_slot,
-            "active_tree_version": result.active_tree_version,
-            "active_search_epoch": result.active_search_epoch,
-            "retained_previous_tree_version": result.retained_previous_tree_version,
+            "routing_slot": result.routing_slot,
+            "tree_version": result.tree_version,
+            "search_epoch": result.search_epoch,
+            "checksum": result.checksum,
+            "point_count": result.point_count,
         }
         print(json.dumps(data, indent=2))
         return True
@@ -97,7 +98,9 @@ async def run_rollback_tree(project_id: str, target_tree_version: str) -> bool:
         print(json.dumps({"status": "error", "message": str(error)}), file=sys.stderr)
         return False
     finally:
-        if hasattr(client, "aclose"):
+        if hasattr(engine_manager, "aclose_all"):
+            await engine_manager.aclose_all()
+        elif hasattr(client, "aclose"):
             await client.aclose()
 
 

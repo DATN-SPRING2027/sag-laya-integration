@@ -944,17 +944,43 @@ async def _project_publish_lock(project_id: str) -> AsyncIterator[None]:
             acquired = await connection.scalar(text("SELECT pg_try_advisory_lock(:key)"), {"key": key})
         if not acquired:
             raise TreePublishInProgress("Another tree publisher owns this project")
+        unlocked = False
+        invalidated = False
         try:
             yield
         finally:
-            try:
+            async def _release_lock() -> bool:
                 async with connection.begin():
-                    await connection.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": key})
-            except SQLAlchemyError:
-                log.exception("Could not release PostgreSQL tree publish lock")
-                await connection.invalidate()
+                    return bool(
+                        await connection.scalar(text("SELECT pg_advisory_unlock(:key)"), {"key": key})
+                    )
+
+            release_task = asyncio.create_task(_release_lock())
+            try:
+                unlocked = await asyncio.shield(asyncio.wait_for(release_task, timeout=5.0))
+            except BaseException as unlock_exc:
+                log.exception("Could not release PostgreSQL tree publish lock; invalidating connection")
+                unlocked = False
+                if not release_task.done():
+                    release_task.cancel()
+                    release_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+                try:
+                    await connection.invalidate()
+                    invalidated = True
+                except BaseException:
+                    log.exception("Failed to invalidate PostgreSQL tree publish lock connection")
+                if not isinstance(unlock_exc, Exception):
+                    raise
+            if not unlocked and not invalidated:
+                try:
+                    await connection.invalidate()
+                except BaseException:
+                    log.exception("Failed to invalidate PostgreSQL tree publish lock connection")
     finally:
-        await connection.close()
+        try:
+            await connection.close()
+        except BaseException:
+            log.exception("Failed to close PostgreSQL tree publish lock connection")
 
 
 async def _stage_candidate(

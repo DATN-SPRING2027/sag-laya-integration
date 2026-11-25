@@ -266,7 +266,6 @@ async def test_live_qdrant_dense_bm25_meta_and_delete_source() -> None:
                 page_to=2,
                 section_path="Điều 15",
                 content_hash=blk.content_hash,
-                qdrant_point_id=str(uuid4()),
             )
             ver = type(
                 "_Ver",

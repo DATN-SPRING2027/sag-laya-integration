@@ -70,7 +70,9 @@ async def test_extract_turns_structured_batch_merges_e0_e1_caches_and_supersedes
         {"id": "t-1", "role": "user", "content": "Đề xuất dùng MongoDB cho ADR-004."},
         {"id": "t-2", "role": "user", "content": "Chốt chuyển sang PostgreSQL 16 thay cho MongoDB."},
     ]
-    results, degraded, reason = await ext.extract_turns_structured_batch(turns, llm=llm)
+    results, degraded, reason = await ext.extract_turns_structured_batch(
+        turns, llm=llm, tenant_id="tenant-p2", thread_id="thread-p2"
+    )
     assert degraded is False
     assert reason is None
     assert complete.await_count == 1
@@ -82,8 +84,10 @@ async def test_extract_turns_structured_batch_merges_e0_e1_caches_and_supersedes
     # Structural E0/E1 (ADR-004) preserved alongside LLM entities:
     assert any(m.key == "entity:adr-004" for m in results[0].entities)
 
-    # Second call for identical normalized content + role hits cache -> 0 new LLM calls:
-    results_cached, degraded2, _ = await ext.extract_turns_structured_batch(turns, llm=llm)
+    # Second call for identical normalized content + role + tenant + thread hits cache -> 0 new LLM calls:
+    results_cached, degraded2, _ = await ext.extract_turns_structured_batch(
+        turns, llm=llm, tenant_id="tenant-p2", thread_id="thread-p2"
+    )
     assert degraded2 is False
     assert complete.await_count == 1
     assert [r.epistemic_status for r in results_cached] == ["PROPOSED", "CONFIRMED"]

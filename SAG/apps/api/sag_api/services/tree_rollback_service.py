@@ -98,12 +98,20 @@ def _prepared_candidate_from_manifest(
         node_ids = [profile["node_id"] for profile in raw_profiles]
         if len(node_ids) != len(set(node_ids)):
             raise PublishVerificationError("Retained tree routing profile IDs are duplicated")
-        assignments = tuple(
-            sorted(
-                (SearchUnitAssignment(**item) for item in raw_assignments if isinstance(item, dict)),
-                key=lambda item: item.search_unit_id,
-            )
-        )
+        parsed_assignments: list[SearchUnitAssignment] = []
+        for item in raw_assignments:
+            if not isinstance(item, dict):
+                raise PublishVerificationError("Retained tree search unit assignment is malformed")
+            raw_ku_ids = item.get("knowledge_unit_ids")
+            if (
+                not isinstance(raw_ku_ids, (list, tuple))
+                or not raw_ku_ids
+                or any(not isinstance(ku_id, str) or not ku_id for ku_id in raw_ku_ids)
+            ):
+                raise PublishVerificationError("Retained tree search unit assignment knowledge_unit_ids is malformed")
+            normalized_item = {**item, "knowledge_unit_ids": tuple(raw_ku_ids)}
+            parsed_assignments.append(SearchUnitAssignment(**normalized_item))
+        assignments = tuple(sorted(parsed_assignments, key=lambda item: item.search_unit_id))
         leaves = tuple(
             sorted(
                 (
@@ -131,7 +139,7 @@ def _prepared_candidate_from_manifest(
         )
         or len({unit_id for _node_id, members in leaves for unit_id in members})
         != sum(len(members) for _node_id, members in leaves)
-        or {item.knowledge_unit_id for item in assignments}
+        or {ku_id for item in assignments for ku_id in item.knowledge_unit_ids}
         != {unit_id for _node_id, members in leaves for unit_id in members}
         or any(
             not isinstance(key, str) or isinstance(value, bool) or not isinstance(value, int) or value <= 0

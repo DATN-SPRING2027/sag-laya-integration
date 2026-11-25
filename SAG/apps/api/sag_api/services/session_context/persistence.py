@@ -2458,9 +2458,20 @@ async def _reconstruct_prefix_into_index(
                         }
                     )
         if cutoff_candidates:
+            eff_tenant = (
+                (str(persisted_turn_units[0].tenant_id or "").strip() if persisted_turn_units else "")
+                or str(getattr(index, "tenant_id", "") or "").strip()
+                or (f"scope:{index.scope_signature}" if index.scope_signature else "")
+            ) or None
+            eff_thread = (
+                (str(persisted_turn_units[0].thread_id or "").strip() if persisted_turn_units else "")
+                or str(index.thread_id or "").strip()
+            )
             analyses, batch_degraded, batch_reason = await extract_turns_structured_batch(
                 cutoff_candidates,
                 llm=llm,
+                tenant_id=eff_tenant,
+                thread_id=eff_thread,
             )
             if batch_degraded:
                 index.extraction_degraded = True
