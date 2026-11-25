@@ -54,7 +54,7 @@ def test_octx_slug_maps_vietnamese_d_stroke():
     assert _slug("Đề án chuyển đổi số") == "de-an-chuyen-doi-so"
 
 
-def test_estimate_tokens_tiktoken_disallowed_special_and_offline_fallback():
+def test_estimate_tokens_tiktoken_disallowed_special_and_offline_fallback(caplog):
     from sag_api.core import text_utils, token_usage
     from sag_api.generation.prompt import estimate_tokens as prompt_estimate_tokens
     from sag_api.parsing.canonical import estimate_unicode_tokens
@@ -67,9 +67,17 @@ def test_estimate_tokens_tiktoken_disallowed_special_and_offline_fallback():
     assert token_usage.estimate_text_tokens([special_text, ""]) == tok_count
     assert text_utils.estimate_tokens("") == 0
 
-    text_utils._tiktoken_encoding.cache_clear()
+    text_utils.reset_tiktoken_fallback_state()
     try:
-        with patch("tiktoken.get_encoding", side_effect=RuntimeError("offline cold cache")):
+        assert text_utils.get_tiktoken_fallback_status() == {
+            "degraded": False,
+            "fallback_count": 0,
+            "reason": None,
+        }
+        with (
+            caplog.at_level("WARNING", logger="sag_api.text_utils"),
+            patch("tiktoken.get_encoding", side_effect=RuntimeError("offline cold cache")),
+        ):
             vi = "Quy định chi tiết thi hành một số điều của Luật."
             est = text_utils.estimate_tokens(vi)
             expected = max(1, (len(vi.encode()) + 2) // 3)
@@ -78,8 +86,44 @@ def test_estimate_tokens_tiktoken_disallowed_special_and_offline_fallback():
             cjk_vi = "你好Tiếng"
             est_cjk = text_utils.estimate_tokens(cjk_vi)
             assert est_cjk == 2 + (len("Tiếng".encode()) + 2) // 3
+
+        warning_records = [r for r in caplog.records if "tiktoken" in r.getMessage().lower()]
+        assert len(warning_records) == 1
+        assert text_utils.get_tiktoken_fallback_status() == {
+            "degraded": True,
+            "fallback_count": 1,
+            "reason": "load:RuntimeError",
+        }
     finally:
-        text_utils._tiktoken_encoding.cache_clear()
+        text_utils.reset_tiktoken_fallback_state()
+
+
+def test_system_metrics_exposes_tiktoken_fallback_status() -> None:
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from sag_api.api.v1 import system as system_api
+    from sag_api.core import text_utils
+
+    text_utils.reset_tiktoken_fallback_state()
+    app = FastAPI()
+    app.include_router(system_api.router, prefix="/api/v1")
+    app.state.knowledge_runtime = type("RT", (), {"ready": True})()
+    try:
+        with patch("tiktoken.get_encoding", side_effect=RuntimeError("offline")):
+            text_utils.estimate_tokens("Kiểm tra cảnh báo tiktoken fallback")
+        with TestClient(app) as client:
+            json_res = client.get("/api/v1/system/metrics?format=json")
+            assert json_res.status_code == 200
+            tf = json_res.json()["tiktoken_fallback"]
+            assert tf == {"degraded": True, "fallback_count": 1, "reason": "load:RuntimeError"}
+
+            prom_res = client.get("/api/v1/system/metrics")
+            assert prom_res.status_code == 200
+            assert "sag_tiktoken_degraded 1" in prom_res.text
+            assert "sag_tiktoken_fallback_total 1" in prom_res.text
+    finally:
+        text_utils.reset_tiktoken_fallback_state()
 
 
 def test_sentence_and_clause_splitter_preserves_numbers_urls_times_abbreviations_and_newlines():

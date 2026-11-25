@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import re
+import threading
 import unicodedata
 from collections.abc import Sequence
 from functools import lru_cache
 from typing import Any
+
+from sag_api.core.logging import get_logger
+
+log = get_logger("text_utils")
 
 _CONTINUOUS_SCRIPT_CHAR_RE = re.compile(
     r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af"
@@ -130,13 +135,55 @@ def slugify_ascii(
     return slug[:max_length] or default
 
 
+_TIKTOKEN_FALLBACK_LOCK = threading.Lock()
+_tiktoken_fallback_warned = False
+_tiktoken_fallback_count = 0
+_tiktoken_fallback_reason: str | None = None
+
+
+def _record_tiktoken_fallback(stage: str, exc: Exception) -> None:
+    global _tiktoken_fallback_warned, _tiktoken_fallback_count, _tiktoken_fallback_reason
+    reason = f"{stage}:{type(exc).__name__}"
+    should_warn = False
+    with _TIKTOKEN_FALLBACK_LOCK:
+        _tiktoken_fallback_count += 1
+        _tiktoken_fallback_reason = reason
+        if not _tiktoken_fallback_warned:
+            _tiktoken_fallback_warned = True
+            should_warn = True
+    if should_warn:
+        log.warning(
+            "tiktoken cl100k_base unavailable (%s); using offline UTF-8 heuristic token estimation",
+            reason,
+        )
+
+
+def get_tiktoken_fallback_status() -> dict[str, Any]:
+    with _TIKTOKEN_FALLBACK_LOCK:
+        return {
+            "degraded": _tiktoken_fallback_count > 0,
+            "fallback_count": _tiktoken_fallback_count,
+            "reason": _tiktoken_fallback_reason,
+        }
+
+
+def reset_tiktoken_fallback_state() -> None:
+    global _tiktoken_fallback_warned, _tiktoken_fallback_count, _tiktoken_fallback_reason
+    with _TIKTOKEN_FALLBACK_LOCK:
+        _tiktoken_fallback_warned = False
+        _tiktoken_fallback_count = 0
+        _tiktoken_fallback_reason = None
+    _tiktoken_encoding.cache_clear()
+
+
 @lru_cache(maxsize=1)
 def _tiktoken_encoding() -> Any | None:
     try:
         import tiktoken
 
         return tiktoken.get_encoding("cl100k_base")
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        _record_tiktoken_fallback("load", exc)
         return None
 
 
@@ -154,8 +201,8 @@ def estimate_tokens(text: str) -> int:
     if enc is not None:
         try:
             return max(1, len(enc.encode(text, disallowed_special=())))
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            _record_tiktoken_fallback("encode", exc)
     return _estimate_tokens_fallback(text)
 
 
