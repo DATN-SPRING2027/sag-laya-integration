@@ -401,6 +401,7 @@ def build_citations(
     event_refs = _event_refs_by_section(events)
     for i, s in enumerate(sections, start=1):
         snippet = _citation_excerpt(s.content)
+        full_content = (s.content or "").strip()
         ref = (source_refs or {}).get(s.source_config_id or "") or {}
         citation = {
             "kind": "internal",
@@ -412,6 +413,8 @@ def build_citations(
             "source_id": ref.get("id"),
             "source_name": ref.get("name"),
         }
+        if full_content and len(full_content) > len(snippet):
+            citation["_verifier_content"] = full_content
         if (
             s.document_id
             and s.document_version_id

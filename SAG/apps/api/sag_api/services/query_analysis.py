@@ -18,18 +18,32 @@ _DMY_DATE_RE = re.compile(r"\b(0?[1-9]|[12]\d|3[01])[/-](0?[1-9]|1[0-2])[/-]((?:
 _ISO_DATE_RE = re.compile(r"\b((?:19|20)\d{2})[/-](0?[1-9]|1[0-2])[/-](0?[1-9]|[12]\d|3[01])\b")
 
 
-def _extract_bridged_date_tokens(text: str) -> list[str]:
-    out: list[str] = []
+def _extract_bridged_date_groups(text: str) -> tuple[tuple[str, ...], ...]:
+    groups: list[tuple[str, ...]] = []
+    seen: set[tuple[str, ...]] = set()
     for m in _DMY_DATE_RE.finditer(text):
         dd, mm, yyyy = int(m.group(1)), int(m.group(2)), int(m.group(3))
         dmy = f"{dd:02d}/{mm:02d}/{yyyy:04d}"
         iso = f"{yyyy:04d}-{mm:02d}-{dd:02d}"
-        out.extend((iso, dmy))
+        group = _unique_values((iso, dmy, m.group(0)))
+        if group and group not in seen:
+            seen.add(group)
+            groups.append(group)
     for m in _ISO_DATE_RE.finditer(text):
         yyyy, mm, dd = int(m.group(1)), int(m.group(2)), int(m.group(3))
         iso = f"{yyyy:04d}-{mm:02d}-{dd:02d}"
         dmy = f"{dd:02d}/{mm:02d}/{yyyy:04d}"
-        out.extend((dmy, iso))
+        group = _unique_values((dmy, iso, m.group(0)))
+        if group and group not in seen:
+            seen.add(group)
+            groups.append(group)
+    return tuple(groups)
+
+
+def _extract_bridged_date_tokens(text: str) -> list[str]:
+    out: list[str] = []
+    for group in _extract_bridged_date_groups(text):
+        out.extend(group[:2])
     return out
 
 _CHINESE_RUN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
@@ -58,12 +72,168 @@ _LEGACY_TERM_RE = re.compile(
 _ALNUM_SUBTOKEN_RE = re.compile(r"[^\W\d_]+|[0-9]+", re.UNICODE)
 _EXACT_TERM_RE = re.compile(r'"([^"\n]+)"|“([^”\n]+)”|「([^」\n]+)」|《([^》\n]+)》|`([^`\n]+)`')
 _IDENTIFIER_RE = re.compile(
-    r"\b(?:ERR[_-][A-Z0-9_-]+|HTTP[_ -]?\d{3}|[A-Z][A-Z0-9_]*[0-9_][A-Z0-9_]*|"
-    r"[A-Z]{2,}(?:-[A-Z0-9]+)+|[A-Za-z]+[_-]\d+[A-Za-z0-9._-]*|v\d+(?:\.\d+)+)\b"
+    r"\b(?:"
+    r"ERR[_-][A-Z0-9_-]+"
+    r"|HTTP[_ -]?\d{3}"
+    r"|[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+"
+    r"|[A-Z]{2,}(?:-[A-Z0-9]+)+"
+    r"|[A-Za-z]{2,}[_-]\d+[A-Za-z0-9._-]*"
+    r"|[A-Z]{2,}\d{2,}[A-Z0-9]*"
+    r"|v\d+(?:\.\d+)+"
+    r")\b"
 )
+_NON_IDENTIFIER_TEMPORAL_RE = re.compile(r"^(?:FY|Q[1-4])(?:[-_]?\d{2,4})?$", re.IGNORECASE)
 _PATH_RE = re.compile(
-    r"(?:(?<![\w$/])/[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=%-]+|[A-Za-z]:\\[^\s]+|\b[\w-]+(?:\.[\w-]+){1,})"
+    r"(?:"
+    r"(?<![\w$:/])/[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=%-]+"
+    r"|[A-Za-z]:\\[^\s]+"
+    r"|\b[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+"
+    r"|\b[\w-]+(?:\.[\w-]+){1,}"
+    r")"
 )
+_NON_PATH_BRAND_NAMES = frozenset(
+    {
+        "node.js",
+        "next.js",
+        "vue.js",
+        "nuxt.js",
+        "react.js",
+        "express.js",
+        "nest.js",
+        "three.js",
+        "chart.js",
+        "d3.js",
+        "anime.js",
+        "alpine.js",
+        "ember.js",
+        "svelte.js",
+        "solid.js",
+        "angular.js",
+        "electron.js",
+        "bun.js",
+        "deno.js",
+        "socket.io",
+        "asp.net",
+        "vb.net",
+        "ml.net",
+    }
+)
+_KNOWN_FILE_EXTENSIONS = frozenset(
+    {
+        "py",
+        "js",
+        "ts",
+        "tsx",
+        "jsx",
+        "mjs",
+        "cjs",
+        "md",
+        "mdx",
+        "txt",
+        "json",
+        "yaml",
+        "yml",
+        "toml",
+        "ini",
+        "cfg",
+        "conf",
+        "env",
+        "sql",
+        "sh",
+        "bash",
+        "zsh",
+        "ps1",
+        "bat",
+        "cmd",
+        "pdf",
+        "doc",
+        "docx",
+        "xls",
+        "xlsx",
+        "ppt",
+        "pptx",
+        "csv",
+        "tsv",
+        "html",
+        "htm",
+        "xml",
+        "css",
+        "scss",
+        "less",
+        "svg",
+        "png",
+        "jpg",
+        "jpeg",
+        "webp",
+        "gif",
+        "go",
+        "rs",
+        "java",
+        "kt",
+        "rb",
+        "php",
+        "c",
+        "cc",
+        "cpp",
+        "h",
+        "hpp",
+        "cs",
+        "swift",
+        "dart",
+        "proto",
+        "graphql",
+        "gql",
+        "tf",
+        "hcl",
+        "lock",
+        "log",
+        "bak",
+        "gz",
+        "tar",
+        "zip",
+        "whl",
+        "dockerfile",
+        "mk",
+        "cmake",
+        "gradle",
+        "properties",
+        "ipynb",
+        "rst",
+        "tex",
+        "bib",
+    }
+)
+
+
+def _is_valid_path_term(cleaned_path: str) -> bool:
+    if len(cleaned_path) < 3:
+        return False
+    if _DMY_DATE_RE.fullmatch(cleaned_path) or _ISO_DATE_RE.fullmatch(cleaned_path):
+        return False
+    if re.fullmatch(r"\d+(?:\.\d+)*(?:\.[xX*]+)?(?:[^\W\d_]+|%)?", cleaned_path):
+        return False
+    if re.fullmatch(r"[A-Za-z](?:\.[A-Za-z])+", cleaned_path):
+        return False
+    if re.fullmatch(r"[A-Z]{1,4}(?:\.[A-Z]{1,4})+", cleaned_path):
+        return False
+    if cleaned_path.lower() in _NON_PATH_BRAND_NAMES:
+        return False
+    if cleaned_path.startswith("/") or re.match(r"^[A-Za-z]:\\", cleaned_path):
+        return any(ch.isalnum() for ch in cleaned_path)
+    if "/" in cleaned_path:
+        segments = [seg for seg in cleaned_path.split("/") if seg]
+        if len(segments) < 2:
+            return False
+        last_ext = segments[-1].rsplit(".", 1)[-1].lower() if "." in segments[-1] else ""
+        if last_ext in _KNOWN_FILE_EXTENSIONS:
+            return True
+        return len(segments) >= 3 and any(any(ch.isalpha() for ch in seg) for seg in segments)
+    parts = cleaned_path.split(".")
+    if len(parts) < 2:
+        return False
+    if parts[-1].lower() in _KNOWN_FILE_EXTENSIONS:
+        return True
+    return len(parts) >= 3 and all(re.fullmatch(r"[a-z][a-z0-9_-]*", p) for p in parts)
 _STRUCTURAL_TEMPORAL_RE = re.compile(
     r"(?:\b(?:19|20)\d{2}\b|\b\d{4}-\d{2}(?:-\d{2})?\b|\b(?:fy|q)[1-4]?\d{2,4}\b|\bq[1-4]\b|\bv\d+(?:\.\d+)+\b|\d{4}年|\d{1,2}月\d{1,2}日)",
     re.IGNORECASE,
@@ -84,6 +254,7 @@ class QueryFeatures:
     global_cues: tuple[str, ...] = ()
     clauses: tuple[str, ...] = ()
     multi_hop: bool = False
+    anchor_groups: tuple[tuple[str, ...], ...] = ()
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -95,6 +266,7 @@ class QueryFeatures:
             "global_cues": list(self.global_cues),
             "clauses": list(self.clauses),
             "multi_hop": self.multi_hop,
+            "anchor_groups": [list(group) for group in self.anchor_groups],
         }
 
 
@@ -209,17 +381,36 @@ def extract_query_features(
         for index in range(1, 6)
         if match.group(index)
     )
-    identifier_terms = _unique_values(
-        [*(match.group(0) for match in _IDENTIFIER_RE.finditer(text)), *_extract_bridged_date_tokens(text)]
+    raw_identifier_terms = _unique_values(
+        match.group(0)
+        for match in _IDENTIFIER_RE.finditer(text)
+        if not _NON_IDENTIFIER_TEMPORAL_RE.fullmatch(match.group(0))
     )
+    date_groups = _extract_bridged_date_groups(text)
+    bridged_dates = [tok for group in date_groups for tok in group[:2]]
+    identifier_terms = _unique_values([*raw_identifier_terms, *bridged_dates])
     path_terms = _unique_values(
         cleaned_path
         for match in _PATH_RE.finditer(text)
         if (cleaned_path := match.group(0).rstrip(".,;:!?)]'\""))
-        and len(cleaned_path) >= 3
-        and not re.fullmatch(r"\d+(?:\.\d+)*(?:\.[xX*]+)?(?:[a-zA-Z%]{1,4})?", cleaned_path)
-        and not re.fullmatch(r"[A-Za-z](?:\.[A-Za-z])+", cleaned_path)
+        and _is_valid_path_term(cleaned_path)
     )
+    anchor_groups_list: list[tuple[str, ...]] = []
+    seen_anchor_keys: set[tuple[str, ...]] = set()
+    covered_singletons: set[str] = set()
+    for group in date_groups:
+        norm_group = tuple(dict.fromkeys(v for term in group if (v := normalize_lexical_text(term))))
+        if norm_group and norm_group not in seen_anchor_keys:
+            seen_anchor_keys.add(norm_group)
+            covered_singletons.update(norm_group)
+            anchor_groups_list.append(group)
+    for term in (*exact_terms, *raw_identifier_terms, *path_terms):
+        norm = normalize_lexical_text(term)
+        if not norm or norm in covered_singletons or (norm,) in seen_anchor_keys:
+            continue
+        seen_anchor_keys.add((norm,))
+        covered_singletons.add(norm)
+        anchor_groups_list.append((term,))
     temporal_cues = _unique_values(m.group(0) for m in _STRUCTURAL_TEMPORAL_RE.finditer(text))
     clauses = decompose_query_clauses(text, subqueries=subqueries)
     multi_hop = bool(multi_hop_hint) or len(clauses) >= 2
@@ -232,6 +423,7 @@ def extract_query_features(
         global_cues=(),
         clauses=clauses if len(clauses) >= 2 else (),
         multi_hop=multi_hop,
+        anchor_groups=tuple(anchor_groups_list),
     )
 
 

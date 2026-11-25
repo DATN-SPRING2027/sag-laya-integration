@@ -32,6 +32,7 @@ from sag_agent import (
     ToolResult as RuntimeToolResult,
 )
 from sag_api.core.errors import ServiceUnavailableError
+from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal
 from sag_api.enums import MessageStatus
 from sag_api.generation import LLMClient, build_prompt_preview
@@ -52,6 +53,10 @@ from sag_api.tools.builtin import WebSearchTool
 from sag_api.tools.mcp import open_agent_mcp_tools
 
 AGENT_MAX_STEPS = 6
+log = get_logger("agent")
+_VERIFIER_MAX_CHUNK_CHARS = 4000
+_VERIFIER_MAX_TOTAL_EVIDENCE_CHARS = 24_000
+_FORCED_FINAL_PREFIX = "The tool-call limit has been reached."
 
 _KNOWLEDGE_TOOLS = ["search_context", "get_entity"]
 _WEB_TOOLS = ["web_search", "open_webpage"]
@@ -67,9 +72,9 @@ _TOOL_LABELS = {
 # Numeric knowledge markers are plain ``[n]`` and session markers are ``[Sn]``
 # (or compound ``[1, 2]``, ``[S1, S2]``, ``[1, S1]``). A Markdown link label
 # (``[n](https://...)``) is an external link and must not be stripped.
-_CITATION_REFERENCE = re.compile(r"\[(\d+)](?!\(\s*(?:https?:|mailto:))", re.IGNORECASE)
+_CITATION_REFERENCE = re.compile(r"\[(\d+)](?!\(\s*(?:https?:|mailto:)|:\s*(?:https?:|mailto:))", re.IGNORECASE)
 _COMPOUND_CITATION_BRACKET = re.compile(
-    r"\[(\s*(?:\d+|S\d+)(?:\s*[,;、]\s*(?:\d+|S\d+))*)\s*](?!\(\s*(?:https?:|mailto:))",
+    r"\[(\s*(?:\d+|S\d+)(?:\s*[,;、]\s*(?:\d+|S\d+))*)\s*](?!\(\s*(?:https?:|mailto:)|:\s*(?:https?:|mailto:))",
     re.IGNORECASE,
 )
 _ANSWER_URL = re.compile(r"https?://[^\s<>\"'`，。；：！？、（）【】《》]+", re.IGNORECASE)
@@ -206,11 +211,29 @@ def _append_current_scene(
     return result
 
 
+def _find_closing_backticks(text: str, start: int, run_len: int) -> int:
+    """Find matching closing backtick run of exact length within the same paragraph, or -1."""
+    para_end = text.find("\n\n", start)
+    limit = len(text) if para_end == -1 else para_end
+    pos = start
+    while pos < limit:
+        idx = text.find("`", pos, limit)
+        if idx == -1:
+            return -1
+        end = idx
+        while end < limit and text[end] == "`":
+            end += 1
+        if end - idx == run_len:
+            return idx
+        pos = end
+    return -1
+
+
 def _rewrite_prose_citation_brackets(
     text: str,
     replacer: Any,
 ) -> str:
-    """Apply ``_COMPOUND_CITATION_BRACKET`` replacement outside fenced and inline code."""
+    """Apply ``_COMPOUND_CITATION_BRACKET`` replacement outside fenced and balanced inline code."""
     if not text:
         return text
 
@@ -219,7 +242,6 @@ def _rewrite_prose_citation_brackets(
     index = 0
     length = len(text)
     code_fence: str | None = None
-    inline_ticks = 0
 
     def _flush_prose(end_idx: int) -> None:
         nonlocal prose_start
@@ -230,7 +252,7 @@ def _rewrite_prose_citation_brackets(
 
     while index < length:
         line_start = index == 0 or text[index - 1] == "\n"
-        if line_start and inline_ticks == 0:
+        if line_start:
             fence_match = re.match(r"^( {0,3})(`{3,}|~{3,})", text[index:])
             if fence_match:
                 marker = fence_match.group(2)
@@ -263,32 +285,30 @@ def _rewrite_prose_citation_brackets(
             run_len = 1
             while index + run_len < length and text[index + run_len] == "`":
                 run_len += 1
-            if inline_ticks == 0:
+            closing = _find_closing_backticks(text, index + run_len, run_len)
+            if closing != -1:
                 _flush_prose(index)
-                inline_ticks = run_len
-                out.append(text[index : index + run_len])
-                prose_start = index + run_len
-            elif inline_ticks == run_len:
-                out.append(text[index : index + run_len])
-                inline_ticks = 0
-                prose_start = index + run_len
-            else:
-                out.append(text[index : index + run_len])
-                prose_start = index + run_len
+                span_end = closing + run_len
+                out.append(text[index:span_end])
+                prose_start = span_end
+                index = span_end
+                continue
+            # Unmatched stray backtick: treat as plain prose so citation parsing stays active.
             index += run_len
             continue
 
-        if inline_ticks > 0:
-            out.append(text[index])
-            prose_start = index + 1
         index += 1
 
-    if code_fence is None and inline_ticks == 0:
+    if code_fence is None:
         _flush_prose(length)
     elif prose_start < length:
         out.append(text[prose_start:length])
 
     return "".join(out)
+
+
+def _strip_internal_citation_fields(citation: Mapping[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in citation.items() if not str(k).startswith("_")}
 
 
 def _finalize_answer_citations(
@@ -333,6 +353,8 @@ def _finalize_answer_citations(
             if token[:1].upper() == "S" and token[1:].isdigit():
                 return match.group(0)
             number = int(token)
+            if number == 0:
+                return match.group(0)
             if number not in traceable:
                 return ""
             if number not in used:
@@ -344,6 +366,9 @@ def _finalize_answer_citations(
         )
         if not has_session_token:
             numbers = [int(item) for item in raw_items]
+            if any(num == 0 for num in numbers):
+                # Citations are 1-indexed; brackets containing 0 (e.g. [0, 1], [0, 100]) are math/index notation.
+                return match.group(0)
             kept_nums: list[str] = []
             for num in numbers:
                 if num in traceable:
@@ -371,7 +396,7 @@ def _finalize_answer_citations(
         used = list(traceable)[:3]
     normalized = []
     for number in used:
-        citation = dict(traceable[number])
+        citation = _strip_internal_citation_fields(traceable[number])
         mapped = number in explicitly_mapped
         citation.update(
             {
@@ -449,12 +474,16 @@ def _finalize_session_citations(
 def _parse_entailment_verdict(raw_text: str) -> tuple[str | None, bool | None]:
     for obj in decode_json_values(raw_text, expected_type=dict):
         if "answerability" in obj or "supported" in obj:
-            raw_ans = obj.get("answerability")
-            ans_val = (
-                raw_ans.strip().lower()
-                if isinstance(raw_ans, str) and raw_ans.strip().lower() in {"answered", "insufficient_evidence"}
-                else ("answered" if "supported" in obj else None)
-            )
+            if "answerability" in obj:
+                raw_ans = obj.get("answerability")
+                ans_val = (
+                    raw_ans.strip().lower()
+                    if isinstance(raw_ans, str)
+                    and raw_ans.strip().lower() in {"answered", "insufficient_evidence"}
+                    else None
+                )
+            else:
+                ans_val = "answered" if "supported" in obj else None
             raw_sup = obj.get("supported")
             sup_val = raw_sup if isinstance(raw_sup, bool) else None
             return ans_val, sup_val
@@ -468,24 +497,73 @@ async def _verify_grounded_entailment(
     answer: str,
     internal_citations: list[dict[str, Any]],
     session_citations: list[dict[str, Any]],
+    verifier_content_by_n: Mapping[int, str] | None = None,
 ) -> tuple[str, str | None]:
     """Verify cited answer is neither an abstention nor an unsupported/fabricated claim (S5-05)."""
+    claim_internal = [cit for cit in internal_citations if cit.get("claim_level") == "claim"]
+    claim_session = [sc for sc in session_citations if sc.get("claim_level") == "claim"]
+    total_items = len(claim_internal) + len(claim_session)
+    if total_items == 0:
+        return "answered", None
+
+    per_item_limit = max(
+        320,
+        min(_VERIFIER_MAX_CHUNK_CHARS, _VERIFIER_MAX_TOTAL_EVIDENCE_CHARS // max(1, total_items)),
+    )
     evidence_lines: list[str] = []
-    for cit in internal_citations:
-        if cit.get("claim_level") != "claim":
-            continue
+    used_chars = 0
+    for cit in claim_internal:
         n = cit.get("n")
-        heading = str(cit.get("heading") or cit.get("document_name") or "").strip()
-        snippet = str(cit.get("snippet") or cit.get("content") or "").strip()
-        if snippet:
-            evidence_lines.append(f"[{n}] {heading}: {snippet}" if heading else f"[{n}] {snippet}")
-    for sc in session_citations:
-        if sc.get("claim_level") != "claim":
+        doc_name = str(cit.get("document_name") or "").strip()
+        heading = str(cit.get("heading") or "").strip()
+        if doc_name and heading and doc_name != heading:
+            label = f"{doc_name} — {heading}"
+        else:
+            label = doc_name or heading
+        full_text = ""
+        if verifier_content_by_n and isinstance(n, int):
+            full_text = str(verifier_content_by_n.get(n) or "").strip()
+        if not full_text:
+            full_text = str(
+                cit.get("_verifier_content") or cit.get("content") or cit.get("snippet") or ""
+            ).strip()
+        if not full_text:
             continue
+        if len(full_text) > per_item_limit:
+            full_text = full_text[:per_item_limit].rstrip() + "…"
+        line = f"[{n}] {label}: {full_text}" if label else f"[{n}] {full_text}"
+        remaining_chars = _VERIFIER_MAX_TOTAL_EVIDENCE_CHARS - used_chars
+        if remaining_chars <= 0:
+            break
+        if len(line) > remaining_chars:
+            prefix = f"[{n}] {label}: " if label else f"[{n}] "
+            if remaining_chars > len(prefix) + 16:
+                line = line[:remaining_chars].rstrip() + "…"
+            elif remaining_chars >= len(prefix):
+                line = prefix.rstrip()
+            else:
+                break
+        evidence_lines.append(line)
+        used_chars += len(line) + 1
+
+    for sc in claim_session:
         ref = sc.get("ref")
-        snippet = str(sc.get("snippet") or sc.get("summary_excerpt") or sc.get("content") or "").strip()
-        if ref and snippet:
-            evidence_lines.append(f"[{ref}] {snippet}")
+        snippet = str(
+            sc.get("content") or sc.get("snippet") or sc.get("summary_excerpt") or ""
+        ).strip()
+        if not (ref and snippet):
+            continue
+        if len(snippet) > per_item_limit:
+            snippet = snippet[:per_item_limit].rstrip() + "…"
+        line = f"[{ref}] {snippet}"
+        remaining_chars = _VERIFIER_MAX_TOTAL_EVIDENCE_CHARS - used_chars
+        if remaining_chars <= 0:
+            break
+        if len(line) > remaining_chars:
+            line = line[:remaining_chars].rstrip() + "…"
+        evidence_lines.append(line)
+        used_chars += len(line) + 1
+
     if not evidence_lines:
         return "answered", None
 
@@ -522,8 +600,13 @@ async def _verify_grounded_entailment(
                 llm.complete(messages, response_format={"type": "json_object"}),
                 timeout=10.0,
             )
-    except Exception:  # noqa: BLE001
-        return "no_answer", "weak_evidence"
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Entailment verifier failed (%s: %s); failing closed with degraded status",
+            type(exc).__name__,
+            exc,
+        )
+        return "no_answer", "entailment_verifier_failed"
 
     answerability, supported = _parse_entailment_verdict(str(raw or ""))
     if answerability is None and supported is None:
@@ -532,7 +615,7 @@ async def _verify_grounded_entailment(
         return "no_answer", "insufficient_evidence"
     if supported is False:
         return "no_answer", "unsupported_claim"
-    if supported is not True:
+    if answerability != "answered" or supported is not True:
         return "no_answer", "weak_evidence"
     return "answered", None
 
@@ -619,6 +702,24 @@ def _runtime_input_tokens(messages: list[dict[str, Any]], tool_schemas: list[dic
     return estimate_tokens(serialized)
 
 
+def _is_forced_final_message(raw_message: Any, normalized: Mapping[str, Any]) -> bool:
+    if normalized.get("role") != "user":
+        return False
+    metadata = (
+        raw_message.get("metadata")
+        if isinstance(raw_message, Mapping)
+        else getattr(raw_message, "metadata", None)
+    )
+    if isinstance(metadata, Mapping) and metadata.get("forced_final"):
+        return True
+    content = normalized.get("content")
+    if isinstance(content, str):
+        stripped = content.strip()
+        if stripped.startswith(_FORCED_FINAL_PREFIX) or stripped == RuntimeAgent.final_instructions:
+            return True
+    return False
+
+
 def _fit_agent_context(
     messages: Any,
     tool_schemas: list[dict[str, Any]],
@@ -626,14 +727,10 @@ def _fit_agent_context(
     context_window_tokens: int,
     reserved_output_tokens: int,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Fit a runtime turn plus schemas and two output reservations in context.
+    """Fit a runtime turn plus tool schemas and one output reservation within context."""
 
-    One output reserve applies to the model call about to run. A second reserve
-    leaves room for that call's tool-call response in the following turn, where
-    a SearchContext result may be appended.
-    """
-
-    normalized = [_runtime_message_dict(message) for message in messages]
+    raw_messages = list(messages)
+    normalized = [_runtime_message_dict(message) for message in raw_messages]
     if not normalized:
         return [], 0
     context_window = max(0, int(context_window_tokens))
@@ -646,6 +743,18 @@ def _fit_agent_context(
     )
     if latest_user is not None:
         required.add(latest_user)
+        if _is_forced_final_message(raw_messages[latest_user], normalized[latest_user]):
+            latest_real_user = next(
+                (
+                    index
+                    for index in range(latest_user - 1, -1, -1)
+                    if normalized[index].get("role") == "user"
+                    and not _is_forced_final_message(raw_messages[index], normalized[index])
+                ),
+                None,
+            )
+            if latest_real_user is not None:
+                required.add(latest_real_user)
     if _runtime_input_tokens([normalized[index] for index in sorted(required)], tool_schemas) > input_budget:
         raise ValueError("system instructions and current query exceed the configured model context budget")
 
@@ -683,10 +792,24 @@ def _fit_agent_context(
         candidate_messages = [normalized[item] for item in candidate_indices]
         if _runtime_input_tokens(candidate_messages, tool_schemas) <= input_budget:
             selected.update(unit)
+        else:
+            break
 
-    fitted = [normalized[index] for index in sorted(selected)]
+    # Drop orphaned leading non-required assistant/tool messages before the first user turn.
+    ordered = sorted(selected)
+    first_user_pos = next((pos for pos, idx in enumerate(ordered) if normalized[idx].get("role") == "user"), None)
+    if first_user_pos is not None:
+        cleaned_indices = [
+            idx
+            for pos, idx in enumerate(ordered)
+            if pos >= first_user_pos or idx in required or normalized[idx].get("role") == "system"
+        ]
+    else:
+        cleaned_indices = ordered
+
+    fitted = [normalized[idx] for idx in cleaned_indices]
     used_tokens = _runtime_input_tokens(fitted, tool_schemas)
-    remaining = max(0, context_window - output_reserve - used_tokens - output_reserve)
+    remaining = max(0, context_window - output_reserve - used_tokens)
     return fitted, remaining
 
 
@@ -829,7 +952,12 @@ def _filter_visible_citations_for_context(
     ]
 
 
-def _adapt_tool(host_tool, host_context: HostToolContext, citations: list[dict]) -> AgentTool:
+def _adapt_tool(
+    host_tool,
+    host_context: HostToolContext,
+    citations: list[dict],
+    verifier_content_by_n: dict[int, str] | None = None,
+) -> AgentTool:
     async def execute(
         arguments: Mapping[str, Any],
         context,
@@ -861,7 +989,20 @@ def _adapt_tool(host_tool, host_context: HostToolContext, citations: list[dict])
             }
             if call_id and call_citations:
                 host_context.citation_numbers_by_call_id[call_id] = call_citations
-        citations.extend(result.citations)
+        if verifier_content_by_n is not None and result.citations:
+            raw_sections = result.data.get("sections")
+            section_list = raw_sections if isinstance(raw_sections, list) else []
+            for idx_cit, cit in enumerate(result.citations):
+                cit_n = cit.get("n")
+                if not isinstance(cit_n, int) or isinstance(cit_n, bool):
+                    continue
+                full_text = str(cit.get("_verifier_content") or cit.get("content") or "").strip()
+                if not full_text and idx_cit < len(section_list):
+                    full_text = str(getattr(section_list[idx_cit], "content", "") or "").strip()
+                if full_text:
+                    verifier_content_by_n[cit_n] = full_text
+        public_tool_citations = [_strip_internal_citation_fields(c) for c in result.citations]
+        citations.extend(public_tool_citations)
         host_context.citation_offset = max(
             host_context.citation_offset,
             _citation_number_high_water(result.citations),
@@ -928,7 +1069,7 @@ def _adapt_tool(host_tool, host_context: HostToolContext, citations: list[dict])
             details["matches"] = matches
         elif result.content:
             details["output_preview"] = result.content[:800]
-        artifacts: dict[str, Any] = {"citations": result.citations}
+        artifacts: dict[str, Any] = {"citations": public_tool_citations}
         if external_references:
             details["external_references"] = external_references[:6]
             artifacts["external_references"] = external_references
@@ -1084,7 +1225,15 @@ async def generate_stream(
         if isinstance(m, Mapping) and m.get("role") in {"user", "assistant"}
     ]
 
-    citations = list(plan.citations)
+    verifier_content_by_n: dict[int, str] = {}
+    citations: list[dict[str, Any]] = []
+    for raw_cit in plan.citations:
+        cit_n = raw_cit.get("n")
+        if isinstance(cit_n, int) and not isinstance(cit_n, bool):
+            full_text = str(raw_cit.get("_verifier_content") or raw_cit.get("content") or "").strip()
+            if full_text:
+                verifier_content_by_n[cit_n] = full_text
+        citations.append(_strip_internal_citation_fields(raw_cit))
     local_evidence_required = knowledge_only or bool(plan.source_ids)
     external_references: list[dict[str, Any]] = []
     external_reference_urls: set[str] = set()
@@ -1186,7 +1335,10 @@ async def generate_stream(
                 # Standalone general knowledge and application-record lanes use no tools.
                 names = []
                 host_tools = []
-            tools = tuple(_adapt_tool(tool, host_context, citations) for tool in host_tools)
+            tools = tuple(
+                _adapt_tool(tool, host_context, citations, verifier_content_by_n)
+                for tool in host_tools
+            )
             scene_notes: list[str] = []
             if question_scope in {"project", "unknown"}:
                 if "search_context" in names:
@@ -1572,6 +1724,7 @@ async def generate_stream(
                             answer=canonical_answer,
                             internal_citations=internal_citations,
                             session_citations=used_session_citations,
+                            verifier_content_by_n=verifier_content_by_n,
                         )
                         if verified_status == "no_answer":
                             canonical_answer = empty_response or no_answer_text(query=plan.query)
@@ -1580,6 +1733,11 @@ async def generate_stream(
                             used_session_citations = []
                             answer_status = "no_answer"
                             no_answer_reason = verified_reason or "weak_evidence"
+                            if verified_reason == "entailment_verifier_failed":
+                                overall_degraded = True
+                                overall_degraded_reason = (
+                                    overall_degraded_reason or "entailment_verifier_failed"
+                                )
                     canonical_citations = [*internal_citations, *external_citations]
                     session_step = _build_session_audit_step(
                         plan_audit_trace,

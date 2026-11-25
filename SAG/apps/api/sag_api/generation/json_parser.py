@@ -9,24 +9,96 @@ _OPEN_THINK = "<think>"
 _CLOSE_THINK = "</think>"
 
 
+def _extract_terminal_standalone_json(after_think: str) -> str:
+    """Recover a complete JSON value only if it starts on its own line and runs cleanly to EOF."""
+    decoder = json.JSONDecoder()
+    pos = 0
+    length = len(after_think)
+    while pos < length:
+        nl = after_think.find("\n", pos)
+        if nl == -1:
+            return ""
+        line_start = nl + 1
+        stripped_start = line_start
+        while stripped_start < length and after_think[stripped_start] in " \t\r":
+            stripped_start += 1
+        if stripped_start < length and after_think[stripped_start] in "{[":
+            try:
+                _, end_pos = decoder.raw_decode(after_think, stripped_start)
+            except json.JSONDecodeError:
+                pass
+            else:
+                if not after_think[end_pos:].strip():
+                    return after_think[stripped_start:end_pos]
+        pos = line_start
+    return ""
+
+
 def strip_think_blocks(raw_text: str) -> str:
-    """Strip one or more `<think>...</think>` blocks, handling truncated/unclosed blocks safely."""
+    """Strip outer `<think>...</think>` blocks without corrupting `<think>` inside valid JSON."""
     text = (raw_text or "").strip()
     if not text:
         return ""
-    while True:
-        lower = text.lower()
-        start = lower.find(_OPEN_THINK)
-        if start == -1:
-            return text
-        end = lower.find(_CLOSE_THINK, start + len(_OPEN_THINK))
-        if end == -1:
-            before = text[:start].strip()
-            if "{" in before or "[" in before:
-                return before
-            after = text[start + len(_OPEN_THINK) :].strip()
-            return after if ("{" in after or "[" in after) else before
-        text = (text[:start] + " " + text[end + len(_CLOSE_THINK) :]).strip()
+    lower = text.lower()
+    if _OPEN_THINK not in lower:
+        return text
+
+    decoder = json.JSONDecoder()
+    out: list[str] = []
+    pos = 0
+    length = len(text)
+    has_json_before = False
+
+    while pos < length:
+        next_think = lower.find(_OPEN_THINK, pos)
+        if next_think == -1:
+            out.append(text[pos:])
+            break
+
+        scan = pos
+        enclosed = False
+        while scan < next_think:
+            next_obj = text.find("{", scan, next_think)
+            next_arr = text.find("[", scan, next_think)
+            if next_obj == -1 and next_arr == -1:
+                break
+            if next_obj == -1:
+                cand = next_arr
+            elif next_arr == -1:
+                cand = next_obj
+            else:
+                cand = min(next_obj, next_arr)
+            try:
+                _, end_pos = decoder.raw_decode(text, cand)
+            except json.JSONDecodeError:
+                scan = cand + 1
+                continue
+            has_json_before = True
+            if end_pos > next_think:
+                out.append(text[pos:end_pos])
+                pos = end_pos
+                enclosed = True
+                break
+            scan = max(end_pos, cand + 1)
+
+        if enclosed:
+            continue
+
+        before_seg = text[pos:next_think]
+        if before_seg:
+            out.append(before_seg)
+        close_idx = lower.find(_CLOSE_THINK, next_think + len(_OPEN_THINK))
+        if close_idx == -1:
+            if has_json_before:
+                break
+            before_so_far = "".join(out).strip()
+            if "{" in before_so_far or "[" in before_so_far:
+                break
+            return _extract_terminal_standalone_json(text[next_think + len(_OPEN_THINK) :])
+        out.append(" ")
+        pos = close_idx + len(_CLOSE_THINK)
+
+    return "".join(out).strip()
 
 
 def extract_fenced_blocks_and_outside(text: str) -> tuple[list[str], str]:
@@ -52,8 +124,11 @@ def extract_fenced_blocks_and_outside(text: str) -> tuple[list[str], str]:
                 if rest.endswith("```") and len(rest) >= 3:
                     inner = rest[:-3].strip()
                     if inner.lower().startswith("json"):
-                        first_ws = inner.find(" ")
-                        inner = inner[first_ws + 1 :].strip() if first_ws != -1 else ""
+                        tail = inner[4:]
+                        if not tail:
+                            inner = ""
+                        elif tail[0].isspace() or tail[0] in "{[":
+                            inner = tail.strip()
                     if inner:
                         fenced_bodies.append(inner)
                     in_fence = False

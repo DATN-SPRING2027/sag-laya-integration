@@ -71,8 +71,42 @@ def _query_anchor_terms(query: str) -> tuple[str, ...]:
     return tuple(normalized)
 
 
-def _sections_cover_query_anchors(required_terms: tuple[str, ...], sections: list[RetrievedSection]) -> bool:
-    if not required_terms:
+def _query_anchor_groups(query: str) -> tuple[tuple[str, ...], ...]:
+    """Return normalized OR-groups (e.g. equivalent date formats) that are ANDed across distinct anchors."""
+    features = extract_query_features(query)
+    groups: list[tuple[str, ...]] = []
+    seen: set[tuple[str, ...]] = set()
+    for raw_group in features.anchor_groups:
+        norm_group = tuple(
+            dict.fromkeys(value for term in raw_group if (value := normalize_lexical_text(term)))
+        )
+        if norm_group and norm_group not in seen:
+            seen.add(norm_group)
+            groups.append(norm_group)
+    return tuple(groups)
+
+
+def _normalize_anchor_groups(
+    required: tuple[str, ...] | tuple[tuple[str, ...], ...],
+) -> tuple[tuple[str, ...], ...]:
+    groups: list[tuple[str, ...]] = []
+    for item in required:
+        if isinstance(item, str):
+            if item:
+                groups.append((item,))
+        else:
+            group = tuple(term for term in item if term)
+            if group:
+                groups.append(group)
+    return tuple(groups)
+
+
+def _sections_cover_query_anchors(
+    required_terms: tuple[str, ...] | tuple[tuple[str, ...], ...],
+    sections: list[RetrievedSection],
+) -> bool:
+    groups = _normalize_anchor_groups(required_terms)
+    if not groups:
         return True
     evidence_text = normalize_lexical_text(
         "\n".join(
@@ -80,16 +114,20 @@ def _sections_cover_query_anchors(required_terms: tuple[str, ...], sections: lis
             for section in sections
         )
     )
-    return all(term in evidence_text for term in required_terms)
+    return all(any(variant in evidence_text for variant in group) for group in groups)
 
 
-def _section_contains_query_anchor(required_terms: tuple[str, ...], section: RetrievedSection) -> bool:
-    if not required_terms:
+def _section_contains_query_anchor(
+    required_terms: tuple[str, ...] | tuple[tuple[str, ...], ...],
+    section: RetrievedSection,
+) -> bool:
+    groups = _normalize_anchor_groups(required_terms)
+    if not groups:
         return True
     evidence_text = normalize_lexical_text(
         f"{section.document_name or ''}\n{section.section_path or ''}\n{section.heading}\n{section.content}"
     )
-    return any(term in evidence_text for term in required_terms)
+    return any(variant in evidence_text for group in groups for variant in group)
 
 
 def build_tool_evidence_pack(
@@ -106,10 +144,10 @@ def build_tool_evidence_pack(
     eligible = [section for section in sections if has_traceable_locator(section)]
     if not eligible:
         return ToolEvidencePack([], "(No traceable evidence available to answer.)", "weak", "weak_evidence", 0)
-    required_terms = _query_anchor_terms(query)
-    if required_terms:
-        eligible = [section for section in eligible if _section_contains_query_anchor(required_terms, section)]
-        if not eligible or not _sections_cover_query_anchors(required_terms, eligible):
+    required_groups = _query_anchor_groups(query)
+    if required_groups:
+        eligible = [section for section in eligible if _section_contains_query_anchor(required_groups, section)]
+        if not eligible or not _sections_cover_query_anchors(required_groups, eligible):
             return ToolEvidencePack(
                 [],
                 "(Evidence does not contain the exact identifier from the question; unable to answer.)",
@@ -148,7 +186,7 @@ def build_tool_evidence_pack(
             "context_budget",
             0,
         )
-    if not _sections_cover_query_anchors(required_terms, selected):
+    if not _sections_cover_query_anchors(required_groups, selected):
         return ToolEvidencePack(
             [],
             "(Evidence within budget does not cover the exact identifier from the question; unable to answer.)",
@@ -392,12 +430,16 @@ def build_evidence_pack(
     eligible = [section for section in sections if has_traceable_locator(section)]
     if not eligible:
         return EvidencePack([], [], "weak", "weak_evidence", base_tokens, output_reserve, context_window)
-    required_terms = _query_anchor_terms(query)
-    if required_terms:
-        anchor_hits = [section for section in eligible if _section_contains_query_anchor(required_terms, section)]
-        if not anchor_hits or not _sections_cover_query_anchors(required_terms, eligible):
+    required_groups = _query_anchor_groups(query)
+    if required_groups:
+        anchor_hits = [section for section in eligible if _section_contains_query_anchor(required_groups, section)]
+        if not anchor_hits or not _sections_cover_query_anchors(required_groups, eligible):
             return EvidencePack([], [], "weak", "weak_evidence", base_tokens, output_reserve, context_window)
-        non_anchor_hits = [section for section in eligible if not _section_contains_query_anchor(required_terms, section)]
+        non_anchor_hits = [
+            section
+            for section in eligible
+            if not _section_contains_query_anchor(required_groups, section)
+        ]
         eligible = [*anchor_hits, *non_anchor_hits]
 
     selected: list[RetrievedSection] = []
@@ -414,7 +456,7 @@ def build_evidence_pack(
 
     if not selected:
         return EvidencePack([], [], "weak", "context_budget", base_tokens, output_reserve, context_window)
-    if not _sections_cover_query_anchors(required_terms, selected):
+    if not _sections_cover_query_anchors(required_groups, selected):
         return EvidencePack([], [], "weak", "weak_evidence", base_tokens, output_reserve, context_window)
     return EvidencePack(
         selected,
