@@ -1512,6 +1512,10 @@ async def run_search_indexing_stage(
     """Execute Phase 2C chunking, PostgreSQL persistence, and Qdrant indexing with audit."""
     start_time = datetime.now(UTC)
     collection_name = f"search_units_{project_id}"
+    try:
+        document_version._last_reconcile_job_id = None
+    except Exception:
+        pass
 
     # Resolve authoritative tenant_id and doc from Document or IngestionRun
     from sag_api.db.models.document import Document
@@ -1801,20 +1805,23 @@ async def run_search_indexing_stage(
                 from sag_api.db.models import Job
                 from sag_api.enums import JobStatus, JobType
 
-                session.add(
-                    Job(
-                        id=str(uuid.uuid4()),
-                        type=JobType.RECONCILE_SEARCH_INDEX,
-                        status=JobStatus.QUEUED,
-                        source_id=doc.source_id if doc else None,
-                        document_id=document_version.document_id,
-                        payload={
-                            "project_id": project_id,
-                            "reason": "superseded_prune_failed",
-                            "superseded_version_id": str(superseded_version_id),
-                        },
-                    )
+                reconcile_job = Job(
+                    id=str(uuid.uuid4()),
+                    type=JobType.RECONCILE_SEARCH_INDEX,
+                    status=JobStatus.QUEUED,
+                    source_id=doc.source_id if doc else None,
+                    document_id=document_version.document_id,
+                    payload={
+                        "project_id": project_id,
+                        "reason": "superseded_prune_failed",
+                        "superseded_version_id": str(superseded_version_id),
+                    },
                 )
+                session.add(reconcile_job)
+                try:
+                    document_version._last_reconcile_job_id = reconcile_job.id
+                except Exception:
+                    pass
         document_version.search_status = "SEARCH_READY"
         document_version.search_ready_at = datetime.now(UTC)
     else:

@@ -457,3 +457,254 @@ def test_session_qdrant_collection_name_prevents_unicode_and_punctuation_collisi
     assert session_qdrant_collection_name("dự án 1") != session_qdrant_collection_name("đề án 1")
     assert session_qdrant_collection_name("proj:a") != session_qdrant_collection_name("proj/a")
     assert session_qdrant_collection_name("proj-alpha") == session_qdrant_collection_name("proj-alpha")
+
+
+@pytest.mark.asyncio
+async def test_delete_source_legacy_sag_uses_source_config_id_not_article_id(
+    p3_lifecycle_db, tmp_path, monkeypatch
+):
+    from sag_api.services import octx_gc_service
+
+    slot_calls: list[str] = []
+    partition_calls: list[str] = []
+
+    fake_session_factory = object()
+    fake_vector_client = object()
+    fake_slot = SimpleNamespace(
+        engine=SimpleNamespace(
+            resources=SimpleNamespace(
+                relational=SimpleNamespace(session_factory=lambda: fake_session_factory),
+                vector=fake_vector_client,
+            )
+        )
+    )
+
+    async def fake_slot_fn(source_config_id: str, _source=None):
+        slot_calls.append(source_config_id)
+        return fake_slot
+
+    async def fake_delete_partition(source_config_id: str, *, sag_session_factory=None, vector_client=None):
+        assert sag_session_factory is fake_session_factory
+        assert vector_client is fake_vector_client
+        partition_calls.append(source_config_id)
+
+    monkeypatch.setattr(octx_gc_service, "delete_source_partition", fake_delete_partition)
+
+    mgr = SimpleNamespace(
+        _slot=AsyncMock(side_effect=fake_slot_fn),
+        release=AsyncMock(),
+        get_search_unit_qdrant_client=AsyncMock(return_value=None),
+    )
+
+    async with p3_lifecycle_db() as session:
+        session.add(Source(id="src-leg-del", name="Legacy Del", sag_source_config_id="cfg-real-datasource"))
+        await session.flush()
+        session.add(
+            Document(
+                id="doc-leg-del",
+                source_id="src-leg-del",
+                tenant_id="tenant-leg",
+                project_id=None,
+                filename="legacy.md",
+                storage_path=str(tmp_path / "legacy.md"),
+                sag_source_id="art-1",
+                status=DocumentStatus.READY,
+                is_active=True,
+            )
+        )
+        await session.commit()
+
+        await source_service.delete_source(
+            session,
+            "src-leg-del",
+            engine_manager=mgr,
+            upload_dir=str(tmp_path),
+            job_queue=None,
+        )
+        assert await session.get(Source, "src-leg-del") is None
+
+    assert slot_calls == ["cfg-real-datasource"]
+    assert partition_calls == ["cfg-real-datasource"]
+    assert "art-1" not in slot_calls
+    assert "art-1" not in partition_calls
+    mgr.release.assert_awaited_once_with("cfg-real-datasource")
+
+
+@pytest.mark.asyncio
+async def test_reconcile_search_index_job_enqueued_durably_after_commit(
+    p3_lifecycle_db, tmp_path, monkeypatch
+):
+    from sqlalchemy import select
+
+    from sag_api.db.models import IngestionRun
+    from sag_api.enums import ConnectorKind, SourceStatus, SourceType
+    from sag_api.jobs import tasks
+    from sag_api.services import dedup_and_temporal_service as temporal
+
+    doc_file = tmp_path / "reconcile_enqueue.md"
+    doc_file.write_text("# Reconcile\n\nBody text.", encoding="utf-8")
+    now = datetime.now(UTC)
+
+    points: list[dict] = []
+
+    def qdrant_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8")) if request.content else {}
+        if request.method == "GET" and request.url.path == "/collections/search_units_proj-rec-q":
+            return httpx.Response(
+                200,
+                json={
+                    "result": {
+                        "config": {
+                            "params": {
+                                "vectors": {"content_vector": {"size": 4}},
+                                "sparse_vectors": {"bm25_sparse": {"modifier": "idf"}},
+                            }
+                        },
+                        "payload_schema": {},
+                    }
+                },
+            )
+        if request.method == "GET" and "/points/" in request.url.path:
+            return httpx.Response(404, json={"status": {"error": "not found"}})
+        if request.method == "PUT" and request.url.path.endswith("/points"):
+            for pt in body.get("points", []):
+                if not pt.get("payload", {}).get("_collection_meta"):
+                    points.append(
+                        {
+                            "id": pt["id"],
+                            "payload": {"content_hash": pt["payload"]["content_hash"]},
+                        }
+                    )
+            return httpx.Response(200, json={"result": {"status": "completed"}})
+        if request.url.path.endswith("/points/count"):
+            return httpx.Response(200, json={"result": {"count": len(points)}})
+        if request.url.path.endswith("/points/scroll"):
+            return httpx.Response(200, json={"result": {"points": points}})
+        if request.url.path.endswith("/points/delete"):
+            must = (body.get("filter") or {}).get("must") or []
+            if must and must[0].get("match", {}).get("any") == ["old-ver-rec"]:
+                return httpx.Response(503, text="qdrant prune error")
+            return httpx.Response(200, json={"result": {"status": "completed"}})
+        return httpx.Response(200, json={"result": {}})
+
+    qdrant_client = httpx.AsyncClient(
+        base_url="http://qdrant.local", transport=httpx.MockTransport(qdrant_handler)
+    )
+
+    class Fixed4DEmbedder:
+        model = "bge-large-en-v1.5"
+        base_url = "https://api.siliconflow.com/v1"
+        dimensions = 4
+
+        async def batch_generate(self, texts: list[str]) -> list[list[float]]:
+            return [[0.25, 0.25, 0.25, 0.25] for _ in texts]
+
+    monkeypatch.setattr(tasks, "SessionLocal", p3_lifecycle_db)
+    monkeypatch.setattr(tasks.settings, "document_event_extraction_enabled", False)
+    monkeypatch.setattr(
+        temporal,
+        "resolve_temporal_supersedes",
+        AsyncMock(return_value={"action": "SUPERSEDED", "supersedes_id": "old-ver-rec"}),
+    )
+
+    mgr = SimpleNamespace(
+        get_sag_embedding=AsyncMock(return_value=Fixed4DEmbedder()),
+        get_search_unit_qdrant_client=AsyncMock(return_value=qdrant_client),
+    )
+    enqueued_after_commit: list[tuple[str, bool]] = []
+
+    async def fake_enqueue_durably(job_id: str) -> None:
+        async with p3_lifecycle_db() as check_session:
+            row = await check_session.get(Job, job_id)
+            enqueued_after_commit.append((job_id, row is not None and row.status == JobStatus.QUEUED))
+
+    job_queue = SimpleNamespace(
+        enqueue_durably=AsyncMock(side_effect=fake_enqueue_durably),
+        source_maintenance_requested=lambda _sid: False,
+        source_stop_requested=lambda _sid: False,
+    )
+
+    try:
+        async with p3_lifecycle_db() as session:
+            session.add(
+                Source(
+                    id="src-rec-q",
+                    name="Rec Q",
+                    source_type=SourceType.DOCUMENT,
+                    connector_kind=ConnectorKind.FILE_UPLOAD,
+                    sag_source_config_id="cfg-rec-q",
+                    status=SourceStatus.ACTIVE,
+                )
+            )
+            session.add(
+                Document(
+                    id="doc-rec-q",
+                    source_id="src-rec-q",
+                    tenant_id="tenant-rec-q",
+                    project_id="proj-rec-q",
+                    filename="reconcile_enqueue.md",
+                    storage_path=str(doc_file),
+                    status=DocumentStatus.PENDING,
+                    is_active=True,
+                )
+            )
+            await session.flush()
+            session.add(
+                DocumentVersion(
+                    id="ver-rec-q",
+                    document_id="doc-rec-q",
+                    version_no=2,
+                    file_hash="fh-rec-q",
+                    valid_from=now,
+                    valid_to=now + timedelta(days=30),
+                    status="RECEIVED",
+                    metadata_json={"security_partition_id": "proj-rec-q"},
+                )
+            )
+            session.add(
+                CanonicalBlock(
+                    id="blk-rec-q",
+                    document_version_id="ver-rec-q",
+                    ordinal=0,
+                    block_type="paragraph",
+                    page_from=1,
+                    page_to=1,
+                    section_path="Reconcile",
+                    normalized_text="Body text.",
+                    content_hash=hashlib.sha256(b"Body text.").hexdigest(),
+                )
+            )
+            session.add(
+                IngestionRun(
+                    id="run-rec-q",
+                    tenant_id="tenant-rec-q",
+                    project_id="proj-rec-q",
+                    document_version_id="ver-rec-q",
+                    idempotency_key="idem-rec-q",
+                    payload_hash="fh-rec-q",
+                    status="QUEUED",
+                )
+            )
+            job = Job(
+                id="job-proc-rec-q",
+                type=JobType.PROCESS_DOCUMENT,
+                status=JobStatus.RUNNING,
+                source_id="src-rec-q",
+                document_id="doc-rec-q",
+                payload={"run_id": "run-rec-q", "canonical_checkpoint_stage": "DEDUP_TEMPORAL"},
+            )
+            session.add(job)
+            await session.commit()
+
+            await tasks._process_document_unlocked(
+                session, job, engine_manager=mgr, job_queue=job_queue
+            )
+
+            reconcile_job = await session.scalar(
+                select(Job).where(Job.type == JobType.RECONCILE_SEARCH_INDEX)
+            )
+            assert reconcile_job is not None
+            assert enqueued_after_commit == [(reconcile_job.id, True)]
+            job_queue.enqueue_durably.assert_awaited_once_with(reconcile_job.id)
+    finally:
+        await qdrant_client.aclose()

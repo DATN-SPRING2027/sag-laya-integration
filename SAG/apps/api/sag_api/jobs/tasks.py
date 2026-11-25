@@ -557,10 +557,15 @@ async def _process_document_unlocked(
                             embedder=embedder,
                             run_id=run_id,
                         )
+                reconcile_job_id = getattr(doc_ver, "_last_reconcile_job_id", None)
                 next_payload = await refresh_payload()
                 next_payload.pop("canonical_checkpoint_stage", None)
                 job.payload = next_payload
                 await session.commit()
+                if reconcile_job_id and job_queue is not None:
+                    from sag_api.services.document_service import _enqueue_persisted_job
+
+                    await _enqueue_persisted_job(job_queue, str(reconcile_job_id))
             except ParsePaused:
                 await _pause_or_yield()
             except (JobPaused, JobYielded):

@@ -567,16 +567,15 @@ async def delete_source(
                 if should_close_client:
                     await resolved_client.aclose()
 
-    if legacy_sag_ids and hasattr(engine_manager, "_slot"):
+    if legacy_sag_ids and sag_id and hasattr(engine_manager, "_slot"):
         from sag_api.services.octx_gc_service import delete_source_partition
 
-        for legacy_sid in sorted(legacy_sag_ids):
-            slot = await engine_manager._slot(legacy_sid, source)
-            await delete_source_partition(
-                legacy_sid,
-                sag_session_factory=slot.engine.resources.relational.session_factory(),
-                vector_client=slot.engine.resources.vector,
-            )
+        slot = await engine_manager._slot(sag_id, source)
+        await delete_source_partition(
+            sag_id,
+            sag_session_factory=slot.engine.resources.relational.session_factory(),
+            vector_client=slot.engine.resources.vector,
+        )
 
     # 悬挂绑定清理（target_id 为普通字符串，无 FK 级联）
     await session.execute(
