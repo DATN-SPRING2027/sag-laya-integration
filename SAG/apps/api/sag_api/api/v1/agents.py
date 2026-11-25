@@ -291,6 +291,15 @@ async def messages(
     for message in visible_messages:
         dto = MessageOut.model_validate(message)
         dto.is_inherited = message.thread_id != thread.id
+        for step in message.steps or ():
+            if not isinstance(step, dict):
+                continue
+            if step.get("degraded"):
+                dto.degraded = True
+                dto.degraded_reason = dto.degraded_reason or step.get("degraded_reason")
+            elif step.get("extraction_degraded"):
+                dto.degraded = True
+                dto.degraded_reason = dto.degraded_reason or step.get("extraction_degraded_reason")
         items_out.append(dto)
     return MessagePageOut(
         items=items_out,

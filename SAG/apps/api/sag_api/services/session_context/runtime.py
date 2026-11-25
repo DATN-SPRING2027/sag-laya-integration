@@ -22,7 +22,7 @@ from sag_api.core.principal_assertion import VerifiedPrincipal
 from sag_api.db.models.agent import Message
 from sag_api.db.models.session_context import SessionUnit
 from sag_api.enums import MessageRole, MessageStatus
-from sag_api.services.decision_router import route_query
+from sag_api.services.decision_router import route_query_async
 from sag_api.services.session_context import persistence as _persistence_mod
 from sag_api.services.session_context.models import AblationMode, ContextAuditTrace, SessionContextPack
 from sag_api.services.session_context.optimizer import build_ecce_context_pack
@@ -758,7 +758,15 @@ async def prepare_session_context_for_ask(
             [d for d in index.active_decisions if d.turn_id in allowed_turn_ids]
         ),
     }
-    decision = await asyncio.to_thread(route_query, query, route_ctx)
+    decision = (
+        await route_query_async(
+            query,
+            has_thread_history=bool(allowed_turn_ids),
+            has_sources=(requested_source_ids is None or bool(requested_source_ids)),
+            scoped=bool(requested_source_ids),
+            context=route_ctx,
+        )
+    ).to_dict()
 
     try:
         pack = await build_ecce_context_pack(

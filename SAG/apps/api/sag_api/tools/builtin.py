@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
+from sag_agent import ToolCapability
 from sag_api.connectors.web import extract_web_markdown, extract_web_title
 from sag_api.core.config import settings
 from sag_api.core.logging import get_logger
@@ -152,6 +153,7 @@ class SearchContextTool(Tool):
             },
             "required": ["query"],
         },
+        capabilities=frozenset({ToolCapability.KNOWLEDGE_SEARCH, ToolCapability.RESEARCH}),
     )
 
     async def invoke(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
@@ -318,6 +320,7 @@ class GetEntityTool(Tool):
             "properties": {"name": {"type": "string", "description": "Tên thực thể"}},
             "required": ["name"],
         },
+        capabilities=frozenset({ToolCapability.ENTITY_LOOKUP, ToolCapability.RESEARCH}),
     )
 
     async def invoke(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
@@ -451,6 +454,7 @@ class GetTimeTool(Tool):
             },
             "additionalProperties": False,
         },
+        capabilities=frozenset({ToolCapability.TIME_LOOKUP}),
     )
 
     async def invoke(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
@@ -670,6 +674,7 @@ class WebSearchTool(Tool):
             "required": ["query"],
             "additionalProperties": False,
         },
+        capabilities=frozenset({ToolCapability.WEB_SEARCH, ToolCapability.RESEARCH}),
     )
 
     @staticmethod
@@ -777,6 +782,7 @@ class OpenWebPageTool(Tool):
             "required": ["url"],
             "additionalProperties": False,
         },
+        capabilities=frozenset({ToolCapability.WEB_FETCH, ToolCapability.RESEARCH}),
     )
 
     async def invoke(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:

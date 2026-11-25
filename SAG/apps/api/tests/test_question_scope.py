@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, create_autospec, patch
 
-from sag_agent import AgentEvent, EventType
+from sag_agent import AgentEvent, EventType, ToolCapability
 from sag_api.core.principal_assertion import VerifiedPrincipal
 from sag_api.generation import LLMClient
 from sag_api.services import agent_service
@@ -18,8 +18,8 @@ from sag_api.tools import Tool, ToolMeta, ToolRegistry, ToolResult
 
 
 class _DummyTool(Tool):
-    def __init__(self, name: str, description: str) -> None:
-        self.meta = ToolMeta(name=name, description=description)
+    def __init__(self, name: str, description: str, capabilities: frozenset[ToolCapability] = frozenset()) -> None:
+        self.meta = ToolMeta(name=name, description=description, capabilities=capabilities)
 
     async def invoke(self, args, ctx) -> ToolResult:
         del args, ctx
@@ -79,11 +79,41 @@ def _make_principal() -> VerifiedPrincipal:
 
 def _make_registry() -> ToolRegistry:
     reg = ToolRegistry()
-    reg.register(_DummyTool("search_context", "Tìm trong kho tri thức dự án"))
-    reg.register(_DummyTool("get_entity", "Tra cứu thực thể tri thức"))
-    reg.register(_DummyTool("get_time", "Tra cứu thời gian hiện tại"))
-    reg.register(_DummyTool("web_search", "Tìm kiếm Internet tin tức thời tiết mới nhất"))
-    reg.register(_DummyTool("open_webpage", "Mở trang web"))
+    reg.register(
+        _DummyTool(
+            "search_context",
+            "Tìm trong kho tri thức dự án",
+            frozenset({ToolCapability.KNOWLEDGE_SEARCH, ToolCapability.RESEARCH}),
+        )
+    )
+    reg.register(
+        _DummyTool(
+            "get_entity",
+            "Tra cứu thực thể tri thức",
+            frozenset({ToolCapability.ENTITY_LOOKUP, ToolCapability.RESEARCH}),
+        )
+    )
+    reg.register(
+        _DummyTool(
+            "get_time",
+            "Tra cứu thời gian hiện tại",
+            frozenset({ToolCapability.TIME_LOOKUP}),
+        )
+    )
+    reg.register(
+        _DummyTool(
+            "web_search",
+            "Tìm kiếm Internet tin tức thời tiết mới nhất",
+            frozenset({ToolCapability.WEB_SEARCH, ToolCapability.RESEARCH}),
+        )
+    )
+    reg.register(
+        _DummyTool(
+            "open_webpage",
+            "Mở trang web",
+            frozenset({ToolCapability.WEB_FETCH, ToolCapability.RESEARCH}),
+        )
+    )
     return reg
 
 
@@ -148,6 +178,10 @@ class QuestionScopeStreamIntegrationTests(unittest.IsolatedAsyncioTestCase):
         web_configured: bool = True,
         output: str = "Câu trả lời trực tiếp.",
     ):
+        import json
+
+        from sag_api.services.decision_router import IntentFlags, UnifiedRouteDecision
+
         source = SimpleNamespace(id="source-1", name="Project Docs", sag_source_config_id="cfg-1")
 
         async def _complete(messages: list[dict], **_kwargs) -> str:
@@ -158,6 +192,23 @@ class QuestionScopeStreamIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         llm = SimpleNamespace(configured=True, complete=AsyncMock(side_effect=_complete))
         runtime = _CapturingRuntime(output=output)
+        scope_val = json.loads(scope_response).get("scope", "general")
+        effective_route = route_decision or {
+            "coarse_intent": "KNOWLEDGE",
+            "question_scope": scope_val,
+            "memory_scope": "project_documents" if scope_val == "project" else "none",
+            "temporal_mode": "atemporal",
+            "answer_shape": "fact_answer",
+            "intent_flags": {
+                "needs_retrieval": scope_val == "project",
+                "needs_time": False,
+                "needs_web": False,
+                "needs_clarification": False,
+                "is_pure_math_or_transform": False,
+            },
+            "confidence": 0.9,
+            "degraded": False,
+        }
         plan = AskPlan(
             query=query,
             source_ids=source_ids,
@@ -166,14 +217,36 @@ class QuestionScopeStreamIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 {"role": "system", "content": "You are Continuum AI."},
                 {"role": "user", "content": query},
             ],
-            route_decision=route_decision or {"is_chitchat": False, "confidence": 0.1},
+            route_decision=effective_route if route_decision is not None else None,
             session_citations=session_citations or [],
+        )
+        flags_raw = effective_route.get("intent_flags") or {}
+        router_mock = AsyncMock(
+            return_value=UnifiedRouteDecision(
+                query=query,
+                coarse_intent=effective_route.get("coarse_intent", "KNOWLEDGE"),
+                question_scope=effective_route.get("question_scope", "general"),
+                memory_scope=effective_route.get("memory_scope", "none"),
+                temporal_mode=effective_route.get("temporal_mode", "atemporal"),
+                answer_shape=effective_route.get("answer_shape", "fact_answer"),
+                intent_flags=IntentFlags(
+                    needs_retrieval=bool(flags_raw.get("needs_retrieval", False)),
+                    needs_time=bool(flags_raw.get("needs_time", False)),
+                    needs_web=bool(flags_raw.get("needs_web", False)),
+                    needs_clarification=bool(flags_raw.get("needs_clarification", False)),
+                    is_pure_math_or_transform=bool(flags_raw.get("is_pure_math_or_transform", False)),
+                ),
+                domain="general",
+                confidence=float(effective_route.get("confidence", 0.9)),
+                degraded=False,
+            )
         )
         resolve_mcp = AsyncMock(return_value=[])
         with (
             patch.object(agent_service, "resolve_sources", AsyncMock(return_value=[source])),
             patch.object(agent_service, "resolve_mcp_specs", resolve_mcp),
             patch.object(agent_service, "persist_answer", AsyncMock(return_value="msg-1")),
+            patch.object(agent_service, "route_query_async", router_mock),
             patch.object(agent_service.WebSearchTool, "configured", staticmethod(lambda: web_configured)),
         ):
             events = [
@@ -191,15 +264,21 @@ class QuestionScopeStreamIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     principal=_make_principal(),
                 )
             ]
-        return events, runtime, llm, resolve_mcp
+        return events, runtime, router_mock, resolve_mcp
 
     async def test_internet_on_general_time_sensitive_query_keeps_web_and_time_tools(self) -> None:
-        events, runtime, llm, resolve_mcp = await self._run_stream(
+        events, runtime, router_mock, resolve_mcp = await self._run_stream(
             query="Thời tiết hôm nay thế nào?",
-            scope_response='{"scope":"general"}',
+            route_decision={
+                "coarse_intent": "KNOWLEDGE",
+                "question_scope": "general",
+                "memory_scope": "none",
+                "intent_flags": {"needs_retrieval": False, "needs_time": True, "needs_web": True},
+                "confidence": 0.9,
+            },
             knowledge_only=False,
         )
-        llm.complete.assert_awaited_once()
+        router_mock.assert_not_awaited()
         resolve_mcp.assert_not_awaited()
         tool_names = [t.spec.name for t in runtime.definition.tools]
         self.assertEqual(tool_names, ["get_time", "web_search", "open_webpage"])
@@ -219,7 +298,13 @@ class QuestionScopeStreamIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_internet_off_general_time_sensitive_query_exposes_no_web_tools(self) -> None:
         _, runtime, _, _ = await self._run_stream(
             query="Thời tiết hôm nay thế nào?",
-            scope_response='{"scope":"general"}',
+            route_decision={
+                "coarse_intent": "KNOWLEDGE",
+                "question_scope": "general",
+                "memory_scope": "none",
+                "intent_flags": {"needs_retrieval": False, "needs_time": False, "needs_web": True},
+                "confidence": 0.9,
+            },
             knowledge_only=True,
         )
         tool_names = [t.spec.name for t in runtime.definition.tools]
@@ -229,13 +314,13 @@ class QuestionScopeStreamIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("current external information cannot be verified", system_prompt)
 
     async def test_standalone_general_question_answers_directly_without_tools_or_evidence_gate(self) -> None:
-        events, runtime, llm, _ = await self._run_stream(
+        events, runtime, router_mock, _ = await self._run_stream(
             query="Giải thích REST API là gì?",
             scope_response='{"scope":"general"}',
             knowledge_only=True,
             output="REST API là kiến trúc giao diện lập trình ứng dụng dựa trên HTTP.",
         )
-        llm.complete.assert_awaited_once()
+        router_mock.assert_awaited_once()
         self.assertEqual([t.spec.name for t in runtime.definition.tools], [])
         deltas = [e for e in events if e.type == EventType.MESSAGE_DELTA.value]
         self.assertEqual(len(deltas), 1)
@@ -256,48 +341,51 @@ class QuestionScopeStreamIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("required application data connection is unavailable", system_prompt)
         self.assertNotIn("Internet access is disabled", system_prompt)
 
-    async def test_explicit_source_selection_skips_classifier_and_retains_evidence_gate(self) -> None:
-        events, runtime, llm, _ = await self._run_stream(
+    async def test_explicit_source_selection_retains_evidence_gate_without_extra_classifier(self) -> None:
+        events, runtime, _, _ = await self._run_stream(
             query="Giải thích REST API trong tài liệu này",
             scope_response='{"scope":"general"}',
             knowledge_only=False,
             source_ids=["source-1"],
             output="Câu trả lời không có trích dẫn.",
         )
-        llm.complete.assert_not_awaited()
         tool_names = [t.spec.name for t in runtime.definition.tools]
         self.assertIn("search_context", tool_names)
         completed = [e for e in events if e.type == EventType.RUN_COMPLETED.value]
         self.assertEqual(completed[0].data["payload"]["answer_status"], "no_answer")
         self.assertEqual(completed[0].data["payload"]["no_answer_reason"], "weak_evidence")
 
-    async def test_fast_path_greeting_and_session_grounded_turns_skip_classifier_and_preserve_session_notes(
+    async def test_fast_path_greeting_and_session_grounded_turns_use_unified_route_and_preserve_session_notes(
         self,
     ) -> None:
-        _, _, greeting_llm, _ = await self._run_stream(
+        _, greeting_runtime, _, _ = await self._run_stream(
             query="Xin chào Continuum AI!",
+            route_decision={
+                "coarse_intent": "CHAT",
+                "question_scope": "general",
+                "memory_scope": "none",
+                "intent_flags": {"needs_retrieval": False},
+                "is_chitchat": True,
+                "confidence": 0.95,
+            },
             knowledge_only=True,
         )
-        greeting_llm.complete.assert_not_awaited()
+        self.assertEqual(greeting_runtime.definition.initial_tool_choice, "none")
 
-        with patch.object(
-            agent_service,
-            "classify_question_scope",
-            wraps=agent_service.classify_question_scope,
-        ) as spy_scope:
-            session_events, session_runtime, session_llm, _ = await self._run_stream(
-                query="Quyết định kiến trúc mình vừa chốt là gì?",
-                knowledge_only=True,
-                route_decision={"is_chitchat": False, "confidence": 0.1, "memory_scope": "session_history"},
-                session_citations=[{"ref": "S1", "turn_index": 1, "snippet": "Chốt dùng PostgreSQL"}],
-                output="Chúng ta đã chốt dùng PostgreSQL [S1].",
-            )
-        spy_scope.assert_not_awaited()
-        self.assertEqual(session_llm.complete.await_count, 1)
-        self.assertIn(
-            "entailment verifier",
-            session_llm.complete.await_args.args[0][0]["content"].lower(),
+        session_events, session_runtime, router_mock, _ = await self._run_stream(
+            query="Quyết định kiến trúc mình vừa chốt là gì?",
+            knowledge_only=True,
+            route_decision={
+                "coarse_intent": "KNOWLEDGE",
+                "question_scope": "project",
+                "memory_scope": "session_history",
+                "intent_flags": {"needs_retrieval": True},
+                "confidence": 0.9,
+            },
+            session_citations=[{"ref": "S1", "turn_index": 1, "snippet": "Chốt dùng PostgreSQL"}],
+            output="Chúng ta đã chốt dùng PostgreSQL [S1].",
         )
+        router_mock.assert_not_awaited()
         session_completed = [e for e in session_events if e.type == EventType.RUN_COMPLETED.value]
         self.assertEqual(session_completed[0].data["payload"]["answer_status"], "answered")
         self.assertIn("[Session Memory Evidence]", session_runtime.history[0]["content"])
@@ -317,7 +405,7 @@ class QuestionScopeStreamIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([t.spec.name for t in runtime.definition.tools], [])
             self.assertEqual(runtime.definition.initial_tool_choice, "auto")
 
-        # Also verify _initial_tool_choice word-boundary guard directly when tools are supplied.
+        # Also verify _initial_tool_choice when tools are supplied and router says general/no retrieval.
         reg = _make_registry()
         adapted_web = tuple(
             agent_service._adapt_tool(reg.get(n), SimpleNamespace(), [])
@@ -328,14 +416,25 @@ class QuestionScopeStreamIntegrationTests(unittest.IsolatedAsyncioTestCase):
             adapted_web,
             knowledge_only=False,
             scoped=False,
-            route_decision={"is_chitchat": False, "confidence": 0.1},
+            route_decision={
+                "coarse_intent": "KNOWLEDGE",
+                "question_scope": "general",
+                "intent_flags": {"needs_retrieval": False, "needs_time": False, "needs_web": False},
+                "confidence": 0.9,
+            },
         )
         self.assertEqual(choice, "auto")
 
     async def test_explicit_public_web_lookup_keeps_web_tools_when_internet_on(self) -> None:
         _, runtime, _, _ = await self._run_stream(
             query="Search the web for OpenAI DevDay announcements",
-            scope_response='{"scope":"general"}',
+            route_decision={
+                "coarse_intent": "KNOWLEDGE",
+                "question_scope": "general",
+                "memory_scope": "none",
+                "intent_flags": {"needs_retrieval": False, "needs_time": False, "needs_web": True},
+                "confidence": 0.9,
+            },
             knowledge_only=False,
         )
         self.assertEqual(
@@ -347,7 +446,13 @@ class QuestionScopeStreamIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_project_policy_question_with_hien_tai_prioritizes_search_context_over_get_time(self) -> None:
         _, runtime, _, _ = await self._run_stream(
             query="Chính sách nghỉ phép hiện tại là gì?",
-            scope_response='{"scope":"project"}',
+            route_decision={
+                "coarse_intent": "KNOWLEDGE",
+                "question_scope": "project",
+                "memory_scope": "project_documents",
+                "intent_flags": {"needs_retrieval": True, "needs_time": True},
+                "confidence": 0.9,
+            },
             knowledge_only=True,
         )
         self.assertEqual(

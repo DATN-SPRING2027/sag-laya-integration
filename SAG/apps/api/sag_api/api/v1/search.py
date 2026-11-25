@@ -41,7 +41,7 @@ from sag_api.schemas.search import (
     SearchSourceHitOut,
     SectionOut,
 )
-from sag_api.services.decision_router import CHAT_HIGH_CONFIDENCE, route_query
+from sag_api.services.decision_router import CHAT_HIGH_CONFIDENCE, route_query_async
 from sag_api.services.eval.llm_judge import judge_pairwise
 from sag_api.services.query_analysis import analyze_query
 from sag_api.services.query_strategy_planner import QueryStrategyPlan, plan_query
@@ -105,16 +105,20 @@ async def _build_query_route(
     analysis = analyze_query(query, segmentation_enabled=settings.search_chinese_segmentation_enabled)
     route_error = False
     try:
-        decision = await asyncio.to_thread(route_query, query)
+        decision = (await route_query_async(query, scoped=bool(source_ids), has_sources=True)).to_dict()
     except Exception:  # noqa: BLE001 - Decision Router must never break retrieval
         decision = {
             "coarse_intent": "AMBIGUOUS",
+            "question_scope": "unknown",
             "is_chitchat": False,
             "need_retrieval": True,
             "suggested_strategy": "multi",
             "answer_shape": "fact_answer",
+            "intent_flags": {"needs_retrieval": True},
             "confidence": 0.0,
             "model": "fallback",
+            "degraded": True,
+            "degraded_reason": "decision_route_error",
             "fallback_used": True,
             "fallback_reason": "decision_route_error",
             "reason_codes": ["DECISION_ROUTE_ERROR"],
@@ -156,10 +160,10 @@ async def _build_query_route(
     if effective_strategy not in SEARCH_STRATEGIES:
         effective_strategy = configured_strategy if configured_strategy in SEARCH_STRATEGIES else "vector"
 
-    fallback_used = bool(decision.get("fallback_used")) or route_error
-    fallback_reason = decision.get("fallback_reason")
+    degraded = bool(decision.get("degraded") or decision.get("fallback_used")) or route_error
+    degraded_reason = decision.get("degraded_reason") or decision.get("fallback_reason")
     if route_error:
-        fallback_reason = "decision_route_error"
+        degraded_reason = "decision_route_error"
     reason_codes = [str(value) for value in (decision.get("reason_codes") or [])]
     if requested_strategy:
         reason_codes.append("EXPLICIT_STRATEGY")
@@ -169,14 +173,19 @@ async def _build_query_route(
         "query_original": query,
         "scope_source_ids": list(source_ids) if source_ids is not None else None,
         "coarse_intent": coarse_intent,
+        "question_scope": str(decision.get("question_scope") or "unknown"),
+        "answer_shape": str(decision.get("answer_shape") or "fact_answer"),
+        "intent_flags": dict(decision.get("intent_flags") or {}),
         "confidence": round(confidence, 4),
         "model": decision.get("model", "fallback"),
         "suggested_strategy": suggested_strategy,
         "requested_strategy": requested_strategy or "auto",
         "effective_strategy": effective_strategy,
-        "retrieval": "skipped" if not need_retrieval else "fallback" if fallback_used else "required",
-        "fallback_used": fallback_used,
-        "fallback_reason": fallback_reason,
+        "retrieval": "skipped" if not need_retrieval else "fallback" if degraded else "required",
+        "degraded": degraded,
+        "degraded_reason": degraded_reason,
+        "fallback_used": degraded,
+        "fallback_reason": degraded_reason,
         "reason_codes": reason_codes,
         "query_analysis": {
             "normalized_phrase": analysis.normalized_phrase,
@@ -209,6 +218,9 @@ def _with_query_route_stats(
         trace["fallback_used"] = True
         trace["retrieval"] = "fallback"
         trace["fallback_reason"] = trace["fallback_reason"] or "retrieval_strategy_fallback"
+    route_degraded = bool(trace.get("degraded"))
+    merged["degraded"] = bool(merged.get("degraded") or route_degraded)
+    merged["degraded_reason"] = merged.get("degraded_reason") or trace.get("degraded_reason")
     merged["query_route"] = trace
     return merged
 
@@ -356,7 +368,14 @@ async def _prepare_global_search(
             return _PreparedGlobalSearch(
                 sources=[],
                 outcome=outcome,
-                response=SearchResponse(query=body.query, sections=[], stats=stats, answer_status="skipped"),
+                response=SearchResponse(
+                    query=body.query,
+                    sections=[],
+                    stats=stats,
+                    answer_status="skipped",
+                    degraded=bool(stats.get("degraded", False)),
+                    degraded_reason=stats.get("degraded_reason"),
+                ),
                 answer_skipped=True,
             )
 
@@ -366,7 +385,14 @@ async def _prepare_global_search(
             return _PreparedGlobalSearch(
                 sources=[],
                 outcome=outcome,
-                response=SearchResponse(query=body.query, sections=[], stats=stats, answer_status="pending"),
+                response=SearchResponse(
+                    query=body.query,
+                    sections=[],
+                    stats=stats,
+                    answer_status="pending",
+                    degraded=bool(stats.get("degraded", False)),
+                    degraded_reason=stats.get("degraded_reason"),
+                ),
             )
 
         refs = {source.sag_source_config_id: source for source in sources}

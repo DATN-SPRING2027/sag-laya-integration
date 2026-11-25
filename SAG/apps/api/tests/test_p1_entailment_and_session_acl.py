@@ -318,7 +318,26 @@ async def test_entailment_verifier_rejects_cited_abstention_and_fabricated_claim
     monkeypatch.setattr(agent_service, "resolve_sources", AsyncMock(return_value=[source]))
     monkeypatch.setattr(agent_service, "resolve_mcp_specs", AsyncMock(return_value=[]))
     monkeypatch.setattr(agent_service, "persist_answer", AsyncMock(return_value="msg-1"))
-    monkeypatch.setattr(agent_service, "classify_question_scope", AsyncMock(return_value="project"))
+    from sag_api.services.decision_router import IntentFlags, UnifiedRouteDecision
+
+    monkeypatch.setattr(
+        agent_service,
+        "route_query_async",
+        AsyncMock(
+            return_value=UnifiedRouteDecision(
+                query="q",
+                coarse_intent="KNOWLEDGE",
+                question_scope="project",
+                memory_scope="project_documents",
+                temporal_mode="atemporal",
+                answer_shape="fact_answer",
+                intent_flags=IntentFlags(needs_retrieval=True),
+                domain="general",
+                confidence=0.9,
+                degraded=False,
+            )
+        ),
+    )
 
     class StubRuntime:
         async def start(self):

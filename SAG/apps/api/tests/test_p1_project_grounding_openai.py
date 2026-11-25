@@ -16,6 +16,7 @@ from sag_api.generation.llm import LLMClient
 from sag_api.services import agent_service
 from sag_api.services.agent_domain import AskPlan
 from sag_api.services.agent_service import AgentStreamEvent
+from sag_api.services.decision_router import IntentFlags, UnifiedRouteDecision
 from sag_api.tools.builtin import SearchContextTool, WebSearchTool
 from sag_api.tools.registry import ToolRegistry
 
@@ -49,8 +50,21 @@ async def test_project_scope_with_web_enabled_forces_search_context_and_citation
     monkeypatch.setattr(agent_service, "persist_answer", AsyncMock(return_value="msg-1"))
     monkeypatch.setattr(
         agent_service,
-        "classify_question_scope",
-        AsyncMock(return_value="project"),
+        "route_query_async",
+        AsyncMock(
+            return_value=UnifiedRouteDecision(
+                query="What is the project architecture?",
+                coarse_intent="KNOWLEDGE",
+                question_scope="project",
+                memory_scope="project_documents",
+                temporal_mode="atemporal",
+                answer_shape="fact_answer",
+                intent_flags=IntentFlags(needs_retrieval=True),
+                domain="technical",
+                confidence=0.9,
+                degraded=False,
+            )
+        ),
     )
 
     captured: dict = {}

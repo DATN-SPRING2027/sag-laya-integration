@@ -58,6 +58,15 @@ class ToolDecisionAction(StrEnum):
     REQUIRE_APPROVAL = "require_approval"
 
 
+class ToolCapability(StrEnum):
+    KNOWLEDGE_SEARCH = "knowledge_search"
+    ENTITY_LOOKUP = "entity_lookup"
+    TIME_LOOKUP = "time_lookup"
+    WEB_SEARCH = "web_search"
+    WEB_FETCH = "web_fetch"
+    RESEARCH = "research"
+
+
 class CancellationToken:
     """Cooperative cancellation token shared by model and tool adapters."""
 
@@ -169,6 +178,7 @@ class ToolSpec:
     requires_approval: bool = False
     execution_mode: ToolExecutionMode | None = None
     timeout_seconds: float | None = None
+    capabilities: frozenset[ToolCapability] = field(default_factory=frozenset)
 
     def to_model_schema(self) -> dict[str, Any]:
         return {

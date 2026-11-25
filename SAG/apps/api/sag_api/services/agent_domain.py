@@ -1277,6 +1277,18 @@ async def prepare_ask(
         llm=llm,
         budget_tokens=int(settings.llm_context_window * 0.4),
     )
+    if route_decision is None:
+        from sag_api.services.decision_router import route_query_async
+
+        routed = await route_query_async(
+            query,
+            prior_turns=history,
+            has_thread_history=bool(history),
+            has_sources=(source_ids is None or bool(source_ids)),
+            scoped=bool(source_ids),
+            llm_client=llm if settings.decision_provider == "llm" else None,
+        )
+        route_decision = routed.to_dict()
     effective_user_name = await resolve_user_display_name(
         session,
         user_name=user_name,

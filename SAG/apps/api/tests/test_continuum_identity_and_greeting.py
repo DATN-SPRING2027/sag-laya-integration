@@ -379,12 +379,42 @@ async def test_direct_intent_routes_greetings_and_name_questions_without_blockin
         ),
         executor=_noop,
     )
+    route_decision = (
+        {
+            "coarse_intent": "CHAT",
+            "question_scope": "general",
+            "intent_flags": {
+                "needs_retrieval": False,
+                "needs_time": False,
+                "needs_web": False,
+                "needs_clarification": False,
+                "is_pure_math_or_transform": False,
+            },
+            "is_chitchat": True,
+            "confidence": 0.95,
+        }
+        if expect_direct
+        else {
+            "coarse_intent": "KNOWLEDGE",
+            "question_scope": "project",
+            "intent_flags": {
+                "needs_retrieval": True,
+                "needs_time": False,
+                "needs_web": False,
+                "needs_clarification": False,
+                "is_pure_math_or_transform": False,
+            },
+            "is_chitchat": False,
+            "confidence": 0.92,
+        }
+    )
     choice = await _initial_tool_choice(
         query,
         (search_tool,),
         knowledge_only=True,
         scoped=False,
-        route_decision={"is_chitchat": False, "confidence": 0.0},
+        route_decision=route_decision,
+        require_project_grounding=not expect_direct,
     )
     if expect_direct:
         assert choice == "none"

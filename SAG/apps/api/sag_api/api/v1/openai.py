@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_agent import AgentRuntime, EventType
+from sag_api.core.config import settings
 from sag_api.core.conversation_ownership import get_conversation_owner
 from sag_api.core.db import SessionLocal, get_session
 from sag_api.core.deps import (
@@ -35,6 +36,7 @@ from sag_api.generation import LLMClient
 from sag_api.sag import EngineManager
 from sag_api.services import agent_domain as svc
 from sag_api.services import agent_service
+from sag_api.services.decision_router import route_query_async
 from sag_api.tools import ToolRegistry
 
 router = APIRouter(prefix="/openai", tags=["openai"])
@@ -111,6 +113,21 @@ async def chat_completions(
     if not llm.configured:
         raise ConfigurationError("尚未配置 LLM，无法生成回答")
 
+    if plan.route_decision is None:
+        routed = await route_query_async(
+            query,
+            prior_turns=history,
+            has_thread_history=bool(history),
+            has_sources=True,
+            web_enabled=True,
+            scoped=False,
+            llm_client=llm if settings.decision_provider == "llm" else None,
+        )
+        plan.route_decision = routed.to_dict()
+
+    initial_degraded = bool((plan.route_decision or {}).get("degraded", False))
+    initial_degraded_reason = (plan.route_decision or {}).get("degraded_reason")
+
     created = int(time.time())
     model = body.model or f"sag:{agent.name}"
     cid = f"chatcmpl-{agent_id[:12]}-{created}"
@@ -139,21 +156,29 @@ async def chat_completions(
             pending_bracket = ""
             should_buffer = bool(plan.citations or plan.session_citations)
             errored = False
+            final_degraded = initial_degraded
+            final_degraded_reason = initial_degraded_reason
+            final_citations: list[dict] = list(plan.citations)
 
-            def chunk(delta: dict, finish: str | None = None) -> str:
-                payload = {
+            def chunk(delta: dict, finish: str | None = None, *, sag_meta: dict | None = None) -> str:
+                payload: dict = {
                     "id": cid,
                     "object": "chat.completion.chunk",
                     "created": created,
                     "model": model,
                     "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
                 }
+                if sag_meta is not None:
+                    payload["sag"] = sag_meta
                 return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
             yield chunk({"role": "assistant"})
             async for event in _events():
                 payload = event.data.get("payload") or {}
                 if event.type == EventType.RUN_STARTED.value:
+                    if "degraded" in payload:
+                        final_degraded = bool(payload.get("degraded"))
+                        final_degraded_reason = payload.get("degraded_reason") or final_degraded_reason
                     if payload.get("grounding_required"):
                         should_buffer = True
                         if pending_bracket:
@@ -185,6 +210,11 @@ async def chat_completions(
                     canonical = str(payload.get("output") or "")
                     streamed = "".join(streamed_parts)
                     pending_bracket = ""
+                    if "degraded" in payload:
+                        final_degraded = bool(payload.get("degraded"))
+                        final_degraded_reason = payload.get("degraded_reason") or final_degraded_reason
+                    if "citations" in payload and payload["citations"] is not None:
+                        final_citations = list(payload["citations"])
                     if should_buffer:
                         if canonical:
                             yield chunk({"content": canonical})
@@ -214,12 +244,22 @@ async def chat_completions(
                     )
                     errored = True
             if not errored:
-                yield chunk({}, finish="stop")
+                yield chunk(
+                    {},
+                    finish="stop",
+                    sag_meta={
+                        "citations": final_citations,
+                        "sources": len(final_citations),
+                        "degraded": final_degraded,
+                        "degraded_reason": final_degraded_reason,
+                    },
+                )
             yield "data: [DONE]\n\n"
 
-        return StreamingResponse(
-            gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
-        )
+        headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+        if initial_degraded:
+            headers["X-SAG-Degraded"] = "true"
+        return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
 
     # 非流式：消费同一事件流，聚合为最终答案
     parts: list[str] = []
@@ -228,9 +268,14 @@ async def chat_completions(
     grounding_active = bool(plan.citations or plan.session_citations)
     citations = plan.citations
     usage: dict = {}
+    final_degraded = initial_degraded
+    final_degraded_reason = initial_degraded_reason
     async for event in _events():
         payload = event.data.get("payload") or {}
         if event.type == EventType.RUN_STARTED.value:
+            if "degraded" in payload:
+                final_degraded = bool(payload.get("degraded"))
+                final_degraded_reason = payload.get("degraded_reason") or final_degraded_reason
             if payload.get("grounding_required"):
                 grounding_active = True
         elif event.type == EventType.TOOL_STARTED.value:
@@ -243,6 +288,9 @@ async def chat_completions(
             final_output = str(payload.get("output") or "")
             if "citations" in payload:
                 citations = payload["citations"] if payload["citations"] is not None else []
+            if "degraded" in payload:
+                final_degraded = bool(payload.get("degraded"))
+                final_degraded_reason = payload.get("degraded_reason") or final_degraded_reason
             usage = payload.get("usage") or {}
         elif event.type in (EventType.RUN_FAILED.value, EventType.RUN_CANCELLED.value):
             error = payload.get("error") or {}
@@ -271,6 +319,11 @@ async def chat_completions(
             "completion_tokens": usage.get("output_tokens", 0),
             "total_tokens": usage.get("total_tokens", 0),
         },
-        # sag 扩展：引用溯源（标准客户端忽略未知字段）
-        "sag": {"citations": citations, "sources": len(citations)},
+        # sag 扩展：引用溯源与降级状态（标准客户端忽略未知字段）
+        "sag": {
+            "citations": citations,
+            "sources": len(citations),
+            "degraded": final_degraded,
+            "degraded_reason": final_degraded_reason,
+        },
     }

@@ -156,6 +156,14 @@ async def test_generate_stream_emits_live_execution_trace_labels_session_context
         source_ids=[source.id],
         messages=[{"role": "user", "content": "Quy trình bàn giao gồm gì?"}],
         user_message_id="msg-user-1",
+        route_decision={
+            "coarse_intent": "KNOWLEDGE",
+            "question_scope": "project",
+            "memory_scope": "session_history",
+            "intent_flags": {"needs_retrieval": True},
+            "confidence": 0.9,
+            "degraded": False,
+        },
         session_audit_trace={
             "mode": "on",
             "latency_ms": 37,
