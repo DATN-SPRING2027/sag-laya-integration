@@ -75,6 +75,7 @@ _COMPLETE_CITATION_BRACKET_RE = re.compile(
 _FENCE_OPEN_RE = re.compile(r"( {0,3})(`{3,}|~{3,})")
 _SPACE_BEFORE_PUNCT_RE = re.compile(r"(?<![ \t])[ \t]++([，。！？；：,.!?;:])")
 _MAX_PENDING_INLINE_CODE_CHARS = 64
+_MAX_PENDING_FENCE_HEADER_CHARS = 256
 
 
 def _is_zero_math_bracket(inner: str) -> bool:
@@ -131,9 +132,16 @@ def _find_incomplete_citation_tail_start(segment: str) -> int | None:
     return start
 
 
-def _find_closing_backticks(text: str, start: int, run_len: int) -> int:
-    para_end = text.find("\n\n", start)
-    limit = len(text) if para_end == -1 else para_end
+def _find_closing_backticks(
+    text: str,
+    start: int,
+    run_len: int,
+    *,
+    limit: int | None = None,
+) -> int:
+    if limit is None:
+        para_end = text.find("\n\n", start)
+        limit = len(text) if para_end == -1 else para_end
     pos = start
     while pos < limit:
         idx = text.find("`", pos, limit)
@@ -148,58 +156,50 @@ def _find_closing_backticks(text: str, start: int, run_len: int) -> int:
     return -1
 
 
-def _advance_markdown_state(
-    flushed: str,
-    *,
-    at_line_start: bool,
-    code_fence: str | None,
-) -> tuple[bool, str | None]:
-    """Advance cross-chunk markdown line-start and fenced-code state for an emitted SSE prefix."""
-    if not flushed:
-        return at_line_start, code_fence
-
-    index = 0
-    length = len(flushed)
-    while index < length:
-        line_start = (index == 0 and at_line_start) or (index > 0 and flushed[index - 1] == "\n")
-        nl_idx = flushed.find("\n", index)
-        line_end = length if nl_idx == -1 else nl_idx + 1
-        if line_start:
-            fence_match = _FENCE_OPEN_RE.match(flushed, index)
-            if fence_match:
-                marker = fence_match.group(2)
-                suffix = flushed[fence_match.end() : line_end].strip()
-                if code_fence is None:
-                    if marker[0] != "`" or "`" not in suffix:
-                        code_fence = marker
-                elif (
-                    code_fence[0] == marker[0]
-                    and len(marker) >= len(code_fence)
-                    and suffix == ""
-                ):
-                    code_fence = None
-        index = line_end
-    return flushed.endswith("\n"), code_fence
-
-
 def _prose_segments(
     text: str,
     *,
     at_line_start: bool = True,
     code_fence: str | None = None,
-) -> tuple[list[tuple[int, int]], int | None]:
-    """Return non-code prose spans and optional start index of a bounded unclosed code/fence span."""
+    hold_incomplete: bool = True,
+) -> tuple[list[tuple[int, int]], int | None, str | None]:
+    """Return ``(prose_segments, unclosed_code_start, end_code_fence)``.
+
+    Single source of truth for both unbuffered SSE citation scanning and cross-chunk
+    markdown state advancement (with ``hold_incomplete=False`` on an already-chosen prefix).
+    """
     segments: list[tuple[int, int]] = []
     prose_start = 0
     index = 0
     length = len(text)
     unclosed_code_start: int | None = None
+    para_limit = -1
 
     while index < length:
         line_start = (index == 0 and at_line_start) or (index > 0 and text[index - 1] == "\n")
         if line_start:
             nl_idx = text.find("\n", index)
             line_end = length if nl_idx == -1 else nl_idx + 1
+
+            # Hold any unterminated potential closing-fence prefix (0..3 spaces + 0..N chars of
+            # code_fence[0] + trailing spaces/tabs) BEFORE len(marker) >= len(code_fence),
+            # so 4+-char closing fences split at 1..3 chars stay intact.
+            if (
+                hold_incomplete
+                and code_fence is not None
+                and nl_idx == -1
+                and (length - index) <= _MAX_PENDING_INLINE_CODE_CHARS
+            ):
+                rem = text[index:]
+                stripped_lead = rem.lstrip(" ")
+                lead_spaces = len(rem) - len(stripped_lead)
+                if lead_spaces <= 3:
+                    core = stripped_lead.rstrip(" \t")
+                    if not core or all(ch == code_fence[0] for ch in core):
+                        unclosed_code_start = index
+                        prose_start = length
+                        break
+
             fence_match = _FENCE_OPEN_RE.match(text, index)
             if fence_match:
                 marker = fence_match.group(2)
@@ -207,12 +207,16 @@ def _prose_segments(
                 if code_fence is None:
                     # CommonMark §4.5: backtick fence info strings cannot contain backticks.
                     if marker[0] != "`" or "`" not in suffix:
-                        if nl_idx == -1 and (length - index) <= _MAX_PENDING_INLINE_CODE_CHARS:
-                            if index > prose_start:
-                                segments.append((prose_start, index))
-                            unclosed_code_start = index
-                            prose_start = length
-                            break
+                        if nl_idx == -1:
+                            # Never commit an opening fence before seeing its terminating newline.
+                            if hold_incomplete and (length - index) <= _MAX_PENDING_FENCE_HEADER_CHARS:
+                                if index > prose_start:
+                                    segments.append((prose_start, index))
+                                unclosed_code_start = index
+                                prose_start = length
+                                break
+                            index = line_end
+                            continue
                         if index > prose_start:
                             segments.append((prose_start, index))
                         code_fence = marker
@@ -224,30 +228,34 @@ def _prose_segments(
                     and len(marker) >= len(code_fence)
                     and suffix == ""
                 ):
-                    if nl_idx == -1 and (length - index) <= _MAX_PENDING_INLINE_CODE_CHARS:
-                        unclosed_code_start = index
-                        prose_start = length
-                        break
                     code_fence = None
                     prose_start = line_end
                     index = line_end
                     continue
-            elif nl_idx == -1 and (length - index) <= _MAX_PENDING_INLINE_CODE_CHARS:
-                stripped_lead = text[index:].lstrip(" ")
-                lead_spaces = length - index - len(stripped_lead)
-                if lead_spaces <= 3:
-                    if code_fence is not None and (
-                        not stripped_lead or all(ch == code_fence[0] for ch in stripped_lead)
-                    ):
-                        unclosed_code_start = index
-                        prose_start = length
-                        break
-                    if code_fence is None and stripped_lead and all(ch == "~" for ch in stripped_lead):
-                        if index > prose_start:
-                            segments.append((prose_start, index))
-                        unclosed_code_start = index
-                        prose_start = length
-                        break
+            elif (
+                hold_incomplete
+                and code_fence is None
+                and nl_idx == -1
+                and (length - index) <= _MAX_PENDING_INLINE_CODE_CHARS
+            ):
+                # Hold 0..3 leading spaces + 1..2 backticks or tildes at line start so indented
+                # opening fences split after 1..2 marker chars preserve at_line_start=True.
+                rem = text[index:]
+                stripped_lead = rem.lstrip(" ")
+                lead_spaces = len(rem) - len(stripped_lead)
+                if (
+                    lead_spaces <= 3
+                    and stripped_lead
+                    and (
+                        all(ch == "`" for ch in stripped_lead)
+                        or all(ch == "~" for ch in stripped_lead)
+                    )
+                ):
+                    if index > prose_start:
+                        segments.append((prose_start, index))
+                    unclosed_code_start = index
+                    prose_start = length
+                    break
 
         if code_fence is not None:
             nl_idx = text.find("\n", index)
@@ -258,7 +266,10 @@ def _prose_segments(
             run_len = 1
             while index + run_len < length and text[index + run_len] == "`":
                 run_len += 1
-            closing = _find_closing_backticks(text, index + run_len, run_len)
+            if index >= para_limit:
+                next_para = text.find("\n\n", index + run_len)
+                para_limit = length if next_para == -1 else next_para
+            closing = _find_closing_backticks(text, index + run_len, run_len, limit=para_limit)
             if closing != -1:
                 if index > prose_start:
                     segments.append((prose_start, index))
@@ -268,7 +279,8 @@ def _prose_segments(
                 continue
             after_open = text[index + run_len :]
             if (
-                unclosed_code_start is None
+                hold_incomplete
+                and unclosed_code_start is None
                 and "\n\n" not in after_open
                 and len(after_open) <= _MAX_PENDING_INLINE_CODE_CHARS
             ):
@@ -284,7 +296,25 @@ def _prose_segments(
 
     if code_fence is None and prose_start < length:
         segments.append((prose_start, length))
-    return segments, unclosed_code_start
+    return segments, unclosed_code_start, code_fence
+
+
+def _advance_markdown_state(
+    flushed: str,
+    *,
+    at_line_start: bool,
+    code_fence: str | None,
+) -> tuple[bool, str | None]:
+    """Advance cross-chunk markdown line-start and fenced-code state using the unified scanner."""
+    if not flushed:
+        return at_line_start, code_fence
+    _, _, next_fence = _prose_segments(
+        flushed,
+        at_line_start=at_line_start,
+        code_fence=code_fence,
+        hold_incomplete=False,
+    )
+    return flushed.endswith("\n"), next_fence
 
 
 def _split_unbuffered_citation_tail_stateful(
@@ -297,7 +327,7 @@ def _split_unbuffered_citation_tail_stateful(
     if not text:
         return "", "", at_line_start, code_fence
 
-    segments, unclosed_code_start = _prose_segments(
+    segments, unclosed_code_start, end_fence = _prose_segments(
         text,
         at_line_start=at_line_start,
         code_fence=code_fence,
@@ -334,11 +364,14 @@ def _split_unbuffered_citation_tail_stateful(
 
     flushed = text[:split_pos]
     pending = text[split_pos:]
-    next_line_start, next_fence = _advance_markdown_state(
-        flushed,
-        at_line_start=at_line_start,
-        code_fence=code_fence,
-    )
+    if split_pos == len(text):
+        next_line_start, next_fence = flushed.endswith("\n"), end_fence
+    else:
+        next_line_start, next_fence = _advance_markdown_state(
+            flushed,
+            at_line_start=at_line_start,
+            code_fence=code_fence,
+        )
     return flushed, pending, next_line_start, next_fence
 
 

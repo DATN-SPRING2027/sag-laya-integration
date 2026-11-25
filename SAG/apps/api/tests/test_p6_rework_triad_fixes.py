@@ -1476,3 +1476,115 @@ async def test_p6_rework_15_stateful_chunk_boundary_fences_and_split_inline_code
     assert out5 == "Code:\n```py\n[99]\n```\nEnd."
 
 
+# ---------------------------------------------------------------------------
+# Item 16 (REV-R4-1..3 / CHAL-R4-1..4): 4+-char fence split, indented backtick
+# fence split, multi-line inline code state sync, and >64-char split inline code
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_p6_rework_16_four_char_fence_indented_backtick_and_multiline_inline_code(monkeypatch) -> None:
+    agent = SimpleNamespace(id="agent-md4", name="Md4Bot", persona={"web_enabled": True})
+    monkeypatch.setattr(openai_api.svc, "get_agent", AsyncMock(return_value=agent))
+    monkeypatch.setattr(openai_api.svc, "resolve_sources", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        openai_api.svc,
+        "build_ask_context",
+        lambda **kw: SimpleNamespace(
+            source_ids=[],
+            citations=[],
+            session_citations=[],
+            route_decision={"coarse_intent": "CHAT", "degraded": False},
+        ),
+    )
+
+    async def _run_deltas(deltas: list[str], canonical: str) -> str:
+        async def fake_stream(*args, **kwargs):
+            yield SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}})
+            for d in deltas:
+                yield SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": d}})
+            yield SimpleNamespace(
+                type=EventType.RUN_COMPLETED.value,
+                data={"payload": {"output": canonical, "citations": [], "degraded": False}},
+            )
+
+        monkeypatch.setattr(openai_api.agent_service, "generate_stream", fake_stream)
+        body = openai_api.ChatCompletionRequest(
+            messages=[openai_api.ChatMessage(role="user", content="code")],
+            stream=True,
+        )
+        resp = await openai_api.chat_completions(
+            agent_id="agent-md4",
+            body=body,
+            _user=SimpleNamespace(id="u-1", name="Tester"),
+            owner_key="owner-1",
+            principal=SimpleNamespace(tenant_id="t-1", organization_id="o-1", user_id="u-1"),
+            session=SimpleNamespace(),
+            engine_manager=SimpleNamespace(),
+            llm=SimpleNamespace(configured=True),
+            tool_registry=SimpleNamespace(),
+            agent_runtime=SimpleNamespace(),
+        )
+        out_chunks: list[str] = []
+        async for raw in resp.body_iterator:
+            text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+            for line in text.splitlines():
+                if not line.startswith("data: ") or line == "data: [DONE]":
+                    continue
+                payload = json.loads(line[len("data: ") :])
+                delta = (payload.get("choices") or [{}])[0].get("delta") or {}
+                if delta.get("content"):
+                    out_chunks.append(delta["content"])
+        return "".join(out_chunks)
+
+    # 1) 4-backtick closing fence split at 3 chars + 1-char streamed
+    canon_4bt = "Intro:\n````markdown\n```py\n[99]\n```\n````\nAfter."
+    out_4bt_split = await _run_deltas(
+        ["Intro:\n````markdown\n```py\n[99]\n```\n", "```", "`\nAfter [99]."],
+        canon_4bt,
+    )
+    assert out_4bt_split == canon_4bt
+    out_4bt_1ch = await _run_deltas(
+        list("Intro:\n````markdown\n```py\n[99]\n```\n````\nAfter [99]."),
+        canon_4bt,
+    )
+    assert out_4bt_1ch == canon_4bt
+
+    # 2) 4-tilde closing fence split at 3 chars
+    canon_4tl = "Intro:\n~~~~\n~~~\n~~~~\nAfter."
+    out_4tl = await _run_deltas(
+        ["Intro:\n~~~~\n~~~\n", "~~~", "~\nAfter [99]."],
+        canon_4tl,
+    )
+    assert out_4tl == canon_4tl
+
+    # 3) Indented (2-space) opening backtick fence split after 2 backticks & 1-char streamed
+    canon_ind = "Code:\n  ```py\nx = 1\n\nprint(1)\n```\nAfter."
+    out_ind_split = await _run_deltas(
+        ["Code:\n  ``", "`py\nx = 1\n\nprint(1)\n```\nAfter [99]."],
+        canon_ind,
+    )
+    assert out_ind_split == canon_ind
+    out_ind_1ch = await _run_deltas(
+        list("Code:\n  ```py\nx = 1\n\nprint(1)\n```\nAfter [99]."),
+        canon_ind,
+    )
+    assert out_ind_1ch == canon_ind
+
+    # 4) Multi-line inline code containing \n~~~ and \n```py must NOT desync fence state
+    canon_ml1 = "Example: `line1\n~~~\nline2`. End."
+    out_ml1 = await _run_deltas(["Example: `line1\n~~~\nline2`.", " End [99]."], canon_ml1)
+    assert out_ml1 == canon_ml1
+
+    canon_ml2 = "Use `foo\n```py\nbar`\nSee."
+    out_ml2 = await _run_deltas(["Use `foo\n```py\nbar`\n", "See [99]."], canon_ml2)
+    assert out_ml2 == canon_ml2
+
+    # 5) Long (>64 chars) line-start split triple-backtick inline code must NOT stick fence open
+    long_code = "a" * 80
+    canon_long = f"```{long_code}``` done."
+    out_long = await _run_deltas([f"```{long_code}", "``` done [99]."], canon_long)
+    assert out_long == canon_long
+
+
+
