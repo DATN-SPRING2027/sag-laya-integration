@@ -110,7 +110,7 @@ _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
         "tenant_id": "VARCHAR(64) NOT NULL DEFAULT 'tenant_continuum_default'",
         "project_id": "VARCHAR(64)",
         "owner_id": "VARCHAR(256)",
-        "logical_source_id": "VARCHAR(128)",
+        "logical_source_id": "VARCHAR(512)",
     },
     "threads": {
         "archived": "BOOLEAN NOT NULL DEFAULT FALSE",
@@ -133,7 +133,10 @@ _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
     "tree_routing_profiles": {"document_version_id": "VARCHAR(128) NOT NULL DEFAULT ''"},
     "knowledge_jobs": {"result_json": "JSON", "usage_json": "JSON", "extractor_version": "VARCHAR(128)", "tree_requested_at": "TIMESTAMP WITH TIME ZONE"},
     "knowledge_graph_builds": {"input_fingerprint": "VARCHAR(64)"},
-    "canonical_blocks": {"dedup_signature_json": "JSON"},
+    "canonical_blocks": {
+        "is_boilerplate": "BOOLEAN NOT NULL DEFAULT FALSE",
+        "dedup_signature_json": "JSON",
+    },
     "search_units": {
         "char_start": "INTEGER",
         "char_end": "INTEGER",
@@ -286,6 +289,15 @@ async def _ensure_document_schema_widths() -> None:
                       AND atttypid = 'character varying'::regtype AND atttypmod = 260
                   )
                   OR EXISTS (
+                    SELECT 1 FROM pg_attribute
+                    WHERE attrelid = 'documents'::regclass AND attname = 'logical_source_id'
+                      AND attnum > 0 AND NOT attisdropped
+                      AND (
+                        atttypid <> 'character varying'::regtype
+                        OR atttypmod <> 516
+                      )
+                  )
+                  OR EXISTS (
                     SELECT 1
                     FROM pg_constraint fk
                     CROSS JOIN LATERAL unnest(fk.conkey, fk.confkey) AS keys(local_attnum, target_attnum)
@@ -327,6 +339,7 @@ async def _ensure_document_schema_widths() -> None:
               END LOOP;
               ALTER TABLE documents ALTER COLUMN id TYPE VARCHAR(36);
               ALTER TABLE documents ALTER COLUMN owner_id TYPE VARCHAR(256);
+              ALTER TABLE documents ALTER COLUMN logical_source_id TYPE VARCHAR(512);
               FOR fk IN SELECT * FROM sag_document_fk_columns LOOP
                 EXECUTE format('ALTER TABLE %s ALTER COLUMN %I TYPE VARCHAR(36)', fk.rel, fk.column_name);
               END LOOP;

@@ -23,7 +23,7 @@ class Document(IDMixin, TimestampMixin, Base):
     )
     project_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     owner_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    logical_source_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    logical_source_id: Mapped[str | None] = mapped_column(String(512), nullable=True, index=True)
 
     source_id: Mapped[str | None] = mapped_column(
         ForeignKey("sources.id", ondelete="CASCADE"), index=True, nullable=True
