@@ -531,6 +531,63 @@ def _segment_section_body_blocks_dp(
     return cuts
 
 
+def resolve_search_unit_text(unit: Any, unit_blocks: Sequence[Any]) -> str:
+    """Resolve exact SearchUnit text, preferring text_snapshot or single-block [char_start:char_end] slice."""
+    snapshot = getattr(unit, "text_snapshot", None)
+    if snapshot is not None and snapshot != "":
+        return str(snapshot)
+
+    block_from_id = getattr(unit, "block_from_id", None)
+    block_to_id = getattr(unit, "block_to_id", None)
+    char_start = getattr(unit, "char_start", None)
+    char_end = getattr(unit, "char_end", None)
+    if (
+        unit_blocks
+        and block_from_id is not None
+        and block_from_id == block_to_id
+        and char_start is not None
+        and char_end is not None
+    ):
+        base_text = str(getattr(unit_blocks[0], "normalized_text", "") or "")
+        start_i = int(char_start)
+        end_i = int(char_end)
+        if 0 <= start_i <= end_i <= len(base_text):
+            return base_text[start_i:end_i]
+
+    return "\n\n".join(
+        str(getattr(b, "normalized_text", "") or "")
+        for b in unit_blocks
+        if getattr(b, "normalized_text", None)
+    )
+
+
+def _locate_monotonic_span(norm_text: str, body_text: str, cursor: int) -> tuple[int, int]:
+    """Locate monotonic (char_start, char_end) bounds in norm_text starting at cursor."""
+    n = len(norm_text)
+    safe_cursor = max(0, min(cursor, n))
+    if not body_text:
+        return safe_cursor, safe_cursor
+
+    exact_pos = norm_text.find(body_text, safe_cursor)
+    if exact_pos != -1:
+        return exact_pos, exact_pos + len(body_text)
+
+    tokens = body_text.split()
+    if not tokens:
+        return safe_cursor, safe_cursor
+
+    start_pos = norm_text.find(tokens[0], safe_cursor)
+    if start_pos == -1:
+        return safe_cursor, safe_cursor
+
+    scan_pos = start_pos + len(tokens[0])
+    for tok in tokens[1:]:
+        found = norm_text.find(tok, scan_pos)
+        if found != -1:
+            scan_pos = found + len(tok)
+    return start_pos, max(start_pos, min(scan_pos, n))
+
+
 def build_search_units_from_blocks(
     blocks: Sequence[CanonicalBlock],
     *,
@@ -566,6 +623,9 @@ def build_search_units_from_blocks(
             page_from=first.page_from,
             page_to=last.page_to,
             section_path=last.section_path or first.section_path,
+            char_start=None,
+            char_end=None,
+            text_snapshot=None,
         )
         unit._text_content = combined_text
         unit._body_block_ids = [b.id for b in group if b.block_type != "heading"]
@@ -573,7 +633,9 @@ def build_search_units_from_blocks(
         units.append(unit)
 
     def _emit_oversized_block(block: CanonicalBlock) -> None:
-        lines = block.normalized_text.splitlines()
+        norm_text = block.normalized_text or ""
+        lines = norm_text.splitlines()
+        sub_entries: list[tuple[str, str]] = []
         if len(lines) > 1:
             table_header_lines: list[str] = []
             body_start = 0
@@ -587,14 +649,14 @@ def build_search_units_from_blocks(
                     body_start = 2
             header_tokens = sum(estimate_unicode_tokens(hl) for hl in table_header_lines)
             effective_budget = max(64, max_tokens_per_unit - header_tokens)
-            sub_chunks: list[str] = []
             cur_lines: list[str] = []
             cur_toks = 0
             for ln in lines[body_start:]:
                 ln_toks = max(1, estimate_unicode_tokens(ln))
                 if cur_lines and (cur_toks + ln_toks) > effective_budget:
                     prefix = table_header_lines if table_header_lines else []
-                    sub_chunks.append("\n".join([*prefix, *cur_lines]))
+                    body_text = "\n".join(cur_lines)
+                    sub_entries.append(("\n".join([*prefix, *cur_lines]), body_text))
                     cur_lines = [ln]
                     cur_toks = ln_toks
                 else:
@@ -602,38 +664,55 @@ def build_search_units_from_blocks(
                     cur_toks += ln_toks
             if cur_lines:
                 prefix = table_header_lines if table_header_lines else []
-                sub_chunks.append("\n".join([*prefix, *cur_lines]))
+                body_text = "\n".join(cur_lines)
+                sub_entries.append(("\n".join([*prefix, *cur_lines]), body_text))
         else:
-            atomic_spans = _split_atomic_spans(block.normalized_text, max_span_tokens=max_tokens_per_unit)
-            sub_chunks = []
+            atomic_spans = _split_atomic_spans(norm_text, max_span_tokens=max_tokens_per_unit)
             cur_spans: list[str] = []
             cur_toks = 0
             for sp in atomic_spans:
                 sp_toks = max(1, estimate_unicode_tokens(sp))
                 if sp_toks > max_tokens_per_unit:
                     if cur_spans:
-                        sub_chunks.append(" ".join(cur_spans))
+                        chunk_t = " ".join(cur_spans)
+                        sub_entries.append((chunk_t, chunk_t))
                         cur_spans = []
                         cur_toks = 0
                     words = sp.split()
                     if len(words) > max_tokens_per_unit:
                         for i in range(0, len(words), max_tokens_per_unit):
-                            sub_chunks.append(" ".join(words[i : i + max_tokens_per_unit]))
+                            chunk_t = " ".join(words[i : i + max_tokens_per_unit])
+                            sub_entries.append((chunk_t, chunk_t))
                     else:
                         for i in range(0, len(sp), max_tokens_per_unit):
-                            sub_chunks.append(sp[i : i + max_tokens_per_unit])
+                            chunk_t = sp[i : i + max_tokens_per_unit]
+                            sub_entries.append((chunk_t, chunk_t))
                 elif cur_spans and (cur_toks + sp_toks) > max_tokens_per_unit:
-                    sub_chunks.append(" ".join(cur_spans))
+                    chunk_t = " ".join(cur_spans)
+                    sub_entries.append((chunk_t, chunk_t))
                     cur_spans = [sp]
                     cur_toks = sp_toks
                 else:
                     cur_spans.append(sp)
                     cur_toks += sp_toks
             if cur_spans:
-                sub_chunks.append(" ".join(cur_spans))
+                chunk_t = " ".join(cur_spans)
+                sub_entries.append((chunk_t, chunk_t))
 
-        is_split = len(sub_chunks) > 1
-        for chunk_text in sub_chunks:
+        is_split = len(sub_entries) > 1
+        cursor = 0
+        for chunk_text, body_anchor in sub_entries:
+            pos = norm_text.find(chunk_text, cursor)
+            if pos != -1:
+                char_start = pos
+                char_end = pos + len(chunk_text)
+                text_snapshot: str | None = None
+                cursor = char_end
+            else:
+                char_start, char_end = _locate_monotonic_span(norm_text, body_anchor, cursor)
+                text_snapshot = chunk_text
+                cursor = char_end
+
             chunk_tok_count = max(1, estimate_unicode_tokens(chunk_text))
             chunk_hash = hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()
             ordinal = len(units)
@@ -648,6 +727,9 @@ def build_search_units_from_blocks(
                 page_from=block.page_from,
                 page_to=block.page_to,
                 section_path=block.section_path,
+                char_start=char_start,
+                char_end=char_end,
+                text_snapshot=text_snapshot,
             )
             unit._text_content = chunk_text
             unit._body_block_ids = [block.id] if block.block_type != "heading" else []
@@ -906,16 +988,19 @@ async def index_search_units_to_qdrant(
     contextual_texts: list[str] = []
     for u in units:
         t = getattr(u, "_text_content", None)
-        if not t and blocks_by_id:
-            b1 = blocks_by_id.get(u.block_from_id)
-            b2 = blocks_by_id.get(u.block_to_id)
-            if b1 and b2:
-                if b1.id == b2.id:
-                    t = b1.normalized_text
-                else:
-                    lo, hi = min(b1.ordinal, b2.ordinal), max(b1.ordinal, b2.ordinal)
-                    span = [b.normalized_text for b in ordered_blocks if lo <= b.ordinal <= hi]
-                    t = "\n\n".join(span) if span else f"{b1.normalized_text}\n\n{b2.normalized_text}"
+        if not t:
+            if getattr(u, "text_snapshot", None):
+                t = resolve_search_unit_text(u, [])
+            elif blocks_by_id:
+                b1 = blocks_by_id.get(u.block_from_id)
+                b2 = blocks_by_id.get(u.block_to_id)
+                if b1 and b2:
+                    if b1.id == b2.id:
+                        unit_blocks = [b1]
+                    else:
+                        lo, hi = min(b1.ordinal, b2.ordinal), max(b1.ordinal, b2.ordinal)
+                        unit_blocks = [b for b in ordered_blocks if lo <= b.ordinal <= hi] or [b1, b2]
+                    t = resolve_search_unit_text(u, unit_blocks)
         raw_t = t or u.section_path or u.content_hash
         texts.append(raw_t)
         contextual_texts.append(contextualize_block_text(u.section_path, raw_t))

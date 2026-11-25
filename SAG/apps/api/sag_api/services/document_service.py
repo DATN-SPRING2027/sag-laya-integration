@@ -1791,10 +1791,13 @@ async def get_document_version_chunks(
     safe_limit = max(1, min(200, int(limit)))
 
     if units:
+        from sag_api.services.search_index_service import resolve_search_unit_text
+
         block_index_by_id = {b.id: idx for idx, b in enumerate(blocks)}
         units.sort(
             key=lambda u: (
                 block_index_by_id.get(u.block_from_id, 0),
+                u.char_start if u.char_start is not None else 0,
                 int(u.page_from or 0),
                 str(u.id),
             )
@@ -1807,11 +1810,7 @@ async def get_document_version_chunks(
             if end_idx < start_idx:
                 start_idx, end_idx = end_idx, start_idx
             unit_blocks = blocks[start_idx : end_idx + 1]
-            combined_text = "\n\n".join(
-                b.normalized_text.strip()
-                for b in unit_blocks
-                if b.normalized_text and b.normalized_text.strip()
-            ).strip()
+            combined_text = resolve_search_unit_text(unit, unit_blocks).strip()
             if not combined_text:
                 continue
             tok = int(unit.token_count or 0)

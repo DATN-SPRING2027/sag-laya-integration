@@ -11,6 +11,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any, Protocol
 from weakref import WeakKeyDictionary
 
@@ -1453,12 +1454,14 @@ async def _ensure_versions_hydrated(
             or not anchor.strip()
         ):
             continue
-        unit_texts = [
-            b_text
+        from sag_api.services.search_index_service import resolve_search_unit_text
+
+        unit_blocks = [
+            SimpleNamespace(normalized_text=b_text)
             for b_ord, b_text in blocks_by_version.get(v_id_str, ())
             if int(s_ord) <= b_ord <= int(e_ord)
         ]
-        combined_text = "\n\n".join(unit_texts)
+        combined_text = resolve_search_unit_text(unit, unit_blocks)
         if (
             not combined_text.strip()
             or hashlib.sha256(combined_text.encode("utf-8")).hexdigest() != unit.content_hash

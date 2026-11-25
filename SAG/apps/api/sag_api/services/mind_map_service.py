@@ -10,6 +10,7 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any, Literal
 
 from pydantic import ValidationError as PydanticValidationError
@@ -564,6 +565,7 @@ async def _select_evidence_catalog(
         unit_order = (
             SearchUnit.page_from.asc(),
             start_block.ordinal.asc(),
+            func.coalesce(SearchUnit.char_start, 0).asc(),
             SearchUnit.id.asc(),
         )
         if topic:
@@ -599,6 +601,11 @@ async def _select_evidence_catalog(
             select(
                 SearchUnit.id.label("unit_id"),
                 SearchUnit.document_version_id.label("document_version_id"),
+                SearchUnit.block_from_id.label("block_from_id"),
+                SearchUnit.block_to_id.label("block_to_id"),
+                SearchUnit.char_start.label("char_start"),
+                SearchUnit.char_end.label("char_end"),
+                SearchUnit.text_snapshot.label("text_snapshot"),
                 SearchUnit.page_from.label("page_from"),
                 SearchUnit.page_to.label("page_to"),
                 SearchUnit.section_path.label("section_path"),
@@ -629,9 +636,32 @@ async def _select_evidence_catalog(
         unit_rows = (await session.execute(unit_stmt)).all()
 
         selected_subq = unit_stmt.subquery()
+        is_sliced_unit = or_(
+            and_(selected_subq.c.text_snapshot.is_not(None), selected_subq.c.text_snapshot != ""),
+            and_(
+                selected_subq.c.block_from_id == selected_subq.c.block_to_id,
+                selected_subq.c.char_start.is_not(None),
+                selected_subq.c.char_end.is_not(None),
+                selected_subq.c.char_end >= selected_subq.c.char_start,
+            ),
+        )
+        block_text_expr = case(
+            (and_(selected_subq.c.text_snapshot.is_not(None), selected_subq.c.text_snapshot != ""), ""),
+            (
+                and_(
+                    selected_subq.c.block_from_id == selected_subq.c.block_to_id,
+                    selected_subq.c.char_start.is_not(None),
+                    selected_subq.c.char_end.is_not(None),
+                    selected_subq.c.char_end >= selected_subq.c.char_start,
+                ),
+                func.substr(CanonicalBlock.normalized_text, 1, selected_subq.c.char_end),
+            ),
+            else_=func.substr(CanonicalBlock.normalized_text, 1, _MAX_UNIT_CHARS),
+        )
         block_window = (
             select(
                 selected_subq.c.unit_id,
+                is_sliced_unit.label("is_sliced_unit"),
                 func.length(CanonicalBlock.normalized_text).label("text_length"),
                 func.count().over(partition_by=selected_subq.c.unit_id).label("block_total"),
                 func.row_number()
@@ -640,7 +670,7 @@ async def _select_evidence_catalog(
                     order_by=(CanonicalBlock.ordinal.asc(), CanonicalBlock.id.asc()),
                 )
                 .label("block_rn"),
-                func.substr(CanonicalBlock.normalized_text, 1, _MAX_UNIT_CHARS).label("text_slice"),
+                block_text_expr.label("text_slice"),
             )
             .join(
                 CanonicalBlock,
@@ -652,23 +682,26 @@ async def _select_evidence_catalog(
             )
             .subquery()
         )
-        blk_rows = (
-            await session.execute(
-                select(block_window)
-                .where(block_window.c.block_rn <= _MAX_BLOCKS_PER_UNIT)
-                .order_by(block_window.c.unit_id.asc(), block_window.c.block_rn.asc())
-            )
-        ).all()
+        blk_stmt = (
+            select(block_window)
+            .where(block_window.c.block_rn <= _MAX_BLOCKS_PER_UNIT)
+            .order_by(block_window.c.unit_id.asc(), block_window.c.block_rn.asc())
+        )
+        blk_rows = (await session.execute(blk_stmt)).all()
     except SQLAlchemyError as error:
         log.warning("mind map evidence hydration failed error_type=%s", type(error).__name__)
         raise ServiceUnavailableError("Mind map evidence is temporarily unavailable") from error
 
-    blocks_by_unit: dict[str, list[str]] = defaultdict(list)
+    from sag_api.services.search_index_service import resolve_search_unit_text
+
+    blocks_by_unit: dict[str, list[SimpleNamespace]] = defaultdict(list)
     truncated_unit_ids: set[str] = set()
-    for unit_id, text_length, block_total, _block_rn, text_slice in blk_rows:
+    for unit_id, sliced_flag, text_length, block_total, _block_rn, text_slice in blk_rows:
         uid = str(unit_id)
-        blocks_by_unit[uid].append(str(text_slice or ""))
-        if int(block_total or 0) > _MAX_BLOCKS_PER_UNIT or int(text_length or 0) > _MAX_UNIT_CHARS:
+        blocks_by_unit[uid].append(SimpleNamespace(normalized_text=str(text_slice or "")))
+        if not sliced_flag and (
+            int(block_total or 0) > _MAX_BLOCKS_PER_UNIT or int(text_length or 0) > _MAX_UNIT_CHARS
+        ):
             truncated_unit_ids.add(uid)
 
     per_doc_candidates: dict[str, list[_CandidateUnit]] = defaultdict(list)
@@ -680,9 +713,14 @@ async def _select_evidence_catalog(
         if doc is None or int(row.start_ordinal) > int(row.end_ordinal):
             continue
         uid = str(row.unit_id)
-        raw_joined = "\n\n".join(
-            part.strip() for part in blocks_by_unit.get(uid, ()) if part and part.strip()
-        ).strip()
+        unit_proxy = SimpleNamespace(
+            block_from_id=row.block_from_id,
+            block_to_id=row.block_to_id,
+            char_start=row.char_start,
+            char_end=row.char_end,
+            text_snapshot=row.text_snapshot,
+        )
+        raw_joined = resolve_search_unit_text(unit_proxy, blocks_by_unit.get(uid, ())).strip()
         if not raw_joined:
             continue
         was_truncated = uid in truncated_unit_ids or len(raw_joined) > _MAX_UNIT_CHARS

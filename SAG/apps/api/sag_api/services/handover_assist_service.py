@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 from collections import defaultdict
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -75,6 +76,7 @@ async def _load_indexed_units(
 
     try:
         from sag_api.db.models import CanonicalBlock, Document, DocumentVersion, SearchUnit
+        from sag_api.services.search_index_service import resolve_search_unit_text
 
         start_block = aliased(CanonicalBlock)
         end_block = aliased(CanonicalBlock)
@@ -91,6 +93,11 @@ async def _load_indexed_units(
                 DocumentVersion.id.label("document_version_id"),
                 DocumentVersion.version_no.label("version_no"),
                 SearchUnit.id.label("unit_id"),
+                SearchUnit.block_from_id.label("block_from_id"),
+                SearchUnit.block_to_id.label("block_to_id"),
+                SearchUnit.char_start.label("char_start"),
+                SearchUnit.char_end.label("char_end"),
+                SearchUnit.text_snapshot.label("text_snapshot"),
                 SearchUnit.page_from.label("page_from"),
                 SearchUnit.section_path.label("section_path"),
                 start_block.ordinal.label("start_ordinal"),
@@ -101,6 +108,7 @@ async def _load_indexed_units(
                     order_by=(
                         SearchUnit.page_from.asc(),
                         start_block.ordinal.asc(),
+                        func.coalesce(SearchUnit.char_start, 0).asc(),
                         SearchUnit.id.asc(),
                     ),
                 )
@@ -134,6 +142,11 @@ async def _load_indexed_units(
                 ranked_subq.c.document_version_id,
                 ranked_subq.c.version_no,
                 ranked_subq.c.unit_id,
+                ranked_subq.c.block_from_id,
+                ranked_subq.c.block_to_id,
+                ranked_subq.c.char_start,
+                ranked_subq.c.char_end,
+                ranked_subq.c.text_snapshot,
                 ranked_subq.c.page_from,
                 ranked_subq.c.section_path,
                 ranked_subq.c.start_ordinal,
@@ -156,11 +169,34 @@ async def _load_indexed_units(
         # Join only the selected SearchUnit spans; do not load whole versions.
         # Both row count and cell length are bounded before materialization.
         selected = stmt.subquery()
+        is_sliced_unit = or_(
+            and_(selected.c.text_snapshot.is_not(None), selected.c.text_snapshot != ""),
+            and_(
+                selected.c.block_from_id == selected.c.block_to_id,
+                selected.c.char_start.is_not(None),
+                selected.c.char_end.is_not(None),
+                selected.c.char_end >= selected.c.char_start,
+            ),
+        )
+        block_text_expr = case(
+            (and_(selected.c.text_snapshot.is_not(None), selected.c.text_snapshot != ""), ""),
+            (
+                and_(
+                    selected.c.block_from_id == selected.c.block_to_id,
+                    selected.c.char_start.is_not(None),
+                    selected.c.char_end.is_not(None),
+                    selected.c.char_end >= selected.c.char_start,
+                ),
+                func.substr(CanonicalBlock.normalized_text, 1, selected.c.char_end),
+            ),
+            else_=func.substr(CanonicalBlock.normalized_text, 1, _MAX_UNIT_CHARS),
+        )
         block_window = (
             select(
                 selected.c.unit_id,
                 selected.c.logical_source_id,
                 selected.c.version_no,
+                is_sliced_unit.label("is_sliced_unit"),
                 func.length(CanonicalBlock.normalized_text).label("text_length"),
                 func.count().over(partition_by=selected.c.unit_id).label("block_total"),
                 func.row_number()
@@ -169,7 +205,7 @@ async def _load_indexed_units(
                     order_by=(CanonicalBlock.ordinal.asc(), CanonicalBlock.id.asc()),
                 )
                 .label("block_rn"),
-                func.substr(CanonicalBlock.normalized_text, 1, _MAX_UNIT_CHARS).label("normalized_text"),
+                block_text_expr.label("normalized_text"),
             )
             .join(
                 CanonicalBlock,
@@ -188,12 +224,12 @@ async def _load_indexed_units(
             )
             .order_by(block_window.c.unit_id, block_window.c.block_rn)
         )
-        blocks_by_unit: dict[str, list[str]] = defaultdict(list)
-        for unit_id, logical_id, version_no, text_length, block_total, _rn, text in (
+        blocks_by_unit: dict[str, list[SimpleNamespace]] = defaultdict(list)
+        for unit_id, logical_id, version_no, sliced_flag, text_length, block_total, _rn, text in (
             await session.execute(blk_stmt)
         ).all():
-            blocks_by_unit[str(unit_id)].append(str(text or ""))
-            if truncated_sources is not None and (
+            blocks_by_unit[str(unit_id)].append(SimpleNamespace(normalized_text=str(text or "")))
+            if truncated_sources is not None and not sliced_flag and (
                 int(block_total) > _MAX_BLOCKS_PER_UNIT or int(text_length or 0) > _MAX_UNIT_CHARS
             ):
                 truncated_sources.add((str(logical_id), int(version_no)))
@@ -207,6 +243,11 @@ async def _load_indexed_units(
         _doc_version_id,
         version_no,
         unit_id,
+        block_from_id,
+        block_to_id,
+        char_start,
+        char_end,
+        text_snapshot,
         page_from,
         section_path,
         start_ord,
@@ -216,8 +257,14 @@ async def _load_indexed_units(
         key = (str(logical_id), int(version_no))
         if key not in logical_targets or int(start_ord) > int(end_ord):
             continue
-        unit_texts = [text for text in blocks_by_unit.get(str(unit_id), ()) if text.strip()]
-        combined_text = "\n\n".join(unit_texts).strip()
+        unit_proxy = SimpleNamespace(
+            block_from_id=block_from_id,
+            block_to_id=block_to_id,
+            char_start=char_start,
+            char_end=char_end,
+            text_snapshot=text_snapshot,
+        )
+        combined_text = resolve_search_unit_text(unit_proxy, blocks_by_unit.get(str(unit_id), ())).strip()
         if truncated_sources is not None and (
             int(source_total) > _MAX_INDEXED_UNITS_PER_SOURCE or len(combined_text) > _MAX_UNIT_CHARS
         ):

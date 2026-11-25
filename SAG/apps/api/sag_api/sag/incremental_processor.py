@@ -247,15 +247,26 @@ class IncrementalDocumentProcessor:
         if not blocks or not units:
             return False
 
+        from sag_api.services.search_index_service import resolve_search_unit_text
+
         block_index_by_id = {b.id: idx for idx, b in enumerate(blocks)}
-        units.sort(key=lambda u: block_index_by_id.get(u.block_from_id, 0))
+        units.sort(
+            key=lambda u: (
+                block_index_by_id.get(u.block_from_id, 0),
+                u.char_start if u.char_start is not None else 0,
+                int(u.page_from or 0),
+                str(u.id),
+            )
+        )
 
         chunk_items: list[ChunkItem] = []
         for idx, unit in enumerate(units):
             start_idx = block_index_by_id.get(unit.block_from_id, 0)
             end_idx = block_index_by_id.get(unit.block_to_id, start_idx)
+            if end_idx < start_idx:
+                start_idx, end_idx = end_idx, start_idx
             unit_blocks = blocks[start_idx : end_idx + 1]
-            combined_text = "\n\n".join(b.normalized_text for b in unit_blocks if b.normalized_text).strip()
+            combined_text = resolve_search_unit_text(unit, unit_blocks).strip()
             if not combined_text:
                 continue
             heading = (unit.section_path or self._document_title or f"Section {idx + 1}").strip()[:500]
