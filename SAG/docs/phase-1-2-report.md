@@ -1,5 +1,7 @@
 # Báo cáo Phase 1–2: SAG RAG và nền tảng tích hợp Laya Local
 
+> **SUPERSEDED (2026-11-25):** Báo cáo checkpoint lịch sử (2026-09-22). Các mô tả về tích hợp **Laya Local** (`SAG_ENABLE_LAYA`) và **trích xuất event/entity bằng LLM mặc định** đã bị thay thế theo [adr-remove-laya-and-r2.md](adr-remove-laya-and-r2.md) và [adr-remove-e2-llm-enrichment.md](adr-remove-e2-llm-enrichment.md).
+
 > Cập nhật: 2026-09-22
 > Branch: `feat/verify-sag-rag-baseline-be-api`
 > Trạng thái checkpoint: **PASS**

@@ -1,5 +1,7 @@
 # Todo — SAG Knowledge Routing RAG
 
+> **SUPERSEDED (2026-11-25):** Checklist tác nghiệp lịch sử (có tham chiếu **Laya Local**, **E2 LLM Enrichment** và một số tệp test cũ đã gỡ bỏ). Kiến trúc hiện hành tuân theo [adr-remove-laya-and-r2.md](../docs/adr-remove-laya-and-r2.md) và [adr-remove-e2-llm-enrichment.md](../docs/adr-remove-e2-llm-enrichment.md).
+
 Nguồn chuẩn: [Workflow v1.1](../docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1.md). Thứ tự và phụ thuộc: [plan.md](plan.md). Các mục dưới đây là việc cần làm, chưa hàm ý trạng thái hiện tại của code.
 
 ## Phase 0 — Contracts & Foundations

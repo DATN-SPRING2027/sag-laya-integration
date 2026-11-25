@@ -1,5 +1,7 @@
 # Phase 3 Review Report — Standalone Laya Local
 
+> **SUPERSEDED (2026-11-25):** Báo cáo review lịch sử cho `laya_router.py` và `test_laya_router.py`. Laya Local Router đã được **loại bỏ khỏi SAG** và thay thế bằng `services/decision_router.py` theo [adr-remove-laya-and-r2.md](adr-remove-laya-and-r2.md).
+
 > Branch: `feat/verify-laya-standalone-be-api`
 > Base: `origin/main`
 > Commit reviewed: `7fa1c68`
