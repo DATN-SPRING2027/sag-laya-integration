@@ -383,7 +383,8 @@ def build_benchmark_scenarios() -> list[BenchmarkScenario]:
                 "gold_tuan_confirm",
                 "gold_sso_keycloak",
             ),
-            budget_tokens=980,
+            # Calibrated for real tiktoken cl100k_base Vietnamese token counts across all 10 active decisions
+            budget_tokens=1180,
             memory_scope="full_session_audit",
             temporal_mode="change_lineage",
         ),
