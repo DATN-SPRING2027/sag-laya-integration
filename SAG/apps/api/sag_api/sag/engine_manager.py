@@ -624,11 +624,7 @@ class EngineManager:
                         inner.dimensions = None
 
         from sag_api.core.token_usage import wrap_embedding_client_with_cache_and_metering
-        from sag_api.services.search_index_service import (
-            build_embedding_model_signature,
-            get_cached_text_embedding,
-            put_cached_text_embedding,
-        )
+        from sag_api.services.search_index_service import build_embedding_model_signature
 
         emb_sig = build_embedding_model_signature(emb, settings_obj=self._settings)
         wrap_embedding_client_with_cache_and_metering(
@@ -637,43 +633,6 @@ class EngineManager:
             settings_obj=self._settings,
             model_signature=emb_sig,
         )
-        if emb is not None and not getattr(emb, "_sag_shared_cache_wrapped", False):
-            orig_generate = emb.generate
-            orig_batch_generate = emb.batch_generate
-
-            async def _cached_generate(text: str) -> list[float]:
-                cached = get_cached_text_embedding(text, model_signature=emb_sig)
-                if cached is not None:
-                    return cached
-                vec = await orig_generate(text)
-                if vec:
-                    put_cached_text_embedding(text, vec, model_signature=emb_sig)
-                return vec
-
-            async def _cached_batch_generate(texts: list[str]) -> list[list[float]]:
-                if not texts:
-                    return []
-                results: list[list[float] | None] = [None] * len(texts)
-                missing_by_text: dict[str, list[int]] = {}
-                for idx, txt in enumerate(texts):
-                    cached = get_cached_text_embedding(txt, model_signature=emb_sig)
-                    if cached is not None:
-                        results[idx] = cached
-                    else:
-                        missing_by_text.setdefault(txt, []).append(idx)
-                if missing_by_text:
-                    unique_missing = list(missing_by_text.keys())
-                    fetched = await orig_batch_generate(unique_missing)
-                    for txt, vec in zip(unique_missing, fetched, strict=True):
-                        if vec:
-                            put_cached_text_embedding(txt, vec, model_signature=emb_sig)
-                        for m_idx in missing_by_text[txt]:
-                            results[m_idx] = vec
-                return [vec or [] for vec in results]
-
-            emb.generate = _cached_generate
-            emb.batch_generate = _cached_batch_generate
-            emb._sag_shared_cache_wrapped = True
 
     async def _ensure_engine_schema(self, engine: DataEngine) -> None:
         if self._schema_ready:

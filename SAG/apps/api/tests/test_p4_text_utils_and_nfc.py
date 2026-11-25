@@ -91,7 +91,7 @@ def test_estimate_tokens_tiktoken_disallowed_special_and_offline_fallback(caplog
         assert len(warning_records) == 1
         assert text_utils.get_tiktoken_fallback_status() == {
             "degraded": True,
-            "fallback_count": 1,
+            "fallback_count": 2,
             "reason": "load:RuntimeError",
         }
     finally:

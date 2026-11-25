@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 import unicodedata
 from collections.abc import Sequence
-from functools import lru_cache
 from typing import Any
 
 from sag_api.core.logging import get_logger
@@ -136,6 +136,9 @@ def slugify_ascii(
 
 
 _TIKTOKEN_FALLBACK_LOCK = threading.Lock()
+_TIKTOKEN_RETRY_COOLDOWN_SECONDS = 60.0
+_tiktoken_cached_encoding: Any | None = None
+_tiktoken_last_failure_monotonic: float | None = None
 _tiktoken_fallback_warned = False
 _tiktoken_fallback_count = 0
 _tiktoken_fallback_reason: str | None = None
@@ -158,33 +161,65 @@ def _record_tiktoken_fallback(stage: str, exc: Exception) -> None:
         )
 
 
+def _record_tiktoken_fallback_hit() -> None:
+    """Increment fallback metric on cooldown-skipped calls without repeating the one-shot warning."""
+    global _tiktoken_fallback_count
+    with _TIKTOKEN_FALLBACK_LOCK:
+        _tiktoken_fallback_count += 1
+
+
 def get_tiktoken_fallback_status() -> dict[str, Any]:
     with _TIKTOKEN_FALLBACK_LOCK:
         return {
-            "degraded": _tiktoken_fallback_count > 0,
+            "degraded": _tiktoken_fallback_count > 0 and _tiktoken_cached_encoding is None,
             "fallback_count": _tiktoken_fallback_count,
             "reason": _tiktoken_fallback_reason,
         }
 
 
 def reset_tiktoken_fallback_state() -> None:
+    global _tiktoken_cached_encoding, _tiktoken_last_failure_monotonic
     global _tiktoken_fallback_warned, _tiktoken_fallback_count, _tiktoken_fallback_reason
     with _TIKTOKEN_FALLBACK_LOCK:
+        _tiktoken_cached_encoding = None
+        _tiktoken_last_failure_monotonic = None
         _tiktoken_fallback_warned = False
         _tiktoken_fallback_count = 0
         _tiktoken_fallback_reason = None
-    _tiktoken_encoding.cache_clear()
 
 
-@lru_cache(maxsize=1)
-def _tiktoken_encoding() -> Any | None:
+def _load_tiktoken_encoding() -> tuple[Any | None, bool]:
+    """Return ``(encoding_or_none, recorded_failure_this_call)`` without pinning None forever."""
+    global _tiktoken_cached_encoding, _tiktoken_last_failure_monotonic
+    now = time.monotonic()
+    with _TIKTOKEN_FALLBACK_LOCK:
+        if _tiktoken_cached_encoding is not None:
+            return _tiktoken_cached_encoding, False
+        if (
+            _tiktoken_last_failure_monotonic is not None
+            and (now - _tiktoken_last_failure_monotonic) < _TIKTOKEN_RETRY_COOLDOWN_SECONDS
+        ):
+            return None, False
+
     try:
         import tiktoken
 
-        return tiktoken.get_encoding("cl100k_base")
+        enc = tiktoken.get_encoding("cl100k_base")
     except Exception as exc:  # noqa: BLE001
+        with _TIKTOKEN_FALLBACK_LOCK:
+            _tiktoken_last_failure_monotonic = time.monotonic()
         _record_tiktoken_fallback("load", exc)
-        return None
+        return None, True
+
+    with _TIKTOKEN_FALLBACK_LOCK:
+        _tiktoken_cached_encoding = enc
+        _tiktoken_last_failure_monotonic = None
+    return enc, False
+
+
+def _tiktoken_encoding() -> Any | None:
+    enc, _ = _load_tiktoken_encoding()
+    return enc
 
 
 def _estimate_tokens_fallback(text: str) -> int:
@@ -197,12 +232,15 @@ def estimate_tokens(text: str) -> int:
     """Estimate token count using tiktoken cl100k_base with an offline UTF-8 Vietnamese-safe fallback."""
     if not text:
         return 0
-    enc = _tiktoken_encoding()
+    enc, recorded_failure = _load_tiktoken_encoding()
     if enc is not None:
         try:
             return max(1, len(enc.encode(text, disallowed_special=())))
         except Exception as exc:  # noqa: BLE001
             _record_tiktoken_fallback("encode", exc)
+            return _estimate_tokens_fallback(text)
+    if not recorded_failure:
+        _record_tiktoken_fallback_hit()
     return _estimate_tokens_fallback(text)
 
 
