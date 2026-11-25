@@ -21,6 +21,19 @@ _ACTIVE_POLICY_SETTINGS: contextvars.ContextVar[Settings | None] = contextvars.C
     "sag_active_policy_settings",
     default=None,
 )
+_OMIT_STREAM_OPTIONS: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "sag_omit_stream_options",
+    default=False,
+)
+_INSTALLED_POLICY_STACK: list[Any] = []
+
+
+class _PolicyRequest(dict):
+    """Normalized LiteLLM request dict that remembers explicit stream_options opt-out idempotently."""
+
+    def __init__(self, *args: Any, omit_stream_options: bool = False, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._sag_omit_stream_options = omit_stream_options
 
 
 @contextmanager
@@ -31,6 +44,16 @@ def policy_settings_scope(active_settings: Settings) -> Iterator[None]:
         yield
     finally:
         _ACTIVE_POLICY_SETTINGS.reset(token)
+
+
+@contextmanager
+def omit_stream_options_scope(enabled: bool = True) -> Iterator[None]:
+    """Suppress stream_options injection across nested LiteLLM policy hooks for the current task."""
+    token = _OMIT_STREAM_OPTIONS.set(enabled)
+    try:
+        yield
+    finally:
+        _OMIT_STREAM_OPTIONS.reset(token)
 
 _COMPLETION_CALL_TYPES = {"completion", "acompletion"}
 _DEEPSEEK_V4_MODELS = {"deepseek-v4-flash", "deepseek-v4-pro"}
@@ -188,7 +211,12 @@ def apply_litellm_completion_policy(
     infer.  An explicit ``enable_thinking: true`` remains an opt-in override.
     """
 
-    normalized = dict(request)
+    explicit_omit_stream_options = bool(
+        getattr(request, "_sag_omit_stream_options", False)
+        or _OMIT_STREAM_OPTIONS.get()
+        or ("stream_options" in request and request.get("stream_options") is None)
+    )
+    normalized = _PolicyRequest(request, omit_stream_options=explicit_omit_stream_options)
     if "extra_body" not in normalized and settings.llm_extra_body:
         normalized["extra_body"] = dict(settings.llm_extra_body)
 
@@ -218,10 +246,10 @@ def apply_litellm_completion_policy(
     if "reasoning_effort" in normalized and _is_openai_route(model, settings):
         _with_allowed_openai_param(normalized, "reasoning_effort")
     if normalized.get("stream") is True:
-        if "stream_options" not in normalized:
-            normalized["stream_options"] = {"include_usage": True}
-        elif normalized["stream_options"] is None:
+        if explicit_omit_stream_options:
             normalized.pop("stream_options", None)
+        elif "stream_options" not in normalized:
+            normalized["stream_options"] = {"include_usage": True}
     return normalized
 
 
@@ -246,55 +274,78 @@ def install_litellm_policy(settings: Settings) -> Any:
     callback = MuseLiteLLMPolicy()
     litellm.callbacks.append(callback)
     original_acompletion = litellm.acompletion
+    next_acompletion = [original_acompletion]
     cache = StructuredOutputCapabilityCache()
 
     async def sag_acompletion(*args: Any, **kwargs: Any) -> Any:
         active_settings = _ACTIVE_POLICY_SETTINGS.get() or settings
-        kwargs = apply_litellm_completion_policy(active_settings, kwargs)
-        if active_settings.llm_structured_output_mode != "auto" or not _json_schema_request(
-            kwargs
-        ):
-            return await original_acompletion(*args, **kwargs)
-        key = _capability_key(kwargs, active_settings)
-        known = cache.get(key)
-        if known == "json_object":
-            return await original_acompletion(*args, **_with_json_object(kwargs))
-        if known == "json_schema":
-            return await original_acompletion(*args, **kwargs)
-
-        async with cache.probe_lock(key):
+        omit_stream = bool(
+            _OMIT_STREAM_OPTIONS.get()
+            or ("stream_options" in kwargs and kwargs.get("stream_options") is None)
+        )
+        with omit_stream_options_scope(omit_stream):
+            kwargs = apply_litellm_completion_policy(active_settings, kwargs)
+            target = next_acompletion[0]
+            if active_settings.llm_structured_output_mode != "auto" or not _json_schema_request(
+                kwargs
+            ):
+                return await target(*args, **kwargs)
+            key = _capability_key(kwargs, active_settings)
             known = cache.get(key)
             if known == "json_object":
-                return await original_acompletion(*args, **_with_json_object(kwargs))
+                return await target(*args, **_with_json_object(kwargs))
             if known == "json_schema":
-                return await original_acompletion(*args, **kwargs)
-            try:
-                result = await original_acompletion(*args, **kwargs)
-            except Exception as error:
-                if not should_downgrade_json_schema(error, kwargs, active_settings):
-                    raise
-                cache.mark(key, "json_object")
-                return await original_acompletion(
-                    *args, **_with_json_object(kwargs)
-                )
-            cache.mark(key, "json_schema")
-            return result
+                return await target(*args, **kwargs)
+
+            async with cache.probe_lock(key):
+                known = cache.get(key)
+                if known == "json_object":
+                    return await target(*args, **_with_json_object(kwargs))
+                if known == "json_schema":
+                    return await target(*args, **kwargs)
+                try:
+                    result = await target(*args, **kwargs)
+                except Exception as error:
+                    if not should_downgrade_json_schema(error, kwargs, active_settings):
+                        raise
+                    cache.mark(key, "json_object")
+                    return await target(*args, **_with_json_object(kwargs))
+                cache.mark(key, "json_schema")
+                return result
 
     callback._sag_original_acompletion = original_acompletion
+    callback._sag_next_acompletion = next_acompletion
     callback._sag_acompletion = sag_acompletion
     callback._sag_structured_output_cache = cache
+    _INSTALLED_POLICY_STACK.append(callback)
     litellm.acompletion = sag_acompletion
     return callback
 
 
 def uninstall_litellm_policy(callback: Any) -> None:
-    """Remove a policy installed by :func:`install_litellm_policy`."""
+    """Remove a policy installed by :func:`install_litellm_policy`, supporting any uninstall order."""
 
     import litellm
 
     wrapper = getattr(callback, "_sag_acompletion", None)
-    original = getattr(callback, "_sag_original_acompletion", None)
-    if wrapper is not None and original is not None and litellm.acompletion is wrapper:
-        litellm.acompletion = original
+    next_ref = getattr(callback, "_sag_next_acompletion", None)
+    fallback_target = next_ref[0] if isinstance(next_ref, list) and next_ref else getattr(
+        callback, "_sag_original_acompletion", None
+    )
+
+    if callback in _INSTALLED_POLICY_STACK:
+        idx = _INSTALLED_POLICY_STACK.index(callback)
+        if litellm.acompletion is wrapper and fallback_target is not None:
+            litellm.acompletion = fallback_target
+        else:
+            for upper in _INSTALLED_POLICY_STACK[idx + 1 :]:
+                upper_next = getattr(upper, "_sag_next_acompletion", None)
+                if isinstance(upper_next, list) and upper_next and upper_next[0] is wrapper:
+                    upper_next[0] = fallback_target
+                    break
+        _INSTALLED_POLICY_STACK.pop(idx)
+    elif wrapper is not None and fallback_target is not None and litellm.acompletion is wrapper:
+        litellm.acompletion = fallback_target
+
     if callback in litellm.callbacks:
         litellm.callbacks.remove(callback)

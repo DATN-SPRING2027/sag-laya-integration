@@ -80,6 +80,7 @@ class _CountingBatchEmbedder:
 
 @pytest.mark.asyncio
 async def test_unified_decision_router_ecce_signals_and_fail_closed(monkeypatch) -> None:
+    decision_router.clear_decision_route_cache()
     monkeypatch.setattr(settings, "decision_provider", "siliconflow")
     monkeypatch.setattr(settings, "decision_api_key", "")
     monkeypatch.setattr(settings, "siliconflow_api_key", "sf-test-key")

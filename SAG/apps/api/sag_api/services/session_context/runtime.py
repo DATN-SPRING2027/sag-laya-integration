@@ -407,6 +407,7 @@ async def prepare_session_context_for_ask(
     embedder: Any | None = None,
     qdrant_client: httpx.AsyncClient | None = None,
     llm: Any | None = None,
+    web_enabled: bool = False,
 ) -> SessionContextPack:
     """Build ACL-enforced, SiliconFlow-routed, durably-synced ECCE context pack."""
     from sag_api.services.agent_domain import filter_messages_for_scope
@@ -759,11 +760,18 @@ async def prepare_session_context_for_ask(
             [d for d in index.active_decisions if d.turn_id in allowed_turn_ids]
         ),
     }
+    prior_turns_payload = [
+        {"role": t.role, "content": t.content}
+        for t in index.turns
+        if t.turn_id in allowed_turn_ids and t.role in {"user", "assistant"} and t.content
+    ]
     decision = (
         await route_query_async(
             query,
+            prior_turns=prior_turns_payload or None,
             has_thread_history=bool(allowed_turn_ids),
             has_sources=(requested_source_ids is None or bool(requested_source_ids)),
+            web_enabled=web_enabled,
             scoped=bool(requested_source_ids),
             context=route_ctx,
             llm_client=llm if settings.decision_provider == "llm" else None,

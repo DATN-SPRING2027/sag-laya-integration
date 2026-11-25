@@ -693,7 +693,36 @@ async def route_query_async(
             client = LLMClient(settings)
         if client is None or not getattr(client, "configured", False):
             return _degraded_decision(query, "decision_llm_unconfigured")
+        client_settings = getattr(client, "_settings", None)
+        llm_model = str(getattr(client_settings, "llm_model", None) or settings.llm_model)
+        llm_base = str(getattr(client_settings, "llm_base_url", None) or settings.llm_base_url or "")
         start_time = time.perf_counter()
+        llm_cache_eligible = use_cache and not prior_turns
+        llm_key = _cache_key(
+            provider=provider,
+            base_url=llm_base,
+            model=llm_model,
+            normalized_query=cleaned,
+            has_sources=has_sources,
+            web_enabled=web_enabled,
+            scoped=scoped,
+            has_thread_history=has_thread_history,
+            context=context,
+        )
+        if llm_cache_eligible:
+            cached = _get_cached_decision_payload(llm_key)
+            if cached is not None:
+                cached_payload, cached_model = cached
+                record_llm_cache_hit(model=cached_model, count=1, component="decision_router")
+                latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
+                cached_decision = _parse_unified_decision_payload(
+                    query,
+                    cached_payload,
+                    model=cached_model,
+                    latency_ms=latency_ms,
+                )
+                if cached_decision is not None:
+                    return cached_decision
         rf = _desired_response_format()
         try:
             raw_content = await asyncio.wait_for(
@@ -713,11 +742,13 @@ async def route_query_async(
         decision = _parse_unified_decision_payload(
             query,
             parsed,
-            model=settings.llm_model,
+            model=llm_model,
             latency_ms=latency_ms,
         )
         if decision is None:
             return _degraded_decision(query, "decision_invalid_schema", latency_ms=latency_ms)
+        if llm_cache_eligible:
+            _put_cached_decision_payload(llm_key, parsed, llm_model)
         return decision
 
     # provider in {"siliconflow", "openai_compatible"}
@@ -730,12 +761,7 @@ async def route_query_async(
 
     model = settings.decision_model
     start_time = time.perf_counter()
-    cache_eligible = (
-        use_cache
-        and http_transport is None
-        and not prior_turns
-        and api_key != "sf-test-key"
-    )
+    cache_eligible = use_cache and http_transport is None and not prior_turns
     key = _cache_key(
         provider=provider,
         base_url=base_url,

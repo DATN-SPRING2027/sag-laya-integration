@@ -117,6 +117,7 @@ async def _initial_tool_choice(
     has_prior_turns: bool = False,
     public_scope: bool = False,
     require_project_grounding: bool = False,
+    llm_client: Any = None,
 ) -> str | dict[str, Any]:
     """Select first-turn tool_choice strictly from UnifiedRouteDecision + ToolSpec.capabilities."""
     del public_scope
@@ -129,6 +130,8 @@ async def _initial_tool_choice(
     if route_decision is not None:
         decision = route_decision
     else:
+        from sag_api.core.config import settings
+
         decision = (
             await route_query_async(
                 normalized,
@@ -136,6 +139,7 @@ async def _initial_tool_choice(
                 has_sources=("search_context" in names),
                 web_enabled=not knowledge_only,
                 scoped=scoped,
+                llm_client=llm_client if settings.decision_provider == "llm" else None,
             )
         ).to_dict()
 
@@ -1259,6 +1263,7 @@ async def generate_stream(
                 has_sources=bool(sources),
                 web_enabled=not knowledge_only,
                 scoped=bool(plan.source_ids),
+                llm_client=llm if settings.decision_provider == "llm" else None,
             )
             plan_route_decision = routed.to_dict()
 
@@ -1457,6 +1462,7 @@ async def generate_stream(
                 has_prior_turns=has_prior_turns,
                 public_scope=(question_scope == "general"),
                 require_project_grounding=require_project_grounding,
+                llm_client=llm,
             )
             is_time_only = flags.needs_time and not flags.needs_retrieval
             local_grounding_required = (

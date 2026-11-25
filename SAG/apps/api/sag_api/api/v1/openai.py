@@ -70,27 +70,165 @@ def _split_query(messages: list[ChatMessage]) -> tuple[str, list[dict[str, str]]
 
 
 _COMPLETE_CITATION_BRACKET_RE = re.compile(
-    r"[ \t]*\[\s*[sS]?\d+(?:\s*[,;、]\s*[sS]?\d+)*\s*\]"
+    r"[ \t]*\[(\s*[sS]?\d+(?:\s*[,;、]\s*[sS]?\d+)*\s*)\](?!\(\s*(?:https?:|mailto:)|:\s*(?:https?:|mailto:))"
 )
 _INCOMPLETE_CITATION_TAIL_RE = re.compile(
     r"[ \t]*\[\s*(?:(?:[sS]?\d+(?:\s*[,;、]\s*[sS]?\d+)*\s*[,;、]\s*(?:[sS]?\d*)?)|(?:[sS]?\d*)|[sS])?\s*$"
 )
+_LINK_PREFIXES = ("(http:", "(https:", "(mailto:", ": http:", ": https:", ": mailto:", ":http:", ":https:", ":mailto:")
+
+
+def _is_zero_math_bracket(inner: str) -> bool:
+    items = [part.strip() for part in re.split(r"[,;、]", inner) if part.strip()]
+    if not items:
+        return False
+    if any(item[:1].upper() == "S" and item[1:].isdigit() for item in items):
+        return False
+    return any(item.isdigit() and int(item) == 0 for item in items)
+
+
+def _has_partial_link_tail(after: str) -> bool:
+    if not after:
+        return False
+    lowered = after.lower()
+    return any(prefix.startswith(lowered) for prefix in _LINK_PREFIXES)
+
+
+def _find_closing_backticks(text: str, start: int, run_len: int) -> int:
+    para_end = text.find("\n\n", start)
+    limit = len(text) if para_end == -1 else para_end
+    pos = start
+    while pos < limit:
+        idx = text.find("`", pos, limit)
+        if idx == -1:
+            return -1
+        end = idx
+        while end < limit and text[end] == "`":
+            end += 1
+        if end - idx == run_len:
+            return idx
+        pos = end
+    return -1
+
+
+def _prose_segments(text: str) -> tuple[list[tuple[int, int]], int | None]:
+    """Return non-code prose spans and optional start index of an unclosed backtick span containing '['."""
+    segments: list[tuple[int, int]] = []
+    prose_start = 0
+    index = 0
+    length = len(text)
+    code_fence: str | None = None
+    unclosed_code_bracket_start: int | None = None
+
+    while index < length:
+        line_start = index == 0 or text[index - 1] == "\n"
+        if line_start:
+            fence_match = re.match(r"^( {0,3})(`{3,}|~{3,})", text[index:])
+            if fence_match:
+                marker = fence_match.group(2)
+                nl_idx = text.find("\n", index)
+                line_end = length if nl_idx == -1 else nl_idx + 1
+                suffix = text[index + len(fence_match.group(0)) : line_end].strip()
+                if code_fence is None:
+                    if index > prose_start:
+                        segments.append((prose_start, index))
+                    code_fence = marker
+                    prose_start = line_end
+                    index = line_end
+                    continue
+                if (
+                    code_fence[0] == marker[0]
+                    and len(marker) >= len(code_fence)
+                    and suffix == ""
+                ):
+                    code_fence = None
+                    prose_start = line_end
+                    index = line_end
+                    continue
+
+        if code_fence is not None:
+            index += 1
+            continue
+
+        if text[index] == "`":
+            run_len = 1
+            while index + run_len < length and text[index + run_len] == "`":
+                run_len += 1
+            closing = _find_closing_backticks(text, index + run_len, run_len)
+            if closing != -1:
+                if index > prose_start:
+                    segments.append((prose_start, index))
+                span_end = closing + run_len
+                prose_start = span_end
+                index = span_end
+                continue
+            if "[" in text[index + run_len :] and unclosed_code_bracket_start is None:
+                if index > prose_start:
+                    segments.append((prose_start, index))
+                unclosed_code_bracket_start = index
+                prose_start = length
+                break
+            index += run_len
+            continue
+
+        index += 1
+
+    if code_fence is None and prose_start < length:
+        segments.append((prose_start, length))
+    return segments, unclosed_code_bracket_start
 
 
 def _split_unbuffered_citation_tail(text: str) -> tuple[str, str]:
-    """Hold syntactic citation brackets (or incomplete prefixes) until RUN_COMPLETED resolves them."""
+    """Hold syntactic prose citation brackets (or incomplete prefixes) until RUN_COMPLETED resolves them."""
     if not text:
         return "", ""
-    complete_match = _COMPLETE_CITATION_BRACKET_RE.search(text)
-    if complete_match:
-        return text[: complete_match.start()], text[complete_match.start() :]
-    incomplete_match = _INCOMPLETE_CITATION_TAIL_RE.search(text)
-    if incomplete_match:
-        return text[: incomplete_match.start()], text[incomplete_match.start() :]
+
+    segments, unclosed_code_bracket_start = _prose_segments(text)
+    for seg_start, seg_end in segments:
+        segment = text[seg_start:seg_end]
+        for match in _COMPLETE_CITATION_BRACKET_RE.finditer(segment):
+            if _is_zero_math_bracket(match.group(1)):
+                continue
+            abs_start = seg_start + match.start()
+            abs_end = seg_start + match.end()
+            # If the bracket ends right before EOF or a partial markdown-link opener, hold it to confirm.
+            if abs_end == len(text) or _has_partial_link_tail(text[abs_end:]):
+                return text[:abs_start], text[abs_start:]
+            return text[:abs_start], text[abs_start:]
+
+    if unclosed_code_bracket_start is not None:
+        return text[:unclosed_code_bracket_start], text[unclosed_code_bracket_start:]
+
+    if segments and segments[-1][1] == len(text):
+        seg_start, seg_end = segments[-1]
+        incomplete_match = _INCOMPLETE_CITATION_TAIL_RE.search(text[seg_start:seg_end])
+        if incomplete_match:
+            abs_start = seg_start + incomplete_match.start()
+            return text[:abs_start], text[abs_start:]
+
     stripped = text.rstrip(" \t")
     if len(stripped) < len(text):
         return stripped, text[len(stripped) :]
     return text, ""
+
+
+def _compute_unstreamed_suffix(streamed: str, canonical: str) -> str:
+    """Return only the unstreamed remainder of canonical output without duplicating or dropping text."""
+    if not canonical:
+        return ""
+    if not streamed:
+        return canonical
+    if canonical.startswith(streamed):
+        return canonical[len(streamed) :]
+    norm_streamed = re.sub(r"[ \t]+([，。！？；：,.!?;:])", r"\1", streamed.lstrip())
+    if norm_streamed and canonical.startswith(norm_streamed):
+        return canonical[len(norm_streamed) :]
+    lhs = norm_streamed or streamed.lstrip()
+    lcp = 0
+    max_len = min(len(lhs), len(canonical))
+    while lcp < max_len and lhs[lcp] == canonical[lcp]:
+        lcp += 1
+    return canonical[lcp:]
 
 
 @router.post("/{agent_id}/chat/completions")
@@ -113,14 +251,28 @@ async def chat_completions(
     if not llm.configured:
         raise ConfigurationError("尚未配置 LLM，无法生成回答")
 
+    persona = getattr(agent, "persona", None) or {}
+    agent_knowledge_only = bool(
+        getattr(agent, "knowledge_only", False)
+        or (isinstance(persona, dict) and persona.get("knowledge_only") is True)
+        or (isinstance(persona, dict) and persona.get("web_enabled") is False)
+    )
+    resolved_sources = await svc.resolve_sources(
+        session,
+        agent,
+        plan.source_ids,
+        principal=principal,
+        include_project_sources=True,
+    )
+
     if plan.route_decision is None:
         routed = await route_query_async(
             query,
             prior_turns=history,
             has_thread_history=bool(history),
-            has_sources=True,
-            web_enabled=True,
-            scoped=False,
+            has_sources=bool(resolved_sources),
+            web_enabled=not agent_knowledge_only,
+            scoped=bool(plan.source_ids),
             llm_client=llm if settings.decision_provider == "llm" else None,
         )
         plan.route_decision = routed.to_dict()
@@ -143,6 +295,7 @@ async def chat_completions(
             llm=llm,
             tool_registry=tool_registry,
             runtime=agent_runtime,
+            knowledge_only=agent_knowledge_only,
             principal=principal,
             temperature=body.temperature,
             max_tokens=body.max_tokens,
@@ -197,15 +350,12 @@ async def chat_completions(
                     if should_buffer:
                         buffered_parts.append(delta)
                     else:
-                        if pending_bracket and _COMPLETE_CITATION_BRACKET_RE.search(pending_bracket):
-                            pending_bracket += delta
-                        else:
-                            flush_text, pending_bracket = _split_unbuffered_citation_tail(
-                                pending_bracket + delta
-                            )
-                            if flush_text:
-                                streamed_parts.append(flush_text)
-                                yield chunk({"content": flush_text})
+                        flush_text, pending_bracket = _split_unbuffered_citation_tail(
+                            pending_bracket + delta
+                        )
+                        if flush_text:
+                            streamed_parts.append(flush_text)
+                            yield chunk({"content": flush_text})
                 elif event.type == EventType.RUN_COMPLETED.value:
                     canonical = str(payload.get("output") or "")
                     streamed = "".join(streamed_parts)
@@ -215,13 +365,9 @@ async def chat_completions(
                         final_degraded_reason = payload.get("degraded_reason") or final_degraded_reason
                     if "citations" in payload and payload["citations"] is not None:
                         final_citations = list(payload["citations"])
-                    if should_buffer:
-                        if canonical:
-                            yield chunk({"content": canonical})
-                    elif canonical.startswith(streamed):
-                        suffix = canonical[len(streamed) :]
-                        if suffix:
-                            yield chunk({"content": suffix})
+                    suffix = _compute_unstreamed_suffix(streamed, canonical)
+                    if suffix:
+                        yield chunk({"content": suffix})
                 elif event.type in (EventType.RUN_FAILED.value, EventType.RUN_CANCELLED.value):
                     pending_bracket = ""
                     error = payload.get("error") or {}

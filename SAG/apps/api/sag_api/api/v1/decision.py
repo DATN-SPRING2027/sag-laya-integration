@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 
+from sag_api.core.config import settings
 from sag_api.core.deps import get_current_user
 from sag_api.db.models import User
 from sag_api.services.decision_router import route_query_async
@@ -51,13 +52,28 @@ class DecisionRouteResponse(BaseModel):
     degraded_reason: str | None = None
     fallback_used: bool = False
     fallback_reason: str | None = None
+    order_mode: str = "relevance"
+    explicit_count: int | None = None
+    target_unit: str = "passage"
+    is_catalog_query: bool = False
+    retrieval_mode_hint: str = "auto"
+    subqueries: list[str] = Field(default_factory=list)
+    topic_slot_key: str | None = None
+    hierarchy_bias: str = "none"
+    entities: list[str] = Field(default_factory=list)
 
 
 @router.post("/route", response_model=DecisionRouteResponse, summary="Định tuyến ý định câu hỏi qua Decision Router")
 async def route_user_query(
     body: DecisionRouteRequest,
+    request: Request,
     _user: User = Depends(get_current_user),
 ) -> DecisionRouteResponse:
     """Classify via unified async structured-output router."""
-    decision = await route_query_async(body.query, context=body.context)
+    llm = getattr(request.app.state, "llm", None)
+    decision = await route_query_async(
+        body.query,
+        context=body.context,
+        llm_client=llm if settings.decision_provider == "llm" else None,
+    )
     return DecisionRouteResponse(**decision.to_dict())

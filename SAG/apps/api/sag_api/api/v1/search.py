@@ -102,10 +102,18 @@ async def _build_query_route(
     *,
     requested_top_k: int | None = None,
     trace_strategy_plan: bool = False,
+    llm: LLMClient | None = None,
 ) -> _QueryRoutePlan:
     route_error = False
     try:
-        decision = (await route_query_async(query, scoped=bool(source_ids), has_sources=True)).to_dict()
+        decision = (
+            await route_query_async(
+                query,
+                scoped=bool(source_ids),
+                has_sources=True,
+                llm_client=llm if settings.decision_provider == "llm" else None,
+            )
+        ).to_dict()
     except Exception:  # noqa: BLE001 - Decision Router must never break retrieval
         decision = {
             "coarse_intent": "AMBIGUOUS",
@@ -347,6 +355,7 @@ async def _prepare_global_search(
     body: GlobalSearchRequest,
     *,
     principal: VerifiedPrincipal,
+    llm: LLMClient | None = None,
 ) -> _PreparedGlobalSearch:
     sources = await search_source_candidates(
         session,
@@ -369,6 +378,7 @@ async def _prepare_global_search(
             body.retrieval_mode,
             requested_top_k=body.top_k,
             trace_strategy_plan=True,
+            llm=llm,
         )
         if not route_plan.need_retrieval:
             stats = _with_query_route_stats(
@@ -580,6 +590,7 @@ async def search(
             [source_id],
             body.strategy,
             requested_top_k=body.top_k,
+            llm=llm,
         )
         if route_plan.need_retrieval:
             if partitioned:
@@ -690,7 +701,7 @@ async def global_search(
         project_id=default_project_id,
         tenant_id=principal.tenant_id,
     ) as search_token_ledger:
-        prepared = await _prepare_global_search(session, engine_manager, body, principal=principal)
+        prepared = await _prepare_global_search(session, engine_manager, body, principal=principal, llm=llm)
         prepared.response = _with_token_usage_stats(prepared.response, search_token_ledger)
         if request.state.auth_kind == "connector":
             return prepared.response.model_copy(
@@ -740,7 +751,7 @@ async def global_search_stream(
                 # Run retrieval inside the response task: EventSourceResponse can
                 # send keep-alive pings immediately and cancel this work as soon as
                 # the browser starts a newer search or disconnects.
-                prepared = await _prepare_global_search(session, engine_manager, body, principal=principal)
+                prepared = await _prepare_global_search(session, engine_manager, body, principal=principal, llm=llm)
                 prepared.response = _with_token_usage_stats(prepared.response, search_token_ledger)
                 yield _sse("result", prepared.response.model_dump(mode="json"))
                 if prepared.answer_skipped:

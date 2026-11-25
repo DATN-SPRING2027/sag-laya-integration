@@ -392,6 +392,7 @@ async def test_search_and_openai_and_single_call_prepare_ask_propagate_degraded(
         "get_agent",
         AsyncMock(return_value=SimpleNamespace(id="a1", name="Bot", persona={}, is_default=False)),
     )
+    monkeypatch.setattr(openai_api.svc, "resolve_sources", AsyncMock(return_value=[]))
     monkeypatch.setattr(
         openai_api.agent_service,
         "generate_stream",

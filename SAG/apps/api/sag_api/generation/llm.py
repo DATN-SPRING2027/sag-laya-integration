@@ -26,6 +26,7 @@ from sag_api.core.errors import (
 from sag_api.core.litellm_policy import (
     _with_json_object,
     apply_litellm_completion_policy,
+    omit_stream_options_scope,
     policy_settings_scope,
     should_downgrade_json_schema,
 )
@@ -185,9 +186,10 @@ class LLMClient:
                 if stream and "stream_options" in normalized and "stream_options" in str(err).casefold():
                     fallback_request = dict(request)
                     fallback_request["stream_options"] = None
-                    return await _litellm_completion(
-                        **apply_litellm_completion_policy(self._settings, fallback_request)
-                    )
+                    with omit_stream_options_scope(True):
+                        return await _litellm_completion(
+                            **apply_litellm_completion_policy(self._settings, fallback_request)
+                        )
                 if not stream and should_downgrade_json_schema(err, normalized, self._settings):
                     json_obj_req = _with_json_object(normalized)
                     try:

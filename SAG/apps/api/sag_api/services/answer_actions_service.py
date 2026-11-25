@@ -1095,6 +1095,7 @@ async def prepare_regenerate(
     owner_key: str,
     llm: Any = None,
     user_name: str | None = None,
+    web_enabled: bool = False,
 ) -> AskPlan:
     from sag_api.api.v1.attachments import attachment_path
     from sag_api.services.decision_router import route_query_async
@@ -1177,11 +1178,18 @@ async def prepare_regenerate(
         ephemeral_index = IncrementalSessionIndex(thread.id)
         await ephemeral_index.append_messages(prior_records, llm=llm)
         allowed_turns = set(ephemeral_index.turns_by_id.keys())
+        prior_turns_payload = [
+            {"role": str(rec.get("role") or ""), "content": str(rec.get("content") or "")}
+            for rec in prior_records
+            if rec.get("role") in {"user", "assistant"} and rec.get("content")
+        ]
         decision = (
             await route_query_async(
                 query_text,
+                prior_turns=prior_turns_payload or None,
                 has_thread_history=bool(allowed_turns),
                 has_sources=True,
+                web_enabled=web_enabled,
                 context={
                     "has_thread_history": bool(allowed_turns),
                     "turn_count": len(allowed_turns),
@@ -1212,6 +1220,7 @@ async def prepare_regenerate(
                 prior_turns=history,
                 has_thread_history=bool(history),
                 has_sources=True,
+                web_enabled=web_enabled,
                 llm_client=llm if settings.decision_provider == "llm" else None,
             )
         ).to_dict()

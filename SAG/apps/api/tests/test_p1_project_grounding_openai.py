@@ -159,6 +159,7 @@ async def test_openai_sse_buffers_grounded_stream_and_sanitizes_errors(monkeypat
     """S5-07: OpenAI SSE must buffer grounded deltas, emit finish_reason='error' without Chinese, and forward params."""
     agent = SimpleNamespace(id="agent-1", name="Tester", persona={})
     monkeypatch.setattr(openai_api.svc, "get_agent", AsyncMock(return_value=agent))
+    monkeypatch.setattr(openai_api.svc, "resolve_sources", AsyncMock(return_value=[]))
     monkeypatch.setattr(
         openai_api.svc,
         "build_ask_context",
@@ -300,6 +301,7 @@ async def test_openai_sse_ungrounded_stream_does_not_leak_stripped_citation_brac
     """PROBE-5C: Unbuffered grounding_required=False SSE must not leak stripped [99]/[S99] before RUN_COMPLETED."""
     agent = SimpleNamespace(id="agent-1", name="Tester", persona={})
     monkeypatch.setattr(openai_api.svc, "get_agent", AsyncMock(return_value=agent))
+    monkeypatch.setattr(openai_api.svc, "resolve_sources", AsyncMock(return_value=[]))
     monkeypatch.setattr(
         openai_api.svc,
         "build_ask_context",
@@ -379,6 +381,7 @@ async def test_openai_nonstream_incomplete_grounded_does_not_leak_raw_parts(monk
     """openai.py:212: Non-streaming incomplete grounded run without RUN_COMPLETED must not emit raw parts."""
     agent = SimpleNamespace(id="agent-1", name="Tester", persona={})
     monkeypatch.setattr(openai_api.svc, "get_agent", AsyncMock(return_value=agent))
+    monkeypatch.setattr(openai_api.svc, "resolve_sources", AsyncMock(return_value=[]))
     monkeypatch.setattr(
         openai_api.svc,
         "build_ask_context",
@@ -438,6 +441,7 @@ async def test_openai_sse_ungrounded_compound_citation_tail_does_not_leak(
 
     agent = SimpleNamespace(id="agent-1", name="Tester", persona={})
     monkeypatch.setattr(openai_api.svc, "get_agent", AsyncMock(return_value=agent))
+    monkeypatch.setattr(openai_api.svc, "resolve_sources", AsyncMock(return_value=[]))
     monkeypatch.setattr(
         openai_api.svc,
         "build_ask_context",
@@ -505,6 +509,7 @@ async def test_openai_sse_ungrounded_markdown_link_streams_immediately(monkeypat
 
     agent = SimpleNamespace(id="agent-1", name="Tester", persona={})
     monkeypatch.setattr(openai_api.svc, "get_agent", AsyncMock(return_value=agent))
+    monkeypatch.setattr(openai_api.svc, "resolve_sources", AsyncMock(return_value=[]))
     monkeypatch.setattr(
         openai_api.svc,
         "build_ask_context",

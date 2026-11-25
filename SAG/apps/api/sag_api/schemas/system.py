@@ -52,7 +52,7 @@ class ModelConfigUpdate(BaseModel):
     llm_timeout_ms: int | None = Field(default=None, ge=1_000, le=600_000)
     llm_max_retries: int | None = Field(default=None, ge=0, le=10)
 
-    decision_provider: Literal["siliconflow", "disabled"] | None = None
+    decision_provider: Literal["siliconflow", "openai_compatible", "llm", "disabled"] | None = None
     decision_model: str | None = Field(default=None, min_length=1, max_length=200)
     siliconflow_api_key: str | None = Field(default=None, max_length=500)
 
