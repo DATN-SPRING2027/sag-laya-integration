@@ -404,6 +404,7 @@ async def _process_document_unlocked(
         if not checkpoint.chunk_ids and not skip_initial_prepare:
             parser_stage = True
             await _advance_canonical_stage("PARSE", 25, DocumentStatus.LOADING)
+            ignore_fallback = bool((job.payload or {}).get("ignore_fallback_cache"))
             try:
                 prepared = await prepare_document(
                     target_storage_path,
@@ -412,10 +413,15 @@ async def _process_document_unlocked(
                     on_state=on_parser_state,
                     should_pause=should_pause,
                     project_id=job_project_id,
+                    ignore_fallback_cache=ignore_fallback,
                 )
             except ParsePaused:
                 await _pause_or_yield()
             parser_stage = False
+            if ignore_fallback:
+                next_payload = dict(job.payload or {})
+                next_payload.pop("ignore_fallback_cache", None)
+                job.payload = next_payload
             parser_state = (job.payload or {}).get("document_parser")
             for field, value in _prepared_parser_values(prepared, parser_state).items():
                 setattr(document, field, value)
@@ -452,6 +458,7 @@ async def _process_document_unlocked(
                     await _advance_canonical_stage("PARSE", 35, DocumentStatus.LOADING)
                     # [P2 Fix]: Safe prepared document resolution on resume to prevent raw binary UTF-8 decoding
                     if prepared is None:
+                        ignore_fallback = bool((job.payload or {}).get("ignore_fallback_cache"))
                         try:
                             prepared = await prepare_document(
                                 target_storage_path,
@@ -460,9 +467,14 @@ async def _process_document_unlocked(
                                 on_state=on_parser_state,
                                 should_pause=should_pause,
                                 project_id=job_project_id,
+                                ignore_fallback_cache=ignore_fallback,
                             )
                         except ParsePaused:
                             await _pause_or_yield()
+                        if ignore_fallback:
+                            next_payload = dict(job.payload or {})
+                            next_payload.pop("ignore_fallback_cache", None)
+                            job.payload = next_payload
 
                     if prepared is None or not prepared.path or not os.path.exists(prepared.path):
                         raise RuntimeError(f"Prepared markdown path missing for document {document.id}")
@@ -1269,6 +1281,8 @@ async def _reprocess_document_task_unlocked(
     process_job_payload = {
         **(process_job.payload or {}),
     }
+    if payload.get("ignore_fallback_cache"):
+        process_job_payload["ignore_fallback_cache"] = True
     if document.storage_path and "storage_path" not in process_job_payload:
         process_job_payload["storage_path"] = document.storage_path
     if latest_ver and document.project_id:

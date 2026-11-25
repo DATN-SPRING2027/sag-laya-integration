@@ -323,15 +323,19 @@ async def reprocess_document(
             {
                 "target_document_id": document.id,
                 "derived_source_ids": sorted(derived_source_ids),
+                "ignore_fallback_cache": True,
             },
             priority=DELETE_PRIORITY,
         )
     elif retrying_cleanup:
+        payload["ignore_fallback_cache"] = True
         payload = set_scheduler(
             payload,
             priority=DELETE_PRIORITY,
             blocked_reason=None,
         )
+    else:
+        payload["ignore_fallback_cache"] = True
     job = Job(
         type=(JobType.REPROCESS_DOCUMENT if requires_maintenance else JobType.PROCESS_DOCUMENT),
         source_id=source.id,
