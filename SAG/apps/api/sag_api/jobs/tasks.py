@@ -842,6 +842,21 @@ async def _process_document_unlocked(
             event_count=Source.event_count + outcome.event_count,
         )
     )
+    if outcome.source_id:
+        from sag_api.sag.octx_vector_protocol import configured_embedding_identity, embedding_identity
+
+        emb_client = None
+        if engine_manager is not None and hasattr(engine_manager, "get_sag_embedding"):
+            try:
+                emb_client = await engine_manager.get_sag_embedding(source.sag_source_config_id, source)
+            except Exception:  # noqa: BLE001
+                emb_client = None
+        vec_identity = embedding_identity(emb_client) or configured_embedding_identity(settings)
+        if vec_identity is not None:
+            src_row = await session.get(Source, source.id)
+            if src_row is not None:
+                src_row.config = {**(src_row.config or {}), "octx_vector_identity": vec_identity}
+                session.add(src_row)
     await touch_source_revision(session, source.id)
     if run_id:
         ingestion_run = await session.get(IngestionRun, run_id)

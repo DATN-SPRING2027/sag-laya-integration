@@ -743,7 +743,20 @@ async def execute_structured_import(
                 )
             )
 
+    from sag_api.sag.octx_vector_protocol import configured_embedding_identity, embedding_identity
+
+    emb_client = None
+    if engine_manager is not None and hasattr(engine_manager, "get_sag_embedding"):
+        try:
+            emb_client = await engine_manager.get_sag_embedding(source_config_id)
+        except Exception:  # noqa: BLE001
+            emb_client = None
+    vec_identity = embedding_identity(emb_client) or configured_embedding_identity(settings)
+
     if source is None:
+        source_cfg: dict[str, Any] = {"octx": {"asset_id": transfer.asset_id}}
+        if vec_identity is not None:
+            source_cfg["octx_vector_identity"] = vec_identity
         source = Source(
             id=source_id,
             name=str((transfer.checkpoint or {}).get("asset_name") or "Imported OCTX")[:200],
@@ -751,7 +764,7 @@ async def execute_structured_import(
             source_type=SourceType.DOCUMENT,
             connector_kind=ConnectorKind.FILE_UPLOAD,
             sag_source_config_id=source_config_id,
-            config={"octx": {"asset_id": transfer.asset_id}},
+            config=source_cfg,
             status=SourceStatus.ACTIVE,
         )
         session.add(source)
@@ -773,6 +786,8 @@ async def execute_structured_import(
             old_installation.retain_until = datetime.now(UTC) + timedelta(days=settings.octx_rollback_retention_days)
         source.sag_source_config_id = source_config_id
         source.status = SourceStatus.ACTIVE
+        if vec_identity is not None:
+            source.config = {**(source.config or {}), "octx_vector_identity": vec_identity}
 
     source.document_count = imported.counts["documents"]
     source.chunk_count = imported.counts["chunks"]
@@ -957,7 +972,20 @@ async def execute_knowledge_import(
         for state in states.values()
         if state.get("status") == "ready"
     ]
+    from sag_api.sag.octx_vector_protocol import configured_embedding_identity, embedding_identity
+
+    kb_emb_client = None
+    if engine_manager is not None and hasattr(engine_manager, "get_sag_embedding"):
+        try:
+            kb_emb_client = await engine_manager.get_sag_embedding(source_config_id)
+        except Exception:  # noqa: BLE001
+            kb_emb_client = None
+    kb_vec_identity = embedding_identity(kb_emb_client) or configured_embedding_identity(settings)
+
     if source is None:
+        kb_source_cfg: dict[str, Any] = {"octx": {"asset_id": transfer.asset_id}}
+        if kb_vec_identity is not None:
+            kb_source_cfg["octx_vector_identity"] = kb_vec_identity
         source = Source(
             id=source_id,
             name=str((transfer.checkpoint or {}).get("asset_name") or "Imported OCTX")[:200],
@@ -965,7 +993,7 @@ async def execute_knowledge_import(
             source_type=SourceType.DOCUMENT,
             connector_kind=ConnectorKind.FILE_UPLOAD,
             sag_source_config_id=source_config_id,
-            config={"octx": {"asset_id": transfer.asset_id}},
+            config=kb_source_cfg,
             status=SourceStatus.ACTIVE,
         )
         session.add(source)
@@ -987,6 +1015,8 @@ async def execute_knowledge_import(
             old_installation.retain_until = datetime.now(UTC) + timedelta(days=settings.octx_rollback_retention_days)
         source.sag_source_config_id = source_config_id
         source.status = SourceStatus.ACTIVE
+        if kb_vec_identity is not None:
+            source.config = {**(source.config or {}), "octx_vector_identity": kb_vec_identity}
     source.document_count = imported.counts["documents"]
     source.chunk_count = imported.counts["chunks"]
     source.event_count = imported.counts["events"]

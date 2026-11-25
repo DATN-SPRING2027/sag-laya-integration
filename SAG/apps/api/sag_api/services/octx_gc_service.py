@@ -29,30 +29,91 @@ _TERMINAL_TRANSFER_STATUSES = {
 }
 
 
+def _is_missing_vector_target(error: Exception) -> bool:
+    status_code = getattr(error, "status_code", None)
+    if status_code is None:
+        status_code = getattr(getattr(error, "response", None), "status_code", None)
+    if status_code == 404:
+        return True
+    msg = str(error).lower()
+    if any(code in msg for code in ("(500)", "(502)", "(503)", "(504)", "(401)", "(403)")):
+        return False
+    return "(404)" in msg or "doesn't exist" in msg or "does not exist" in msg or "not found" in msg
+
+
 async def _delete_vector_partition(
     client: Any, index: str, source_config_id: str
 ) -> None:
-    """按 data_source_id 删除一个分区。"""
+    """按 data_source_id 删除一个分区（支持 Qdrant 过滤删除、分页扫描并忽略 404）。"""
     from zleap.sag.core.adapters.models import Filter, VectorQuery
 
+    # Fast path for QdrantVectorStore: atomic filter delete on Qdrant /points/delete (ignores 404).
+    if callable(getattr(client, "_request", None)) and callable(getattr(client, "_path", None)):
+        try:
+            await client._request(
+                "POST",
+                client._path(index, "/points/delete?wait=true"),
+                json={
+                    "filter": {
+                        "must": [
+                            {
+                                "key": "data_source_id",
+                                "match": {"value": source_config_id},
+                            }
+                        ]
+                    }
+                },
+            )
+            return
+        except Exception as exc:
+            if _is_missing_vector_target(exc):
+                return
+            raise
+
     if callable(getattr(client, "query", None)):
-        hits = await client.query(
-            index,
-            VectorQuery(filters=Filter.eq("data_source_id", source_config_id), limit=100_000),
-        )
-        if hits:
-            await client.delete(index, tuple(str(hit.id) for hit in hits))
-        return
+        batch_size = 1000
+        seen_batches: set[tuple[str, ...]] = set()
+        while True:
+            try:
+                hits = await client.query(
+                    index,
+                    VectorQuery(filters=Filter.eq("data_source_id", source_config_id), limit=batch_size),
+                )
+            except Exception as exc:
+                if _is_missing_vector_target(exc):
+                    return
+                raise
+            if not hits:
+                return
+            hit_ids = tuple(str(hit.id) for hit in hits)
+            if hit_ids in seen_batches:
+                raise RuntimeError(
+                    f"Vector GC pagination made zero progress on index {index} for source {source_config_id}"
+                )
+            seen_batches.add(hit_ids)
+            try:
+                await client.delete(index, hit_ids)
+            except Exception as exc:
+                if _is_missing_vector_target(exc):
+                    return
+                raise
+            if len(hits) < batch_size:
+                return
 
     raw_client = getattr(client, "client", client)
     delete_by_query = getattr(raw_client, "delete_by_query", None)
     if callable(delete_by_query):
-        await delete_by_query(
-            index=index,
-            query={"term": {"data_source_id": source_config_id}},
-            conflicts="proceed",
-            refresh=True,
-        )
+        try:
+            await delete_by_query(
+                index=index,
+                query={"term": {"data_source_id": source_config_id}},
+                conflicts="proceed",
+                refresh=True,
+            )
+        except Exception as exc:
+            if _is_missing_vector_target(exc):
+                return
+            raise
         return
 
     engine_factory = getattr(client, "_engine", None)
@@ -62,10 +123,15 @@ async def _delete_vector_partition(
             f"DELETE FROM {quote}{index}{quote} "
             "WHERE data_source_id = :data_source_id"
         )
-        async with engine_factory().begin() as connection:
-            await connection.execute(
-                statement, {"data_source_id": source_config_id}
-            )
+        try:
+            async with engine_factory().begin() as connection:
+                await connection.execute(
+                    statement, {"data_source_id": source_config_id}
+                )
+        except Exception as exc:
+            if _is_missing_vector_target(exc):
+                return
+            raise
         return
 
     raise RuntimeError(

@@ -183,7 +183,11 @@ def prepare_vector_reuse(
             # The reuse decision must compare against the *current* embedding
             # configuration, never against dimensions declared by the package.
             # A mismatched or undetectable local dimension simply disables reuse.
-            local_dimensions = int(getattr(embedding_client, "dimensions", 0) or 0)
+            local_dimensions = int(
+                getattr(embedding_client, "schema_dimensions", None)
+                or getattr(embedding_client, "dimensions", 0)
+                or 0
+            )
         except (TypeError, ValueError):
             local_dimensions = 0
         for profile in profiles:
