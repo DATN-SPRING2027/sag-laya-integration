@@ -200,10 +200,22 @@ def test_task3_detect_document_language():
         "Đội ngũ quản trị tri thức duy trì sổ đăng ký chất lượng AI cho quy trình "
         "tìm kiếm và truy xuất doanh nghiệp."
     )
-    assert detect_document_language(en_text, configured="zh") == "en"
-    assert detect_document_language(vi_text, configured="zh") == "en"
+    zh_text = "知识治理团队维护企业搜索与检索评审的质量登记册。"
+
+    # Configured language is honored when explicitly set to en/zh/vi.
+    assert detect_document_language(en_text, configured="zh") == "zh"
+    assert detect_document_language(vi_text, configured="zh") == "zh"
+    assert detect_document_language(en_text, configured="vi") == "vi"
     assert detect_document_language(en_text, configured="en") == "en"
-    assert Settings(sag_language="zh").sag_language == "en"
+
+    # Unset or "auto" performs genuine NFC-normalized script/diacritic detection.
+    assert detect_document_language(vi_text) == "vi"
+    assert detect_document_language(zh_text) == "zh"
+    assert detect_document_language(en_text, configured="auto") == "en"
+
+    assert Settings(sag_language="zh").sag_language == "zh"
+    assert Settings(sag_language="vi").sag_language == "vi"
+    assert Settings(sag_language="en").sag_language == "en"
 
 
 @pytest_asyncio.fixture

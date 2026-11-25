@@ -199,7 +199,9 @@ def build_engine_config(settings: Settings, *, overrides: dict[str, Any] | None 
         relational=_build_relational(settings),
         vector=_build_vector(settings),
         data_dir=str(overrides.get("data_dir") or settings.data_dir),
-        language="en",
+        # zleap-sag==0.12.0 EngineConfig.language only permits Literal["zh", "en"];
+        # map "vi" -> "en" at the EngineConfig boundary while sag_api retains "vi".
+        language="zh" if settings.sag_language == "zh" else "en",
         runtime_limits=RuntimeLimits(
             llm_concurrency=max(6, min(256, settings.document_extract_concurrency)),
             embedding_concurrency=settings.embedding_concurrency,

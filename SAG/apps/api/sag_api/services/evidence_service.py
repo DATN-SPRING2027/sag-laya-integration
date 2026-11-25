@@ -325,12 +325,22 @@ def _search_prompt_messages(query: str, sections: list[RetrievedSection]) -> lis
         )
         for index, section in enumerate(sections, 1)
     ]
+    configured_lang = (settings.sag_language or "en").strip().lower()
+    if configured_lang == "zh":
+        language_rule = "in Chinese unless the user explicitly asks for another language"
+    elif configured_lang == "vi":
+        language_rule = (
+            "in the same language as the user's question (preferring Vietnamese when appropriate, "
+            "unless the user asks for another language)"
+        )
+    else:
+        language_rule = "in the same language as the user's question (e.g., Vietnamese or English, never Chinese)"
     return [
         {
             "role": "system",
             "content": (
                 "You are an evidence-grounded search answerer. Answer only the specific question asked by the user "
-                "in the same language as the user's question (e.g., Vietnamese or English, never Chinese), without "
+                f"{language_rule}, without "
                 "summarizing unrelated candidates. Use only the provided evidence and ignore irrelevant content. "
                 "Always prioritize active/Approved documents over SUPERSEDED documents, and never cite a SUPERSEDED "
                 "document as active guidance. Recognize direct domain equivalences in the text (e.g., expiration/retention "

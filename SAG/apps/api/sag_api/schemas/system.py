@@ -74,12 +74,19 @@ class ModelConfigUpdate(BaseModel):
 
     search_strategy: SearchStrategy | None = None
     search_top_k: int | None = Field(default=None, ge=1)
-    sag_language: Literal["en", "zh"] | None = None
+    sag_language: Literal["en", "zh", "vi"] | None = None
 
     @field_validator("sag_language", mode="before")
     @classmethod
-    def normalize_sag_language(cls, value: str | None) -> str | None:
-        return "en" if value is not None else None
+    def normalize_sag_language(cls, value: object) -> object:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"en", "zh", "vi"}:
+                return normalized
+            raise ValueError("sag_language must be one of: en, zh, vi")
+        return value
 
     @field_validator("mineru_provider", mode="before")
     @classmethod

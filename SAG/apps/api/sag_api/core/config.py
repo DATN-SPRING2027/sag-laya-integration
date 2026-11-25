@@ -177,7 +177,7 @@ class Settings(BaseSettings):
     # ── zleap-sag 后端选择 ─────────────────────────────────────────────
     sag_vector_provider: Literal["es", "pgvector", "qdrant", "oceanbase"] = "qdrant"
     sag_relational_provider: Literal["sqlite", "postgres", "mysql", "oceanbase"] = "postgres"
-    sag_language: Literal["en", "zh"] = "en"
+    sag_language: Literal["en", "zh", "vi"] = "en"
 
     # PostgreSQL 元数据连接字段
     sag_pg_host: str = "localhost"
@@ -438,8 +438,13 @@ class Settings(BaseSettings):
 
     @field_validator("sag_language", mode="before")
     @classmethod
-    def _normalize_sag_language(cls, value: object) -> str:
-        return "en"
+    def _normalize_sag_language(cls, value: object) -> object:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"en", "zh", "vi"}:
+                return normalized
+            raise ValueError("sag_language must be one of: en, zh, vi")
+        return value
 
     @field_validator("timezone")
     @classmethod
