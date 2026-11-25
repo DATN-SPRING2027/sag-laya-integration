@@ -64,9 +64,11 @@ services:
       SAG_SAG_VECTOR_PROVIDER: qdrant
       SAG_SAG_RELATIONAL_PROVIDER: postgres
       # Use the configured Qdrant Cloud endpoint by default; local Qdrant remains
-      # available as a fallback when SAG_SAG_QDRANT_URL is left unset.
-      SAG_SAG_QDRANT_URL: ${SAG_SAG_QDRANT_URL:-http://qdrant:6333}
-      SAG_SAG_QDRANT_API_KEY: ${SAG_SAG_QDRANT_API_KEY:-}
+      # available as a fallback when SAG_QDRANT_URL / SAG_SAG_QDRANT_URL is unset.
+      SAG_QDRANT_URL: ${SAG_QDRANT_URL:-${SAG_SAG_QDRANT_URL:-http://qdrant:6333}}
+      SAG_QDRANT_API_KEY: ${SAG_QDRANT_API_KEY:-${SAG_SAG_QDRANT_API_KEY:-}}
+      SAG_SERVICE_API_KEY: ${SAG_SERVICE_API_KEY:-}
+      SAG_TOKEN_PRICING_JSON: ${SAG_TOKEN_PRICING_JSON:-}
       SAG_SAG_PG_HOST: db
       SAG_SAG_PG_PORT: "5432"
       SAG_SAG_PG_USER: ${POSTGRES_USER:-sag}

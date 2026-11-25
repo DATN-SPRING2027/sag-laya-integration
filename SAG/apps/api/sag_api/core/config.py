@@ -19,7 +19,7 @@ from typing import Annotated, Literal
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import Field, PrivateAttr, field_validator, model_validator
+from pydantic import AliasChoices, Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from sag_api.core.model_providers import ModelProviderId, get_model_provider
@@ -27,6 +27,14 @@ from sag_api.enums import SearchStrategy, normalize_search_strategy
 
 _DEFAULT_LLM_PROVIDER = get_model_provider("openai")
 FIXED_SEARCH_TOP_K = 5
+_INSECURE_SECRETS = frozenset(
+    {
+        "dev-insecure-secret-change-me-in-production-0123456789",
+        "dev-secret-change-me-at-least-32-bytes",
+        "please-change-this-in-production-0123456789",
+        "dev-secret-change-me",
+    }
+)
 
 
 def _resolve_default_env_file() -> Path:
@@ -84,6 +92,15 @@ class Settings(BaseSettings):
     principal_assertion_max_project_ids: int = Field(default=256, ge=1, le=4096)
     # Shared only between Continuum BE and this API for project-scoped BFF calls.
     bff_service_token: str | None = None
+    # Optional dedicated internal service bearer key (must be explicit & non-empty).
+    service_api_key: str | None = None
+    # Optional JSON pricing override map for token_usage USD estimation.
+    token_pricing_json: str | None = None
+    # Optional stdio MCP source ID (legacy; stdio transport remains disabled).
+    mcp_source_id: str | None = None
+    # Desktop sidecar bind host/port.
+    desktop_host: str = "127.0.0.1"
+    desktop_port: int = Field(default=8000, ge=1, le=65535)
     # 供桌面端启动时写入本地 DSH 连接文件的公开地址与可选文件位置。
     dsh_public_url: str = "http://127.0.0.1:8000"
     dsh_connection_file: str | None = None
@@ -182,8 +199,14 @@ class Settings(BaseSettings):
     sag_pg_user: str = "sag"
     sag_pg_password: str = "sag"
     sag_pg_database: str = "sag"
-    sag_qdrant_url: str = "http://localhost:6333"
-    sag_qdrant_api_key: str | None = None
+    sag_qdrant_url: str = Field(
+        default="http://localhost:6333",
+        validation_alias=AliasChoices("SAG_QDRANT_URL", "SAG_SAG_QDRANT_URL"),
+    )
+    sag_qdrant_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("SAG_QDRANT_API_KEY", "SAG_SAG_QDRANT_API_KEY"),
+    )
 
     # ── LLM（答案生成 + 抽取）─────────────────────────────────────────
     # 协议、路由规则和技术默认值统一由 model_providers 注册表维护。
@@ -458,10 +481,10 @@ class Settings(BaseSettings):
     @field_validator("principal_assertion_issuer")
     @classmethod
     def _validate_principal_assertion_issuer(cls, value: str | None) -> str | None:
-        if value is None:
+        if value is None or not value.strip():
             return None
         normalized = value.strip()
-        if not normalized or normalized != value or len(normalized) > 512:
+        if normalized != value or len(normalized) > 512:
             raise ValueError("principal_assertion_issuer must be a non-empty exact identifier")
         return normalized
 
@@ -476,7 +499,7 @@ class Settings(BaseSettings):
     @field_validator("principal_assertion_jwks_url")
     @classmethod
     def _validate_principal_assertion_jwks_url(cls, value: str | None) -> str | None:
-        if value is None:
+        if value is None or not value.strip():
             return None
         normalized = value.strip()
         parsed = urlsplit(normalized)
@@ -491,6 +514,14 @@ class Settings(BaseSettings):
         ):
             raise ValueError("principal_assertion_jwks_url must be a fixed HTTPS URL without credentials")
         return normalized
+
+    @field_validator("service_api_key", "token_pricing_json", "mcp_source_id", "sag_qdrant_api_key", mode="before")
+    @classmethod
+    def _blank_optional_str_as_none(cls, value: object) -> object:
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return value
 
     @field_validator("bff_service_token")
     @classmethod
@@ -530,6 +561,15 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _require_production_storage_backends(self) -> Settings:
         if self.environment == "prod":
+            if "debug" in self.model_fields_set and self.debug:
+                raise ValueError("SAG_DEBUG must be false when SAG_ENVIRONMENT=prod")
+            if self.debug:
+                object.__setattr__(self, "debug", False)
+            stripped_secret = (self.secret_key or "").strip()
+            if not stripped_secret or len(stripped_secret) < 32 or stripped_secret in _INSECURE_SECRETS:
+                raise ValueError(
+                    "SAG_SECRET_KEY must be a strong non-default secret (>= 32 chars) in prod"
+                )
             if urlsplit(self.database_url).scheme != "postgresql+asyncpg":
                 raise ValueError("SAG_DATABASE_URL must use PostgreSQL with asyncpg in prod")
             if self.sag_relational_provider != "postgres":
@@ -538,7 +578,7 @@ class Settings(BaseSettings):
                 raise ValueError("SAG_SAG_VECTOR_PROVIDER must be qdrant in prod")
             qdrant_url = urlsplit(self.sag_qdrant_url)
             if qdrant_url.scheme not in {"http", "https"} or not qdrant_url.hostname:
-                raise ValueError("SAG_SAG_QDRANT_URL must be an absolute HTTP(S) URL in prod")
+                raise ValueError("SAG_QDRANT_URL must be an absolute HTTP(S) URL in prod")
         return self
 
     @property

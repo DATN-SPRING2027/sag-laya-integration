@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import secrets
 from typing import Literal
 
@@ -17,6 +16,7 @@ from sag_api.core.db import get_session
 from sag_api.core.error_taxonomy import ErrorCode
 from sag_api.core.errors import AuthError, ForbiddenError
 from sag_api.core.identity import VerifiedPrincipal
+from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import (
     VerifiedPrincipal as AssertionVerifiedPrincipal,
 )
@@ -34,6 +34,7 @@ from sag_api.services.dsh_integration_service import authenticate_connector
 
 _bearer = HTTPBearer(auto_error=False)
 _AuthKind = Literal["jwt", "connector"]
+log = get_logger("deps")
 
 
 def _require_matching_auth_mode(payload: dict) -> None:
@@ -155,8 +156,13 @@ async def get_verified_principal(
     token = creds.credentials
     # Hỗ trợ credential riêng biệt (service_api_key) cho internal service nếu được cấu hình.
     # Tuyệt đối không chấp nhận settings.secret_key (khóa ký HMAC) làm bearer token.
-    service_api_key = getattr(settings, "service_api_key", None) or os.getenv("SAG_SERVICE_API_KEY")
+    service_api_key = settings.service_api_key
     if service_api_key and secrets.compare_digest(token, service_api_key):
+        log.warning(
+            "Authenticated internal service principal via SAG_SERVICE_API_KEY method=%s path=%s",
+            request.method,
+            request.url.path,
+        )
         principal = VerifiedPrincipal(
             user_id="service:internal",
             tenant_id="tenant_continuum_default",

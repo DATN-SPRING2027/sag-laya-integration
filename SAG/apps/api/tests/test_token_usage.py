@@ -260,3 +260,60 @@ async def test_per_file_rollup_and_project_report_avoid_double_counting(token_db
     assert report["grand_total"]["totals"]["llm_input_tokens"] == 1100
     assert report["grand_total"]["totals"]["llm_output_tokens"] == 120
     assert get_runtime_token_usage("proj-1")["totals"]["total_tokens"] == 2010
+
+
+@pytest.mark.asyncio
+async def test_token_usage_cost_known_flag_for_unpriced_and_override_models(monkeypatch) -> None:
+    """S5-15: unpriced models set cost_known=False; SAG_TOKEN_PRICING_JSON or known pricing sets True."""
+    import json
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from sag_api.api.v1 import system as system_api
+
+    reset_runtime_token_usage()
+    monkeypatch.delenv("SAG_TOKEN_PRICING_JSON", raising=False)
+
+    with token_usage_scope(component="answer_generation", project_id="proj-unpriced") as ledger:
+        record_llm_usage(
+            model="qwen3.6-flash",
+            usage={"llm_input_tokens": 100, "llm_output_tokens": 50, "total_tokens": 150, "usage_source": "provider"},
+        )
+    summary = ledger.to_summary()
+    assert summary["cost_usd"] == 0.0
+    assert summary["cost_known"] is False
+    assert summary["totals"]["cost_known"] is False
+    assert summary["by_model"]["qwen3.6-flash"]["cost_known"] is False
+
+    app = FastAPI()
+    app.include_router(system_api.router, prefix="/api/v1")
+    app.state.knowledge_runtime = SimpleNamespace(ready=True)
+    with TestClient(app) as client:
+        prom_res = client.get("/api/v1/system/metrics")
+        assert prom_res.status_code == 200
+        assert "sag_token_cost_known 0" in prom_res.text
+
+        json_res = client.get("/api/v1/system/metrics?format=json")
+        assert json_res.status_code == 200
+        assert json_res.json()["token_usage"]["cost_known"] is False
+
+    # With SAG_TOKEN_PRICING_JSON override, cost_known becomes True and cost_usd > 0
+    reset_runtime_token_usage()
+    monkeypatch.setenv(
+        "SAG_TOKEN_PRICING_JSON",
+        json.dumps({"qwen3.6-flash": {"llm_input_per_1m": 0.1, "llm_output_per_1m": 0.2}}),
+    )
+    with token_usage_scope(component="answer_generation", project_id="proj-priced") as priced_ledger:
+        record_llm_usage(
+            model="qwen3.6-flash",
+            usage={
+                "llm_input_tokens": 1000,
+                "llm_output_tokens": 500,
+                "total_tokens": 1500,
+                "usage_source": "provider",
+            },
+        )
+    priced_summary = priced_ledger.to_summary()
+    assert priced_summary["cost_known"] is True
+    assert priced_summary["cost_usd"] > 0.0

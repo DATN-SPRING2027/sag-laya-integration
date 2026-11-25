@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from sag_api import __version__
 from sag_api.api.v1 import api_router
 from sag_api.branding import PRODUCT_NAME
-from sag_api.core.config import settings
+from sag_api.core.config import _INSECURE_SECRETS, settings
 from sag_api.core.db import SessionLocal, dispose_db, init_db
 from sag_api.core.error_taxonomy import ErrorCode, ErrorLayer, ErrorStage
 from sag_api.core.errors import ApiError
@@ -24,18 +24,13 @@ from sag_api.runtime import KnowledgeRuntime
 log = get_logger("app")
 
 
-# 已知不安全的默认密钥（生产环境拒绝启动）
-_INSECURE_SECRETS = {
-    "dev-insecure-secret-change-me-in-production-0123456789",
-    "please-change-this-in-production-0123456789",
-    "dev-secret-change-me",
-}
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging("DEBUG" if settings.debug else "INFO")
-    if settings.environment == "prod" and settings.secret_key in _INSECURE_SECRETS:
+    stripped_secret = (settings.secret_key or "").strip()
+    if settings.environment == "prod" and (
+        not stripped_secret or len(stripped_secret) < 32 or stripped_secret in _INSECURE_SECRETS
+    ):
         raise RuntimeError(
             "生产环境禁止使用默认 SAG_SECRET_KEY。请设置强随机值（≥32 字节），例如：openssl rand -hex 32"
         )

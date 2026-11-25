@@ -96,6 +96,10 @@ def get_model_pricing(model: str | None) -> dict[str, float]:
     key = _normalize_model_key(model)
     table = dict(DEFAULT_MODEL_PRICING_PER_1M_USD)
     override_raw = os.getenv("SAG_TOKEN_PRICING_JSON", "").strip()
+    if not override_raw:
+        from sag_api.core.config import settings
+
+        override_raw = (settings.token_pricing_json or "").strip()
     if override_raw:
         try:
             parsed = json.loads(override_raw)
@@ -113,6 +117,11 @@ def get_model_pricing(model: str | None) -> dict[str, float]:
         if key.endswith("/" + candidate_key) or candidate_key.endswith("/" + key):
             return rates
     return {}
+
+
+def has_model_pricing(model: str | None) -> bool:
+    """Return True iff USD pricing rates are known for the given model."""
+    return bool(get_model_pricing(model))
 
 
 def compute_bucket_cost_usd(model: str | None, bucket: Mapping[str, Any]) -> float:
@@ -232,6 +241,7 @@ def empty_token_bucket() -> dict[str, Any]:
         "cache_hits": 0,
         "estimated_calls": 0,
         "cost_usd": 0.0,
+        "cost_known": True,
     }
 
 
@@ -271,9 +281,12 @@ def _accumulate_bucket(
                 "llm_output_tokens": llm_out,
             },
         )
+        delta_cost_known = has_model_pricing(model)
     else:
         delta_cost = float(delta.get("cost_usd", 0.0) or 0.0)
+        delta_cost_known = bool(delta.get("cost_known", True))
     target["cost_usd"] = round(float(target.get("cost_usd", 0.0)) + delta_cost, 8)
+    target["cost_known"] = bool(target.get("cost_known", True)) and delta_cost_known
 
 
 class TokenLedger:
@@ -354,6 +367,7 @@ class TokenLedger:
             "by_component": by_comp,
             "by_model": by_mod,
             "cost_usd": totals["cost_usd"],
+            "cost_known": bool(totals.get("cost_known", True)),
         }
         if meta:
             out["metadata"] = meta
@@ -886,6 +900,7 @@ async def build_project_token_usage_report(
                 "by_model": fsummary["by_model"],
                 "totals": fsummary["totals"],
                 "cost_usd": fsummary["cost_usd"],
+                "cost_known": fsummary["cost_known"],
                 "metadata": fsummary.get("metadata", {}),
             }
         )
@@ -940,11 +955,15 @@ async def build_project_token_usage_report(
                 has_any = True
         if has_any:
             diff_bucket["cost_usd"] = compute_bucket_cost_usd(mod_name, diff_bucket)
+            diff_bucket["cost_known"] = has_model_pricing(mod_name)
             query_by_model[mod_name] = diff_bucket
 
     query_summary = query_ledger.to_summary()
     if query_by_model:
         query_summary["by_model"] = query_by_model
+        query_cost_known = all(bool(b.get("cost_known", True)) for b in query_by_model.values())
+        query_summary["cost_known"] = bool(query_summary.get("cost_known", True)) and query_cost_known
+        query_summary["totals"]["cost_known"] = query_summary["cost_known"]
 
     grand_total = merge_token_summaries(ingestion_summary, query_summary)
 
