@@ -28,9 +28,9 @@ from zleap.sag import DataEngine
 from zleap.sag.pipeline import SearchOptions, SearchRequest, SearchScope
 
 from sag_api.core.config import Settings
-from sag_api.core.text_utils import normalize_text
 from sag_api.core.error_taxonomy import ErrorLayer, ErrorStage
 from sag_api.core.logging import get_logger
+from sag_api.core.text_utils import normalize_text
 from sag_api.enums import (
     SEARCH_STRATEGIES,
     SEARCH_STRATEGY_REQUIREMENTS,

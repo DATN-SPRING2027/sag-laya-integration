@@ -2027,8 +2027,6 @@ async def _retrieve_search_unit_sections(
     deadline: float,
 ) -> SearchOutcome:
     """Query only currently authorized versions with a verified Phase 2C manifest."""
-    import unicodedata
-
     from sag_api.services.retrieval_service import _query_allows_superseded, rerank_sections
 
     query = normalize_text(query or "")
