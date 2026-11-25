@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import inspect
 import json
-import re
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
@@ -18,7 +16,8 @@ from sag_api.core.errors import ServiceUnavailableError, UpstreamError
 from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal
 from sag_api.core.token_usage import TokenLedger, extract_chat_usage, token_usage_scope
-from sag_api.generation.llm import LLMClient
+from sag_api.generation.json_parser import decode_json_object
+from sag_api.generation.llm import StructuredLLMClient
 from sag_api.schemas.handover_assist import (
     AssistCoverageOut,
     CitationLocatorPayload,
@@ -36,30 +35,14 @@ from sag_api.schemas.handover_assist import (
 
 log = get_logger("handover_assist")
 
-_CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.DOTALL)
 _MAX_EVIDENCE_UNITS = 100
 _MAX_INDEXED_UNITS_PER_SOURCE = 25
 _MAX_BLOCKS_PER_UNIT = 8
 _MAX_UNIT_CHARS = 1600
 
 
-def _supports_response_format(complete_fn: Any) -> bool:
-    target = getattr(complete_fn, "side_effect", None)
-    fn = target if callable(target) else complete_fn
-    try:
-        sig = inspect.signature(fn)
-    except (TypeError, ValueError):
-        return False
-    return any(
-        p.kind == inspect.Parameter.VAR_KEYWORD or name == "response_format"
-        for name, p in sig.parameters.items()
-    )
-
-
-async def _complete_json(llm: Any, messages: list[dict[str, str]]) -> str:
-    if _supports_response_format(llm.complete):
-        return await llm.complete(messages, response_format={"type": "json_object"})
-    return await llm.complete(messages)
+async def _complete_json(llm: StructuredLLMClient, messages: list[dict[str, str]]) -> str:
+    return await llm.complete(messages, response_format={"type": "json_object"})
 
 
 @dataclass(frozen=True)
@@ -373,7 +356,7 @@ def _render_evidence_catalog(units: list[_EvidenceUnit]) -> str:
 
 
 def _parse_llm_json(raw: str) -> dict[str, Any]:
-    cleaned = _CODE_FENCE_RE.sub("", (raw or "").strip()).strip()
+    cleaned = (raw or "").strip()
     if not cleaned:
         raise UpstreamError(
             "LLM returned an empty handover response",
@@ -381,31 +364,10 @@ def _parse_llm_json(raw: str) -> dict[str, Any]:
             layer=ErrorLayer.LLM,
             stage=ErrorStage.GENERATE,
         )
-    try:
-        parsed = json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start != -1 and end > start:
-            try:
-                parsed = json.loads(cleaned[start : end + 1])
-            except json.JSONDecodeError:
-                raise UpstreamError(
-                    "LLM returned malformed JSON for handover assist",
-                    code=ErrorCode.UPSTREAM_ERROR,
-                    layer=ErrorLayer.LLM,
-                    stage=ErrorStage.GENERATE,
-                ) from exc
-        else:
-            raise UpstreamError(
-                "LLM returned non-JSON output for handover assist",
-                code=ErrorCode.UPSTREAM_ERROR,
-                layer=ErrorLayer.LLM,
-                stage=ErrorStage.GENERATE,
-            ) from exc
-    if not isinstance(parsed, dict):
+    parsed = decode_json_object(cleaned)
+    if parsed is None:
         raise UpstreamError(
-            "LLM handover response root must be a JSON object",
+            "LLM returned malformed or non-JSON output for handover assist",
             code=ErrorCode.UPSTREAM_ERROR,
             layer=ErrorLayer.LLM,
             stage=ErrorStage.GENERATE,
@@ -413,7 +375,7 @@ def _parse_llm_json(raw: str) -> dict[str, Any]:
     return parsed
 
 
-def _ensure_llm_ready(llm: LLMClient) -> None:
+def _ensure_llm_ready(llm: StructuredLLMClient) -> None:
     if not getattr(llm, "configured", False):
         raise ServiceUnavailableError(
             "Handover AI model provider is not configured",
@@ -465,7 +427,7 @@ async def execute_handover_assist(
     principal: VerifiedPrincipal,
     project_id: str,
     body: HandoverAssistRequest,
-    llm: LLMClient,
+    llm: StructuredLLMClient,
 ) -> HandoverAssistResponse:
     """Execute bounded, citation-verified handover assistance within principal scope."""
     if not body.sources:

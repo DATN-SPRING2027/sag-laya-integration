@@ -45,7 +45,14 @@ class _CountingLLMStub:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def complete(self, messages: list[dict[str, str]]) -> str:
+    async def complete(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        response_format: dict[str, Any] | None = None,
+        **_kwargs: Any,
+    ) -> str:
+        del messages, response_format, _kwargs
         self.calls += 1
         return "Stub summary"
 

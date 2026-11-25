@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import inspect
 import json
 import math
 import re
@@ -39,6 +38,8 @@ from sag_api.db.models import (
     StageRun,
 )
 from sag_api.enums import DocumentStatus, JobStatus, JobType
+from sag_api.generation.json_parser import decode_json_object
+from sag_api.generation.llm import StructuredLLMClient
 from sag_api.schemas.mind_map import (
     MindMapCitationOut,
     MindMapCoverageOut,
@@ -50,7 +51,6 @@ from sag_api.schemas.mind_map import (
 
 log = get_logger("services.mind_map")
 
-_CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.DOTALL)
 _CONTINUUM_DOC_ID_RE = re.compile(
     r"^(?:continuum:project_document:|project-document:)?([0-9a-fA-F]{24})\Z"
 )
@@ -876,21 +876,7 @@ def _render_llm_prompt(
 
 
 def _extract_json_dict(raw: str) -> dict[str, Any] | None:
-    cleaned = _CODE_FENCE_RE.sub("", (raw or "").strip()).strip()
-    if not cleaned:
-        return None
-    try:
-        parsed = json.loads(cleaned)
-    except json.JSONDecodeError:
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start == -1 or end <= start:
-            return None
-        try:
-            parsed = json.loads(cleaned[start : end + 1])
-        except json.JSONDecodeError:
-            return None
-    return parsed if isinstance(parsed, dict) else None
+    return decode_json_object(raw or "")
 
 
 def _parse_valid_citation_indices(raw_node: dict[str, Any], max_index: int) -> list[int]:
@@ -1259,18 +1245,11 @@ def _build_outline_fallback_tree(
     return _finalize_draft_tree(root_draft, by_index)
 
 
-async def _call_llm_json(llm: Any, messages: list[dict[str, str]]) -> str:
-    sig = inspect.signature(llm.complete)
-    params = sig.parameters
-    supports_rf = "response_format" in params or any(
-        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+async def _call_llm_json(llm: StructuredLLMClient, messages: list[dict[str, str]]) -> str:
+    return await asyncio.wait_for(
+        llm.complete(messages, response_format=_MIND_MAP_RESPONSE_FORMAT),
+        timeout=_MIND_MAP_LLM_TIMEOUT_SECONDS,
     )
-    coro = (
-        llm.complete(messages, response_format=_MIND_MAP_RESPONSE_FORMAT)
-        if supports_rf
-        else llm.complete(messages)
-    )
-    return await asyncio.wait_for(coro, timeout=_MIND_MAP_LLM_TIMEOUT_SECONDS)
 
 
 def _partition_scope_hash(principal: VerifiedPrincipal) -> str:

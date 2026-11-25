@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock
 
 import httpx
@@ -677,7 +678,13 @@ async def test_handover_assist_filters_indexed_units_by_exact_version_in_sql_bef
 
     captured_prompts: list[list[dict[str, str]]] = []
 
-    async def _complete_spy(messages: list[dict[str, str]]) -> str:
+    async def _complete_spy(
+        messages: list[dict[str, str]],
+        *,
+        response_format: dict[str, Any] | None = None,
+        **_kwargs: Any,
+    ) -> str:
+        del response_format, _kwargs
         captured_prompts.append(messages)
         return json.dumps(
             {

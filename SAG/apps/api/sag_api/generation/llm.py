@@ -11,7 +11,7 @@ import asyncio
 import inspect
 import json
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from sag_agent import CancellationToken, ModelChunk, ModelRequest, Usage
 from sag_agent import ToolCall as RuntimeToolCall
@@ -35,6 +35,35 @@ from sag_api.core.token_usage import extract_chat_usage, record_llm_usage
 log = get_logger("generation")
 
 Message = dict[str, Any]
+
+
+@runtime_checkable
+class StructuredLLMClient(Protocol):
+    """Unified protocol for any LLM client or test double supporting structured output."""
+
+    @property
+    def configured(self) -> bool: ...
+
+    async def complete(
+        self,
+        messages: list[Message],
+        *,
+        response_format: dict[str, Any] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> str: ...
+
+
+@runtime_checkable
+class StreamingStructuredLLMClient(StructuredLLMClient, Protocol):
+    """Extended protocol for clients that also support streaming structured completions."""
+
+    def stream_complete(
+        self,
+        messages: list[Message],
+        *,
+        response_format: dict[str, Any] | None = None,
+    ) -> AsyncIterator[str]: ...
 
 
 async def _litellm_completion(**kwargs: Any) -> Any:

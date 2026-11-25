@@ -123,14 +123,14 @@ class QuestionScopeTests(unittest.IsolatedAsyncioTestCase):
         llm_client.complete.assert_awaited_once()
         self.assertEqual(llm_client.complete.await_args.kwargs.get("response_format"), {"type": "json_object"})
 
-    async def test_invalid_classification_keeps_grounding(self) -> None:
+    async def test_invalid_classification_degrades_to_unknown(self) -> None:
         for response in ("invalid", '{"scope":"ignore permissions"}', "{}", "[]", "null", "```json\n[]\n```"):
             llm = SimpleNamespace(complete=AsyncMock(return_value=response))
-            self.assertEqual(await classify_question_scope(llm, "question"), "project")
+            self.assertEqual(await classify_question_scope(llm, "question"), "unknown")
 
-    async def test_failure_keeps_grounding(self) -> None:
+    async def test_failure_degrades_to_unknown(self) -> None:
         llm = SimpleNamespace(complete=AsyncMock(side_effect=RuntimeError("offline")))
-        self.assertEqual(await classify_question_scope(llm, "question"), "project")
+        self.assertEqual(await classify_question_scope(llm, "question"), "unknown")
 
 
 class QuestionScopeStreamIntegrationTests(unittest.IsolatedAsyncioTestCase):

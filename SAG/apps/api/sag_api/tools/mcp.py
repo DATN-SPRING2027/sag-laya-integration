@@ -25,6 +25,7 @@ from mcp.client.streamable_http import streamablehttp_client
 
 from sag_api.core.error_taxonomy import ErrorCode
 from sag_api.core.logging import get_logger
+from sag_api.generation.json_parser import decode_json_values, extract_fenced_blocks_and_outside
 from sag_api.tools.base import Tool, ToolContext, ToolMeta, ToolResult
 
 log = get_logger("mcp.client")
@@ -57,7 +58,6 @@ class MCPToolsBundle:
 
 
 _URL_PATTERN = re.compile(r"https?://[^\s<>\"'`，。；：！？、（）【】《》]+", re.IGNORECASE)
-_JSON_FENCE_PATTERN = re.compile(r"```(?:json)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
 _URL_KEYS = frozenset(
     {
         "url",
@@ -138,15 +138,13 @@ def _short_snippet(value: Any) -> str:
 
     # Some search MCPs put their complete JSON response in a field named
     # ``content``.  That payload is transport data, not a citation excerpt.
-    json_candidate = snippet
-    fenced = _JSON_FENCE_PATTERN.fullmatch(snippet)
-    if fenced:
-        json_candidate = fenced.group(1).strip()
-    try:
-        parsed = json.loads(json_candidate)
-    except (TypeError, ValueError):
-        pass
-    else:
+    fenced_bodies, _outside = extract_fenced_blocks_and_outside(value)
+    candidates = [snippet, *fenced_bodies]
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except (TypeError, ValueError):
+            continue
         if isinstance(parsed, (dict, list)):
             return ""
 
@@ -225,20 +223,23 @@ def _external_references(result: Any) -> list[dict[str, str]]:
             continue
         stripped_text = text.strip()
         full_text_is_json = False
-        candidates = [stripped_text, *_JSON_FENCE_PATTERN.findall(text)]
-        for index, candidate in enumerate(candidates):
-            try:
-                parsed = json.loads(candidate)
-            except (TypeError, ValueError):
-                continue
-            if index == 0 and isinstance(parsed, (dict, list)):
-                full_text_is_json = True
-            walk(parsed)
+        fenced_bodies, outside_text = extract_fenced_blocks_and_outside(text)
+        try:
+            parsed_full = json.loads(stripped_text)
+        except (TypeError, ValueError):
+            parsed_full = None
+        if isinstance(parsed_full, (dict, list)):
+            full_text_is_json = True
+            walk(parsed_full)
+        else:
+            for candidate in fenced_bodies:
+                for parsed in decode_json_values(candidate, expected_type=(dict, list)):
+                    walk(parsed)
         if not full_text_is_json:
             # JSON fences were already processed structurally.  Excluding them
             # from the raw URL scan prevents links embedded in serialized
             # snippets from leaking out as standalone references.
-            walk(_JSON_FENCE_PATTERN.sub("", text))
+            walk(outside_text)
     return list(references.values())
 
 

@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
-import json
 import math
 import re
 import threading
@@ -16,6 +14,7 @@ from typing import Any, Literal
 
 from sag_api.core.config import FIXED_SEARCH_TOP_K, settings
 from sag_api.core.logging import get_logger
+from sag_api.generation.json_parser import decode_json_values
 from sag_api.sag import RetrievedSection, SearchOutcome
 from sag_api.services.evidence_service import (
     SearchSource,
@@ -1568,55 +1567,16 @@ def _normalize_citation_brackets(text: str) -> str:
     )
 
 
-def _strip_think_prefix(raw_text: str) -> str:
-    text = (raw_text or "").strip()
-    while True:
-        start = text.find("<think>")
-        if start == -1:
-            return text
-        end = text.find("</think>", start + len("<think>"))
-        if end == -1:
-            before = text[:start].strip()
-            if "{" in before:
-                return before
-            after = text[start + len("<think>") :].strip()
-            return after if "{" in after else before
-        text = (text[:start] + " " + text[end + len("</think>") :]).strip()
-
-
 def _parse_structured_search_answer(raw_text: str) -> tuple[str | None, str | None]:
-    cleaned = _strip_think_prefix(raw_text)
-    if not cleaned:
-        return None, None
-    decoder = json.JSONDecoder()
-    idx = cleaned.find("{")
-    while idx != -1:
-        try:
-            obj, _end = decoder.raw_decode(cleaned, idx)
-        except json.JSONDecodeError:
-            idx = cleaned.find("{", idx + 1)
-            continue
-        if isinstance(obj, dict):
-            answerability = obj.get("answerability")
-            if isinstance(answerability, str):
-                norm_ans = answerability.strip().lower()
-                if norm_ans in {"answered", "insufficient_evidence"}:
-                    raw_ans = obj.get("answer")
-                    ans_text = raw_ans.strip() if isinstance(raw_ans, str) else ""
-                    return norm_ans, ans_text
-        idx = cleaned.find("{", idx + 1)
+    for obj in decode_json_values(raw_text, expected_type=dict):
+        answerability = obj.get("answerability")
+        if isinstance(answerability, str):
+            norm_ans = answerability.strip().lower()
+            if norm_ans in {"answered", "insufficient_evidence"}:
+                raw_ans = obj.get("answer")
+                ans_text = raw_ans.strip() if isinstance(raw_ans, str) else ""
+                return norm_ans, ans_text
     return None, None
-
-
-def _supports_response_format(fn: Any) -> bool:
-    try:
-        sig = inspect.signature(fn)
-    except (TypeError, ValueError):
-        return False
-    return any(
-        p.kind == inspect.Parameter.VAR_KEYWORD or name == "response_format"
-        for name, p in sig.parameters.items()
-    )
 
 
 def _validated_answer(answer: str, section_count: int) -> str | None:
@@ -1704,12 +1664,9 @@ async def synthesize_search_answer(
 
     from sag_api.core.token_usage import token_usage_scope
 
-    kwargs: dict[str, Any] = {}
-    if _supports_response_format(llm.complete):
-        kwargs["response_format"] = {"type": "json_object"}
     try:
         with token_usage_scope(component="answer_generation"):
-            answer = await llm.complete(pack.messages, **kwargs)
+            answer = await llm.complete(pack.messages, response_format={"type": "json_object"})
     except Exception as error:  # noqa: BLE001
         log.warning("Search synthesis failed; returning extractive fallback (%s)", type(error).__name__)
         return SearchAnswer(
@@ -1789,13 +1746,10 @@ async def stream_synthesize_search_answer(
 
     from sag_api.core.token_usage import token_usage_scope
 
-    kwargs: dict[str, Any] = {}
-    if _supports_response_format(llm.stream_complete):
-        kwargs["response_format"] = {"type": "json_object"}
     parts: list[str] = []
     try:
         with token_usage_scope(component="answer_generation"):
-            async for delta in llm.stream_complete(pack.messages, **kwargs):
+            async for delta in llm.stream_complete(pack.messages, response_format={"type": "json_object"}):
                 if delta:
                     parts.append(delta)
     except asyncio.CancelledError:

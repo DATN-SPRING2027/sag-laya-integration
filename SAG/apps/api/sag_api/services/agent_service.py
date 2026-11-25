@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import re
 import unicodedata
@@ -35,6 +34,7 @@ from sag_api.core.errors import ServiceUnavailableError
 from sag_api.core.principal_assertion import VerifiedPrincipal
 from sag_api.enums import MessageStatus
 from sag_api.generation import LLMClient, build_prompt_preview
+from sag_api.generation.json_parser import decode_json_values
 from sag_api.generation.prompt import estimate_tokens
 from sag_api.sag import EngineManager, SourceGraphInfo
 from sag_api.services.agent_domain import (
@@ -566,35 +566,9 @@ def _finalize_session_citations(
     return cleaned, returned, has_explicit
 
 
-def _strip_think_for_json(raw_text: str) -> str:
-    text = (raw_text or "").strip()
-    while True:
-        start = text.find("<think>")
-        if start == -1:
-            return text
-        end = text.find("</think>", start + len("<think>"))
-        if end == -1:
-            before = text[:start].strip()
-            if "{" in before:
-                return before
-            after = text[start + len("<think>") :].strip()
-            return after if "{" in after else before
-        text = (text[:start] + " " + text[end + len("</think>") :]).strip()
-
-
 def _parse_entailment_verdict(raw_text: str) -> tuple[str | None, bool | None]:
-    cleaned = _strip_think_for_json(raw_text)
-    if not cleaned:
-        return None, None
-    decoder = json.JSONDecoder()
-    idx = cleaned.find("{")
-    while idx != -1:
-        try:
-            obj, _end = decoder.raw_decode(cleaned, idx)
-        except json.JSONDecodeError:
-            idx = cleaned.find("{", idx + 1)
-            continue
-        if isinstance(obj, dict) and ("answerability" in obj or "supported" in obj):
+    for obj in decode_json_values(raw_text, expected_type=dict):
+        if "answerability" in obj or "supported" in obj:
             raw_ans = obj.get("answerability")
             ans_val = (
                 raw_ans.strip().lower()
@@ -604,7 +578,6 @@ def _parse_entailment_verdict(raw_text: str) -> tuple[str | None, bool | None]:
             raw_sup = obj.get("supported")
             sup_val = raw_sup if isinstance(raw_sup, bool) else None
             return ans_val, sup_val
-        idx = cleaned.find("{", idx + 1)
     return None, None
 
 
@@ -661,22 +634,14 @@ async def _verify_grounded_entailment(
             ),
         },
     ]
-    kwargs: dict[str, Any] = {}
-    try:
-        sig = inspect.signature(llm.complete)
-        if any(
-            p.kind == inspect.Parameter.VAR_KEYWORD or name == "response_format"
-            for name, p in sig.parameters.items()
-        ):
-            kwargs["response_format"] = {"type": "json_object"}
-    except (TypeError, ValueError):
-        pass
-
     try:
         from sag_api.core.token_usage import token_usage_scope
 
         with token_usage_scope(component="entailment_verifier"):
-            raw = await asyncio.wait_for(llm.complete(messages, **kwargs), timeout=10.0)
+            raw = await asyncio.wait_for(
+                llm.complete(messages, response_format={"type": "json_object"}),
+                timeout=10.0,
+            )
     except Exception:  # noqa: BLE001
         return "no_answer", "weak_evidence"
 
