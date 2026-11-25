@@ -6,6 +6,7 @@ from sag_api.core.config import settings
 from sag_api.sag import RetrievedSection, SearchOutcome
 from sag_api.schemas.search import GlobalSearchRequest
 from sag_api.services import search_unit_retrieval_service as retrieval
+from sag_api.services.query_strategy_planner import plan_query
 from sag_api.services.retrieval_service import select_diverse_sections
 
 
@@ -27,17 +28,24 @@ def sections(count):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "query,requested,expected,expected_auto,expected_first_wave",
+    "query,requested,route_kwargs,expected,expected_auto,expected_first_wave",
     [
-        ("policies", None, 5, False, 32),
-        ("policies", 5, 5, False, 32),
-        ("policies", 3, 3, False, 32),
-        ("policies", 70, 50, False, 200),
-        ("liệt kê 20 file liên quan đến chính sách", None, 20, True, 80),
+        ("policies", None, None, 5, False, 32),
+        ("policies", 5, None, 5, False, 32),
+        ("policies", 3, None, 3, False, 32),
+        ("policies", 70, None, 50, False, 200),
+        (
+            "liệt kê 20 file liên quan đến chính sách",
+            None,
+            {"answer_shape": "document_list", "explicit_count": 20},
+            20,
+            True,
+            80,
+        ),
     ],
 )
 async def test_retrieval_resolves_cardinality_from_plan_and_api_override(
-    monkeypatch, query, requested, expected, expected_auto, expected_first_wave
+    monkeypatch, query, requested, route_kwargs, expected, expected_auto, expected_first_wave
 ):
     monkeypatch.setattr(settings, "search_unit_candidate_limit", 256)
     monkeypatch.setattr(settings, "search_top_k", 8)
@@ -57,7 +65,15 @@ async def test_retrieval_resolves_cardinality_from_plan_and_api_override(
         )
 
     monkeypatch.setattr(retrieval, "_retrieve_search_unit_sections", fetch)
-    result = await retrieval.retrieve_search_unit_sections(None, [], query, principal=None, top_k=requested)
+    qsp = plan_query(query, requested_top_k=requested, route_decision=route_kwargs) if route_kwargs else None
+    result = await retrieval.retrieve_search_unit_sections(
+        None,
+        [],
+        query,
+        principal=None,
+        top_k=requested,
+        query_strategy_plan=qsp,
+    )
     assert len(result.sections) == expected
     assert result.stats["automatic_top_k"] is expected_auto
     assert result.stats["requested_top_k"] == expected
