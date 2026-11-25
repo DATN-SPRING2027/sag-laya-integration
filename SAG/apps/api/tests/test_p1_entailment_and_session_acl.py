@@ -368,3 +368,95 @@ async def test_entailment_verifier_rejects_cited_abstention_and_fabricated_claim
     completed = next(e for e in events if e.type == EventType.RUN_COMPLETED.value)
     assert completed.data["payload"]["answer_status"] == expected_status
     assert completed.data["payload"]["no_answer_reason"] == expected_reason
+
+
+@pytest.mark.asyncio
+async def test_entailment_verifier_runs_on_real_llm_client_for_session_grounded_scope(monkeypatch):
+    """S5-05: Real LLMClient verifies session-grounded [S1] answers and fails closed on unsupported claims."""
+    from sag_api.generation import llm as llm_module
+    from sag_api.generation.llm import LLMClient
+
+    monkeypatch.setattr(agent_service, "resolve_sources", AsyncMock(return_value=[]))
+    monkeypatch.setattr(agent_service, "resolve_mcp_specs", AsyncMock(return_value=[]))
+    monkeypatch.setattr(agent_service, "persist_answer", AsyncMock(return_value="msg-1"))
+
+    class StubRuntime:
+        async def start(self):
+            return None
+
+        def run(self, *_args, **_kwargs):
+            async def _events():
+                yield SimpleNamespace(
+                    type=EventType.RUN_STARTED,
+                    run_id="r-1",
+                    sequence=1,
+                    timestamp=1,
+                    turn=0,
+                    version="1",
+                    payload={},
+                    to_dict=lambda: {"type": "run.started", "run_id": "r-1", "sequence": 1},
+                )
+                yield SimpleNamespace(
+                    type=EventType.RUN_COMPLETED,
+                    run_id="r-1",
+                    sequence=2,
+                    timestamp=2,
+                    turn=1,
+                    version="1",
+                    payload={"output": "We chose MySQL 8 in that meeting [S1]."},
+                    to_dict=lambda: {"type": "run.completed", "run_id": "r-1", "sequence": 2},
+                )
+
+            return _events()
+
+    async def fake_litellm(**_kwargs):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "answerability": "answered",
+                                "supported": False,
+                                "reason": "Session snippet says PostgreSQL 18, not MySQL 8.",
+                            }
+                        )
+                    )
+                )
+            ],
+            usage=None,
+        )
+
+    monkeypatch.setattr(llm_module, "_litellm_completion", fake_litellm)
+    from sag_api.core.config import Settings
+
+    real_llm = LLMClient(
+        Settings(llm_provider="openai", llm_api_key="sk-test", llm_model="gpt-4o-mini")
+    )
+    plan = AskPlan(
+        query="What DB did we choose?",
+        user_message_id="u-1",
+        messages=[{"role": "system", "content": "sys"}, {"role": "user", "content": "q"}],
+        citations=[],
+        route_decision={"is_chitchat": False, "confidence": 0.1, "memory_scope": "session_history"},
+        session_citations=[_sess_cit("S1")],
+    )
+    agent = SimpleNamespace(id="a-1", name="Tester", persona={}, is_default=True)
+    events = [
+        ev
+        async for ev in agent_service.generate_stream(
+            _noop_session_factory,
+            plan=plan,
+            agent=agent,
+            thread_id="t-1",
+            engine_manager=SimpleNamespace(),
+            llm=real_llm,
+            tool_registry=ToolRegistry(),
+            runtime=StubRuntime(),
+            knowledge_only=True,
+            principal=_principal(),
+        )
+    ]
+    completed = next(e for e in events if e.type == EventType.RUN_COMPLETED.value)
+    assert completed.data["payload"]["answer_status"] == "no_answer"
+    assert completed.data["payload"]["no_answer_reason"] == "unsupported_claim"

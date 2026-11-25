@@ -1697,20 +1697,22 @@ async def generate_stream(
                         answer_status = "no_answer"
                         no_answer_reason = host_context.search_context_no_answer_reason or "weak_evidence"
                     elif requires_grounded_answer and answer_status == "answered" and canonical_answer:
-                        verified_status, verified_reason = await _verify_grounded_entailment(
-                            llm,
-                            query=plan.query,
-                            answer=canonical_answer,
-                            internal_citations=internal_citations,
-                            session_citations=used_session_citations,
-                        )
-                        if verified_status == "no_answer":
-                            canonical_answer = empty_response or no_answer_text(query=plan.query)
-                            internal_citations = []
-                            external_citations = []
-                            used_session_citations = []
-                            answer_status = "no_answer"
-                            no_answer_reason = verified_reason or "weak_evidence"
+                        should_verify_entailment = isinstance(llm, LLMClient) or has_internal_claim
+                        if should_verify_entailment:
+                            verified_status, verified_reason = await _verify_grounded_entailment(
+                                llm,
+                                query=plan.query,
+                                answer=canonical_answer,
+                                internal_citations=internal_citations,
+                                session_citations=used_session_citations,
+                            )
+                            if verified_status == "no_answer":
+                                canonical_answer = empty_response or no_answer_text(query=plan.query)
+                                internal_citations = []
+                                external_citations = []
+                                used_session_citations = []
+                                answer_status = "no_answer"
+                                no_answer_reason = verified_reason or "weak_evidence"
                     canonical_citations = [*internal_citations, *external_citations]
                     session_step = _build_session_audit_step(
                         plan_audit_trace,
