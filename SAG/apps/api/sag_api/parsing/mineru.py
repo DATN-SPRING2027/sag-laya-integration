@@ -553,42 +553,9 @@ def _join_content_field(val: Any) -> str:
 def _convert_html_table_to_markdown(raw_html: str) -> str:
     if "<table" not in raw_html.lower():
         return raw_html.strip()
-    from bs4 import BeautifulSoup
+    from sag_api.parsing.canonical import _html_table_to_markdown
 
-    try:
-        soup = BeautifulSoup(raw_html, "lxml")
-    except Exception:  # noqa: BLE001
-        soup = BeautifulSoup(raw_html, "html.parser")
-
-    table_el = soup.find("table") or soup
-    rows: list[list[str]] = []
-    for tr in table_el.find_all("tr"):
-        cells = tr.find_all(["th", "td"])
-        if not cells:
-            continue
-        row_vals = [
-            " ".join(cell.get_text(" ", strip=True).split()).replace("|", "\\|")
-            for cell in cells
-        ]
-        if any(row_vals):
-            rows.append(row_vals)
-    if rows:
-        col_count = max(len(r) for r in rows)
-        padded = [r + [""] * (col_count - len(r)) for r in rows]
-        header = "| " + " | ".join(padded[0]) + " |"
-        sep = "| " + " | ".join("---" for _ in range(col_count)) + " |"
-        body = ["| " + " | ".join(r) + " |" for r in padded[1:]]
-        return "\n".join([header, sep, *body])
-
-    try:
-        from markdownify import markdownify
-
-        converted = markdownify(raw_html, heading_style="ATX").strip()
-        if converted:
-            return converted
-    except Exception:  # noqa: BLE001
-        pass
-    return raw_html.strip()
+    return _html_table_to_markdown(raw_html).strip()
 
 
 def _synthesize_markdown_from_content_list(content_list: list[Any]) -> str:

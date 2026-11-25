@@ -453,10 +453,13 @@ class QdrantVectorStore:
         )
         if request.sort:
             for field, direction in reversed(request.sort):
-                records.sort(
-                    key=lambda record: (record.payload.get(field) is None, record.payload.get(field)),
+                present = [record for record in records if record.payload.get(field) is not None]
+                missing = [record for record in records if record.payload.get(field) is None]
+                present.sort(
+                    key=lambda record: record.payload.get(field),
                     reverse=direction == "desc",
                 )
+                records = present + missing
         if request.distinct_field:
             seen: set[Any] = set()
             records = [

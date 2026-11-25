@@ -586,8 +586,10 @@ def test_bilingual_vietnamese_english_stopwords_and_diacritics() -> None:
     # Single source of truth for bilingual stopwords
     assert _SPARSE_QUERY_STOPWORDS is COMMON_STOPWORDS
     assert _LEXICAL_STOPWORDS is COMMON_STOPWORDS
-    for vi_stop in ("là", "của", "những", "được", "trong", "với", "tại", "không"):
+    for vi_stop in ("là", "của", "những", "được", "trong", "với", "tại", "gì"):
         assert vi_stop in COMMON_STOPWORDS
+    for vi_polarity in ("không", "chưa", "phải"):
+        assert vi_polarity not in COMMON_STOPWORDS
     for en_stop in ("the", "what", "where", "which", "about"):
         assert en_stop in COMMON_STOPWORDS
 

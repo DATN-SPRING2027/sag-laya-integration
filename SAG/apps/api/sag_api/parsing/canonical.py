@@ -145,28 +145,19 @@ def segment_prose_by_information_cohesion(
     for grams in raw_counters:
         weighted_vecs.append({g: cnt * idf_map[g] for g, cnt in grams.items()})
 
-    # 3. Làm mượt cửa sổ lân cận Hearst [0.25, 1.0, 0.25] để câu chuyển ý ngắn không bị tách rời
-    smoothed: list[dict[str, float]] = []
-    norms: list[float] = []
-    for i in range(m):
-        vec: dict[str, float] = dict(weighted_vecs[i])
-        if i > 0:
-            for g, val in weighted_vecs[i - 1].items():
-                vec[g] = vec.get(g, 0.0) + 0.25 * val
-        if i + 1 < m:
-            for g, val in weighted_vecs[i + 1].items():
-                vec[g] = vec.get(g, 0.0) + 0.25 * val
-        norm = math.sqrt(math.fsum(v * v for v in vec.values())) or 1.0
-        smoothed.append(vec)
-        norms.append(norm)
+    # 3. Chuẩn hóa chuẩn Euclid L2 trực tiếp trên vector Self-Information (không bơm biên giả [0.25, 1, 0.25])
+    norms: list[float] = [
+        math.sqrt(math.fsum(v * v for v in vec.values())) or 1.0
+        for vec in weighted_vecs
+    ]
 
     # 4. Ma trận tương đồng Cosine đối xứng S (M x M)
     sim = [[0.0] * m for _ in range(m)]
     for i in range(m):
         sim[i][i] = 1.0
-        vi, ni = smoothed[i], norms[i]
+        vi, ni = weighted_vecs[i], norms[i]
         for j in range(i + 1, m):
-            vj, nj = smoothed[j], norms[j]
+            vj, nj = weighted_vecs[j], norms[j]
             if len(vi) > len(vj):
                 dot = math.fsum(val * vi[g] for g, val in vj.items() if g in vi)
             else:
@@ -174,27 +165,33 @@ def segment_prose_by_information_cohesion(
             c = max(0.0, min(1.0, dot / (ni * nj)))
             sim[i][j] = sim[j][i] = c
 
-    # 5. Chuẩn hóa hạng cục bộ C99 (cửa sổ bán kính r=2 -> lân cận 5x5) làm sắc nét biên chủ đề
+    # 5. Chuẩn hóa hạng cục bộ C99 ngoài đường chéo (loại bỏ đường chéo tự tương đồng i==j
+    #    để tránh thiên vị đoạn 1 câu và bảo toàn tính đối xứng rank_mat[i][j] == rank_mat[j][i])
     rank_mat = [[0.0] * m for _ in range(m)]
-    radius = 2
+    radius = 4
     for i in range(m):
         r_lo, r_hi = max(0, i - radius), min(m, i + radius + 1)
-        for j in range(m):
+        for j in range(i + 1, m):
             c_lo, c_hi = max(0, j - radius), min(m, j + radius + 1)
             target = sim[i][j]
             lower_cnt = 0
+            equal_cnt = 0
             total_cnt = 0
             for ri in range(r_lo, r_hi):
                 row_ri = sim[ri]
                 for cj in range(c_lo, c_hi):
-                    if ri == i and cj == j:
+                    if ri == cj or (ri == i and cj == j):
                         continue
                     total_cnt += 1
-                    if row_ri[cj] < target:
+                    val = row_ri[cj]
+                    if val < target:
                         lower_cnt += 1
-            rank_mat[i][j] = (lower_cnt / total_cnt) if total_cnt > 0 else target
+                    elif val == target:
+                        equal_cnt += 1
+            rank_val = ((lower_cnt + 0.5 * equal_cnt) / total_cnt) if total_cnt > 0 else 0.5
+            rank_mat[i][j] = rank_mat[j][i] = rank_val
 
-    # Tổng tiền tố 2D để tính mật độ gắn kết nội bộ của mọi đoạn [a, b) trong O(1)
+    # Tổng tiền tố 2D để tính mật độ gắn kết ngoài đường chéo của mọi đoạn [a, b) trong O(1)
     ps2d = [[0.0] * (m + 1) for _ in range(m + 1)]
     for i in range(m):
         row_ps = ps2d[i + 1]
@@ -213,24 +210,30 @@ def segment_prose_by_information_cohesion(
     dp = [neg_inf] * (m + 1)
     prev_cut = [0] * (m + 1)
     dp[0] = 0.0
+    prior_pairs = 4.0
+    open_cost = max(12.0, 0.12 * max_block_tokens)
 
     for b in range(1, m + 1):
         best_val = neg_inf
         best_a = b - 1
         for a in range(b - 1, -1, -1):
             seg_toks = prefix_tokens[b] - prefix_tokens[a]
-            if seg_toks > max_block_tokens and b - a > 1:
-                break
             cnt = b - a
-            mean_cohesion = _rect_sum(a, b) / (cnt * cnt)
+            if seg_toks > max_block_tokens and cnt > 1:
+                break
+            if cnt == 1:
+                mean_cohesion = 0.40
+            else:
+                # Làm mượt Laplace nhẹ (prior=0.5 trên 4 cặp giả) giảm phương sai đoạn 2 câu
+                mean_cohesion = (_rect_sum(a, b) + 0.5 * prior_pairs) / (cnt * (cnt - 1) + prior_pairs)
             # Phạt nhẹ nếu đoạn quá vụn (< min_block_tokens) để tránh cắt lẻ 1 câu chuyển ý
             short_penalty = (
                 0.18 * (min_block_tokens - seg_toks)
                 if seg_toks < min_block_tokens and m > 2
                 else 0.0
             )
-            # Chi phí mở đoạn mới nhỏ giúp ưu tiên giữ chung 1 đoạn khi mật độ gắn kết đồng nhất
-            seg_score = dp[a] + (seg_toks * mean_cohesion) - short_penalty - 4.5
+            # Chi phí mở đoạn tỷ lệ với max_block_tokens giúp giữ đoạn đồng nhất khi mật độ ổn định
+            seg_score = dp[a] + (seg_toks * mean_cohesion) - short_penalty - open_cost
             if seg_score > best_val:
                 best_val = seg_score
                 best_a = a

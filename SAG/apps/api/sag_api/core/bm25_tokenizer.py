@@ -24,12 +24,13 @@ COMMON_STOPWORDS: frozenset[str] = frozenset(
         "các", "những", "một", "này", "đó", "tại", "về", "từ", "theo", "khi", "như",
         "bởi", "vì", "nếu", "thì", "mà", "để", "đến", "tới", "ra", "vào", "lên", "xuống",
         "cũng", "vẫn", "đều", "chỉ", "rất", "quá", "lắm", "rồi", "hay", "hoặc", "nhưng",
-        "gì", "nào", "ai", "đâu", "sao", "thế", "bao", "nhiêu", "không", "chưa", "phải",
+        "gì", "nào", "ai", "đâu", "sao", "thế", "bao", "nhiêu",
     }
 )
 
-_UNICODE_TOKEN_RE = regex.compile(r"[\p{L}\d]+")
-_GLUED_ALNUM_SPLIT_RE = regex.compile(r"\p{L}+|\d+")
+_UNICODE_TOKEN_RE = regex.compile(r"[\p{L}\p{M}\d]+")
+_GLUED_ALNUM_SPLIT_RE = regex.compile(r"[\p{L}\p{M}]+|\d+")
+_GRAPHEME_CLUSTER_RE = regex.compile(r"\X")
 _CONTINUOUS_SCRIPT_RUN_RE = regex.compile(
     r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
     r"\u0e00-\u0e7f\u0e80-\u0eff\u1780-\u17ff\u1000-\u109f]+"
@@ -44,7 +45,7 @@ class BM25TokenResult:
 
 
 def expand_continuous_script_tokens(tokens: list[str]) -> list[str]:
-    """Split unspaced CJK/Kana/Thai/Lao/Khmer/Myanmar runs into overlapping character bigrams."""
+    """Split unspaced CJK/Kana/Thai/Lao/Khmer/Myanmar runs into grapheme-cluster bigrams."""
     out: list[str] = []
     for tok in tokens:
         if not _CONTINUOUS_SCRIPT_RUN_RE.search(tok):
@@ -57,11 +58,12 @@ def expand_continuous_script_tokens(tokens: list[str]) -> list[str]:
                 if prefix:
                     out.append(prefix)
             run = match.group(0)
-            if len(run) == 1:
-                out.append(run)
+            clusters = _GRAPHEME_CLUSTER_RE.findall(run)
+            if len(clusters) == 1:
+                out.append(clusters[0])
             else:
-                for pos in range(len(run) - 1):
-                    out.append(run[pos : pos + 2])
+                for pos in range(len(clusters) - 1):
+                    out.append(clusters[pos] + clusters[pos + 1])
             last_end = match.end()
         if last_end < len(tok):
             suffix = tok[last_end:]
@@ -129,7 +131,7 @@ def tokenize_bm25_tokens(
 
     expanded_tokens: list[str] = list(active_tokens)
     for tok in active_tokens:
-        if tok.isalnum() and not tok.isalpha() and not tok.isdigit():
+        if any(ch.isdigit() for ch in tok) and any(ch.isalpha() for ch in tok):
             for sub in _GLUED_ALNUM_SPLIT_RE.findall(tok):
                 if sub == tok:
                     continue
