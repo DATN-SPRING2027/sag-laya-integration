@@ -218,7 +218,9 @@ async def ingest_content(
         file_bytes=content.encode("utf-8"),
         original_filename=filename,
         content_type="text/markdown",
-        logical_source_id=logical_source_id or f"source:{source.id}:{filename}",
+        logical_source_id=compact_logical_source_id(
+            logical_source_id or f"source:{source.id}:{filename}"
+        ),
         job_queue=job_queue,
         source_id=source.id,
     )
@@ -1116,7 +1118,7 @@ async def handle_document_upload(
 
     payload_hash = compute_payload_hash(file_bytes)
     idempotency_key = normalize_idempotency_key(client_token)
-    logical_id = (logical_source_id or original_filename).strip()
+    logical_id = compact_logical_source_id(logical_source_id or original_filename)
 
     # Step 1: Pre-allocation lookup by (tenant_id, project_id, idempotency_key)
     existing_run = await _find_upload_run(
@@ -1623,6 +1625,28 @@ async def get_document_version_status(
     ):
         current_stage = "PAUSED" if doc.status == DocumentStatus.PAUSED else "PAUSING"
 
+    version_unit_count = int(
+        (
+            await session.scalar(
+                select(func.count(SearchUnit.id)).where(
+                    SearchUnit.document_version_id == doc_ver.id
+                )
+            )
+        )
+        or 0
+    )
+    resolved_chunk_count = (
+        version_unit_count
+        if (
+            version_unit_count > 0
+            or (
+                not doc.sag_source_id
+                and (doc_ver.version_no > 1 or doc_ver.search_status == "SEARCH_READY")
+            )
+        )
+        else int(doc.chunk_count or 0)
+    )
+
     return DocumentVersionStatusResponse(
         document_id=doc_ver.document_id,
         version_no=doc_ver.version_no,
@@ -1641,10 +1665,183 @@ async def get_document_version_status(
         document_status=doc_status_str,
         parser_provider=doc.parser_provider,
         parser_status=doc.parser_status,
-        chunk_count=int(doc.chunk_count or 0),
+        chunk_count=resolved_chunk_count,
         event_count=int(doc.event_count or 0),
         token_usage=int(doc.token_usage or 0),
     )
+
+
+async def resolve_document_canonical_outline(
+    session: AsyncSession,
+    *,
+    document: Document,
+    principal: object,
+) -> list[dict[str, object]]:
+    """Build outline rows from active, partition-authorized CanonicalBlocks."""
+    now = datetime.now(UTC)
+    is_service = bool(getattr(principal, "is_service", False))
+    allowed_partitions = getattr(principal, "allowed_partition_ids", None) or getattr(
+        principal, "allowed_partitions", None
+    )
+    if not is_service and not allowed_partitions:
+        return []
+
+    stmt = (
+        select(DocumentVersion.id)
+        .where(
+            DocumentVersion.document_id == document.id,
+            DocumentVersion.search_status.in_(("READY", "SEARCH_READY")),
+            DocumentVersion.search_ready_at.is_not(None),
+            DocumentVersion.valid_from <= now,
+            DocumentVersion.valid_to > now,
+        )
+        .order_by(DocumentVersion.version_no.desc())
+        .limit(1)
+    )
+    if not is_service and allowed_partitions:
+        partition_expr = DocumentVersion.metadata_json["security_partition_id"].as_string()
+        stmt = stmt.where(partition_expr.in_(sorted(allowed_partitions)))
+
+    version_id = (await session.execute(stmt)).scalar_one_or_none()
+    if not version_id:
+        return []
+
+    blocks = (
+        await session.scalars(
+            select(CanonicalBlock)
+            .where(CanonicalBlock.document_version_id == version_id)
+            .order_by(CanonicalBlock.ordinal.asc())
+        )
+    ).all()
+    heading_blocks = [b for b in blocks if b.block_type == "heading"]
+    outline_rows: list[dict[str, object]] = []
+    if heading_blocks:
+        for rank, blk in enumerate(heading_blocks):
+            heading_text = (blk.normalized_text or blk.section_path or "").strip()
+            if heading_text:
+                outline_rows.append(
+                    {"rank": rank, "heading": heading_text, "chunk_id": blk.id}
+                )
+    else:
+        seen_paths: set[str] = set()
+        for blk in blocks:
+            sp = (blk.section_path or "").strip()
+            if sp and sp not in seen_paths:
+                seen_paths.add(sp)
+                outline_rows.append(
+                    {"rank": len(outline_rows), "heading": sp, "chunk_id": blk.id}
+                )
+    return outline_rows
+
+
+async def resolve_document_parsed_markdown(
+    session: AsyncSession,
+    *,
+    document: Document,
+    source: Source,
+    principal: object | None = None,
+    engine_manager: object | None = None,
+) -> str | None:
+    """Resolve full parsed Markdown for a Document via sidecar -> CanonicalBlock -> legacy engine."""
+    from sag_api.parsing.service import _signature, parsed_sidecar_paths
+
+    storage_path = document.storage_path or ""
+    if storage_path:
+        suffix = os.path.splitext(storage_path)[1].lower()
+        if suffix in {".md", ".markdown"} and os.path.isfile(storage_path):
+            try:
+                with open(storage_path, encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+                if text.strip():
+                    return text
+            except OSError:
+                pass
+
+        candidate_paths: list[str] = []
+        if document.parser_provider in {"mineru", "markitdown"}:
+            sig = _signature(document.parser_provider, settings)
+            candidate_paths.append(f"{storage_path}.parsed.{sig}.md")
+        for prov in ("mineru", "markitdown"):
+            sig = _signature(prov, settings)
+            p = f"{storage_path}.parsed.{sig}.md"
+            if p not in candidate_paths:
+                candidate_paths.append(p)
+        for p in parsed_sidecar_paths(storage_path):
+            if ".fallback-" not in os.path.basename(p) and p not in candidate_paths:
+                candidate_paths.append(p)
+
+        for candidate in candidate_paths:
+            if os.path.isfile(candidate):
+                try:
+                    with open(candidate, encoding="utf-8", errors="replace") as f:
+                        text = f.read()
+                    if text.strip():
+                        return text
+                except OSError:
+                    continue
+
+    # Step 2: Reconstruct from latest active, partition-authorized DocumentVersion + CanonicalBlocks
+    now = datetime.now(UTC)
+    is_service = bool(getattr(principal, "is_service", False)) if principal is not None else True
+    allowed_partitions = (
+        getattr(principal, "allowed_partition_ids", None)
+        or getattr(principal, "allowed_partitions", None)
+        if principal is not None
+        else None
+    )
+    if is_service or allowed_partitions:
+        ver_stmt = (
+            select(DocumentVersion.id)
+            .where(
+                DocumentVersion.document_id == document.id,
+                DocumentVersion.status != "REVOKED",
+                DocumentVersion.valid_to > now,
+            )
+            .order_by(
+                case((DocumentVersion.search_status == "SEARCH_READY", 0), else_=1),
+                DocumentVersion.version_no.desc(),
+            )
+            .limit(1)
+        )
+        if not is_service and allowed_partitions:
+            partition_expr = DocumentVersion.metadata_json["security_partition_id"].as_string()
+            ver_stmt = ver_stmt.where(partition_expr.in_(sorted(allowed_partitions)))
+        version_id = (await session.execute(ver_stmt)).scalar_one_or_none()
+        if version_id:
+            blocks = (
+                await session.scalars(
+                    select(CanonicalBlock)
+                    .where(CanonicalBlock.document_version_id == version_id)
+                    .order_by(CanonicalBlock.ordinal.asc())
+                )
+            ).all()
+            if blocks:
+                parts: list[str] = []
+                last_page: int | None = None
+                for blk in blocks:
+                    page_no = int(blk.page_from or 1)
+                    if page_no >= 1 and page_no != last_page:
+                        parts.append(f"<!-- PAGE {page_no} -->")
+                        last_page = page_no
+                    txt = (blk.normalized_text or "").strip()
+                    if not txt:
+                        continue
+                    if blk.block_type == "heading":
+                        level = min(6, max(1, (blk.section_path or "").count(" > ") + 1))
+                        parts.append(f"{'#' * level} {txt}")
+                    else:
+                        parts.append(txt)
+                if parts:
+                    return "\n\n".join(parts) + "\n"
+
+    # Step 3: Legacy sag_source_id fallback
+    if document.sag_source_id and engine_manager is not None:
+        return await engine_manager.get_document_markdown(
+            source.sag_source_config_id,
+            document.sag_source_id,
+            source=source,
+        )
+    return None
 
 
 async def get_project_document_readiness_batch(
@@ -1689,6 +1886,17 @@ async def get_project_document_readiness_batch(
         (version.document_id, version.version_no): (version, document)
         for version, document in rows.all()
     }
+    version_ids = [version.id for version, _doc in visible_by_key.values()]
+    unit_counts_by_version: dict[str, int] = {}
+    if version_ids:
+        count_rows = await session.execute(
+            select(SearchUnit.document_version_id, func.count(SearchUnit.id))
+            .where(SearchUnit.document_version_id.in_(version_ids))
+            .group_by(SearchUnit.document_version_id)
+        )
+        unit_counts_by_version = {
+            str(ver_id): int(cnt or 0) for ver_id, cnt in count_rows.all()
+        }
 
     items: list[ProjectDocumentReadinessItem] = []
     for document_id, version_no in refs:
@@ -1712,11 +1920,11 @@ async def get_project_document_readiness_batch(
         status_value = getattr(version.status, "value", version.status)
         search_status_value = getattr(version.search_status, "value", version.search_status)
         document_status_value = getattr(document.status, "value", document.status)
+        version_unit_count = unit_counts_by_version.get(version.id, 0)
         is_ready = (
             document.status == DocumentStatus.READY
             and version.search_status == "SEARCH_READY"
             and version.search_ready_at is not None
-            and int(document.chunk_count or 0) > 0
         )
         items.append(
             ProjectDocumentReadinessItem(
@@ -1727,7 +1935,11 @@ async def get_project_document_readiness_batch(
                 search_status=str(search_status_value),
                 search_ready=is_ready,
                 document_status=str(document_status_value),
-                chunk_count=int(document.chunk_count or 0),
+                chunk_count=(
+                    version_unit_count
+                    if (version_unit_count > 0 or not document.sag_source_id)
+                    else int(document.chunk_count or 0)
+                ),
             )
         )
 

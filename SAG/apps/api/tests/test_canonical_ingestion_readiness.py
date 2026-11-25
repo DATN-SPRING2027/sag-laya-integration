@@ -994,6 +994,38 @@ async def test_project_document_readiness_batch_requires_confirmed_project_mappi
         ready_version.search_status = "SEARCH_READY"
         ready_version.search_ready_at = datetime.now(UTC)
 
+        # S1-10: version readiness reports SearchUnit counts scoped to the DocumentVersion
+        # instead of trusting document-level chunk_count.
+        from sag_api.db.models.routing_rag import CanonicalBlock, SearchUnit
+
+        blk = CanonicalBlock(
+            id="ready-blk-1",
+            document_version_id="version",
+            ordinal=0,
+            block_type="paragraph",
+            page_from=1,
+            page_to=1,
+            section_path="Root",
+            normalized_text="Ready content",
+            content_hash="r" * 64,
+        )
+        session.add(blk)
+        await session.flush()
+        session.add(
+            SearchUnit(
+                id="ready-unit-1",
+                document_version_id="version",
+                block_from_id="ready-blk-1",
+                block_to_id="ready-blk-1",
+                security_partition_id="project",
+                content_hash="r" * 64,
+                token_count=2,
+                page_from=1,
+                page_to=1,
+                section_path="Root",
+            )
+        )
+
         session.add(Source(id="pending-source", name="Pending", sag_source_config_id="pending-config"))
         await session.flush()
         session.add(
@@ -1050,7 +1082,7 @@ async def test_project_document_readiness_batch_requires_confirmed_project_mappi
 
     assert result.items[0].found is True
     assert result.items[0].search_ready is True
-    assert result.items[0].chunk_count == 8
+    assert result.items[0].chunk_count == 1
     assert result.items[1].found is False
     assert result.items[1].search_ready is False
     assert result.items[2].found is False

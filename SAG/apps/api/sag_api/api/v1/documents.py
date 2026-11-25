@@ -60,6 +60,7 @@ from sag_api.schemas.routing_rag import (
     ProjectDocumentReadinessBatchResponse,
 )
 from sag_api.services.document_service import (
+    compact_logical_source_id,
     delete_document,
     get_document_version_chunks,
     get_document_version_status,
@@ -70,6 +71,7 @@ from sag_api.services.document_service import (
     ingest_content,
     pause_document,
     reprocess_document,
+    resolve_document_parsed_markdown,
     resolve_project_document,
     resume_document,
     revoke_project_document,
@@ -324,7 +326,9 @@ async def upload(
                 partition_id=x_continuum_security_partition,
             )
             norm_logical_source_id = (
-                normalize_text(logical_source_id, preserve_code=True) if logical_source_id else None
+                compact_logical_source_id(normalize_text(logical_source_id, preserve_code=True))
+                if logical_source_id
+                else None
             )
             result = await handle_document_upload(
                 session,
@@ -336,7 +340,8 @@ async def upload(
                 file_bytes=data,
                 original_filename=filename,
                 content_type=file.content_type or "application/octet-stream",
-                logical_source_id=norm_logical_source_id or f"source:{source.id}:{filename}",
+                logical_source_id=norm_logical_source_id
+                or compact_logical_source_id(f"source:{source.id}:{filename}"),
                 job_queue=job_queue,
                 source_id=source.id,
             )
@@ -521,13 +526,13 @@ async def get_parsed(
         if document.status == DocumentStatus.FAILED:
             raise ConflictError(document.error or "Document parsing failed, no parsed content available")
         raise ConflictError("Document parsing is still in progress")
-    if not document.sag_source_id:
-        raise NotFoundError("Parsed content not found, please reprocess the document")
 
-    markdown = await engine_manager.get_document_markdown(
-        source.sag_source_config_id,
-        document.sag_source_id,
+    markdown = await resolve_document_parsed_markdown(
+        session,
+        document=document,
         source=source,
+        principal=principal,
+        engine_manager=engine_manager,
     )
     if not markdown:
         raise NotFoundError("Parsed content not found, please reprocess the document")
@@ -696,7 +701,11 @@ async def upload_document_version(
         file_bytes=file_bytes,
         original_filename=filename,
         content_type=file.content_type or "application/octet-stream",
-        logical_source_id=normalize_text(logical_source_id, preserve_code=True) if logical_source_id else None,
+        logical_source_id=(
+            compact_logical_source_id(normalize_text(logical_source_id, preserve_code=True))
+            if logical_source_id
+            else None
+        ),
         source_published_at=source_published_at,
         job_queue=job_queue,
     )

@@ -383,6 +383,26 @@ def build_source_mcp(
         if match is None:
             return "(Không tìm thấy tài liệu này.)"
         document, source = match
+
+        from sag_api.core.db import SessionLocal
+        from sag_api.services.document_service import resolve_document_canonical_outline
+
+        async with SessionLocal() as session:
+            is_versioned = source.id in await versioned_source_ids(session, [source.id])
+            if is_versioned:
+                rows = await resolve_document_canonical_outline(
+                    session,
+                    document=document,
+                    principal=scope.principal,
+                )
+                if not rows:
+                    return "(Chưa có mục lục; tài liệu có thể vẫn đang được xử lý.)"
+                return "\n".join(
+                    f"{row['rank']:>3}. {row['heading'] or '(Đoạn không có tiêu đề)'}"
+                    f"（chunk_id={row['chunk_id']}）"
+                    for row in rows
+                )
+
         if not document.sag_source_id:
             return "(Chưa có mục lục; tài liệu có thể vẫn đang được xử lý.)"
         rows = await scope.engine_manager.list_chunk_headings(
@@ -499,13 +519,36 @@ def build_source_mcp(
         document, source = match
         import os
 
-        if not document.storage_path or not os.path.isfile(document.storage_path):
-            return "(Tệp gốc không tồn tại hoặc đã được dọn dẹp.)"
-        try:
-            with open(document.storage_path, encoding="utf-8", errors="replace") as file:
-                lines = file.readlines()
-        except OSError:
-            return "(Đọc tệp thất bại.)"
+        from sag_api.core.db import SessionLocal
+        from sag_api.parsing.text import is_plain_text_path
+        from sag_api.services.document_service import resolve_document_parsed_markdown
+
+        storage_path = document.storage_path or ""
+        file_exists = bool(storage_path and os.path.isfile(storage_path))
+        lines: list[str] | None = None
+
+        if not file_exists or not is_plain_text_path(storage_path):
+            async with SessionLocal() as session:
+                parsed_md = await resolve_document_parsed_markdown(
+                    session,
+                    document=document,
+                    source=source,
+                    principal=scope.principal,
+                    engine_manager=scope.engine_manager,
+                )
+            if parsed_md:
+                lines = parsed_md.splitlines(keepends=True)
+            elif not file_exists:
+                return "(Tệp gốc không tồn tại hoặc đã được dọn dẹp.)"
+            else:
+                return "(Tài liệu nhị phân chưa có nội dung Markdown đã phân tích.)"
+        else:
+            try:
+                with open(storage_path, encoding="utf-8", errors="replace") as file:
+                    lines = file.readlines()
+            except OSError:
+                return "(Đọc tệp thất bại.)"
+
         start = max(0, offset - 1)
         page = lines[start : start + max(1, min(limit, 500))]
         if not page:
