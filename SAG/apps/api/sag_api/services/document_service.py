@@ -1228,10 +1228,16 @@ async def handle_document_upload(
                             code="DOCUMENT_PARTITION_MISMATCH",
                             retryable=False,
                         )
+                    is_latest_failed = (
+                        latest_ver.status == "FAILED"
+                        or latest_ver.search_status in ("FAILED", "INDEX_FAILED")
+                        or doc.status == DocumentStatus.FAILED
+                    )
                     if (
                         latest_ver
                         and latest_ver.file_hash == payload_hash
                         and latest_ver.status != "REVOKED"
+                        and not is_latest_failed
                         and doc.is_active
                     ):
                         # Exact duplicate: Cùng hash + cùng source identity
@@ -1280,10 +1286,10 @@ async def handle_document_upload(
                         )
                         break
                     elif latest_ver:
-                        # Đóng khoảng hiệu lực của phiên bản cũ tại thời điểm phiên bản mới bắt đầu (Comment #13)
-                        latest_ver.valid_to = now_utc
+                        # Keep latest_ver.valid_to open until replacement version commits SEARCH_READY
+                        # via resolve_temporal_supersedes; failed retries must not hide active predecessors.
                         version_no = latest_ver.version_no + 1
-                        supersedes_id = latest_ver.id
+                        supersedes_id = latest_ver.id if not is_latest_failed else latest_ver.supersedes_id
                     else:
                         version_no = 1
                         supersedes_id = None
@@ -1333,6 +1339,22 @@ async def handle_document_upload(
                     )
                     session.add(snapshot)
                 else:
+                    if existing_ver.file_hash != payload_hash:
+                        raise ConflictError(
+                            "Document version already exists with a different content hash",
+                            layer=ErrorLayer.CLIENT,
+                            stage=ErrorStage.UPLOAD,
+                            code="VERSION_HASH_MISMATCH",
+                            retryable=False,
+                        )
+                    if (existing_ver.metadata_json or {}).get("security_partition_id") != security_partition_id:
+                        raise ConflictError(
+                            "Document version already belongs to a different security partition",
+                            layer=ErrorLayer.CLIENT,
+                            stage=ErrorStage.UPLOAD,
+                            code="DOCUMENT_PARTITION_MISMATCH",
+                            retryable=False,
+                        )
                     doc_version = existing_ver
 
                 run_id = str(uuid.uuid4())

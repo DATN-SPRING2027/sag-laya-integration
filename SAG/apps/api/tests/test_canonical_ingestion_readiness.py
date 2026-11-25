@@ -894,8 +894,17 @@ async def test_reprocess_ready_project_document_completes_without_legacy_engine_
 
     monkeypatch.setattr(search_index_service, "run_search_indexing_stage", fake_index)
 
+    import httpx
+
+    # P3 (S1-11): _reprocess_document_task_unlocked cleans Qdrant points when SEARCH_READY;
+    # provide a mock Qdrant client on manager so offline unit test does not dial localhost:6333.
+    mock_qdrant_client = httpx.AsyncClient(
+        base_url="http://qdrant.local",
+        transport=httpx.MockTransport(lambda _req: httpx.Response(200, json={"result": {"status": "completed"}})),
+    )
     manager = SimpleNamespace(
         get_sag_embedding=AsyncMock(return_value=None),
+        get_search_unit_qdrant_client=AsyncMock(return_value=mock_qdrant_client),
         process_document=AsyncMock(side_effect=AssertionError("Legacy extractor should not run")),
         delete_document_data=AsyncMock(side_effect=AssertionError("Legacy delete_document_data must not run for Phase 2-only project documents")),
     )
@@ -960,6 +969,7 @@ async def test_reprocess_ready_project_document_completes_without_legacy_engine_
         assert final_status.search_ready is True
         assert final_status.current_stage == "COMPLETE"
         assert final_status.document_status == "ready"
+    await mock_qdrant_client.aclose()
 
 
 @pytest.mark.asyncio

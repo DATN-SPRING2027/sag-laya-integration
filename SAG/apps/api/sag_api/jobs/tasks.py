@@ -9,13 +9,13 @@ from __future__ import annotations
 import os
 import re
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import httpx
-from sqlalchemy import update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.config import settings
@@ -692,16 +692,36 @@ async def _process_document_unlocked(
             parser_failure_values = _parser_state_values(parser_state)
             parser_failure_values["parser_status"] = "failed"
             parser_failure_values["fallback_reason"] = _redact_parser_reason(message)
-        # Kiểm tra xem tài liệu đã đạt SEARCH_READY trước đó hay chưa (Phase 2C đã commit)
-        is_search_ready = False
+        # Kiểm tra xem phiên bản hiện tại (hoặc phiên bản tiền nhiệm đang hiệu lực) đã đạt SEARCH_READY hay chưa
+        current_ver_search_ready = False
+        current_ver_id: str | None = None
         if run_id:
             ing_run_chk = await session.get(IngestionRun, run_id)
             if ing_run_chk:
+                current_ver_id = str(ing_run_chk.document_version_id)
                 ver_chk = await session.get(DocumentVersion, ing_run_chk.document_version_id)
                 if ver_chk and ver_chk.search_status == "SEARCH_READY":
-                    is_search_ready = True
+                    current_ver_search_ready = True
 
-        doc_target_status = DocumentStatus.READY if is_search_ready else DocumentStatus.FAILED
+        has_active_ready_predecessor = False
+        if not current_ver_search_ready:
+            now_utc = datetime.now(UTC)
+            pred_stmt = select(DocumentVersion.id).where(
+                DocumentVersion.document_id == document.id,
+                DocumentVersion.search_status == "SEARCH_READY",
+                DocumentVersion.status != "REVOKED",
+                DocumentVersion.valid_from <= now_utc,
+                DocumentVersion.valid_to > now_utc,
+            )
+            if current_ver_id:
+                pred_stmt = pred_stmt.where(DocumentVersion.id != current_ver_id)
+            has_active_ready_predecessor = (await session.scalar(pred_stmt.limit(1))) is not None
+
+        doc_target_status = (
+            DocumentStatus.READY
+            if (current_ver_search_ready or has_active_ready_predecessor)
+            else DocumentStatus.FAILED
+        )
 
         failed = await session.execute(
             update(Document)
@@ -740,7 +760,7 @@ async def _process_document_unlocked(
                 if ver:
                     # Nếu Phase 2C đã hoàn tất và SEARCH_READY, lỗi extraction/LLM hoặc enrichment
                     # phía sau không được phép hạ cấp hoặc xóa trạng thái tìm kiếm
-                    if is_search_ready:
+                    if current_ver_search_ready:
                         ver.status = "SEARCH_READY"
                         ver.knowledge_status = "FAILED"
                     else:
@@ -876,6 +896,88 @@ async def _process_document_unlocked(
             )
 
 
+async def _resolve_document_qdrant_project_ids(
+    session: AsyncSession,
+    document: Document,
+    *,
+    version_ids: Sequence[str] | None = None,
+) -> list[str]:
+    project_ids: list[str] = []
+    seen: set[str] = set()
+
+    def _add(pid: object) -> None:
+        if isinstance(pid, str):
+            clean = pid.strip()
+            if clean and clean not in seen:
+                seen.add(clean)
+                project_ids.append(clean)
+
+    _add(getattr(document, "project_id", None))
+
+    from sag_api.db.models import SourceProjectMapping
+    from sag_api.db.models.routing_rag import IngestionRun
+
+    if version_ids:
+        run_pids = (
+            await session.scalars(
+                select(IngestionRun.project_id)
+                .where(IngestionRun.document_version_id.in_(list(version_ids)))
+                .distinct()
+            )
+        ).all()
+        for pid in run_pids:
+            _add(pid)
+
+    if getattr(document, "source_id", None):
+        mapping_pids = (
+            await session.scalars(
+                select(SourceProjectMapping.project_id)
+                .where(SourceProjectMapping.source_id == document.source_id)
+                .distinct()
+            )
+        ).all()
+        for pid in mapping_pids:
+            _add(pid)
+
+    return project_ids
+
+
+async def _delete_qdrant_points_for_versions(
+    engine_manager: EngineManager | None,
+    *,
+    project_ids: Sequence[str],
+    document_version_ids: Sequence[str],
+) -> None:
+    if not project_ids or not document_version_ids:
+        return
+    from sag_api.services.search_index_service import delete_document_points_from_qdrant
+
+    shared_qdrant_client = None
+    if engine_manager is not None and hasattr(engine_manager, "get_search_unit_qdrant_client"):
+        shared_qdrant_client = await engine_manager.get_search_unit_qdrant_client()
+
+    if shared_qdrant_client is not None:
+        for pid in project_ids:
+            await delete_document_points_from_qdrant(
+                shared_qdrant_client,
+                project_id=pid,
+                document_version_ids=document_version_ids,
+            )
+        return
+
+    qdrant_url = getattr(settings, "sag_qdrant_url", "http://localhost:6333").rstrip("/")
+    qdrant_headers = {}
+    if getattr(settings, "sag_qdrant_api_key", None):
+        qdrant_headers["api-key"] = settings.sag_qdrant_api_key
+    async with httpx.AsyncClient(base_url=qdrant_url, headers=qdrant_headers, timeout=30.0) as qdrant_client:
+        for pid in project_ids:
+            await delete_document_points_from_qdrant(
+                qdrant_client,
+                project_id=pid,
+                document_version_ids=document_version_ids,
+            )
+
+
 async def delete_document_task(
     session: AsyncSession, job: Job, *, engine_manager: EngineManager, job_queue=None
 ) -> None:
@@ -915,27 +1017,21 @@ async def _delete_document_task_unlocked(
     )
 
     # Phase 2 Cleanup: Delete Qdrant points for all document versions belonging to this document
-    from sqlalchemy import select
-
-    from sag_api.db.models.routing_rag import DocumentVersion
     version_ids = (
         await session.execute(
             select(DocumentVersion.id).where(DocumentVersion.document_id == document.id)
         )
     ).scalars().all()
-    if version_ids and document.project_id:
-        qdrant_url = getattr(settings, "sag_qdrant_url", "http://localhost:6333").rstrip("/")
-        qdrant_headers = {}
-        if getattr(settings, "sag_qdrant_api_key", None):
-            qdrant_headers["api-key"] = settings.sag_qdrant_api_key
+    target_project_ids = await _resolve_document_qdrant_project_ids(
+        session, document, version_ids=version_ids
+    )
+    if version_ids and target_project_ids:
         try:
-            async with httpx.AsyncClient(base_url=qdrant_url, headers=qdrant_headers, timeout=30.0) as qdrant_client:
-                from sag_api.services.search_index_service import delete_document_points_from_qdrant
-                await delete_document_points_from_qdrant(
-                    qdrant_client,
-                    project_id=document.project_id,
-                    document_version_ids=version_ids,
-                )
+            await _delete_qdrant_points_for_versions(
+                engine_manager,
+                project_ids=target_project_ids,
+                document_version_ids=version_ids,
+            )
         except Exception as qdel_err:
             log.error("Failed to delete Qdrant points on document deletion %s: %s", document.id, qdel_err)
             raise RuntimeError(f"Qdrant cleanup failed during document deletion: {qdel_err}") from qdel_err
@@ -1065,6 +1161,17 @@ async def _reprocess_document_task_unlocked(
     if source is None:
         raise NotFoundError("Nguồn dữ liệu không tồn tại")
 
+    from sag_api.db.models.routing_rag import CanonicalBlock, SearchUnit
+
+    latest_ver = (
+        await session.execute(
+            select(DocumentVersion)
+            .where(DocumentVersion.document_id == document.id)
+            .order_by(DocumentVersion.version_no.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
     payload = dict(job.payload or {})
     derived_source_ids = sorted(
         {value.strip() for value in payload.get("derived_source_ids", []) if isinstance(value, str) and value.strip()}
@@ -1076,6 +1183,46 @@ async def _reprocess_document_task_unlocked(
             document,
             derived_source_ids,
         )
+        if latest_ver is not None:
+            had_units = (
+                await session.scalar(
+                    select(SearchUnit.id)
+                    .where(SearchUnit.document_version_id == latest_ver.id)
+                    .limit(1)
+                )
+            ) is not None
+            target_project_ids = await _resolve_document_qdrant_project_ids(
+                session, document, version_ids=[latest_ver.id]
+            )
+            if target_project_ids and (
+                had_units or latest_ver.search_status in ("SEARCH_READY", "INDEX_FAILED", "INDEXING")
+            ):
+                try:
+                    await _delete_qdrant_points_for_versions(
+                        engine_manager,
+                        project_ids=target_project_ids,
+                        document_version_ids=[latest_ver.id],
+                    )
+                except Exception as qdel_err:
+                    log.error(
+                        "Failed to delete Qdrant points on document reprocess %s: %s",
+                        document.id,
+                        qdel_err,
+                    )
+                    raise RuntimeError(
+                        f"Qdrant cleanup failed during document reprocess: {qdel_err}"
+                    ) from qdel_err
+            await session.execute(
+                delete(SearchUnit).where(SearchUnit.document_version_id == latest_ver.id)
+            )
+            await session.execute(
+                delete(CanonicalBlock).where(CanonicalBlock.document_version_id == latest_ver.id)
+            )
+            latest_ver.status = "RECEIVED"
+            latest_ver.search_status = "PENDING"
+            latest_ver.search_ready_at = None
+            latest_ver.knowledge_status = "NOT_STARTED"
+            latest_ver.knowledge_ready_at = None
 
     await session.refresh(document)
     if document.status in _DELETE_CONTROL_STATES:
@@ -1098,19 +1245,6 @@ async def _reprocess_document_task_unlocked(
         session.add(process_job)
         await session.flush()
 
-    # Create an IngestionRun for Phase 2 processing on reprocess
-    from sqlalchemy import select
-
-    from sag_api.db.models.routing_rag import DocumentVersion, IngestionRun
-    latest_ver = (
-        await session.execute(
-            select(DocumentVersion)
-            .where(DocumentVersion.document_id == document.id)
-            .order_by(DocumentVersion.version_no.desc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-
     new_run_id = None
     process_job_payload = {
         **(process_job.payload or {}),
@@ -1126,8 +1260,8 @@ async def _reprocess_document_task_unlocked(
         latest_ver.status = "RECEIVED"
         latest_ver.search_status = "PENDING"
         latest_ver.search_ready_at = None
-        if latest_ver.knowledge_status in ("FAILED", "REVOKED"):
-            latest_ver.knowledge_status = "NOT_STARTED"
+        latest_ver.knowledge_status = "NOT_STARTED"
+        latest_ver.knowledge_ready_at = None
         ing_run = IngestionRun(
             id=new_run_id,
             tenant_id=tenant_id,
