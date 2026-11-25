@@ -9,11 +9,28 @@ patching ``site-packages``.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+import contextvars
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
 from sag_api.core.config import Settings
+
+_ACTIVE_POLICY_SETTINGS: contextvars.ContextVar[Settings | None] = contextvars.ContextVar(
+    "sag_active_policy_settings",
+    default=None,
+)
+
+
+@contextmanager
+def policy_settings_scope(active_settings: Settings) -> Iterator[None]:
+    """Bind the calling LLMClient's Settings for LiteLLM policy hooks."""
+    token = _ACTIVE_POLICY_SETTINGS.set(active_settings)
+    try:
+        yield
+    finally:
+        _ACTIVE_POLICY_SETTINGS.reset(token)
 
 _COMPLETION_CALL_TYPES = {"completion", "acompletion"}
 _DEEPSEEK_V4_MODELS = {"deepseek-v4-flash", "deepseek-v4-pro"}
@@ -120,6 +137,13 @@ def _thinking_override(extra_body: object) -> bool | None:
     direct = extra_body.get("enable_thinking")
     if isinstance(direct, bool):
         return direct
+    thinking_cfg = extra_body.get("thinking")
+    if isinstance(thinking_cfg, Mapping):
+        thinking_type = str(thinking_cfg.get("type") or "").strip().lower()
+        if thinking_type == "enabled":
+            return True
+        if thinking_type == "disabled":
+            return False
     template_kwargs = extra_body.get("chat_template_kwargs")
     if isinstance(template_kwargs, Mapping):
         nested = template_kwargs.get("enable_thinking")
@@ -169,12 +193,14 @@ def apply_litellm_completion_policy(
         normalized["extra_body"] = dict(settings.llm_extra_body)
 
     model = str(normalized.get("model") or settings.routed_llm_model)
-    if _is_deepseek_v4(model):
-        extra_body = dict(normalized.get("extra_body") or {})
-        extra_body["thinking"] = {"type": "disabled"}
-        normalized["extra_body"] = extra_body
-
     thinking = _thinking_override(normalized.get("extra_body"))
+    if _is_deepseek_v4(model) and thinking is not True:
+        extra_body = dict(normalized.get("extra_body") or {})
+        if "thinking" not in extra_body:
+            extra_body["thinking"] = {"type": "disabled"}
+            normalized["extra_body"] = extra_body
+            thinking = False
+
     if thinking is False or (thinking is None and "qwen" in model.casefold()):
         if "reasoning_effort" not in normalized:
             normalized["reasoning_effort"] = "none"
@@ -214,7 +240,8 @@ def install_litellm_policy(settings: Settings) -> Any:
             kind = getattr(call_type, "value", call_type)
             if kind is not None and kind not in _COMPLETION_CALL_TYPES:
                 return kwargs
-            return apply_litellm_completion_policy(settings, kwargs)
+            active_settings = _ACTIVE_POLICY_SETTINGS.get() or settings
+            return apply_litellm_completion_policy(active_settings, kwargs)
 
     callback = MuseLiteLLMPolicy()
     litellm.callbacks.append(callback)
@@ -222,12 +249,13 @@ def install_litellm_policy(settings: Settings) -> Any:
     cache = StructuredOutputCapabilityCache()
 
     async def sag_acompletion(*args: Any, **kwargs: Any) -> Any:
-        kwargs = apply_litellm_completion_policy(settings, kwargs)
-        if settings.llm_structured_output_mode != "auto" or not _json_schema_request(
+        active_settings = _ACTIVE_POLICY_SETTINGS.get() or settings
+        kwargs = apply_litellm_completion_policy(active_settings, kwargs)
+        if active_settings.llm_structured_output_mode != "auto" or not _json_schema_request(
             kwargs
         ):
             return await original_acompletion(*args, **kwargs)
-        key = _capability_key(kwargs, settings)
+        key = _capability_key(kwargs, active_settings)
         known = cache.get(key)
         if known == "json_object":
             return await original_acompletion(*args, **_with_json_object(kwargs))
@@ -243,7 +271,7 @@ def install_litellm_policy(settings: Settings) -> Any:
             try:
                 result = await original_acompletion(*args, **kwargs)
             except Exception as error:
-                if not should_downgrade_json_schema(error, kwargs, settings):
+                if not should_downgrade_json_schema(error, kwargs, active_settings):
                     raise
                 cache.mark(key, "json_object")
                 return await original_acompletion(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
 from collections import defaultdict
@@ -40,6 +41,25 @@ _MAX_EVIDENCE_UNITS = 100
 _MAX_INDEXED_UNITS_PER_SOURCE = 25
 _MAX_BLOCKS_PER_UNIT = 8
 _MAX_UNIT_CHARS = 1600
+
+
+def _supports_response_format(complete_fn: Any) -> bool:
+    target = getattr(complete_fn, "side_effect", None)
+    fn = target if callable(target) else complete_fn
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        p.kind == inspect.Parameter.VAR_KEYWORD or name == "response_format"
+        for name, p in sig.parameters.items()
+    )
+
+
+async def _complete_json(llm: Any, messages: list[dict[str, str]]) -> str:
+    if _supports_response_format(llm.complete):
+        return await llm.complete(messages, response_format={"type": "json_object"})
+    return await llm.complete(messages)
 
 
 @dataclass(frozen=True)
@@ -549,7 +569,7 @@ async def execute_handover_assist(
             project_id=project_id,
             tenant_id=principal.tenant_id or "",
         ) as usage_ledger:
-            raw_completion = await llm.complete(messages)
+            raw_completion = await _complete_json(llm, messages)
             usage_out = _extract_usage_out(usage_ledger, messages, raw_completion)
         parsed = _parse_llm_json(raw_completion)
         raw_candidates = parsed.get("candidates")
@@ -606,7 +626,7 @@ async def execute_handover_assist(
             project_id=project_id,
             tenant_id=principal.tenant_id or "",
         ) as usage_ledger:
-            raw_completion = await llm.complete(messages)
+            raw_completion = await _complete_json(llm, messages)
             usage_out = _extract_usage_out(usage_ledger, messages, raw_completion)
         parsed = _parse_llm_json(raw_completion)
         raw_items = parsed.get("items")
@@ -670,7 +690,7 @@ async def execute_handover_assist(
         project_id=project_id,
         tenant_id=principal.tenant_id or "",
     ) as usage_ledger:
-        raw_completion = await llm.complete(messages)
+        raw_completion = await _complete_json(llm, messages)
         usage_out = _extract_usage_out(usage_ledger, messages, raw_completion)
     parsed = _parse_llm_json(raw_completion)
     status_raw = str(parsed.get("answerStatus") or "").strip().upper()

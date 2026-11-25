@@ -503,7 +503,7 @@ class AgentRuntime:
                 return str(assistant.content or "") or "\n".join(outcome.model_content for outcome in outcomes)
 
         if agent.finalize_on_max_turns:
-            handle.context.messages.append(AgentMessage(role="system", content=agent.final_instructions))
+            handle.context.messages.append(AgentMessage(role="user", content=agent.final_instructions))
             assistant, duration_ms = await self._model_turn(
                 agent,
                 handle,
@@ -869,6 +869,13 @@ class AgentRuntime:
         except Exception as exc:  # noqa: BLE001
             store_error = exc
             ctx.metadata.setdefault("store_errors", []).append(f"failed to append {event.type.value}: {exc}")
+        if (
+            store_error is not None
+            and self.config.fail_on_store_error
+            and not tolerate_store_error
+            and event_type not in _TERMINAL_EVENTS
+        ):
+            raise RunStoreError(f"failed to append {event.type.value}: {store_error}") from store_error
         handle._push(event)
         for listener in tuple(self._listeners):
             try:
@@ -877,11 +884,4 @@ class AgentRuntime:
                     await value
             except Exception as exc:  # noqa: BLE001
                 ctx.metadata.setdefault("listener_errors", []).append(str(exc))
-        if (
-            store_error is not None
-            and self.config.fail_on_store_error
-            and not tolerate_store_error
-            and event_type not in _TERMINAL_EVENTS
-        ):
-            raise RunStoreError(f"failed to append {event.type.value}: {store_error}") from store_error
         return event

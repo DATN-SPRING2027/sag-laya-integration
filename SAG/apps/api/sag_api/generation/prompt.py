@@ -177,6 +177,8 @@ _GUIDANCE = {
         "source can be formed, state the evidence gap instead of presenting the claim as confirmed.\n"
         "- Preserve LaTeX from evidence: use \\(...\\) for inline math and \\[...\\] for display math. Never wrap math "
         "in backticks or Markdown code fences, and never remove its math delimiters.\n"
+        "- If no relevant sources are provided or retrieved evidence does not contain enough information to answer "
+        "the question, clearly state that you do not have enough source evidence instead of guessing.\n"
         "- Before finishing, verify that the real goal was answered, evidence is fresh enough, dates and numbers "
         "are accurate, citations open, and remaining uncertainty is explicit."
     ),
@@ -212,7 +214,9 @@ _USER_ADDRESSING = {
 _USER_TEMPLATE = {
     "en": (
         "Sources:\n{context}\n\nQuestion: {query}\n\n"
-        "Answer from the sources in the same language as the question and cite with [index]."
+        "Answer from the sources in the same language as the question and cite with [index]. "
+        "If the sources are empty or do not contain enough evidence to answer, clearly state that "
+        "the available sources do not contain enough information and do not guess."
     ),
 }
 
@@ -243,6 +247,30 @@ def _identity_prompt(name: str, language: str, *, user_name: str | None = None) 
     return f"{identity_text} {addressing_text}"
 
 
+def _resolve_prompt_language(language: str | None) -> str:
+    normalized = (language or "en").strip().lower()
+    if normalized in {"vi", "en", "zh"}:
+        return normalized
+    return "en"
+
+
+def _guidance_for_language(lang: str) -> str:
+    base = _GUIDANCE["en"]
+    if lang == "zh":
+        base = base.replace(
+            "- Always respond in the same language as the user's question (e.g., Vietnamese or English) unless "
+            "the user explicitly asks for another language. Never respond in Chinese.",
+            "- Respond in Chinese unless the user explicitly asks for another language.",
+        )
+    elif lang == "vi":
+        base = (
+            base
+            + "\n- Preferred response language for this session: Vietnamese "
+            "(unless the user writes in another language)."
+        )
+    return base
+
+
 def build_messages(
     query: str,
     sections: list[RetrievedSection],
@@ -252,11 +280,11 @@ def build_messages(
     name: str = DEFAULT_AGENT_NAME,
     user_name: str | None = None,
 ) -> list[dict[str, str]]:
-    lang = "en"
+    lang = _resolve_prompt_language(language)
     messages: list[dict[str, str]] = [
         {
             "role": "system",
-            "content": "\n\n".join((_identity_prompt(name, lang, user_name=user_name), _GUIDANCE[lang])),
+            "content": "\n\n".join((_identity_prompt(name, lang, user_name=user_name), _guidance_for_language(lang))),
         }
     ]
     if history:
@@ -264,7 +292,7 @@ def build_messages(
     messages.append(
         {
             "role": "user",
-            "content": _USER_TEMPLATE[lang].format(context=_format_context(sections), query=query),
+            "content": _USER_TEMPLATE["en"].format(context=_format_context(sections), query=query),
         }
     )
     return messages
@@ -282,20 +310,25 @@ def build_agent_messages(
     user_name: str | None = None,
 ) -> list[dict[str, Any]]:
     """Build agent messages with on-demand tool retrieval."""
-    lang = "en"
+    lang = _resolve_prompt_language(language)
     persona = persona or {}
     parts = [_identity_prompt(name, lang, user_name=user_name)]
     system_prompt = str(persona.get("system_prompt") or "").strip()
     if system_prompt:
         parts.append(system_prompt)
-    parts.append(_GUIDANCE[lang])
-    parts.append(_TIME_RULE[lang].format(timezone=timezone))
+    parts.append(_guidance_for_language(lang))
+    parts.append(_TIME_RULE["en"].format(timezone=timezone))
     guardrails = persona.get("guardrails") or []
     if guardrails:
         parts.append("Constraints: " + "; ".join(guardrails))
     empty_response = (persona.get("empty_response") or "").strip()
     if empty_response:
         parts.append(f'If no relevant sources are found after retrieval, respond with: "{empty_response}"')
+    else:
+        parts.append(
+            "If no relevant sources are found after retrieval, clearly state that the available knowledge base "
+            "does not contain enough evidence to answer without guessing."
+        )
     messages: list[dict[str, str]] = [{"role": "system", "content": "\n\n".join(parts)}]
     if history:
         messages.extend(history)
