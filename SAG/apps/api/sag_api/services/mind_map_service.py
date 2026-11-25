@@ -24,6 +24,7 @@ from sqlalchemy.orm import aliased
 from sag_api.core.errors import ForbiddenError, ServiceUnavailableError
 from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal
+from sag_api.core.text_utils import normalize_text
 from sag_api.core.token_usage import extract_chat_usage, token_usage_scope
 from sag_api.db.base import new_id
 from sag_api.db.models import (
@@ -55,7 +56,7 @@ log = get_logger("services.mind_map")
 _CONTINUUM_DOC_ID_RE = re.compile(
     r"^(?:continuum:project_document:|project-document:)?([0-9a-fA-F]{24})\Z"
 )
-_SECTION_SPLIT_RE = re.compile(r"\s*(?:>|/|→|\|)\s*")
+_SECTION_SPLIT_RE = re.compile(r"\s*(?:>|→|\|)\s*")
 _WORD_TOKEN_RE = re.compile(r"[\w]{2,}", re.UNICODE)
 
 _MAX_DOCUMENTS = 24
@@ -158,7 +159,7 @@ def _topic_terms(topic: str | None) -> list[str]:
     if not topic:
         return []
     seen: list[str] = []
-    for match in _WORD_TOKEN_RE.findall(topic.casefold()):
+    for match in _WORD_TOKEN_RE.findall(normalize_text(topic).casefold()):
         if match not in seen:
             seen.append(match)
         if len(seen) >= 8:
@@ -176,10 +177,10 @@ def _score_text_against_topic(
 ) -> float:
     if not topic:
         return 0.0
-    needle = topic.casefold()
-    fname_l = filename.casefold()
-    sec_l = section_path.casefold()
-    body_l = content.casefold()
+    needle = normalize_text(topic).casefold()
+    fname_l = normalize_text(filename).casefold()
+    sec_l = normalize_text(section_path).casefold()
+    body_l = normalize_text(content).casefold()
     score = 0.0
     if needle in sec_l:
         score += 12.0

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
-import unicodedata
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -14,6 +12,7 @@ from sqlalchemy import and_, exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
+from sag_api.core.text_utils import slugify_ascii
 from sag_api.octx.errors import OctxSourceReextractRequiredError
 from sag_api.sag.octx_ids import ProducerIdMap
 from sag_api.sag.octx_vector_manifest import VectorExportManifest
@@ -48,9 +47,7 @@ def _write_jsonl(handle, record: dict[str, Any]) -> None:  # noqa: ANN001
 
 
 def _slug(value: str) -> str:
-    normalized = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode()
-    slug = re.sub(r"[^a-zA-Z0-9]+", "-", normalized).strip("-").casefold()
-    return slug[:80] or "document"
+    return slugify_ascii(value, max_length=80, default="document")
 
 
 _SENSITIVE_EXTRA_KEY_TOKENS = (

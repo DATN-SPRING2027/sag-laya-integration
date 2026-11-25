@@ -21,8 +21,10 @@ import threading
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from functools import lru_cache
 from typing import Any
+
+from sag_api.core.text_utils import _tiktoken_encoding  # noqa: F401
+from sag_api.core.text_utils import estimate_text_tokens as _shared_estimate_text_tokens
 
 # Default serverless pricing per 1,000,000 tokens in USD (SiliconFlow / OpenAI-compatible).
 # Operators can override or extend entries via SAG_TOKEN_PRICING_JSON.
@@ -137,26 +139,8 @@ def compute_bucket_cost_usd(model: str | None, bucket: Mapping[str, Any]) -> flo
     return round(cost, 8)
 
 
-@lru_cache(maxsize=1)
-def _tiktoken_encoding():
-    try:
-        import tiktoken
-
-        return tiktoken.get_encoding("cl100k_base")
-    except Exception:  # noqa: BLE001
-        return None
-
-
 def estimate_text_tokens(texts: Sequence[str] | str | None) -> int:
-    if not texts:
-        return 0
-    items = [texts] if isinstance(texts, str) else [t for t in texts if t]
-    if not items:
-        return 0
-    enc = _tiktoken_encoding()
-    if enc is not None:
-        return sum(len(enc.encode(t)) for t in items)
-    return sum(max(1, len(t.encode("utf-8")) // 4) for t in items)
+    return _shared_estimate_text_tokens(texts)
 
 
 def extract_embedding_usage(raw_usage: Any, texts: Sequence[str] | str | None = None) -> dict[str, Any]:

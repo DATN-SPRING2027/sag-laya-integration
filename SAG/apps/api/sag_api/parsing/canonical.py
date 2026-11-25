@@ -8,10 +8,16 @@ from __future__ import annotations
 
 import hashlib
 import re
-import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Literal
+
+from sag_api.core.text_utils import (
+    estimate_tokens,
+    normalize_text,
+    split_clauses_multilingual,
+    split_sentence_spans_multilingual,
+)
 
 BlockType = Literal["heading", "paragraph", "table", "code", "list", "caption"]
 
@@ -48,59 +54,45 @@ _MULTILINGUAL_CLAUSE_SPLIT_RE = re.compile(
 
 
 def estimate_unicode_tokens(text: str) -> int:
-    """Ước lượng số lượng token độc lập ngôn ngữ (hỗ trợ cả chữ Latin/Cyrillic/Ả Rập có dấu cách
-    lẫn chữ Hán/Nhật/Hàn/Thái/Lào/Khmer không khoảng trắng) mà không tốn chi phí gọi model."""
-    if not text:
-        return 0
-    continuous_chars = len(_CONTINUOUS_SCRIPT_CHAR_RE.findall(text))
-    stripped_other = _CONTINUOUS_SCRIPT_CHAR_RE.sub(" ", text)
-    spaced_words = len(stripped_other.split())
-    return max(1, continuous_chars + spaced_words)
+    """Ước lượng số lượng token qua shared tiktoken cl100k_base + fallback tiếng Việt/CJK."""
+    return estimate_tokens(text)
 
 
-def _split_atomic_spans(text: str, *, max_span_tokens: int) -> list[str]:
-    """Tách văn bản thành các câu tự nhiên đa ngôn ngữ; chỉ hạ xuống ranh giới mệnh đề nếu 1 câu đơn quá dài."""
-    import math as _math  # noqa: F401
+def _split_atomic_spans_with_offsets(text: str, *, max_span_tokens: int) -> list[tuple[int, int, str]]:
+    """Tách văn bản thành câu tự nhiên đa ngôn ngữ kèm offset; hạ xuống mệnh đề nếu câu quá dài."""
+    raw_spans = split_sentence_spans_multilingual(text)
+    if not raw_spans:
+        stripped = text.strip()
+        return [(0, len(text), stripped)] if stripped else []
 
-    raw_parts = [p.strip() for p in _MULTILINGUAL_SENTENCE_SPLIT_RE.split(text) if p and p.strip()]
-    if not raw_parts:
-        return [text.strip()] if text.strip() else []
-
-    # Gộp các mảnh đánh số đầu mục quá ngắn (VD: "1.", "Điều 5.") vào câu ngay sau nó
-    merged_sentences: list[str] = []
-    idx = 0
-    while idx < len(raw_parts):
-        cur = raw_parts[idx]
-        if idx + 1 < len(raw_parts) and len(cur) <= 12 and estimate_unicode_tokens(cur) <= 3:
-            merged_sentences.append(f"{cur} {raw_parts[idx + 1]}")
-            idx += 2
-        else:
-            merged_sentences.append(cur)
-            idx += 1
-
-    final_spans: list[str] = []
-    for sent in merged_sentences:
+    final_spans: list[tuple[int, int, str]] = []
+    for s_start, s_end, sent in raw_spans:
         if estimate_unicode_tokens(sent) <= max_span_tokens:
-            final_spans.append(sent)
+            final_spans.append((s_start, s_end, sent))
             continue
-        clauses = [c.strip() for c in _MULTILINGUAL_CLAUSE_SPLIT_RE.split(sent) if c and c.strip()]
+        clauses = split_clauses_multilingual(sent)
         if len(clauses) <= 1:
-            final_spans.append(sent)
+            final_spans.append((s_start, s_end, sent))
             continue
         buf: list[str] = []
         buf_toks = 0
         for cl in clauses:
             cl_toks = estimate_unicode_tokens(cl)
             if buf and buf_toks + cl_toks > max_span_tokens // 2:
-                final_spans.append(" ".join(buf))
+                final_spans.append((s_start, s_end, " ".join(buf)))
                 buf = [cl]
                 buf_toks = cl_toks
             else:
                 buf.append(cl)
                 buf_toks += cl_toks
         if buf:
-            final_spans.append(" ".join(buf))
+            final_spans.append((s_start, s_end, " ".join(buf)))
     return final_spans
+
+
+def _split_atomic_spans(text: str, *, max_span_tokens: int) -> list[str]:
+    """Tách văn bản thành các câu tự nhiên đa ngôn ngữ; chỉ hạ xuống ranh giới mệnh đề nếu 1 câu đơn quá dài."""
+    return [seg for _s, _e, seg in _split_atomic_spans_with_offsets(text, max_span_tokens=max_span_tokens)]
 
 
 def segment_prose_by_information_cohesion(
@@ -125,7 +117,8 @@ def segment_prose_by_information_cohesion(
     if not cleaned or estimate_unicode_tokens(cleaned) <= max_block_tokens:
         return [cleaned] if cleaned else []
 
-    spans = _split_atomic_spans(cleaned, max_span_tokens=max_block_tokens)
+    span_records = _split_atomic_spans_with_offsets(cleaned, max_span_tokens=max_block_tokens)
+    spans = [seg for _s, _e, seg in span_records]
     m = len(spans)
     if m <= 1:
         return [cleaned]
@@ -260,7 +253,23 @@ def segment_prose_by_information_cohesion(
         cur = a
     cuts.reverse()
 
-    segments = [" ".join(spans[a:b]).strip() for a, b in cuts if " ".join(spans[a:b]).strip()]
+    def _join_span_range(a: int, b: int) -> str:
+        parts: list[str] = []
+        for idx_s in range(a, b):
+            if idx_s > a:
+                prev_end = span_records[idx_s - 1][1]
+                cur_start = span_records[idx_s][0]
+                gap = cleaned[prev_end:cur_start] if cur_start >= prev_end else ""
+                if "\n\n" in gap:
+                    parts.append("\n\n")
+                elif "\n" in gap:
+                    parts.append("\n")
+                else:
+                    parts.append(" ")
+            parts.append(span_records[idx_s][2])
+        return "".join(parts).strip()
+
+    segments = [seg for a, b in cuts if (seg := _join_span_range(a, b))]
     return segments if segments else [cleaned]
 
 
@@ -276,33 +285,6 @@ class ExtractedBlock:
     source_anchor: str | None = None
     is_boilerplate: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
-
-
-def normalize_text(text: str, *, preserve_code: bool = False) -> str:
-    """Chuẩn hóa Unicode NFC, loại bỏ ký tự điều khiển ngoại trừ tab/newline.
-    
-    Bảo toàn nguyên vẹn dấu chấm câu, định danh kỹ thuật, cấu trúc bảng và thụt lề code.
-    """
-    if not text:
-        return ""
-
-    # 1. Unicode Normalization: NFC dựng sẵn chuẩn quốc tế
-    normalized = unicodedata.normalize("NFC", text)
-
-    # 2. Xóa các ký tự điều khiển vô hình (zero-width, null), giữ \n, \t
-    cleaned_chars = [
-        ch for ch in normalized
-        if ch in ("\n", "\t", "\r") or not unicodedata.category(ch).startswith("C")
-    ]
-    cleaned = "".join(cleaned_chars)
-
-    if preserve_code:
-        # Giữ nguyên cấu trúc dòng và khoảng trắng cho code
-        return cleaned.rstrip()
-
-    # 3. Chuẩn hóa xuống dòng Unix
-    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
-    return cleaned.strip()
 
 
 def is_boilerplate_text(text: str) -> bool:

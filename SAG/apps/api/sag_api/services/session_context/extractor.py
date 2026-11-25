@@ -6,7 +6,6 @@ import asyncio
 import hashlib
 import json
 import re
-import unicodedata
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -15,6 +14,7 @@ from typing import Any
 
 from sag_api.core.config import settings
 from sag_api.core.logging import get_logger
+from sag_api.core.text_utils import normalize_text, split_sentence_spans_multilingual
 from sag_api.core.token_usage import token_usage_scope
 from sag_api.generation.json_parser import decode_json_object
 from sag_api.generation.llm import StructuredLLMClient
@@ -156,7 +156,7 @@ class _TurnBlockAdapter:
 
 
 def normalize_session_text(text: str) -> str:
-    return unicodedata.normalize("NFC", text or "").strip()
+    return normalize_text(text or "", preserve_code=True)
 
 
 def normalize_entity_key(label: str) -> str:
@@ -183,16 +183,11 @@ def extract_content_terms(text: str) -> set[str]:
 
 
 def split_sentences_with_spans(text: str) -> list[tuple[int, int, str]]:
-    """Split text into sentences preserving decimals using _SENTENCE_SPLIT_RE."""
+    """Split text into sentences preserving numbers, URLs, times, ratios, abbreviations, and newlines."""
     normalized = normalize_session_text(text)
     if not normalized:
         return []
-    spans: list[tuple[int, int, str]] = []
-    for match in _SENTENCE_SPLIT_RE.finditer(normalized):
-        s_start, s_end = match.span()
-        seg = normalized[s_start:s_end].strip()
-        if seg:
-            spans.append((s_start, s_end, seg))
+    spans = split_sentence_spans_multilingual(normalized)
     return spans or [(0, len(normalized), normalized)]
 
 

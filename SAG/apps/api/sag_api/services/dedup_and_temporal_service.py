@@ -26,6 +26,7 @@ from sqlalchemy import desc, inspect, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.logging import get_logger
+from sag_api.core.text_utils import normalize_text
 from sag_api.db.models.document import Document
 from sag_api.db.models.routing_rag import (
     CanonicalBlock,
@@ -100,7 +101,7 @@ def tokenize_for_minhash(text: str) -> list[str]:
     """
     if not text:
         return []
-    return _MINHASH_TOKEN_RE.findall(text.casefold())
+    return _MINHASH_TOKEN_RE.findall(normalize_text(text).casefold())
 
 
 _MINHASH_CACHE: OrderedDict[str, list[int]] = OrderedDict()
@@ -300,7 +301,7 @@ _LIFECYCLE_SUPERSEDE_JOINED: frozenset[str] = frozenset({
 
 
 def _tokenize_for_diff(text: str) -> list[str]:
-    norm = _THOUSANDS_COMMA_RE.sub("", text.casefold())
+    norm = _THOUSANDS_COMMA_RE.sub("", normalize_text(text).casefold())
     norm = _EN_WON_T_RE.sub("will not", norm)
     norm = _EN_CAN_T_RE.sub("can not", norm)
     norm = _EN_N_T_RE.sub(r"\1 not", norm)

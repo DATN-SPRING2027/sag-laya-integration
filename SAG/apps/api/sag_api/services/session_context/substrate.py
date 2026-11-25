@@ -20,6 +20,7 @@ from typing import Any
 import igraph as ig
 
 from sag_api.core.logging import get_logger
+from sag_api.core.text_utils import normalize_text
 from sag_api.generation.prompt import estimate_tokens
 from sag_api.services.search_index_service import (
     COMMON_STOPWORDS,
@@ -662,10 +663,12 @@ class IncrementalSessionIndex:
         window.content_terms = frozenset(merged_terms)
 
     def _register_turn_entities(self, turn: IndexedTurn) -> None:
+        norm_content_cf = normalize_text(turn.content, preserve_code=True).casefold()
         for mention in turn.entities:
             self.entity_surfaces.setdefault(mention.key, mention.surface)
             turn_counts = self.entity_to_turn_counts.setdefault(mention.key, {})
-            occ = max(1, turn.content.casefold().count(mention.surface.casefold()))
+            norm_surface_cf = normalize_text(mention.surface, preserve_code=True).casefold()
+            occ = max(1, norm_content_cf.count(norm_surface_cf)) if norm_surface_cf else 1
             turn_counts[turn.turn_id] = turn_counts.get(turn.turn_id, 0) + occ
             for alias_key in mention.soft_aliases:
                 self.soft_alias_neighbors.setdefault(mention.key, set()).add(alias_key)

@@ -16,6 +16,7 @@ from typing import Any, Protocol
 from weakref import WeakKeyDictionary
 
 import httpx
+import regex
 from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,6 +27,7 @@ from sag_api.core.db import SessionLocal
 from sag_api.core.errors import ServiceUnavailableError
 from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal
+from sag_api.core.text_utils import normalize_text
 from sag_api.db.models import (
     CanonicalBlock,
     Document,
@@ -960,9 +962,9 @@ def _routing_trace(
     }
 
 
-_ARTIFACT_CODE_RE = re.compile(
-    r"\b([a-z]{2,8})[\s_#-]+(\d{2,6}[a-z0-9]*)\b",
-    re.IGNORECASE,
+_ARTIFACT_CODE_RE = regex.compile(
+    r"(?<!\w)(\p{L}{2,8})[\s_#-]+(\d{2,6}[\p{L}\d]*)(?!\w)",
+    regex.IGNORECASE,
 )
 _NON_ARTIFACT_PREFIXES = frozenset(
     {
@@ -1619,7 +1621,7 @@ async def _expand_multi_hop_sections(
 
     seed_version_ids = {str(item[0]) for item in seed_ranges}
     allowed_partitions = sorted({v.partition_id for v in current_versions.values()})
-    query_folded = re.sub(r"[\s_-]+", " ", (query or "").lower()).strip()
+    query_folded = re.sub(r"[\s_-]+", " ", normalize_text(query or "").lower()).strip()
     query_single_words = set(re.findall(r"[^\W_]+", query_folded, flags=re.UNICODE))
     allowed_lineage_kinds = (
         {"SUPERSEDED_BY", "CONTRADICTS"}
@@ -1664,7 +1666,7 @@ async def _expand_multi_hop_sections(
                         seed_ku_scores[ku.id] = max(seed_ku_scores.get(ku.id, 0.0), s_score)
                         if idx_r < 2 or s_score >= 0.85 * max_seed_score:
                             for ent in ku.entities_raw:
-                                ent_clean = re.sub(r"[\s_-]+", " ", ent.lower()).strip()
+                                ent_clean = re.sub(r"[\s_-]+", " ", normalize_text(ent or "").lower()).strip()
                                 is_cont = _is_cjk_or_continuous_entity(ent_clean)
                                 if len(ent_clean) < (2 if is_cont else 3):
                                     continue
@@ -1723,7 +1725,7 @@ async def _expand_multi_hop_sections(
                         b_ent for b_ent in top_seed_entities if _is_cjk_or_continuous_entity(b_ent)
                     }
                     path_patterns: dict[str, re.Pattern[str]] = {
-                        b_ent: re.compile(rf"\b{re.escape(b_ent)}\b")
+                        b_ent: re.compile(rf"(?<!\w){re.escape(b_ent)}(?!\w)")
                         for b_ent in top_seed_entities
                         if b_ent not in cont_entities and len(b_ent) >= 5
                     }

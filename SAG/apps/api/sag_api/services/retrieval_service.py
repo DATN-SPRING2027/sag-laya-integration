@@ -14,6 +14,7 @@ from typing import Any, Literal
 
 from sag_api.core.config import FIXED_SEARCH_TOP_K, settings
 from sag_api.core.logging import get_logger
+from sag_api.core.text_utils import normalize_text, split_sentences_multilingual
 from sag_api.generation.json_parser import decode_json_values
 from sag_api.sag import RetrievedSection, SearchOutcome
 from sag_api.services.evidence_service import (
@@ -1528,13 +1529,13 @@ def _best_excerpt(
         query,
         segmentation_enabled=settings.search_chinese_segmentation_enabled,
     )
-    content = re.sub(r"\s+", " ", section.content).strip()
+    content = normalize_text(section.content, preserve_code=True)
     if not content:
         return section.heading.strip()
-    sentences = [part.strip() for part in re.split(r"(?<=[。！？.!?])", content) if part.strip()]
+    sentences = [" ".join(part.split()) for part in split_sentences_multilingual(content) if part.strip()]
     terms = [normalize_lexical_text(term) for term in effective.scoring_terms]
     best = max(
-        sentences or [content],
+        sentences or [" ".join(content.split())],
         key=lambda sentence: sum(term in normalize_lexical_text(sentence) for term in terms),
     )
     return best[:limit] + ("…" if len(best) > limit else "")

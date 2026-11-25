@@ -28,6 +28,7 @@ from zleap.sag import DataEngine
 from zleap.sag.pipeline import SearchOptions, SearchRequest, SearchScope
 
 from sag_api.core.config import Settings
+from sag_api.core.text_utils import normalize_text
 from sag_api.core.error_taxonomy import ErrorLayer, ErrorStage
 from sag_api.core.logging import get_logger
 from sag_api.enums import (
@@ -1781,7 +1782,9 @@ class EngineManager:
                 *direct_rows,
                 *(row for row in balanced_rows if (row["source_config_id"], row["id"]) not in selected_direct_keys),
             ]:
-                normalized_title = re.sub(r"\s+", "", str(row["title"] or "")).casefold()
+                normalized_title = re.sub(
+                    r"\s+", "", normalize_text(str(row["title"] or ""))
+                ).casefold()
                 title_key = (row["source_config_id"], normalized_title or row["id"])
                 if title_key in seen_titles:
                     continue

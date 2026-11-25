@@ -24,6 +24,7 @@ from sag_api.core.identity import (
 )
 from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal as AssertionVerifiedPrincipal
+from sag_api.core.text_utils import estimate_tokens
 from sag_api.db.base import new_id
 from sag_api.db.models import Document, Job, Source, SourceProjectMapping
 from sag_api.db.models.routing_rag import (
@@ -1865,7 +1866,7 @@ async def get_document_version_chunks(
         content = (block.normalized_text or "").strip()
         if not content:
             continue
-        est_tokens = max(1, len(content.split()))
+        est_tokens = estimate_tokens(content)
         total_tokens += est_tokens
         ordinal = len(block_items) + 1
         block_items.append(

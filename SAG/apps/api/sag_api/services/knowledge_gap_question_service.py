@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.config import settings
+from sag_api.core.text_utils import normalize_text
 from sag_api.core.token_usage import token_usage_scope
 from sag_api.db.models import KnowledgeEvidence, KnowledgeGap, KnowledgeGapQuestion, KnowledgeQualityAssessment
 from sag_api.generation.llm import LLMClient
@@ -141,9 +142,9 @@ def _validated_question(value: str) -> str:
 
 
 def _validate_evidence_anchor(question: str, evidence: list[dict[str, str]]) -> None:
-    question_tokens = re.findall(r"[^\W_]+", question.casefold(), flags=re.UNICODE)
+    question_tokens = re.findall(r"[^\W_]+", normalize_text(question).casefold(), flags=re.UNICODE)
     for item in evidence:
-        quote_tokens = re.findall(r"[^\W_]+", item["quote"].casefold(), flags=re.UNICODE)
+        quote_tokens = re.findall(r"[^\W_]+", normalize_text(item["quote"]).casefold(), flags=re.UNICODE)
         phrase_length = min(3, len(quote_tokens))
         if phrase_length == 0:
             continue

@@ -9,6 +9,7 @@ from sag_api.core.db import get_session
 from sag_api.core.deps import get_current_user, get_engine_manager, require_path_source_access
 from sag_api.core.errors import ForbiddenError, NotFoundError, ValidationError
 from sag_api.core.principal_assertion import VerifiedPrincipal, require_project_read_principal
+from sag_api.core.text_utils import normalize_text
 from sag_api.db.models import User
 from sag_api.sag import EngineManager
 from sag_api.schemas.chunk import (
@@ -131,6 +132,7 @@ async def grep(
     engine_manager: EngineManager = Depends(get_engine_manager),
 ) -> GrepResponse:
     """精确文本匹配：按原文字面内容查找，大小写不敏感。"""
+    pattern = normalize_text(pattern)
     source = await get_source(session, source_id)
     if source.id in await versioned_source_ids(session, [source.id]):
         from sag_api.services.search_unit_retrieval_service import grep_search_unit_blocks

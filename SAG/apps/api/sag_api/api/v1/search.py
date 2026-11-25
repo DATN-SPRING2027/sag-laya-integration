@@ -22,6 +22,7 @@ from sag_api.core.error_taxonomy import ErrorCode
 from sag_api.core.errors import ApiError, ValidationError
 from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal, require_project_read_principal
+from sag_api.core.text_utils import normalize_text
 from sag_api.core.token_usage import TokenLedger, token_usage_scope
 from sag_api.db.models import Source, User
 from sag_api.enums import SEARCH_STRATEGIES, normalize_search_strategy
@@ -350,10 +351,11 @@ async def _prepare_global_search(
     # request never occupies a pooled database connection while waiting on the
     # engine or model. SessionLocal uses expire_on_commit=False.
     await session.commit()
+    query = normalize_text(body.query)
     resolved_project_id = _resolve_search_project_id(principal, sources)
     with token_usage_scope(project_id=resolved_project_id, tenant_id=principal.tenant_id):
         route_plan = await _build_query_route(
-            body.query,
+            query,
             body.source_ids,
             body.strategy,
             body.retrieval_mode,
@@ -370,12 +372,12 @@ async def _prepare_global_search(
                 },
                 route_plan,
             )
-            outcome = SearchOutcome(query=body.query, sections=[], stats=stats)
+            outcome = SearchOutcome(query=query, sections=[], stats=stats)
             return _PreparedGlobalSearch(
                 sources=[],
                 outcome=outcome,
                 response=SearchResponse(
-                    query=body.query,
+                    query=query,
                     sections=[],
                     stats=stats,
                     answer_status="skipped",
@@ -387,12 +389,12 @@ async def _prepare_global_search(
 
         if not sources:
             stats = _with_query_route_stats({"sources": 0}, route_plan)
-            outcome = SearchOutcome(query=body.query, sections=[], stats=stats)
+            outcome = SearchOutcome(query=query, sections=[], stats=stats)
             return _PreparedGlobalSearch(
                 sources=[],
                 outcome=outcome,
                 response=SearchResponse(
-                    query=body.query,
+                    query=query,
                     sections=[],
                     stats=stats,
                     answer_status="pending",
@@ -407,7 +409,7 @@ async def _prepare_global_search(
         outcome = await retrieve_search_unit_sections(
             engine_manager,
             sources,
-            body.query,
+            query,
             principal=principal,
             top_k=body.top_k,
             query_strategy_plan=route_plan.strategy_plan,
@@ -447,9 +449,9 @@ async def _prepare_global_search(
 
     return _PreparedGlobalSearch(
         sources=sources,
-        outcome=SearchOutcome(query=body.query, sections=outcome.sections, stats=stats),
+        outcome=SearchOutcome(query=query, sections=outcome.sections, stats=stats),
         response=SearchResponse(
-            query=body.query,
+            query=query,
             sections=section_outputs,
             stats=stats,
             answer_status="pending",
@@ -557,6 +559,7 @@ async def search(
         from sag_api.core.errors import NotFoundError
 
         raise NotFoundError("信源不存在")
+    query = normalize_text(body.query)
     project_id = _resolve_search_project_id(principal, [source])
     with token_usage_scope(
         component="search_request",
@@ -565,7 +568,7 @@ async def search(
     ) as search_token_ledger:
         partitioned = source.id in await versioned_source_ids(session, [source.id])
         route_plan = await _build_query_route(
-            body.query,
+            query,
             [source_id],
             body.strategy,
             requested_top_k=body.top_k,
@@ -577,7 +580,7 @@ async def search(
                 outcome = await retrieve_search_unit_sections(
                     engine_manager,
                     [source],
-                    body.query,
+                    query,
                     principal=principal,
                     top_k=body.top_k,
                     query_strategy_plan=route_plan.strategy_plan,
@@ -588,13 +591,13 @@ async def search(
                     retrieve_relevant_sections(
                         engine_manager,
                         [source],
-                        body.query,
+                        query,
                         strategy=route_plan.strategy,
                         top_k=body.top_k,
                     ),
                     recall_event_scores(
                         engine_manager,
-                        body.query,
+                        query,
                         {source.sag_source_config_id: source},
                         limit=route_plan.strategy_plan.retrieval_plan.cardinality.effective_n,
                     ),
@@ -606,7 +609,7 @@ async def search(
                 },
                 route_plan,
             )
-            outcome = SearchOutcome(query=body.query, sections=outcome.sections, stats=stats)
+            outcome = SearchOutcome(query=query, sections=outcome.sections, stats=stats)
         else:
             event_scores = {}
             stats = _with_query_route_stats(
@@ -618,7 +621,7 @@ async def search(
                 },
                 route_plan,
             )
-            outcome = SearchOutcome(query=body.query, sections=[], stats=stats)
+            outcome = SearchOutcome(query=query, sections=[], stats=stats)
         for section in outcome.sections:
             section.source_config_id = section.source_config_id or source.sag_source_config_id
         graph_fields = (
@@ -632,7 +635,7 @@ async def search(
             )
         )
         answer = (
-            await synthesize_search_answer(body.query, outcome.sections, llm=llm, sources=[source])
+            await synthesize_search_answer(query, outcome.sections, llm=llm, sources=[source])
             if route_plan.need_retrieval
             else SearchAnswer("", [], "skipped")
         )
@@ -640,7 +643,7 @@ async def search(
         retrieval_degraded = bool(outcome.stats.get("degraded", False))
         retrieval_degraded_reason = outcome.stats.get("degraded_reason")
         return SearchResponse(
-            query=body.query,
+            query=query,
             sections=[
                 SectionOut(**{**s.model_dump(), "source_id": source.id}, source_name=source.name) for s in outcome.sections
             ],
@@ -881,6 +884,7 @@ async def eval_compare(
 
     source_refs = {source.sag_source_config_id: source for source in sources}
     partitioned_ids = await versioned_source_ids(session, [source.id for source in sources])
+    query = normalize_text(body.query)
     if not sources:
         empty_results = [
             EvalStrategyResultOut(
@@ -891,7 +895,7 @@ async def eval_compare(
             for strategy in ordered_strategies
         ]
         return EvalCompareResponse(
-            query=body.query,
+            query=query,
             results=empty_results,
             judges=[],
             judge_enabled=False,
@@ -903,7 +907,7 @@ async def eval_compare(
             _run_one_strategy(
                 engine_manager,
                 sources,
-                body.query,
+                query,
                 strategy,
                 body.top_k,
                 source_refs,
@@ -949,7 +953,7 @@ async def eval_compare(
             ]
             verdict = await judge_pairwise(
                 llm,
-                body.query,
+                query,
                 a,
                 a_sections,
                 b,
@@ -970,7 +974,7 @@ async def eval_compare(
             judge_reason = "所有 pairwise judge 都失败,已回退空结果"
 
     return EvalCompareResponse(
-        query=body.query,
+        query=query,
         results=list(results),
         judges=judges,
         judge_enabled=judge_enabled,

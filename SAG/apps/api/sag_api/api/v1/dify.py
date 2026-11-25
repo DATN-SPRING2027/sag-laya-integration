@@ -17,6 +17,7 @@ from sag_api.core.errors import (
     ValidationError,
 )
 from sag_api.core.principal_assertion import VerifiedPrincipal, require_principal_assertion
+from sag_api.core.text_utils import normalize_text
 from sag_api.sag import EngineManager
 from sag_api.schemas.dify import (
     DifyRetrievalRecord,
@@ -60,7 +61,7 @@ async def retrieval(
     """Adapt one SAG source to Dify's external knowledge retrieval contract."""
 
     knowledge_id = body.knowledge_id.strip()
-    query = body.query.strip()
+    query = normalize_text(body.query)
     if not knowledge_id and not query:
         return DifyRetrievalResponse()
     if not knowledge_id or not query:

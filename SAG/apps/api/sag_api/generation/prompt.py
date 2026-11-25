@@ -7,6 +7,7 @@ import unicodedata
 from typing import Any
 
 from sag_api.branding import DEFAULT_AGENT_NAME
+from sag_api.core.text_utils import estimate_tokens as _shared_estimate_tokens
 from sag_api.sag import RetrievedSection
 
 _EXCESS_BLANK_LINES_RE = re.compile(r"\n{3,}")
@@ -222,9 +223,8 @@ _USER_TEMPLATE = {
 
 
 def estimate_tokens(text: str) -> int:
-    """Token estimate: CJK ≈ 1/char, others ≈ 1/4 chars."""
-    cjk = sum(1 for ch in text if "\u3000" <= ch <= "\u9fff" or "\uf900" <= ch <= "\ufaff")
-    return cjk + max(0, (len(text) - cjk) + 3) // 4
+    """Token estimate using shared tiktoken cl100k_base + UTF-8 Vietnamese-safe fallback."""
+    return _shared_estimate_tokens(text)
 
 
 def _format_context(sections: list[RetrievedSection]) -> str:

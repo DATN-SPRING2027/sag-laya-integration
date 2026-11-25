@@ -17,12 +17,14 @@ from sqlalchemy.orm import load_only
 
 from sag_api.core.config import settings
 from sag_api.core.db import SessionLocal
+from sag_api.core.text_utils import normalize_text
 from sag_api.db.models.routing_rag import (
     ProjectSearchState,
     TreeManifest,
     TreeRoutingProfile,
     TreeSnapshotLease,
 )
+from sag_api.sag.search_unit_store import _expand_continuous_script_tokens
 from sag_api.services.query_routing_service import (
     GroupRoutingSnapshot,
     scope_fingerprint,
@@ -33,7 +35,6 @@ from sag_api.services.query_routing_service import (
 from sag_api.services.query_routing_service import (
     RoutingSnapshot as QueryRoutingSnapshot,
 )
-from sag_api.sag.search_unit_store import _expand_continuous_script_tokens
 from sag_api.services.search_index_service import COMMON_STOPWORDS
 from sag_api.services.tree_publish_service import (
     _checksum_manifest,
@@ -159,14 +160,17 @@ def _query_signal_scores(
     folded_query: str | None = None,
     query_years: tuple[int, ...] = (),
 ) -> dict[str, float]:
+    norm_query = normalize_text(query)
     if query_terms is None:
-        raw_query_terms = set(_expand_continuous_script_tokens(_TOKEN_PATTERN.findall(query.casefold())))
+        raw_query_terms = set(_expand_continuous_script_tokens(_TOKEN_PATTERN.findall(norm_query.casefold())))
         informative_terms = {
             t for t in raw_query_terms if t not in COMMON_STOPWORDS and (len(t) >= 2 or t.isdigit())
         }
         query_terms = informative_terms or raw_query_terms
     if folded_query is None:
-        folded_query = query.casefold()
+        folded_query = norm_query.casefold()
+    else:
+        folded_query = normalize_text(folded_query).casefold()
     sparse = profile.get("sparse")
     weights: list[tuple[str, float]] = []
     if isinstance(sparse, list):
@@ -180,7 +184,7 @@ def _query_signal_scores(
                 and math.isfinite(float(item[1]))
                 and float(item[1]) >= 0.0
             ):
-                weights.append((item[0].casefold(), float(item[1])))
+                weights.append((normalize_text(item[0]).casefold(), float(item[1])))
     weight_map: dict[str, float] = {}
     for term, weight in weights:
         weight_map[term] = weight_map.get(term, 0.0) + weight
@@ -197,18 +201,19 @@ def _query_signal_scores(
     scores: dict[str, float] = {"sparse": sparse_score}
     entities = profile.get("entities")
     if isinstance(entities, list) and all(isinstance(entity, str) for entity in entities):
+        norm_entities = [normalize_text(entity) for entity in entities]
         if any(
             entity.strip()
             and (
                 (len(entity.strip()) >= 4 or not entity.isascii())
                 and entity.casefold() in folded_query
             )
-            for entity in entities
+            for entity in norm_entities
         ):
             scores["entity"] = 1.0
         else:
             best_overlap = 0.0
-            for entity in entities:
+            for entity in norm_entities:
                 ent_tokens = {
                     t
                     for t in _TOKEN_PATTERN.findall(entity.casefold())
@@ -368,14 +373,15 @@ def _build_query_node_profiles(
 ) -> tuple[QueryNodeProfile, ...]:
     if not cached_nodes:
         return ()
+    norm_query = normalize_text(query)
     if query_terms is None:
-        raw_query_terms = set(_expand_continuous_script_tokens(_TOKEN_PATTERN.findall(query.casefold())))
+        raw_query_terms = set(_expand_continuous_script_tokens(_TOKEN_PATTERN.findall(norm_query.casefold())))
         informative_terms = {
             t for t in raw_query_terms if t not in COMMON_STOPWORDS and (len(t) >= 2 or t.isdigit())
         }
         query_terms = informative_terms or raw_query_terms
     if folded_query is None:
-        folded_query = query.casefold()
+        folded_query = norm_query.casefold()
     if query_years is None:
         query_years = tuple(
             sorted({int(m) for m in _QUERY_YEAR_RE.findall(query) if 1900 <= int(m) <= 2100})
@@ -879,12 +885,13 @@ async def acquire_tree_query_snapshot(
 
     # Compute dense/sparse/entity/temporal scores outside the DB transaction so locks are never held during I/O
     try:
-        raw_query_terms = set(_expand_continuous_script_tokens(_TOKEN_PATTERN.findall(query.casefold())))
+        norm_query = normalize_text(query)
+        raw_query_terms = set(_expand_continuous_script_tokens(_TOKEN_PATTERN.findall(norm_query.casefold())))
         informative_terms = {
             t for t in raw_query_terms if t not in COMMON_STOPWORDS and (len(t) >= 2 or t.isdigit())
         }
         query_terms = informative_terms or raw_query_terms
-        folded_query = query.casefold()
+        folded_query = norm_query.casefold()
         query_years = tuple(
             sorted({int(m) for m in _QUERY_YEAR_RE.findall(query) if 1900 <= int(m) <= 2100})
         )

@@ -37,6 +37,7 @@ from sag_api.core.principal_assertion import (
     require_project_bff_principal,
     require_project_read_principal,
 )
+from sag_api.core.text_utils import normalize_text
 from sag_api.db.models import Document, User
 from sag_api.enums import DocumentStatus
 from sag_api.jobs import JobQueue
@@ -102,8 +103,9 @@ def _check_extension(filename: str | None) -> None:
 
 
 def _upload_filename(filename: str | None) -> str:
-    """Strip client paths from multipart filenames on POSIX and Windows."""
-    return (filename or "upload").replace("\\", "/").rsplit("/", maxsplit=1)[-1] or "upload"
+    """Strip client paths from multipart filenames on POSIX and Windows and normalize to NFC."""
+    base = (filename or "upload").replace("\\", "/").rsplit("/", maxsplit=1)[-1] or "upload"
+    return normalize_text(base, preserve_code=True) or "upload"
 
 
 async def _source_upload_scope(
@@ -321,6 +323,9 @@ async def upload(
                 project_id=project_id,
                 partition_id=x_continuum_security_partition,
             )
+            norm_logical_source_id = (
+                normalize_text(logical_source_id, preserve_code=True) if logical_source_id else None
+            )
             result = await handle_document_upload(
                 session,
                 tenant_id=tenant_id,
@@ -331,7 +336,7 @@ async def upload(
                 file_bytes=data,
                 original_filename=filename,
                 content_type=file.content_type or "application/octet-stream",
-                logical_source_id=logical_source_id or f"source:{source.id}:{filename}",
+                logical_source_id=norm_logical_source_id or f"source:{source.id}:{filename}",
                 job_queue=job_queue,
                 source_id=source.id,
             )
@@ -389,6 +394,16 @@ async def ingest(
             project_id=body.project_id,
             partition_id=x_continuum_security_partition,
         )
+        norm_messages = None
+        if body.messages:
+            norm_messages = []
+            for m in body.messages:
+                d = m.model_dump()
+                if isinstance(d.get("text"), str):
+                    d["text"] = normalize_text(d["text"], preserve_code=True)
+                if isinstance(d.get("author"), str):
+                    d["author"] = normalize_text(d["author"])
+                norm_messages.append(d)
         document = await ingest_content(
             session,
             source,
@@ -397,10 +412,12 @@ async def ingest(
             owner_id=principal.subject,
             security_partition_id=partition_id,
             client_token=idempotency_key or f"source-ingest-{uuid.uuid4().hex}",
-            text=body.text,
-            title=body.title,
-            messages=[m.model_dump() for m in body.messages] if body.messages else None,
-            logical_source_id=body.logical_source_id,
+            text=normalize_text(body.text, preserve_code=True) if body.text else None,
+            title=normalize_text(body.title) if body.title else None,
+            messages=norm_messages,
+            logical_source_id=(
+                normalize_text(body.logical_source_id, preserve_code=True) if body.logical_source_id else None
+            ),
             job_queue=job_queue,
         )
     return DocumentOut.model_validate(document)
@@ -679,7 +696,7 @@ async def upload_document_version(
         file_bytes=file_bytes,
         original_filename=filename,
         content_type=file.content_type or "application/octet-stream",
-        logical_source_id=logical_source_id,
+        logical_source_id=normalize_text(logical_source_id, preserve_code=True) if logical_source_id else None,
         source_published_at=source_published_at,
         job_queue=job_queue,
     )
