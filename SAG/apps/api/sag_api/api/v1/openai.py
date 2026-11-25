@@ -148,27 +148,71 @@ def _find_closing_backticks(text: str, start: int, run_len: int) -> int:
     return -1
 
 
-def _prose_segments(text: str) -> tuple[list[tuple[int, int]], int | None]:
-    """Return non-code prose spans and optional start index of a bounded unclosed inline-code span."""
+def _advance_markdown_state(
+    flushed: str,
+    *,
+    at_line_start: bool,
+    code_fence: str | None,
+) -> tuple[bool, str | None]:
+    """Advance cross-chunk markdown line-start and fenced-code state for an emitted SSE prefix."""
+    if not flushed:
+        return at_line_start, code_fence
+
+    index = 0
+    length = len(flushed)
+    while index < length:
+        line_start = (index == 0 and at_line_start) or (index > 0 and flushed[index - 1] == "\n")
+        nl_idx = flushed.find("\n", index)
+        line_end = length if nl_idx == -1 else nl_idx + 1
+        if line_start:
+            fence_match = _FENCE_OPEN_RE.match(flushed, index)
+            if fence_match:
+                marker = fence_match.group(2)
+                suffix = flushed[fence_match.end() : line_end].strip()
+                if code_fence is None:
+                    if marker[0] != "`" or "`" not in suffix:
+                        code_fence = marker
+                elif (
+                    code_fence[0] == marker[0]
+                    and len(marker) >= len(code_fence)
+                    and suffix == ""
+                ):
+                    code_fence = None
+        index = line_end
+    return flushed.endswith("\n"), code_fence
+
+
+def _prose_segments(
+    text: str,
+    *,
+    at_line_start: bool = True,
+    code_fence: str | None = None,
+) -> tuple[list[tuple[int, int]], int | None]:
+    """Return non-code prose spans and optional start index of a bounded unclosed code/fence span."""
     segments: list[tuple[int, int]] = []
     prose_start = 0
     index = 0
     length = len(text)
-    code_fence: str | None = None
     unclosed_code_start: int | None = None
 
     while index < length:
-        line_start = index == 0 or text[index - 1] == "\n"
+        line_start = (index == 0 and at_line_start) or (index > 0 and text[index - 1] == "\n")
         if line_start:
+            nl_idx = text.find("\n", index)
+            line_end = length if nl_idx == -1 else nl_idx + 1
             fence_match = _FENCE_OPEN_RE.match(text, index)
             if fence_match:
                 marker = fence_match.group(2)
-                nl_idx = text.find("\n", index)
-                line_end = length if nl_idx == -1 else nl_idx + 1
                 suffix = text[fence_match.end() : line_end].strip()
                 if code_fence is None:
                     # CommonMark §4.5: backtick fence info strings cannot contain backticks.
                     if marker[0] != "`" or "`" not in suffix:
+                        if nl_idx == -1 and (length - index) <= _MAX_PENDING_INLINE_CODE_CHARS:
+                            if index > prose_start:
+                                segments.append((prose_start, index))
+                            unclosed_code_start = index
+                            prose_start = length
+                            break
                         if index > prose_start:
                             segments.append((prose_start, index))
                         code_fence = marker
@@ -180,10 +224,30 @@ def _prose_segments(text: str) -> tuple[list[tuple[int, int]], int | None]:
                     and len(marker) >= len(code_fence)
                     and suffix == ""
                 ):
+                    if nl_idx == -1 and (length - index) <= _MAX_PENDING_INLINE_CODE_CHARS:
+                        unclosed_code_start = index
+                        prose_start = length
+                        break
                     code_fence = None
                     prose_start = line_end
                     index = line_end
                     continue
+            elif nl_idx == -1 and (length - index) <= _MAX_PENDING_INLINE_CODE_CHARS:
+                stripped_lead = text[index:].lstrip(" ")
+                lead_spaces = length - index - len(stripped_lead)
+                if lead_spaces <= 3:
+                    if code_fence is not None and (
+                        not stripped_lead or all(ch == code_fence[0] for ch in stripped_lead)
+                    ):
+                        unclosed_code_start = index
+                        prose_start = length
+                        break
+                    if code_fence is None and stripped_lead and all(ch == "~" for ch in stripped_lead):
+                        if index > prose_start:
+                            segments.append((prose_start, index))
+                        unclosed_code_start = index
+                        prose_start = length
+                        break
 
         if code_fence is not None:
             nl_idx = text.find("\n", index)
@@ -223,12 +287,22 @@ def _prose_segments(text: str) -> tuple[list[tuple[int, int]], int | None]:
     return segments, unclosed_code_start
 
 
-def _split_unbuffered_citation_tail(text: str) -> tuple[str, str]:
-    """Hold syntactic prose citation brackets (or incomplete prefixes) until RUN_COMPLETED resolves them."""
+def _split_unbuffered_citation_tail_stateful(
+    text: str,
+    *,
+    at_line_start: bool = True,
+    code_fence: str | None = None,
+) -> tuple[str, str, bool, str | None]:
+    """Hold syntactic prose citation brackets or split fence headers while advancing markdown state."""
     if not text:
-        return "", ""
+        return "", "", at_line_start, code_fence
 
-    segments, unclosed_code_start = _prose_segments(text)
+    segments, unclosed_code_start = _prose_segments(
+        text,
+        at_line_start=at_line_start,
+        code_fence=code_fence,
+    )
+    split_pos: int | None = None
     for seg_start, seg_end in segments:
         segment = text[seg_start:seg_end]
         for match in _COMPLETE_CITATION_BRACKET_RE.finditer(segment):
@@ -237,22 +311,41 @@ def _split_unbuffered_citation_tail(text: str) -> tuple[str, str]:
             abs_start = seg_start + match.start()
             while abs_start > seg_start and text[abs_start - 1] in " \t":
                 abs_start -= 1
-            return text[:abs_start], text[abs_start:]
+            split_pos = abs_start
+            break
+        if split_pos is not None:
+            break
 
-    if unclosed_code_start is not None:
-        return text[:unclosed_code_start], text[unclosed_code_start:]
+    if split_pos is None and unclosed_code_start is not None:
+        split_pos = unclosed_code_start
 
-    if segments and segments[-1][1] == len(text):
+    if split_pos is None and segments and segments[-1][1] == len(text):
         seg_start, seg_end = segments[-1]
         incomplete_rel = _find_incomplete_citation_tail_start(text[seg_start:seg_end])
         if incomplete_rel is not None:
-            abs_start = seg_start + incomplete_rel
-            return text[:abs_start], text[abs_start:]
+            split_pos = seg_start + incomplete_rel
 
-    stripped = text.rstrip(" \t")
-    if len(stripped) < len(text):
-        return stripped, text[len(stripped) :]
-    return text, ""
+    if split_pos is None:
+        stripped = text.rstrip(" \t")
+        if len(stripped) < len(text):
+            split_pos = len(stripped)
+        else:
+            split_pos = len(text)
+
+    flushed = text[:split_pos]
+    pending = text[split_pos:]
+    next_line_start, next_fence = _advance_markdown_state(
+        flushed,
+        at_line_start=at_line_start,
+        code_fence=code_fence,
+    )
+    return flushed, pending, next_line_start, next_fence
+
+
+def _split_unbuffered_citation_tail(text: str) -> tuple[str, str]:
+    """Hold syntactic prose citation brackets (or incomplete prefixes) until RUN_COMPLETED resolves them."""
+    flushed, pending, _, _ = _split_unbuffered_citation_tail_stateful(text)
+    return flushed, pending
 
 
 def _compute_unstreamed_suffix(
@@ -359,6 +452,8 @@ async def chat_completions(
             streamed_parts: list[str] = []
             buffered_parts: list[str] = []
             pending_bracket = ""
+            stream_at_line_start = True
+            stream_code_fence: str | None = None
             should_buffer = bool(plan.citations or plan.session_citations)
             streamed_before_tool = False
             need_turn_separator = False
@@ -366,6 +461,24 @@ async def chat_completions(
             final_degraded = initial_degraded
             final_degraded_reason = initial_degraded_reason
             final_citations: list[dict] = list(plan.citations)
+
+            def _rotate_streamed_turn() -> str | None:
+                nonlocal pending_bracket, streamed_before_tool, need_turn_separator
+                nonlocal stream_at_line_start, stream_code_fence
+                flushed_ws: str | None = None
+                if not should_buffer:
+                    if pending_bracket and pending_bracket.isspace() and streamed_parts:
+                        streamed_parts.append(pending_bracket)
+                        flushed_ws = pending_bracket
+                        pending_bracket = ""
+                    if streamed_parts:
+                        streamed_before_tool = True
+                        need_turn_separator = not streamed_parts[-1][-1].isspace()
+                        prior_streamed_parts.extend(streamed_parts)
+                        streamed_parts.clear()
+                    stream_at_line_start = True
+                    stream_code_fence = None
+                return flushed_ws
 
             def chunk(delta: dict, finish: str | None = None, *, sag_meta: dict | None = None) -> str:
                 payload: dict = {
@@ -391,23 +504,28 @@ async def chat_completions(
                         if pending_bracket:
                             buffered_parts.append(pending_bracket)
                             pending_bracket = ""
+                elif event.type == EventType.TURN_STARTED.value:
+                    if not should_buffer and streamed_parts:
+                        flushed_ws = _rotate_streamed_turn()
+                        if flushed_ws:
+                            yield chunk({"content": flushed_ws})
+                        pending_bracket = ""
                 elif event.type == EventType.TOOL_STARTED.value:
-                    if not should_buffer:
-                        if pending_bracket and pending_bracket.isspace() and streamed_parts:
-                            streamed_parts.append(pending_bracket)
-                            yield chunk({"content": pending_bracket})
-                            pending_bracket = ""
-                        if streamed_parts:
-                            streamed_before_tool = True
-                            need_turn_separator = not streamed_parts[-1][-1].isspace()
-                            prior_streamed_parts.extend(streamed_parts)
-                            streamed_parts.clear()
+                    flushed_ws = _rotate_streamed_turn()
+                    if flushed_ws:
+                        yield chunk({"content": flushed_ws})
                     if payload.get("name") in {"search_context", "get_entity"}:
                         should_buffer = True
                         if pending_bracket:
                             buffered_parts.append(pending_bracket)
                             pending_bracket = ""
                     else:
+                        pending_bracket = ""
+                elif event.type == EventType.TOOL_FAILED.value:
+                    flushed_ws = _rotate_streamed_turn()
+                    if flushed_ws:
+                        yield chunk({"content": flushed_ws})
+                    if not should_buffer:
                         pending_bracket = ""
                 elif event.type == EventType.MESSAGE_DELTA.value:
                     delta = str(payload.get("delta") or "")
@@ -416,8 +534,15 @@ async def chat_completions(
                     if should_buffer:
                         buffered_parts.append(delta)
                     else:
-                        flush_text, pending_bracket = _split_unbuffered_citation_tail(
-                            pending_bracket + delta
+                        (
+                            flush_text,
+                            pending_bracket,
+                            stream_at_line_start,
+                            stream_code_fence,
+                        ) = _split_unbuffered_citation_tail_stateful(
+                            pending_bracket + delta,
+                            at_line_start=stream_at_line_start,
+                            code_fence=stream_code_fence,
                         )
                         if flush_text:
                             streamed_parts.append(flush_text)

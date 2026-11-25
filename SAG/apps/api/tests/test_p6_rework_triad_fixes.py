@@ -1301,3 +1301,178 @@ def test_p6_rework_13_commonmark_line_start_triple_backtick_inline_code() -> Non
     assert flushed == "```inline``` and invalid"
     assert pending == " [99] and valid [1]."
 
+
+# ---------------------------------------------------------------------------
+# Item 14 (CHAL-R3-1): Preflight TOOL_FAILED without TOOL_STARTED must not double-stream
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_p6_rework_14_preflight_tool_failed_sse_no_double_stream(monkeypatch) -> None:
+    agent = SimpleNamespace(id="agent-tf", name="ToolFailBot", persona={"web_enabled": True})
+    monkeypatch.setattr(openai_api.svc, "get_agent", AsyncMock(return_value=agent))
+    monkeypatch.setattr(openai_api.svc, "resolve_sources", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        openai_api.svc,
+        "build_ask_context",
+        lambda **kw: SimpleNamespace(
+            source_ids=[],
+            citations=[],
+            session_citations=[],
+            route_decision={"coarse_intent": "TIME", "degraded": False},
+        ),
+    )
+
+    async def fake_generate_stream(*args, **kwargs):
+        yield SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}})
+        yield SimpleNamespace(type=EventType.TURN_STARTED.value, data={"payload": {"turn": 1}})
+        yield SimpleNamespace(
+            type=EventType.MESSAGE_DELTA.value,
+            data={"payload": {"delta": "Let me check."}},
+        )
+        # Preflight failure (e.g. unknown_tool / parse_error): TOOL_FAILED fires WITHOUT TOOL_STARTED
+        yield SimpleNamespace(
+            type=EventType.TOOL_FAILED.value,
+            data={"payload": {"name": "unknown_clock", "error": {"code": "unknown_tool"}}},
+        )
+        yield SimpleNamespace(type=EventType.TURN_STARTED.value, data={"payload": {"turn": 2}})
+        yield SimpleNamespace(
+            type=EventType.MESSAGE_DELTA.value,
+            data={"payload": {"delta": "I could not call the clock tool."}},
+        )
+        yield SimpleNamespace(
+            type=EventType.RUN_COMPLETED.value,
+            data={"payload": {"output": "I could not call the clock tool.", "citations": [], "degraded": False}},
+        )
+
+    monkeypatch.setattr(openai_api.agent_service, "generate_stream", fake_generate_stream)
+
+    body = openai_api.ChatCompletionRequest(
+        messages=[openai_api.ChatMessage(role="user", content="Check clock")],
+        stream=True,
+    )
+    resp = await openai_api.chat_completions(
+        agent_id="agent-tf",
+        body=body,
+        _user=SimpleNamespace(id="u-1", name="Tester"),
+        owner_key="owner-1",
+        principal=SimpleNamespace(tenant_id="t-1", organization_id="o-1", user_id="u-1"),
+        session=SimpleNamespace(),
+        engine_manager=SimpleNamespace(),
+        llm=SimpleNamespace(configured=True),
+        tool_registry=SimpleNamespace(),
+        agent_runtime=SimpleNamespace(),
+    )
+    chunks: list[str] = []
+    async for raw in resp.body_iterator:
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+        for line in text.splitlines():
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            payload = json.loads(line[len("data: ") :])
+            delta = (payload.get("choices") or [{}])[0].get("delta") or {}
+            if delta.get("content"):
+                chunks.append(delta["content"])
+    full = "".join(chunks)
+    assert full.count("I could not call the clock tool.") == 1
+    assert full == "Let me check.\n\nI could not call the clock tool."
+
+
+# ---------------------------------------------------------------------------
+# Item 15 (CHAL-R3-2): Stateful SSE markdown fence/inline-code across chunk boundaries
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_p6_rework_15_stateful_chunk_boundary_fences_and_split_inline_code(monkeypatch) -> None:
+    agent = SimpleNamespace(id="agent-md", name="MdBot", persona={"web_enabled": True})
+    monkeypatch.setattr(openai_api.svc, "get_agent", AsyncMock(return_value=agent))
+    monkeypatch.setattr(openai_api.svc, "resolve_sources", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        openai_api.svc,
+        "build_ask_context",
+        lambda **kw: SimpleNamespace(
+            source_ids=[],
+            citations=[],
+            session_citations=[],
+            route_decision={"coarse_intent": "CHAT", "degraded": False},
+        ),
+    )
+
+    async def _run_deltas(deltas: list[str], canonical: str) -> str:
+        async def fake_stream(*args, **kwargs):
+            yield SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}})
+            for d in deltas:
+                yield SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": d}})
+            yield SimpleNamespace(
+                type=EventType.RUN_COMPLETED.value,
+                data={"payload": {"output": canonical, "citations": [], "degraded": False}},
+            )
+
+        monkeypatch.setattr(openai_api.agent_service, "generate_stream", fake_stream)
+        body = openai_api.ChatCompletionRequest(
+            messages=[openai_api.ChatMessage(role="user", content="show code")],
+            stream=True,
+        )
+        resp = await openai_api.chat_completions(
+            agent_id="agent-md",
+            body=body,
+            _user=SimpleNamespace(id="u-1", name="Tester"),
+            owner_key="owner-1",
+            principal=SimpleNamespace(tenant_id="t-1", organization_id="o-1", user_id="u-1"),
+            session=SimpleNamespace(),
+            engine_manager=SimpleNamespace(),
+            llm=SimpleNamespace(configured=True),
+            tool_registry=SimpleNamespace(),
+            agent_runtime=SimpleNamespace(),
+        )
+        out_chunks: list[str] = []
+        async for raw in resp.body_iterator:
+            text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+            for line in text.splitlines():
+                if not line.startswith("data: ") or line == "data: [DONE]":
+                    continue
+                payload = json.loads(line[len("data: ") :])
+                delta = (payload.get("choices") or [{}])[0].get("delta") or {}
+                if delta.get("content"):
+                    out_chunks.append(delta["content"])
+        return "".join(out_chunks)
+
+    # 1) Closing backtick fence + prose [99] in next chunk
+    out1 = await _run_deltas(
+        ["Here is code:\n```python\nx = 1\n", "```\nSee [99]."],
+        "Here is code:\n```python\nx = 1\n```\nSee.",
+    )
+    assert "[99]" not in out1
+    assert out1 == "Here is code:\n```python\nx = 1\n```\nSee."
+
+    # 2) Closing tilde fence + prose [99] in next chunk
+    out2 = await _run_deltas(
+        ["Here:\n~~~\ny = 2\n", "~~~\nAfter [99]."],
+        "Here:\n~~~\ny = 2\n~~~\nAfter.",
+    )
+    assert "[99]" not in out2
+    assert out2 == "Here:\n~~~\ny = 2\n~~~\nAfter."
+
+    # 3) Line-start split triple-backtick inline code
+    out3 = await _run_deltas(
+        ["```inline", "``` and [99]."],
+        "```inline``` and.",
+    )
+    assert "[99]" not in out3
+    assert out3 == "```inline``` and."
+
+    # 4) Mid-line split triple-backtick inline code
+    out4 = await _run_deltas(
+        ["Use ", "```foo", "``` [99]."],
+        "Use ```foo```.",
+    )
+    assert "[99]" not in out4
+    assert out4 == "Use ```foo```."
+
+    # 5) 1-char streaming across opening AND closing fence + prose [99]
+    src5 = "Code:\n```py\n[99]\n```\nEnd [99]."
+    out5 = await _run_deltas(list(src5), "Code:\n```py\n[99]\n```\nEnd.")
+    assert out5 == "Code:\n```py\n[99]\n```\nEnd."
+
+
