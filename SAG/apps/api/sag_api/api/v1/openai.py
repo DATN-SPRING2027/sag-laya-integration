@@ -167,13 +167,15 @@ def _prose_segments(text: str) -> tuple[list[tuple[int, int]], int | None]:
                 line_end = length if nl_idx == -1 else nl_idx + 1
                 suffix = text[fence_match.end() : line_end].strip()
                 if code_fence is None:
-                    if index > prose_start:
-                        segments.append((prose_start, index))
-                    code_fence = marker
-                    prose_start = line_end
-                    index = line_end
-                    continue
-                if (
+                    # CommonMark §4.5: backtick fence info strings cannot contain backticks.
+                    if marker[0] != "`" or "`" not in suffix:
+                        if index > prose_start:
+                            segments.append((prose_start, index))
+                        code_fence = marker
+                        prose_start = line_end
+                        index = line_end
+                        continue
+                elif (
                     code_fence[0] == marker[0]
                     and len(marker) >= len(code_fence)
                     and suffix == ""
@@ -353,11 +355,13 @@ async def chat_completions(
     if body.stream:
 
         async def gen():
+            prior_streamed_parts: list[str] = []
             streamed_parts: list[str] = []
             buffered_parts: list[str] = []
             pending_bracket = ""
             should_buffer = bool(plan.citations or plan.session_citations)
             streamed_before_tool = False
+            need_turn_separator = False
             errored = False
             final_degraded = initial_degraded
             final_degraded_reason = initial_degraded_reason
@@ -388,13 +392,23 @@ async def chat_completions(
                             buffered_parts.append(pending_bracket)
                             pending_bracket = ""
                 elif event.type == EventType.TOOL_STARTED.value:
-                    if payload.get("name") in {"search_context", "get_entity"}:
-                        if not should_buffer and streamed_parts:
+                    if not should_buffer:
+                        if pending_bracket and pending_bracket.isspace() and streamed_parts:
+                            streamed_parts.append(pending_bracket)
+                            yield chunk({"content": pending_bracket})
+                            pending_bracket = ""
+                        if streamed_parts:
                             streamed_before_tool = True
+                            need_turn_separator = not streamed_parts[-1][-1].isspace()
+                            prior_streamed_parts.extend(streamed_parts)
+                            streamed_parts.clear()
+                    if payload.get("name") in {"search_context", "get_entity"}:
                         should_buffer = True
                         if pending_bracket:
                             buffered_parts.append(pending_bracket)
                             pending_bracket = ""
+                    else:
+                        pending_bracket = ""
                 elif event.type == EventType.MESSAGE_DELTA.value:
                     delta = str(payload.get("delta") or "")
                     if not delta:
@@ -407,21 +421,34 @@ async def chat_completions(
                         )
                         if flush_text:
                             streamed_parts.append(flush_text)
-                            yield chunk({"content": flush_text})
+                            if need_turn_separator:
+                                need_turn_separator = False
+                                out_text = flush_text if flush_text[0].isspace() else f"\n\n{flush_text}"
+                            else:
+                                out_text = flush_text
+                            yield chunk({"content": out_text})
                 elif event.type == EventType.RUN_COMPLETED.value:
                     canonical = str(payload.get("output") or "")
-                    streamed = "".join(streamed_parts)
+                    turn_streamed = "".join(streamed_parts)
+                    all_streamed = "".join(prior_streamed_parts) + turn_streamed
                     pending_bracket = ""
                     if "degraded" in payload:
                         final_degraded = bool(payload.get("degraded"))
                         final_degraded_reason = payload.get("degraded_reason") or final_degraded_reason
                     if "citations" in payload and payload["citations"] is not None:
                         final_citations = list(payload["citations"])
-                    suffix = _compute_unstreamed_suffix(
-                        streamed,
-                        canonical,
-                        post_tool_turn=streamed_before_tool,
-                    )
+                    if turn_streamed:
+                        suffix = _compute_unstreamed_suffix(
+                            turn_streamed,
+                            canonical,
+                            post_tool_turn=False,
+                        )
+                    else:
+                        suffix = _compute_unstreamed_suffix(
+                            all_streamed,
+                            canonical,
+                            post_tool_turn=streamed_before_tool,
+                        )
                     if suffix:
                         yield chunk({"content": suffix})
                 elif event.type in (EventType.RUN_FAILED.value, EventType.RUN_CANCELLED.value):

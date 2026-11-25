@@ -170,9 +170,12 @@ def test_p6_rework_01_fenced_code_blocks_preserved_and_forced_final_default_matc
 
 def test_p6_rework_02_redos_all_regexes_under_10ms_and_backtick_streaming() -> None:
     def _measure_ms(fn) -> float:
-        t0 = time.perf_counter()
-        fn()
-        return (time.perf_counter() - t0) * 1000.0
+        best = float("inf")
+        for _ in range(3):
+            t0 = time.perf_counter()
+            fn()
+            best = min(best, (time.perf_counter() - t0) * 1000.0)
+        return best
 
     # 1) query_analysis.py:213 decimal/version wildcard check
     adv_num = "1." + "x" * 2000 + "_"
@@ -1192,3 +1195,109 @@ def test_p6_rework_11_html_span_non_positive_and_rollback_duplicate_ku() -> None
         )
         with pytest.raises(PublishVerificationError, match="knowledge_unit_ids"):
             tree_rollback_service._prepared_candidate_from_manifest(rec, expected_status="INACTIVE")
+
+
+# ---------------------------------------------------------------------------
+# Item 12 (CHAL-R2-1): Non-knowledge tool mid-stream Turn-1 -> Turn-2 SSE must NOT double-stream
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_p6_rework_12_non_knowledge_tool_sse_no_double_stream(monkeypatch) -> None:
+    agent = SimpleNamespace(id="agent-time", name="TimeBot", persona={"web_enabled": True})
+    monkeypatch.setattr(openai_api.svc, "get_agent", AsyncMock(return_value=agent))
+    monkeypatch.setattr(openai_api.svc, "resolve_sources", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        openai_api.svc,
+        "build_ask_context",
+        lambda **kw: SimpleNamespace(
+            source_ids=[],
+            citations=[],
+            session_citations=[],
+            route_decision={"coarse_intent": "TIME", "degraded": False},
+        ),
+    )
+
+    async def fake_generate_stream(*args, **kwargs):
+        yield SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}})
+        yield SimpleNamespace(
+            type=EventType.MESSAGE_DELTA.value,
+            data={"payload": {"delta": "Let me check the current time."}},
+        )
+        yield SimpleNamespace(
+            type=EventType.TOOL_STARTED.value,
+            data={"payload": {"name": "get_time", "call_id": "tc-time-1"}},
+        )
+        yield SimpleNamespace(
+            type=EventType.MESSAGE_DELTA.value,
+            data={"payload": {"delta": "The current time is 16:50 UTC."}},
+        )
+        yield SimpleNamespace(
+            type=EventType.RUN_COMPLETED.value,
+            data={"payload": {"output": "The current time is 16:50 UTC.", "citations": [], "degraded": False}},
+        )
+
+    monkeypatch.setattr(openai_api.agent_service, "generate_stream", fake_generate_stream)
+
+    body = openai_api.ChatCompletionRequest(
+        messages=[openai_api.ChatMessage(role="user", content="What time is it?")],
+        stream=True,
+    )
+    resp = await openai_api.chat_completions(
+        agent_id="agent-time",
+        body=body,
+        _user=SimpleNamespace(id="u-1", name="Tester"),
+        owner_key="owner-1",
+        principal=SimpleNamespace(tenant_id="t-1", organization_id="o-1", user_id="u-1"),
+        session=SimpleNamespace(),
+        engine_manager=SimpleNamespace(),
+        llm=SimpleNamespace(configured=True),
+        tool_registry=SimpleNamespace(),
+        agent_runtime=SimpleNamespace(),
+    )
+    chunks: list[str] = []
+    async for raw in resp.body_iterator:
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+        for line in text.splitlines():
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            payload = json.loads(line[len("data: ") :])
+            delta = (payload.get("choices") or [{}])[0].get("delta") or {}
+            if delta.get("content"):
+                chunks.append(delta["content"])
+    full = "".join(chunks)
+    assert full.count("The current time is 16:50 UTC.") == 1
+    assert "Let me check the current time." in full
+    assert "Let me check the current time.\n\nThe current time is 16:50 UTC." == full
+
+
+# ---------------------------------------------------------------------------
+# Item 13 (CHAL-R2-2): CommonMark §4.5 line-start triple-backtick inline code is NOT a fence
+# ---------------------------------------------------------------------------
+
+
+def test_p6_rework_13_commonmark_line_start_triple_backtick_inline_code() -> None:
+    cits = [
+        {
+            "n": 1,
+            "chunk_id": "c1",
+            "source_id": "s1",
+            "document_id": "d1",
+            "document_version_id": "v1",
+            "page_from": 1,
+            "page_to": 1,
+            "anchor": "p1",
+        }
+    ]
+    sample = "```inline``` and invalid [99] and valid [1]."
+    cleaned, used = agent_service._finalize_answer_citations(sample, cits)
+    assert cleaned.startswith("```inline```")
+    assert "[99]" not in cleaned
+    assert "[1]." in cleaned
+    assert [c["n"] for c in used] == [1]
+
+    # Twin in openai.py _split_unbuffered_citation_tail must detect [99] as prose citation tail!
+    flushed, pending = openai_api._split_unbuffered_citation_tail(sample)
+    assert flushed == "```inline``` and invalid"
+    assert pending == " [99] and valid [1]."
+

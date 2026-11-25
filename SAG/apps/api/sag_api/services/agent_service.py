@@ -269,13 +269,15 @@ def _rewrite_prose_citation_brackets(
                 line_end = length if nl_idx == -1 else nl_idx + 1
                 suffix = text[fence_match.end() : line_end].strip()
                 if code_fence is None:
-                    _flush_prose(index)
-                    code_fence = marker
-                    out.append(text[index:line_end])
-                    prose_start = line_end
-                    index = line_end
-                    continue
-                if (
+                    # CommonMark §4.5: backtick fence info strings cannot contain backticks.
+                    if marker[0] != "`" or "`" not in suffix:
+                        _flush_prose(index)
+                        code_fence = marker
+                        out.append(text[index:line_end])
+                        prose_start = line_end
+                        index = line_end
+                        continue
+                elif (
                     code_fence[0] == marker[0]
                     and len(marker) >= len(code_fence)
                     and suffix == ""
