@@ -57,7 +57,10 @@ packages = ["sag_api", "sag_agent"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-markers = ["ai_smoke: opt-in live requests to configured AI services"]
+markers = [
+    "ai_smoke: opt-in live requests to configured AI services",
+    "integration: opt-in live integration tests against PostgreSQL, Qdrant, MinerU, and configured LLM/router",
+]
 
 [tool.ruff]
 line-length = 120
