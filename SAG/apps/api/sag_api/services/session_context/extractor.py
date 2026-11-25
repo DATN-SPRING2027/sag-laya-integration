@@ -47,7 +47,6 @@ _SINGLE_WORD_STOP_ENTITIES = frozenset(
         "phần", "loạt", "chương", "điều", "khoản", "mục", "luật", "nghị", "thông", "văn",
     }
 )
-_SENTENCE_SPLIT_RE = re.compile(r"(?:[^.!?\n]|\d+\.\d+)+(?:[.!?](?!\d)|$)")
 _TICKET_ID_RE = re.compile(r"^(pr|adr|rfc|issue|task|bug)\s*#?\s*(\d+)$")
 
 _CANONICAL_TECH_SYNONYMS: dict[str, str] = {

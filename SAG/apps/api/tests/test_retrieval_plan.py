@@ -152,11 +152,25 @@ def test_field_predicate_validation_and_fallback() -> None:
 
 
 def test_temporal_order_and_parallel_clause_decomposition() -> None:
-    strat = plan_query(
-        "Liệt kê 10 tài liệu mới nhất về bảo mật, và ai là người phê duyệt chính sách?",
+    query = "Liệt kê 10 tài liệu mới nhất về bảo mật, và ai là người phê duyệt chính sách?"
+    # Without router subqueries, semantic VI conjunctions fail closed to NONE (no regex split).
+    unrouted = plan_query(
+        query,
         answer_shape="document_list",
         order_mode="time_desc",
         explicit_count=10,
+    ).retrieval_plan
+    assert unrouted.decomposition.mode == DecompositionMode.NONE
+
+    strat = plan_query(
+        query,
+        answer_shape="document_list",
+        order_mode="time_desc",
+        explicit_count=10,
+        subqueries=(
+            "Liệt kê 10 tài liệu mới nhất về bảo mật",
+            "Ai là người phê duyệt chính sách?",
+        ),
     )
     plan = strat.retrieval_plan
     assert plan.target == TargetUnit.DOCUMENT

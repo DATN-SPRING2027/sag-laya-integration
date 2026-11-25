@@ -181,6 +181,8 @@ class RetrievalPlan:
     is_unfiltered_catalog: bool = False
     fallback_used: bool = False
     unsupported_reason: str | None = None
+    temporal_mode: str = "atemporal"
+    entities: tuple[str, ...] = ()
 
     @property
     def per_document_limit(self) -> int | None:
@@ -284,6 +286,8 @@ def build_retrieval_plan(
     exact_lookup: bool = False,
     constraints: tuple[FieldPredicate, ...] = (),
     cursor: str | None = None,
+    temporal_mode: str | None = None,
+    entities: tuple[str, ...] = (),
 ) -> RetrievalPlan:
     """Compile structured routing signals + API parameters into a validated 7-axis RetrievalPlan."""
     query = unicodedata.normalize("NFC", query or "")
@@ -395,6 +399,14 @@ def build_retrieval_plan(
             cursor=cursor,
         )
 
+    clean_temporal = (temporal_mode or "").strip().lower() or "atemporal"
+    clean_entities = tuple(
+        dict.fromkeys(
+            unicodedata.normalize("NFC", str(ent)).strip()
+            for ent in entities
+            if str(ent).strip()
+        )
+    )
     return RetrievalPlan(
         planner_version=RETRIEVAL_PLAN_VERSION,
         target=target,
@@ -408,6 +420,8 @@ def build_retrieval_plan(
         is_unfiltered_catalog=is_unfiltered_catalog,
         fallback_used=fallback_used,
         unsupported_reason=unsupported_reason,
+        temporal_mode=clean_temporal,
+        entities=clean_entities,
     )
 
 

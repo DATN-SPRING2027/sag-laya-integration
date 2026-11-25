@@ -127,24 +127,28 @@ def _unique_values(values: Iterable[str], *, limit: int = 8) -> tuple[str, ...]:
     return tuple(result)
 
 
-_CLAUSE_SPLIT_RE = re.compile(
-    r"(?:,\s+and\s+(?=(?:what|which|who|where|why|how|when|is|are|was|were|did|does|do|should|can)\b)"
-    r"|\s+and\s+(?=(?:what|which|who|where|why|how\s+(?:do|does|did|should|can|could|to|will|would|is|are|was|were))\b)"
-    r"|,\s*và\s+(?=(?:ai|cái\s+gì|gì|ở\s+đâu|đâu|khi\s+nào|như\s+thế\s+nào|bao\s+nhiêu|nào|có\s+phải|là)\b)"
-    r"|[?？]\s+(?=\S)"
-    r"|[;；]\s*)",
-    re.IGNORECASE,
-)
-_SALIENT_PROPER_TERM_RE = re.compile(
-    r"\b(?:[A-Z][a-z0-9]+[A-Z][A-Za-z0-9]*|[A-Z]{2,}[0-9]*|[A-Za-z]+\d+[A-Za-z0-9]*)\b"
-)
+_CLAUSE_SPLIT_RE = re.compile(r"[?？]\s+(?=\S)|[;；]\s*")
 
 
-def decompose_query_clauses(query: str) -> tuple[str, ...]:
-    """Split a compound multi-clause question into independent semantic sub-queries."""
+def decompose_query_clauses(
+    query: str,
+    *,
+    subqueries: Iterable[str] | None = None,
+) -> tuple[str, ...]:
+    """Return structured router sub-queries when available, else split only on structural punctuation."""
     text = _nfc(query).strip()
     if not text:
         return ()
+    if subqueries is not None:
+        cleaned = list(
+            dict.fromkeys(
+                item
+                for raw in subqueries
+                if (item := _nfc(str(raw)).strip())
+            )
+        )
+        if len(cleaned) >= 2:
+            return tuple(cleaned[:4])
     parts = [part.strip(" ,;?？；") for part in _CLAUSE_SPLIT_RE.split(text) if part and part.strip(" ,;?？；")]
     if len(parts) <= 1:
         return (text,)
@@ -152,26 +156,50 @@ def decompose_query_clauses(query: str) -> tuple[str, ...]:
     return tuple(valid) if len(valid) >= 2 else (text,)
 
 
-def extract_salient_query_terms(query: str) -> frozenset[str]:
-    """Identify proper nouns, CamelCase symbols, acronyms, and alphanumeric identifiers from cased query."""
+def extract_salient_query_terms(
+    query: str,
+    *,
+    entities: Iterable[str] | None = None,
+) -> frozenset[str]:
+    """Identify proper nouns, CamelCase symbols, acronyms, and alphanumeric identifiers language-agnostically."""
     text = _nfc(query).strip()
-    if not text:
-        return frozenset()
     salient: set[str] = set()
-    for match in _SALIENT_PROPER_TERM_RE.finditer(text):
-        norm = normalize_lexical_text(match.group(0))
-        if len(norm) >= 2 and norm not in COMMON_STOPWORDS:
-            salient.add(norm)
+    for ent in entities or ():
+        ent_nfc = _nfc(str(ent)).strip()
+        if not ent_nfc:
+            continue
+        ent_norm = normalize_lexical_text(ent_nfc)
+        if len(ent_norm) >= 2 and ent_norm not in COMMON_STOPWORDS:
+            salient.add(ent_norm)
+        for tok in re.findall(r"[^\W_]+", ent_nfc, flags=re.UNICODE):
+            tok_norm = normalize_lexical_text(tok)
+            if len(tok_norm) >= 2 and tok_norm not in COMMON_STOPWORDS:
+                salient.add(tok_norm)
+    if not text:
+        return frozenset(salient)
     tokens = re.findall(r"[^\W_]+", text, flags=re.UNICODE)
     for idx, tok in enumerate(tokens):
-        if idx > 0 and tok[:1].isupper() and any(c.islower() for c in tok[1:]):
-            norm = normalize_lexical_text(tok)
-            if len(norm) >= 3 and norm not in COMMON_STOPWORDS:
-                salient.add(norm)
+        norm = normalize_lexical_text(tok)
+        if len(norm) < 2 or norm in COMMON_STOPWORDS:
+            continue
+        has_alpha = any(c.isalpha() for c in tok)
+        has_digit = any(c.isdigit() for c in tok)
+        has_lower = any(c.islower() for c in tok)
+        has_internal_upper = any(unicodedata.category(c) in {"Lu", "Lt"} for c in tok[1:])
+        is_all_caps_acronym = has_alpha and not has_lower
+        is_alnum_ident = has_alpha and has_digit
+        is_mid_proper = idx > 0 and unicodedata.category(tok[0]) in {"Lu", "Lt"} and any(c.islower() for c in tok[1:])
+        if has_internal_upper or is_all_caps_acronym or is_alnum_ident or is_mid_proper:
+            salient.add(norm)
     return frozenset(salient)
 
 
-def extract_query_features(query: str) -> QueryFeatures:
+def extract_query_features(
+    query: str,
+    *,
+    subqueries: Iterable[str] | None = None,
+    multi_hop_hint: bool = False,
+) -> QueryFeatures:
     """Extract bounded, structural query signals for routing and trace output."""
 
     text = _nfc(query).strip()
@@ -193,8 +221,8 @@ def extract_query_features(query: str) -> QueryFeatures:
         and not re.fullmatch(r"[A-Za-z](?:\.[A-Za-z])+", cleaned_path)
     )
     temporal_cues = _unique_values(m.group(0) for m in _STRUCTURAL_TEMPORAL_RE.finditer(text))
-    clauses = decompose_query_clauses(text)
-    multi_hop = len(clauses) >= 2
+    clauses = decompose_query_clauses(text, subqueries=subqueries)
+    multi_hop = bool(multi_hop_hint) or len(clauses) >= 2
     return QueryFeatures(
         exact_terms=exact_terms,
         identifier_terms=identifier_terms,
@@ -333,11 +361,13 @@ def analyze_query(
     *,
     segmentation_enabled: bool = True,
     segmenter: Segmenter | None = None,
+    subqueries: Iterable[str] | None = None,
+    multi_hop_hint: bool = False,
 ) -> QueryAnalysis:
     query = _nfc(query)
     cleaned = query.strip().lower()
     phrase = normalize_lexical_text(cleaned)
-    features = extract_query_features(query)
+    features = extract_query_features(query, subqueries=subqueries, multi_hop_hint=multi_hop_hint)
     legacy_terms, legacy_expanded_terms = _legacy_query_terms(cleaned)
     legacy_lookup_terms = _lookup_terms(legacy_terms, phrase)
     chinese_runs = _chinese_runs(cleaned)

@@ -8,10 +8,13 @@ import re
 import threading
 import time
 import unicodedata
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from sag_api.services.query_strategy_planner import QueryStrategyPlan
 
 import httpx
 from sqlalchemy.exc import SQLAlchemyError
@@ -500,24 +503,10 @@ def _is_boilerplate(section: RetrievedSection) -> bool:
     return sum(marker in text for marker in _BOILERPLATE) >= 2
 
 
-def _query_allows_superseded(query: str) -> bool:
-    query_lower = normalize_text(query or "").lower()
-    return any(
-        cue in query_lower
-        for cue in (
-            "superseded",
-            "deprecated",
-            "obsolete",
-            "archived",
-            "historical",
-            "outdated",
-            "earlier",
-            "previous",
-            "bản cũ",
-            "đã thay thế",
-            "trước khi điều chỉnh",
-        )
-    )
+def _query_allows_superseded(query: str = "", *, temporal_mode: str | None = None) -> bool:
+    """Allow superseded document versions only when structured router temporal_mode targets history/lineage."""
+    del query
+    return str(temporal_mode or "").strip().lower() in {"change_lineage", "past_point"}
 
 
 def _is_superseded_section(sec: RetrievedSection) -> bool:
@@ -572,12 +561,16 @@ def rerank_sections(
     exact_lexical_keys: set[tuple[str, str]] | None = None,
     limit: int | None,
     analysis: QueryAnalysis | None = None,
+    subqueries: Sequence[str] = (),
+    entities: Sequence[str] = (),
+    temporal_mode: str | None = None,
 ) -> RerankResult:
     """Fuse retriever rank lists without assuming their scores share a scale."""
 
     effective = analysis or analyze_query(
         query,
         segmentation_enabled=settings.search_chinese_segmentation_enabled,
+        subqueries=subqueries,
     )
     lexical = lexical or []
     lexical_keys = {_section_key(section) for section in lexical}
@@ -684,7 +677,7 @@ def rerank_sections(
     raw_terms = [term for term in raw_terms if term]
     filtered_terms = [term for term in raw_terms if term not in _LEXICAL_STOPWORDS]
     query_term_list = tuple(filtered_terms if filtered_terms else raw_terms)
-    salient_terms = extract_salient_query_terms(query)
+    salient_terms = extract_salient_query_terms(query, entities=entities)
     anchor_terms = frozenset(
         norm
         for term in (
@@ -694,7 +687,15 @@ def rerank_sections(
         )
         if (norm := _normalize_query_term(term))
     )
-    clauses = decompose_query_clauses(query)
+    cleaned_subqueries = tuple(
+        dict.fromkeys(str(s).strip() for s in subqueries if str(s).strip())
+    )
+    if len(cleaned_subqueries) >= 2:
+        clauses = cleaned_subqueries[:4]
+    elif len(effective.features.clauses) >= 2:
+        clauses = effective.features.clauses
+    else:
+        clauses = decompose_query_clauses(query)
     if anchor_terms:
         query_term_list = tuple(dict.fromkeys([*query_term_list, *sorted(anchor_terms)]))
     clause_term_lists = (
@@ -895,7 +896,7 @@ def rerank_sections(
             (hybrid_score, retriever_coverage, int(exact), rank_sum, key, section)
         )
 
-    if not _query_allows_superseded(query) and ranked:
+    if not _query_allows_superseded(temporal_mode=temporal_mode) and ranked:
         ranked = [item for item in ranked if not _is_superseded_section(item[5])]
 
     ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3], item[4]))
@@ -949,6 +950,8 @@ def select_diverse_sections(
     diversity_weight: float | None = None,
     near_duplicate_similarity: float | None = None,
     per_document_limit: int | None = None,
+    multi_hop: bool | None = None,
+    entities: Sequence[str] = (),
     _cancelled: threading.Event | None = None,
 ) -> tuple[list[RetrievedSection], dict[str, Any]]:
     """Collapse near-identical text and apply deterministic MMR without dropping query anchors."""
@@ -976,6 +979,7 @@ def select_diverse_sections(
         raise ValueError("Near-duplicate similarity must be between 0.9 and one")
 
     features = extract_query_features(query)
+    effective_multi_hop = bool(multi_hop) if multi_hop is not None else features.multi_hop
     required = tuple(
         dict.fromkeys(
             value
@@ -1094,16 +1098,16 @@ def select_diverse_sections(
         float(settings.search_doc_admission_ratio)
         if unbounded_limit
         else min(0.75, float(settings.search_doc_admission_ratio))
-        if features.multi_hop or per_document_limit == 1
+        if effective_multi_hop or per_document_limit == 1
         else max(0.94, float(settings.search_doc_admission_ratio))
     )
     salient_doc_terms = {
-        term for term in extract_salient_query_terms(query) if len(term) >= 3
+        term for term in extract_salient_query_terms(query, entities=entities) if len(term) >= 3
     }
     admitted_docs: set[str] = {doc_key(unique[i]) for i in selected_indices}
     if ordered_docs:
         admitted_docs.add(ordered_docs[0])
-        allow_wide_docs = unbounded_limit or features.multi_hop or per_document_limit == 1
+        allow_wide_docs = unbounded_limit or effective_multi_hop or per_document_limit == 1
         max_initial_docs = limit if allow_wide_docs else min(limit, 2)
         for doc_rank_idx, d_key in enumerate(ordered_docs[1:], start=1):
             if len(admitted_docs) >= max_initial_docs:
@@ -1113,7 +1117,7 @@ def select_diverse_sections(
                 admission_ratio
                 if (
                     unbounded_limit
-                    or (not features.multi_hop and per_document_limit != 1)
+                    or (not effective_multi_hop and per_document_limit != 1)
                     or doc_rank_idx == 1
                     or len(unique) <= limit + 1
                 )
@@ -1165,7 +1169,7 @@ def select_diverse_sections(
     fallback_doc_floor = max(0.20, admission_ratio * top_doc_score)
     same_doc_penalty_weight = (
         max(0.08, float(settings.search_same_doc_penalty_weight))
-        if features.multi_hop
+        if effective_multi_hop
         else float(settings.search_same_doc_penalty_weight)
     )
     compared = [0] * len(unique)
@@ -1200,7 +1204,7 @@ def select_diverse_sections(
             )
             allow_wide_sample = (
                 unbounded_limit
-                or features.multi_hop
+                or effective_multi_hop
                 or per_document_limit == 1
                 or len(unique) <= limit + 1
             )
@@ -1208,7 +1212,7 @@ def select_diverse_sections(
                 max(0.20, 0.40 * top_doc_score)
                 if (per_document_limit == 1 and all_initial_single_chunk)
                 else fallback_doc_floor
-                if (unbounded_limit or per_document_limit == 1 or (features.multi_hop and len(unique) <= limit + 1))
+                if (unbounded_limit or per_document_limit == 1 or (effective_multi_hop and len(unique) <= limit + 1))
                 else max(0.45, 0.78 * top_doc_score)
                 if allow_wide_sample
                 else max(0.55, 0.88 * top_doc_score)
@@ -1376,21 +1380,43 @@ async def retrieve_relevant_sections(
     *,
     strategy: str | None = None,
     top_k: int | None = None,
+    query_strategy_plan: QueryStrategyPlan | None = None,
 ) -> SearchOutcome:
     """One retrieval contract for search UI and the Agent's search_context tool."""
-    from sag_api.services.retrieval_plan import TargetUnit, build_retrieval_plan, group_sections_by_document
+    from sag_api.services.retrieval_plan import (
+        TargetUnit,
+        build_retrieval_plan,
+        group_sections_by_document,
+        rebuild_retrieval_plan_with_top_k,
+    )
 
     total_start = time.perf_counter()
-    analysis = analyze_query(
-        query,
-        segmentation_enabled=settings.search_chinese_segmentation_enabled,
-    )
-    retrieval_plan = build_retrieval_plan(
-        query,
-        requested_top_k=top_k,
-        clauses=analysis.features.clauses,
-        multi_hop=analysis.features.multi_hop,
-    )
+    if query_strategy_plan is not None:
+        retrieval_plan = rebuild_retrieval_plan_with_top_k(query_strategy_plan.retrieval_plan, top_k)
+        subqueries = retrieval_plan.decomposition.subqueries
+        multi_hop_hint = bool(query_strategy_plan.multi_hop_eligible)
+        entities = retrieval_plan.entities
+        temporal_mode: str | None = retrieval_plan.temporal_mode
+        analysis = analyze_query(
+            query,
+            segmentation_enabled=settings.search_chinese_segmentation_enabled,
+            subqueries=subqueries,
+            multi_hop_hint=multi_hop_hint,
+        )
+    else:
+        subqueries = ()
+        entities = ()
+        temporal_mode = None
+        analysis = analyze_query(
+            query,
+            segmentation_enabled=settings.search_chinese_segmentation_enabled,
+        )
+        retrieval_plan = build_retrieval_plan(
+            query,
+            requested_top_k=top_k,
+            clauses=analysis.features.clauses,
+            multi_hop=analysis.features.multi_hop,
+        )
     effective_top_k = retrieval_plan.cardinality.effective_n
     requested_limit = min(effective_top_k, settings.search_unit_candidate_limit)
     candidate_limit = min(settings.search_unit_candidate_limit, max(requested_limit * 4, 20))
@@ -1447,6 +1473,9 @@ async def retrieve_relevant_sections(
         exact_lexical_keys=exact_lexical_keys,
         limit=rerank_pool_limit,
         analysis=analysis,
+        subqueries=subqueries,
+        entities=entities,
+        temporal_mode=temporal_mode,
     )
     final_sections = (
         group_sections_by_document(reranked.sections, limit=requested_limit)

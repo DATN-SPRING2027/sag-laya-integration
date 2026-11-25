@@ -40,30 +40,6 @@ _WEB_PAGE_TEXT_LIMIT = 12_000
 _WEB_PAGE_MAX_REDIRECTS = 3
 _WEB_PAGE_CONTENT_TYPES = ("text/html", "text/plain", "application/xhtml+xml")
 _WEB_PAGE_PORTS = frozenset({80, 443, 8080, 8443})
-_RECENT_QUERY_MARKERS = (
-    "hôm nay",
-    "ngày mai",
-    "tuần này",
-    "tháng này",
-    "gần đây",
-    "mới nhất",
-    "thời gian thực",
-    "hiện tại",
-    "thời tiết",
-    "tin tức",
-    "giá",
-    "tỷ giá",
-    "lịch thi đấu",
-    "tỷ số",
-    "today",
-    "tomorrow",
-    "latest",
-    "current",
-    "live",
-    "weather",
-    "news",
-    "price",
-)
 
 
 def _events_by_section(events: list | None) -> dict[tuple[str, str], list]:
@@ -689,7 +665,6 @@ class WebSearchTool(Tool):
         return bool(_web_search_endpoint() and settings.llm_api_key)
 
     async def invoke(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        del ctx
         query = str(args.get("query") or "").strip()
         if not query:
             return ToolResult(content="(Thiếu nội dung truy vấn để tìm kiếm Internet.)", data={"section_count": 0})
@@ -714,8 +689,15 @@ class WebSearchTool(Tool):
         requested_time_range = str(args.get("time_range") or "").strip().lower()
         if requested_time_range in {"day", "week", "month", "year"}:
             request_payload["time_range"] = requested_time_range
-        elif any(marker in query.casefold() for marker in _RECENT_QUERY_MARKERS):
-            request_payload["time_range"] = "week"
+        else:
+            route_decision = ctx.route_decision if isinstance(ctx.route_decision, dict) else {}
+            route_flags = route_decision.get("intent_flags")
+            route_temporal = str(route_decision.get("temporal_mode") or "").strip().lower()
+            if (
+                (isinstance(route_flags, dict) and route_flags.get("needs_time"))
+                or route_temporal == "current_effective"
+            ):
+                request_payload["time_range"] = "week"
         category = str(args.get("category") or "").strip().lower()
         if category in {"general", "news"}:
             request_payload["category"] = category

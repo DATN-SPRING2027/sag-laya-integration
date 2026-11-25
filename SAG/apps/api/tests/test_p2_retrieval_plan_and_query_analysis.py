@@ -7,13 +7,15 @@ from types import SimpleNamespace
 import pytest
 
 from sag_api.sag import RetrievedSection
+from sag_api.services import canonical_service  # noqa: F401
 from sag_api.services import query_analysis as qa
 from sag_api.services import retrieval_plan as rp
+from sag_api.services import retrieval_service as rs
 from sag_api.services import search_unit_retrieval_service as surs
 from sag_api.services.decision_router import IntentFlags, UnifiedRouteDecision
 from sag_api.services.query_strategy_planner import RetrievalMode, plan_query
 from sag_api.tools.base import ToolContext
-from sag_api.tools.builtin import SearchContextTool
+from sag_api.tools.builtin import SearchContextTool, WebSearchTool
 
 
 def test_query_analysis_preserves_vietnamese_content_and_removes_semantic_regexes() -> None:
@@ -26,8 +28,26 @@ def test_query_analysis_preserves_vietnamese_content_and_removes_semantic_regexe
         "_RELATION_CUES",
         "_RELATION_STEM_GROUPS",
         "_GLOBAL_CUES",
+        "_SALIENT_PROPER_TERM_RE",
     ):
         assert not hasattr(qa, removed), f"Legacy semantic list/regex {removed} must be removed from query_analysis"
+
+    from sag_api.parsing import canonical
+    from sag_api.services.session_context import extractor as sc_extractor
+
+    for removed_dead in (
+        "_CONTINUOUS_SCRIPT_CHAR_RE",
+        "_MULTILINGUAL_SENTENCE_SPLIT_RE",
+        "_MULTILINGUAL_CLAUSE_SPLIT_RE",
+    ):
+        assert not hasattr(canonical, removed_dead), f"Dead unused regex {removed_dead} must be removed from canonical"
+    assert not hasattr(sc_extractor, "_SENTENCE_SPLIT_RE"), "Dead _SENTENCE_SPLIT_RE must be removed from extractor"
+
+    from sag_api.tools import builtin as builtin_tools
+
+    assert not hasattr(builtin_tools, "_RECENT_QUERY_MARKERS"), (
+        "_RECENT_QUERY_MARKERS keyword heuristic must be removed from tools/builtin.py"
+    )
 
     for removed_rp in (
         "_DOC_UNIT_WORDS",
@@ -195,3 +215,220 @@ async def test_search_unit_and_builtin_tool_preserve_plan_axes_with_top_k_overri
     assert captured_plans[0].output == rp.OutputMode.LIST
     assert captured_plans[0].is_unfiltered_catalog is True
     assert captured_plans[0].cardinality.effective_n == 50
+
+
+def test_decompose_query_clauses_structural_only_and_subqueries_fail_closed() -> None:
+    # EN/VI conjunctions must NOT split via semantic regex — fail closed to single query when subqueries unavailable
+    en_q = "Why was Northpeak's invoice disputed, and how was the billing calculation corrected?"
+    vi_q = "Sự khác nhau giữa quy trình cấp 1 và khẩn cấp là gì, và khi nào cần áp dụng?"
+    assert qa.decompose_query_clauses(en_q) == (en_q,)
+    assert qa.decompose_query_clauses(vi_q) == (vi_q,)
+    assert qa.decompose_query_clauses(en_q, subqueries=()) == (en_q,)
+    assert qa.decompose_query_clauses(en_q, subqueries=("only one",)) == (en_q,)
+
+    # Structural punctuation (? / ;) still splits deterministically
+    assert qa.decompose_query_clauses("What is retention? What port is used?") == (
+        "What is retention",
+        "What port is used",
+    )
+    assert qa.decompose_query_clauses("Retention policy; Port configuration") == (
+        "Retention policy",
+        "Port configuration",
+    )
+
+    # Router subqueries (>= 2) override and propagate through analyze_query & plan_query
+    routed_subs = ("Why was Northpeak's invoice disputed?", "How was the billing calculation corrected?")
+    assert qa.decompose_query_clauses(en_q, subqueries=routed_subs) == routed_subs
+
+    degraded_analysis = qa.analyze_query(en_q, subqueries=(), multi_hop_hint=False)
+    assert degraded_analysis.features.clauses == ()
+    assert degraded_analysis.features.multi_hop is False
+
+    routed_analysis = qa.analyze_query(en_q, subqueries=routed_subs, multi_hop_hint=True)
+    assert routed_analysis.features.clauses == routed_subs
+    assert routed_analysis.features.multi_hop is True
+
+    strat = plan_query(
+        en_q,
+        route_decision=UnifiedRouteDecision(
+            query=en_q,
+            coarse_intent="KNOWLEDGE",
+            question_scope="project",
+            memory_scope="project_documents",
+            temporal_mode="change_lineage",
+            answer_shape="fact_answer",
+            intent_flags=IntentFlags(needs_retrieval=True),
+            domain="business_hr",
+            confidence=0.9,
+            retrieval_mode_hint="multi_hop",
+            subqueries=routed_subs,
+            entities=("Northpeak", "Đà Nẵng"),
+        ),
+    )
+    assert strat.multi_hop_eligible is True
+    assert strat.retrieval_plan.decomposition.subqueries == routed_subs
+    assert strat.retrieval_plan.temporal_mode == "change_lineage"
+    assert strat.retrieval_plan.entities == ("Northpeak", "Đà Nẵng")
+
+
+def test_salient_query_terms_unicode_and_entities_and_artifact_prefixes() -> None:
+    salient = qa.extract_salient_query_terms(
+        "What caused the MedThink latency spike on GPU nodes using HTTP2 near Đà Nẵng?",
+        entities=("PostgreSQL", "Đà Nẵng"),
+    )
+    for expected in ("medthink", "gpu", "http2", "đànẵng", "nẵng", "postgresql"):
+        assert expected in salient
+
+    # Vietnamese accented time/structural units must not be treated as artifact codes
+    assert surs._extract_artifact_codes("Ngày 15 tháng 10 năm 2026 tại điều 15 mục 12 bước 03") == set()
+    assert surs._extract_artifact_codes("Fixed in PR-24108 and INC-9821") == {"pr 24108", "inc 9821"}
+
+
+@pytest.mark.asyncio
+async def test_propagation_of_subqueries_multi_hop_temporal_and_web_time_range(monkeypatch) -> None:
+    # 1. rerank_sections respects temporal_mode for superseded and accepts subqueries/entities
+    sup_sec = RetrievedSection(
+        chunk_id="sup-1",
+        document_id="d1",
+        heading="Old Spec",
+        content="Retention is 30 days.",
+        score=0.95,
+        raw_dense_score=0.95,
+        is_superseded=True,
+    )
+    assert rs.rerank_sections("previous superseded retention", [sup_sec], limit=5).sections == []
+    assert (
+        len(
+            rs.rerank_sections(
+                "retention history",
+                [sup_sec],
+                limit=5,
+                temporal_mode="change_lineage",
+            ).sections
+        )
+        == 1
+    )
+
+    # 2. select_diverse_sections honors explicit multi_hop=True even without conjunction regex
+    docs = [
+        RetrievedSection(
+            chunk_id=f"d{i}",
+            document_id=f"doc-{i}",
+            document_name=f"Doc{i}.md",
+            heading="Info",
+            content=f"Unique section content number {i} for query topic.",
+            score=0.90 - 0.12 * i,
+            rank=i,
+        )
+        for i in range(3)
+    ]
+    selected_sh, _ = rs.select_diverse_sections("topic overview", docs, limit=3, multi_hop=False)
+    selected_mh, _ = rs.select_diverse_sections("topic overview", docs, limit=3, multi_hop=True)
+    assert len(selected_mh) >= len(selected_sh)
+
+    # 3. WebSearchTool derives time_range from structured ctx.route_decision instead of _RECENT_QUERY_MARKERS
+    import httpx
+
+    from sag_api.core.config import settings
+
+    captured_payloads: list[dict] = []
+
+    class _FakeAsyncClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, _url, **_kwargs):
+            captured_payloads.append(_kwargs["json"])
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", _url),
+                json={"results": [{"title": "T", "url": "https://ex.com", "content": "ok"}]},
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+    monkeypatch.setattr(settings, "llm_api_key", "k-test")
+    monkeypatch.setattr(settings, "llm_base_url", "https://api.302.ai/v1")
+
+    ctx_recent = ToolContext(
+        engine_manager=SimpleNamespace(),
+        route_decision={"temporal_mode": "current_effective", "intent_flags": {"needs_time": False}},
+    )
+    await WebSearchTool().invoke({"query": "hôm nay thời tiết thế nào"}, ctx_recent)
+    assert captured_payloads[-1].get("time_range") == "week"
+
+    ctx_atemporal = ToolContext(
+        engine_manager=SimpleNamespace(),
+        route_decision={"temporal_mode": "atemporal", "intent_flags": {"needs_time": False}},
+    )
+    await WebSearchTool().invoke({"query": "today weather without flag"}, ctx_atemporal)
+    assert "time_range" not in captured_payloads[-1]
+
+
+@pytest.mark.asyncio
+async def test_search_route_and_legacy_retrieve_propagate_subqueries_and_temporal(monkeypatch) -> None:
+    from unittest.mock import AsyncMock
+
+    from sag_api.api.v1 import search as search_api
+
+    routed_subs = ("What caused the outage?", "How was it mitigated?")
+    fake_decision = UnifiedRouteDecision(
+        query="What caused the outage, and how was it mitigated?",
+        coarse_intent="KNOWLEDGE",
+        question_scope="project",
+        memory_scope="project_documents",
+        temporal_mode="change_lineage",
+        answer_shape="fact_answer",
+        intent_flags=IntentFlags(needs_retrieval=True),
+        domain="technical",
+        confidence=0.92,
+        retrieval_mode_hint="multi_hop",
+        subqueries=routed_subs,
+        entities=("OutageService",),
+    )
+    monkeypatch.setattr(search_api, "route_query_async", AsyncMock(return_value=fake_decision))
+
+    route_plan = await search_api._build_query_route(
+        fake_decision.query,
+        ["src-1"],
+        None,
+        trace_strategy_plan=True,
+    )
+    assert route_plan.trace["query_analysis"]["features"]["clauses"] == list(routed_subs)
+    assert route_plan.trace["query_analysis"]["features"]["multi_hop"] is True
+    assert "MULTI_HOP_CUE" in route_plan.trace["reason_codes"]
+
+    sup_sec = RetrievedSection(
+        chunk_id="c-sup",
+        document_id="d1",
+        heading="History",
+        content="OutageService v1 was replaced after the incident.",
+        score=0.92,
+        raw_dense_score=0.92,
+        source_id="src-1",
+        source_config_id="cfg-1",
+        is_superseded=True,
+    )
+    engine = SimpleNamespace(
+        search_many=AsyncMock(return_value=SimpleNamespace(query=fake_decision.query, sections=[sup_sec], stats={})),
+        grep_chunks=AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        rs,
+        "_hidden_document_derivatives",
+        AsyncMock(return_value=SimpleNamespace(source_ids=set(), source_config_ids=set(), source_keys=set())),
+    )
+
+    outcome = await rs.retrieve_relevant_sections(
+        engine,
+        [SimpleNamespace(id="src-1", sag_source_config_id="cfg-1")],
+        fake_decision.query,
+        query_strategy_plan=route_plan.strategy_plan,
+    )
+    assert [s.chunk_id for s in outcome.sections] == ["c-sup"]
+    assert outcome.stats["retrieval_plan"]["decomposition"]["subqueries"] == list(routed_subs)

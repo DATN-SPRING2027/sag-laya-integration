@@ -41,20 +41,6 @@ _FENCE_OPEN_RE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
 # Regex nhận diện danh sách
 _LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+(.+)$")
 
-# Dải ký tự chữ viết không khoảng trắng (CJK, Hiragana, Katakana, Hangul, Thái, Lào, Khmer, Myanmar)
-_CONTINUOUS_SCRIPT_CHAR_RE = re.compile(
-    r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af"
-    r"\u0e00-\u0e7f\u0e80-\u0eff\u1780-\u17ff\u1000-\u109f]"
-)
-
-# Ngắt câu đa ngôn ngữ bảo toàn số thập phân (3.14) và mã hiệu
-_MULTILINGUAL_SENTENCE_SPLIT_RE = re.compile(
-    r"(?:(?<=[.!?。！？；;])\s+(?=\S))|(?:\n+)"
-)
-_MULTILINGUAL_CLAUSE_SPLIT_RE = re.compile(
-    r"(?:(?<=[,，、:：；;])\s*)|(?:\s+(?=[\(\[（]))"
-)
-
 
 def estimate_unicode_tokens(text: str) -> int:
     """Ước lượng số lượng token qua shared tiktoken cl100k_base + fallback tiếng Việt/CJK."""

@@ -367,7 +367,7 @@ async def test_live_decision_router_and_llm_structured() -> None:
     if router_ready:
         decision = await route_query_async("Điều 15 của quy chế nghỉ phép quy định gì?")
         assert decision.degraded is False
-        assert decision.question_scope in {"project", "public", "application", "unknown"}
+        assert decision.question_scope in {"project", "general", "application", "unknown"}
 
     if cfg.llm_configured:
         cfg.llm_max_tokens = min(cfg.llm_max_tokens, 64)

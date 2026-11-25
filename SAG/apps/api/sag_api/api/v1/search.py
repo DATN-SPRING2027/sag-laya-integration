@@ -103,7 +103,6 @@ async def _build_query_route(
     requested_top_k: int | None = None,
     trace_strategy_plan: bool = False,
 ) -> _QueryRoutePlan:
-    analysis = analyze_query(query, segmentation_enabled=settings.search_chinese_segmentation_enabled)
     route_error = False
     try:
         decision = (await route_query_async(query, scoped=bool(source_ids), has_sources=True)).to_dict()
@@ -129,9 +128,18 @@ async def _build_query_route(
             "is_catalog_query": False,
             "retrieval_mode_hint": "auto",
             "subqueries": [],
+            "entities": [],
         }
         route_error = True
 
+    routed_subqueries = tuple(str(s).strip() for s in (decision.get("subqueries") or ()) if str(s).strip())
+    routed_multi_hop_hint = str(decision.get("retrieval_mode_hint") or "").strip().lower() in {"multi_hop", "multi"}
+    analysis = analyze_query(
+        query,
+        segmentation_enabled=settings.search_chinese_segmentation_enabled,
+        subqueries=routed_subqueries,
+        multi_hop_hint=routed_multi_hop_hint,
+    )
     strategy_plan = plan_query(
         query,
         requested_mode=requested_retrieval_mode,
@@ -594,6 +602,7 @@ async def search(
                         query,
                         strategy=route_plan.strategy,
                         top_k=body.top_k,
+                        query_strategy_plan=route_plan.strategy_plan,
                     ),
                     recall_event_scores(
                         engine_manager,

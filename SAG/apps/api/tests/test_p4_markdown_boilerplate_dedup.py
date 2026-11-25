@@ -370,10 +370,19 @@ async def test_superseded_filtering_no_fallback_and_valid_to_propagation():
     )
     assert res_blocked.sections == []
 
-    res_allowed = retrieval_service.rerank_sections(
+    # Without explicit router temporal_mode, superseded keywords in query text must still fail closed
+    res_still_blocked = retrieval_service.rerank_sections(
         "What was the previous superseded retention period?",
         [sup_sec],
         limit=5,
+    )
+    assert res_still_blocked.sections == []
+
+    res_allowed = retrieval_service.rerank_sections(
+        "What was the retention period before the change?",
+        [sup_sec],
+        limit=5,
+        temporal_mode="change_lineage",
     )
     assert len(res_allowed.sections) == 1
 

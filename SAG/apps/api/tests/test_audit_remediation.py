@@ -780,10 +780,15 @@ def test_first_principles_stage1_to_stage5_architectural_upgrades() -> None:
     assert "2018" in analysis.scoring_terms
     assert "q2" in analysis.scoring_terms
 
+    # EN conjunctions no longer split via semantic regex; router subqueries supply multi-clause decomposition.
     mh_features = extract_query_features(
-        "What caused the database failover, and how does it affect the replication lag?"
+        "What caused the database failover, and how does it affect the replication lag?",
+        subqueries=("What caused the database failover?", "How does it affect the replication lag?"),
     )
     assert mh_features.multi_hop is True
+    assert extract_query_features(
+        "What caused the database failover, and how does it affect the replication lag?"
+    ).multi_hop is False
 
     # 3. Stage 3: Unicode diacritic entity extraction (Vietnamese + European proper nouns)
     unicode_block = _make_block(
@@ -892,9 +897,12 @@ def test_cognitive_upgrades_clause_decomposition_artifact_bridge_and_entropy_adm
     from sag_api.services.retrieval_service import select_diverse_sections
     from sag_api.services.search_unit_retrieval_service import _extract_artifact_codes
 
-    # 1. Clause decomposition, salient proper nouns, and dispute multi-hop detection
+    # 1. Clause decomposition via router subqueries (fail-closed without them), salient proper nouns, and multi-hop
+    en_dispute = "Why was Northpeak's invoice disputed, and how was the billing calculation corrected?"
+    assert decompose_query_clauses(en_dispute) == (en_dispute,)
     clauses = decompose_query_clauses(
-        "Why was Northpeak's invoice disputed, and how was the billing calculation corrected?"
+        en_dispute,
+        subqueries=("Why was Northpeak's invoice disputed?", "How was the billing calculation corrected?"),
     )
     assert len(clauses) == 2
     salient = extract_salient_query_terms(
@@ -904,7 +912,8 @@ def test_cognitive_upgrades_clause_decomposition_artifact_bridge_and_entropy_adm
     assert "gpu" in salient
 
     dispute_features = extract_query_features(
-        "How does INC-9821 relate to the driver upgrade, and what caused the latency spike?"
+        "How does INC-9821 relate to the driver upgrade, and what caused the latency spike?",
+        subqueries=("How does INC-9821 relate to the driver upgrade?", "What caused the latency spike?"),
     )
     assert dispute_features.multi_hop is True
 
@@ -999,10 +1008,12 @@ def test_cognitive_upgrades_clause_decomposition_artifact_bridge_and_entropy_adm
             source_id="src-1",
         ),
     ]
+    # Multi-Hop: routed multi_hop=True (from UnifiedRouteDecision/QueryStrategyPlan) admits 4 distinct docs
     mh_selected, _ = select_diverse_sections(
         "Why was the outage triggered, and how did the PR fix the ticket?",
         mh_sections,
         limit=4,
+        multi_hop=True,
     )
     assert {s.document_id for s in mh_selected} == {"mh-doc-1", "mh-doc-2", "mh-doc-3", "mh-doc-4"}
 
@@ -1201,10 +1212,12 @@ def test_system_bottleneck_bug_fixes_e0_routing_and_multihop_diversity() -> None
             source_id="src-1",
         ),
     ]
+    # Multi-Hop Diversity: routed multi_hop=True admits 5 distinct qualifying docs
     mh5_selected, _ = select_diverse_sections(
         "Why was the outage triggered, and how did the PR fix the ticket?",
         mh5_sections,
         limit=5,
+        multi_hop=True,
     )
     assert [s.document_id for s in mh5_selected] == ["doc-1", "doc-2", "doc-3", "doc-4", "doc-5"]
 
@@ -1258,13 +1271,23 @@ def test_vietnamese_entity_lexer_and_multihop_detection() -> None:
     ml_terms = terms(multilang_block.normalized_text)
     assert "個人" in ml_terms and "情報" in ml_terms and "保護" in ml_terms
 
-    # 2. Structural multi-clause detection in extract_query_features & semantic multi-hop via router hint
+    # 2. Semantic multi-hop via router hint & router subqueries (no semantic VI conjunction regex)
     from sag_api.services.query_strategy_planner import plan_query
 
     mh_q1 = "Mối liên hệ giữa dịch vụ xác thực và cổng thanh toán dẫn đến lỗi gì?"
     mh_q2 = "Sự khác nhau giữa quy trình phê duyệt cấp 1 và quy trình khẩn cấp là gì, và khi nào cần áp dụng?"
     assert plan_query(mh_q1, retrieval_mode_hint="multi_hop").multi_hop_eligible is True
-    assert extract_query_features(mh_q2).multi_hop is True
+    assert extract_query_features(mh_q2).multi_hop is False
+    assert (
+        plan_query(
+            mh_q2,
+            subqueries=(
+                "Sự khác nhau giữa quy trình phê duyệt cấp 1 và quy trình khẩn cấp là gì?",
+                "Khi nào cần áp dụng quy trình khẩn cấp?",
+            ),
+        ).multi_hop_eligible
+        is True
+    )
 
 
 @pytest.mark.asyncio

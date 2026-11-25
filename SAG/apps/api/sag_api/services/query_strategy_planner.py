@@ -85,11 +85,12 @@ def plan_query(
     is_catalog_query: bool | None = None,
     retrieval_mode_hint: str | None = None,
     subqueries: tuple[str, ...] | list[str] = (),
+    temporal_mode: str | None = None,
+    entities: tuple[str, ...] | list[str] = (),
     route_decision: Mapping[str, Any] | Any | None = None,
     constraints: tuple[FieldPredicate, ...] = (),
 ) -> QueryStrategyPlan:
     """Select a stable primary mode and compile the 7-axis RetrievalPlan."""
-    effective_features = features or extract_query_features(query)
     if route_decision is not None:
         if answer_shape is None:
             answer_shape = _route_field(route_decision, "answer_shape")
@@ -106,8 +107,17 @@ def plan_query(
             retrieval_mode_hint = _route_field(route_decision, "retrieval_mode_hint")
         if not subqueries:
             subqueries = tuple(_route_field(route_decision, "subqueries") or ())
+        if temporal_mode is None:
+            temporal_mode = _route_field(route_decision, "temporal_mode")
+        if not entities:
+            entities = tuple(_route_field(route_decision, "entities") or ())
 
     hint_norm = (str(retrieval_mode_hint or "").strip().lower())
+    effective_features = features or extract_query_features(
+        query,
+        subqueries=subqueries,
+        multi_hop_hint=(hint_norm in {"multi_hop", "multi"}),
+    )
     requested = _normalize_mode(requested_mode)
     reasons: list[str] = []
     modifiers: list[RetrievalMode] = []
@@ -180,6 +190,8 @@ def plan_query(
         multi_hop=multi_hop_eligible,
         exact_lookup=exact_lookup,
         constraints=constraints,
+        temporal_mode=str(temporal_mode) if temporal_mode else None,
+        entities=tuple(str(e).strip() for e in entities if str(e).strip()),
     )
     if retrieval_plan.target.value == "DOCUMENT":
         reasons.append(f"TARGET_DOCUMENT_{retrieval_plan.output.value}")

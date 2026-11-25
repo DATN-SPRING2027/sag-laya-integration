@@ -8,6 +8,7 @@ import math
 import re
 import threading
 import time
+import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -74,6 +75,8 @@ async def _select_diverse_sections(
     limit,
     deadline,
     per_document_limit: int | None = None,
+    multi_hop: bool | None = None,
+    entities: tuple[str, ...] | list[str] = (),
 ):
     """Keep evidence scoring off the API loop and stop it when its request ends."""
     from sag_api.services.retrieval_service import select_diverse_sections
@@ -90,6 +93,8 @@ async def _select_diverse_sections(
                 candidates,
                 limit=limit,
                 per_document_limit=per_document_limit,
+                multi_hop=multi_hop,
+                entities=entities,
                 _cancelled=cancelled,
             ))
             try:
@@ -988,7 +993,9 @@ _NON_ARTIFACT_PREFIXES = frozenset(
         "page", "pages", "step", "steps", "tier", "tiers", "part", "parts", "item", "items",
         "line", "lines", "table", "tables", "figure", "figures", "note", "notes", "top", "max", "min",
         "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
-        "ngay", "thang", "nam", "tuan", "gio", "phut", "giay", "trang", "buoc", "lan", "phan", "muc",
+        "ngay", "ngày", "thang", "tháng", "nam", "năm", "tuan", "tuần", "gio", "giờ",
+        "phut", "phút", "giay", "giây", "trang", "buoc", "bước", "lan", "lần",
+        "phan", "phần", "muc", "mục", "dieu", "điều", "khoan", "khoản", "chuong", "chương",
     }
 )
 _INTERNAL_URI_SLUG_RE = re.compile(
@@ -1001,7 +1008,7 @@ def _extract_artifact_codes(text: str) -> set[str]:
     if not text:
         return set()
     codes: set[str] = set()
-    for match in _ARTIFACT_CODE_RE.finditer(text):
+    for match in _ARTIFACT_CODE_RE.finditer(unicodedata.normalize("NFC", text)):
         prefix = match.group(1).lower()
         if prefix in _NON_ARTIFACT_PREFIXES:
             continue
@@ -2031,10 +2038,10 @@ async def _retrieve_search_unit_sections(
     from sag_api.services.retrieval_service import _query_allows_superseded, rerank_sections
 
     query = normalize_text(query or "")
-    allows_superseded = _query_allows_superseded(query)
     requested_limit = min(top_k, settings.search_unit_candidate_limit) if top_k is not None else candidate_limit
     selection_limit = requested_limit if top_k is not None else None
     strategy_plan = query_strategy_plan or plan_query(query, requested_top_k=top_k)
+    allows_superseded = _query_allows_superseded(temporal_mode=strategy_plan.retrieval_plan.temporal_mode)
     per_doc_limit = strategy_plan.retrieval_plan.per_document_limit
     retrieval_stats = {
         "effective_strategy": "canonical_hybrid",
@@ -2731,7 +2738,7 @@ async def _retrieve_search_unit_sections(
         selection_fallback_reason = "rerank_budget_exhausted"
         raw_fallback_pool = _fair_rank_merge([semantic, lexical])
         lexical_keys = {_section_key(sec) for sec in lexical}
-        allows_superseded = _query_allows_superseded(query)
+        allows_superseded = _query_allows_superseded(temporal_mode=strategy_plan.retrieval_plan.temporal_mode)
         min_dense = float(settings.search_min_dense_score)
         fallback_pool: list[RetrievedSection] = []
         for sec in raw_fallback_pool:
@@ -2780,7 +2787,15 @@ async def _retrieve_search_unit_sections(
         t_diversity_ms = round((time.perf_counter() - t_rerank_start) * 1000, 2)
     else:
         t_fusion_start = time.perf_counter()
-        fused = rerank_sections(query, semantic, lexical=lexical, limit=None)
+        fused = rerank_sections(
+            query,
+            semantic,
+            lexical=lexical,
+            limit=None,
+            subqueries=strategy_plan.retrieval_plan.decomposition.subqueries,
+            entities=strategy_plan.retrieval_plan.entities,
+            temporal_mode=strategy_plan.retrieval_plan.temporal_mode,
+        )
         t_fusion_ms = round((time.perf_counter() - t_fusion_start) * 1000, 2)
         rerank_stats = {
             "candidates": fused.candidate_count,
@@ -2790,6 +2805,7 @@ async def _retrieve_search_unit_sections(
         t_div_start = time.perf_counter()
         is_multi_hop_query = (
             strategy_plan.primary_strategy.value == "MULTI_HOP"
+            or strategy_plan.multi_hop_eligible
             or "MULTI_HOP_CANDIDATE" in strategy_plan.reason_codes
         )
         sibling_sections = (
@@ -2811,6 +2827,8 @@ async def _retrieve_search_unit_sections(
                 limit=selection_limit,
                 deadline=selection_deadline,
                 per_document_limit=per_doc_limit,
+                multi_hop=is_multi_hop_query,
+                entities=strategy_plan.retrieval_plan.entities,
             )
         except TimeoutError:
             selection_fallback_reason = "diversity_budget_exhausted"
@@ -2941,6 +2959,8 @@ async def _retrieve_search_unit_sections(
                         limit=selection_limit,
                         deadline=selection_deadline,
                         per_document_limit=per_doc_limit,
+                        multi_hop=is_multi_hop_mode,
+                        entities=effective_plan.retrieval_plan.entities,
                     )
                 except TimeoutError:
                     diversity_stats = {**diversity_stats, "reason": "diversity_budget_exhausted"}
