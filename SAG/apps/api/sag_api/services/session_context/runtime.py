@@ -725,10 +725,21 @@ async def prepare_session_context_for_ask(
         allowed_turn_ids = set(index.turns_by_id.keys())
     else:
         req_src_set = set(requested_source_ids)
+        turns = list(index.turns)
+        excluded_turn_ids: set[str] = set()
+        for idx_pos, t in enumerate(turns):
+            cited = set(t.cited_source_ids)
+            if cited and not cited.issubset(req_src_set):
+                excluded_turn_ids.add(t.turn_id)
+                if t.role == "assistant":
+                    prev_idx = idx_pos - 1
+                    while prev_idx >= 0 and turns[prev_idx].role == "user":
+                        excluded_turn_ids.add(turns[prev_idx].turn_id)
+                        prev_idx -= 1
         allowed_turn_ids = {
             t.turn_id
-            for t in index.turns
-            if t.role != "assistant" or set(t.cited_source_ids).issubset(req_src_set)
+            for t in turns
+            if t.turn_id not in excluded_turn_ids
         }
 
     # SiliconFlow System One routing (run off event loop; deterministic fallback if disabled/unconfigured)

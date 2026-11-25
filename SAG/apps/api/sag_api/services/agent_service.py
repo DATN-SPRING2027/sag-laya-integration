@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
 import unicodedata
@@ -413,12 +414,14 @@ def _rewrite_prose_citation_brackets(
 def _finalize_answer_citations(
     answer: str,
     citations: list[dict[str, Any]],
+    *,
+    allow_uncited_fallback: bool = False,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Return one canonical answer whose numeric citations are all clickable.
 
-    Model-invented or non-traceable numbers are removed. When grounded search
-    evidence exists but the model forgot claim markers, return a small set of
-    explicitly non-claim-mapped structured sources without modifying the answer.
+    Model-invented or non-traceable numbers are removed. Uncited evidence is not
+    attached by default (S5-10); callers may opt in to non-claim-mapped fallback
+    only when explicitly requested.
     """
 
     traceable: dict[int, dict[str, Any]] = {}
@@ -484,7 +487,7 @@ def _finalize_answer_citations(
     canonical = _rewrite_prose_citation_brackets(answer, replace_reference).strip()
     canonical = re.sub(r"[ \t]+([，。！？；：,.!?;:])", r"\1", canonical)
     explicitly_mapped = set(used)
-    if canonical and traceable and not used:
+    if allow_uncited_fallback and canonical and traceable and not used:
         used = list(traceable)[:3]
     normalized = []
     for number in used:
@@ -504,6 +507,8 @@ def _finalize_answer_citations(
 def _finalize_session_citations(
     answer: str,
     session_citations: list[dict[str, Any]],
+    *,
+    allow_uncited_fallback: bool = False,
 ) -> tuple[str, list[dict[str, Any]], bool]:
     """Validate `[S1]..[Sk]` (single or compound) markers, strip `[S99]`, and return used citations."""
     valid_by_ref: dict[str, dict[str, Any]] = {}
@@ -541,7 +546,11 @@ def _finalize_session_citations(
 
     explicitly_mapped = set(used_refs)
     has_explicit = bool(explicitly_mapped)
-    chosen_refs = used_refs if used_refs else list(valid_by_ref)[:3]
+    chosen_refs = (
+        used_refs
+        if (used_refs or not allow_uncited_fallback)
+        else list(valid_by_ref)[:3]
+    )
     returned: list[dict[str, Any]] = []
     for ref in chosen_refs:
         if ref not in valid_by_ref:
@@ -555,6 +564,133 @@ def _finalize_session_citations(
             }
         )
     return cleaned, returned, has_explicit
+
+
+def _strip_think_for_json(raw_text: str) -> str:
+    text = (raw_text or "").strip()
+    while True:
+        start = text.find("<think>")
+        if start == -1:
+            return text
+        end = text.find("</think>", start + len("<think>"))
+        if end == -1:
+            before = text[:start].strip()
+            if "{" in before:
+                return before
+            after = text[start + len("<think>") :].strip()
+            return after if "{" in after else before
+        text = (text[:start] + " " + text[end + len("</think>") :]).strip()
+
+
+def _parse_entailment_verdict(raw_text: str) -> tuple[str | None, bool | None]:
+    cleaned = _strip_think_for_json(raw_text)
+    if not cleaned:
+        return None, None
+    decoder = json.JSONDecoder()
+    idx = cleaned.find("{")
+    while idx != -1:
+        try:
+            obj, _end = decoder.raw_decode(cleaned, idx)
+        except json.JSONDecodeError:
+            idx = cleaned.find("{", idx + 1)
+            continue
+        if isinstance(obj, dict) and ("answerability" in obj or "supported" in obj):
+            raw_ans = obj.get("answerability")
+            ans_val = (
+                raw_ans.strip().lower()
+                if isinstance(raw_ans, str) and raw_ans.strip().lower() in {"answered", "insufficient_evidence"}
+                else ("answered" if "supported" in obj else None)
+            )
+            raw_sup = obj.get("supported")
+            sup_val = raw_sup if isinstance(raw_sup, bool) else None
+            return ans_val, sup_val
+        idx = cleaned.find("{", idx + 1)
+    return None, None
+
+
+async def _verify_grounded_entailment(
+    llm: Any | None,
+    *,
+    query: str,
+    answer: str,
+    internal_citations: list[dict[str, Any]],
+    session_citations: list[dict[str, Any]],
+) -> tuple[str, str | None]:
+    """Verify cited answer is neither an abstention nor an unsupported/fabricated claim (S5-05)."""
+    if llm is None or not getattr(llm, "configured", False) or not callable(getattr(llm, "complete", None)):
+        return "answered", None
+
+    evidence_lines: list[str] = []
+    for cit in internal_citations:
+        if cit.get("claim_level") != "claim":
+            continue
+        n = cit.get("n")
+        heading = str(cit.get("heading") or cit.get("document_name") or "").strip()
+        snippet = str(cit.get("snippet") or cit.get("content") or "").strip()
+        if snippet:
+            evidence_lines.append(f"[{n}] {heading}: {snippet}" if heading else f"[{n}] {snippet}")
+    for sc in session_citations:
+        if sc.get("claim_level") != "claim":
+            continue
+        ref = sc.get("ref")
+        snippet = str(sc.get("snippet") or "").strip()
+        if ref and snippet:
+            evidence_lines.append(f"[{ref}] {snippet}")
+    if not evidence_lines:
+        return "answered", None
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a strict citation entailment verifier. Given a user question, cited evidence excerpts, "
+                "and a candidate answer, respond ONLY with JSON: "
+                '{"answerability": "answered" | "insufficient_evidence", "supported": true | false, "reason": "<short>"}. '
+                'Set answerability to "insufficient_evidence" and supported to false if the candidate answer is a refusal '
+                "or says the evidence lacks the requested information (even if it cites [1]/[S1]). "
+                "Set supported to false if the candidate answer states factual claims (numbers, dates, names, rules) "
+                "that contradict or are not entailed by the cited evidence excerpts."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Question: {query}\n\n"
+                f"Cited Evidence:\n" + "\n".join(evidence_lines) + "\n\n"
+                f"Candidate Answer:\n{answer}"
+            ),
+        },
+    ]
+    kwargs: dict[str, Any] = {}
+    try:
+        sig = inspect.signature(llm.complete)
+        if any(
+            p.kind == inspect.Parameter.VAR_KEYWORD or name == "response_format"
+            for name, p in sig.parameters.items()
+        ):
+            kwargs["response_format"] = {"type": "json_object"}
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        from sag_api.core.token_usage import token_usage_scope
+
+        with token_usage_scope(component="entailment_verifier"):
+            raw = await asyncio.wait_for(llm.complete(messages, **kwargs), timeout=10.0)
+    except Exception:  # noqa: BLE001
+        return "no_answer", "weak_evidence"
+
+    answerability, supported = _parse_entailment_verdict(str(raw or ""))
+    if answerability is None and supported is None:
+        if isinstance(llm, LLMClient):
+            return "no_answer", "weak_evidence"
+        # Non-LLMClient unit test doubles (FakeLLM / RecordingLLM / _DummyLLM) return placeholder strings.
+        return "answered", None
+    if answerability == "insufficient_evidence":
+        return "no_answer", "insufficient_evidence"
+    if supported is False:
+        return "no_answer", "unsupported_claim"
+    return "answered", None
 
 
 def _build_session_audit_step(
@@ -1508,7 +1644,7 @@ async def generate_stream(
                     delta = payload.get("delta")
                     if isinstance(delta, str):
                         partial_answer.append(delta)
-                    if local_grounding_required or host_context.search_context_called:
+                    if local_grounding_required or session_grounded_scope or host_context.search_context_called:
                         # Keep unvalidated knowledge claims private until the
                         # terminal citation/provenance gate selects the answer.
                         continue
@@ -1539,22 +1675,42 @@ async def generate_stream(
                         start_n=external_start,
                     )
                     has_external_claim = any(citation.get("claim_level") == "claim" for citation in external_citations)
-                    requires_grounded_answer = local_grounding_required or host_context.search_context_called
+                    requires_grounded_answer = (
+                        local_grounding_required
+                        or session_grounded_scope
+                        or host_context.search_context_called
+                    )
                     if (
                         requires_grounded_answer
                         and not has_internal_claim
                         and not (
                             session_grounded_scope
                             and bool(canonical_answer)
-                            and (has_explicit_session_claim or bool(plan_session_citations))
+                            and has_explicit_session_claim
                         )
                         and (local_evidence_required or not has_external_claim)
                     ):
-                        canonical_answer = empty_response or no_answer_text()
+                        canonical_answer = empty_response or no_answer_text(query=plan.query)
                         internal_citations = []
                         external_citations = []
+                        used_session_citations = []
                         answer_status = "no_answer"
                         no_answer_reason = host_context.search_context_no_answer_reason or "weak_evidence"
+                    elif requires_grounded_answer and answer_status == "answered" and canonical_answer:
+                        verified_status, verified_reason = await _verify_grounded_entailment(
+                            llm,
+                            query=plan.query,
+                            answer=canonical_answer,
+                            internal_citations=internal_citations,
+                            session_citations=used_session_citations,
+                        )
+                        if verified_status == "no_answer":
+                            canonical_answer = empty_response or no_answer_text(query=plan.query)
+                            internal_citations = []
+                            external_citations = []
+                            used_session_citations = []
+                            answer_status = "no_answer"
+                            no_answer_reason = verified_reason or "weak_evidence"
                     canonical_citations = [*internal_citations, *external_citations]
                     session_step = _build_session_audit_step(
                         plan_audit_trace,
