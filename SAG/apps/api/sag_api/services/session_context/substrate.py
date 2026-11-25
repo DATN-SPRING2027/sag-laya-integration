@@ -225,7 +225,8 @@ async def embed_texts_with_provenance(
                 return rebuilt, emb_sig
             except Exception as exc:  # noqa: BLE001
                 log.warning(
-                    "Session embedder failed during dimension-drift recompute (sig=%s); falling back to deterministic-ngram-v1: %s",
+                    "Session embedder failed during dimension-drift recompute "
+                    "(sig=%s); falling back to deterministic-ngram-v1: %s",
                     emb_sig,
                     type(exc).__name__,
                 )
