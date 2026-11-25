@@ -48,8 +48,8 @@ from sag_api.services.search_index_service import (
     put_cached_text_embedding,
 )
 from sag_api.services.session_context.extractor import (
-    classify_epistemic_state,
     extract_content_terms,
+    extract_turns_structured_batch,
     normalize_session_text,
     split_sentences_with_spans,
 )
@@ -2380,7 +2380,7 @@ async def sync_session_index_to_storage(
     return stats
 
 
-def _reconstruct_prefix_into_index(
+async def _reconstruct_prefix_into_index(
     index: IncrementalSessionIndex,
     *,
     persisted_turn_units: Sequence[SessionUnit],
@@ -2388,9 +2388,10 @@ def _reconstruct_prefix_into_index(
     project_records: Sequence[dict[str, Any]],
     hydrated_vectors: dict[str, tuple[float, ...]],
     embedder: Any | None,
+    llm: Any | None = None,
     as_of_cutoff: bool = False,
 ) -> None:
-    """Hydrate prefix `0 .. K - 1` into `IncrementalSessionIndex` without re-running NER or HTTP embedding."""
+    """Hydrate prefix `0 .. K - 1` into `IncrementalSessionIndex` without re-running HTTP embedding."""
     target_mode = compute_embedding_signature(embedder)
     index.embedding_mode = target_mode
     base_turn_ordinal = len(index.turns)
@@ -2402,6 +2403,40 @@ def _reconstruct_prefix_into_index(
         for d in persisted_decisions
         if d.session_unit_id in unit_id_to_turn_id
     }
+
+    intrinsic_by_turn_id: dict[str, Any] = {}
+    if as_of_cutoff:
+        cutoff_candidates: list[dict[str, Any]] = []
+        seen_cutoff_tids: set[str] = set()
+        dec_unit_ids_needing_restore = {
+            d.session_unit_id
+            for d in persisted_decisions
+            if d.epistemic_status == "SUPERSEDED"
+            and (d.superseded_by_id is None or d.superseded_by_id not in dec_id_to_turn_id)
+            and d.ledger_kind != "OPEN_ISSUE"
+        }
+        for i, u_row in enumerate(persisted_turn_units):
+            if u_row.epistemic_status == "SUPERSEDED" or u_row.id in dec_unit_ids_needing_restore:
+                rec = project_records[i]
+                tid = str(rec["id"])
+                if tid not in seen_cutoff_tids:
+                    seen_cutoff_tids.add(tid)
+                    cutoff_candidates.append(
+                        {
+                            "id": tid,
+                            "role": str(rec.get("role") or u_row.role or "user"),
+                            "content": normalize_session_text(str(rec["content"])),
+                        }
+                    )
+        if cutoff_candidates:
+            analyses, batch_degraded, batch_reason = await extract_turns_structured_batch(
+                cutoff_candidates,
+                llm=llm,
+            )
+            if batch_degraded:
+                index.extraction_degraded = True
+                index.extraction_degraded_reason = index.extraction_degraded_reason or batch_reason
+            intrinsic_by_turn_id = {a.turn_id: a for a in analyses}
 
     for i, u_row in enumerate(persisted_turn_units):
         rec = project_records[i]
@@ -2523,9 +2558,12 @@ def _reconstruct_prefix_into_index(
             index.cached_cited_source_ids.update(cited_sources)
 
         restored_turn_status = u_row.epistemic_status
+        intrinsic_analysis = intrinsic_by_turn_id.get(t_id)
         if as_of_cutoff and restored_turn_status == "SUPERSEDED":
-            intrinsic_st, _, _ = classify_epistemic_state(content, role=role)
-            restored_turn_status = intrinsic_st if intrinsic_st != "FACT" else "CONFIRMED"
+            if intrinsic_analysis is not None and not intrinsic_analysis.degraded:
+                restored_turn_status = intrinsic_analysis.epistemic_status
+            else:
+                restored_turn_status = "FACT"
 
         turn_obj = IndexedTurn(
             turn_id=t_id,
@@ -2589,13 +2627,18 @@ def _reconstruct_prefix_into_index(
         vt_ts: float | None = None
         if as_of_cutoff and dec_status == "SUPERSEDED" and sup_by_turn_id is None:
             # Decision was superseded on ancestor AFTER our branch cutoff -> restore As-Of active state!
-            intrinsic_st, _, _ = classify_epistemic_state(turn_obj.content, role=turn_obj.role)
+            intrinsic_analysis = intrinsic_by_turn_id.get(t_id)
             if d_row.ledger_kind == "OPEN_ISSUE":
                 dec_status = "OPEN_ISSUE"
-            elif intrinsic_st in {"CONFIRMED", "PROPOSED", "CONSIDERING", "OPEN_ISSUE", "NEGATED"}:
-                dec_status = intrinsic_st
+            elif (
+                intrinsic_analysis is not None
+                and not intrinsic_analysis.degraded
+                and intrinsic_analysis.epistemic_status
+                in {"CONFIRMED", "PROPOSED", "CONSIDERING", "OPEN_ISSUE", "NEGATED"}
+            ):
+                dec_status = intrinsic_analysis.epistemic_status
             else:
-                dec_status = "CONFIRMED"
+                dec_status = "FACT"
             turn_obj.epistemic_status = dec_status  # type: ignore[assignment]
             turn_obj.superseded_by_turn_id = None
             vt_ts = vf_aware.timestamp() if dec_status == "NEGATED" else None
@@ -2664,6 +2707,7 @@ async def _hydrate_ancestor_segments_as_of(
     scope: SessionPersistenceScope | None,
     embedder: Any | None,
     qdrant_client: httpx.AsyncClient | None,
+    llm: Any | None = None,
 ) -> int:
     """Hydrate read-only ancestor segments As-Of their branch cutoffs (`0` HTTP re-embeds when persisted)."""
     if not ancestor_segments_records:
@@ -2677,7 +2721,7 @@ async def _hydrate_ancestor_segments_as_of(
         if not seg_records:
             continue
         if scope is None:
-            await index.append_messages(seg_records, embedder=embedder)
+            await index.append_messages(seg_records, embedder=embedder, llm=llm)
             continue
 
         anc_units = list(
@@ -2800,13 +2844,14 @@ async def _hydrate_ancestor_segments_as_of(
                     .scalars()
                     .all()
                 )
-                _reconstruct_prefix_into_index(
+                await _reconstruct_prefix_into_index(
                     index,
                     persisted_turn_units=usable_units,
                     persisted_decisions=anc_decisions,
                     project_records=seg_records[:usable_k],
                     hydrated_vectors=anc_vecs,
                     embedder=embedder,
+                    llm=llm,
                     as_of_cutoff=True,
                 )
                 hydrated_anc_turns += usable_k
@@ -2814,7 +2859,7 @@ async def _hydrate_ancestor_segments_as_of(
                 usable_k = 0
 
         if usable_k < len(seg_records):
-            await index.append_messages(seg_records[usable_k:], embedder=embedder)
+            await index.append_messages(seg_records[usable_k:], embedder=embedder, llm=llm)
 
     index.seal_inherited_boundary()
     index.inherited_lineage_signature = lineage_signature
@@ -2834,6 +2879,7 @@ async def hydrate_or_backfill_cold_session_index(
     caller_had_pending_state: bool = False,
     ancestor_segments_records: Sequence[tuple[str, Sequence[dict[str, Any]]]] = (),
     lineage_signature: str = "",
+    llm: Any | None = None,
 ) -> PersistenceSyncStats:
     """Cold-start entrypoint: hydrate verified prefix (`0` HTTP re-embeds), lazy-backfill, or reconcile."""
     try:
@@ -2859,8 +2905,9 @@ async def hydrate_or_backfill_cold_session_index(
                     scope=None,
                     embedder=embedder,
                     qdrant_client=qdrant_client,
+                    llm=llm,
                 )
-            await index.append_messages(project_records, embedder=embedder)
+            await index.append_messages(project_records, embedder=embedder, llm=llm)
             return PersistenceSyncStats(status="memory_only")
         raise
 
@@ -2875,8 +2922,9 @@ async def hydrate_or_backfill_cold_session_index(
                 scope=None,
                 embedder=embedder,
                 qdrant_client=qdrant_client,
+                llm=llm,
             )
-        await index.append_messages(project_records, embedder=embedder)
+        await index.append_messages(project_records, embedder=embedder, llm=llm)
         return PersistenceSyncStats(status="memory_only")
 
     index.persistence_active = True
@@ -2901,7 +2949,7 @@ async def hydrate_or_backfill_cold_session_index(
     except Exception as exc:  # noqa: BLE001
         if _is_missing_session_tables_error(exc):
             index.persistence_active = False
-            await index.append_messages(project_records, embedder=embedder)
+            await index.append_messages(project_records, embedder=embedder, llm=llm)
             return PersistenceSyncStats(status="memory_only")
         raise
 
@@ -2915,6 +2963,7 @@ async def hydrate_or_backfill_cold_session_index(
             scope=scope,
             embedder=embedder,
             qdrant_client=qdrant_client,
+            llm=llm,
         )
 
     base_turn_ordinal = index.inherited_turn_count
@@ -2924,7 +2973,7 @@ async def hydrate_or_backfill_cold_session_index(
     expected_dim = declared_embedder_dim(embedder)
 
     if index.turns and index.embedding_mode != embedding_sig:
-        await index.append_messages(project_records, embedder=None)
+        await index.append_messages(project_records, embedder=None, llm=llm)
         return PersistenceSyncStats(status="degraded_unpersisted")
 
     # Empty own visible history: purge any lingering own derived state if k_persisted > 0
@@ -2967,7 +3016,7 @@ async def hydrate_or_backfill_cold_session_index(
 
     # Lazy Backfill (`k == 0`) or Reconciled Rebuild (delete / ACL revocation / model drift)
     if not prefix_ok:
-        await index.append_messages(project_records, embedder=embedder)
+        await index.append_messages(project_records, embedder=embedder, llm=llm)
         if index.turns and index.embedding_mode != embedding_sig:
             log.warning(
                 "Skipping cold persistence write for thread=%s: embedder degraded (%s != %s)",
@@ -3056,7 +3105,7 @@ async def hydrate_or_backfill_cold_session_index(
                     embedder=embedder,
                 )
                 if actual_sig != embedding_sig:
-                    await index.append_messages(project_records, embedder=None)
+                    await index.append_messages(project_records, embedder=None, llm=llm)
                     return PersistenceSyncStats(status="degraded_unpersisted")
                 for (u_row, _), f_vec in zip(still_missing, fallback_vecs, strict=True):
                     hydrated_vectors[u_row.id] = f_vec
@@ -3077,13 +3126,14 @@ async def hydrate_or_backfill_cold_session_index(
         .all()
     )
 
-    _reconstruct_prefix_into_index(
+    await _reconstruct_prefix_into_index(
         index,
         persisted_turn_units=persisted_turn_units,
         persisted_decisions=persisted_decisions,
         project_records=project_records[:k_persisted],
         hydrated_vectors=hydrated_vectors,
         embedder=embedder,
+        llm=llm,
     )
 
     if k_persisted == n_visible:
@@ -3123,7 +3173,7 @@ async def hydrate_or_backfill_cold_session_index(
         t.turn_id: (t.epistemic_status, t.superseded_by_turn_id) for t in index.turns
     }
 
-    await index.append_messages(project_records[k_persisted:], embedder=embedder)
+    await index.append_messages(project_records[k_persisted:], embedder=embedder, llm=llm)
     if index.turns and index.embedding_mode != embedding_sig:
         log.warning(
             "Skipping delta persistence write for thread=%s: embedder degraded (%s != %s)",
@@ -3176,6 +3226,7 @@ async def backfill_thread_session_context(
     requested_source_ids: Collection[str] | None = None,
     embedder: Any | None = None,
     qdrant_client: httpx.AsyncClient | None = None,
+    llm: Any | None = None,
 ) -> PersistenceSyncStats:
     """Explicitly materialize or reconcile multi-view session context persistence for a thread."""
     from sag_api.services.agent_domain import filter_messages_for_scope
@@ -3214,4 +3265,5 @@ async def backfill_thread_session_context(
         caller_had_pending_state=caller_pending,
         ancestor_segments_records=ancestor_records,
         lineage_signature=lineage_sig,
+        llm=llm,
     )

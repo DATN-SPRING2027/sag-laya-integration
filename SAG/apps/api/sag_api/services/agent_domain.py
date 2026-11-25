@@ -1120,6 +1120,7 @@ async def _resolve_session_history(
                 owner_key=owner_key,
                 requested_source_ids=source_ids,
                 budget_tokens=budget_tokens,
+                llm=llm,
             )
             pack.audit_trace.mode = "shadow"
             log_session_audit_trace(thread_id, pack.audit_trace)
@@ -1138,6 +1139,7 @@ async def _resolve_session_history(
             owner_key=owner_key,
             requested_source_ids=source_ids,
             budget_tokens=budget_tokens,
+            llm=llm,
         )
         log_session_audit_trace(thread_id, pack.audit_trace)
         return (

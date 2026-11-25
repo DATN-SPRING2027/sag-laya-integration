@@ -5,7 +5,6 @@ SAG-ECCE Session Context Engine (`off` | `shadow` | `on`).
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 from collections.abc import Collection
 from datetime import timedelta
@@ -407,6 +406,7 @@ async def prepare_session_context_for_ask(
     ablation: AblationMode = "V5_ecce_full",
     embedder: Any | None = None,
     qdrant_client: httpx.AsyncClient | None = None,
+    llm: Any | None = None,
 ) -> SessionContextPack:
     """Build ACL-enforced, SiliconFlow-routed, durably-synced ECCE context pack."""
     from sag_api.services.agent_domain import filter_messages_for_scope
@@ -551,7 +551,7 @@ async def prepare_session_context_for_ask(
                     next_last_id = str(delta_raw[-1].id)
                     next_seen_raw_ids = set(index.seen_raw_ids) | {str(m.id) for m in delta_raw}
 
-                    added = await index.append_messages(delta_records, embedder=active_embedder)
+                    added = await index.append_messages(delta_records, embedder=active_embedder, llm=llm)
                     if added > 0 and index.embedding_mode != target_emb_sig:
                         # HTTP embedder degraded to deterministic fallback -> never poison DB/Qdrant
                         persistence_stats = PersistenceSyncStats(status="degraded_unpersisted")
@@ -706,6 +706,7 @@ async def prepare_session_context_for_ask(
                 caller_had_pending_state=caller_had_pending_state,
                 ancestor_segments_records=ancestor_records,
                 lineage_signature=lineage_sig,
+                llm=llm,
             )
             if persistence_stats.status == "degraded_unpersisted":
                 evict_after_pack = True

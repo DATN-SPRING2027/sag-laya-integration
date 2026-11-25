@@ -40,6 +40,7 @@ from sag_api.services.session_context import (
     set_custom_session_qdrant_client_factory,
 )
 from sag_api.services.session_context.substrate import deterministic_ngram_vector
+from tests.ecce_test_helpers import StructuredExtractorTestLLM
 
 
 def _principal(*, org_id: str = "org-continuum", project_id: str = "proj-alpha") -> VerifiedPrincipal:
@@ -314,6 +315,7 @@ async def test_lazy_backfill_and_incremental_delta_sync_with_qdrant(monkeypatch)
         await session.commit()
 
         # 1. First ask triggers Lazy Backfill across all 4 tables + Qdrant!
+        extractor_llm = StructuredExtractorTestLLM()
         plan_1 = await agent_domain.prepare_ask(
             session,
             agent=agent,
@@ -321,6 +323,7 @@ async def test_lazy_backfill_and_incremental_delta_sync_with_qdrant(monkeypatch)
             query="Dịch vụ thanh toán lõi hiện chốt dùng database nào?",
             principal=principal,
             owner_key=owner_key,
+            llm=extractor_llm,
         )
         trace_1 = plan_1.session_audit_trace
         assert trace_1 is not None
@@ -421,6 +424,7 @@ async def test_lazy_backfill_and_incremental_delta_sync_with_qdrant(monkeypatch)
             query="Kiểm tra lại hạn mức kết nối connection pool?",
             principal=principal,
             owner_key=owner_key,
+            llm=extractor_llm,
         )
         trace_2 = plan_2.session_audit_trace
         assert trace_2 is not None
@@ -500,6 +504,7 @@ async def test_cold_start_worker_restart_hydrates_from_db_and_qdrant_with_zero_h
         current_q_msg = msgs[-1]
 
         # Initial cold materialization (embeds 4 historical turns + their sentences + query)
+        extractor_llm = StructuredExtractorTestLLM()
         pack_initial = await prepare_session_context_for_ask(
             session,
             thread_id=thread.id,
@@ -511,6 +516,7 @@ async def test_cold_start_worker_restart_hydrates_from_db_and_qdrant_with_zero_h
             budget_tokens=1200,
             embedder=http_embedder,
             qdrant_client=q_client,
+            llm=extractor_llm,
         )
         assert pack_initial.audit_trace.persistence_status == "lazy_backfill"
         assert len(http_embedder.batches) >= 2  # historical batch + query batch
@@ -531,6 +537,7 @@ async def test_cold_start_worker_restart_hydrates_from_db_and_qdrant_with_zero_h
             budget_tokens=1200,
             embedder=http_embedder,
             qdrant_client=q_client,
+            llm=extractor_llm,
         )
         assert pack_hydrated.audit_trace.persistence_status == "hydrated_clean"
         assert pack_hydrated.audit_trace.persisted_units_written == 0
@@ -565,6 +572,7 @@ async def test_cold_start_worker_restart_hydrates_from_db_and_qdrant_with_zero_h
             budget_tokens=1200,
             embedder=http_embedder,
             qdrant_client=q_client,
+            llm=extractor_llm,
         )
         assert pack_delta.audit_trace.persistence_status == "hydrated_delta"
         # First batch embeds ONLY `current_q_msg` ("Câu hỏi hiện tại?"), NEVER the 4 earlier turns!
@@ -624,6 +632,7 @@ async def test_middle_of_window_delete_via_raw_sql_and_api_reconciles_db_and_qdr
         session.add_all([msg_a, msg_b, msg_c])
         await session.commit()
 
+        extractor_llm = StructuredExtractorTestLLM()
         _ = await agent_domain.prepare_ask(
             session,
             agent=agent,
@@ -631,6 +640,7 @@ async def test_middle_of_window_delete_via_raw_sql_and_api_reconciles_db_and_qdr
             query="Module lưu vết kiểm toán đang chốt dùng gì?",
             principal=principal,
             owner_key=owner_key,
+            llm=extractor_llm,
         )
         # Before deleting B: A is SUPERSEDED by B
         dec_before = list(
@@ -670,6 +680,7 @@ async def test_middle_of_window_delete_via_raw_sql_and_api_reconciles_db_and_qdr
             query="Đề xuất hiện còn hiệu lực cho module lưu vết kiểm toán là gì?",
             principal=principal,
             owner_key=owner_key,
+            llm=extractor_llm,
         )
         assert plan_reconciled.session_audit_trace is not None
         assert plan_reconciled.session_audit_trace["persistence_status"] == "reconciled_rebuild"
@@ -716,6 +727,7 @@ async def test_middle_of_window_delete_via_raw_sql_and_api_reconciles_db_and_qdr
             query="Kiểm tra lại kế hoạch thứ Sáu?",
             principal=principal,
             owner_key=owner_key,
+            llm=extractor_llm,
         )
         assert len(qdrant.points[col_name]) > 0
         await agent_domain.delete_thread(session, agent.id, thread.id, owner_key=owner_key)

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import binascii
 import hashlib
 import hmac
@@ -1176,7 +1175,7 @@ async def prepare_regenerate(
     if settings.session_context_mode == "on" and scoped_prior:
         prior_records, _ = _extract_visible_records(scoped_prior)
         ephemeral_index = IncrementalSessionIndex(thread.id)
-        await ephemeral_index.append_messages(prior_records)
+        await ephemeral_index.append_messages(prior_records, llm=llm)
         allowed_turns = set(ephemeral_index.turns_by_id.keys())
         decision = (
             await route_query_async(

@@ -7,6 +7,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -18,9 +19,14 @@ from sag_api.enums import BindingTargetType, MessageRole, MessageStatus
 from sag_api.services import agent_domain, decision_router
 from sag_api.services.session_context import SESSION_INDEX_CACHE, IncrementalSessionIndex
 from sag_api.services.session_context.extractor import (
-    classify_epistemic_state,
+    clear_turn_extraction_cache,
     extract_content_terms,
-    extract_turn_entities_and_sentences,
+    extract_turns_structured_batch,
+)
+from tests.ecce_test_helpers import (
+    StructuredExtractorTestLLM,
+    is_session_extraction_prompt,
+    mock_extract_turns_json,
 )
 
 
@@ -44,6 +50,7 @@ class _CountingLLMStub:
 
     def __init__(self) -> None:
         self.calls = 0
+        self.extraction_calls = 0
 
     async def complete(
         self,
@@ -52,7 +59,10 @@ class _CountingLLMStub:
         response_format: dict[str, Any] | None = None,
         **_kwargs: Any,
     ) -> str:
-        del messages, response_format, _kwargs
+        del response_format, _kwargs
+        if is_session_extraction_prompt(messages):
+            self.extraction_calls += 1
+            return mock_extract_turns_json(messages)
         self.calls += 1
         return "Stub summary"
 
@@ -68,95 +78,96 @@ class _CountingBatchEmbedder:
         return [list(deterministic_ngram_vector(t, dim=64)) for t in texts]
 
 
-def test_siliconflow_decision_router_4_questions_and_legacy_backward_compat(monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_unified_decision_router_ecce_signals_and_fail_closed(monkeypatch) -> None:
     monkeypatch.setattr(settings, "decision_provider", "siliconflow")
+    monkeypatch.setattr(settings, "decision_api_key", "")
     monkeypatch.setattr(settings, "siliconflow_api_key", "sf-test-key")
+    monkeypatch.setattr(settings, "decision_base_url", "")
+    monkeypatch.setattr(settings, "siliconflow_base_url", "https://api.siliconflow.com/v1")
     monkeypatch.setattr(settings, "decision_model", "Kev-4b")
+    monkeypatch.setattr(settings, "llm_structured_output_mode", "json_object")
 
-    captured_payload: dict[str, Any] = {}
+    captured: list[dict[str, Any]] = []
 
-    class _FakeResponse:
-        def __init__(self, body: dict[str, Any]) -> None:
-            self._body = body
-
-        def raise_for_status(self) -> None:
-            return None
-
-        def json(self) -> dict[str, Any]:
-            return self._body
-
-    def _mock_post_full(url: str, *, headers: dict[str, str], json: dict[str, Any], timeout: Any) -> _FakeResponse:
-        captured_payload["url"] = url
-        captured_payload["json"] = json
-        return _FakeResponse(
-            {
-                "model": "Kev-4b",
-                "answers": {
-                    "intent_type": {"choice": "complex_reasoning", "confidence": 0.91},
-                    "domain_topic": {"choice": "technical", "confidence": 0.94},
-                    "memory_scope": {"choice": "hybrid_both", "confidence": 0.89},
-                    "temporal_mode": {"choice": "change_lineage", "confidence": 0.87},
-                },
-            }
+    def _transport(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        captured.append({"url": str(request.url), "body": body})
+        payload = {
+            "coarse_intent": "KNOWLEDGE",
+            "question_scope": "project",
+            "memory_scope": "hybrid_both",
+            "temporal_mode": "change_lineage",
+            "answer_shape": "fact_answer",
+            "intent_flags": {
+                "needs_retrieval": True,
+                "needs_time": False,
+                "needs_web": False,
+                "needs_clarification": False,
+                "is_pure_math_or_transform": False,
+            },
+            "domain": "technical",
+            "confidence": 0.91,
+            "reason_codes": ["LINEAGE_AND_SPEC"],
+            "order_mode": "relevance",
+            "explicit_count": None,
+            "target_unit": "passage",
+            "is_catalog_query": False,
+            "retrieval_mode_hint": "multi",
+            "subqueries": [],
+            "topic_slot_key": "slot:database",
+            "hierarchy_bias": "none",
+            "entities": ["CockroachDB", "PostgreSQL", "ADR-004"],
+        }
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(payload)}}]},
         )
 
-    monkeypatch.setattr(decision_router.httpx, "post", _mock_post_full)
-    res = decision_router.route_query(
+    res = await decision_router.route_query_async(
         "Vì sao chúng ta chuyển từ CockroachDB sang PostgreSQL và có khớp tài liệu ADR-004 không?",
         context={"has_thread_history": True, "turn_count": 42},
+        http_transport=httpx.MockTransport(_transport),
     )
-    assert captured_payload["url"] == "https://api.siliconflow.com/v1/systemone"
-    assert set(captured_payload["json"]["questions"].keys()) == {
-        "intent_type",
-        "domain_topic",
-        "memory_scope",
-        "temporal_mode",
-        "answer_shape",
-    }
-    assert captured_payload["json"]["state"]["turn_count"] == 42
-    assert res["fallback_used"] is False
-    assert res["coarse_intent"] == "KNOWLEDGE"
-    assert res["memory_scope"] == "hybrid_both"
-    assert res["temporal_mode"] == "change_lineage"
-    assert res["suggested_strategy"] == "multi"
+    assert captured[0]["url"] == "https://api.siliconflow.com/v1/chat/completions"
+    assert res.degraded is False
+    assert res.coarse_intent == "KNOWLEDGE"
+    assert res.memory_scope == "hybrid_both"
+    assert res.temporal_mode == "change_lineage"
+    assert res.suggested_strategy == "multi"
+    assert res.topic_slot_key == "slot:database"
 
-    # Legacy 2-question mock compatibility + temporal-filter vs temporal-target separation
-    def _mock_post_legacy_two_keys(
-        url: str, *, headers: dict[str, str], json: dict[str, Any], timeout: Any
-    ) -> _FakeResponse:
-        return _FakeResponse(
-            {
-                "model": "Kev-4b",
-                "answers": {
-                    "intent_type": {"choice": "factual_lookup", "confidence": 0.88},
-                    "domain_topic": {"choice": "technical", "confidence": 0.85},
-                },
-            }
-        )
-
-    monkeypatch.setattr(decision_router.httpx, "post", _mock_post_legacy_two_keys)
-    res_filter = decision_router.route_query("Trong buổi họp tuần trước, ai nhận phụ trách module thanh toán?")
-    assert res_filter["fallback_used"] is False
-    assert res_filter["memory_scope"] == "session_history"
-    assert res_filter["temporal_mode"] == "current_effective"
-
-    res_target = decision_router.route_query("Chúng ta thống nhất lịch golive vào ngày nào?")
-    assert res_target["memory_scope"] == "session_history"
-    assert res_target["temporal_mode"] == "past_point"
+    # Disabled / unreachable provider fails closed with degraded=True and zero regex guessing
+    monkeypatch.setattr(settings, "decision_provider", "disabled")
+    degraded_res = await decision_router.route_query_async("Trong buổi họp tuần trước, ai nhận phụ trách?")
+    assert degraded_res.degraded is True
+    assert degraded_res.memory_scope == "hybrid_both"
+    assert degraded_res.question_scope == "unknown"
 
 
-def test_vietnamese_extractor_preserves_unicode_and_role_qualifiers() -> None:
+@pytest.mark.asyncio
+async def test_vietnamese_extractor_preserves_unicode_and_role_qualifiers() -> None:
+    clear_turn_extraction_cache()
     terms = extract_content_terms("Trong cuộc họp ở Đà Nẵng, anh Minh phụ trách ngân sách hợp đồng.")
     assert "hợp" in terms and "đồng" in terms and "ngân" in terms and "sách" in terms
 
-    mentions_fe, _ = extract_turn_entities_and_sentences(
-        "t1", 0, "Giao cho anh Minh FE phụ trách giao diện bảng điều khiển."
+    llm = StructuredExtractorTestLLM()
+    analyses, degraded, _ = await extract_turns_structured_batch(
+        [
+            {"id": "t1", "role": "user", "content": "Giao cho anh Minh FE phụ trách giao diện bảng điều khiển."},
+            {
+                "id": "t2",
+                "role": "user",
+                "content": "Còn anh Minh BE phụ trách cổng thanh toán PostgreSQL theo ADR-004.",
+            },
+            {"id": "t3", "role": "user", "content": "Mình đề xuất thử dùng MongoDB cho nhanh."},
+            {"id": "t4", "role": "user", "content": "Do lỗi transaction nên bỏ MongoDB, chốt dùng PostgreSQL 16."},
+        ],
+        llm=llm,
     )
-    mentions_be, _ = extract_turn_entities_and_sentences(
-        "t2", 1, "Còn anh Minh BE phụ trách cổng thanh toán PostgreSQL theo ADR-004."
-    )
-    keys_fe = {m.key: m for m in mentions_fe}
-    keys_be = {m.key: m for m in mentions_be}
+    assert degraded is False
+    keys_fe = {m.key: m for m in analyses[0].entities}
+    keys_be = {m.key: m for m in analyses[1].entities}
 
     assert "entity:minh fe" in keys_fe
     assert "entity:minh be" in keys_be
@@ -166,16 +177,15 @@ def test_vietnamese_extractor_preserves_unicode_and_role_qualifiers() -> None:
     assert "entity:postgresql" in keys_be
     assert "entity:adr-004" in keys_be
 
-    st_prop, slot_prop, _ = classify_epistemic_state("Mình đề xuất thử dùng MongoDB cho nhanh.")
-    assert st_prop == "PROPOSED" and slot_prop == "slot:database"
-
-    st_conf, slot_conf, _ = classify_epistemic_state("Do lỗi transaction nên bỏ MongoDB, chốt dùng PostgreSQL 16.")
-    assert st_conf == "CONFIRMED" and slot_conf == "slot:database"
+    assert analyses[2].epistemic_status == "PROPOSED" and analyses[2].topic_slot_key == "slot:database"
+    assert analyses[3].epistemic_status == "CONFIRMED" and analyses[3].topic_slot_key == "slot:database"
 
 
 @pytest.mark.asyncio
 async def test_incremental_substrate_appends_delta_without_cache_wipe() -> None:
+    clear_turn_extraction_cache()
     embedder = _CountingBatchEmbedder()
+    extractor_llm = StructuredExtractorTestLLM()
     idx = IncrementalSessionIndex("thread-inc")
     base_time = datetime(2026, 10, 28, 8, 0, tzinfo=UTC)
 
@@ -188,7 +198,7 @@ async def test_incremental_substrate_appends_delta_without_cache_wipe() -> None:
         }
         for i in range(6)
     ]
-    added_1 = await idx.append_messages(initial_msgs, embedder=embedder)
+    added_1 = await idx.append_messages(initial_msgs, embedder=embedder, llm=extractor_llm)
     assert added_1 == 6
     assert len(embedder.batches) == 1
     first_turn_ref = idx.turns_by_id["m-0"]
@@ -208,7 +218,7 @@ async def test_incremental_substrate_appends_delta_without_cache_wipe() -> None:
             "created_at": base_time + timedelta(minutes=8),
         },
     ]
-    added_2 = await idx.append_messages(delta_msgs, embedder=embedder)
+    added_2 = await idx.append_messages(delta_msgs, embedder=embedder, llm=extractor_llm)
     assert added_2 == 2
     assert len(embedder.batches) == 2
     assert idx.turns_by_id["m-0"] is first_turn_ref
@@ -330,6 +340,7 @@ async def test_prepare_ask_modes_long_horizon_acl_revocation_and_deletion(monkey
 
         # 2. Mode = "on": retrieves Turn #1 beyond 200-turn limit with 0 LLM memory calls!
         llm_stub.calls = 0
+        llm_stub.extraction_calls = 0
         monkeypatch.setattr(settings, "session_context_mode", "on")
         plan_on = await agent_domain.prepare_ask(
             session,
@@ -341,6 +352,7 @@ async def test_prepare_ask_modes_long_horizon_acl_revocation_and_deletion(monkey
             llm=llm_stub,
         )
         assert llm_stub.calls == 0
+        assert llm_stub.extraction_calls == 0
         assert plan_on.session_audit_trace is not None
         assert plan_on.session_audit_trace["llm_memory_calls"] == 0
         serialized_on = json.dumps(plan_on.messages, ensure_ascii=False)
@@ -410,60 +422,49 @@ async def test_prepare_ask_modes_long_horizon_acl_revocation_and_deletion(monkey
 
 
 
-def test_pr42_vietnamese_negation_guard_and_non_slot_replacement_chain() -> None:
-    """PR #42 Finding #3: Block negated confirmations and supersede non-slot entities regardless of mention order."""
-    from sag_api.services.session_context.extractor import (
-        classify_epistemic_state,
-        extract_superseded_entity_keys,
-        extract_turn_entities_and_sentences,
+@pytest.mark.asyncio
+async def test_pr42_vietnamese_negation_guard_and_non_slot_replacement_chain() -> None:
+    """PR #42 Finding #3: Block negated confirmations and supersede non-slot entities via structured extraction."""
+    clear_turn_extraction_cache()
+    extractor_llm = StructuredExtractorTestLLM()
+    analyses, degraded, _ = await extract_turns_structured_batch(
+        [
+            {"id": "c1", "role": "user", "content": "Chúng ta chưa chốt dùng MongoDB nhé."},
+            {"id": "c2", "role": "user", "content": "Không thống nhất phương án này cho bản release."},
+            {"id": "c3", "role": "user", "content": "Đừng quyết định chọn MongoDB vội."},
+            {"id": "c4", "role": "user", "content": "Đề xuất chuyển sang dùng Redis Streams thử xem."},
+            {"id": "c5", "role": "user", "content": "Không dùng MongoDB nữa, chốt dùng PostgreSQL 18."},
+            {"id": "t2", "role": "user", "content": "Chuyển sang dùng Vue thay cho React ở cổng quản trị nội bộ."},
+        ],
+        llm=extractor_llm,
     )
-
-    s_unfinalized, _, _ = classify_epistemic_state("Chúng ta chưa chốt dùng MongoDB nhé.")
-    assert s_unfinalized == "CONSIDERING"
-
-    s_rejected, _, _ = classify_epistemic_state("Không thống nhất phương án này cho bản release.")
-    assert s_rejected == "NEGATED"
-
-    s_dont, _, _ = classify_epistemic_state("Đừng quyết định chọn MongoDB vội.")
-    assert s_dont != "CONFIRMED"
-
-    s_tentative, _, _ = classify_epistemic_state("Đề xuất chuyển sang dùng Redis Streams thử xem.")
-    assert s_tentative == "PROPOSED"
-
-    s_compound_ok, _, _ = classify_epistemic_state("Không dùng MongoDB nữa, chốt dùng PostgreSQL 18.")
-    assert s_compound_ok == "CONFIRMED"
-
-    mentions, _ = extract_turn_entities_and_sentences(
-        "t2",
-        1,
-        "Chuyển sang dùng Vue thay cho React ở cổng quản trị nội bộ.",
-    )
-    replaced = extract_superseded_entity_keys(
-        "Chuyển sang dùng Vue thay cho React ở cổng quản trị nội bộ.",
-        mentions,
-    )
-    assert "entity:react" in replaced
-    assert "entity:vue" not in replaced
+    assert degraded is False
+    assert analyses[0].epistemic_status == "CONSIDERING"
+    assert analyses[1].epistemic_status == "NEGATED"
+    assert analyses[2].epistemic_status != "CONFIRMED"
+    assert analyses[3].epistemic_status == "PROPOSED"
+    assert analyses[4].epistemic_status == "CONFIRMED"
+    assert "entity:react" in analyses[5].superseded_entity_keys
+    assert "entity:vue" not in analyses[5].superseded_entity_keys
 
     idx = IncrementalSessionIndex("thread-nonslot")
-    asyncio.run(
-        idx.append_messages(
-            [
-                {"id": "u1", "role": "user", "content": "Chốt dùng React cho cổng quản trị nội bộ.", "created_at": 100},
-                {
-                    "id": "u2",
-                    "role": "user",
-                    "content": "Chuyển sang dùng Vue thay cho React ở cổng quản trị nội bộ.",
-                    "created_at": 200,
-                },
-                {
-                    "id": "u3",
-                    "role": "user",
-                    "content": "Bỏ Vue, chốt dùng Svelte cho cổng quản trị nội bộ.",
-                    "created_at": 300,
-                },
-            ]
-        )
+    await idx.append_messages(
+        [
+            {"id": "u1", "role": "user", "content": "Chốt dùng React cho cổng quản trị nội bộ.", "created_at": 100},
+            {
+                "id": "u2",
+                "role": "user",
+                "content": "Chuyển sang dùng Vue thay cho React ở cổng quản trị nội bộ.",
+                "created_at": 200,
+            },
+            {
+                "id": "u3",
+                "role": "user",
+                "content": "Bỏ Vue, chốt dùng Svelte cho cổng quản trị nội bộ.",
+                "created_at": 300,
+            },
+        ],
+        llm=extractor_llm,
     )
     assert idx.turns_by_id["u1"].epistemic_status == "SUPERSEDED"
     assert idx.turns_by_id["u1"].superseded_by_turn_id == "u2"
@@ -557,23 +558,27 @@ async def test_pr42_knowledge_only_grounding_single_router_call_delta_db_and_tra
 
     route_calls: list[str] = []
 
-    def _counted_route(q: str, ctx: dict | None = None) -> dict:
+    async def _counted_route(q: str, **_kwargs: Any) -> decision_router.UnifiedRouteDecision:
         route_calls.append(q)
-        return {
-            "is_chitchat": False,
-            "need_retrieval": False,
-            "suggested_strategy": "vector",
-            "domain": "technical",
-            "memory_scope": "session_history",
-            "temporal_mode": "current_effective",
-            "confidence": 0.91,
-            "latency_ms": 1.2,
-            "model": "Kev-4b-stub",
-            "fallback_used": False,
-        }
+        return decision_router.UnifiedRouteDecision(
+            query=q,
+            coarse_intent="KNOWLEDGE",
+            question_scope="project",
+            memory_scope="session_history",
+            temporal_mode="current_effective",
+            answer_shape="fact_answer",
+            intent_flags=decision_router.IntentFlags(needs_retrieval=False),
+            domain="technical",
+            confidence=0.91,
+            suggested_strategy="vector",
+            latency_ms=1.2,
+            model="Kev-4b-stub",
+            degraded=False,
+        )
 
-    monkeypatch.setattr(sc_runtime, "route_query", _counted_route)
-    monkeypatch.setattr(decision_router, "route_query", _counted_route)
+    monkeypatch.setattr(sc_runtime, "route_query_async", _counted_route)
+    monkeypatch.setattr(decision_router, "route_query_async", _counted_route)
+    monkeypatch.setattr(agent_service, "route_query_async", _counted_route)
 
     class _FakeEvent:
         def __init__(self, event_type: str, payload: dict, turn: int = 0, sequence: int = 1) -> None:
@@ -624,6 +629,8 @@ async def test_pr42_knowledge_only_grounding_single_router_call_delta_db_and_tra
             *_args: Any,
             **_kwargs: Any,
         ) -> str:
+            if is_session_extraction_prompt(messages):
+                return mock_extract_turns_json(messages or [])
             system_prompt = str((messages or [{}])[0].get("content") or "")
             if "entailment verifier" in system_prompt.lower() or "answerability" in system_prompt:
                 return json.dumps(

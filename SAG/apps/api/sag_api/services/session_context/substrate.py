@@ -28,10 +28,10 @@ from sag_api.services.search_index_service import (
     put_cached_text_embedding,
 )
 from sag_api.services.session_context.extractor import (
-    classify_epistemic_state,
+    ExtractedTurnAnalysis,
     extract_content_terms,
-    extract_superseded_entity_keys,
-    extract_turn_entities_and_sentences,
+    extract_structural_entities_and_sentences,
+    extract_turns_structured_batch,
     normalize_session_text,
 )
 from sag_api.services.session_context.models import (
@@ -302,6 +302,8 @@ class IncrementalSessionIndex:
         self.inherited_decision_count: int = 0
         self.force_new_episode_next: bool = False
         self.inherited_lineage_signature: str = ""
+        self.extraction_degraded: bool = False
+        self.extraction_degraded_reason: str | None = None
 
     def seal_inherited_boundary(self) -> None:
         """Freeze inherited ancestor prefix boundaries so own units never reference ancestor Message IDs."""
@@ -325,6 +327,7 @@ class IncrementalSessionIndex:
         raw_messages: Sequence[dict[str, Any]],
         *,
         embedder: Any | None = None,
+        llm: Any | None = None,
         project_aliases: Sequence[tuple[str, str]] = (),
     ) -> int:
         """Incrementally index only unseen messages in chronological order."""
@@ -350,23 +353,26 @@ class IncrementalSessionIndex:
                 self.embedding_mode = target_mode
             return 0
 
-        # Pre-extract entities & sentences for all pending turns (0 LLM calls)
-        extracted_per_msg: list[tuple[list[EntityMention], list[tuple[str, tuple[str, ...]]]]] = []
+        # Structured LLM turn analysis (batched & cached) + structural E0/E1 spans
+        base_ordinal = len(self.turns)
+        analyses, batch_degraded, batch_degraded_reason = await extract_turns_structured_batch(
+            pending,
+            llm=llm,
+            project_aliases=project_aliases,
+            base_ordinal=base_ordinal,
+        )
+        if batch_degraded:
+            self.extraction_degraded = True
+            self.extraction_degraded_reason = self.extraction_degraded_reason or batch_degraded_reason
+
+        extracted_per_msg: list[ExtractedTurnAnalysis] = analyses
         texts_to_embed: list[str] = []
         turn_vec_offsets: list[int] = []
         sent_vec_ranges: list[tuple[int, int]] = []
 
-        base_ordinal = len(self.turns)
         for offset, msg in enumerate(pending):
-            t_id = str(msg["id"])
             content = normalize_session_text(str(msg["content"]))
-            mentions, sent_items = extract_turn_entities_and_sentences(
-                t_id,
-                base_ordinal + offset,
-                content,
-                project_aliases=project_aliases,
-            )
-            extracted_per_msg.append((mentions, sent_items))
+            sent_items = extracted_per_msg[offset].sentences
             turn_vec_offsets.append(len(texts_to_embed))
             texts_to_embed.append(content)
             s_start_idx = len(texts_to_embed)
@@ -395,6 +401,7 @@ class IncrementalSessionIndex:
                 await self.append_messages(
                     prior_records[:inh_k],
                     embedder=None,
+                    llm=llm,
                     project_aliases=project_aliases,
                 )
                 self.seal_inherited_boundary()
@@ -402,6 +409,7 @@ class IncrementalSessionIndex:
             await self.append_messages(
                 [*prior_records[inh_k:], *pending],
                 embedder=None,
+                llm=llm,
                 project_aliases=project_aliases,
             )
             return len(pending)
@@ -423,7 +431,9 @@ class IncrementalSessionIndex:
                 ts = float(ordinal * 60)
                 iso = ""
 
-            mentions, sent_items = extracted_per_msg[offset]
+            analysis = extracted_per_msg[offset]
+            mentions = list(analysis.entities)
+            sent_items = list(analysis.sentences)
             t_vec = all_vectors[turn_vec_offsets[offset]]
             s_lo, s_hi = sent_vec_ranges[offset]
             s_vecs = all_vectors[s_lo:s_hi]
@@ -454,8 +464,10 @@ class IncrementalSessionIndex:
                 corpus_doc_freqs=self.doc_freqs,
                 total_corpus_docs=max(50, ordinal + 1),
             )
-            epistemic_status, slot_key, is_anaphoric = classify_epistemic_state(content, role=role)
-            superseded_ent_keys = extract_superseded_entity_keys(content, mentions)
+            epistemic_status = analysis.epistemic_status
+            slot_key = analysis.topic_slot_key
+            is_anaphoric = analysis.is_anaphoric_or_short
+            superseded_ent_keys = analysis.superseded_entity_keys
 
             episode = self._assign_or_open_episode(
                 turn_id=t_id,
@@ -464,7 +476,7 @@ class IncrementalSessionIndex:
                 ts=ts,
             )
 
-            # Anaphoric confirmation resolution ("Chốt phương án 2 như anh Minh vừa đề xuất nhé")
+            # Anaphoric confirmation resolution
             companion_ids: tuple[str, ...] = ()
             if (
                 epistemic_status == "CONFIRMED"
@@ -506,6 +518,9 @@ class IncrementalSessionIndex:
                 topic_slot_key=slot_key,
                 superseded_entity_keys=superseded_ent_keys,
                 is_anaphoric_or_short=is_anaphoric,
+                is_interrogative=analysis.is_interrogative,
+                intrinsic_epistemic_status=epistemic_status,
+                extraction_degraded=analysis.degraded,
                 cited_source_ids=cited_sources,
             )
             self.turns.append(turn_obj)
@@ -854,15 +869,20 @@ class IncrementalSessionIndex:
         hybrid_scores: dict[str, float],
         *,
         allowed_turn_ids: set[str] | None = None,
+        query_entities: Sequence[EntityMention] = (),
     ) -> dict[str, float]:
-        """V2: Zero-Mem Query-Conditioned Entity-Sentence Sparse Activation + Bounded igraph PPR."""
+        """V2: Query-Conditioned Entity-Sentence Sparse Activation + Bounded igraph PPR."""
         visible_turns = [
             t for t in self.turns if allowed_turn_ids is None or t.turn_id in allowed_turn_ids
         ]
         if not visible_turns:
             return {}
 
-        q_mentions, _ = extract_turn_entities_and_sentences("query", 0, query)
+        struct_mentions, _ = extract_structural_entities_and_sentences("query", 0, query)
+        q_mentions_by_key: dict[str, EntityMention] = {m.key: m for m in struct_mentions}
+        for m in query_entities:
+            q_mentions_by_key.setdefault(m.key, m)
+        q_mentions = list(q_mentions_by_key.values())
         q_terms = extract_content_terms(query)
 
         # 1. Seed entity activations (exact + lexical surface overlap + soft alias expansion)
@@ -1014,15 +1034,13 @@ class IncrementalSessionIndex:
         hybrid_scores: dict[str, float],
         *,
         temporal_mode: str = "atemporal",
+        hierarchy_bias: str = "none",
         allowed_turn_ids: set[str] | None = None,
     ) -> dict[str, float]:
         """V3: 4-Level Temporal-Semantic Hierarchy (Session -> Drift Episode -> 3-Turn Window -> Turn)."""
         q_terms = extract_content_terms(query)
-        q_lower = query.casefold()
-        prefers_early = bool(re.search(r"\b(?:đầu\s+phiên|đầu\s+buổi|lúc\s+đầu|ban\s+đầu|first|beginning)\b", q_lower))
-        prefers_recent = bool(
-            re.search(r"\b(?:vừa\s+bàn|lúc\s+nãy|mới\s+nhất|gần\s+nhất|tiếp\s+tục|just\s+now|latest)\b", q_lower)
-        )
+        prefers_early = hierarchy_bias == "early"
+        prefers_recent = hierarchy_bias == "recent"
 
         ep_scores: dict[str, float] = {}
         n_eps = max(1, len(self.episodes))
