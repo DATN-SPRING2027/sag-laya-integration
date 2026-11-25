@@ -630,7 +630,7 @@ async def test_get_document_version_chunks_orders_units_and_enforces_partition_a
 
     markdown_body = (
         "# System Architecture\n\n"
-        "Multi-tenant RBAC boundary isolates project data across Cloudflare R2 and PostgreSQL.\n\n"
+        "Multi-tenant RBAC boundary isolates project data across object storage and PostgreSQL.\n\n"
         "## Sharding Strategy\n\n"
         "| Shard | Region | Capacity |\n"
         "| --- | --- | --- |\n"
@@ -781,13 +781,11 @@ async def test_revoked_resync_with_same_idempotency_key_and_project_source_contr
     from sag_api.core.config import settings
     from sag_api.core.principal_assertion import VerifiedPrincipal as BffVerifiedPrincipal
     from sag_api.services.document_service import (
-        handle_document_object_ingest,
         handle_document_upload,
         revoke_project_document,
     )
 
     monkeypatch.setattr(settings, "data_dir", str(tmp_path))
-    monkeypatch.setattr(settings, "object_ingest_allowed_hosts", ["r2.example.internal"])
 
     async with ingestion_db() as session:
         first = await handle_document_upload(
@@ -855,49 +853,6 @@ async def test_revoked_resync_with_same_idempotency_key_and_project_source_contr
         assert resynced.status == "RECEIVED"
         assert resynced.search_status == "PENDING"
 
-        # Also verify Direct-to-R2 object ingest path with same client_token after revoke
-        sha = "a" * 64
-        obj_v1 = await handle_document_object_ingest(
-            session,
-            tenant_id="tenant-resync",
-            project_id="project-resync",
-            owner_id="leader-1",
-            security_partition_id="project-resync",
-            client_token="continuum:project_document:doc-r2:v1:aaaa1111",
-            source_url="https://r2.example.internal/bucket/doc.pdf?X-Amz-Signature=1",
-            original_filename="doc.pdf",
-            expected_sha256=sha,
-            expected_size_bytes=2048,
-            content_type="application/pdf",
-            logical_source_id="continuum:project_document:doc-r2",
-        )
-        assert obj_v1.version_no == 1
-        await revoke_project_document(
-            session,
-            tenant_id="tenant-resync",
-            project_id="project-resync",
-            document_id=obj_v1.document_id,
-            reason="MANUAL_REVOKE",
-        )
-        obj_v2 = await handle_document_object_ingest(
-            session,
-            tenant_id="tenant-resync",
-            project_id="project-resync",
-            owner_id="leader-1",
-            security_partition_id="project-resync",
-            client_token="continuum:project_document:doc-r2:v1:aaaa1111",
-            source_url="https://r2.example.internal/bucket/doc.pdf?X-Amz-Signature=2",
-            original_filename="doc.pdf",
-            expected_sha256=sha,
-            expected_size_bytes=2048,
-            content_type="application/pdf",
-            logical_source_id="continuum:project_document:doc-r2",
-        )
-        assert obj_v2.version_no == 2
-        assert obj_v2.is_duplicate is False
-        assert obj_v2.status == "RECEIVED"
-        assert obj_v2.search_status == "PENDING"
-
 
 @pytest.mark.asyncio
 async def test_reprocess_ready_project_document_completes_without_legacy_engine_schema(
@@ -924,7 +879,6 @@ async def test_reprocess_ready_project_document_completes_without_legacy_engine_
 
     monkeypatch.setattr(tasks.settings, "data_dir", str(tmp_path))
     monkeypatch.setattr(tasks.settings, "document_event_extraction_enabled", False)
-    monkeypatch.setattr(tasks.settings, "object_ingest_allowed_hosts", ["r2.example.internal"])
 
     fake_queue = SimpleNamespace(
         enqueue=AsyncMock(),
@@ -975,8 +929,6 @@ async def test_reprocess_ready_project_document_completes_without_legacy_engine_
             source,
             doc.id,
             job_queue=fake_queue,
-            remote_source_url="https://r2.example.internal/bucket/arch.md?X-Amz-Signature=fresh",
-            original_filename="arch.md",
         )
         assert reproc_job.type == JobType.REPROCESS_DOCUMENT
         reproc_job.status = JobStatus.RUNNING
@@ -985,7 +937,6 @@ async def test_reprocess_ready_project_document_completes_without_legacy_engine_
         await tasks._reprocess_document_task_unlocked(session, reproc_job, engine_manager=manager, job_queue=fake_queue)
         reproc_job.status = JobStatus.SUCCEEDED
         await session.commit()
-        assert "remote_source_url" not in (reproc_job.payload or {})
 
         proc_job_id = (reproc_job.payload or {}).get("process_job_id")
         assert proc_job_id
@@ -1098,7 +1049,12 @@ async def test_project_document_readiness_batch_route_enforces_bff_project_scope
     from sag_api.api.v1.documents import project_router
     from sag_api.core.db import get_session
     from sag_api.core.errors import ApiError
-    from sag_api.core.principal_assertion import require_project_bff_principal
+    from sag_api.core.principal_assertion import (
+        VerifiedPrincipal as BffVerifiedPrincipal,
+    )
+    from sag_api.core.principal_assertion import (
+        require_project_bff_principal,
+    )
 
     async with ingestion_db() as session:
         app = FastAPI()
@@ -1111,10 +1067,16 @@ async def test_project_document_readiness_batch_route_enforces_bff_project_scope
                 content=exc.to_envelope(),
             )
 
-        principal = SimpleNamespace(
+        principal = BffVerifiedPrincipal(
             subject="user",
-            tenant_id="tenant",
+            organization_id="tenant",
             allowed_project_ids=frozenset({"project"}),
+            issuer="continuum-bff",
+            key_id="kid-1",
+            token_id="jti-1",
+            issued_at=1_700_000_000,
+            expires_at=1_700_000_900,
+            tenant_id="tenant",
             allowed_partition_ids=frozenset({"project"}),
         )
         app.dependency_overrides[require_project_bff_principal] = lambda: principal
@@ -1156,3 +1118,173 @@ async def test_project_document_readiness_batch_route_enforces_bff_project_scope
     ]
     assert denied.status_code == 403
     assert duplicate.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_ingest_object_endpoint_removed_returns_404(ingestion_db) -> None:
+    import httpx
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse
+
+    from sag_api.api.v1.documents import project_router
+    from sag_api.core.db import get_session
+    from sag_api.core.errors import ApiError
+    from sag_api.core.principal_assertion import (
+        VerifiedPrincipal as BffVerifiedPrincipal,
+    )
+    from sag_api.core.principal_assertion import (
+        require_project_bff_principal,
+    )
+
+    async with ingestion_db() as session:
+        app = FastAPI()
+        app.include_router(project_router)
+
+        @app.exception_handler(ApiError)
+        async def handle_api_error(request, exc):
+            return JSONResponse(status_code=exc.status_code, content=exc.to_envelope())
+
+        principal = BffVerifiedPrincipal(
+            subject="user",
+            organization_id="tenant",
+            allowed_project_ids=frozenset({"project"}),
+            issuer="continuum-bff",
+            key_id="kid-1",
+            token_id="jti-1",
+            issued_at=1_700_000_000,
+            expires_at=1_700_000_900,
+            tenant_id="tenant",
+            allowed_partition_ids=frozenset({"project"}),
+        )
+        app.dependency_overrides[require_project_bff_principal] = lambda: principal
+        app.dependency_overrides[get_session] = lambda: session
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/projects/project/documents/ingest-object",
+                headers={"Idempotency-Key": "removed-r2-endpoint"},
+                json={
+                    "source_url": "https://acct.r2.cloudflarestorage.com/bucket/doc.pdf",
+                    "original_filename": "doc.pdf",
+                    "expected_sha256": "a" * 64,
+                    "expected_size_bytes": 1024,
+                },
+            )
+
+    assert response.status_code in (404, 405)
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_project_reprocess_endpoint_works_without_body_and_r2_schemas_removed(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse
+
+    from sag_api.api.v1 import documents as documents_api
+    from sag_api.core.db import get_session
+    from sag_api.core.deps import get_job_queue
+    from sag_api.core.errors import ApiError
+    from sag_api.core.principal_assertion import (
+        VerifiedPrincipal as BffVerifiedPrincipal,
+    )
+    from sag_api.core.principal_assertion import (
+        require_project_bff_principal,
+    )
+    from sag_api.schemas import routing_rag
+
+    assert not hasattr(routing_rag, "DocumentObjectIngestRequest")
+    assert not hasattr(routing_rag, "DocumentReprocessRequest")
+    assert not hasattr(Settings, "object_ingest_allowed_hosts")
+    assert not hasattr(Settings, "object_ingest_allow_private_hosts_in_dev")
+    assert not hasattr(Settings, "object_ingest_timeout_seconds")
+    assert not hasattr(Settings, "remote_snapshot_gc_enabled")
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(documents_api, "SessionLocal", factory)
+
+    doc_file = tmp_path / "sample.md"
+    doc_file.write_text("# Sample\n\nBody text.", encoding="utf-8")
+    digest = hashlib.sha256(doc_file.read_bytes()).hexdigest()
+
+    fake_queue = SimpleNamespace(
+        enqueue=AsyncMock(),
+        begin_source_maintenance=lambda *_args, **_kwargs: None,
+    )
+
+    async with factory() as session:
+        session.add(Source(id="source", name="Source", sag_source_config_id="config"))
+        await session.flush()
+        session.add(
+            SourceProjectMapping(
+                source_id="source",
+                organization_id="tenant",
+                project_id="project",
+                state="CONFIRMED",
+                confirmed_at=datetime.now(UTC),
+                confirmed_by="user",
+                approval_ref="test",
+            )
+        )
+        session.add(
+            Document(
+                id="document",
+                source_id="source",
+                tenant_id="tenant",
+                project_id="project",
+                filename=doc_file.name,
+                storage_path=str(doc_file),
+                status=DocumentStatus.FAILED,
+            )
+        )
+        await session.flush()
+        session.add(
+            DocumentVersion(
+                id="version",
+                document_id="document",
+                version_no=1,
+                file_hash=digest,
+                metadata_json={"security_partition_id": "project"},
+            )
+        )
+        await session.commit()
+
+        app = FastAPI()
+        app.include_router(documents_api.project_router)
+
+        @app.exception_handler(ApiError)
+        async def handle_api_error(request, exc):
+            return JSONResponse(status_code=exc.status_code, content=exc.to_envelope())
+
+        principal = BffVerifiedPrincipal(
+            subject="user",
+            organization_id="tenant",
+            allowed_project_ids=frozenset({"project"}),
+            issuer="continuum-bff",
+            key_id="kid-1",
+            token_id="jti-1",
+            issued_at=1_700_000_000,
+            expires_at=1_700_000_900,
+            tenant_id="tenant",
+            allowed_partition_ids=frozenset({"project"}),
+        )
+        app.dependency_overrides[require_project_bff_principal] = lambda: principal
+        app.dependency_overrides[get_session] = lambda: session
+        app.dependency_overrides[get_job_queue] = lambda: fake_queue
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post("/projects/project/documents/document/reprocess")
+
+    await engine.dispose()
+    assert response.status_code == 200
+    assert response.json()["type"] == "process_document"

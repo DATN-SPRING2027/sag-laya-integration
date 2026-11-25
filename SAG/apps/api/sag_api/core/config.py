@@ -235,12 +235,7 @@ class Settings(BaseSettings):
     mineru_poll_timeout: float = 300.0
     mineru_result_max_mb: int = 100
 
-    # ── R2 Object Ingest & Multi-Lane Parsing ──────────────────────────
-    object_ingest_allowed_hosts: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: [".r2.cloudflarestorage.com"]
-    )
-    object_ingest_allow_private_hosts_in_dev: bool = False
-    object_ingest_timeout_seconds: float = Field(default=120.0, ge=5.0, le=900.0)
+    # ── Multi-Lane Parsing ─────────────────────────────────────────────
     local_parse_workers: int = Field(default=2, ge=1, le=16)
     local_parse_timeout_seconds: float = Field(default=90.0, ge=5.0, le=600.0)
     local_parse_max_tasks_per_child: int = Field(default=25, ge=1, le=500)
@@ -249,7 +244,6 @@ class Settings(BaseSettings):
     per_project_heavy_parse_limit: int = Field(default=3, ge=1, le=32)
     excel_max_rows_per_sheet: int = Field(default=5000, ge=10, le=100_000)
     excel_max_cols_per_sheet: int = Field(default=64, ge=4, le=512)
-    remote_snapshot_gc_enabled: bool = True
 
     # ── 检索默认 ────────────────────────────────────────────────────────
     # multi_es_fast：默认策略。相关率平均比 vector 高 ~14 个百分点；
@@ -352,7 +346,7 @@ class Settings(BaseSettings):
             data["decision_model"] = "Kev-4b"
         return data
 
-    @field_validator("cors_origins", "object_ingest_allowed_hosts", mode="before")
+    @field_validator("cors_origins", mode="before")
     @classmethod
     def _split_origins(cls, v: object) -> object:
         """允许用逗号分隔的字符串配置 CORS 源。"""

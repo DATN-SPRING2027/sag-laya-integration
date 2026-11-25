@@ -390,12 +390,6 @@ async def _process_document_unlocked(
         parser_stage = False
         initial_payload = dict(job.payload or {})
         target_storage_path = initial_payload.get("storage_path") or document.storage_path
-        remote_object_sourced = bool(initial_payload.get("remote_object_sourced"))
-        remote_source_url = (
-            initial_payload.get("remote_source_url")
-            if isinstance(initial_payload.get("remote_source_url"), str)
-            else None
-        )
         job_project_id = (
             str(initial_payload.get("project_id"))
             if initial_payload.get("project_id")
@@ -408,63 +402,6 @@ async def _process_document_unlocked(
             and canonical_checkpoint in ("PARSE", "DEDUP_TEMPORAL")
         )
         if not checkpoint.chunk_ids and not skip_initial_prepare:
-            from sag_api.parsing.service import has_cached_prepared_document
-
-            needs_remote_fetch = bool(
-                remote_object_sourced
-                and remote_source_url
-                and not (
-                    target_storage_path
-                    and (
-                        os.path.isfile(target_storage_path)
-                        or has_cached_prepared_document(target_storage_path, settings)
-                    )
-                )
-            )
-            if needs_remote_fetch and remote_source_url:
-                import time as _time
-
-                from sag_api.parsing.remote_object import stream_remote_object_to_snapshot
-
-                await _advance_canonical_stage("RECEIVE", 10, DocumentStatus.LOADING)
-                dl_start = _time.monotonic()
-                try:
-                    target_storage_path = await stream_remote_object_to_snapshot(
-                        remote_source_url,
-                        target_path=target_storage_path,
-                        original_filename=str(
-                            initial_payload.get("original_filename") or document.filename
-                        ),
-                        expected_sha256=str(initial_payload.get("expected_sha256") or ""),
-                        expected_size_bytes=int(
-                            initial_payload.get("expected_size_bytes") or document.size_bytes or 0
-                        ),
-                        settings=settings,
-                        should_pause=should_pause,
-                    )
-                except ParsePaused:
-                    await _pause_or_yield()
-                dl_ms = round((_time.monotonic() - dl_start) * 1000, 2)
-                if run_id:
-                    session.add(
-                        StageRun(
-                            id=str(uuid.uuid4()),
-                            run_id=run_id,
-                            stage="receive",
-                            status="SUCCESS",
-                            duration_ms=dl_ms,
-                            metrics_json={
-                                "byte_size": int(
-                                    initial_payload.get("expected_size_bytes")
-                                    or document.size_bytes
-                                    or 0
-                                ),
-                                "source": "remote_object_stream",
-                            },
-                        )
-                    )
-                    await session.commit()
-
             parser_stage = True
             await _advance_canonical_stage("PARSE", 25, DocumentStatus.LOADING)
             try:
@@ -474,7 +411,6 @@ async def _process_document_unlocked(
                     state=(job.payload or {}).get("document_parser"),
                     on_state=on_parser_state,
                     should_pause=should_pause,
-                    remote_source_url=remote_source_url,
                     project_id=job_project_id,
                 )
             except ParsePaused:
@@ -483,11 +419,6 @@ async def _process_document_unlocked(
             parser_state = (job.payload or {}).get("document_parser")
             for field, value in _prepared_parser_values(prepared, parser_state).items():
                 setattr(document, field, value)
-            if remote_source_url:
-                scrubbed_payload = await refresh_payload()
-                if "remote_source_url" in scrubbed_payload:
-                    scrubbed_payload.pop("remote_source_url", None)
-                    job.payload = scrubbed_payload
             await session.commit()
             if prepared.fallback_from:
                 log.warning(
@@ -916,49 +847,6 @@ async def _process_document_unlocked(
     await session.refresh(document)
     await _finalize_research_task_for_run(session, run_id)
 
-    # Post-index Disk GC: when the immutable raw binary lives permanently on R2,
-    # reclaim heavy binary snapshots on local SAG disk while retaining the lightweight
-    # `.parsed.<signature>.md` sidecar cache for fast re-chunking / reprocessing.
-    from sag_api.parsing.service import has_cached_prepared_document
-
-    if (
-        getattr(settings, "remote_snapshot_gc_enabled", True)
-        and remote_object_sourced
-        and target_storage_path
-        and prepared is not None
-        and prepared.path != target_storage_path
-        and os.path.splitext(target_storage_path)[1].lower() not in {".md", ".markdown"}
-        and os.path.isfile(prepared.path)
-        and os.path.isfile(target_storage_path)
-        and has_cached_prepared_document(target_storage_path, settings)
-    ):
-        try:
-            import asyncio as _asyncio
-
-            from sqlalchemy import select as _select
-
-            active_sibling = await session.scalar(
-                _select(Document.id)
-                .where(
-                    Document.storage_path == target_storage_path,
-                    Document.id != document.id,
-                    Document.status.in_(
-                        [
-                            DocumentStatus.PENDING,
-                            DocumentStatus.LOADING,
-                            DocumentStatus.EXTRACTING,
-                            DocumentStatus.PAUSED,
-                            DocumentStatus.PAUSING,
-                        ]
-                    ),
-                )
-                .limit(1)
-            )
-            if active_sibling is None:
-                await _asyncio.to_thread(os.remove, target_storage_path)
-        except Exception as gc_err:  # noqa: BLE001
-            log.debug("Skipped post-index raw snapshot GC for %s: %s", document.id, gc_err)
-
     log.info(
         "Xử lý tài liệu hoàn thành doc=%s parser=%s cached=%s chunks=%d events=%d tokens=%d",
         document.id,
@@ -1229,15 +1117,6 @@ async def _reprocess_document_task_unlocked(
     }
     if document.storage_path and "storage_path" not in process_job_payload:
         process_job_payload["storage_path"] = document.storage_path
-    for forwarded_key in (
-        "remote_object_sourced",
-        "remote_source_url",
-        "expected_sha256",
-        "expected_size_bytes",
-        "original_filename",
-    ):
-        if forwarded_key in payload and payload[forwarded_key] is not None:
-            process_job_payload[forwarded_key] = payload[forwarded_key]
     if latest_ver and document.project_id:
         new_run_id = str(uuid.uuid4())
         tenant_id = document.tenant_id or "tenant_default"
@@ -1278,10 +1157,8 @@ async def _reprocess_document_task_unlocked(
         )
     process_job.payload = process_job_payload
 
-    scrubbed_reprocess_payload = dict(payload)
-    scrubbed_reprocess_payload.pop("remote_source_url", None)
     job.payload = {
-        **scrubbed_reprocess_payload,
+        **payload,
         "cleanup_completed": True,
         "process_job_id": process_job.id,
     }

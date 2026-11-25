@@ -6,7 +6,6 @@ from datetime import datetime
 
 from fastapi import (
     APIRouter,
-    Body,
     Depends,
     File,
     Form,
@@ -51,8 +50,6 @@ from sag_api.schemas.common import Ok
 from sag_api.schemas.document import DocumentOut, IngestRequest
 from sag_api.schemas.job import JobOut
 from sag_api.schemas.routing_rag import (
-    DocumentObjectIngestRequest,
-    DocumentReprocessRequest,
     DocumentRevokeRequest,
     DocumentRevokeResponse,
     DocumentUploadResponse,
@@ -68,7 +65,6 @@ from sag_api.services.document_service import (
     get_or_create_project_source,
     get_project_document_readiness_batch,
     get_public_document,
-    handle_document_object_ingest,
     handle_document_upload,
     ingest_content,
     pause_document,
@@ -696,75 +692,6 @@ async def upload_document_version(
     return result
 
 
-@project_router.post(
-    "/ingest-object",
-    response_model=DocumentUploadResponse,
-    summary="Zero-buffer ingest of a document version from an authorized R2/S3 presigned URL",
-)
-async def ingest_document_object_version(
-    project_id: str,
-    payload: DocumentObjectIngestRequest,
-    response: Response,
-    idempotency_key: str = Header(..., alias="Idempotency-Key"),
-    x_continuum_user_id: str | None = Header(None, alias="X-Continuum-User-Id"),
-    x_continuum_security_partition: str | None = Header(None, alias="X-Continuum-Security-Partition"),
-    x_continuum_tenant_id: str | None = Header(None, alias="X-Continuum-Tenant-Id"),
-    principal: VerifiedPrincipal = Depends(require_project_bff_principal),
-    session: AsyncSession = Depends(get_session),
-    job_queue: JobQueue | None = Depends(get_job_queue),
-) -> DocumentUploadResponse:
-    if project_id not in principal.allowed_project_ids:
-        raise ForbiddenError(
-            f"Principal '{principal.subject}' is not authorized to access project '{project_id}'"
-        )
-    if x_continuum_user_id and x_continuum_user_id != principal.subject:
-        raise ForbiddenError("X-Continuum-User-Id does not match the signed principal")
-    if not principal.tenant_id:
-        raise ForbiddenError("The signed principal assertion has no tenant scope")
-    if x_continuum_tenant_id and x_continuum_tenant_id != principal.tenant_id:
-        raise ForbiddenError("X-Continuum-Tenant-Id does not match the signed principal")
-
-    partition = x_continuum_security_partition
-    if not partition or not partition.strip():
-        if len(principal.allowed_partition_ids) == 1:
-            partition = next(iter(principal.allowed_partition_ids))
-        else:
-            raise ValidationError(
-                "X-Continuum-Security-Partition header is required to enforce data isolation"
-            )
-    if partition not in principal.allowed_partition_ids:
-        raise ForbiddenError(
-            f"Principal '{principal.subject}' is not authorized for security partition '{partition}'"
-        )
-
-    filename = _upload_filename(payload.original_filename)
-    _check_extension(filename)
-
-    result = await handle_document_object_ingest(
-        session,
-        tenant_id=principal.tenant_id,
-        project_id=project_id,
-        owner_id=principal.subject,
-        security_partition_id=partition,
-        client_token=idempotency_key,
-        source_url=payload.source_url,
-        original_filename=filename,
-        expected_sha256=payload.expected_sha256,
-        expected_size_bytes=payload.expected_size_bytes,
-        content_type=payload.content_type or "application/octet-stream",
-        logical_source_id=payload.logical_source_id,
-        source_published_at=payload.source_published_at,
-        job_queue=job_queue,
-    )
-
-    if result.is_duplicate:
-        response.status_code = status.HTTP_200_OK
-    else:
-        response.status_code = status.HTTP_202_ACCEPTED
-
-    return result
-
-
 @project_router.get(
     "/{document_id}/versions/{version_no}/status",
     response_model=DocumentVersionStatusResponse,
@@ -948,8 +875,6 @@ async def resume_project_document_endpoint(
     summary="Reprocess a project document from failed or ready state",
 )
 async def reprocess_project_document_endpoint(
-    payload: DocumentReprocessRequest | None = Body(default=None),
-    *,
     project_id: str,
     document_id: str,
     principal: VerifiedPrincipal = Depends(require_project_bff_principal),
@@ -965,10 +890,6 @@ async def reprocess_project_document_endpoint(
             source,
             doc.id,
             job_queue=job_queue,
-            remote_source_url=payload.source_url if payload else None,
-            expected_sha256=payload.expected_sha256 if payload else None,
-            expected_size_bytes=payload.expected_size_bytes if payload else None,
-            original_filename=payload.original_filename if payload else None,
         )
     return JobOut.model_validate(job)
 

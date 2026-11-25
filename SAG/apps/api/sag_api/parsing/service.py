@@ -143,20 +143,6 @@ async def _acquire_lane(
             yield
 
 
-def has_cached_prepared_document(path: str, settings: Settings) -> bool:
-    """Return True when either a raw Markdown file or a valid current-signature parsed sidecar exists on disk."""
-    if not path:
-        return False
-    suffix = os.path.splitext(path)[1].lower()
-    if suffix in {".md", ".markdown"}:
-        return os.path.isfile(path)
-    for candidate_provider in ("mineru", "markitdown"):
-        sig = _signature(candidate_provider, settings)
-        if _is_cached(f"{path}.parsed.{sig}.md"):
-            return True
-    return False
-
-
 async def prepare_document(
     path: str,
     settings: Settings,
@@ -164,7 +150,6 @@ async def prepare_document(
     state: dict[str, Any] | None = None,
     on_state: ParseStateCallback | None = None,
     should_pause: PauseCallback | None = None,
-    remote_source_url: str | None = None,
     project_id: str | None = None,
 ) -> PreparedDocument:
     """Trả về đường dẫn Markdown có thể chuyển trực tiếp cho canonical/zleap-sag."""
@@ -222,7 +207,6 @@ async def prepare_document(
             state=state,
             on_state=on_state,
             should_pause=should_pause,
-            remote_source_url=remote_source_url,
             project_id=project_id,
         )
 
@@ -282,7 +266,6 @@ async def _prepare_and_cache(
     state: dict[str, Any] | None,
     on_state: ParseStateCallback | None,
     should_pause: PauseCallback | None = None,
-    remote_source_url: str | None = None,
     project_id: str | None = None,
 ) -> PreparedDocument:
     parser_state = _compatible_state(state, provider, signature, settings)
@@ -345,7 +328,6 @@ async def _prepare_and_cache(
                     state=parser_state,
                     on_state=track_state,
                     should_pause=should_pause,
-                    remote_source_url=remote_source_url,
                 )
         except ApiError as mineru_error:
             return await _prepare_markitdown_fallback(
