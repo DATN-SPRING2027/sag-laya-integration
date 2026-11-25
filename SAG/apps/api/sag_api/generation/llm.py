@@ -114,15 +114,29 @@ class LLMClient:
         tools: list[dict] | None = None,
         tool_choice: str | dict | None = None,
         response_format: dict[str, Any] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> Any:
+        from sag_api.core.model_providers import get_model_provider
+
+        resolved_temperature = (
+            get_model_provider(self._settings.llm_provider).resolve_temperature(float(temperature))
+            if temperature is not None
+            else self._settings.effective_llm_temperature
+        )
+        resolved_max_tokens = (
+            max(1, min(int(max_tokens), int(self._settings.llm_context_window)))
+            if max_tokens is not None
+            else self._settings.llm_max_tokens
+        )
         request: dict[str, Any] = {
             "model": self._settings.routed_llm_model,
             "api_key": self._settings.llm_api_key,
             "timeout": self._settings.llm_timeout_ms / 1000,
             "num_retries": self._settings.llm_max_retries,
             "messages": messages,
-            "temperature": self._settings.effective_llm_temperature,
-            "max_tokens": self._settings.llm_max_tokens,
+            "temperature": resolved_temperature,
+            "max_tokens": resolved_max_tokens,
             "stream": stream,
         }
         if tools:
@@ -193,12 +207,17 @@ class LLMClient:
         collected_parts: list[str] = []
         usage_recorded = False
         stream = None
+        req_meta = getattr(request, "metadata", None) or {}
+        req_temperature = req_meta.get("temperature")
+        req_max_tokens = req_meta.get("max_tokens")
         try:
             stream = await self._create_completion(
                 serialized_messages,
                 tools=list(request.tools) or None,
                 tool_choice=request.tool_choice if request.tools else None,
                 stream=True,
+                temperature=(float(req_temperature) if req_temperature is not None else None),
+                max_tokens=(int(req_max_tokens) if req_max_tokens is not None else None),
             )
             async for chunk in stream:
                 cancellation.raise_if_cancelled()
@@ -306,10 +325,17 @@ class LLMClient:
         messages: list[Message],
         *,
         response_format: dict[str, Any] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         self._ensure_configured()
         try:
-            resp = await self._create_completion(messages, response_format=response_format)
+            resp = await self._create_completion(
+                messages,
+                response_format=response_format,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
             choices = _attr(resp, "choices", []) or []
             if not choices:
                 raise UpstreamError(

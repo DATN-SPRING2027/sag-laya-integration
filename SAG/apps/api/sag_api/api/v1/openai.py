@@ -48,9 +48,8 @@ class ChatCompletionRequest(BaseModel):
     messages: list[ChatMessage] = Field(min_length=1)
     model: str | None = None
     stream: bool = False
-    # 兼容字段，接收但不强制透传（检索参数以助手人格为准）
-    temperature: float | None = None
-    max_tokens: int | None = None
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    max_tokens: int | None = Field(default=None, ge=1)
 
 
 def _split_query(messages: list[ChatMessage]) -> tuple[str, list[dict[str, str]]]:
@@ -103,12 +102,17 @@ async def chat_completions(
             tool_registry=tool_registry,
             runtime=agent_runtime,
             principal=principal,
+            temperature=body.temperature,
+            max_tokens=body.max_tokens,
         )
 
     if body.stream:
 
         async def gen():
             streamed_parts: list[str] = []
+            buffered_parts: list[str] = []
+            should_buffer = bool(plan.citations or plan.session_citations)
+            errored = False
 
             def chunk(delta: dict, finish: str | None = None) -> str:
                 payload = {
@@ -122,26 +126,54 @@ async def chat_completions(
 
             yield chunk({"role": "assistant"})
             async for event in _events():
-                payload = event.data["payload"]
-                if event.type == EventType.MESSAGE_DELTA.value:
-                    delta = str(payload["delta"])
-                    streamed_parts.append(delta)
-                    yield chunk({"content": delta})
+                payload = event.data.get("payload") or {}
+                if event.type == EventType.RUN_STARTED.value:
+                    if payload.get("grounding_required"):
+                        should_buffer = True
+                elif event.type == EventType.TOOL_STARTED.value:
+                    if payload.get("name") in {"search_context", "get_entity"}:
+                        should_buffer = True
+                elif event.type == EventType.MESSAGE_DELTA.value:
+                    delta = str(payload.get("delta") or "")
+                    if not delta:
+                        continue
+                    if should_buffer:
+                        buffered_parts.append(delta)
+                    else:
+                        streamed_parts.append(delta)
+                        yield chunk({"content": delta})
                 elif event.type == EventType.RUN_COMPLETED.value:
                     canonical = str(payload.get("output") or "")
                     streamed = "".join(streamed_parts)
-                    # Canonicalization can append traceable-source fallbacks.
-                    # Stream the suffix when it preserves the content already
-                    # delivered; destructive rewrites remain a non-stream-only
-                    # guarantee because SSE cannot retract prior chunks.
-                    if canonical.startswith(streamed):
+                    if should_buffer:
+                        if canonical:
+                            yield chunk({"content": canonical})
+                    elif canonical.startswith(streamed):
                         suffix = canonical[len(streamed) :]
                         if suffix:
                             yield chunk({"content": suffix})
                 elif event.type in (EventType.RUN_FAILED.value, EventType.RUN_CANCELLED.value):
                     error = payload.get("error") or {}
-                    yield chunk({"content": f"\n[错误] {error.get('message', '生成失败')}"})
-            yield chunk({}, finish="stop")
+                    err_msg = str(error.get("message") or "Generation failed")
+                    err_code = str(error.get("code") or "stream_error")
+                    yield chunk({}, finish="error")
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "error": {
+                                    "message": err_msg,
+                                    "type": "server_error",
+                                    "code": err_code,
+                                }
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n\n"
+                    )
+                    errored = True
+            if not errored:
+                yield chunk({}, finish="stop")
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(
@@ -151,19 +183,22 @@ async def chat_completions(
     # 非流式：消费同一事件流，聚合为最终答案
     parts: list[str] = []
     final_output = ""
+    completed_seen = False
     citations = plan.citations
     usage: dict = {}
     async for event in _events():
-        payload = event.data["payload"]
+        payload = event.data.get("payload") or {}
         if event.type == EventType.MESSAGE_DELTA.value:
             parts.append(payload["delta"])
         elif event.type == EventType.RUN_COMPLETED.value:
+            completed_seen = True
             final_output = str(payload.get("output") or "")
-            citations = payload.get("citations") or citations
+            if "citations" in payload:
+                citations = payload["citations"] if payload["citations"] is not None else []
             usage = payload.get("usage") or {}
         elif event.type in (EventType.RUN_FAILED.value, EventType.RUN_CANCELLED.value):
             error = payload.get("error") or {}
-            raise UpstreamError(error.get("message", "生成失败"))
+            raise UpstreamError(error.get("message", "Generation failed"))
     return {
         "id": cid,
         "object": "chat.completion",
@@ -172,7 +207,10 @@ async def chat_completions(
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": final_output or "".join(parts)},
+                "message": {
+                    "role": "assistant",
+                    "content": final_output if completed_seen else "".join(parts),
+                },
                 "finish_reason": "stop",
             }
         ],

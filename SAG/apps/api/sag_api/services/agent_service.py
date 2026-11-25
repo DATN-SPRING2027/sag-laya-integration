@@ -244,6 +244,7 @@ async def _initial_tool_choice(
     session_grounded: bool = False,
     has_prior_turns: bool = False,
     public_scope: bool = False,
+    require_project_grounding: bool = False,
 ) -> str | dict[str, Any]:
     """Apply only high-confidence first-turn routing.
 
@@ -263,7 +264,12 @@ async def _initial_tool_choice(
         normalized
     ):
         return "none"
-    if not normalized or _DIRECT_RESPONSE_HINT.search(normalized):
+    if not normalized or (
+        not knowledge_only
+        and not scoped
+        and not require_project_grounding
+        and _DIRECT_RESPONSE_HINT.search(normalized)
+    ):
         return "auto"
 
     # Cloud decision routing is kept off the event loop; failures never block retrieval.
@@ -291,7 +297,7 @@ async def _initial_tool_choice(
         and not _TIME_ONLY_INTENT.search(normalized)
     ):
         return "auto"
-    if (knowledge_only or scoped) and "search_context" in names:
+    if (knowledge_only or scoped or require_project_grounding) and "search_context" in names:
         return _named_tool_choice("search_context")
     if _EXPLICIT_RESEARCH_INTENT.search(normalized) and any(_tool_supports_research(tool) for tool in tools):
         return "required"
@@ -1073,6 +1079,8 @@ async def generate_stream(
     runtime: AgentRuntime | None = None,
     knowledge_only: bool = False,
     principal: VerifiedPrincipal | None = None,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
 ) -> AsyncIterator[AgentStreamEvent]:
     """Run one request and expose the SDK event contract to the host transport."""
 
@@ -1140,6 +1148,10 @@ async def generate_stream(
             if (knowledge_only or question_scope != "project")
             else await resolve_mcp_specs(session, agent)
         )
+    local_evidence_required = (
+        local_evidence_required
+        or (question_scope == "project" and bool(sources))
+    )
     host_context = HostToolContext(
         engine_manager=engine_manager,
         sources=sources,
@@ -1282,6 +1294,7 @@ async def generate_stream(
             # output and tool-result messages. This is the only content the UI
             # may describe as the model's starting context.
             frozen_prompt_preview = build_prompt_preview(run_messages)
+            require_project_grounding = question_scope == "project" and not session_grounded_scope
             initial_tool_choice = await _initial_tool_choice(
                 plan.query,
                 tools,
@@ -1291,6 +1304,7 @@ async def generate_stream(
                 session_grounded=session_grounded_scope,
                 has_prior_turns=has_prior_turns,
                 public_scope=(question_scope == "general"),
+                require_project_grounding=require_project_grounding,
             )
             local_grounding_required = (
                 question_scope == "project"
@@ -1301,6 +1315,11 @@ async def generate_stream(
             )
             empty_response = str((agent.persona or {}).get("empty_response") or "").strip()
             max_turns = max(1, int(getattr(settings, "agent_max_steps", AGENT_MAX_STEPS)))
+            effective_reserved_output_tokens = (
+                min(max(1, int(max_tokens)), int(settings.llm_context_window))
+                if max_tokens is not None
+                else settings.llm_max_tokens
+            )
 
             tool_schemas = [tool.spec.to_model_schema() for tool in tools]
 
@@ -1309,7 +1328,7 @@ async def generate_stream(
                     messages,
                     tool_schemas,
                     context_window_tokens=settings.llm_context_window,
-                    reserved_output_tokens=settings.llm_max_tokens,
+                    reserved_output_tokens=effective_reserved_output_tokens,
                 )
                 host_context.evidence_token_budget = evidence_budget
                 had_citations = bool(citations)
@@ -1346,6 +1365,8 @@ async def generate_stream(
                     "source_names": [source.name for source in sources],
                     "web_enabled": not knowledge_only,
                     "knowledge_only": knowledge_only,
+                    **({"temperature": float(temperature)} if temperature is not None else {}),
+                    **({"max_tokens": int(max_tokens)} if max_tokens is not None else {}),
                 },
             )
 
@@ -1389,6 +1410,7 @@ async def generate_stream(
                         "tool_warnings": mcp_bundle.warnings,
                         "web_enabled": not knowledge_only,
                         "knowledge_only": knowledge_only,
+                        "grounding_required": bool(local_grounding_required or session_grounded_scope),
                         **({"session_context": session_context_meta} if session_context_meta is not None else {}),
                     }
                 elif event.type in (
