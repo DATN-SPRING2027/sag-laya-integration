@@ -421,6 +421,8 @@ async def _prepare_global_search(
             sections=section_outputs,
             stats=stats,
             answer_status="pending",
+            degraded=bool(stats.get("degraded", False)),
+            degraded_reason=stats.get("degraded_reason"),
         ),
     )
 
@@ -463,12 +465,16 @@ async def _complete_global_search(
 
     if prepared.answer_skipped:
         return prepared.response.model_copy(update={"summary": "", "answer_status": "skipped"})
+    degraded = bool(prepared.response.degraded or answer.degraded)
+    degraded_reason = answer.degraded_reason or prepared.response.degraded_reason
     return prepared.response.model_copy(
         update={
             "summary": answer.text,
             "citations": [SearchCitationOut.model_validate(citation) for citation in answer.citations],
             "answer_status": answer.status,
             "no_answer_reason": answer.no_answer_reason,
+            "degraded": degraded,
+            "degraded_reason": degraded_reason,
             "exploration_id": exploration_id,
         }
     )
@@ -599,6 +605,8 @@ async def search(
             else SearchAnswer("", [], "skipped")
         )
         # 对外 source_id = sag 信源 id（可路由 / 取原文），不泄漏引擎内部 id
+        retrieval_degraded = bool(outcome.stats.get("degraded", False))
+        retrieval_degraded_reason = outcome.stats.get("degraded_reason")
         return SearchResponse(
             query=body.query,
             sections=[
@@ -610,6 +618,8 @@ async def search(
             citations=answer.citations,
             answer_status=answer.status,
             no_answer_reason=answer.no_answer_reason,
+            degraded=bool(retrieval_degraded or answer.degraded),
+            degraded_reason=answer.degraded_reason or retrieval_degraded_reason,
             stats={
                 **outcome.stats,
                 "event_hits": len(graph_fields["events"]),
@@ -709,6 +719,8 @@ async def global_search_stream(
                                     update.citations or [],
                                     update.status,
                                     update.no_answer_reason,
+                                    degraded=update.degraded,
+                                    degraded_reason=update.degraded_reason,
                                 )
 
                 completed = await _complete_global_search(

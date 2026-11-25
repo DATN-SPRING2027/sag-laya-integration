@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import json
 import math
 import re
 import threading
@@ -1557,29 +1559,6 @@ def fallback_search_answer(query: str, sections: list[RetrievedSection]) -> str:
 
 
 _MULTI_CITATION_BRACKET_RE = re.compile(r"\[(\d+(?:\s*[,;]\s*\d+)+)]")
-_ABSTENTION_PREFIX_RE = re.compile(
-    r"^\s*(?:insufficient[_\s-]evidence\b|"
-    r"the\s+(?:provided\s+|available\s+|retrieved\s+)?(?:evidence|documents?|context|sources?)\s+"
-    r"(?:do(?:es)?\s+not|cannot)\s+(?:contain|specify|mention|provide|include|state|answer)\b|"
-    r"based\s+on\s+the\s+(?:provided\s+|available\s+)?(?:evidence|documents?|context),\s+there\s+is\s+no\s+(?:information|mention)\b|"
-    r"(?:bằng\s+chứng|tài\s+liệu)\s+(?:được\s+cung\s+cấp\s+)?không\s+(?:chứa|đề\s+cập|nêu|có\s+thông\s+tin)\b)",
-    re.IGNORECASE,
-)
-_UNGROUNDED_REFUSAL_CUES = (
-    "does not contain",
-    "does not specify",
-    "does not mention",
-    "does not provide",
-    "do not contain",
-    "do not specify",
-    "do not mention",
-    "not mentioned in the provided",
-    "not specified in the provided",
-    "cannot be determined from the provided",
-    "insufficient evidence",
-    "không có thông tin",
-    "không đề cập",
-)
 
 
 def _normalize_citation_brackets(text: str) -> str:
@@ -1589,17 +1568,55 @@ def _normalize_citation_brackets(text: str) -> str:
     )
 
 
-def _is_abstention_response(answer: str) -> bool:
-    text = answer.strip()
-    if not text:
+def _strip_think_prefix(raw_text: str) -> str:
+    text = (raw_text or "").strip()
+    while True:
+        start = text.find("<think>")
+        if start == -1:
+            return text
+        end = text.find("</think>", start + len("<think>"))
+        if end == -1:
+            before = text[:start].strip()
+            if "{" in before:
+                return before
+            after = text[start + len("<think>") :].strip()
+            return after if "{" in after else before
+        text = (text[:start] + " " + text[end + len("</think>") :]).strip()
+
+
+def _parse_structured_search_answer(raw_text: str) -> tuple[str | None, str | None]:
+    cleaned = _strip_think_prefix(raw_text)
+    if not cleaned:
+        return None, None
+    decoder = json.JSONDecoder()
+    idx = cleaned.find("{")
+    while idx != -1:
+        try:
+            obj, _end = decoder.raw_decode(cleaned, idx)
+        except json.JSONDecodeError:
+            idx = cleaned.find("{", idx + 1)
+            continue
+        if isinstance(obj, dict):
+            answerability = obj.get("answerability")
+            if isinstance(answerability, str):
+                norm_ans = answerability.strip().lower()
+                if norm_ans in {"answered", "insufficient_evidence"}:
+                    raw_ans = obj.get("answer")
+                    ans_text = raw_ans.strip() if isinstance(raw_ans, str) else ""
+                    return norm_ans, ans_text
+        idx = cleaned.find("{", idx + 1)
+    return None, None
+
+
+def _supports_response_format(fn: Any) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
         return False
-    lowered = text.lower()
-    if "insufficient_evidence" in lowered or _ABSTENTION_PREFIX_RE.search(text):
-        return True
-    normalized = _normalize_citation_brackets(text)
-    if not _CITATION_RE.findall(normalized) and any(cue in lowered for cue in _UNGROUNDED_REFUSAL_CUES):
-        return True
-    return False
+    return any(
+        p.kind == inspect.Parameter.VAR_KEYWORD or name == "response_format"
+        for name, p in sig.parameters.items()
+    )
 
 
 def _validated_answer(answer: str, section_count: int) -> str | None:
@@ -1641,17 +1658,21 @@ def _build_search_citations(
 class SearchAnswerUpdate:
     kind: Literal["delta", "completed"]
     text: str
-    status: Literal["answered", "no_answer"] = "answered"
+    status: Literal["answered", "extractive_fallback", "no_answer"] = "answered"
     no_answer_reason: str | None = None
     citations: list[dict[str, Any]] | None = None
+    degraded: bool = False
+    degraded_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class SearchAnswer:
     text: str
     citations: list[dict[str, Any]]
-    status: Literal["answered", "no_answer", "skipped"]
+    status: Literal["answered", "extractive_fallback", "no_answer", "skipped"]
     no_answer_reason: str | None = None
+    degraded: bool = False
+    degraded_reason: str | None = None
 
 
 async def synthesize_search_answer(
@@ -1666,28 +1687,53 @@ async def synthesize_search_answer(
     verified_sections = await resolve_traceable_evidence(sections, sources or []) if sources is not None else sections
     pack = build_evidence_pack(query, verified_sections)
     if pack.status != "sufficient":
-        return SearchAnswer(no_answer_text(), [], "no_answer", pack.no_answer_reason)
+        return SearchAnswer(no_answer_text(query=query), [], "no_answer", pack.no_answer_reason)
 
     citations = _build_search_citations(pack.sections, sources or [])
     if len(citations) != len(pack.sections) or any(not citation.get("source_id") for citation in citations):
-        return SearchAnswer(no_answer_text(), [], "no_answer", "weak_evidence")
+        return SearchAnswer(no_answer_text(query=query), [], "no_answer", "weak_evidence")
     fallback = fallback_search_answer(query, pack.sections)
     if llm is None or not getattr(llm, "configured", False):
-        return SearchAnswer(fallback, _citations_used_by_answer(fallback, citations), "answered")
+        return SearchAnswer(
+            fallback,
+            _citations_used_by_answer(fallback, citations),
+            "extractive_fallback",
+            degraded=True,
+            degraded_reason="llm_unconfigured",
+        )
 
     from sag_api.core.token_usage import token_usage_scope
 
+    kwargs: dict[str, Any] = {}
+    if _supports_response_format(llm.complete):
+        kwargs["response_format"] = {"type": "json_object"}
     try:
         with token_usage_scope(component="answer_generation"):
-            answer = await llm.complete(pack.messages)
+            answer = await llm.complete(pack.messages, **kwargs)
     except Exception as error:  # noqa: BLE001
-        log.warning("搜索答案生成失败，回退证据摘要：%s", error)
-        return SearchAnswer(fallback, _citations_used_by_answer(fallback, citations), "answered")
-    if _is_abstention_response(answer):
-        return SearchAnswer(no_answer_text(), [], "no_answer", "insufficient_evidence")
-    validated = _validated_answer(answer, len(pack.sections))
-    canonical = validated or fallback
-    return SearchAnswer(canonical, _citations_used_by_answer(canonical, citations), "answered")
+        log.warning("Search synthesis failed; returning extractive fallback (%s)", type(error).__name__)
+        return SearchAnswer(
+            fallback,
+            _citations_used_by_answer(fallback, citations),
+            "extractive_fallback",
+            degraded=True,
+            degraded_reason=f"llm_error:{type(error).__name__}",
+        )
+    answerability, parsed_answer = _parse_structured_search_answer(answer)
+    if answerability == "insufficient_evidence":
+        return SearchAnswer(no_answer_text(query=query), [], "no_answer", "insufficient_evidence")
+    if answerability is None:
+        return SearchAnswer(
+            fallback,
+            _citations_used_by_answer(fallback, citations),
+            "extractive_fallback",
+            degraded=True,
+            degraded_reason="invalid_structured_output",
+        )
+    validated = _validated_answer(parsed_answer or "", len(pack.sections))
+    if validated is None:
+        return SearchAnswer(no_answer_text(query=query), [], "no_answer", "weak_evidence")
+    return SearchAnswer(validated, _citations_used_by_answer(validated, citations), "answered")
 
 
 async def stream_synthesize_search_answer(
@@ -1704,7 +1750,7 @@ async def stream_synthesize_search_answer(
     if pack.status != "sufficient":
         yield SearchAnswerUpdate(
             kind="completed",
-            text=no_answer_text(),
+            text=no_answer_text(query=query),
             status="no_answer",
             no_answer_reason=pack.no_answer_reason,
             citations=[],
@@ -1715,7 +1761,7 @@ async def stream_synthesize_search_answer(
     if len(citations) != len(pack.sections) or any(not citation.get("source_id") for citation in citations):
         yield SearchAnswerUpdate(
             kind="completed",
-            text=no_answer_text(),
+            text=no_answer_text(query=query),
             status="no_answer",
             no_answer_reason="weak_evidence",
             citations=[],
@@ -1724,44 +1770,98 @@ async def stream_synthesize_search_answer(
     fallback = fallback_search_answer(query, pack.sections)
     if llm is None or not getattr(llm, "configured", False):
         used_citations = _citations_used_by_answer(fallback, citations)
-        yield SearchAnswerUpdate(kind="delta", text=fallback)
-        yield SearchAnswerUpdate(kind="completed", text=fallback, citations=used_citations)
+        yield SearchAnswerUpdate(
+            kind="delta",
+            text=fallback,
+            status="extractive_fallback",
+            degraded=True,
+            degraded_reason="llm_unconfigured",
+        )
+        yield SearchAnswerUpdate(
+            kind="completed",
+            text=fallback,
+            status="extractive_fallback",
+            citations=used_citations,
+            degraded=True,
+            degraded_reason="llm_unconfigured",
+        )
         return
 
     from sag_api.core.token_usage import token_usage_scope
 
+    kwargs: dict[str, Any] = {}
+    if _supports_response_format(llm.stream_complete):
+        kwargs["response_format"] = {"type": "json_object"}
     parts: list[str] = []
     try:
         with token_usage_scope(component="answer_generation"):
-            async for delta in llm.stream_complete(pack.messages):
+            async for delta in llm.stream_complete(pack.messages, **kwargs):
                 if delta:
                     parts.append(delta)
     except asyncio.CancelledError:
         raise
     except Exception as error:  # noqa: BLE001
-        log.warning("搜索答案流生成失败，回退证据摘要：%s", error)
+        log.warning("Search stream synthesis failed; returning extractive fallback (%s)", type(error).__name__)
         fallback_citations = _citations_used_by_answer(fallback, citations)
+        reason = f"llm_error:{type(error).__name__}"
+        yield SearchAnswerUpdate(
+            kind="delta",
+            text=fallback,
+            status="extractive_fallback",
+            degraded=True,
+            degraded_reason=reason,
+        )
         yield SearchAnswerUpdate(
             kind="completed",
             text=fallback,
+            status="extractive_fallback",
             citations=fallback_citations,
+            degraded=True,
+            degraded_reason=reason,
         )
         return
 
     raw_answer = "".join(parts)
-    if _is_abstention_response(raw_answer):
+    answerability, parsed_answer = _parse_structured_search_answer(raw_answer)
+    if answerability == "insufficient_evidence":
         yield SearchAnswerUpdate(
             kind="completed",
-            text=no_answer_text(),
+            text=no_answer_text(query=query),
             status="no_answer",
             no_answer_reason="insufficient_evidence",
             citations=[],
         )
         return
-    validated = _validated_answer(raw_answer, len(pack.sections))
-    answer = validated or fallback
-    used_citations = _citations_used_by_answer(answer, citations)
+    if answerability is None:
+        fallback_citations = _citations_used_by_answer(fallback, citations)
+        yield SearchAnswerUpdate(
+            kind="delta",
+            text=fallback,
+            status="extractive_fallback",
+            degraded=True,
+            degraded_reason="invalid_structured_output",
+        )
+        yield SearchAnswerUpdate(
+            kind="completed",
+            text=fallback,
+            status="extractive_fallback",
+            citations=fallback_citations,
+            degraded=True,
+            degraded_reason="invalid_structured_output",
+        )
+        return
+    validated = _validated_answer(parsed_answer or "", len(pack.sections))
+    if validated is None:
+        yield SearchAnswerUpdate(
+            kind="completed",
+            text=no_answer_text(query=query),
+            status="no_answer",
+            no_answer_reason="weak_evidence",
+            citations=[],
+        )
+        return
+    used_citations = _citations_used_by_answer(validated, citations)
     # Provider deltas remain private until citation syntax is checked against
     # this exact pack. Only the canonical text is sent as a single delta.
-    yield SearchAnswerUpdate(kind="delta", text=answer)
-    yield SearchAnswerUpdate(kind="completed", text=answer, citations=used_citations)
+    yield SearchAnswerUpdate(kind="delta", text=validated)
+    yield SearchAnswerUpdate(kind="completed", text=validated, citations=used_citations)

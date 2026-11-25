@@ -126,8 +126,16 @@ class SearchResponse(BaseModel):
     source_hits: list[SearchSourceHitOut] = Field(default_factory=list)
     summary: str = ""
     citations: list[SearchCitationOut] = Field(default_factory=list)
-    answer_status: Literal["pending", "answered", "no_answer", "skipped"] = "skipped"
-    no_answer_reason: Literal["empty_evidence", "weak_evidence", "context_budget"] | None = None
+    answer_status: Literal["pending", "answered", "extractive_fallback", "no_answer", "skipped"] = "skipped"
+    no_answer_reason: Literal[
+        "empty_evidence",
+        "weak_evidence",
+        "context_budget",
+        "insufficient_evidence",
+        "unsupported_claim",
+    ] | None = None
+    degraded: bool = False
+    degraded_reason: str | None = None
     exploration_id: str | None = None
     stats: dict[str, Any]
 
