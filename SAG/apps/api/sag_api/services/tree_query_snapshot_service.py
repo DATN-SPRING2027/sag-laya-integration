@@ -12,11 +12,15 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
+import httpx
 from sqlalchemy import delete, func, select, tuple_
 from sqlalchemy.orm import load_only
+from zleap.sag.exceptions import SagError
 
 from sag_api.core.config import settings
 from sag_api.core.db import SessionLocal
+from sag_api.core.errors import ApiError
+from sag_api.core.logging import get_logger
 from sag_api.core.text_utils import normalize_text
 from sag_api.db.models.routing_rag import (
     ProjectSearchState,
@@ -41,6 +45,8 @@ from sag_api.services.tree_publish_service import (
     _database_now,
     _scoped_profile_checksum,
 )
+
+log = get_logger("tree_query_snapshot")
 
 _TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
 _QUERY_YEAR_RE = re.compile(r"\b((?:19|20)\d{2})\b")
@@ -530,7 +536,16 @@ async def _resolve_scope_query_vector(
                 vec = await shielded
         else:
             vec = raw_task_or_vec
-    except (TimeoutError, Exception):  # noqa: BLE001 - fall back to sparse/entity/temporal signals on slow/failed embed
+    except (
+        TimeoutError,
+        httpx.HTTPError,
+        ApiError,
+        SagError,
+        ValueError,
+        RuntimeError,
+        OSError,
+    ) as exc:
+        log.warning("Scope query vector unavailable (%s)", type(exc).__name__)
         return None
     if isinstance(vec, Sequence) and not isinstance(vec, (str, bytes)):
         return _normalize_unit_vector(vec)

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -233,8 +234,8 @@ async def _load_indexed_units(
                 int(block_total) > _MAX_BLOCKS_PER_UNIT or int(text_length or 0) > _MAX_UNIT_CHARS
             ):
                 truncated_sources.add((str(logical_id), int(version_no)))
-    except Exception as exc:  # noqa: BLE001
-        log.debug("Skipping optional indexed SearchUnit enrichment: %s", type(exc).__name__)
+    except SQLAlchemyError as exc:
+        log.warning("Optional indexed SearchUnit enrichment unavailable: %s", type(exc).__name__)
         return {}
 
     mapped: dict[tuple[str, int], list[tuple[LocatorKind, str, str, str]]] = {}

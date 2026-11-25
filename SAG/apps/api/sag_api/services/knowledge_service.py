@@ -19,8 +19,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import delete, insert, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sag_api.core.logging import get_logger
 from sag_api.db.models import (
     CanonicalBlock,
     Document,
@@ -706,6 +708,21 @@ async def batch_version_inputs(session: AsyncSession, version_ids: Sequence[str]
     return results
 
 
+log = get_logger("knowledge")
+
+
+def _is_missing_table_error(exc: BaseException) -> bool:
+    orig = getattr(exc, "orig", None)
+    if getattr(orig, "pgcode", None) == "42P01" or getattr(orig, "sqlstate", None) == "42P01":
+        return True
+    msg = str(exc).lower()
+    return (
+        "no such table" in msg
+        or "undefinedtable" in msg
+        or ("relation" in msg and "does not exist" in msg)
+    )
+
+
 async def _load_sag_engine_entities(session: AsyncSession, document_id: str) -> tuple[str, ...]:
     """Harvest LLM-extracted entities from sag-engine (LightRAG Dual-Level Bridging)."""
     document = await session.get(Document, document_id)
@@ -766,8 +783,14 @@ async def _load_sag_engine_entities(session: AsyncSession, document_id: str) -> 
                             if 2 <= len(ename) <= 120:
                                 collected.add(ename)
         return tuple(sorted(collected))
-    except Exception:  # noqa: BLE001 - optional sag-engine tables may be absent in isolated tests
+    except ImportError:
         return ()
+    except SQLAlchemyError as exc:
+        if _is_missing_table_error(exc):
+            log.debug("Optional sag-engine entity tables absent: %s", type(exc).__name__)
+            return ()
+        log.warning("Failed loading sag-engine entities for document %s: %s", document_id, type(exc).__name__)
+        raise
 
 
 async def rebuild_knowledge_version(

@@ -15,14 +15,17 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import httpx
 from fastapi import UploadFile
 from packaging.version import InvalidVersion, Version
 from sqlalchemy import select, update
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
+from zleap.sag.exceptions import SagError
 
 from sag_api.core.config import settings
 from sag_api.core.error_taxonomy import ErrorCode, ErrorLayer, ErrorStage
-from sag_api.core.errors import ConflictError, NotFoundError, ValidationError
+from sag_api.core.errors import ApiError, ConflictError, NotFoundError, ValidationError
 from sag_api.db.base import new_id
 from sag_api.db.models import (
     Document,
@@ -749,7 +752,16 @@ async def execute_structured_import(
     if engine_manager is not None and hasattr(engine_manager, "get_sag_embedding"):
         try:
             emb_client = await engine_manager.get_sag_embedding(source_config_id)
-        except Exception:  # noqa: BLE001
+        except (
+            ApiError,
+            SagError,
+            httpx.HTTPError,
+            TimeoutError,
+            OSError,
+            SQLAlchemyError,
+            ValueError,
+        ) as exc:
+            logger.warning("OCTX vector identity lookup unavailable: %s", type(exc).__name__)
             emb_client = None
     vec_identity = embedding_identity(emb_client) or configured_embedding_identity(settings)
 
@@ -978,7 +990,16 @@ async def execute_knowledge_import(
     if engine_manager is not None and hasattr(engine_manager, "get_sag_embedding"):
         try:
             kb_emb_client = await engine_manager.get_sag_embedding(source_config_id)
-        except Exception:  # noqa: BLE001
+        except (
+            ApiError,
+            SagError,
+            httpx.HTTPError,
+            TimeoutError,
+            OSError,
+            SQLAlchemyError,
+            ValueError,
+        ) as exc:
+            logger.warning("OCTX KB vector identity lookup unavailable: %s", type(exc).__name__)
             kb_emb_client = None
     kb_vec_identity = embedding_identity(kb_emb_client) or configured_embedding_identity(settings)
 

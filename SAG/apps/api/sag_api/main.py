@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,6 +24,15 @@ from sag_api.core.principal_assertion import principal_assertion_lifespan
 from sag_api.runtime import KnowledgeRuntime
 
 log = get_logger("app")
+
+
+async def _drain_warm_manifest_task(warm_task: asyncio.Task[Any]) -> None:
+    try:
+        await warm_task
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        log.debug("Warm manifest cache task ended on shutdown: %s", type(exc).__name__)
 
 
 @asynccontextmanager
@@ -68,7 +79,6 @@ async def lifespan(app: FastAPI):
                     log.warning("Failed to initialize knowledge worker embedder: %s", error)
             if settings.knowledge_worker_enabled:
                 await knowledge_worker.start()
-            import asyncio
             from sag_api.services.universe_knowledge_service import warm_active_tree_manifest_cache
 
             warm_task = asyncio.create_task(
@@ -80,10 +90,7 @@ async def lifespan(app: FastAPI):
             finally:
                 if not warm_task.done():
                     warm_task.cancel()
-                    try:
-                        await warm_task
-                    except BaseException:  # noqa: BLE001
-                        pass
+                await _drain_warm_manifest_task(warm_task)
     finally:
         failures: list[BaseException] = []
         for cleanup in (

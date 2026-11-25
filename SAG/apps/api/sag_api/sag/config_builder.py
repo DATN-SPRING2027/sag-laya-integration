@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from zleap.sag import EngineConfig
 from zleap.sag.config import (
@@ -40,7 +41,7 @@ def extract_postgres_search_path(database_url: str) -> str | None:
     """Extract ?search_path=... from a PostgreSQL SQLAlchemy URL so zleap-sag shares sag_api's schema."""
     try:
         url = make_url(database_url)
-    except Exception:
+    except ArgumentError:
         return None
     if not url.drivername.startswith("postgresql"):
         return None

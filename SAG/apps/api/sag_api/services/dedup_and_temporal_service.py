@@ -992,7 +992,7 @@ async def run_dedup_and_temporal_stage(
                     if prior_cached:
                         block_embeddings.update(curr_cached)
                         block_embeddings.update(prior_cached)
-            except Exception:
+            except (TypeError, ValueError, AttributeError):
                 pass
         else:
             try:

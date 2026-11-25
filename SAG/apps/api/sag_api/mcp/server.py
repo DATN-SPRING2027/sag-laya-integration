@@ -14,12 +14,16 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Annotated, TypedDict
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import Field
+from sqlalchemy.exc import SQLAlchemyError
+from zleap.sag.exceptions import SagError
 
-from sag_api.core.config import FIXED_SEARCH_TOP_K
+from sag_api.core.errors import ApiError
+from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal
 from sag_api.services.query_strategy_planner import plan_query
 from sag_api.services.retrieval_service import retrieve_relevant_sections
@@ -29,6 +33,8 @@ from sag_api.services.source_service import versioned_source_ids
 if TYPE_CHECKING:
     from sag_api.db.models import Document, Source
     from sag_api.sag import EngineManager
+
+log = get_logger("mcp")
 
 
 class MCPToolDetail(TypedDict):
@@ -325,7 +331,12 @@ def build_source_mcp(
                 body = "\n\n".join(snippets) if snippets else (entity.description or "")
                 prefix = f"Nguồn: {_source_title(source)}\n" if len(selected) > 1 else ""
                 return f"{prefix}Thực thể “{entity.name}” ({entity.type}):\n{body}".strip()
-            except Exception:
+            except (ApiError, SagError, httpx.HTTPError, TimeoutError, OSError, SQLAlchemyError) as exc:
+                log.warning(
+                    "MCP legacy get_entity failed source=%s error_type=%s",
+                    source.id,
+                    type(exc).__name__,
+                )
                 return None
 
         legacy_matches = await asyncio.gather(*(_legacy_entity(source) for source in legacy_sources))
@@ -472,7 +483,12 @@ def build_source_mcp(
                 return await scope.engine_manager.grep_chunks(
                     source.sag_source_config_id, needle, source=source, limit=bounded_limit
                 )
-            except Exception:
+            except (ApiError, SagError, httpx.HTTPError, TimeoutError, OSError, SQLAlchemyError) as exc:
+                log.warning(
+                    "MCP legacy grep failed source=%s error_type=%s",
+                    source.id,
+                    type(exc).__name__,
+                )
                 return []
 
         results = await asyncio.gather(*(_legacy_grep(source) for source in legacy_sources))
@@ -600,7 +616,12 @@ def build_source_mcp(
                         source.sag_source_config_id, cid, source=source
                     )
                     return source, chunk
-                except Exception:
+                except (ApiError, SagError, httpx.HTTPError, TimeoutError, OSError, SQLAlchemyError) as exc:
+                    log.warning(
+                        "MCP legacy get_chunk failed source=%s error_type=%s",
+                        source.id,
+                        type(exc).__name__,
+                    )
                     return source, None
 
             results = await asyncio.gather(*(_one(source) for source in legacy_sources))

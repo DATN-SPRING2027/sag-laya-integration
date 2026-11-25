@@ -1583,7 +1583,8 @@ async def _hydrate_sibling_sections_for_top_versions(
                         )
                     )
             return siblings
-    except Exception:  # noqa: BLE001 - sibling hydration is best-effort
+    except (SQLAlchemyError, TimeoutError, AttributeError, ValueError) as exc:
+        log.debug("Skipping sibling SearchUnit hydration: %s", type(exc).__name__)
         return []
 
 

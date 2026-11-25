@@ -332,53 +332,64 @@ async def ensure_qdrant_collection_and_indexes(
         collection_ready = False
         collection_verified = False
         existing_indexed_fields: set[str] = set()
+        info_res: httpx.Response | None = None
         try:
             info_res = await qdrant_client.get(f"/collections/{collection_name}")
-            if info_res.is_success:
-                result_data = info_res.json().get("result", {})
-                if isinstance(result_data, dict):
-                    cfg = result_data.get("config", {})
-                    existing_vectors = cfg.get("params", {}).get("vectors", {})
-                    existing_sparse = cfg.get("params", {}).get("sparse_vectors", {})
-                    if isinstance(existing_vectors, dict) and "content_vector" in existing_vectors:
-                        existing_dim = existing_vectors["content_vector"].get("size")
-                        if existing_dim and existing_dim != vector_dim:
-                            raise ValueError(
-                                f"Qdrant collection {collection_name} dimension mismatch: "
-                                f"existing {existing_dim} vs required {vector_dim}"
-                            )
-                        if isinstance(existing_sparse, dict) and "bm25_sparse" in existing_sparse:
-                            sparse_cfg = existing_sparse.get("bm25_sparse")
-                            if isinstance(sparse_cfg, dict) and sparse_cfg.get("modifier") != "idf":
-                                try:
-                                    patch_res = await qdrant_client.patch(
-                                        f"/collections/{collection_name}",
-                                        json={"sparse_vectors": {"bm25_sparse": {"modifier": "idf"}}},
-                                    )
-                                    if patch_res.status_code >= 400:
-                                        log.warning(
-                                            "Could not enable Qdrant IDF modifier on %s: HTTP %s",
-                                            collection_name,
-                                            patch_res.status_code,
-                                        )
-                                except Exception as patch_exc:
-                                    log.debug(
-                                        "Skipping Qdrant IDF modifier patch on %s: %s",
+        except (httpx.HTTPError, TimeoutError, OSError) as check_exc:
+            log.warning("Collection check skipped or non-fatal: %s", sanitize_error_message(check_exc))
+            info_res = None
+
+        if info_res is not None and info_res.is_success:
+            try:
+                raw_info = info_res.json()
+                result_data = raw_info.get("result", {}) if isinstance(raw_info, dict) else {}
+            except (ValueError, TypeError) as parse_exc:
+                log.warning(
+                    "Invalid JSON from Qdrant collection check on %s: %s",
+                    collection_name,
+                    sanitize_error_message(parse_exc),
+                )
+                result_data = {}
+            if isinstance(result_data, dict):
+                cfg = result_data.get("config", {})
+                existing_vectors = cfg.get("params", {}).get("vectors", {})
+                existing_sparse = cfg.get("params", {}).get("sparse_vectors", {})
+                if isinstance(existing_vectors, dict) and "content_vector" in existing_vectors:
+                    existing_dim = existing_vectors["content_vector"].get("size")
+                    if existing_dim and existing_dim != vector_dim:
+                        raise ValueError(
+                            f"Qdrant collection {collection_name} dimension mismatch: "
+                            f"existing {existing_dim} vs required {vector_dim}"
+                        )
+                    if isinstance(existing_sparse, dict) and "bm25_sparse" in existing_sparse:
+                        sparse_cfg = existing_sparse.get("bm25_sparse")
+                        if isinstance(sparse_cfg, dict) and sparse_cfg.get("modifier") != "idf":
+                            try:
+                                patch_res = await qdrant_client.patch(
+                                    f"/collections/{collection_name}",
+                                    json={"sparse_vectors": {"bm25_sparse": {"modifier": "idf"}}},
+                                )
+                                if patch_res.status_code >= 400:
+                                    log.warning(
+                                        "Could not enable Qdrant IDF modifier on %s: HTTP %s",
                                         collection_name,
-                                        sanitize_error_message(patch_exc),
+                                        patch_res.status_code,
                                     )
-                            collection_ready = True
-                            collection_verified = True
-                    payload_schema = result_data.get("payload_schema")
-                    if isinstance(payload_schema, dict):
-                        existing_indexed_fields = set(payload_schema.keys())
-        except Exception as check_exc:
-            if isinstance(check_exc, ValueError):
-                raise
-            log.debug("Collection check skipped or non-fatal: %s", sanitize_error_message(check_exc))
+                            except (httpx.HTTPError, TimeoutError, OSError) as patch_exc:
+                                log.warning(
+                                    "Skipping Qdrant IDF modifier patch on %s: %s",
+                                    collection_name,
+                                    sanitize_error_message(patch_exc),
+                                )
+                        collection_ready = True
+                        collection_verified = True
+                payload_schema = result_data.get("payload_schema")
+                if isinstance(payload_schema, dict):
+                    existing_indexed_fields = set(payload_schema.keys())
 
         # 1. Create collection with dense and sparse vectors when not already verified
         if not collection_ready:
+            col_res: httpx.Response | None = None
             try:
                 col_res = await qdrant_client.put(
                     f"/collections/{collection_name}",
@@ -396,6 +407,13 @@ async def ensure_qdrant_collection_and_indexes(
                         }
                     },
                 )
+            except (httpx.HTTPError, TimeoutError, OSError) as exc:
+                log.warning(
+                    "Could not ensure Qdrant collection %s: %s",
+                    collection_name,
+                    sanitize_error_message(exc),
+                )
+            if col_res is not None:
                 if col_res.status_code >= 400 and col_res.status_code != 409:
                     err_text = col_res.text.lower()
                     if "already exists" not in err_text:
@@ -403,10 +421,6 @@ async def ensure_qdrant_collection_and_indexes(
                             f"Failed to create Qdrant collection {collection_name}: HTTP {col_res.status_code} - {col_res.text}"
                         )
                 collection_verified = True
-            except Exception as exc:
-                if isinstance(exc, (RuntimeError, ValueError)):
-                    raise
-                log.warning("Could not ensure Qdrant collection %s: %s", collection_name, sanitize_error_message(exc))
 
         # 2. Pre-provision missing payload indexes for fast filtering; fail stage if index creation fails
         missing_index_fields = [
@@ -1249,8 +1263,8 @@ async def index_search_units_to_qdrant(
         knowledge_block_preload_estimated_tokens=_preload_est_tokens,
     )
     try:
-        setattr(version, "_last_search_index_token_usage", combined_ledger.to_summary())
-    except Exception:
+        version._last_search_index_token_usage = combined_ledger.to_summary()
+    except AttributeError:
         pass
     if not vectors or not vectors[0] or len(vectors[0]) <= 0:
         raise ValueError(
@@ -1453,7 +1467,7 @@ async def run_search_indexing_stage(
     collection_name = f"search_units_{project_id}"
     try:
         document_version._last_reconcile_job_id = None
-    except Exception:
+    except AttributeError:
         pass
 
     # Resolve authoritative tenant_id and doc from Document or IngestionRun
@@ -1497,8 +1511,8 @@ async def run_search_indexing_stage(
             )
             if pre_embed_summary is not None:
                 try:
-                    setattr(document_version, "_last_search_index_token_usage", pre_embed_summary)
-                except Exception:
+                    document_version._last_search_index_token_usage = pre_embed_summary
+                except AttributeError:
                     pass
         except Exception as exc:
             indexing_error = str(exc)
@@ -1759,7 +1773,7 @@ async def run_search_indexing_stage(
                 session.add(reconcile_job)
                 try:
                     document_version._last_reconcile_job_id = reconcile_job.id
-                except Exception:
+                except AttributeError:
                     pass
         document_version.search_status = "SEARCH_READY"
         document_version.search_ready_at = datetime.now(UTC)

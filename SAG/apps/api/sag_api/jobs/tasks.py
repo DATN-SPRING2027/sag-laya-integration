@@ -15,7 +15,9 @@ from typing import Any
 
 import httpx
 from sqlalchemy import delete, select, update
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
+from zleap.sag.exceptions import SagError
 
 from sag_api.core.config import settings
 from sag_api.core.db import SessionLocal
@@ -555,7 +557,19 @@ async def _process_document_unlocked(
                 if engine_manager is not None and hasattr(engine_manager, "get_search_unit_qdrant_client"):
                     try:
                         shared_qdrant_client = await engine_manager.get_search_unit_qdrant_client()
-                    except Exception:
+                    except (
+                        ApiError,
+                        SagError,
+                        httpx.HTTPError,
+                        TimeoutError,
+                        OSError,
+                        SQLAlchemyError,
+                        ValueError,
+                    ) as qdrant_exc:
+                        log.warning(
+                            "Could not get shared Qdrant client: %s",
+                            sanitize_error_message(qdrant_exc),
+                        )
                         shared_qdrant_client = None
                 if shared_qdrant_client is not None:
                     search_units = await run_search_indexing_stage(

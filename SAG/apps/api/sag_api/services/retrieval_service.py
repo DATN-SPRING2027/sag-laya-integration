@@ -13,7 +13,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from sag_api.core.config import FIXED_SEARCH_TOP_K, settings
+import httpx
+from sqlalchemy.exc import SQLAlchemyError
+from zleap.sag.exceptions import SagError
+
+from sag_api.core.config import settings
+from sag_api.core.errors import ApiError
 from sag_api.core.logging import get_logger
 from sag_api.core.text_utils import normalize_text, split_sentences_multilingual
 from sag_api.generation.json_parser import decode_json_values
@@ -1332,7 +1337,12 @@ async def _lexical_sections(
                     term,
                     **options,
                 )
-            except Exception:  # noqa: BLE001
+            except (ApiError, SagError, httpx.HTTPError, TimeoutError, OSError, SQLAlchemyError) as exc:
+                log.warning(
+                    "Lexical grep_chunks failed for source=%s error_type=%s",
+                    source.id,
+                    type(exc).__name__,
+                )
                 return [], False
         sections = [
             RetrievedSection(
