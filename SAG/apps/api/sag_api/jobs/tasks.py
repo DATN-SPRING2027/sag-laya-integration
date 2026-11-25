@@ -1350,37 +1350,114 @@ async def sync_source(session: AsyncSession, job: Job, *, engine_manager=None, j
 
 
 async def _sync_source_unlocked(session: AsyncSession, job: Job, *, job_queue=None) -> None:
-    """Đồng bộ connector động: discover → fetch → đăng ký tài liệu và xếp hàng xử lý (tái sử dụng pipeline ingest→extract)."""
+    """Đồng bộ connector động: discover → fetch → chuẩn hóa qua handle_document_upload vào Canonical RAG."""
     # Import trễ để tránh phụ thuộc vòng với package jobs
+    import hashlib
+
     from sag_api.connectors import registry
-    from sag_api.core.config import settings
-    from sag_api.services.document_service import create_document_from_upload
+    from sag_api.core.errors import ValidationError
+    from sag_api.db.models import SourceProjectMapping
+    from sag_api.services.document_service import (
+        compact_logical_source_id,
+        compute_payload_hash,
+        handle_document_upload,
+    )
 
     source = await session.get(Source, job.source_id) if job.source_id else None
     if source is None:
         raise NotFoundError("Nguồn dữ liệu không tồn tại")
 
+    job_payload = dict(job.payload or {})
+    source_cfg = source.config if isinstance(source.config, dict) else {}
+    tenant_id = str(job_payload.get("tenant_id") or "").strip()
+    project_id = str(job_payload.get("project_id") or "").strip()
+    if not tenant_id or not project_id:
+        mapping = await session.scalar(
+            select(SourceProjectMapping)
+            .where(
+                SourceProjectMapping.source_id == source.id,
+                SourceProjectMapping.state == "CONFIRMED",
+            )
+            .order_by(SourceProjectMapping.created_at.asc())
+            .limit(1)
+        )
+        if mapping is not None:
+            tenant_id = tenant_id or str(mapping.organization_id or "").strip()
+            project_id = project_id or str(mapping.project_id or "").strip()
+    if not tenant_id:
+        tenant_id = str(source_cfg.get("tenant_id") or "").strip()
+    if not project_id:
+        project_id = str(source_cfg.get("project_id") or "").strip()
+    if not tenant_id or not project_id:
+        raise ValidationError(
+            "Nguồn dữ liệu chưa được gắn tenant/project hợp lệ để đồng bộ vào Canonical RAG"
+        )
+
+    owner_id = str(
+        job_payload.get("owner_id")
+        or source_cfg.get("owner_id")
+        or f"connector:{source.id}"
+    ).strip()
+    explicit_partition = str(
+        job_payload.get("security_partition_id")
+        or source_cfg.get("security_partition_id")
+        or ""
+    ).strip()
+
     connector = registry.get(source.connector_kind)
-    discovered = await connector.discover(source.config or {})
+    discovered = await connector.discover(source_cfg)
     fetched = 0
+    deduped = 0
     for d in discovered:
         try:
-            local = await connector.fetch(source.config or {}, d)
+            local = await connector.fetch(source_cfg, d)
         except Exception as e:  # noqa: BLE001 - Thất bại từng bài không ảnh hưởng đến đồng bộ tổng thể
             log.warning("Đồng bộ thu thập thất bại %s: %s", d.external_id, getattr(e, "message", None) or e)
             continue
         try:
             with open(local.path, "rb") as f:
                 data = f.read()
-            await create_document_from_upload(
+            logical_id = compact_logical_source_id(f"source:{source.id}:{d.external_id}")
+            security_partition_id = explicit_partition
+            if not security_partition_id:
+                existing_ver = await session.scalar(
+                    select(DocumentVersion)
+                    .join(Document, Document.id == DocumentVersion.document_id)
+                    .where(
+                        Document.tenant_id == tenant_id,
+                        Document.project_id == project_id,
+                        Document.logical_source_id == logical_id,
+                        Document.is_active.is_(True),
+                        DocumentVersion.status != "REVOKED",
+                    )
+                    .order_by(DocumentVersion.version_no.desc())
+                    .limit(1)
+                )
+                if existing_ver is not None and isinstance(existing_ver.metadata_json, dict):
+                    security_partition_id = str(
+                        existing_ver.metadata_json.get("security_partition_id") or ""
+                    ).strip()
+            if not security_partition_id:
+                security_partition_id = project_id
+            ext_digest = hashlib.sha256(str(d.external_id).encode("utf-8")).hexdigest()[:16]
+            content_digest = compute_payload_hash(data)[:16]
+            client_token = f"sync:{source.id}:{ext_digest}:{content_digest}"
+            upload_resp = await handle_document_upload(
                 session,
-                source,
-                filename=local.filename,
+                tenant_id=tenant_id,
+                project_id=project_id,
+                owner_id=owner_id,
+                security_partition_id=security_partition_id,
+                client_token=client_token,
+                file_bytes=data,
+                original_filename=local.filename,
                 content_type=local.content_type,
-                data=data,
-                upload_dir=settings.upload_dir,
+                logical_source_id=logical_id,
                 job_queue=job_queue,
+                source_id=source.id,
             )
+            if upload_resp.is_duplicate:
+                deduped += 1
         finally:
             try:
                 os.remove(local.path)
@@ -1388,10 +1465,22 @@ async def _sync_source_unlocked(session: AsyncSession, job: Job, *, job_queue=No
                 pass
         fetched += 1
 
-    job.progress = 1.0
-    job.payload = {**(job.payload or {}), "discovered": len(discovered), "fetched": fetched}
+    refreshed_job = await session.get(Job, job.id) or job
+    refreshed_job.progress = 1.0
+    refreshed_job.payload = {
+        **job_payload,
+        "discovered": len(discovered),
+        "fetched": fetched,
+        "deduped": deduped,
+    }
     await session.commit()
-    log.info("Đồng bộ hoàn tất source=%s tìm thấy=%d thu thập=%d", source.id, len(discovered), fetched)
+    log.info(
+        "Đồng bộ hoàn tất source=%s tìm thấy=%d thu thập=%d trùng=%d",
+        source.id,
+        len(discovered),
+        fetched,
+        deduped,
+    )
 
 
 async def index_universe(session: AsyncSession, job: Job, *, engine_manager: EngineManager, job_queue=None) -> None:

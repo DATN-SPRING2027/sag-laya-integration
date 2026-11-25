@@ -613,13 +613,36 @@ async def delete_source(
     )
 
 
-async def sync_source(session: AsyncSession, source_id: str, *, job_queue: JobQueue) -> Job:
+async def sync_source(
+    session: AsyncSession,
+    source_id: str,
+    *,
+    job_queue: JobQueue,
+    tenant_id: str | None = None,
+    project_id: str | None = None,
+    owner_id: str | None = None,
+    security_partition_id: str | None = None,
+) -> Job:
     """触发一次动态连接器同步（如网页抓取）。"""
     source = await get_source(session, source_id)
     connector = registry.get(source.connector_kind)
     if not connector.meta.supports_sync:
         raise ValidationError("该连接器不支持同步")
-    job = Job(type=JobType.SYNC_SOURCE, source_id=source.id, status=JobStatus.QUEUED)
+    payload: dict[str, str] = {}
+    if tenant_id:
+        payload["tenant_id"] = tenant_id
+    if project_id:
+        payload["project_id"] = project_id
+    if owner_id:
+        payload["owner_id"] = owner_id
+    if security_partition_id:
+        payload["security_partition_id"] = security_partition_id
+    job = Job(
+        type=JobType.SYNC_SOURCE,
+        source_id=source.id,
+        status=JobStatus.QUEUED,
+        payload=payload,
+    )
     session.add(job)
     await session.commit()
     await session.refresh(job)

@@ -1070,6 +1070,19 @@ async def get_or_create_project_source(
     return source
 
 
+_LOGICAL_SOURCE_ID_MAX_LEN = 512
+
+
+def compact_logical_source_id(value: str, *, max_length: int = _LOGICAL_SOURCE_ID_MAX_LEN) -> str:
+    """Bound logical_source_id deterministically within VARCHAR(512) without losing uniqueness."""
+    cleaned = (value or "").strip()
+    if len(cleaned) <= max_length:
+        return cleaned
+    digest = hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:16]
+    prefix_len = max(1, max_length - len(digest) - 1)
+    return f"{cleaned[:prefix_len]}:{digest}"
+
+
 async def handle_document_upload(
     session: AsyncSession,
     *,
