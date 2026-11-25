@@ -255,6 +255,7 @@ class Settings(BaseSettings):
     search_source_concurrency: int = Field(default=4, ge=1, le=32)
     # Hard cap for canonical SearchUnits hydrated and reranked across all scopes.
     search_unit_candidate_limit: int = Field(default=1024, ge=1)
+    search_min_dense_score: float = Field(default=0.35, ge=0.0, le=1.0)
     search_rerank_min_remaining_seconds: float = Field(default=0.1, ge=0.0, le=2.0)
     search_tree_profile_limit: int = Field(default=8192, ge=256, le=16384)
     # Keep part of the routed query's deadline available to its ACL-scoped global escape.

@@ -615,7 +615,7 @@ def group_sections_by_document(
     *,
     limit: int,
     relative_floor: float = 0.50,
-    absolute_floor: float = 0.20,
+    absolute_floor: float = 0.35,
 ) -> list[Any]:
     """Group ACL-verified sections by document identity (1 representative section per document).
 
@@ -665,7 +665,7 @@ def group_sections_by_document(
         if len(selected) >= limit:
             break
         score = float(getattr(sec, "score", 0.0) or 0.0)
-        if selected and score < min_score:
+        if score < absolute_floor or (selected and score < min_score):
             continue
         rank = len(selected)
         if hasattr(sec, "model_copy"):

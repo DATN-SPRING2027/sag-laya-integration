@@ -102,24 +102,32 @@ async def retrieval(
         or strategy
     )
     fallback_used = bool(outcome.stats.get("fallback_used", False))
-    records = [
-        DifyRetrievalRecord(
-            content=section.content,
-            title=_section_title(source.name, section.heading),
-            score=section.score,
-            metadata={
-                "document_id": section.document_id or (
-                    f"{source.id}:{section.chunk_id}" if section.chunk_id else source.id
-                ),
-                "source_id": source.id,
-                "source_name": source.name,
-                "chunk_id": getattr(section, "search_unit_id", None) or section.chunk_id or "",
-                "heading": section.heading,
-                "retrieval_strategy": effective_strategy,
-                "fallback_used": fallback_used,
-            },
+    records = []
+    for section in outcome.sections:
+        semantic_score = float(
+            section.raw_dense_score
+            if section.raw_dense_score is not None
+            else section.score
         )
-        for section in outcome.sections
-        if section.score >= body.retrieval_setting.score_threshold
-    ]
+        if semantic_score < body.retrieval_setting.score_threshold:
+            continue
+        records.append(
+            DifyRetrievalRecord(
+                content=section.content,
+                title=_section_title(source.name, section.heading),
+                score=max(0.0, semantic_score),
+                metadata={
+                    "document_id": section.document_id or (
+                        f"{source.id}:{section.chunk_id}" if section.chunk_id else source.id
+                    ),
+                    "source_id": source.id,
+                    "source_name": source.name,
+                    "chunk_id": getattr(section, "search_unit_id", None) or section.chunk_id or "",
+                    "heading": section.heading,
+                    "hybrid_score": section.score,
+                    "retrieval_strategy": effective_strategy,
+                    "fallback_used": fallback_used,
+                },
+            )
+        )
     return DifyRetrievalResponse(records=records[:body.retrieval_setting.top_k])

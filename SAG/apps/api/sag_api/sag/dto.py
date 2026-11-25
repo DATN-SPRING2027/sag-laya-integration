@@ -15,6 +15,7 @@ class RetrievedSection(BaseModel):
     heading: str = ""
     content: str = ""
     score: float = 0.0
+    raw_dense_score: float | None = None
     rank: int = 0
     source_id: str | None = None
     source_config_id: str | None = None
@@ -45,11 +46,17 @@ class RetrievedSection(BaseModel):
             s = model_dump()
         metadata = s.get("metadata")
         metadata = metadata if isinstance(metadata, dict) else {}
+        raw_dense = s.get("raw_dense_score")
+        if raw_dense is None:
+            raw_dense = s.get("raw_semantic_score")
+        if raw_dense is None:
+            raw_dense = metadata.get("raw_dense_score")
         return cls(
             chunk_id=s.get("chunk_id") or s.get("id"),
             heading=(s.get("heading") or s.get("title") or metadata.get("heading") or "").strip(),
             content=(s.get("content") or "").strip(),
             score=float(s.get("score") or 0.0),
+            raw_dense_score=(float(raw_dense) if raw_dense is not None else None),
             rank=int(s.get("rank") or metadata.get("rank") or 0),
             source_id=s.get("source_id"),
             source_config_id=s.get("source_config_id") or s.get("data_source_id"),

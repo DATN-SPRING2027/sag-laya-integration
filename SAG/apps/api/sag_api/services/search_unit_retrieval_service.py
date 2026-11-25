@@ -2617,6 +2617,11 @@ async def _retrieve_search_unit_sections(
                 },
             )
             sections_by_key[section_key] = section
+        if channel == "dense":
+            raw_dense_val = float(hit.score) if math.isfinite(float(hit.score)) else None
+            if raw_dense_val is not None and section.raw_dense_score != raw_dense_val:
+                section = section.model_copy(update={"raw_dense_score": raw_dense_val})
+                sections_by_key[section_key] = section
         interleaved_rank = rank if origin == "global_only" else rank * 2 + int(origin != "branch_local")
         ranked_by_channel_and_scope[(channel, scope_key)].append(
             section.model_copy(update={"score": score, "rank": interleaved_rank})
@@ -2652,8 +2657,34 @@ async def _retrieve_search_unit_sections(
     diversity_stats: dict[str, Any] = {}
     initial_pool: list[RetrievedSection] = []
     if rerank_remaining <= settings.search_rerank_min_remaining_seconds:
+        from sag_api.services.retrieval_service import (
+            _is_boilerplate,
+            _is_superseded_section,
+            _query_allows_superseded,
+            _section_key,
+        )
+
         selection_fallback_reason = "rerank_budget_exhausted"
-        fallback_pool = _fair_rank_merge([semantic, lexical])
+        raw_fallback_pool = _fair_rank_merge([semantic, lexical])
+        lexical_keys = {_section_key(sec) for sec in lexical}
+        allows_superseded = _query_allows_superseded(query)
+        min_dense = float(settings.search_min_dense_score)
+        fallback_pool: list[RetrievedSection] = []
+        for sec in raw_fallback_pool:
+            sec_key = _section_key(sec)
+            in_lexical = sec_key in lexical_keys
+            if not in_lexical and _is_boilerplate(sec):
+                continue
+            if not allows_superseded and _is_superseded_section(sec):
+                continue
+            eff_dense = (
+                float(sec.raw_dense_score)
+                if sec.raw_dense_score is not None
+                else float(sec.score or 0.0)
+            )
+            if not in_lexical and eff_dense < min_dense:
+                continue
+            fallback_pool.append(sec)
         initial_pool = fallback_pool
         if per_doc_limit == 1 and selection_limit is not None:
             from sag_api.services.retrieval_plan import group_sections_by_document
@@ -2662,9 +2693,9 @@ async def _retrieve_search_unit_sections(
         else:
             selected = fallback_pool[:selection_limit]
         rerank_stats = {
-            "candidates": len(fallback_pool),
-            "relevant": None,
-            "filtered_irrelevant": None,
+            "candidates": len(raw_fallback_pool),
+            "relevant": len(fallback_pool),
+            "filtered_irrelevant": len(raw_fallback_pool) - len(fallback_pool),
         }
         coverage = {
             "status": "unknown",
@@ -2981,6 +3012,8 @@ async def _retrieve_search_unit_sections(
             "coverage": coverage,
             "routing": routing,
             "selection_fallback_reason": selection_fallback_reason,
+            "degraded": bool(selection_fallback_reason),
+            "degraded_reason": selection_fallback_reason,
             "stage_latencies_ms": {
                 "auth_scope": t_auth_ms,
                 "tree_route": t_route_ms,

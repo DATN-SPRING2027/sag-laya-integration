@@ -489,8 +489,54 @@ def _compute_document_aware_effective_ranks(
 
 
 def _is_boilerplate(section: RetrievedSection) -> bool:
-    text = f"{section.heading}\n{section.content}"
+    text = unicodedata.normalize("NFC", f"{section.heading}\n{section.content}").lower()
     return sum(marker in text for marker in _BOILERPLATE) >= 2
+
+
+def _query_allows_superseded(query: str) -> bool:
+    query_lower = unicodedata.normalize("NFC", query or "").lower()
+    return any(
+        cue in query_lower
+        for cue in (
+            "superseded",
+            "deprecated",
+            "obsolete",
+            "archived",
+            "historical",
+            "outdated",
+            "earlier",
+            "previous",
+            "bản cũ",
+            "đã thay thế",
+            "trước khi điều chỉnh",
+        )
+    )
+
+
+def _is_superseded_section(sec: RetrievedSection) -> bool:
+    meta = f"{sec.document_name or ''}\n{sec.section_path or ''}\n{sec.heading or ''}".lower()
+    if any(
+        marker in meta
+        for marker in (
+            "superseded",
+            "[deprecated]",
+            "(deprecated)",
+            "[obsolete]",
+            "(obsolete)",
+            "[archived]",
+            "(archived)",
+        )
+    ):
+        return True
+    body = (sec.content or "").lower()
+    body_norm = normalize_lexical_text(body)
+    return (
+        'status: "superseded"' in body
+        or "status: superseded" in body
+        or "status: deprecated" in body
+        or "statussuperseded" in body_norm
+        or "statusdeprecated" in body_norm
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -558,13 +604,19 @@ def rerank_sections(
                 float(previous.score or 0.0),
                 float(section.score or 0.0),
             )
+            raw_candidates = [
+                float(val)
+                for val in (previous.raw_dense_score, section.raw_dense_score)
+                if val is not None and math.isfinite(float(val))
+            ]
+            best_raw_dense = max(raw_candidates) if raw_candidates else None
             if current_preference > previous_preference:
                 representatives[key] = section.model_copy(
-                    update={"score": best_score}
+                    update={"score": best_score, "raw_dense_score": best_raw_dense}
                 )
             else:
                 representatives[key] = previous.model_copy(
-                    update={"score": best_score}
+                    update={"score": best_score, "raw_dense_score": best_raw_dense}
                 )
         preferred_keys = preferred_keys or set()
         ordered_keys = sorted(
@@ -579,6 +631,7 @@ def rerank_sections(
     semantic_eff_ranks = _compute_document_aware_effective_ranks(semantic_ranks, semantic_by_key)
     lexical_eff_ranks = _compute_document_aware_effective_ranks(lexical_ranks, lexical_by_key)
     semantic_scores: dict[tuple[str, str], float] = {}
+    raw_dense_scores: dict[tuple[str, str], float] = {}
     for section in semantic:
         key = _section_key(section)
         if not key[1]:
@@ -586,6 +639,9 @@ def rerank_sections(
         score = float(section.score or 0.0)
         if math.isfinite(score):
             semantic_scores[key] = max(semantic_scores.get(key, 0.0), score, 0.0)
+        if section.raw_dense_score is not None and math.isfinite(float(section.raw_dense_score)):
+            raw_val = float(section.raw_dense_score)
+            raw_dense_scores[key] = max(raw_dense_scores.get(key, raw_val), raw_val)
     candidate_keys = set(semantic_ranks) | set(lexical_ranks)
     if not candidate_keys:
         return RerankResult([], 0, 0, 0, len(lexical))
@@ -805,65 +861,28 @@ def rerank_sections(
             1.0,
             0.56 * fused_score + 0.32 * lexical_score + 0.12 * relative_semantic_score,
         )
-        # Each candidate may pass through either retrieval signal. The relative
-        # semantic gate stays active even when another candidate has a lexical hit.
-        relevant = (
-            lexical_match
-            or lexical_score >= 0.2
-            or relative_semantic_score >= _SEMANTIC_RELATIVE_RELEVANCE_FLOOR
+        # Each candidate may pass through either retrieval signal.
+        # Semantic-only candidates must also meet the absolute raw cosine floor (S4-01).
+        raw_dense = raw_dense_scores.get(key)
+        effective_raw_dense = raw_dense if raw_dense is not None else raw
+        semantic_relevant = (
+            semantic_rank is not None
+            and relative_semantic_score >= _SEMANTIC_RELATIVE_RELEVANCE_FLOOR
+            and effective_raw_dense >= float(settings.search_min_dense_score)
         )
+        relevant = lexical_match or lexical_score >= 0.2 or semantic_relevant
         if not relevant:
             continue
         rank_sum = sum(rank for rank in (semantic_rank, lexical_rank) if rank is not None)
         retriever_coverage = int(semantic_rank is not None) + int(lexical_rank is not None)
+        if raw_dense is not None and section.raw_dense_score is None:
+            section = section.model_copy(update={"raw_dense_score": raw_dense})
         ranked.append(
             (hybrid_score, retriever_coverage, int(exact), rank_sum, key, section)
         )
 
-    query_lower = query.lower()
-    allows_superseded = any(
-        cue in query_lower
-        for cue in (
-            "superseded",
-            "deprecated",
-            "obsolete",
-            "archived",
-            "historical",
-            "outdated",
-            "earlier",
-            "previous",
-            "bản cũ",
-            "đã thay thế",
-            "trước khi điều chỉnh",
-        )
-    )
-    if not allows_superseded and ranked:
-        def _is_superseded(sec: RetrievedSection) -> bool:
-            meta = f"{sec.document_name or ''}\n{sec.section_path or ''}\n{sec.heading or ''}".lower()
-            if any(
-                marker in meta
-                for marker in (
-                    "superseded",
-                    "[deprecated]",
-                    "(deprecated)",
-                    "[obsolete]",
-                    "(obsolete)",
-                    "[archived]",
-                    "(archived)",
-                )
-            ):
-                return True
-            body = (sec.content or "").lower()
-            body_norm = normalize_lexical_text(body)
-            return (
-                'status: "superseded"' in body
-                or "status: superseded" in body
-                or "status: deprecated" in body
-                or "statussuperseded" in body_norm
-                or "statusdeprecated" in body_norm
-            )
-
-        active_ranked = [item for item in ranked if not _is_superseded(item[5])]
+    if not _query_allows_superseded(query) and ranked:
+        active_ranked = [item for item in ranked if not _is_superseded_section(item[5])]
         if active_ranked:
             ranked = active_ranked
 
