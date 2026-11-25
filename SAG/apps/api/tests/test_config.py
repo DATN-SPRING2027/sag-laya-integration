@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from sag_api.core.config import _DEFAULT_ENV_FILE, Settings
+from sag_api.services import settings_service
 
 
 def test_default_dotenv_is_resolved_from_repository_root() -> None:
@@ -74,3 +75,44 @@ def test_mineru_official_api_token_is_sole_mineru_configuration(tmp_path, monkey
     assert unconfigured.mineru_official_api_token is None
     assert unconfigured.mineru_configured is False
     assert unconfigured.effective_document_parser == "markitdown"
+
+
+def test_legacy_laya_and_openrouter_decision_config_shims_migrate_to_siliconflow() -> None:
+    migrated_laya = Settings(
+        _env_file=None,
+        decision_provider="laya",
+        decision_model="typesafe/jev-1.14",
+    )
+    assert migrated_laya.decision_provider == "siliconflow"
+    assert migrated_laya.decision_model == "Kev-4b"
+
+    migrated_openrouter = Settings(
+        _env_file=None,
+        decision_provider="openrouter",
+    )
+    assert migrated_openrouter.decision_provider == "siliconflow"
+    assert migrated_openrouter.decision_model == "Kev-4b"
+
+    cleaned_overrides = settings_service._normalize_overrides(
+        {
+            "decision_provider": "openrouter",
+            "openrouter_api_key": "legacy-secret",
+            "laya_model_path": "/models/laya",
+            "laya_device": "cpu",
+        }
+    )
+    assert cleaned_overrides == {
+        "decision_provider": "siliconflow",
+        "decision_model": "Kev-4b",
+    }
+
+
+def test_r2_object_ingest_settings_removed() -> None:
+    for removed_field in (
+        "object_ingest_allowed_hosts",
+        "object_ingest_allow_private_hosts_in_dev",
+        "object_ingest_timeout_seconds",
+        "remote_snapshot_gc_enabled",
+    ):
+        assert removed_field not in Settings.model_fields
+        assert not hasattr(Settings, removed_field)
