@@ -212,6 +212,7 @@ def _group_similarity(
 
 def _build_verbatim_session_citation(ref: str, turns: Sequence[IndexedTurn]) -> dict[str, Any]:
     primary = turns[-1]
+    snippet = "\n".join(f"[{t.role}]: {t.content}" for t in turns)[:1200]
     return {
         "kind": "session_memory",
         "ref": ref,
@@ -221,6 +222,7 @@ def _build_verbatim_session_citation(ref: str, turns: Sequence[IndexedTurn]) -> 
         "epistemic_status": primary.epistemic_status,
         "sha256": primary.content_hash,
         "cited_source_ids": sorted({sid for t in turns for sid in t.cited_source_ids}),
+        "snippet": snippet,
     }
 
 
@@ -265,6 +267,7 @@ def _format_inert_evidence_message(
                 "epistemic_status": grp.epistemic_status,
                 "sha256": primary.content_hash,
                 "cited_source_ids": sorted({sid for t in grp_turns for sid in t.cited_source_ids}),
+                "snippet": combined_text[:1200],
             }
         )
 

@@ -617,9 +617,6 @@ async def _verify_grounded_entailment(
     session_citations: list[dict[str, Any]],
 ) -> tuple[str, str | None]:
     """Verify cited answer is neither an abstention nor an unsupported/fabricated claim (S5-05)."""
-    if llm is None or not getattr(llm, "configured", False) or not callable(getattr(llm, "complete", None)):
-        return "answered", None
-
     evidence_lines: list[str] = []
     for cit in internal_citations:
         if cit.get("claim_level") != "claim":
@@ -633,11 +630,14 @@ async def _verify_grounded_entailment(
         if sc.get("claim_level") != "claim":
             continue
         ref = sc.get("ref")
-        snippet = str(sc.get("snippet") or "").strip()
+        snippet = str(sc.get("snippet") or sc.get("summary_excerpt") or sc.get("content") or "").strip()
         if ref and snippet:
             evidence_lines.append(f"[{ref}] {snippet}")
     if not evidence_lines:
         return "answered", None
+
+    if llm is None or not getattr(llm, "configured", False) or not callable(getattr(llm, "complete", None)):
+        return "no_answer", "weak_evidence"
 
     messages = [
         {
@@ -682,14 +682,13 @@ async def _verify_grounded_entailment(
 
     answerability, supported = _parse_entailment_verdict(str(raw or ""))
     if answerability is None and supported is None:
-        if isinstance(llm, LLMClient):
-            return "no_answer", "weak_evidence"
-        # Non-LLMClient unit test doubles (FakeLLM / RecordingLLM / _DummyLLM) return placeholder strings.
-        return "answered", None
+        return "no_answer", "weak_evidence"
     if answerability == "insufficient_evidence":
         return "no_answer", "insufficient_evidence"
     if supported is False:
         return "no_answer", "unsupported_claim"
+    if supported is not True:
+        return "no_answer", "weak_evidence"
     return "answered", None
 
 
@@ -1697,22 +1696,20 @@ async def generate_stream(
                         answer_status = "no_answer"
                         no_answer_reason = host_context.search_context_no_answer_reason or "weak_evidence"
                     elif requires_grounded_answer and answer_status == "answered" and canonical_answer:
-                        should_verify_entailment = isinstance(llm, LLMClient) or has_internal_claim
-                        if should_verify_entailment:
-                            verified_status, verified_reason = await _verify_grounded_entailment(
-                                llm,
-                                query=plan.query,
-                                answer=canonical_answer,
-                                internal_citations=internal_citations,
-                                session_citations=used_session_citations,
-                            )
-                            if verified_status == "no_answer":
-                                canonical_answer = empty_response or no_answer_text(query=plan.query)
-                                internal_citations = []
-                                external_citations = []
-                                used_session_citations = []
-                                answer_status = "no_answer"
-                                no_answer_reason = verified_reason or "weak_evidence"
+                        verified_status, verified_reason = await _verify_grounded_entailment(
+                            llm,
+                            query=plan.query,
+                            answer=canonical_answer,
+                            internal_citations=internal_citations,
+                            session_citations=used_session_citations,
+                        )
+                        if verified_status == "no_answer":
+                            canonical_answer = empty_response or no_answer_text(query=plan.query)
+                            internal_citations = []
+                            external_citations = []
+                            used_session_citations = []
+                            answer_status = "no_answer"
+                            no_answer_reason = verified_reason or "weak_evidence"
                     canonical_citations = [*internal_citations, *external_citations]
                     session_step = _build_session_audit_step(
                         plan_audit_trace,
@@ -1757,7 +1754,7 @@ async def generate_stream(
                         partial_text,
                         citations,
                     )
-                    if host_context.search_context_called or local_grounding_required:
+                    if host_context.search_context_called or local_grounding_required or session_grounded_scope:
                         canonical_answer = ""
                         internal_citations = []
                     session_step = _build_session_audit_step(plan_audit_trace)
