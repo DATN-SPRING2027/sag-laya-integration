@@ -23,7 +23,11 @@ from sag_api.core.db import SessionLocal
 from sag_api.core.error_taxonomy import ErrorLayer, ErrorStage
 from sag_api.core.errors import ApiError, NotFoundError, is_retryable_error
 from sag_api.core.logging import get_logger
-from sag_api.core.sanitizer import sanitize_error_message
+from sag_api.core.sanitizer import (
+    inspect_replacement_chars,
+    redact_parser_reason,
+    sanitize_error_message,
+)
 from sag_api.db.models import Document, Job, Source
 from sag_api.db.models.routing_rag import DocumentVersion, IngestionRun, StageRun
 from sag_api.enums import DocumentStatus, JobStatus, JobType
@@ -71,10 +75,7 @@ _PARSER_UPLOAD_STATES = {"uploading", "uploaded"}
 _PARSER_QUEUE_STATES = {"created", "pending", "queued", "queueing"}
 _PARSER_DONE_STATES = {"done", "success", "succeeded", "completed", "finished"}
 _PARSER_FAILED_STATES = {"failed", "failure", "error", "cancelled", "canceled", "fallback_failed"}
-_SECRET_QUERY_KEYS = re.compile(r"(?i)([?&](?:token|key|signature|credential|authorization|x-amz-[^=]+)=)[^&#\s]+")
-_BEARER_TOKEN = re.compile(r"(?i)bearer\s+\S+")
-_API_KEY = re.compile(r"(?i)\b(?:sk|ak)-[a-z0-9._-]{6,}\b")
-_URL = re.compile(r"https?://[^\s；，,]+")
+_redact_parser_reason = redact_parser_reason
 
 
 async def _finalize_research_task_for_run(session: AsyncSession, run_id: str | None) -> None:
@@ -97,19 +98,6 @@ def _mineru_details(state: dict[str, Any] | None = None) -> tuple[str, str]:
     model = current.get("mineru_model")
     default_model = settings.mineru_official_model if settings.mineru_official_model in {"vlm", "pipeline"} else "vlm"
     return "official", model if model in {"vlm", "pipeline"} else default_model
-
-
-def _redact_parser_reason(value: object) -> str | None:
-    if value is None:
-        return None
-    message = " ".join(str(value).split())
-    if not message:
-        return None
-    message = _SECRET_QUERY_KEYS.sub(r"\1[REDACTED]", message)
-    message = _BEARER_TOKEN.sub("Bearer [REDACTED]", message)
-    message = _API_KEY.sub("[REDACTED]", message)
-    message = _URL.sub("[URL REDACTED]", message)
-    return message[:300]
 
 
 def _fallback_reason(state: dict[str, Any]) -> str | None:
@@ -482,10 +470,38 @@ async def _process_document_unlocked(
                     with open(prepared.path, "r", encoding="utf-8", errors="replace") as f:
                         doc_content = f.read()
 
+                    r_count, r_ratio = inspect_replacement_chars(doc_content)
+                    if r_count > 0:
+                        log.warning(
+                            "Replacement characters U+FFFD detected doc=%s version=%s count=%d ratio=%.4f",
+                            document.id,
+                            doc_ver.id,
+                            r_count,
+                            r_ratio,
+                        )
+                        doc_ver.metadata_json = {
+                            **(doc_ver.metadata_json or {}),
+                            "replacement_char_count": r_count,
+                            "replacement_char_ratio": round(r_ratio, 6),
+                        }
+
                     from sag_api.services.canonical_service import parse_and_persist_document_content
                     await parse_and_persist_document_content(
                         session, doc_ver.id, doc_content, run_id=run_id
                     )
+                    if r_count > 0:
+                        parse_stage_run = await session.scalar(
+                            select(StageRun)
+                            .where(StageRun.run_id == run_id, StageRun.stage == "PARSE")
+                            .order_by(StageRun.created_at.desc())
+                            .limit(1)
+                        )
+                        if parse_stage_run is not None:
+                            parse_stage_run.metrics_json = {
+                                **(parse_stage_run.metrics_json or {}),
+                                "replacement_char_count": r_count,
+                                "replacement_char_ratio": round(r_ratio, 6),
+                            }
                     job.payload = {
                         **(await refresh_payload()),
                         "canonical_checkpoint_stage": "PARSE",

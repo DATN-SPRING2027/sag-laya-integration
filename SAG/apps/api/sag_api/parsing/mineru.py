@@ -30,6 +30,7 @@ from sag_api.core.errors import (
     ServiceUnavailableError,
     UpstreamError,
 )
+from sag_api.core.sanitizer import decode_bytes_safely
 from sag_api.core.text_utils import normalize_text
 
 if TYPE_CHECKING:
@@ -105,7 +106,15 @@ async def download_mineru_result_markdown(
             except OSError:
                 pass
 
-    text = raw_bytes.decode(encoding, errors="replace")
+    try:
+        text, _, _ = decode_bytes_safely(
+            raw_bytes,
+            encoding=encoding,
+            context="mineru_download",
+            raise_on_severe=True,
+        )
+    except ValueError as exc:
+        raise UpstreamError("MinerU 解析结果包含过多乱码字符（U+FFFD）") from exc
     return _require_markdown(text)
 
 
@@ -317,9 +326,13 @@ def _markdown_from_zip_archive(archive: zipfile.ZipFile, size_limit: int) -> str
     content_list: list[Any] | None = None
     if content_list_candidates:
         try:
-            parsed_json = json.loads(
-                archive.read(content_list_candidates[0]).decode("utf-8", errors="replace")
+            cl_text, _, _ = decode_bytes_safely(
+                archive.read(content_list_candidates[0]),
+                encoding="utf-8",
+                context="mineru_content_list",
+                raise_on_severe=False,
             )
+            parsed_json = json.loads(cl_text)
             if isinstance(parsed_json, list):
                 content_list = parsed_json
         except (ValueError, OSError):
@@ -335,7 +348,15 @@ def _markdown_from_zip_archive(archive: zipfile.ZipFile, size_limit: int) -> str
         chosen = md_candidates[0]
         if chosen.file_size > size_limit:
             raise UpstreamError("MinerU Markdown 结果超过允许大小")
-        raw_md = archive.read(chosen).decode("utf-8", errors="replace")
+        try:
+            raw_md, _, _ = decode_bytes_safely(
+                archive.read(chosen),
+                encoding="utf-8",
+                context="mineru_zip_markdown",
+                raise_on_severe=True,
+            )
+        except ValueError as exc:
+            raise UpstreamError("MinerU 压缩包 Markdown 包含过多乱码字符（U+FFFD）") from exc
         if content_list:
             raw_md = _inject_page_markers_from_content_list(raw_md, content_list)
         return _require_markdown(raw_md)
