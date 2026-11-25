@@ -1745,6 +1745,47 @@ async def resolve_document_parsed_markdown(
     """Resolve full parsed Markdown for a Document via sidecar -> CanonicalBlock -> legacy engine."""
     from sag_api.parsing.service import _signature, parsed_sidecar_paths
 
+    # Enforce partition authorization before reading any disk sidecar when DocumentVersion rows exist.
+    now = datetime.now(UTC)
+    is_service = bool(getattr(principal, "is_service", False)) if principal is not None else True
+    allowed_partitions = (
+        getattr(principal, "allowed_partition_ids", None)
+        or getattr(principal, "allowed_partitions", None)
+        if principal is not None
+        else None
+    )
+    authorized_version_id: str | None = None
+    if is_service or allowed_partitions:
+        ver_stmt = (
+            select(DocumentVersion.id)
+            .where(
+                DocumentVersion.document_id == document.id,
+                DocumentVersion.status != "REVOKED",
+                DocumentVersion.valid_to > now,
+            )
+            .order_by(
+                case((DocumentVersion.search_status == "SEARCH_READY", 0), else_=1),
+                DocumentVersion.version_no.desc(),
+            )
+            .limit(1)
+        )
+        if not is_service and allowed_partitions:
+            partition_expr = DocumentVersion.metadata_json["security_partition_id"].as_string()
+            ver_stmt = ver_stmt.where(partition_expr.in_(sorted(allowed_partitions)))
+        authorized_version_id = (await session.execute(ver_stmt)).scalar_one_or_none()
+
+    if principal is not None and not is_service and authorized_version_id is None:
+        has_any_version = (
+            await session.execute(
+                select(DocumentVersion.id)
+                .where(DocumentVersion.document_id == document.id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if has_any_version is not None:
+            return None
+
+    # Step 1: Resolve on-disk markdown or parsed sidecar
     storage_path = document.storage_path or ""
     if storage_path:
         suffix = os.path.splitext(storage_path)[1].lower()
@@ -1781,58 +1822,32 @@ async def resolve_document_parsed_markdown(
                     continue
 
     # Step 2: Reconstruct from latest active, partition-authorized DocumentVersion + CanonicalBlocks
-    now = datetime.now(UTC)
-    is_service = bool(getattr(principal, "is_service", False)) if principal is not None else True
-    allowed_partitions = (
-        getattr(principal, "allowed_partition_ids", None)
-        or getattr(principal, "allowed_partitions", None)
-        if principal is not None
-        else None
-    )
-    if is_service or allowed_partitions:
-        ver_stmt = (
-            select(DocumentVersion.id)
-            .where(
-                DocumentVersion.document_id == document.id,
-                DocumentVersion.status != "REVOKED",
-                DocumentVersion.valid_to > now,
+    if authorized_version_id:
+        blocks = (
+            await session.scalars(
+                select(CanonicalBlock)
+                .where(CanonicalBlock.document_version_id == authorized_version_id)
+                .order_by(CanonicalBlock.ordinal.asc())
             )
-            .order_by(
-                case((DocumentVersion.search_status == "SEARCH_READY", 0), else_=1),
-                DocumentVersion.version_no.desc(),
-            )
-            .limit(1)
-        )
-        if not is_service and allowed_partitions:
-            partition_expr = DocumentVersion.metadata_json["security_partition_id"].as_string()
-            ver_stmt = ver_stmt.where(partition_expr.in_(sorted(allowed_partitions)))
-        version_id = (await session.execute(ver_stmt)).scalar_one_or_none()
-        if version_id:
-            blocks = (
-                await session.scalars(
-                    select(CanonicalBlock)
-                    .where(CanonicalBlock.document_version_id == version_id)
-                    .order_by(CanonicalBlock.ordinal.asc())
-                )
-            ).all()
-            if blocks:
-                parts: list[str] = []
-                last_page: int | None = None
-                for blk in blocks:
-                    page_no = int(blk.page_from or 1)
-                    if page_no >= 1 and page_no != last_page:
-                        parts.append(f"<!-- PAGE {page_no} -->")
-                        last_page = page_no
-                    txt = (blk.normalized_text or "").strip()
-                    if not txt:
-                        continue
-                    if blk.block_type == "heading":
-                        level = min(6, max(1, (blk.section_path or "").count(" > ") + 1))
-                        parts.append(f"{'#' * level} {txt}")
-                    else:
-                        parts.append(txt)
-                if parts:
-                    return "\n\n".join(parts) + "\n"
+        ).all()
+        if blocks:
+            parts: list[str] = []
+            last_page: int | None = None
+            for blk in blocks:
+                page_no = int(blk.page_from or 1)
+                if page_no >= 1 and page_no != last_page:
+                    parts.append(f"<!-- PAGE {page_no} -->")
+                    last_page = page_no
+                txt = (blk.normalized_text or "").strip()
+                if not txt:
+                    continue
+                if blk.block_type == "heading":
+                    level = min(6, max(1, (blk.section_path or "").count(" > ") + 1))
+                    parts.append(f"{'#' * level} {txt}")
+                else:
+                    parts.append(txt)
+            if parts:
+                return "\n\n".join(parts) + "\n"
 
     # Step 3: Legacy sag_source_id fallback
     if document.sag_source_id and engine_manager is not None:

@@ -40,6 +40,7 @@ from sag_api.schemas.routing_rag import ProjectDocumentVersionRef
 from sag_api.services.document_service import (
     get_project_document_readiness_batch,
     handle_document_upload,
+    resolve_document_parsed_markdown,
 )
 
 
@@ -237,6 +238,118 @@ async def test_s1_06_parsed_endpoint_resolves_sidecar_and_canonical_blocks_witho
             ) as denied_client:
                 r_denied = await denied_client.get("/sources/src-p1/documents/doc-canon/parsed")
                 assert r_denied.status_code == 404
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_resolve_document_parsed_markdown_enforces_partition_before_sidecar(
+    tmp_path, monkeypatch
+) -> None:
+    cfg = _make_settings(mineru_official_api_token=None)
+    cfg.activate_data_dir(tmp_path / "data")
+    monkeypatch.setattr("sag_api.core.config.settings", cfg)
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    now = datetime.now(UTC)
+    async with factory() as session:
+        src = Source(
+            id="src-sec-1",
+            name="Sidecar Auth Source",
+            source_type=SourceType.DOCUMENT,
+            sag_source_config_id="cfg-sec-1",
+            config={},
+        )
+        sig = _signature("markitdown", cfg)
+
+        # Versioned document with disk sidecar in partition "part-1"
+        pdf_versioned = tmp_path / "secret.pdf"
+        pdf_versioned.write_bytes(b"%PDF-1.4\n")
+        (tmp_path / f"secret.pdf.parsed.{sig}.md").write_text(
+            "# Secret Sidecar\n\nConfidential partition content.\n",
+            encoding="utf-8",
+        )
+        doc_versioned = Document(
+            id="doc-sec-ver",
+            source_id="src-sec-1",
+            tenant_id="tenant-1",
+            project_id="proj-1",
+            filename="secret.pdf",
+            content_type="application/pdf",
+            storage_path=str(pdf_versioned),
+            status=DocumentStatus.READY,
+            parser_provider="markitdown",
+            is_active=True,
+        )
+        ver_part1 = DocumentVersion(
+            id="ver-sec-1",
+            document_id="doc-sec-ver",
+            version_no=1,
+            file_hash="4" * 64,
+            status="READY",
+            search_status="SEARCH_READY",
+            search_ready_at=now,
+            valid_from=now - timedelta(minutes=1),
+            valid_to=now + timedelta(days=365),
+            metadata_json={"security_partition_id": "part-1"},
+        )
+
+        # Legacy non-versioned document (zero DocumentVersion rows) with disk sidecar
+        pdf_legacy = tmp_path / "legacy.pdf"
+        pdf_legacy.write_bytes(b"%PDF-1.4\n")
+        (tmp_path / f"legacy.pdf.parsed.{sig}.md").write_text(
+            "# Legacy Sidecar\n\nLegacy non-versioned content.\n",
+            encoding="utf-8",
+        )
+        doc_legacy = Document(
+            id="doc-sec-legacy",
+            source_id="src-sec-1",
+            filename="legacy.pdf",
+            content_type="application/pdf",
+            storage_path=str(pdf_legacy),
+            status=DocumentStatus.READY,
+            parser_provider="markitdown",
+            is_active=True,
+        )
+
+        session.add_all([src, doc_versioned, ver_part1, doc_legacy])
+        await session.commit()
+
+        denied_principal = _make_principal(partition_id="other-part")
+        allowed_principal = _make_principal(partition_id="part-1")
+
+        # Must return None even though .parsed.*.md sidecar exists on disk
+        denied_res = await resolve_document_parsed_markdown(
+            session,
+            document=doc_versioned,
+            source=src,
+            principal=denied_principal,
+        )
+        assert denied_res is None
+
+        # Authorized partition still resolves sidecar normally
+        allowed_res = await resolve_document_parsed_markdown(
+            session,
+            document=doc_versioned,
+            source=src,
+            principal=allowed_principal,
+        )
+        assert allowed_res is not None
+        assert "Confidential partition content." in allowed_res
+
+        # Legacy non-versioned Document (0 DocumentVersion rows) remains accessible
+        legacy_res = await resolve_document_parsed_markdown(
+            session,
+            document=doc_legacy,
+            source=src,
+            principal=denied_principal,
+        )
+        assert legacy_res is not None
+        assert "Legacy non-versioned content." in legacy_res
 
     await engine.dispose()
 
