@@ -2347,12 +2347,28 @@ async def _retrieve_search_unit_sections(
     ] = defaultdict(list)
     from sag_api.services.search_index_service import build_embedding_model_signature
 
-    active_emb_sig = build_embedding_model_signature(
-        settings_obj=getattr(engine_manager, "_settings", None) or settings
+    active_settings = getattr(engine_manager, "_settings", None) or settings
+    configured_dim = getattr(active_settings, "embedding_dimensions", None)
+    default_active_emb_sig = build_embedding_model_signature(
+        settings_obj=active_settings
     )
     max_dense_raw_score = 0.0
     max_sparse_raw_score = 0.0
     for group, _route, origin, semantic_hits, lexical_hits in channel_results:
+        config_key = group.source.sag_source_config_id or group.source.id
+        v_task = vector_tasks.get(config_key)
+        query_vector = (
+            v_task.result()
+            if v_task is not None and v_task.done() and not v_task.cancelled() and v_task.exception() is None
+            else None
+        )
+        if configured_dim is None and isinstance(query_vector, (list, tuple)) and len(query_vector) > 0:
+            active_emb_sig = build_embedding_model_signature(
+                settings_obj=active_settings,
+                dimensions=len(query_vector),
+            )
+        else:
+            active_emb_sig = default_active_emb_sig
         for channel_hits, channel in ((semantic_hits, "dense"), (lexical_hits, "sparse")):
             max_score = max((max(0.0, hit.score) for hit in channel_hits), default=0.0)
             if channel == "dense":

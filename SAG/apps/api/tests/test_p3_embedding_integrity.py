@@ -822,3 +822,238 @@ async def test_qdrant_refuses_unknown_or_invalid_vector_dimensions():
                 embedder=EmptyEmbedder(),
             )
     assert called is False
+
+
+@pytest.mark.asyncio
+async def test_retrieval_unlisted_custom_512d_model_with_none_dimensions_matches_index(
+    p3_emb_db, monkeypatch
+):
+    from sag_api.services import search_index_service
+    from sag_api.services import search_unit_retrieval_service as retrieval
+
+    _reset_shared_cache()
+
+    custom_model = "custom/unlisted-embedder-v1"
+    custom_base_url = "https://custom-emb.invalid/v1"
+    vec_512 = [0.5] * 512
+
+    class Custom512DEmbedder:
+        model = custom_model
+        base_url = custom_base_url
+        dimensions = None
+
+        async def generate(self, _text: str) -> list[float]:
+            return list(vec_512)
+
+        async def batch_generate(self, texts: list[str]) -> list[list[float]]:
+            return [list(vec_512) for _ in texts]
+
+    monkeypatch.setattr(settings, "embedding_model", custom_model)
+    monkeypatch.setattr(settings, "embedding_base_url", custom_base_url)
+    monkeypatch.setattr(settings, "embedding_dimensions", None)
+
+    now = datetime.now(UTC)
+    content = "Custom 512-d unlisted embedding model integrity content."
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    collection_name = "search_units_proj-512"
+
+    stored_points: dict[str, dict] = {}
+    collection_created = False
+
+    def q_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal collection_created
+        if request.method == "GET" and request.url.path == f"/collections/{collection_name}":
+            if not collection_created:
+                return httpx.Response(404, json={"status": {"error": "not found"}})
+            return httpx.Response(
+                200,
+                json={
+                    "result": {
+                        "config": {
+                            "params": {
+                                "vectors": {"content_vector": {"size": 512}},
+                                "sparse_vectors": {"bm25_sparse": {"modifier": "idf"}},
+                            }
+                        },
+                        "payload_schema": {},
+                    }
+                },
+            )
+        if request.method == "PUT" and request.url.path == f"/collections/{collection_name}":
+            collection_created = True
+            return httpx.Response(200, json={"result": True})
+        if request.method == "GET" and f"/collections/{collection_name}/points/" in request.url.path:
+            pid = request.url.path.rsplit("/", 1)[-1]
+            pt = stored_points.get(pid)
+            if pt is None:
+                return httpx.Response(404, json={"status": {"error": "not found"}})
+            return httpx.Response(200, json={"result": pt})
+        if request.method == "PUT" and request.url.path == f"/collections/{collection_name}/points":
+            body = json.loads(request.content.decode("utf-8"))
+            for pt in body.get("points", []):
+                stored_points[pt["id"]] = pt
+            return httpx.Response(200, json={"result": {"status": "completed"}})
+        if request.method == "POST" and request.url.path == f"/collections/{collection_name}/points/query/batch":
+            data_points = [
+                {
+                    "id": pid,
+                    "score": 0.92,
+                    "payload": pt["payload"],
+                }
+                for pid, pt in stored_points.items()
+                if not pt.get("payload", {}).get("_collection_meta")
+            ]
+            return httpx.Response(200, json={"result": [{"points": data_points}, {"points": []}]})
+        return httpx.Response(200, json={"result": {}})
+
+    async with p3_emb_db() as session:
+        session.add(Source(id="src-512", name="Source 512", sag_source_config_id="cfg-512"))
+        await session.flush()
+        session.add(
+            SourceProjectMapping(
+                source_id="src-512",
+                organization_id="tenant-512",
+                project_id="proj-512",
+                state="CONFIRMED",
+                confirmed_at=now,
+                confirmed_by="user",
+                approval_ref="test",
+            )
+        )
+        session.add(
+            Document(
+                id="doc-512",
+                source_id="src-512",
+                tenant_id="tenant-512",
+                project_id="proj-512",
+                filename="custom512.md",
+                storage_path="custom512.md",
+                status=DocumentStatus.READY,
+                is_active=True,
+            )
+        )
+        session.add(
+            DocumentVersion(
+                id="ver-512",
+                document_id="doc-512",
+                version_no=1,
+                file_hash="fh-512",
+                status=DocumentStatus.READY,
+                search_status="SEARCH_READY",
+                search_ready_at=now,
+                metadata_json={"security_partition_id": "part-512"},
+            )
+        )
+        session.add(
+            IngestionRun(
+                id="run-512",
+                document_version_id="ver-512",
+                project_id="proj-512",
+                tenant_id="tenant-512",
+                idempotency_key="idem-512",
+                payload_hash="ph-512",
+                status="COMPLETED",
+                started_at=now,
+            )
+        )
+        checksum = "b" * 64
+        session.add(
+            StageRun(
+                id="sr-512",
+                run_id="run-512",
+                stage="INDEX_SEARCH",
+                status="SUCCESS",
+                created_at=now,
+                metrics_json={
+                    "manifest_verified": True,
+                    "collection_name": collection_name,
+                    "search_unit_count": 1,
+                    "pg_count": 1,
+                    "qdrant_count": 1,
+                    "qdrant_indexed_count": 1,
+                    "manifest_checksum": checksum,
+                    "qdrant_checksum": checksum,
+                },
+            )
+        )
+        blk = CanonicalBlock(
+            id="blk-512",
+            document_version_id="ver-512",
+            ordinal=0,
+            block_type="paragraph",
+            page_from=1,
+            page_to=1,
+            section_path="Custom",
+            normalized_text=content,
+            content_hash=digest,
+            source_anchor="anchor-512",
+        )
+        su = SearchUnit(
+            id="unit-512",
+            document_version_id="ver-512",
+            block_from_id="blk-512",
+            block_to_id="blk-512",
+            security_partition_id="part-512",
+            content_hash=digest,
+            token_count=8,
+            page_from=1,
+            page_to=1,
+            section_path="Custom",
+        )
+        su._text_content = content
+        session.add_all([blk, su])
+        await session.commit()
+
+        embedder = Custom512DEmbedder()
+        async with httpx.AsyncClient(
+            base_url="http://qdrant.local", transport=httpx.MockTransport(q_handler)
+        ) as client:
+            ver = await session.get(DocumentVersion, "ver-512")
+            await search_index_service.index_search_units_to_qdrant(
+                client,
+                project_id="proj-512",
+                units=[su],
+                version=ver,
+                tenant_id="tenant-512",
+                embedder=embedder,
+                blocks_by_id={"blk-512": blk},
+            )
+            unit_pt_id = search_index_service.generate_search_unit_point_id(collection_name, "unit-512")
+            assert stored_points[unit_pt_id]["payload"]["embedding_model_signature"].endswith("|512")
+
+            @asynccontextmanager
+            async def session_ctx():
+                async with p3_emb_db() as sess:
+                    yield sess
+
+            monkeypatch.setattr(retrieval, "SessionLocal", session_ctx)
+            monkeypatch.setattr(retrieval, "capture_routing_decisions", AsyncMock(return_value={}))
+            mgr = SimpleNamespace(
+                _settings=settings,
+                get_search_unit_qdrant_client=AsyncMock(return_value=client),
+                get_sag_embedding=AsyncMock(return_value=embedder),
+            )
+            principal = VerifiedPrincipal(
+                subject="u1",
+                organization_id="tenant-512",
+                allowed_project_ids=frozenset({"proj-512"}),
+                issuer="test",
+                key_id="k1",
+                token_id="t1",
+                issued_at=1,
+                expires_at=2,
+                tenant_id="tenant-512",
+                allowed_partition_ids=frozenset({"part-512"}),
+            )
+            source = SimpleNamespace(id="src-512", name="Source 512", sag_source_config_id="cfg-512")
+            outcome = await retrieval._retrieve_search_unit_sections(
+                mgr,
+                [source],
+                "custom 512-d unlisted embedding",
+                principal=principal,
+                top_k=5,
+                candidate_limit=8,
+                deadline=asyncio.get_running_loop().time() + 5.0,
+            )
+            assert len(outcome.sections) == 1
+            assert outcome.sections[0].chunk_id == "unit-512"
