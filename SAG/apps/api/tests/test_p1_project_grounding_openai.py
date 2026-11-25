@@ -279,3 +279,129 @@ async def test_llm_client_create_completion_respects_temperature_and_max_tokens_
     )
     assert captured["temperature"] == pytest.approx(0.15)
     assert captured["max_tokens"] == 300
+
+
+@pytest.mark.asyncio
+async def test_openai_sse_ungrounded_stream_does_not_leak_stripped_citation_brackets(monkeypatch):
+    """PROBE-5C: Unbuffered grounding_required=False SSE must not leak stripped [99]/[S99] before RUN_COMPLETED."""
+    agent = SimpleNamespace(id="agent-1", name="Tester", persona={})
+    monkeypatch.setattr(openai_api.svc, "get_agent", AsyncMock(return_value=agent))
+    monkeypatch.setattr(
+        openai_api.svc,
+        "build_ask_context",
+        lambda **_kwargs: AskPlan(
+            query="q",
+            user_message_id="u-1",
+            messages=[{"role": "user", "content": "q"}],
+            citations=[],
+            session_citations=[],
+        ),
+    )
+
+    async def fake_stream_ungrounded_with_split_citation(*_args, **_kwargs):
+        yield AgentStreamEvent(
+            type=EventType.RUN_STARTED.value,
+            data={"payload": {"grounding_required": False}},
+        )
+        yield AgentStreamEvent(
+            type=EventType.MESSAGE_DELTA.value,
+            data={"payload": {"delta": "See [docs](https://example.com) and "}},
+        )
+        yield AgentStreamEvent(
+            type=EventType.MESSAGE_DELTA.value,
+            data={"payload": {"delta": "General fact ["}},
+        )
+        yield AgentStreamEvent(
+            type=EventType.MESSAGE_DELTA.value,
+            data={"payload": {"delta": "99]."}},
+        )
+        yield AgentStreamEvent(
+            type=EventType.RUN_COMPLETED.value,
+            data={
+                "payload": {
+                    "output": "See [docs](https://example.com) and General fact.",
+                    "citations": [],
+                }
+            },
+        )
+
+    monkeypatch.setattr(openai_api.agent_service, "generate_stream", fake_stream_ungrounded_with_split_citation)
+    req = openai_api.ChatCompletionRequest(
+        messages=[openai_api.ChatMessage(role="user", content="q")],
+        stream=True,
+    )
+    resp = await openai_api.chat_completions(
+        agent_id="agent-1",
+        body=req,
+        _user=SimpleNamespace(name="User"),
+        owner_key="owner-1",
+        principal=_principal(),
+        session=SimpleNamespace(),
+        engine_manager=SimpleNamespace(),
+        llm=SimpleNamespace(configured=True),
+        tool_registry=SimpleNamespace(),
+        agent_runtime=SimpleNamespace(),
+    )
+    chunks = [chunk async for chunk in resp.body_iterator]
+    body_text = "".join(c.decode() if isinstance(c, bytes) else c for c in chunks)
+    assert "[99]" not in body_text
+    assert "99]" not in body_text
+    assert "[docs](https://example.com)" in body_text
+    # Reassemble streamed content deltas
+    import json as _json
+
+    assembled = []
+    for line in body_text.splitlines():
+        if line.startswith("data: ") and line != "data: [DONE]":
+            obj = _json.loads(line[6:])
+            delta_content = (obj.get("choices") or [{}])[0].get("delta", {}).get("content")
+            if delta_content:
+                assembled.append(delta_content)
+    assert "".join(assembled) == "See [docs](https://example.com) and General fact."
+
+
+@pytest.mark.asyncio
+async def test_openai_nonstream_incomplete_grounded_does_not_leak_raw_parts(monkeypatch):
+    """openai.py:212: Non-streaming incomplete grounded run without RUN_COMPLETED must not emit raw parts."""
+    agent = SimpleNamespace(id="agent-1", name="Tester", persona={})
+    monkeypatch.setattr(openai_api.svc, "get_agent", AsyncMock(return_value=agent))
+    monkeypatch.setattr(
+        openai_api.svc,
+        "build_ask_context",
+        lambda **_kwargs: AskPlan(
+            query="q",
+            user_message_id="u-1",
+            messages=[{"role": "user", "content": "q"}],
+            citations=[],
+            session_citations=[],
+        ),
+    )
+
+    async def fake_incomplete_grounded(*_args, **_kwargs):
+        yield AgentStreamEvent(
+            type=EventType.RUN_STARTED.value,
+            data={"payload": {"grounding_required": True}},
+        )
+        yield AgentStreamEvent(
+            type=EventType.MESSAGE_DELTA.value,
+            data={"payload": {"delta": "Unverified leak [99]"}},
+        )
+
+    monkeypatch.setattr(openai_api.agent_service, "generate_stream", fake_incomplete_grounded)
+    non_stream_req = openai_api.ChatCompletionRequest(
+        messages=[openai_api.ChatMessage(role="user", content="q")],
+        stream=False,
+    )
+    non_stream_res = await openai_api.chat_completions(
+        agent_id="agent-1",
+        body=non_stream_req,
+        _user=SimpleNamespace(name="User"),
+        owner_key="owner-1",
+        principal=_principal(),
+        session=SimpleNamespace(),
+        engine_manager=SimpleNamespace(),
+        llm=SimpleNamespace(configured=True),
+        tool_registry=SimpleNamespace(),
+        agent_runtime=SimpleNamespace(),
+    )
+    assert non_stream_res["choices"][0]["message"]["content"] == ""

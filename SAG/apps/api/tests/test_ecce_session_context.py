@@ -611,7 +611,23 @@ async def test_pr42_knowledge_only_grounding_single_router_call_delta_db_and_tra
     class _DummyLLM:
         configured = True
 
-        async def complete(self, *_args, **_kwargs) -> str:
+        async def complete(
+            self,
+            messages: list[dict[str, Any]] | None = None,
+            *_args: Any,
+            **_kwargs: Any,
+        ) -> str:
+            system_prompt = str((messages or [{}])[0].get("content") or "")
+            if "entailment verifier" in system_prompt.lower() or "answerability" in system_prompt:
+                return json.dumps(
+                    {
+                        "answerability": "answered",
+                        "supported": True,
+                        "reason": "Supported by session evidence.",
+                    }
+                )
+            if '"scope"' in system_prompt:
+                return '{"scope": "project"}'
             return "tóm tắt"
 
     owner_key = "continuum:user-pr42"

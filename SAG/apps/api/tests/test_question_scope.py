@@ -139,6 +139,7 @@ class QuestionScopeStreamIntegrationTests(unittest.IsolatedAsyncioTestCase):
         *,
         query: str,
         scope_response: str = '{"scope":"general"}',
+        entailment_response: str = '{"answerability":"answered","supported":true}',
         knowledge_only: bool = False,
         source_ids: list[str] | None = None,
         messages: list[dict] | None = None,
@@ -148,7 +149,14 @@ class QuestionScopeStreamIntegrationTests(unittest.IsolatedAsyncioTestCase):
         output: str = "Câu trả lời trực tiếp.",
     ):
         source = SimpleNamespace(id="source-1", name="Project Docs", sag_source_config_id="cfg-1")
-        llm = SimpleNamespace(configured=True, complete=AsyncMock(return_value=scope_response))
+
+        async def _complete(messages: list[dict], **_kwargs) -> str:
+            system_prompt = str((messages or [{}])[0].get("content") or "")
+            if "entailment verifier" in system_prompt.lower() or "answerability" in system_prompt:
+                return entailment_response
+            return scope_response
+
+        llm = SimpleNamespace(configured=True, complete=AsyncMock(side_effect=_complete))
         runtime = _CapturingRuntime(output=output)
         plan = AskPlan(
             query=query,
@@ -272,14 +280,26 @@ class QuestionScopeStreamIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         greeting_llm.complete.assert_not_awaited()
 
-        _, session_runtime, session_llm, _ = await self._run_stream(
-            query="Quyết định kiến trúc mình vừa chốt là gì?",
-            knowledge_only=True,
-            route_decision={"is_chitchat": False, "confidence": 0.1, "memory_scope": "session_history"},
-            session_citations=[{"ref": "S1", "turn_index": 1, "snippet": "Chốt dùng PostgreSQL"}],
-            output="Chúng ta đã chốt dùng PostgreSQL [S1].",
+        with patch.object(
+            agent_service,
+            "classify_question_scope",
+            wraps=agent_service.classify_question_scope,
+        ) as spy_scope:
+            session_events, session_runtime, session_llm, _ = await self._run_stream(
+                query="Quyết định kiến trúc mình vừa chốt là gì?",
+                knowledge_only=True,
+                route_decision={"is_chitchat": False, "confidence": 0.1, "memory_scope": "session_history"},
+                session_citations=[{"ref": "S1", "turn_index": 1, "snippet": "Chốt dùng PostgreSQL"}],
+                output="Chúng ta đã chốt dùng PostgreSQL [S1].",
+            )
+        spy_scope.assert_not_awaited()
+        self.assertEqual(session_llm.complete.await_count, 1)
+        self.assertIn(
+            "entailment verifier",
+            session_llm.complete.await_args.args[0][0]["content"].lower(),
         )
-        session_llm.complete.assert_not_awaited()
+        session_completed = [e for e in session_events if e.type == EventType.RUN_COMPLETED.value]
+        self.assertEqual(session_completed[0].data["payload"]["answer_status"], "answered")
         self.assertIn("[Session Memory Evidence]", session_runtime.history[0]["content"])
 
     async def test_database_and_cs_concepts_do_not_false_match_research_lookup(self) -> None:

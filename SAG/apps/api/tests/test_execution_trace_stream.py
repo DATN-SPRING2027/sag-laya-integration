@@ -32,6 +32,7 @@ class GroundedSearchTool(Tool):
                     "page_from": 2,
                     "page_to": 2,
                     "anchor": "handover-checklist",
+                    "snippet": "Quy trình bàn giao yêu cầu checklist.",
                 }
             ],
             data={"section_count": 1},
@@ -179,7 +180,10 @@ async def test_generate_stream_emits_live_execution_trace_labels_session_context
             agent=SimpleNamespace(id="agent-1", name="Continuum Agent", persona={}, is_default=True),
             thread_id="thread-1",
             engine_manager=SimpleNamespace(),
-            llm=SimpleNamespace(configured=True),
+            llm=SimpleNamespace(
+                configured=True,
+                complete=AsyncMock(return_value='{"answerability": "answered", "supported": true}'),
+            ),
             tool_registry=registry,
             runtime=TraceSimulatingRuntime(),
             knowledge_only=True,
@@ -289,7 +293,10 @@ async def test_tool_failed_propagates_canonical_label_and_omits_session_context_
             agent=SimpleNamespace(id="agent-1", name="Continuum Agent", persona={}, is_default=True),
             thread_id="thread-2",
             engine_manager=SimpleNamespace(),
-            llm=SimpleNamespace(configured=True),
+            llm=SimpleNamespace(
+                configured=True,
+                complete=AsyncMock(return_value='{"answerability": "answered", "supported": true}'),
+            ),
             tool_registry=ToolRegistry(),
             runtime=ToolFailureSimulatingRuntime(),
             knowledge_only=False,

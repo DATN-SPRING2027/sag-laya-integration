@@ -97,6 +97,13 @@ class FakeLLM(ModelProvider):
         self.release_gate: asyncio.Event | None = None
 
     async def complete(self, messages: list[dict], **_kwargs) -> str:
+        system_prompt = str((messages or [{}])[0].get("content") or "")
+        if "entailment verifier" in system_prompt.lower() or "answerability" in system_prompt:
+            return json.dumps(
+                {"answerability": "answered", "supported": True, "reason": "Matches cited evidence."}
+            )
+        if '"scope"' in system_prompt:
+            return '{"scope": "project"}'
         return "Summary"
 
     async def stream_turn(self, request: ModelRequest, cancellation: CancellationToken):
