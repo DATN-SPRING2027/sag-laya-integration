@@ -229,12 +229,79 @@ def _profile(
     )
 
 
+def _agglomerate_communities(
+    groups: list[tuple[str, ...]],
+    edge_weights: dict[tuple[str, str], float],
+    target_count: int,
+) -> list[tuple[str, ...]]:
+    """Agglomeratively merge Leiden communities down to target_count preserving graph structure."""
+    if len(groups) <= target_count:
+        return groups
+
+    active: dict[int, tuple[str, ...]] = {idx: group for idx, group in enumerate(groups)}
+    unit_to_group: dict[str, int] = {
+        uid: idx for idx, group in active.items() for uid in group
+    }
+    pair_weights: dict[tuple[int, int], float] = defaultdict(float)
+    for (src, dst), weight in edge_weights.items():
+        if weight <= 0:
+            continue
+        g_src = unit_to_group.get(src)
+        g_dst = unit_to_group.get(dst)
+        if g_src is None or g_dst is None or g_src == g_dst:
+            continue
+        key = (g_src, g_dst) if g_src < g_dst else (g_dst, g_src)
+        pair_weights[key] += weight
+
+    while len(active) > target_count:
+        if pair_weights:
+            (left, right), _best_w = min(
+                pair_weights.items(),
+                key=lambda item: (
+                    -item[1],
+                    len(active[item[0][0]]) + len(active[item[0][1]]),
+                    active[item[0][0]][0],
+                    active[item[0][1]][0],
+                ),
+            )
+        else:
+            smallest = sorted(
+                active.keys(),
+                key=lambda gid: (len(active[gid]), active[gid][0]),
+            )
+            left, right = smallest[0], smallest[1]
+            if left > right:
+                left, right = right, left
+
+        active[left] = tuple(sorted(active[left] + active[right]))
+        del active[right]
+
+        # Re-key all inter-community edges incident to `right` onto `left`
+        pair_weights.pop((left, right), None)
+        updates: dict[tuple[int, int], float] = defaultdict(float)
+        to_remove: list[tuple[int, int]] = []
+        for pair, weight in pair_weights.items():
+            a, b = pair
+            if a == right or b == right:
+                other = b if a == right else a
+                to_remove.append(pair)
+                if other != left and other in active:
+                    new_key = (left, other) if left < other else (other, left)
+                    updates[new_key] += weight
+        for pair in to_remove:
+            del pair_weights[pair]
+        for new_key, weight in updates.items():
+            pair_weights[new_key] += weight
+
+    return sorted(active.values(), key=lambda group: group[0])
+
+
 def _partition(
     unit_ids: tuple[str, ...],
     edge_weights: dict[tuple[str, str], float],
     config: TreeBuildConfig,
 ) -> list[tuple[str, ...]]:
-    """Constrained Leiden partition with capacity and balanced fallback."""
+    """Constrained Leiden partition with hierarchical community ceiling and agglomerative merge."""
     if len(unit_ids) <= config.target_cluster_size:
         return [unit_ids]
     try:
@@ -243,6 +310,10 @@ def _partition(
     except ImportError as exc:
         raise RuntimeError("Phase 6 requires the igraph and leidenalg dependencies") from exc
 
+    effective_max_size = max(
+        config.max_cluster_size,
+        math.ceil(len(unit_ids) / config.max_children),
+    )
     indices = {unit_id: index for index, unit_id in enumerate(unit_ids)}
     graph_pairs = sorted(edge_weights.items())
     graph_edges = [(indices[left], indices[right]) for (left, right), _ in graph_pairs]
@@ -254,30 +325,54 @@ def _partition(
         leidenalg.CPMVertexPartition,
         weights=weights,
         n_iterations=-1,
-        max_comm_size=config.max_cluster_size,
+        max_comm_size=effective_max_size,
         seed=int.from_bytes(seed_bytes, "big") & 0x7FFF_FFFF,
         resolution_parameter=config.leiden_resolution,
     )
     groups = [{unit_ids[index] for index in community} for community in partition]
-    # Guard giant/unconnected components with deterministic balanced chunks.
+    # Split any community exceeding the per-level ceiling while keeping Leiden membership intact.
     balanced: list[tuple[str, ...]] = []
     for group in sorted(groups, key=lambda items: min(items)):
         members = sorted(group)
-        if len(members) > config.max_cluster_size:
-            count = math.ceil(len(members) / config.max_cluster_size)
+        if len(members) > effective_max_size:
+            count = math.ceil(len(members) / effective_max_size)
             balanced.extend(tuple(part) for part in _balanced_chunks(members, count))
         else:
             balanced.append(tuple(members))
 
     if len(balanced) > config.max_children:
-        count = min(config.max_children, math.ceil(len(unit_ids) / config.target_cluster_size))
-        balanced = [tuple(part) for part in _balanced_chunks(sorted(unit_ids), count)]
+        balanced = _agglomerate_communities(balanced, edge_weights, config.max_children)
     elif len(balanced) <= 1 and len(unit_ids) > config.target_cluster_size:
-        count = min(config.max_children, math.ceil(len(unit_ids) / config.target_cluster_size))
-        balanced = [tuple(part) for part in _balanced_chunks(sorted(unit_ids), count)]
+        sub_max_size = max(
+            config.target_cluster_size,
+            math.ceil(len(unit_ids) / config.max_children),
+        )
+        if sub_max_size < len(unit_ids):
+            sub_partition = leidenalg.find_partition(
+                graph,
+                leidenalg.CPMVertexPartition,
+                weights=weights,
+                n_iterations=-1,
+                max_comm_size=sub_max_size,
+                seed=int.from_bytes(seed_bytes, "big") & 0x7FFF_FFFF,
+                resolution_parameter=config.leiden_resolution,
+            )
+            sub_groups = [
+                tuple(sorted(unit_ids[index] for index in community))
+                for community in sub_partition
+                if community
+            ]
+            if len(sub_groups) > 1:
+                balanced = (
+                    _agglomerate_communities(sub_groups, edge_weights, config.max_children)
+                    if len(sub_groups) > config.max_children
+                    else sorted(sub_groups, key=lambda group: group[0])
+                )
+        if len(balanced) <= 1:
+            count = min(config.max_children, math.ceil(len(unit_ids) / config.target_cluster_size))
+            balanced = [tuple(part) for part in _balanced_chunks(sorted(unit_ids), count)]
 
-    # Avoid repeated singleton merges when Leiden yields many isolates. The
-    # fallback stays linear and produces groups near target size.
+    # Avoid repeated singleton merges when Leiden yields many isolates on edgeless inputs.
     small_group_count = sum(len(group) < config.min_cluster_size for group in balanced)
     if small_group_count > max(1, math.ceil(len(unit_ids) / config.target_cluster_size)):
         count = min(config.max_children, math.ceil(len(unit_ids) / config.target_cluster_size))
@@ -301,14 +396,17 @@ def _partition(
             elif target_group == small_index and source_group != small_index:
                 weights_by_group[source_group].append(weight)
         options = [
-            (math.fsum(weights_by_group[index]), index)
+            (math.fsum(weights_by_group[index]), -len(group), index)
             for index, group in enumerate(balanced)
-            if index != small_index and len(group) + len(small) <= config.max_cluster_size
+            if index != small_index and len(group) + len(small) <= effective_max_size
         ]
         if not options:
-            count = math.ceil(len(unit_ids) / config.max_cluster_size)
-            return [tuple(part) for part in _balanced_chunks(sorted(unit_ids), count)]
-        _, target_index = max(options, key=lambda pair: (pair[0], -pair[1]))
+            options = [
+                (math.fsum(weights_by_group[index]), -len(group), index)
+                for index, group in enumerate(balanced)
+                if index != small_index
+            ]
+        _, _, target_index = max(options, key=lambda triple: (triple[0], triple[1], -triple[2]))
         balanced[target_index] = tuple(sorted(balanced[target_index] + small))
         balanced.pop(small_index)
     return sorted(balanced, key=lambda group: group[0])

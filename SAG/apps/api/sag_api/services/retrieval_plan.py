@@ -507,13 +507,21 @@ def group_sections_by_document(
     )
     top_score = float(getattr(representatives[0], "score", 0.0) or 0.0)
     min_score = max(absolute_floor, top_score * relative_floor)
+    high_confidence_semantic_floor = 0.70
 
     selected: list[Any] = []
     for sec in representatives:
         if len(selected) >= limit:
             break
         score = float(getattr(sec, "score", 0.0) or 0.0)
-        if score < absolute_floor or (selected and score < min_score):
+        raw_dense = getattr(sec, "raw_dense_score", None)
+        is_high_conf_semantic = (
+            raw_dense is not None
+            and isinstance(raw_dense, (int, float))
+            and not isinstance(raw_dense, bool)
+            and float(raw_dense) >= high_confidence_semantic_floor
+        )
+        if not is_high_conf_semantic and (score < absolute_floor or (selected and score < min_score)):
             continue
         rank = len(selected)
         if hasattr(sec, "model_copy"):

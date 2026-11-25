@@ -2217,7 +2217,7 @@ async def _retrieve_search_unit_sections(
                         and route.reason_code == "ROUTE_DESCENDED"
                         and float(route.margin or 0.0) >= 0.22
                         and not strategy_plan.multi_hop_eligible
-                        and strategy_plan.primary_strategy.value not in {"MULTI_HOP", "GLOBAL_SUMMARY"}
+                        and strategy_plan.primary_strategy.value not in {"MULTI_HOP", "GLOBAL_TOPIC"}
                         and strategy_plan.retrieval_plan.target.value != "DOCUMENT"
                     )
                     eff_escape_limit = max(8, candidate_limit // 2) if confident_local else candidate_limit
@@ -2731,9 +2731,11 @@ async def _retrieve_search_unit_sections(
     diversity_stats: dict[str, Any] = {}
     initial_pool: list[RetrievedSection] = []
     if rerank_remaining <= settings.search_rerank_min_remaining_seconds:
+        from sag_api.services.query_analysis import analyze_query
         from sag_api.services.retrieval_service import (
             _is_boilerplate,
             _is_superseded_section,
+            _passes_lexical_floor_bypass,
             _query_allows_superseded,
             _section_key,
         )
@@ -2743,11 +2745,16 @@ async def _retrieve_search_unit_sections(
         lexical_keys = {_section_key(sec) for sec in lexical}
         allows_superseded = _query_allows_superseded(temporal_mode=strategy_plan.retrieval_plan.temporal_mode)
         min_dense = float(settings.search_min_dense_score)
+        fallback_analysis = analyze_query(
+            query,
+            segmentation_enabled=settings.search_chinese_segmentation_enabled,
+            subqueries=strategy_plan.retrieval_plan.decomposition.subqueries,
+        )
         fallback_pool: list[RetrievedSection] = []
         for sec in raw_fallback_pool:
             sec_key = _section_key(sec)
             in_lexical = sec_key in lexical_keys
-            if not in_lexical and _is_boilerplate(sec):
+            if _is_boilerplate(sec):
                 continue
             if not allows_superseded and _is_superseded_section(sec):
                 continue
@@ -2756,7 +2763,10 @@ async def _retrieve_search_unit_sections(
                 if sec.raw_dense_score is not None
                 else float(sec.score or 0.0)
             )
-            if not in_lexical and eff_dense < min_dense:
+            if eff_dense < min_dense and not (
+                in_lexical
+                and _passes_lexical_floor_bypass(query, sec, analysis=fallback_analysis)
+            ):
                 continue
             fallback_pool.append(sec)
         initial_pool = fallback_pool

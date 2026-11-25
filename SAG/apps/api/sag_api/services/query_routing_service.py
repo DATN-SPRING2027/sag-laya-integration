@@ -71,8 +71,8 @@ class RoutingPolicy(BaseModel):
 
     beam_width: int = Field(default=3, ge=1, le=8)
     broad_entropy_threshold: float = Field(default=0.72, ge=0.0, le=1.0)
-    broad_margin_threshold: float = Field(default=0.10, ge=0.0, le=1.0)
-    decisive_margin: float = Field(default=0.18, ge=0.0, le=1.0)
+    broad_margin_threshold: float = Field(default=0.25, ge=0.0, le=1.0)
+    decisive_margin: float = Field(default=0.10, ge=0.0, le=1.0)
     membership_limit: int = Field(default=256, ge=1, le=256)
 
 

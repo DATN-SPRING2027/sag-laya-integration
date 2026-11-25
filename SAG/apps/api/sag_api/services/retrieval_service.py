@@ -503,6 +503,63 @@ def _is_boilerplate(section: RetrievedSection) -> bool:
     return sum(marker in text for marker in _BOILERPLATE) >= 2
 
 
+def _passes_lexical_floor_bypass(
+    query: str,
+    section: RetrievedSection,
+    *,
+    analysis: QueryAnalysis | None = None,
+    min_lexical_score: float = 0.35,
+) -> bool:
+    """Allow a below-min-dense lexical candidate to pass only on anchor match or strong lexical relevance."""
+    effective = analysis or analyze_query(
+        query,
+        segmentation_enabled=settings.search_chinese_segmentation_enabled,
+    )
+    contextual_heading = " ".join(
+        part
+        for part in (section.document_name, section.section_path, section.heading)
+        if part
+    )
+    head_spaced = _normalize_spaced_lexical_text(contextual_heading or section.heading)
+    body_spaced = _normalize_spaced_lexical_text(section.content)
+    full_spaced = (
+        f"{head_spaced}{body_spaced[1:]}"
+        if head_spaced and body_spaced
+        else (head_spaced or body_spaced)
+    )
+    full_compact = full_spaced.replace(" ", "")
+    full_roots = _extract_ascii_roots(full_spaced)
+    anchor_terms = frozenset(
+        norm
+        for term in (
+            *effective.features.exact_terms,
+            *effective.features.identifier_terms,
+            *effective.features.path_terms,
+        )
+        if (norm := _normalize_query_term(term))
+    )
+    if anchor_terms and any(
+        _term_matches_text(
+            anchor,
+            full_spaced,
+            spaceless_text=full_compact,
+            root_tokens=full_roots,
+        )
+        for anchor in anchor_terms
+    ):
+        return True
+    contextual_section = (
+        section.model_copy(update={"heading": contextual_heading})
+        if contextual_heading and contextual_heading != section.heading
+        else section
+    )
+    lexical_score = max(
+        _lexical_relevance(query, section, analysis=effective),
+        _lexical_relevance(query, contextual_section, analysis=effective),
+    )
+    return lexical_score >= min_lexical_score
+
+
 def _query_allows_superseded(query: str = "", *, temporal_mode: str | None = None) -> bool:
     """Allow superseded document versions only when structured router temporal_mode targets history/lineage."""
     del query
@@ -864,7 +921,7 @@ def rerank_sections(
             lex_eff = min(lex_eff, interaction_lex_ranks[key])
         exact = key in exact_keys
         lexical_match = lexical_rank is not None
-        if _is_boilerplate(section) and not lexical_match and lexical_score < 0.35:
+        if _is_boilerplate(section):
             continue
         reciprocal_rank_score = sum(
             1.0 / (_RRF_K + eff_rank + 1.0)
@@ -876,16 +933,40 @@ def rerank_sections(
             1.0,
             0.56 * fused_score + 0.32 * lexical_score + 0.12 * relative_semantic_score,
         )
-        # Each candidate may pass through either retrieval signal.
-        # Semantic-only candidates must also meet the absolute raw cosine floor (S4-01).
+        # Each candidate must either clear the semantic dense floor (S4-01) or earn a
+        # genuine lexical pass (explicit anchor match or strong lexical relevance when dense is OOD).
         raw_dense = raw_dense_scores.get(key)
         effective_raw_dense = raw_dense if raw_dense is not None else raw
+        min_dense = float(settings.search_min_dense_score)
         semantic_relevant = (
             semantic_rank is not None
             and relative_semantic_score >= _SEMANTIC_RELATIVE_RELEVANCE_FLOOR
-            and effective_raw_dense >= float(settings.search_min_dense_score)
+            and effective_raw_dense >= min_dense
         )
-        relevant = lexical_match or lexical_score >= 0.2 or semantic_relevant
+        _hs, full_spaced, _hc, full_compact, _hr, full_roots = section_norm_cache[key]
+        has_anchor_match = bool(
+            (exact_lexical_keys is not None and key in exact_lexical_keys)
+            or (
+                anchor_terms
+                and any(
+                    _term_matches_text(
+                        anchor,
+                        full_spaced,
+                        spaceless_text=full_compact,
+                        root_tokens=full_roots,
+                    )
+                    for anchor in anchor_terms
+                )
+            )
+        )
+        dense_known_ood = raw_dense is not None and raw_dense < min_dense
+        strong_lexical = has_anchor_match or lexical_score >= 0.35
+        lexical_relevant = (
+            strong_lexical
+            if dense_known_ood
+            else (strong_lexical or (lexical_match and lexical_score >= 0.20))
+        )
+        relevant = semantic_relevant or lexical_relevant
         if not relevant:
             continue
         rank_sum = sum(rank for rank in (semantic_rank, lexical_rank) if rank is not None)
@@ -1094,12 +1175,13 @@ def select_diverse_sections(
             doc_best_score[d_key] = float(sec.score or 0.0)
 
     top_doc_score = doc_best_score.get(ordered_docs[0], 0.0) if ordered_docs else 0.0
+    configured_admission_ratio = float(settings.search_doc_admission_ratio)
     admission_ratio = (
-        float(settings.search_doc_admission_ratio)
+        configured_admission_ratio
         if unbounded_limit
-        else min(0.75, float(settings.search_doc_admission_ratio))
+        else min(0.75, configured_admission_ratio)
         if effective_multi_hop or per_document_limit == 1
-        else max(0.94, float(settings.search_doc_admission_ratio))
+        else configured_admission_ratio
     )
     salient_doc_terms = {
         term for term in extract_salient_query_terms(query, entities=entities) if len(term) >= 3
@@ -1108,7 +1190,7 @@ def select_diverse_sections(
     if ordered_docs:
         admitted_docs.add(ordered_docs[0])
         allow_wide_docs = unbounded_limit or effective_multi_hop or per_document_limit == 1
-        max_initial_docs = limit if allow_wide_docs else min(limit, 2)
+        max_initial_docs = limit
         for doc_rank_idx, d_key in enumerate(ordered_docs[1:], start=1):
             if len(admitted_docs) >= max_initial_docs:
                 break
@@ -1213,9 +1295,9 @@ def select_diverse_sections(
                 if (per_document_limit == 1 and all_initial_single_chunk)
                 else fallback_doc_floor
                 if (unbounded_limit or per_document_limit == 1 or (effective_multi_hop and len(unique) <= limit + 1))
-                else max(0.45, 0.78 * top_doc_score)
+                else max(0.45, fallback_doc_floor)
                 if allow_wide_sample
-                else max(0.55, 0.88 * top_doc_score)
+                else fallback_doc_floor
             )
             next_doc = next(
                 (
