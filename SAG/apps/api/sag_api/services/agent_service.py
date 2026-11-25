@@ -57,6 +57,11 @@ log = get_logger("agent")
 _VERIFIER_MAX_CHUNK_CHARS = 4000
 _VERIFIER_MAX_TOTAL_EVIDENCE_CHARS = 24_000
 _FORCED_FINAL_PREFIX = "The tool-call limit has been reached."
+_DEFAULT_FINAL_INSTRUCTIONS = str(
+    RuntimeAgent.__dataclass_fields__["final_instructions"].default
+).strip()
+_FENCE_OPEN_RE = re.compile(r"( {0,3})(`{3,}|~{3,})")
+_SPACE_BEFORE_PUNCT_RE = re.compile(r"(?<![ \t])[ \t]++([，。！？；：,.!?;:])")
 
 _KNOWLEDGE_TOOLS = ["search_context", "get_entity"]
 _WEB_TOOLS = ["web_search", "open_webpage"]
@@ -257,12 +262,12 @@ def _rewrite_prose_citation_brackets(
     while index < length:
         line_start = index == 0 or text[index - 1] == "\n"
         if line_start:
-            fence_match = re.match(r"^( {0,3})(`{3,}|~{3,})", text[index:])
+            fence_match = _FENCE_OPEN_RE.match(text, index)
             if fence_match:
                 marker = fence_match.group(2)
                 nl_idx = text.find("\n", index)
                 line_end = length if nl_idx == -1 else nl_idx + 1
-                suffix = text[index + len(fence_match.group(0)) : line_end].strip()
+                suffix = text[fence_match.end() : line_end].strip()
                 if code_fence is None:
                     _flush_prose(index)
                     code_fence = marker
@@ -275,14 +280,15 @@ def _rewrite_prose_citation_brackets(
                     and len(marker) >= len(code_fence)
                     and suffix == ""
                 ):
-                    out.append(text[index:line_end])
+                    out.append(text[prose_start:line_end])
                     code_fence = None
                     prose_start = line_end
                     index = line_end
                     continue
 
         if code_fence is not None:
-            index += 1
+            nl_idx = text.find("\n", index)
+            index = length if nl_idx == -1 else nl_idx + 1
             continue
 
         if text[index] == "`":
@@ -394,7 +400,7 @@ def _finalize_answer_citations(
         return f"[{', '.join(kept)}]" if kept else ""
 
     canonical = _rewrite_prose_citation_brackets(answer, replace_reference).strip()
-    canonical = re.sub(r"[ \t]+([，。！？；：,.!?;:])", r"\1", canonical)
+    canonical = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", canonical)
     explicitly_mapped = set(used)
     if allow_uncited_fallback and canonical and traceable and not used:
         used = list(traceable)[:3]
@@ -449,7 +455,7 @@ def _finalize_session_citations(
         return f"[{', '.join(kept)}]" if kept else ""
 
     cleaned = _rewrite_prose_citation_brackets(answer, _replace_session_bracket).strip()
-    cleaned = re.sub(r"[ \t]+([，。！？；：,.!?;:])", r"\1", cleaned)
+    cleaned = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", cleaned)
     if not valid_by_ref:
         return cleaned, [], False
 
@@ -719,7 +725,9 @@ def _is_forced_final_message(raw_message: Any, normalized: Mapping[str, Any]) ->
     content = normalized.get("content")
     if isinstance(content, str):
         stripped = content.strip()
-        if stripped.startswith(_FORCED_FINAL_PREFIX) or stripped == RuntimeAgent.final_instructions:
+        if stripped.startswith(_FORCED_FINAL_PREFIX) or (
+            _DEFAULT_FINAL_INSTRUCTIONS and stripped == _DEFAULT_FINAL_INSTRUCTIONS
+        ):
             return True
     return False
 

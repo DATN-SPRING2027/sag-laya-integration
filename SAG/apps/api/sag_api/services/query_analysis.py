@@ -85,12 +85,13 @@ _IDENTIFIER_RE = re.compile(
 _NON_IDENTIFIER_TEMPORAL_RE = re.compile(r"^(?:FY|Q[1-4])(?:[-_]?\d{2,4})?$", re.IGNORECASE)
 _PATH_RE = re.compile(
     r"(?:"
-    r"(?<![\w$:/])/[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=%-]+"
-    r"|[A-Za-z]:\\[^\s]+"
-    r"|\b[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+"
-    r"|\b[\w-]+(?:\.[\w-]+){1,}"
+    r"(?<![\w$:/])/[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=%-]++"
+    r"|[A-Za-z]:\\[^\s]++"
+    r"|(?<![A-Za-z0-9_.-])[A-Za-z0-9_.-]++(?:/[A-Za-z0-9_.-]++)++"
+    r"|(?<![\w-])[\w-]++(?:\.[\w-]++)++"
     r")"
 )
+_NUMERIC_OR_VERSION_RE = re.compile(r"\d++(?:\.\d++)*+(?:\.[xX*]++|[^\W\d_]++|%)?")
 _NON_PATH_BRAND_NAMES = frozenset(
     {
         "node.js",
@@ -210,7 +211,7 @@ def _is_valid_path_term(cleaned_path: str) -> bool:
         return False
     if _DMY_DATE_RE.fullmatch(cleaned_path) or _ISO_DATE_RE.fullmatch(cleaned_path):
         return False
-    if re.fullmatch(r"\d+(?:\.\d+)*(?:\.[xX*]+)?(?:[^\W\d_]+|%)?", cleaned_path):
+    if _NUMERIC_OR_VERSION_RE.fullmatch(cleaned_path):
         return False
     if re.fullmatch(r"[A-Za-z](?:\.[A-Za-z])+", cleaned_path):
         return False

@@ -2080,15 +2080,12 @@ async def _retrieve_search_unit_sections(
     try:
         async with asyncio.timeout_at(deadline):
             async with SessionLocal() as session:
-                try:
-                    ready_versions = await _load_current_ready_versions(
-                        session,
-                        sources,
-                        principal,
-                        include_superseded=allows_superseded,
-                    )
-                except TypeError:
-                    ready_versions = await _load_current_ready_versions(session, sources, principal)
+                ready_versions = await _load_current_ready_versions(
+                    session,
+                    sources,
+                    principal,
+                    include_superseded=allows_superseded,
+                )
     except TimeoutError as error:
         log.warning("canonical search authorization exceeded query budget")
         raise ServiceUnavailableError("Canonical search exceeded the query budget") from error
@@ -2510,21 +2507,18 @@ async def _retrieve_search_unit_sections(
     try:
         async with asyncio.timeout_at(deadline):
             async with SessionLocal() as session:
-                try:
-                    verified_candidate_versions = await _load_current_ready_versions(
-                        session,
-                        sources,
-                        principal,
-                        version_ids=candidate_version_ids,
-                        include_superseded=allows_superseded,
-                    )
-                    current_versions = {
-                        vid: ver
-                        for vid, ver in ready_versions.items()
-                        if vid not in candidate_version_ids
-                    } | verified_candidate_versions
-                except TypeError:
-                    current_versions = await _load_current_ready_versions(session, sources, principal)
+                verified_candidate_versions = await _load_current_ready_versions(
+                    session,
+                    sources,
+                    principal,
+                    version_ids=candidate_version_ids,
+                    include_superseded=allows_superseded,
+                )
+                current_versions = {
+                    vid: ver
+                    for vid, ver in ready_versions.items()
+                    if vid not in candidate_version_ids
+                } | verified_candidate_versions
                 start_block = aliased(CanonicalBlock)
                 end_block = aliased(CanonicalBlock)
                 rows = (
@@ -3090,28 +3084,13 @@ async def _retrieve_search_unit_sections(
         try:
             async with asyncio.timeout_at(deadline):
                 async with SessionLocal() as session:
-                    try:
-                        refreshed = await _load_current_ready_versions(
-                            session,
-                            sources,
-                            principal,
-                            version_ids=selected_version_ids,
-                            include_superseded=allows_superseded,
-                        )
-                    except TypeError:
-                        try:
-                            refreshed = await _load_current_ready_versions(
-                                session,
-                                sources,
-                                principal,
-                                version_ids=selected_version_ids,
-                            )
-                        except TypeError:
-                            refreshed = await _load_current_ready_versions(
-                                session,
-                                sources,
-                                principal,
-                            )
+                    refreshed = await _load_current_ready_versions(
+                        session,
+                        sources,
+                        principal,
+                        version_ids=selected_version_ids,
+                        include_superseded=allows_superseded,
+                    )
             _verify_selection_scope(selected_version_ids, current_versions, refreshed)
         except (TimeoutError, SQLAlchemyError) as error:
             raise ServiceUnavailableError("Search scope could not be revalidated") from error

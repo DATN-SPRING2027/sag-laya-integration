@@ -70,12 +70,11 @@ def _split_query(messages: list[ChatMessage]) -> tuple[str, list[dict[str, str]]
 
 
 _COMPLETE_CITATION_BRACKET_RE = re.compile(
-    r"[ \t]*\[(\s*[sS]?\d+(?:\s*[,;、]\s*[sS]?\d+)*\s*)\](?!\(\s*(?:https?:|mailto:)|:\s*(?:https?:|mailto:))"
+    r"\[(\s*+[sS]?\d++(?:\s*+[,;、]\s*+[sS]?\d++)*+\s*+)\](?!\(\s*+(?:https?:|mailto:)|:\s*+(?:https?:|mailto:))"
 )
-_INCOMPLETE_CITATION_TAIL_RE = re.compile(
-    r"[ \t]*\[\s*(?:(?:[sS]?\d+(?:\s*[,;、]\s*[sS]?\d+)*\s*[,;、]\s*(?:[sS]?\d*)?)|(?:[sS]?\d*)|[sS])?\s*$"
-)
-_LINK_PREFIXES = ("(http:", "(https:", "(mailto:", ": http:", ": https:", ": mailto:", ":http:", ":https:", ":mailto:")
+_FENCE_OPEN_RE = re.compile(r"( {0,3})(`{3,}|~{3,})")
+_SPACE_BEFORE_PUNCT_RE = re.compile(r"(?<![ \t])[ \t]++([，。！？；：,.!?;:])")
+_MAX_PENDING_INLINE_CODE_CHARS = 64
 
 
 def _is_zero_math_bracket(inner: str) -> bool:
@@ -87,11 +86,49 @@ def _is_zero_math_bracket(inner: str) -> bool:
     return any(item.isdigit() and int(item) == 0 for item in items)
 
 
-def _has_partial_link_tail(after: str) -> bool:
-    if not after:
-        return False
-    lowered = after.lower()
-    return any(prefix.startswith(lowered) for prefix in _LINK_PREFIXES)
+def _find_incomplete_citation_tail_start(segment: str) -> int | None:
+    """Linear O(N) scan for an unclosed trailing citation prefix (e.g. ' [1, ', ' [S1')."""
+    bracket_idx = segment.rfind("[")
+    if bracket_idx == -1:
+        return None
+    # States: 0 = expect item (optional ws, then S or digit), 1 = after S (expect digit),
+    # 2 = inside digits, 3 = whitespace after digits (expect separator).
+    state = 0
+    for ch in segment[bracket_idx + 1 :]:
+        if state == 0:
+            if ch.isspace():
+                continue
+            if ch in "sS":
+                state = 1
+            elif ch.isdigit():
+                state = 2
+            else:
+                return None
+        elif state == 1:
+            if ch.isdigit():
+                state = 2
+            else:
+                return None
+        elif state == 2:
+            if ch.isdigit():
+                continue
+            if ch.isspace():
+                state = 3
+            elif ch in ",;、":
+                state = 0
+            else:
+                return None
+        else:
+            if ch.isspace():
+                continue
+            if ch in ",;、":
+                state = 0
+            else:
+                return None
+    start = bracket_idx
+    while start > 0 and segment[start - 1] in " \t":
+        start -= 1
+    return start
 
 
 def _find_closing_backticks(text: str, start: int, run_len: int) -> int:
@@ -112,23 +149,23 @@ def _find_closing_backticks(text: str, start: int, run_len: int) -> int:
 
 
 def _prose_segments(text: str) -> tuple[list[tuple[int, int]], int | None]:
-    """Return non-code prose spans and optional start index of an unclosed backtick span containing '['."""
+    """Return non-code prose spans and optional start index of a bounded unclosed inline-code span."""
     segments: list[tuple[int, int]] = []
     prose_start = 0
     index = 0
     length = len(text)
     code_fence: str | None = None
-    unclosed_code_bracket_start: int | None = None
+    unclosed_code_start: int | None = None
 
     while index < length:
         line_start = index == 0 or text[index - 1] == "\n"
         if line_start:
-            fence_match = re.match(r"^( {0,3})(`{3,}|~{3,})", text[index:])
+            fence_match = _FENCE_OPEN_RE.match(text, index)
             if fence_match:
                 marker = fence_match.group(2)
                 nl_idx = text.find("\n", index)
                 line_end = length if nl_idx == -1 else nl_idx + 1
-                suffix = text[index + len(fence_match.group(0)) : line_end].strip()
+                suffix = text[fence_match.end() : line_end].strip()
                 if code_fence is None:
                     if index > prose_start:
                         segments.append((prose_start, index))
@@ -147,7 +184,8 @@ def _prose_segments(text: str) -> tuple[list[tuple[int, int]], int | None]:
                     continue
 
         if code_fence is not None:
-            index += 1
+            nl_idx = text.find("\n", index)
+            index = length if nl_idx == -1 else nl_idx + 1
             continue
 
         if text[index] == "`":
@@ -162,10 +200,15 @@ def _prose_segments(text: str) -> tuple[list[tuple[int, int]], int | None]:
                 prose_start = span_end
                 index = span_end
                 continue
-            if "[" in text[index + run_len :] and unclosed_code_bracket_start is None:
+            after_open = text[index + run_len :]
+            if (
+                unclosed_code_start is None
+                and "\n\n" not in after_open
+                and len(after_open) <= _MAX_PENDING_INLINE_CODE_CHARS
+            ):
                 if index > prose_start:
                     segments.append((prose_start, index))
-                unclosed_code_bracket_start = index
+                unclosed_code_start = index
                 prose_start = length
                 break
             index += run_len
@@ -175,7 +218,7 @@ def _prose_segments(text: str) -> tuple[list[tuple[int, int]], int | None]:
 
     if code_fence is None and prose_start < length:
         segments.append((prose_start, length))
-    return segments, unclosed_code_bracket_start
+    return segments, unclosed_code_start
 
 
 def _split_unbuffered_citation_tail(text: str) -> tuple[str, str]:
@@ -183,27 +226,25 @@ def _split_unbuffered_citation_tail(text: str) -> tuple[str, str]:
     if not text:
         return "", ""
 
-    segments, unclosed_code_bracket_start = _prose_segments(text)
+    segments, unclosed_code_start = _prose_segments(text)
     for seg_start, seg_end in segments:
         segment = text[seg_start:seg_end]
         for match in _COMPLETE_CITATION_BRACKET_RE.finditer(segment):
             if _is_zero_math_bracket(match.group(1)):
                 continue
             abs_start = seg_start + match.start()
-            abs_end = seg_start + match.end()
-            # If the bracket ends right before EOF or a partial markdown-link opener, hold it to confirm.
-            if abs_end == len(text) or _has_partial_link_tail(text[abs_end:]):
-                return text[:abs_start], text[abs_start:]
+            while abs_start > seg_start and text[abs_start - 1] in " \t":
+                abs_start -= 1
             return text[:abs_start], text[abs_start:]
 
-    if unclosed_code_bracket_start is not None:
-        return text[:unclosed_code_bracket_start], text[unclosed_code_bracket_start:]
+    if unclosed_code_start is not None:
+        return text[:unclosed_code_start], text[unclosed_code_start:]
 
     if segments and segments[-1][1] == len(text):
         seg_start, seg_end = segments[-1]
-        incomplete_match = _INCOMPLETE_CITATION_TAIL_RE.search(text[seg_start:seg_end])
-        if incomplete_match:
-            abs_start = seg_start + incomplete_match.start()
+        incomplete_rel = _find_incomplete_citation_tail_start(text[seg_start:seg_end])
+        if incomplete_rel is not None:
+            abs_start = seg_start + incomplete_rel
             return text[:abs_start], text[abs_start:]
 
     stripped = text.rstrip(" \t")
@@ -212,23 +253,31 @@ def _split_unbuffered_citation_tail(text: str) -> tuple[str, str]:
     return text, ""
 
 
-def _compute_unstreamed_suffix(streamed: str, canonical: str) -> str:
-    """Return only the unstreamed remainder of canonical output without duplicating or dropping text."""
+def _compute_unstreamed_suffix(
+    streamed: str,
+    canonical: str,
+    *,
+    post_tool_turn: bool = False,
+) -> str:
+    """Return only the unstreamed remainder of canonical output without duplicating or corrupting text."""
     if not canonical:
         return ""
     if not streamed:
         return canonical
     if canonical.startswith(streamed):
         return canonical[len(streamed) :]
-    norm_streamed = re.sub(r"[ \t]+([，。！？；：,.!?;:])", r"\1", streamed.lstrip())
+    norm_streamed = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", streamed.lstrip())
     if norm_streamed and canonical.startswith(norm_streamed):
         return canonical[len(norm_streamed) :]
-    lhs = norm_streamed or streamed.lstrip()
-    lcp = 0
-    max_len = min(len(lhs), len(canonical))
-    while lcp < max_len and lhs[lcp] == canonical[lcp]:
-        lcp += 1
-    return canonical[lcp:]
+    if not post_tool_turn:
+        norm_trimmed = norm_streamed.rstrip(" \t\r\n")
+        if norm_trimmed and canonical.startswith(norm_trimmed):
+            tail = canonical[len(norm_trimmed) :]
+            if not tail or not tail[0].isalnum():
+                return tail
+    if streamed[-1].isspace():
+        return canonical
+    return f"\n\n{canonical}"
 
 
 @router.post("/{agent_id}/chat/completions")
@@ -308,6 +357,7 @@ async def chat_completions(
             buffered_parts: list[str] = []
             pending_bracket = ""
             should_buffer = bool(plan.citations or plan.session_citations)
+            streamed_before_tool = False
             errored = False
             final_degraded = initial_degraded
             final_degraded_reason = initial_degraded_reason
@@ -339,6 +389,8 @@ async def chat_completions(
                             pending_bracket = ""
                 elif event.type == EventType.TOOL_STARTED.value:
                     if payload.get("name") in {"search_context", "get_entity"}:
+                        if not should_buffer and streamed_parts:
+                            streamed_before_tool = True
                         should_buffer = True
                         if pending_bracket:
                             buffered_parts.append(pending_bracket)
@@ -365,7 +417,11 @@ async def chat_completions(
                         final_degraded_reason = payload.get("degraded_reason") or final_degraded_reason
                     if "citations" in payload and payload["citations"] is not None:
                         final_citations = list(payload["citations"])
-                    suffix = _compute_unstreamed_suffix(streamed, canonical)
+                    suffix = _compute_unstreamed_suffix(
+                        streamed,
+                        canonical,
+                        post_tool_turn=streamed_before_tool,
+                    )
                     if suffix:
                         yield chunk({"content": suffix})
                 elif event.type in (EventType.RUN_FAILED.value, EventType.RUN_CANCELLED.value):
