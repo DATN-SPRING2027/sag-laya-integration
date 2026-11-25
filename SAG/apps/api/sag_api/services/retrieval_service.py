@@ -328,10 +328,9 @@ def _lexical_relevance(
     raw_terms = [term for term in raw_terms if term]
     filtered_terms = [term for term in raw_terms if term not in _LEXICAL_STOPWORDS]
     terms = filtered_terms if filtered_terms else raw_terms
-    from sag_api.services.query_analysis import _remove_query_noise
 
     phrase = effective.normalized_phrase
-    spaced_phrase = _normalize_spaced_lexical_text(_remove_query_noise(query))
+    spaced_phrase = _normalize_spaced_lexical_text(unicodedata.normalize("NFC", query or "").strip().lower())
 
     score = 0.0
     if _phrase_matches_text(phrase, spaced_phrase, text, spaceless_text=text_compact):
@@ -758,9 +757,7 @@ def rerank_sections(
             idf *= 1.45
         term_weights[term] = idf
 
-    from sag_api.services.query_analysis import _remove_query_noise
-
-    spaced_query_phrase = _normalize_spaced_lexical_text(_remove_query_noise(query))
+    spaced_query_phrase = _normalize_spaced_lexical_text(unicodedata.normalize("NFC", query or "").strip().lower())
     top_semantic_score = max(semantic_scores.values(), default=0.0)
     lexical_scores: dict[tuple[str, str], float] = {}
     for key, section in merged.items():

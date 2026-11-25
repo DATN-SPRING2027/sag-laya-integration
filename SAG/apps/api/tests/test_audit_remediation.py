@@ -1237,10 +1237,12 @@ def test_vietnamese_entity_lexer_and_multihop_detection() -> None:
     ml_terms = terms(multilang_block.normalized_text)
     assert "個人" in ml_terms and "情報" in ml_terms and "保護" in ml_terms
 
-    # 2. Vietnamese multi-hop query feature detection (domain-agnostic relational/comparative structure)
+    # 2. Structural multi-clause detection in extract_query_features & semantic multi-hop via router hint
+    from sag_api.services.query_strategy_planner import plan_query
+
     mh_q1 = "Mối liên hệ giữa dịch vụ xác thực và cổng thanh toán dẫn đến lỗi gì?"
     mh_q2 = "Sự khác nhau giữa quy trình phê duyệt cấp 1 và quy trình khẩn cấp là gì, và khi nào cần áp dụng?"
-    assert extract_query_features(mh_q1).multi_hop is True
+    assert plan_query(mh_q1, retrieval_mode_hint="multi_hop").multi_hop_eligible is True
     assert extract_query_features(mh_q2).multi_hop is True
 
 

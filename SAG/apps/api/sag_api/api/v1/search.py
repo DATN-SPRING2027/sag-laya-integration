@@ -122,6 +122,12 @@ async def _build_query_route(
             "fallback_used": True,
             "fallback_reason": "decision_route_error",
             "reason_codes": ["DECISION_ROUTE_ERROR"],
+            "order_mode": "relevance",
+            "explicit_count": None,
+            "target_unit": "passage",
+            "is_catalog_query": False,
+            "retrieval_mode_hint": "auto",
+            "subqueries": [],
         }
         route_error = True
 
@@ -130,7 +136,7 @@ async def _build_query_route(
         requested_mode=requested_retrieval_mode,
         features=analysis.features,
         requested_top_k=requested_top_k,
-        answer_shape=str(decision.get("answer_shape") or "") or None,
+        route_decision=decision,
     )
 
     confidence = decision.get("confidence", 0.0)

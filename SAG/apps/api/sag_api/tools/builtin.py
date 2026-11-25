@@ -158,6 +158,7 @@ class SearchContextTool(Tool):
 
     async def invoke(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         import unicodedata
+        from dataclasses import replace
 
         query = unicodedata.normalize("NFC", (args.get("query") or "")).strip()
         if not query or not ctx.sources:
@@ -170,15 +171,12 @@ class SearchContextTool(Tool):
         from sag_api.services.retrieval_plan import (
             OutputMode,
             TargetUnit,
-            is_unfiltered_scope_catalog_query,
+            rebuild_retrieval_plan_with_top_k,
         )
         from sag_api.services.search_unit_retrieval_service import retrieve_search_unit_sections
 
-        auto_plan = plan_query(query)
-        unfiltered_catalog = is_unfiltered_scope_catalog_query(
-            query,
-            [str(getattr(s, "name", "") or "") for s in ctx.sources],
-        )
+        auto_plan = plan_query(query, route_decision=ctx.route_decision)
+        unfiltered_catalog = auto_plan.retrieval_plan.is_unfiltered_catalog
         if auto_plan.retrieval_plan.target == TargetUnit.DOCUMENT and auto_plan.retrieval_plan.output in {
             OutputMode.LIST,
             OutputMode.COUNT,
@@ -186,13 +184,22 @@ class SearchContextTool(Tool):
             min_catalog_k = 50 if unfiltered_catalog else auto_plan.retrieval_plan.cardinality.effective_n
             limit = max(limit or 0, min_catalog_k)
 
+        effective_plan = (
+            replace(
+                auto_plan,
+                retrieval_plan=rebuild_retrieval_plan_with_top_k(auto_plan.retrieval_plan, limit),
+            )
+            if limit is not None
+            else auto_plan
+        )
+
         outcome = await retrieve_search_unit_sections(
             ctx.engine_manager,
             ctx.sources,
             query,
             principal=ctx.principal,
             top_k=limit,
-            query_strategy_plan=plan_query(query, requested_top_k=limit),
+            query_strategy_plan=effective_plan,
         )
         routing_trace = outcome.stats.get("routing")
         sections = [

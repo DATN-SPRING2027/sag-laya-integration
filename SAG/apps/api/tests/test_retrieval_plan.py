@@ -36,10 +36,11 @@ def test_default_passage_answer_preserves_top5() -> None:
 
 
 @pytest.mark.parametrize(
-    "query,expected_target,expected_output,expected_n,expected_source,expected_per_doc",
+    "query,route_kwargs,expected_target,expected_output,expected_n,expected_source,expected_per_doc",
     [
         (
             "Hãy liệt kê 20 file liên quan đến chính sách bảo mật",
+            {"answer_shape": "document_list", "explicit_count": 20},
             TargetUnit.DOCUMENT,
             OutputMode.LIST,
             20,
@@ -48,6 +49,7 @@ def test_default_passage_answer_preserves_top5() -> None:
         ),
         (
             "Mở 20 file tài liệu về kiến trúc hệ thống",
+            {"answer_shape": "open_document", "explicit_count": 20},
             TargetUnit.DOCUMENT,
             OutputMode.OPEN,
             20,
@@ -56,6 +58,7 @@ def test_default_passage_answer_preserves_top5() -> None:
         ),
         (
             "Find top 15 documents about disaster recovery",
+            {"answer_shape": "document_list", "explicit_count": 15},
             TargetUnit.DOCUMENT,
             OutputMode.LIST,
             15,
@@ -64,6 +67,7 @@ def test_default_passage_answer_preserves_top5() -> None:
         ),
         (
             "Có bao nhiêu tài liệu quy định về phân vùng bảo mật?",
+            {"answer_shape": "exhaustive_count", "is_catalog_query": True},
             TargetUnit.DOCUMENT,
             OutputMode.COUNT,
             50,
@@ -72,6 +76,7 @@ def test_default_passage_answer_preserves_top5() -> None:
         ),
         (
             "Tóm tắt tất cả các tài liệu trong dự án",
+            {"answer_shape": "summarize_set", "is_catalog_query": True},
             TargetUnit.DOCUMENT,
             OutputMode.SUMMARIZE,
             10,
@@ -80,6 +85,7 @@ def test_default_passage_answer_preserves_top5() -> None:
         ),
         (
             "Mở tài liệu hướng dẫn vận hành",
+            {"answer_shape": "open_document", "explicit_count": 1},
             TargetUnit.DOCUMENT,
             OutputMode.OPEN,
             1,
@@ -88,6 +94,7 @@ def test_default_passage_answer_preserves_top5() -> None:
         ),
         (
             "So sánh cơ chế phân quyền giữa phiên bản v1 và v2",
+            {"answer_shape": "multi_facet_compare"},
             TargetUnit.PASSAGE,
             OutputMode.COMPARE,
             8,
@@ -98,13 +105,14 @@ def test_default_passage_answer_preserves_top5() -> None:
 )
 def test_seven_axis_retrieval_plan_compilation(
     query: str,
+    route_kwargs: dict[str, object],
     expected_target: TargetUnit,
     expected_output: OutputMode,
     expected_n: int,
     expected_source: CountSource,
     expected_per_doc: int | None,
 ) -> None:
-    strat = plan_query(query)
+    strat = plan_query(query, route_decision=route_kwargs)
     plan = strat.retrieval_plan
     assert plan.target == expected_target
     assert plan.output == expected_output
@@ -116,17 +124,17 @@ def test_seven_axis_retrieval_plan_compilation(
 def test_cardinality_precedence_api_over_query_over_default_and_clamping() -> None:
     # 1. Query asks for 20 files -> effective_n = 20 (QUERY)
     q = "Liệt kê 20 file liên quan đến thanh toán"
-    plan_q = build_retrieval_plan(q)
+    plan_q = build_retrieval_plan(q, answer_shape="document_list", explicit_count=20)
     assert plan_q.cardinality.effective_n == 20
     assert plan_q.cardinality.count_source == CountSource.QUERY
 
     # 2. API caller explicitly passes top_k=12 -> overrides query count (API > QUERY)
-    plan_api = build_retrieval_plan(q, requested_top_k=12)
+    plan_api = build_retrieval_plan(q, answer_shape="document_list", explicit_count=20, requested_top_k=12)
     assert plan_api.cardinality.effective_n == 12
     assert plan_api.cardinality.count_source == CountSource.API
 
     # 3. Query asks for 500 files -> clamped to max_cap=50
-    plan_clamped = build_retrieval_plan("Liệt kê 500 file liên quan")
+    plan_clamped = build_retrieval_plan("Liệt kê 500 file liên quan", answer_shape="document_list", explicit_count=500)
     assert plan_clamped.cardinality.effective_n == 50
     assert plan_clamped.cardinality.max_cap == 50
 
@@ -145,7 +153,10 @@ def test_field_predicate_validation_and_fallback() -> None:
 
 def test_temporal_order_and_parallel_clause_decomposition() -> None:
     strat = plan_query(
-        "Liệt kê 10 tài liệu mới nhất về bảo mật, và ai là người phê duyệt chính sách?"
+        "Liệt kê 10 tài liệu mới nhất về bảo mật, và ai là người phê duyệt chính sách?",
+        answer_shape="document_list",
+        order_mode="time_desc",
+        explicit_count=10,
     )
     plan = strat.retrieval_plan
     assert plan.target == TargetUnit.DOCUMENT

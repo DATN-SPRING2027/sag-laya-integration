@@ -47,37 +47,51 @@ def test_vietnamese_nfd_and_nfc_produce_identical_analysis_and_sparse_vectors(
 
 
 def test_vietnamese_document_list_and_catalog_query_shape_detection() -> None:
-    """Vietnamese catalog questions with modifiers must compile to DOCUMENT+LIST without false positives."""
-    design_plan = plan_query("Trong project Design có những tài liệu thiết kế nào?").retrieval_plan
+    """Vietnamese catalog questions with structured route metadata compile to DOCUMENT+LIST."""
+    design_plan = plan_query(
+        "Trong project Design có những tài liệu thiết kế nào?",
+        answer_shape="document_list",
+        is_catalog_query=False,
+    ).retrieval_plan
     assert design_plan.target == TargetUnit.DOCUMENT
     assert design_plan.output == OutputMode.LIST
     assert design_plan.per_document_limit == 1
 
-    fe_plan = plan_query("Dự án Frontend hiện có những tài liệu nào sẵn sàng tra cứu?").retrieval_plan
+    fe_plan = plan_query(
+        "Dự án Frontend hiện có những tài liệu nào sẵn sàng tra cứu?",
+        answer_shape="document_list",
+        is_catalog_query=True,
+    ).retrieval_plan
     assert fe_plan.target == TargetUnit.DOCUMENT
     assert fe_plan.output == OutputMode.LIST
 
-    all_list_plan = plan_query("Liệt kê tất cả các tài liệu hiện có trong dự án Database").retrieval_plan
+    all_list_plan = plan_query(
+        "Liệt kê tất cả các tài liệu hiện có trong dự án Database",
+        answer_shape="document_list",
+        is_catalog_query=True,
+    ).retrieval_plan
     assert all_list_plan.target == TargetUnit.DOCUMENT
     assert all_list_plan.output == OutputMode.LIST
     assert all_list_plan.cardinality.mode == CardinalityMode.ALL
     assert all_list_plan.cardinality.effective_n == 50
 
-    # Factual citation attribution questions must remain PASSAGE + ANSWER
-    fact_q1 = plan_query("Theo tài liệu nào frontend sử dụng Next.js?").retrieval_plan
+    # Factual citation attribution questions remain PASSAGE + ANSWER
+    fact_q1 = plan_query("Theo tài liệu nào frontend sử dụng Next.js?", answer_shape="fact_answer").retrieval_plan
     assert fact_q1.target == TargetUnit.PASSAGE
     assert fact_q1.output == OutputMode.ANSWER
 
-    fact_q2 = plan_query("Trong tài liệu nào mô tả kiến trúc BFF?").retrieval_plan
+    fact_q2 = plan_query("Trong tài liệu nào mô tả kiến trúc BFF?", answer_shape="fact_answer").retrieval_plan
     assert fact_q2.target == TargetUnit.PASSAGE
     assert fact_q2.output == OutputMode.ANSWER
 
 
 def test_vietnamese_relation_cues_and_entity_filename_diversity_selection() -> None:
-    """Queries naming a domain acronym and 'quan hệ' must admit the matching schema file alongside README."""
+    """Queries naming a domain acronym must admit the matching schema file alongside README."""
+    from sag_api.services.query_strategy_planner import RetrievalMode
+
     query = "Các collection trong cơ sở dữ liệu IAM gồm những gì và quan hệ ra sao?"
-    features = extract_query_features(query)
-    assert any("quan hệ" in cue for cue in features.relation_cues)
+    strat = plan_query(query, retrieval_mode_hint="entity_relational")
+    assert strat.primary_strategy == RetrievalMode.ENTITY_RELATIONAL
 
     candidates: list[RetrievedSection] = []
     # Index overview README.md with 4 chunks (top score 0.86)
@@ -185,6 +199,7 @@ async def test_search_context_tool_preserves_catalog_cardinality_and_exposes_fil
         principal=None,
         persona={"top_k": 5},
         evidence_token_budget=16000,
+        route_decision={"answer_shape": "document_list", "is_catalog_query": True},
     )
     nfd_catalog_q = unicodedata.normalize("NFD", "Liệt kê tất cả các tài liệu hiện có trong dự án Database")
     result = await tool.invoke(
@@ -203,25 +218,34 @@ async def test_search_context_tool_preserves_catalog_cardinality_and_exposes_fil
 
 @pytest.mark.asyncio
 async def test_initial_tool_choice_clarification_vs_followup_and_capability_greeting():
-    from sag_agent import AgentTool, ToolSpec
+    from sag_agent import AgentTool, ToolCapability, ToolSpec
     from sag_api.services.agent_service import _initial_tool_choice
 
     async def noop(args, ctx):
         return ""
 
     search_tool = AgentTool(
-        spec=ToolSpec(name="search_context", description="Search knowledge documents", parameters={"type": "object"}),
+        spec=ToolSpec(
+            name="search_context",
+            description="Search knowledge documents",
+            parameters={"type": "object"},
+            capabilities=frozenset({ToolCapability.KNOWLEDGE_SEARCH}),
+        ),
         executor=noop,
     )
     tools = (search_tool,)
 
-    # 1. Underspecified first-turn pronoun questions must clarify first ("none"), not blindly search
+    # 1. Underspecified queries with needs_clarification=True must clarify first ("none"), not blindly search
     first_turn_choice = await _initial_tool_choice(
         "Nó hoạt động ra sao?",
         tools,
         knowledge_only=True,
         scoped=True,
-        route_decision={"is_chitchat": False, "confidence": 0.1},
+        route_decision={
+            "coarse_intent": "AMBIGUOUS",
+            "intent_flags": {"needs_retrieval": False, "needs_clarification": True},
+            "confidence": 0.9,
+        },
         has_prior_turns=False,
     )
     assert first_turn_choice == "none"
@@ -231,18 +255,27 @@ async def test_initial_tool_choice_clarification_vs_followup_and_capability_gree
         tools,
         knowledge_only=True,
         scoped=True,
-        route_decision={"is_chitchat": False, "confidence": 0.1},
+        route_decision={
+            "coarse_intent": "AMBIGUOUS",
+            "intent_flags": {"needs_retrieval": False, "needs_clarification": True},
+            "confidence": 0.9,
+        },
         has_prior_turns=False,
     )
     assert second_first_turn == "none"
 
-    # 2. In a multi-turn follow-up (has_prior_turns=True), the same pronoun question MUST search knowledge
+    # 2. In a multi-turn follow-up where router sees prior turns and needs_retrieval=True, search knowledge
     followup_choice = await _initial_tool_choice(
         "Nó hoạt động ra sao?",
         tools,
         knowledge_only=True,
         scoped=True,
-        route_decision={"is_chitchat": False, "confidence": 0.1},
+        route_decision={
+            "coarse_intent": "KNOWLEDGE",
+            "question_scope": "project",
+            "intent_flags": {"needs_retrieval": True, "needs_clarification": False},
+            "confidence": 0.9,
+        },
         has_prior_turns=True,
     )
     assert followup_choice == {"type": "function", "function": {"name": "search_context"}}
@@ -254,7 +287,12 @@ async def test_initial_tool_choice_clarification_vs_followup_and_capability_gree
         tools,
         knowledge_only=True,
         scoped=True,
-        route_decision={"is_chitchat": False, "confidence": 0.1},
+        route_decision={
+            "coarse_intent": "CHAT",
+            "question_scope": "application",
+            "intent_flags": {"needs_retrieval": False, "needs_clarification": False},
+            "confidence": 0.95,
+        },
         has_prior_turns=False,
     )
     assert greeting_cap == "none"
@@ -264,7 +302,12 @@ async def test_initial_tool_choice_clarification_vs_followup_and_capability_gree
         tools,
         knowledge_only=True,
         scoped=True,
-        route_decision={"is_chitchat": False, "confidence": 0.1},
+        route_decision={
+            "coarse_intent": "KNOWLEDGE",
+            "question_scope": "project",
+            "intent_flags": {"needs_retrieval": True, "needs_clarification": False},
+            "confidence": 0.92,
+        },
         has_prior_turns=False,
     )
     assert project_cap == {"type": "function", "function": {"name": "search_context"}}
@@ -319,35 +362,35 @@ def test_finalize_answer_citations_accepts_non_url_parenthetical_after_bracket_a
     assert normalized[0]["mapped"] is True
     assert normalized[0]["claim_level"] == "claim"
 def test_unfiltered_scope_catalog_recognizes_named_project_scope_but_rejects_topic_filter():
-    from sag_api.services.retrieval_plan import is_unfiltered_scope_catalog_query
-
-    fe_sources = ["Project 6ad8834abef68a3326035eeb"]
-    assert is_unfiltered_scope_catalog_query(
-        "Danh sách các tài liệu đã sẵn sàng tra cứu trong project Frontend",
-        fe_sources,
-    )
-    assert is_unfiltered_scope_catalog_query(
+    unfiltered = build_retrieval_plan(
         "Trong project Frontend hiện có những tài liệu nào đã sẵn sàng tra cứu? Hãy liệt kê đầy đủ tên tệp.",
-        fe_sources,
+        answer_shape="document_list",
+        is_catalog_query=True,
     )
-    assert is_unfiltered_scope_catalog_query(
-        "Project Database hiện có bao nhiêu tài liệu sẵn sàng tìm kiếm? "
-        "Hãy nêu con số tổng cộng và liệt kê tên các tệp đó.",
-        ["Project 6addb493601e4bc926ed440c"],
-    )
-    assert is_unfiltered_scope_catalog_query(
-        "Trong project SAG hiện có những tài liệu nào sẵn sàng tra cứu?",
-        ["Project 6addb47a601e4bc926ed43a0"],
-    )
+    assert unfiltered.is_unfiltered_catalog is True
+    assert unfiltered.cardinality.effective_n == 50
 
-    assert not is_unfiltered_scope_catalog_query(
+    count_unfiltered = build_retrieval_plan(
+        "Project Database hiện có bao nhiêu tài liệu sẵn sàng tìm kiếm?",
+        answer_shape="exhaustive_count",
+        is_catalog_query=True,
+    )
+    assert count_unfiltered.is_unfiltered_catalog is True
+
+    topic_filtered = build_retrieval_plan(
         "Danh sách các tài liệu về Redis trong project Backend",
-        ["Project 6ad7758334bd88b3f2cc844d"],
+        answer_shape="document_list",
+        is_catalog_query=False,
     )
-    assert not is_unfiltered_scope_catalog_query(
-        "Liệt kê các tài liệu xác thực JWT trong project Frontend",
-        fe_sources,
+    assert topic_filtered.is_unfiltered_catalog is False
+
+    capped_explicit = build_retrieval_plan(
+        "Liệt kê 5 tài liệu mới nhất",
+        answer_shape="document_list",
+        explicit_count=5,
+        is_catalog_query=True,
     )
+    assert capped_explicit.is_unfiltered_catalog is False
 
 
 @pytest.mark.asyncio
@@ -405,6 +448,7 @@ async def test_search_context_catalog_query_ignores_project_acronym_anchor_and_e
         persona={},
         citation_offset=0,
         evidence_token_budget=8000,
+        route_decision={"answer_shape": "document_list", "is_catalog_query": True},
     )
     result = await SearchContextTool().invoke(
         {"query": "Trong project SAG hiện có những tài liệu nào sẵn sàng tra cứu?", "top_k": 5},

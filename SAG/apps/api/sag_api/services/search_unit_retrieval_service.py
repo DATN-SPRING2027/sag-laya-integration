@@ -1560,12 +1560,6 @@ async def _hydrate_sibling_sections_for_top_versions(
 _CONTINUOUS_ENTITY_CHAR_RE = re.compile(
     r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\u0e00-\u0eff\u1780-\u17ff\u1000-\u109f]"
 )
-_CONFLICT_LINEAGE_CUE_RE = re.compile(
-    r"(?<!\w)(?:contradict\w*|conflict\w*|discrepanc\w*|mismatch\w*|inconsisten\w*|"
-    r"differ\w*|versus|vs\.?|compare|comparison|reconcil\w*|"
-    r"mâu\s+thuẫn|xung\s+đột|khác\s+nhau|sai\s+lệch|đối\s+chiếu|so\s+sánh)(?!\w)",
-    flags=re.IGNORECASE | re.UNICODE,
-)
 
 
 def _is_cjk_or_continuous_entity(text: str) -> bool:
@@ -1616,7 +1610,7 @@ async def _expand_multi_hop_sections(
     query_single_words = set(re.findall(r"[^\W_]+", query_folded, flags=re.UNICODE))
     allowed_lineage_kinds = (
         {"SUPERSEDED_BY", "CONTRADICTS"}
-        if (not lineage_only or allow_contradiction_lineage or bool(_CONFLICT_LINEAGE_CUE_RE.search(query or "")))
+        if (not lineage_only or allow_contradiction_lineage)
         else {"SUPERSEDED_BY"}
     )
     try:
@@ -1924,18 +1918,13 @@ async def retrieve_search_unit_sections(
     if top_k is not None and plan.retrieval_plan.cardinality.requested_n != top_k:
         from dataclasses import replace
 
-        from sag_api.services.retrieval_plan import build_retrieval_plan
+        from sag_api.services.retrieval_plan import rebuild_retrieval_plan_with_top_k
 
         plan = replace(
             plan,
-            retrieval_plan=build_retrieval_plan(
-                query,
-                requested_top_k=top_k,
-                strategy_mode=plan.primary_strategy.value,
-                clauses=plan.retrieval_plan.decomposition.subqueries,
-                multi_hop=plan.multi_hop_eligible,
-                exact_lookup=plan.primary_strategy.value == "EXACT",
-                constraints=plan.retrieval_plan.constraints,
+            retrieval_plan=rebuild_retrieval_plan_with_top_k(
+                plan.retrieval_plan,
+                top_k,
             ),
         )
     effective_top_k = plan.retrieval_plan.cardinality.effective_n
@@ -2808,7 +2797,14 @@ async def _retrieve_search_unit_sections(
                 for s in initial_pool
                 if (s.search_unit_id or s.chunk_id)
             }
+            from sag_api.services.retrieval_plan import AnswerShape
+
             has_required_anchors = int((diversity_stats or {}).get("required_anchor_count", 0) or 0) > 0
+            allow_contradiction = bool(
+                has_required_anchors
+                or effective_plan.retrieval_plan.answer_shape == AnswerShape.MULTI_FACET_COMPARE
+                or effective_plan.primary_strategy.value in {"ENTITY_RELATIONAL", "MULTI_HOP"}
+            )
             t_graph_start = time.perf_counter()
             expanded_sections = await _expand_multi_hop_sections(
                 seed_sections=list(seed_pool),
@@ -2820,7 +2816,7 @@ async def _retrieve_search_unit_sections(
                 limit=min(settings.search_unit_candidate_limit, max(8, requested_limit * 2)),
                 lineage_only=not is_multi_hop_mode,
                 query=query,
-                allow_contradiction_lineage=has_required_anchors,
+                allow_contradiction_lineage=allow_contradiction,
                 preloaded_k_index=(scope_k_index_holder[0] if scope_k_index_holder else None),
             )
             t_graph_expansion_ms = round((time.perf_counter() - t_graph_start) * 1000, 2)
@@ -2902,14 +2898,14 @@ async def _retrieve_search_unit_sections(
         graph_expansion_attempted=graph_expansion_attempted,
         graph_expanded_candidates=graph_expanded_candidates,
     )
-    from sag_api.services.retrieval_plan import OutputMode, is_unfiltered_scope_catalog_query
+    from sag_api.services.retrieval_plan import OutputMode
 
     max_catalog_slots = selection_limit if selection_limit is not None else requested_limit
     if (
         per_doc_limit == 1
         and strategy_plan.retrieval_plan.output in {OutputMode.LIST, OutputMode.COUNT}
+        and strategy_plan.retrieval_plan.is_unfiltered_catalog
         and len(selected) < max_catalog_slots
-        and is_unfiltered_scope_catalog_query(query, [s.name for s in sources])
     ):
         represented_vids = {str(section.document_version_id or "") for section in selected}
         missing_vids = [

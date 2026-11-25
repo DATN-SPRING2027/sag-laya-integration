@@ -13,10 +13,8 @@ orthogonal 7-axis specification:
 
 from __future__ import annotations
 
-import re
 import unicodedata
-from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
 
@@ -179,6 +177,8 @@ class RetrievalPlan:
     order: OrderMode
     decomposition: DecompositionSpec
     output: OutputMode
+    answer_shape: AnswerShape = AnswerShape.FACT_ANSWER
+    is_unfiltered_catalog: bool = False
     fallback_used: bool = False
     unsupported_reason: str | None = None
 
@@ -197,233 +197,76 @@ class RetrievalPlan:
             "order": self.order.value,
             "decomposition": self.decomposition.as_dict(),
             "output": self.output.value,
+            "answer_shape": self.answer_shape.value,
+            "is_unfiltered_catalog": self.is_unfiltered_catalog,
             "per_document_limit": self.per_document_limit,
             "fallback_used": self.fallback_used,
             "unsupported_reason": self.unsupported_reason,
         }
 
 
-_DOC_UNIT_WORDS = (
-    r"file|files|tệp|tập\s+tin|tài\s+liệu|văn\s+bản|hồ\s+sơ|báo\s+cáo|"
-    r"chính\s+sách|quy\s+định|quy\s+trình|hợp\s+đồng|biên\s+bản|"
-    r"document|documents|doc|docs|report|reports|policy|policies|contract|contracts|paper|papers|runbook|runbooks|spec|specs"
-)
-_TOPIC_UNIT_WORDS = r"chủ\s+đề|vấn\s+đề\s+chính|nhóm\s+chủ\s+đề|topic|topics|theme|themes"
-_PASSAGE_UNIT_WORDS = (
-    r"đoạn|mục|phần|kết\s+quả|bằng\s+chứng| trích\s+đoạn|"
-    r"passage|passages|section|sections|chunk|chunks|result|results|snippet|snippets"
-)
-
-_EXPLICIT_DOC_COUNT_RE = re.compile(
-    rf"(?i)(?:(?:\b(?:top|mở|liệt\s+kê|tìm|lấy|hiển\s+thị|cho\s+tôi|xem|list|show|open|find|get|give\s+me|return)\s+(?:ra\s+|cho\s+tôi\s+)?(\d{{1,3}})\s+(?:các\s+|những\s+)?(?:{_DOC_UNIT_WORDS})\b)"
-    rf"|(?:\b(\d{{1,3}})\s+(?:{_DOC_UNIT_WORDS})\s+(?:liên\s+quan|gần\s+nhất|mới\s+nhất|đầu\s+tiên|quan\s+trọng|chính|khác\s+nhau|relevant|related|recent|latest|top|matching|distinct)\b)"
-    rf"|(?:\b(?:mở|liệt\s+kê|tìm|lấy|xem|list|show|open|find|get)\s+(?:đến\s+|tới\s+|khoảng\s+|tối\s+đa\s+|up\s+to\s+)?(\d{{1,3}})\s+(?:{_DOC_UNIT_WORDS})\b))"
-)
-_EXPLICIT_TOPIC_COUNT_RE = re.compile(
-    rf"(?i)\b(?:top|liệt\s+kê|tìm|lấy|cho\s+biết|list|show|find|get|identify)?\s*(\d{{1,3}})\s+(?:{_TOPIC_UNIT_WORDS})\b"
-)
-_EXPLICIT_PASSAGE_COUNT_RE = re.compile(
-    rf"(?i)\b(?:top|liệt\s+kê|tìm|lấy|hiển\s+thị|list|show|find|get|return)\s+(\d{{1,3}})\s+(?:{_PASSAGE_UNIT_WORDS})\b"
-)
-_DOC_COUNT_QUESTION_RE = re.compile(
-    rf"(?i)(?:\b(?:có\s+bao\s+nhiêu|tổng\s+số|đếm\s+số(?:\s+lượng)?|số\s+lượng)\s+(?:các\s+|những\s+)?(?:{_DOC_UNIT_WORDS})\b"
-    rf"|\bhow\s+many\s+(?:[a-z_-]+\s+){{0,2}}(?:{_DOC_UNIT_WORDS})\b)"
-)
-_DOC_ALL_RE = re.compile(
-    rf"(?i)(?:\b(?:tất\s+cả|toàn\s+bộ|mọi)\s+(?:các\s+|những\s+)?(?:{_DOC_UNIT_WORDS})\b"
-    rf"|\b(?:all|every)\s+(?:the\s+)?(?:[a-z_-]+\s+){{0,2}}(?:{_DOC_UNIT_WORDS})\b)"
-)
-_DOC_LIST_RE = re.compile(
-    rf"(?i)(?:\b(?:liệt\s+kê|danh\s+sách|kể\s+tên|cho\s+biết\s+các)\b.*\b(?:{_DOC_UNIT_WORDS})\b"
-    rf"|\b(?:những|các)\s+(?:{_DOC_UNIT_WORDS})(?:\s+[^\W\d_][\w-]*){{0,3}}\s+nào\b"
-    rf"|(?<!theo\s)(?<!trong\s)\b(?:hiện\s+có|gồm(?:\s+có)?|bao\s+gồm|có)\s+(?:những\s+|các\s+)?(?:{_DOC_UNIT_WORDS})(?:\s+[^\W\d_][\w-]*){{0,3}}\s+nào\b"
-    rf"|\b(?:liệt\s+kê|danh\s+sách|list|show\s+all|what\s+are\s+the|which)\s+(?:các\s+|những\s+|the\s+)?(?:[^\W\d_][\w-]*\s+){{0,2}}(?:{_DOC_UNIT_WORDS})\b)",
-    re.UNICODE,
-)
-_DOC_OPEN_RE = re.compile(
-    rf"(?i)^\s*(?:hãy\s+|vui\s+lòng\s+|please\s+)?(?:mở|xem\s+nội\s+dung|hiển\s+thị\s+toàn\s+bộ|open|view)\s+(?:{_DOC_UNIT_WORDS})\b"
-)
-_DOC_SUMMARIZE_RE = re.compile(
-    rf"(?i)\b(?:tóm\s+tắt|tổng\s+hợp|summarize|summary\s+of)\s+(?:tất\s+cả\s+|toàn\s+bộ\s+|mọi\s+|all\s+|every\s+)?(?:các\s+|những\s+|the\s+)?(?:{_DOC_UNIT_WORDS})\b"
-)
-_COMPARE_RE = re.compile(
-    r"(?i)\b(?:so\s+sánh|khác\s+nhau\s+giữa|khác\s+gì\s+giữa|điểm\s+khác\s+biệt\s+giữa|compare|comparison\s+between|difference\s+between|differences\s+between|versus|vs\.?)\b"
-)
-_TIME_DESC_RE = re.compile(
-    r"(?i)\b(?:mới\s+nhất|gần\s+đây\s+nhất|hiện\s+hành|latest|newest|most\s+recent)\b"
-)
-_TIME_ASC_RE = re.compile(
-    r"(?i)\b(?:cũ\s+nhất|đầu\s+tiên|theo\s+thứ\s+tự\s+thời\s+gian|oldest|earliest|chronological)\b"
-)
+def _normalize_answer_shape(answer_shape: str | None) -> AnswerShape:
+    normalized = (answer_shape or "").strip().lower()
+    if normalized in VALID_ANSWER_SHAPES:
+        return AnswerShape(normalized)
+    return AnswerShape.FACT_ANSWER
 
 
-@dataclass(frozen=True, slots=True)
-class QueryShapeSignals:
-    answer_shape: AnswerShape
-    target: TargetUnit
-    output: OutputMode
-    explicit_count: int | None
-    cardinality_mode: CardinalityMode
-    order: OrderMode
+def _normalize_order_mode(order_mode: str | None) -> OrderMode:
+    normalized = (order_mode or "").strip().lower()
+    if normalized == "time_desc":
+        return OrderMode.TIME_DESC
+    if normalized == "time_asc":
+        return OrderMode.TIME_ASC
+    if normalized == "field":
+        return OrderMode.FIELD
+    return OrderMode.RELEVANCE
 
 
-def extract_query_cardinality_and_shape(query: str) -> QueryShapeSignals:
-    """Deterministically extract explicit count and target/output shape from a query."""
-    cleaned = unicodedata.normalize("NFC", query or "").strip()
-    if not cleaned:
-        return QueryShapeSignals(
-            answer_shape=AnswerShape.FACT_ANSWER,
-            target=TargetUnit.PASSAGE,
-            output=OutputMode.ANSWER,
-            explicit_count=None,
-            cardinality_mode=CardinalityMode.N,
-            order=OrderMode.RELEVANCE,
-        )
-
-    order = OrderMode.RELEVANCE
-    if _TIME_DESC_RE.search(cleaned):
-        order = OrderMode.TIME_DESC
-    elif _TIME_ASC_RE.search(cleaned):
-        order = OrderMode.TIME_ASC
-
-    # 1. Explicit document count (e.g., "liệt kê 20 file liên quan", "mở 20 file", "top 15 documents")
-    doc_count_match = _EXPLICIT_DOC_COUNT_RE.search(cleaned)
-    if doc_count_match:
-        raw_num = next((g for g in doc_count_match.groups() if g is not None), None)
-        count_val = int(raw_num) if raw_num is not None else None
-        is_open = bool(re.search(r"(?i)\b(?:mở|open)\b", cleaned))
-        if count_val == 1 and is_open:
-            return QueryShapeSignals(
-                answer_shape=AnswerShape.OPEN_DOCUMENT,
-                target=TargetUnit.DOCUMENT,
-                output=OutputMode.OPEN,
-                explicit_count=1,
-                cardinality_mode=CardinalityMode.ONE,
-                order=order,
-            )
-        return QueryShapeSignals(
-            answer_shape=AnswerShape.DOCUMENT_LIST,
-            target=TargetUnit.DOCUMENT,
-            output=OutputMode.OPEN if is_open else OutputMode.LIST,
-            explicit_count=count_val,
-            cardinality_mode=CardinalityMode.N,
-            order=order,
-        )
-
-    # 2. Explicit topic count
-    topic_count_match = _EXPLICIT_TOPIC_COUNT_RE.search(cleaned)
-    if topic_count_match:
-        count_val = int(topic_count_match.group(1))
-        return QueryShapeSignals(
-            answer_shape=AnswerShape.SUMMARIZE_SET,
-            target=TargetUnit.TOPIC,
-            output=OutputMode.LIST,
-            explicit_count=count_val,
-            cardinality_mode=CardinalityMode.N,
-            order=order,
-        )
-
-    # 3. Explicit passage/result count
-    passage_count_match = _EXPLICIT_PASSAGE_COUNT_RE.search(cleaned)
-    if passage_count_match:
-        count_val = int(passage_count_match.group(1))
-        return QueryShapeSignals(
-            answer_shape=AnswerShape.FACT_ANSWER,
-            target=TargetUnit.PASSAGE,
-            output=OutputMode.LIST if count_val > FIXED_SEARCH_TOP_K else OutputMode.ANSWER,
-            explicit_count=count_val,
-            cardinality_mode=CardinalityMode.N,
-            order=order,
-        )
-
-    # 4. Document count question ("có bao nhiêu file/tài liệu", "how many documents")
-    if _DOC_COUNT_QUESTION_RE.search(cleaned):
-        return QueryShapeSignals(
-            answer_shape=AnswerShape.EXHAUSTIVE_COUNT,
-            target=TargetUnit.DOCUMENT,
-            output=OutputMode.COUNT,
-            explicit_count=None,
-            cardinality_mode=CardinalityMode.ALL,
-            order=order,
-        )
-
-    # 5. Document summarize / all documents
-    if _DOC_SUMMARIZE_RE.search(cleaned):
-        is_all = bool(_DOC_ALL_RE.search(cleaned))
-        return QueryShapeSignals(
-            answer_shape=AnswerShape.SUMMARIZE_SET,
-            target=TargetUnit.DOCUMENT,
-            output=OutputMode.SUMMARIZE,
-            explicit_count=None,
-            cardinality_mode=CardinalityMode.ALL if is_all else CardinalityMode.N,
-            order=order,
-        )
-
-    # 6. Document list ("liệt kê các tài liệu/file", "tất cả các file", "which documents")
-    if _DOC_ALL_RE.search(cleaned) or _DOC_LIST_RE.search(cleaned):
-        is_all = bool(_DOC_ALL_RE.search(cleaned))
-        return QueryShapeSignals(
-            answer_shape=AnswerShape.DOCUMENT_LIST,
-            target=TargetUnit.DOCUMENT,
-            output=OutputMode.LIST,
-            explicit_count=None,
-            cardinality_mode=CardinalityMode.ALL if is_all else CardinalityMode.N,
-            order=order,
-        )
-
-    # 7. Open a single document ("mở tài liệu X", "open file Y")
-    if _DOC_OPEN_RE.search(cleaned):
-        return QueryShapeSignals(
-            answer_shape=AnswerShape.OPEN_DOCUMENT,
-            target=TargetUnit.DOCUMENT,
-            output=OutputMode.OPEN,
-            explicit_count=1,
-            cardinality_mode=CardinalityMode.ONE,
-            order=order,
-        )
-
-    # 8. Multi-facet / multi-entity comparison
-    if _COMPARE_RE.search(cleaned):
-        return QueryShapeSignals(
-            answer_shape=AnswerShape.MULTI_FACET_COMPARE,
-            target=TargetUnit.PASSAGE,
-            output=OutputMode.COMPARE,
-            explicit_count=None,
-            cardinality_mode=CardinalityMode.N,
-            order=order,
-        )
-
-    return QueryShapeSignals(
-        answer_shape=AnswerShape.FACT_ANSWER,
-        target=TargetUnit.PASSAGE,
-        output=OutputMode.ANSWER,
-        explicit_count=None,
-        cardinality_mode=CardinalityMode.N,
-        order=order,
-    )
+def _normalize_target_unit(target_unit: str | None) -> TargetUnit | None:
+    if not target_unit:
+        return None
+    normalized = str(target_unit).strip().upper()
+    try:
+        return TargetUnit(normalized)
+    except ValueError:
+        return None
 
 
 def _shape_to_target_output(
-    answer_shape: str | None,
-    signals: QueryShapeSignals,
+    answer_shape: AnswerShape,
+    *,
+    target_unit: TargetUnit | None,
+    explicit_count: int | None,
+    is_catalog_query: bool | None,
 ) -> tuple[TargetUnit, OutputMode, CardinalityMode]:
-    """Resolve (TargetUnit, OutputMode, CardinalityMode) combining deterministic signals and router answer_shape."""
-    # Explicit user counts or strong structural document cues take precedence
-    if signals.explicit_count is not None or signals.answer_shape != AnswerShape.FACT_ANSWER:
-        return signals.target, signals.output, signals.cardinality_mode
-
-    normalized = (answer_shape or "").strip().lower()
-    if normalized == AnswerShape.DOCUMENT_LIST.value:
-        return TargetUnit.DOCUMENT, OutputMode.LIST, CardinalityMode.N
-    if normalized == AnswerShape.EXHAUSTIVE_COUNT.value:
-        return TargetUnit.DOCUMENT, OutputMode.COUNT, CardinalityMode.ALL
-    if normalized == AnswerShape.SUMMARIZE_SET.value:
-        return TargetUnit.DOCUMENT, OutputMode.SUMMARIZE, CardinalityMode.N
-    if normalized == AnswerShape.OPEN_DOCUMENT.value:
-        return TargetUnit.DOCUMENT, OutputMode.OPEN, CardinalityMode.ONE
-    if normalized == AnswerShape.MULTI_FACET_COMPARE.value:
-        return TargetUnit.PASSAGE, OutputMode.COMPARE, CardinalityMode.N
-    return TargetUnit.PASSAGE, OutputMode.ANSWER, CardinalityMode.N
+    """Resolve (TargetUnit, OutputMode, CardinalityMode) from structured UnifiedRouteDecision signals."""
+    if answer_shape == AnswerShape.DOCUMENT_LIST:
+        allowed_list_targets = {TargetUnit.DOCUMENT, TargetUnit.TOPIC, TargetUnit.FACT, TargetUnit.TURN}
+        resolved_target = target_unit if target_unit in allowed_list_targets else TargetUnit.DOCUMENT
+        card = (
+            CardinalityMode.ALL
+            if (explicit_count is None and is_catalog_query and resolved_target == TargetUnit.DOCUMENT)
+            else CardinalityMode.N
+        )
+        return resolved_target, OutputMode.LIST, card
+    if answer_shape == AnswerShape.EXHAUSTIVE_COUNT:
+        allowed_count_targets = {TargetUnit.DOCUMENT, TargetUnit.FACT}
+        resolved_target = target_unit if target_unit in allowed_count_targets else TargetUnit.DOCUMENT
+        return resolved_target, OutputMode.COUNT, CardinalityMode.ALL
+    if answer_shape == AnswerShape.SUMMARIZE_SET:
+        allowed_sum_targets = {TargetUnit.DOCUMENT, TargetUnit.TOPIC, TargetUnit.TURN}
+        resolved_target = target_unit if target_unit in allowed_sum_targets else TargetUnit.DOCUMENT
+        return resolved_target, OutputMode.SUMMARIZE, CardinalityMode.N
+    if answer_shape == AnswerShape.OPEN_DOCUMENT:
+        card = CardinalityMode.ONE if (explicit_count is None or explicit_count == 1) else CardinalityMode.N
+        return TargetUnit.DOCUMENT, OutputMode.OPEN, card
+    if answer_shape == AnswerShape.MULTI_FACET_COMPARE:
+        allowed_cmp_targets = {TargetUnit.PASSAGE, TargetUnit.DOCUMENT}
+        resolved_target = target_unit if target_unit in allowed_cmp_targets else TargetUnit.PASSAGE
+        return resolved_target, OutputMode.COMPARE, CardinalityMode.N
+    resolved_target = target_unit or TargetUnit.PASSAGE
+    return resolved_target, OutputMode.ANSWER, CardinalityMode.N
 
 
 def build_retrieval_plan(
@@ -431,6 +274,10 @@ def build_retrieval_plan(
     *,
     requested_top_k: int | None = None,
     answer_shape: str | None = None,
+    order_mode: str | None = None,
+    explicit_count: int | None = None,
+    target_unit: str | None = None,
+    is_catalog_query: bool | None = None,
     strategy_mode: str | None = None,
     clauses: tuple[str, ...] = (),
     multi_hop: bool = False,
@@ -438,14 +285,34 @@ def build_retrieval_plan(
     constraints: tuple[FieldPredicate, ...] = (),
     cursor: str | None = None,
 ) -> RetrievalPlan:
-    """Compile query + routing signals into a validated 7-axis RetrievalPlan."""
+    """Compile structured routing signals + API parameters into a validated 7-axis RetrievalPlan."""
     query = unicodedata.normalize("NFC", query or "")
-    signals = extract_query_cardinality_and_shape(query)
-    target, output, card_mode = _shape_to_target_output(answer_shape, signals)
+    resolved_shape = _normalize_answer_shape(answer_shape)
+    resolved_order = _normalize_order_mode(order_mode)
+    normalized_target = _normalize_target_unit(target_unit)
+    clean_count = (
+        int(explicit_count)
+        if isinstance(explicit_count, int) and not isinstance(explicit_count, bool) and explicit_count >= 1
+        else None
+    )
+
+    target, output, card_mode = _shape_to_target_output(
+        resolved_shape,
+        target_unit=normalized_target,
+        explicit_count=clean_count,
+        is_catalog_query=is_catalog_query,
+    )
 
     if strategy_mode == "GLOBAL_TOPIC" and target == TargetUnit.PASSAGE and output == OutputMode.ANSWER:
         target = TargetUnit.TOPIC
         output = OutputMode.SUMMARIZE
+
+    is_unfiltered_catalog = bool(
+        is_catalog_query
+        and target == TargetUnit.DOCUMENT
+        and output in {OutputMode.LIST, OutputMode.COUNT}
+        and clean_count is None
+    )
 
     # Validate constraints against FIELD_REGISTRY
     valid_constraints: list[FieldPredicate] = []
@@ -491,8 +358,6 @@ def build_retrieval_plan(
     if requested_top_k is not None:
         if requested_top_k < 1:
             raise ValueError("top_k must be positive")
-        # When an API caller explicitly passes top_k, honor it up to the plan's max_cap
-        # (or up to 50 if the caller explicitly requests a larger set via API).
         api_cap = max(max_cap, 50) if requested_top_k > max_cap else max_cap
         effective_n = min(max(1, int(requested_top_k)), api_cap)
         resolved_mode = CardinalityMode.ONE if effective_n == 1 else CardinalityMode.N
@@ -504,12 +369,12 @@ def build_retrieval_plan(
             count_source=CountSource.API,
             cursor=cursor,
         )
-    elif signals.explicit_count is not None:
-        effective_n = min(max(1, signals.explicit_count), max_cap)
+    elif clean_count is not None:
+        effective_n = min(max(1, clean_count), max_cap)
         resolved_mode = CardinalityMode.ONE if effective_n == 1 else card_mode
         cardinality = CardinalitySpec(
             mode=resolved_mode,
-            requested_n=signals.explicit_count,
+            requested_n=clean_count,
             effective_n=effective_n,
             max_cap=max_cap,
             count_source=CountSource.QUERY,
@@ -536,78 +401,47 @@ def build_retrieval_plan(
         selection=selection,
         constraints=tuple(valid_constraints),
         cardinality=cardinality,
-        order=signals.order,
+        order=resolved_order,
         decomposition=decomp,
         output=output,
+        answer_shape=resolved_shape,
+        is_unfiltered_catalog=is_unfiltered_catalog,
         fallback_used=fallback_used,
         unsupported_reason=unsupported_reason,
     )
 
 
-_CATALOG_META_TOKENS: frozenset[str] = frozenset(
-    {
-        "liệt", "kê", "danh", "sách", "kể", "tên", "tất", "cả", "toàn", "bộ", "mọi",
-        "tài", "liệu", "file", "files", "document", "documents", "doc", "docs", "tệp",
-        "tập", "tin", "văn", "bản", "hồ", "sơ", "báo", "cáo", "spec", "specs", "runbook", "runbooks",
-        "dự", "án", "project", "projects", "workspace", "kho", "tri", "thức", "knowledge", "base",
-        "scope", "phạm", "vi", "nguồn", "source", "sources", "hiện", "tại", "có", "gồm",
-        "bao", "nhiêu", "mấy", "tổng", "cộng", "con", "số", "lượng", "đếm", "sẵn", "sàng",
-        "tra", "cứu", "tìm", "kiếm", "xem", "cho", "biết", "tôi", "hỏi", "hãy", "vui", "lòng", "please",
-        "list", "show", "all", "every", "how", "many", "available", "ready", "indexed", "searchable",
-        "search", "search_ready", "in", "the", "of", "for", "and", "or", "what", "are", "which", "current",
-        "của", "trong", "ở", "thuộc", "là", "gì", "nào", "những", "các", "đã", "chưa", "đang", "được",
-        "và", "hay", "đầy", "đủ", "cụ", "thể", "từng", "hết", "rõ", "nêu", "ra", "kèm", "trích", "dẫn",
-        "nhé", "nội", "dung", "quan", "chính", "này", "đó", "một",
-    }
-)
-_SOURCE_NAME_ALIASES: dict[str, tuple[str, ...]] = {
-    "database": ("db", "cơ", "sở", "dữ", "liệu"),
-    "design": ("thiết", "kế", "ui", "ux"),
-    "documentation": ("doc", "docs", "báo", "cáo"),
-    "frontend": ("fe",),
-    "backend": ("be",),
-    "general": ("chung",),
-    "research": ("nghiên", "cứu"),
-}
-_TOPIC_FILTER_CUES_RE = re.compile(
-    r"\b(?:nói\s+về|viết\s+về|bàn\s+về|liên\s+quan|đề\s+cập|chứa|"
-    r"about|regarding|related\s+to|concerning|containing|mentioning)\b",
-    re.IGNORECASE | re.UNICODE,
-)
-_BOUND_SCOPE_NAME_RE = re.compile(
-    r"\b(?:project|dự\s+án|workspace)\s+[\w-]+",
-    re.IGNORECASE | re.UNICODE,
-)
-
-
-def is_unfiltered_scope_catalog_query(
-    query: str,
-    source_names: Iterable[str] = (),
-) -> bool:
-    """Return True when a DOCUMENT LIST/COUNT query asks for the entire bound scope without a narrow topic filter."""
-    normalized_q = unicodedata.normalize("NFC", query or "").strip()
-    if not normalized_q:
-        return False
-    signals = extract_query_cardinality_and_shape(normalized_q)
+def rebuild_retrieval_plan_with_top_k(
+    plan: RetrievalPlan,
+    requested_top_k: int | None,
+) -> RetrievalPlan:
+    """Apply an explicit top_k override onto an existing RetrievalPlan without dropping other axes (S4-11)."""
+    if requested_top_k is None:
+        return plan
+    if requested_top_k < 1:
+        raise ValueError("top_k must be positive")
+    _, base_max_cap = _CARDINALITY_BOUNDS.get(
+        (plan.target, plan.output),
+        (FIXED_SEARCH_TOP_K, 20),
+    )
     if (
-        signals.target != TargetUnit.DOCUMENT
-        or signals.output not in {OutputMode.LIST, OutputMode.COUNT}
-        or signals.explicit_count is not None
+        plan.target == TargetUnit.PASSAGE
+        and plan.output == OutputMode.COMPARE
+        and len(plan.decomposition.subqueries) >= 2
     ):
-        return False
-    if re.search(r'["“”`]|\b[\w-]+\.(?:md|pdf|docx|txt|json|ya?ml|csv|xlsx)\b', normalized_q, re.IGNORECASE):
-        return False
-    if _TOPIC_FILTER_CUES_RE.search(normalized_q):
-        return False
-    stripped_q = _BOUND_SCOPE_NAME_RE.sub(" ", normalized_q)
-    allowed = set(_CATALOG_META_TOKENS)
-    for raw_name in source_names:
-        for tok in re.findall(r"[^\W_]+", unicodedata.normalize("NFC", raw_name or "").lower(), flags=re.UNICODE):
-            allowed.add(tok)
-            allowed.update(_SOURCE_NAME_ALIASES.get(tok, ()))
-    tokens = re.findall(r"[^\W_]+", stripped_q.lower(), flags=re.UNICODE)
-    leftover = [tok for tok in tokens if tok not in allowed]
-    return len(leftover) == 0
+        base_max_cap = max(base_max_cap, 15)
+    api_cap = max(base_max_cap, 50) if requested_top_k > base_max_cap else base_max_cap
+    effective_n = min(max(1, int(requested_top_k)), api_cap)
+    resolved_mode = CardinalityMode.ONE if effective_n == 1 else CardinalityMode.N
+    updated_cardinality = CardinalitySpec(
+        mode=resolved_mode,
+        requested_n=int(requested_top_k),
+        effective_n=effective_n,
+        max_cap=api_cap,
+        count_source=CountSource.API,
+        cursor=plan.cardinality.cursor,
+    )
+    return replace(plan, cardinality=updated_cardinality)
 
 
 def group_sections_by_document(
