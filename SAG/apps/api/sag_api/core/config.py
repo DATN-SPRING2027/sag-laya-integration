@@ -311,10 +311,41 @@ class Settings(BaseSettings):
     session_context_qdrant_sync_enabled: bool = True
     session_context_max_messages: int = Field(default=5000, ge=50, le=50000)
     session_context_full_audit_max_batches: int = Field(default=6, ge=1, le=20)
-    decision_provider: Literal["siliconflow", "disabled"] = "siliconflow"
+    decision_provider: Literal["siliconflow", "openai_compatible", "llm", "disabled"] = "siliconflow"
+    decision_base_url: str | None = None
+    decision_api_key: str | None = None
     decision_model: str = Field(default="Kev-4b", min_length=1, max_length=200)
+    decision_timeout_ms: int = Field(default=10_000, ge=500, le=60_000)
     siliconflow_base_url: str = "https://api.siliconflow.com/v1"
     siliconflow_api_key: str | None = None
+
+    @field_validator("decision_base_url")
+    @classmethod
+    def _validate_decision_base_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().rstrip("/")
+        if not normalized:
+            return None
+        parsed = urlsplit(normalized)
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("decision_base_url must be an HTTP(S) base URL without credentials")
+        return normalized
+
+    @field_validator("decision_api_key", mode="before")
+    @classmethod
+    def _blank_decision_api_key_as_none(cls, value: object) -> object:
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return value
 
     @field_validator("siliconflow_base_url")
     @classmethod
@@ -538,6 +569,26 @@ class Settings(BaseSettings):
     def effective_embedding_base_url(self) -> str | None:
         provider = get_model_provider(self.llm_provider)
         return self.embedding_base_url or (self.llm_base_url if provider.can_reuse_embedding_credentials else None)
+
+    @property
+    def effective_decision_base_url(self) -> str | None:
+        if self.decision_base_url:
+            return self.decision_base_url
+        if self.decision_provider == "siliconflow":
+            return self.siliconflow_base_url
+        if self.decision_provider == "llm":
+            return self.llm_base_url
+        return None
+
+    @property
+    def effective_decision_api_key(self) -> str | None:
+        if self.decision_api_key:
+            return self.decision_api_key
+        if self.decision_provider == "siliconflow":
+            return self.siliconflow_api_key
+        if self.decision_provider == "llm":
+            return self.llm_api_key
+        return None
 
     @property
     def mineru_configured(self) -> bool:

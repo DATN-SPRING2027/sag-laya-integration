@@ -443,9 +443,30 @@ class RuntimeTokenRegistry:
 
 RUNTIME_TOKEN_REGISTRY = RuntimeTokenRegistry()
 
+_ROUTER_DEGRADED_LOCK = threading.RLock()
+_ROUTER_DEGRADED_COUNTS: dict[str, int] = {}
+
+
+def record_router_degraded(reason: str) -> None:
+    key = (reason or "unknown").strip() or "unknown"
+    with _ROUTER_DEGRADED_LOCK:
+        _ROUTER_DEGRADED_COUNTS[key] = _ROUTER_DEGRADED_COUNTS.get(key, 0) + 1
+
+
+def get_router_degraded_metrics() -> dict[str, int]:
+    with _ROUTER_DEGRADED_LOCK:
+        return dict(_ROUTER_DEGRADED_COUNTS)
+
+
+def reset_router_degraded_metrics() -> None:
+    with _ROUTER_DEGRADED_LOCK:
+        _ROUTER_DEGRADED_COUNTS.clear()
+
 
 def reset_runtime_token_usage(project_id: str | None = None) -> None:
     RUNTIME_TOKEN_REGISTRY.reset(project_id=project_id)
+    if project_id is None:
+        reset_router_degraded_metrics()
 
 
 def get_runtime_token_usage(project_id: str | None = None) -> dict[str, Any]:
@@ -637,6 +658,24 @@ def wrap_embedding_client_with_cache_and_metering(emb: Any, *, default_model: st
     emb.batch_generate = _cached_batch_generate
     emb._sag_shared_cache_wrapped = True
     emb._sag_token_metered_cache_wrapped = True
+
+
+def record_llm_cache_hit(
+    *,
+    model: str | None,
+    count: int = 1,
+    component: str | None = None,
+    project_id: str | None = None,
+) -> None:
+    if count <= 0:
+        return
+    _dispatch_event(
+        default_component="llm_completion",
+        model=model,
+        component=component,
+        project_id=project_id,
+        delta={"cache_hits": count},
+    )
 
 
 def record_llm_usage(

@@ -236,10 +236,11 @@ async def metrics(request: Request, format: str = "prometheus") -> Response:
     knowledge_ready = bool(runtime and runtime.ready)
     qdrant_ready = await _qdrant_ready(request)
 
-    from sag_api.core.token_usage import get_runtime_token_usage
+    from sag_api.core.token_usage import get_router_degraded_metrics, get_runtime_token_usage
     from sag_api.services.route_cache_service import route_decision_cache
 
     runtime_token_usage = get_runtime_token_usage()
+    degraded_counts = get_router_degraded_metrics()
 
     cache_size = len(route_decision_cache)
     cache_max = route_decision_cache.max_entries
@@ -251,6 +252,10 @@ async def metrics(request: Request, format: str = "prometheus") -> Response:
                 "status": "ok",
                 "system_up": 1,
                 "token_usage": runtime_token_usage,
+                "decision_router_degraded": {
+                    "total": sum(degraded_counts.values()),
+                    "by_reason": degraded_counts,
+                },
                 "db_ready": db_ready,
                 "knowledge_runtime_ready": knowledge_ready,
                 "qdrant_ready": qdrant_ready,
@@ -318,7 +323,13 @@ async def metrics(request: Request, format: str = "prometheus") -> Response:
         "# HELP sag_token_cost_usd_total Estimated cumulative USD cost of measured tokens since process start",
         "# TYPE sag_token_cost_usd_total counter",
         f'sag_token_cost_usd_total {float(runtime_token_usage["cost_usd"]):.8f}',
+        "# HELP sag_decision_router_degraded_total Total times decision router degraded to fail-closed fallback",
+        "# TYPE sag_decision_router_degraded_total counter",
+        f'sag_decision_router_degraded_total{{reason="all"}} {sum(degraded_counts.values())}',
     ]
+    for degraded_reason, degraded_count in sorted(degraded_counts.items()):
+        safe_reason = degraded_reason.replace('"', "")
+        lines.append(f'sag_decision_router_degraded_total{{reason="{safe_reason}"}} {degraded_count}')
     if qdrant_ready is not None:
         lines.extend(
             [
