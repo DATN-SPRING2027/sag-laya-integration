@@ -543,7 +543,14 @@ async def test_handover_assist_filters_indexed_units_by_exact_version_in_sql_bef
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
     from sag_api.db.base import Base
-    from sag_api.db.models import CanonicalBlock, Document, DocumentVersion, SearchUnit
+    from sag_api.db.models import (
+        CanonicalBlock,
+        Document,
+        DocumentVersion,
+        KnowledgeConflictResolution,
+        SearchUnit,
+        SourceProjectMapping,
+    )
 
     monkeypatch.setattr(settings, "bff_service_token", "test-bff-token")
 
@@ -556,6 +563,8 @@ async def test_handover_assist_filters_indexed_units_by_exact_version_in_sql_bef
                 DocumentVersion.__table__,
                 CanonicalBlock.__table__,
                 SearchUnit.__table__,
+                SourceProjectMapping.__table__,
+                KnowledgeConflictResolution.__table__,
             ],
         )
 

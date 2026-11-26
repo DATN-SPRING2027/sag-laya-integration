@@ -83,6 +83,9 @@ async def _load_indexed_units(
     try:
         from sag_api.db.models import CanonicalBlock, Document, DocumentVersion, SearchUnit
         from sag_api.services.search_index_service import resolve_search_unit_text
+        from sag_api.services.unit_supersession_overlay import (
+            build_active_superseded_unit_exists,
+        )
 
         now_utc = datetime.now(UTC)
         start_block = aliased(CanonicalBlock)
@@ -94,6 +97,34 @@ async def _load_indexed_units(
             )
             for logical_id, version_no in sorted(logical_targets)
         ]
+        unit_superseded_expr = build_active_superseded_unit_exists(
+            SearchUnit.id,
+            tenant_id=principal.tenant_id,
+            project_ids=[project_id],
+            allowed_partitions=principal.allowed_partition_ids,
+            reference_time=now_utc,
+            organization_id=principal.organization_id or None,
+        )
+        exclude_unit_superseded = task in ("DRAFT_GENERATION", "SOURCE_PROPOSAL")
+        version_superseded_expr = DocumentVersion.valid_to <= now_utc
+        is_superseded_expr = (
+            version_superseded_expr
+            if exclude_unit_superseded
+            else or_(version_superseded_expr, unit_superseded_expr)
+        )
+        where_clauses = [
+            Document.tenant_id == principal.tenant_id,
+            Document.project_id == project_id,
+            Document.is_active.is_(True),
+            or_(*pair_filters),
+            DocumentVersion.search_status.in_(("READY", "SEARCH_READY")),
+            SearchUnit.security_partition_id.in_(principal.allowed_partition_ids),
+            start_block.document_version_id == DocumentVersion.id,
+            end_block.document_version_id == DocumentVersion.id,
+        ]
+        if exclude_unit_superseded:
+            where_clauses.append(~unit_superseded_expr)
+
         ranked_subq = (
             select(
                 Document.logical_source_id.label("logical_source_id"),
@@ -109,7 +140,7 @@ async def _load_indexed_units(
                 SearchUnit.section_path.label("section_path"),
                 start_block.ordinal.label("start_ordinal"),
                 end_block.ordinal.label("end_ordinal"),
-                (DocumentVersion.valid_to <= now_utc).label("is_superseded"),
+                is_superseded_expr.label("is_superseded"),
                 func.row_number()
                 .over(
                     partition_by=(Document.logical_source_id, DocumentVersion.version_no),
@@ -131,16 +162,7 @@ async def _load_indexed_units(
             .join(SearchUnit, SearchUnit.document_version_id == DocumentVersion.id)
             .join(start_block, start_block.id == SearchUnit.block_from_id)
             .join(end_block, end_block.id == SearchUnit.block_to_id)
-            .where(
-                Document.tenant_id == principal.tenant_id,
-                Document.project_id == project_id,
-                Document.is_active.is_(True),
-                or_(*pair_filters),
-                DocumentVersion.search_status.in_(("READY", "SEARCH_READY")),
-                SearchUnit.security_partition_id.in_(principal.allowed_partition_ids),
-                start_block.document_version_id == DocumentVersion.id,
-                end_block.document_version_id == DocumentVersion.id,
-            )
+            .where(*where_clauses)
             .subquery()
         )
         max_rows = max(_MAX_EVIDENCE_UNITS, len(logical_targets) * _MAX_INDEXED_UNITS_PER_SOURCE)
@@ -287,7 +309,6 @@ async def _load_indexed_units(
         mapped.setdefault(key, []).append((loc_kind, loc_val, heading, combined_text[:_MAX_UNIT_CHARS]))
         if superseded_unit_keys is not None and bool(is_superseded):
             superseded_unit_keys.add((key[0], key[1], loc_kind, loc_val))
-    del task  # Phase 1 retains pinned versions across tasks; Phase 2 filters DRAFT/PROPOSAL units.
     return mapped
 
 

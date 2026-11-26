@@ -50,6 +50,10 @@ from sag_api.schemas.mind_map import (
     MindMapOut,
     MindMapUsageOut,
 )
+from sag_api.services.unit_supersession_overlay import (
+    build_active_superseded_unit_exists,
+    compute_scope_supersession_digest,
+)
 
 log = get_logger("services.mind_map")
 
@@ -359,12 +363,23 @@ async def _load_project_scope_snapshot(
         unit_counts: dict[str, int] = {}
         manifest_by_ver: dict[str, str] = {}
         if candidate_ready_ver_ids:
+            active_superseded_exists = build_active_superseded_unit_exists(
+                SearchUnit.id,
+                tenant_id=tenant_id,
+                project_ids=scoped_project_ids,
+                allowed_partitions=allowed_partitions,
+                reference_time=now,
+                organization_id=principal.organization_id,
+                allowed_source_ids=source_ids,
+                hidden_document_ids=hidden_ids,
+            )
             count_rows = (
                 await session.execute(
                     select(SearchUnit.document_version_id, func.count(SearchUnit.id))
                     .where(
                         SearchUnit.document_version_id.in_(sorted(candidate_ready_ver_ids)),
                         SearchUnit.security_partition_id.in_(sorted(allowed_partitions)),
+                        ~active_superseded_exists,
                     )
                     .group_by(SearchUnit.document_version_id)
                 )
@@ -460,6 +475,18 @@ async def _load_project_scope_snapshot(
             ).hexdigest()
             return [], pending_count, fp
 
+        supersession_digest = await compute_scope_supersession_digest(
+            session,
+            version_ids=candidate_ready_ver_ids,
+            tenant_ids=[tenant_id],
+            project_ids=scoped_project_ids,
+            allowed_partitions=allowed_partitions,
+            reference_time=now,
+            organization_id=principal.organization_id,
+            allowed_source_ids=source_ids,
+            hidden_document_ids=hidden_ids,
+        )
+
         fp_parts: list[str] = []
         for d in sorted(ready_docs, key=lambda item: (item.sag_document_id, item.document_version_id)):
             meta_suffix = (
@@ -471,8 +498,9 @@ async def _load_project_scope_snapshot(
                 f"{d.sag_document_id}:{d.document_version_id}:{d.version_no}:{d.manifest_fingerprint}{meta_suffix}"
             )
         fp_payload = "|".join(fp_parts)
+        sup_suffix = f":sup={supersession_digest}" if supersession_digest != "none" else ""
         scope_fp = hashlib.sha256(
-            f"ready:{tenant_id}:{project_id}:{fp_payload}".encode()
+            f"ready:{tenant_id}:{project_id}:{fp_payload}{sup_suffix}".encode()
         ).hexdigest()
         return ready_docs, pending_count, scope_fp
     except SQLAlchemyError as error:
@@ -527,9 +555,21 @@ async def _select_evidence_catalog(
     ready_docs: list[_ReadyDocumentScope],
     pending_count: int,
     topic: str | None,
+    project_id: str | None = None,
+    reference_time: datetime | None = None,
 ) -> tuple[list[_CatalogEvidence], MindMapCoverageOut, dict[str, list[str]]]:
     terms = _topic_terms(topic)
     allowed_partitions = sorted(principal.allowed_partition_ids)
+    tenant_id = (principal.tenant_id or principal.organization_id or "").strip()
+    now_utc = reference_time or datetime.now(UTC)
+    if project_id and project_id != "all":
+        scoped_project_ids = [project_id]
+    else:
+        scoped_project_ids = (
+            sorted({d.project_id for d in ready_docs if d.project_id})
+            or sorted(principal.allowed_project_ids)
+        )
+    confirmed_source_ids = sorted({d.source_id for d in ready_docs if d.source_id})
 
     try:
         ordered_docs = list(ready_docs)
@@ -615,6 +655,17 @@ async def _select_evidence_catalog(
                 .scalar_subquery()
             )
             unit_order = ((heading_score + func.coalesce(span_score, 0.0)).desc(), *unit_order)
+        hidden_ids = await _hidden_control_document_ids(session, confirmed_source_ids)
+        active_superseded_exists = build_active_superseded_unit_exists(
+            SearchUnit.id,
+            tenant_id=tenant_id,
+            project_ids=scoped_project_ids,
+            allowed_partitions=allowed_partitions,
+            reference_time=now_utc,
+            organization_id=principal.organization_id,
+            allowed_source_ids=confirmed_source_ids or None,
+            hidden_document_ids=hidden_ids,
+        )
         ranked_units = (
             select(
                 SearchUnit.id.label("unit_id"),
@@ -643,6 +694,7 @@ async def _select_evidence_catalog(
                 SearchUnit.security_partition_id.in_(allowed_partitions),
                 start_block.document_version_id == SearchUnit.document_version_id,
                 end_block.document_version_id == SearchUnit.document_version_id,
+                ~active_superseded_exists,
             )
             .subquery()
         )
@@ -1668,6 +1720,8 @@ async def generate_project_mind_map(
         ready_docs=ready_docs,
         pending_count=pending_count,
         topic=topic_display,
+        project_id=project_id,
+        reference_time=now,
     )
     if not catalog:
         await _evict_snapshot(

@@ -30,6 +30,7 @@ from sag_api.db.models import (
     CanonicalBlock,
     Document,
     DocumentVersion,
+    KnowledgeConflictResolution,
     ProjectMindMapSnapshot,
     SearchUnit,
     Source,
@@ -497,6 +498,8 @@ async def test_handover_qa_retains_version_superseded_units_annotates_prompt_and
                 DocumentVersion.__table__,
                 CanonicalBlock.__table__,
                 SearchUnit.__table__,
+                SourceProjectMapping.__table__,
+                KnowledgeConflictResolution.__table__,
             ],
         )
 
