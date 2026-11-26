@@ -2318,6 +2318,144 @@ async def test_p6_rework_21_turn_separators_markdown_indent_links_and_post_tool_
         assert out_pt == f"Done.{ws_ch}"
 
 
+# ---------------------------------------------------------------------------
+# Item 22 (CHAL-R10-1 & CHAL-R10-2 + 2-turn TOOL_FAILED dedup): No spurious
+# \n\n on whitespace-only prefix, no token gluing or punctuation space leak
+# after deleted citations, and no Turn-2 duplication after trailing TOOL_FAILED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_p6_rework_22_ws_only_prefix_token_gluing_and_multiturn_tool_failed_dedup(
+    monkeypatch,
+) -> None:
+    agent = SimpleNamespace(id="agent-r10", name="R10Bot", persona={"web_enabled": True})
+    monkeypatch.setattr(openai_api.svc, "get_agent", AsyncMock(return_value=agent))
+    monkeypatch.setattr(openai_api.svc, "resolve_sources", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        openai_api.svc,
+        "build_ask_context",
+        lambda **kw: SimpleNamespace(
+            source_ids=[],
+            citations=[],
+            session_citations=[],
+            route_decision={"coarse_intent": "CHAT", "degraded": False},
+        ),
+    )
+
+    async def _run_events(events: list[SimpleNamespace]) -> str:
+        async def fake_stream(*args, **kwargs):
+            for ev in events:
+                yield ev
+
+        monkeypatch.setattr(openai_api.agent_service, "generate_stream", fake_stream)
+        body = openai_api.ChatCompletionRequest(
+            messages=[openai_api.ChatMessage(role="user", content="check")],
+            stream=True,
+        )
+        resp = await openai_api.chat_completions(
+            agent_id="agent-r10",
+            body=body,
+            _user=SimpleNamespace(id="u-1", name="Tester"),
+            owner_key="owner-1",
+            principal=SimpleNamespace(tenant_id="t-1", organization_id="o-1", user_id="u-1"),
+            session=SimpleNamespace(),
+            engine_manager=SimpleNamespace(),
+            llm=SimpleNamespace(configured=True),
+            tool_registry=SimpleNamespace(),
+            agent_runtime=SimpleNamespace(),
+        )
+        out_chunks: list[str] = []
+        async for raw in resp.body_iterator:
+            text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+            for line in text.splitlines():
+                if not line.startswith("data: ") or line == "data: [DONE]":
+                    continue
+                payload = json.loads(line[len("data: ") :])
+                delta = (payload.get("choices") or [{}])[0].get("delta") or {}
+                if delta.get("content"):
+                    out_chunks.append(delta["content"])
+        return "".join(out_chunks)
+
+    # CHAL-R10-1: Whitespace-only streamed prefix must NOT inject spurious \n\n
+    for raw_ws, expected_ws in [
+        (" `config.yaml`", " `config.yaml`"),
+        ("\u3000[99] The answer is 42.", "\u3000The answer is 42."),
+    ]:
+        canon_ws, _ = agent_service._finalize_answer_citations(raw_ws, [])
+        for chunks in ([raw_ws], list(raw_ws)):
+            out_ws = await _run_events(
+                [
+                    SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}}),
+                    *[
+                        SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": c}})
+                        for c in chunks
+                    ],
+                    SimpleNamespace(
+                        type=EventType.RUN_COMPLETED.value,
+                        data={"payload": {"output": canon_ws, "citations": [], "degraded": False}},
+                    ),
+                ]
+            )
+            assert out_ws == expected_ws
+
+    out_t2_ws = await _run_events(
+        [
+            SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}}),
+            SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": "Step 1."}}),
+            SimpleNamespace(type=EventType.TOOL_STARTED.value, data={"payload": {"name": "web_search"}}),
+            SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": " `config.yaml`"}}),
+            SimpleNamespace(
+                type=EventType.RUN_COMPLETED.value,
+                data={"payload": {"output": "`config.yaml`", "citations": [], "degraded": False}},
+            ),
+        ]
+    )
+    assert out_t2_ws == "Step 1.\n\n `config.yaml`"
+
+    # CHAL-R10-2: Deleted citations must NOT glue adjacent tokens and MUST clean space before punctuation
+    for raw_t1, expected_t1 in [
+        ("Range [99][0, 1]", "Range [0, 1]"),
+        ("Use [99]`config.yaml`", "Use `config.yaml`"),
+        ("A [99]B", "A B"),
+        ("Code [99] :", "Code:"),
+        ("A [99] [88] .", "A."),
+    ]:
+        for chunks in ([raw_t1], list(raw_t1)):
+            out_t1 = await _run_events(
+                [
+                    SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}}),
+                    *[
+                        SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": c}})
+                        for c in chunks
+                    ],
+                    SimpleNamespace(type=EventType.TOOL_STARTED.value, data={"payload": {"name": "web_search"}}),
+                    SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": "Done."}}),
+                    SimpleNamespace(
+                        type=EventType.RUN_COMPLETED.value,
+                        data={"payload": {"output": "Done.", "citations": [], "degraded": False}},
+                    ),
+                ]
+            )
+            assert out_t1 == f"{expected_t1}\n\nDone."
+
+    # 2-turn trailing TOOL_FAILED must NOT duplicate Turn 2 on RUN_COMPLETED
+    out_2t_fail = await _run_events(
+        [
+            SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}}),
+            SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": "Step 1."}}),
+            SimpleNamespace(type=EventType.TOOL_STARTED.value, data={"payload": {"name": "web_search"}}),
+            SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": "Done."}}),
+            SimpleNamespace(type=EventType.TOOL_FAILED.value, data={"payload": {"name": "get_time"}}),
+            SimpleNamespace(
+                type=EventType.RUN_COMPLETED.value,
+                data={"payload": {"output": "Done.", "citations": [], "degraded": False}},
+            ),
+        ]
+    )
+    assert out_2t_fail == "Step 1.\n\nDone."
+
+
 
 
 

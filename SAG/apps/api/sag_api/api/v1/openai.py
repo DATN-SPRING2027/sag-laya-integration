@@ -74,6 +74,7 @@ _COMPLETE_CITATION_BRACKET_RE = re.compile(
     re.IGNORECASE,
 )
 _SPACE_BEFORE_PUNCT_RE = re.compile(r"(?<![ \t])[ \t]++([，。！？；：,.!?;:])")
+_PUNCT_CHARS = "，。！？；：,.!?;:"
 
 
 def _is_zero_math_bracket(inner: str) -> bool:
@@ -248,10 +249,22 @@ def _resolve_turn_eof_pending(
                 continue
             stripped_any = True
             before = seg[pos : match.start()]
-            # Trim only horizontal space immediately before the deleted citation site so Markdown
-            # indentation, nested lists, aligned tables, and 2-space hard line breaks stay intact.
-            seg_parts.append(before.rstrip(" \t"))
-            pos = match.end()
+            # Trim horizontal space at the deleted citation site ONLY when followed by whitespace,
+            # punctuation, or EOF (never gluing adjacent tokens like "Use [99]`code`" or "A [99]B"),
+            # and swallow space immediately after the citation if it precedes punctuation ("Code [99] :").
+            after_seg_idx = match.end()
+            ws_end = after_seg_idx
+            while ws_end < len(seg) and seg[ws_end] in " \t":
+                ws_end += 1
+            if ws_end > after_seg_idx and ws_end < len(seg) and seg[ws_end] in _PUNCT_CHARS:
+                after_seg_idx = ws_end
+            after_abs = seg_start + after_seg_idx
+            next_ch = pending[after_abs] if after_abs < len(pending) else ""
+            if not next_ch or next_ch in " \t\r\n" or next_ch in _PUNCT_CHARS:
+                seg_parts.append(before.rstrip(" \t"))
+            else:
+                seg_parts.append(before)
+            pos = after_seg_idx
         seg_parts.append(seg[pos:])
         out.append("".join(seg_parts))
         cursor = seg_end
@@ -291,7 +304,7 @@ def _compute_unstreamed_suffix(
             tail = canonical[len(norm_trimmed) :]
             if not tail or not tail[0].isalnum():
                 return tail
-    if streamed.endswith("\n"):
+    if streamed.endswith("\n") or (not post_tool_turn and not norm_streamed):
         return canonical
     return f"\n\n{canonical}"
 
@@ -370,6 +383,7 @@ async def chat_completions(
 
         async def gen():
             prior_streamed_parts: list[str] = []
+            last_rotated_turn = ""
             streamed_parts: list[str] = []
             buffered_parts: list[str] = []
             pending_bracket = ""
@@ -385,7 +399,7 @@ async def chat_completions(
 
             def _rotate_streamed_turn() -> str | None:
                 nonlocal pending_bracket, streamed_before_tool, need_turn_separator
-                nonlocal stream_at_line_start, stream_code_fence
+                nonlocal stream_at_line_start, stream_code_fence, last_rotated_turn
                 flushed_eof: str | None = None
                 if not should_buffer:
                     if pending_bracket:
@@ -408,6 +422,7 @@ async def chat_completions(
                                 flushed_eof = eof_tail
                     if streamed_parts:
                         streamed_before_tool = True
+                        last_rotated_turn = "".join(streamed_parts)
                         need_turn_separator = not streamed_parts[-1].endswith("\n")
                         prior_streamed_parts.extend(streamed_parts)
                         streamed_parts.clear()
@@ -495,6 +510,16 @@ async def chat_completions(
                             canonical,
                             post_tool_turn=False,
                         )
+                    elif (
+                        last_rotated_turn
+                        and _compute_unstreamed_suffix(
+                            last_rotated_turn,
+                            canonical,
+                            post_tool_turn=True,
+                        )
+                        == ""
+                    ):
+                        suffix = ""
                     else:
                         suffix = _compute_unstreamed_suffix(
                             all_streamed,
