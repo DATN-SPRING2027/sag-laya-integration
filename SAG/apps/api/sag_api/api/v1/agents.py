@@ -291,6 +291,15 @@ async def messages(
     for message in visible_messages:
         dto = MessageOut.model_validate(message)
         dto.is_inherited = message.thread_id != thread.id
+        for step in message.steps or ():
+            if not isinstance(step, dict):
+                continue
+            if step.get("degraded"):
+                dto.degraded = True
+                dto.degraded_reason = dto.degraded_reason or step.get("degraded_reason")
+            elif step.get("extraction_degraded"):
+                dto.degraded = True
+                dto.degraded_reason = dto.degraded_reason or step.get("extraction_degraded_reason")
         items_out.append(dto)
     return MessagePageOut(
         items=items_out,
@@ -416,6 +425,7 @@ async def ask(
     thread = await svc.get_thread(session, agent.id, thread_id, owner_key=owner_key)
     if not llm.configured:
         raise ConfigurationError("尚未配置 LLM，无法生成回答")
+    web_enabled = body.effective_web_enabled
     actions_svc.claim_thread_generation(thread.id, agent_runtime)
     try:
         plan = await svc.prepare_ask(
@@ -429,11 +439,11 @@ async def ask(
             owner_key=owner_key,
             llm=llm,
             user_name=current_user.name,
+            web_enabled=web_enabled,
         )
     except BaseException:
         actions_svc.release_thread_generation(thread.id)
         raise
-    web_enabled = body.effective_web_enabled
 
     async def event_gen():
         last = None
@@ -648,6 +658,7 @@ async def regenerate_message(
     if not llm.configured:
         raise ConfigurationError("尚未配置 LLM，无法生成回答")
 
+    web_enabled = body.effective_web_enabled
     actions_svc.claim_thread_generation(thread.id, agent_runtime)
     try:
         plan = await actions_svc.prepare_regenerate(
@@ -659,12 +670,11 @@ async def regenerate_message(
             owner_key=owner_key,
             llm=llm,
             user_name=current_user.name,
+            web_enabled=web_enabled,
         )
     except BaseException:
         actions_svc.release_thread_generation(thread.id)
         raise
-
-    web_enabled = body.effective_web_enabled
 
     async def event_gen():
         last = None

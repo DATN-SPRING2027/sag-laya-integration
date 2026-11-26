@@ -1,3 +1,5 @@
+> **SUPERSEDED (2026-11-25):** Đặc tả kiến trúc v1.1 (2026-09-23). Các phần mô tả **Laya Local** (`§13.6`, `§14.1`, `laya_ms`, `SAG_ENABLE_LAYA`) và **Tier E2 LLM Enrichment** (`§9`) đã bị **thay thế** theo [adr-remove-laya-and-r2.md](adr-remove-laya-and-r2.md) và [adr-remove-e2-llm-enrichment.md](adr-remove-e2-llm-enrichment.md). Định tuyến truy vấn thực tế đi qua `services/decision_router.py`; pipeline kiến thức mặc định chỉ chạy `Phase 2C SearchUnit` + `Phase 5A FOUNDATION (E0/E1)`.
+
 **SAG**
 
 Knowledge Routing RAG Workflow

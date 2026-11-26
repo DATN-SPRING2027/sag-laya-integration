@@ -30,6 +30,7 @@ from zleap.sag.pipeline import SearchOptions, SearchRequest, SearchScope
 from sag_api.core.config import Settings
 from sag_api.core.error_taxonomy import ErrorLayer, ErrorStage
 from sag_api.core.logging import get_logger
+from sag_api.core.text_utils import normalize_text
 from sag_api.enums import (
     SEARCH_STRATEGIES,
     SEARCH_STRATEGY_REQUIREMENTS,
@@ -602,62 +603,36 @@ class EngineManager:
                 inner_emb = getattr(emb, attr_name, None)
                 if inner_emb is not None and getattr(inner_emb, "max_tokens", 512) <= 512:
                     inner_emb.max_tokens = 8192
+
+        if self._settings.embedding_dimensions is None:
+            hostname = (urlparse(self._settings.effective_embedding_base_url or "").hostname or "").lower()
+            model = self._settings.embedding_model.strip().lower()
+            if hostname in ("api.siliconflow.com", "api.siliconflow.cn") and model == "baai/bge-m3":
+                if emb is not None:
+                    from sag_api.services.search_index_service import resolve_embedding_dimensions
+
+                    resolved_schema_dim = (
+                        getattr(emb, "schema_dimensions", None)
+                        or getattr(emb, "dimensions", None)
+                        or resolve_embedding_dimensions(self._settings.embedding_model, None)
+                    )
+                    emb.schema_dimensions = int(resolved_schema_dim)
+                    emb.dimensions = None
+                    inner = getattr(emb, "inner", None)
+                    if inner is not None:
+                        inner.schema_dimensions = int(resolved_schema_dim)
+                        inner.dimensions = None
+
         from sag_api.core.token_usage import wrap_embedding_client_with_cache_and_metering
-        wrap_embedding_client_with_cache_and_metering(emb, default_model=self._settings.embedding_model)
-        if emb is not None and not getattr(emb, "_sag_shared_cache_wrapped", False):
-            from sag_api.services.search_index_service import (
-                get_cached_text_embedding,
-                put_cached_text_embedding,
-            )
+        from sag_api.services.search_index_service import build_embedding_model_signature
 
-            orig_generate = emb.generate
-            orig_batch_generate = emb.batch_generate
-
-            async def _cached_generate(text: str) -> list[float]:
-                cached = get_cached_text_embedding(text)
-                if cached is not None:
-                    return cached
-                vec = await orig_generate(text)
-                if vec:
-                    put_cached_text_embedding(text, vec)
-                return vec
-
-            async def _cached_batch_generate(texts: list[str]) -> list[list[float]]:
-                if not texts:
-                    return []
-                results: list[list[float] | None] = [None] * len(texts)
-                missing_by_text: dict[str, list[int]] = {}
-                for idx, txt in enumerate(texts):
-                    cached = get_cached_text_embedding(txt)
-                    if cached is not None:
-                        results[idx] = cached
-                    else:
-                        missing_by_text.setdefault(txt, []).append(idx)
-                if missing_by_text:
-                    unique_missing = list(missing_by_text.keys())
-                    fetched = await orig_batch_generate(unique_missing)
-                    for txt, vec in zip(unique_missing, fetched, strict=True):
-                        if vec:
-                            put_cached_text_embedding(txt, vec)
-                        for m_idx in missing_by_text[txt]:
-                            results[m_idx] = vec
-                return [vec or [] for vec in results]
-
-            emb.generate = _cached_generate
-            emb.batch_generate = _cached_batch_generate
-            emb._sag_shared_cache_wrapped = True
-
-        if self._settings.embedding_dimensions is not None:
-            return
-        hostname = (urlparse(self._settings.effective_embedding_base_url or "").hostname or "").lower()
-        model = self._settings.embedding_model.strip().lower()
-        if hostname not in ("api.siliconflow.com", "api.siliconflow.cn") or model != "baai/bge-m3":
-            return
-        if emb is not None:
-            emb.dimensions = None
-            inner = getattr(emb, "inner", None)
-            if inner is not None:
-                inner.dimensions = None
+        emb_sig = build_embedding_model_signature(emb, settings_obj=self._settings)
+        wrap_embedding_client_with_cache_and_metering(
+            emb,
+            default_model=self._settings.embedding_model,
+            settings_obj=self._settings,
+            model_signature=emb_sig,
+        )
 
     async def _ensure_engine_schema(self, engine: DataEngine) -> None:
         if self._schema_ready:
@@ -1084,7 +1059,6 @@ class EngineManager:
                             8 if self._settings.document_extraction_profile == "concise" else 20
                         ),
                         write_event_entity_vectors=self._settings.document_write_event_entity_vectors,
-                        enable_strict_filtering=self._settings.document_strict_filtering,
                         event_entity_attempts=self._settings.document_event_entity_attempts,
                         extraction_profile=self._settings.document_extraction_profile,
                         document_version_id=document_version_id,
@@ -1766,7 +1740,9 @@ class EngineManager:
                 *direct_rows,
                 *(row for row in balanced_rows if (row["source_config_id"], row["id"]) not in selected_direct_keys),
             ]:
-                normalized_title = re.sub(r"\s+", "", str(row["title"] or "")).casefold()
+                normalized_title = re.sub(
+                    r"\s+", "", normalize_text(str(row["title"] or ""))
+                ).casefold()
                 title_key = (row["source_config_id"], normalized_title or row["id"])
                 if title_key in seen_titles:
                     continue

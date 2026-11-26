@@ -4,18 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import math
 import re
 import threading
 import time
+import unicodedata
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any, Protocol
 from weakref import WeakKeyDictionary
 
 import httpx
-from sqlalchemy import func, select
+import regex
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -25,6 +30,7 @@ from sag_api.core.db import SessionLocal
 from sag_api.core.errors import ServiceUnavailableError
 from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal
+from sag_api.core.text_utils import normalize_text
 from sag_api.db.models import (
     CanonicalBlock,
     Document,
@@ -41,7 +47,7 @@ from sag_api.db.models import (
     StageRun,
     TreeManifest,
 )
-from sag_api.enums import DocumentStatus, JobStatus, JobType
+from sag_api.enums import DocumentStatus, JobStatus, JobType, normalize_scope_tags
 from sag_api.sag import RetrievedSection, SearchOutcome
 from sag_api.sag.search_unit_store import (
     SearchIndexUnavailable,
@@ -58,6 +64,12 @@ from sag_api.services.query_routing_service import (
     scope_fingerprint,
 )
 from sag_api.services.query_strategy_planner import QueryStrategyPlan, plan_query, promote_multi_hop
+from sag_api.services.unit_supersession_overlay import (
+    SupersededUnitInfo,
+    compute_scope_supersession_digest,
+    load_active_conflict_unit_ids_for_scope,
+    load_superseded_unit_ids_for_scope,
+)
 
 log = get_logger("search_units")
 _routed_query_demand_tasks: set[asyncio.Task[None]] = set()
@@ -71,6 +83,9 @@ async def _select_diverse_sections(
     limit,
     deadline,
     per_document_limit: int | None = None,
+    multi_hop: bool | None = None,
+    entities: tuple[str, ...] | list[str] = (),
+    temporal_mode: str | None = None,
 ):
     """Keep evidence scoring off the API loop and stop it when its request ends."""
     from sag_api.services.retrieval_service import select_diverse_sections
@@ -87,6 +102,9 @@ async def _select_diverse_sections(
                 candidates,
                 limit=limit,
                 per_document_limit=per_document_limit,
+                multi_hop=multi_hop,
+                entities=entities,
+                temporal_mode=temporal_mode,
                 _cancelled=cancelled,
             ))
             try:
@@ -120,12 +138,21 @@ def _resolve_public_document_id(logical_source_id: object) -> str | None:
     return None
 
 
-def _verify_selection_scope(version_ids, previous, refreshed):
+def _verify_selection_scope(
+    version_ids,
+    previous,
+    refreshed,
+    *,
+    selected_unit_ids: set[str] | frozenset[str] | list[str] | tuple[str, ...] = (),
+    superseded_unit_ids: set[str] | frozenset[str] | Mapping[str, Any] | None = None,
+):
     fields = ("source_id", "project_id", "tenant_id", "partition_id", "acl_mapping_version",
               "ingestion_run_id", "index_stage_run_id", "search_manifest_checksum")
     if any(vid not in previous or vid not in refreshed or any(
         getattr(previous[vid], key) != getattr(refreshed[vid], key) for key in fields
     ) for vid in version_ids):
+        raise ServiceUnavailableError("Search scope changed during evidence selection")
+    if superseded_unit_ids and any(uid in superseded_unit_ids for uid in selected_unit_ids):
         raise ServiceUnavailableError("Search scope changed during evidence selection")
 
 
@@ -147,6 +174,12 @@ class _ReadyVersion:
     ingestion_run_id: str = ""
     index_stage_run_id: str = ""
     search_manifest_checksum: str = ""
+    valid_to: datetime | None = None
+    is_superseded: bool = False
+    document_id: str = ""
+    authority_tier: int | None = None
+    effective_from: datetime | None = None
+    scope_tags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,12 +296,98 @@ def _verified_manifest(metrics: Any, *, project_id: str) -> bool:
     )
 
 
+_STAGE_CLOCK_SKEW_TOLERANCE = timedelta(seconds=1)
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def _min_utc(a: datetime | None, b: datetime | None) -> datetime | None:
+    a_utc = _as_utc(a)
+    b_utc = _as_utc(b)
+    if a_utc is None:
+        return b_utc
+    if b_utc is None:
+        return a_utc
+    return a_utc if a_utc <= b_utc else b_utc
+
+
+def _overlay_fingerprint_from_state(
+    superseded_units: Mapping[str, SupersededUnitInfo],
+    active_conflict_unit_ids: frozenset[str] | set[str],
+) -> str:
+    """Compute a deterministic 16-char hex digest matching compute_scope_supersession_digest."""
+    if not superseded_units and not active_conflict_unit_ids:
+        return "none"
+    canonical_payload = {
+        "superseded": [
+            [
+                info.loser_unit_id,
+                info.winner_unit_id,
+                info.winner_version_id,
+                info.winner_document_id,
+                info.effective_valid_to.isoformat() if info.effective_valid_to is not None else "",
+                info.resolution_id,
+            ]
+            for info in sorted(
+                superseded_units.values(),
+                key=lambda item: (item.loser_unit_id, item.resolution_id, item.winner_unit_id),
+            )
+        ],
+        "conflicts": sorted(active_conflict_unit_ids),
+    }
+    raw = json.dumps(canonical_payload, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _apply_unit_overlay_to_section(
+    sec_template: RetrievedSection,
+    *,
+    superseded_units: Mapping[str, SupersededUnitInfo],
+    active_conflict_unit_ids: frozenset[str] | set[str],
+    include_unit_superseded: bool,
+    extra_updates: dict[str, Any] | None = None,
+) -> RetrievedSection | None:
+    """Return a stamped model_copy or None if suppressed. Never mutates sec_template."""
+    u_id = str(sec_template.search_unit_id or sec_template.chunk_id or "")
+    sup_info = superseded_units.get(u_id) if u_id else None
+    if sup_info is not None and not include_unit_superseded:
+        return None
+    updates: dict[str, Any] = dict(extra_updates or {})
+    if sup_info is not None:
+        updates["is_superseded"] = True
+        updates["conflict_status"] = "SUPERSEDED_BY_UNIT"
+        updates["valid_to"] = _min_utc(sec_template.valid_to, sup_info.effective_valid_to)
+    elif u_id and u_id in active_conflict_unit_ids:
+        updates["conflict_status"] = "ACTIVE_CONFLICT"
+    return sec_template.model_copy(update=updates) if updates else sec_template.model_copy()
+
+
 def _stage_belongs_to_current_attempt(
     attempt_started_at: datetime | None,
     stage: StageRun,
+    *,
+    attempt_count: int | None = None,
 ) -> bool:
-    """A retry invalidates older SUCCESS manifests as soon as its run starts."""
-    return attempt_started_at is not None and stage.created_at >= attempt_started_at
+    """A retry invalidates older SUCCESS manifests while absorbing <=1s DB/SQLite clock skew."""
+    if attempt_started_at is None or stage.created_at is None:
+        return False
+    if attempt_count is not None and isinstance(stage.metrics_json, dict):
+        stage_attempt = stage.metrics_json.get("attempt_count")
+        if (
+            isinstance(stage_attempt, int)
+            and not isinstance(stage_attempt, bool)
+            and stage_attempt != attempt_count
+        ):
+            return False
+    attempt_utc = _as_utc(attempt_started_at)
+    stage_utc = _as_utc(stage.created_at)
+    if attempt_utc is None or stage_utc is None:
+        return False
+    return (stage_utc + _STAGE_CLOCK_SKEW_TOLERANCE) >= attempt_utc
 
 
 async def _load_current_ready_versions(
@@ -277,6 +396,8 @@ async def _load_current_ready_versions(
     principal: VerifiedPrincipal,
     *,
     version_ids: set[str] | list[str] | tuple[str, ...] | None = None,
+    include_superseded: bool = False,
+    reference_time: datetime | None = None,
 ) -> dict[str, _ReadyVersion]:
     try:
         return await _load_current_ready_versions_checked(
@@ -284,6 +405,8 @@ async def _load_current_ready_versions(
             sources,
             principal,
             version_ids=version_ids,
+            include_superseded=include_superseded,
+            reference_time=reference_time,
         )
     except SQLAlchemyError as error:
         log.warning("canonical scope lookup unavailable error_type=%s", type(error).__name__)
@@ -299,18 +422,85 @@ async def grep_search_unit_blocks(
     limit: int,
 ) -> list[CanonicalBlock]:
     """Find literal text in every currently searchable, ACL-scoped canonical block."""
-    versions = await _load_current_ready_versions(session, sources, principal)
+    reference_time = datetime.now(UTC)
+    versions = await _load_current_ready_versions(
+        session,
+        sources,
+        principal,
+        reference_time=reference_time,
+    )
     if not versions:
         return []
 
+    scoped_source_ids = sorted({source.id for source in sources})
+    scoped_tenants = sorted({v.tenant_id for v in versions.values() if v.tenant_id})
+    scoped_projects = sorted({v.project_id for v in versions.values() if v.project_id})
+    principal_partitions = sorted(principal.allowed_partition_ids)
+    try:
+        hidden_document_ids = await _hidden_reprocess_document_ids(session, scoped_source_ids)
+    except SQLAlchemyError as error:
+        log.warning("canonical literal search unavailable error_type=%s", type(error).__name__)
+        raise ServiceUnavailableError("Canonical literal search is unavailable") from error
+
+    superseded_units = await load_superseded_unit_ids_for_scope(
+        session,
+        loser_version_ids=sorted(versions),
+        tenant_ids=scoped_tenants,
+        project_ids=scoped_projects,
+        allowed_partitions=principal_partitions,
+        reference_time=reference_time,
+        organization_id=principal.organization_id,
+        allowed_source_ids=scoped_source_ids,
+        hidden_document_ids=hidden_document_ids,
+    )
+
     escaped = pattern.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     try:
+        predicates: list[Any] = [
+            CanonicalBlock.document_version_id.in_(sorted(versions)),
+            CanonicalBlock.normalized_text.ilike(f"%{escaped}%", escape="\\"),
+        ]
+        if superseded_units:
+            superseded_unit_ids = sorted(superseded_units)
+            loser_vid_rows = (
+                await session.scalars(
+                    select(SearchUnit.document_version_id)
+                    .where(
+                        SearchUnit.id.in_(superseded_unit_ids),
+                        SearchUnit.document_version_id.in_(sorted(versions)),
+                    )
+                    .distinct()
+                )
+            ).all()
+            superseded_loser_vids = sorted({str(vid) for vid in loser_vid_rows if vid})
+            if superseded_loser_vids:
+                active_su = aliased(SearchUnit)
+                b_from = aliased(CanonicalBlock)
+                b_to = aliased(CanonicalBlock)
+                active_unit_covers_block = (
+                    select(active_su.id)
+                    .join(b_from, b_from.id == active_su.block_from_id)
+                    .join(b_to, b_to.id == active_su.block_to_id)
+                    .where(
+                        active_su.document_version_id == CanonicalBlock.document_version_id,
+                        active_su.security_partition_id.in_(principal_partitions),
+                        active_su.id.notin_(superseded_unit_ids),
+                        b_from.document_version_id == active_su.document_version_id,
+                        b_to.document_version_id == active_su.document_version_id,
+                        b_from.ordinal <= CanonicalBlock.ordinal,
+                        b_to.ordinal >= CanonicalBlock.ordinal,
+                    )
+                    .exists()
+                )
+                predicates.append(
+                    or_(
+                        CanonicalBlock.document_version_id.notin_(superseded_loser_vids),
+                        active_unit_covers_block,
+                    )
+                )
         rows = await session.scalars(
             select(CanonicalBlock)
-            .where(
-                CanonicalBlock.document_version_id.in_(versions),
-                CanonicalBlock.normalized_text.ilike(f"%{escaped}%", escape="\\"),
-            )
+            .where(*predicates)
             .order_by(CanonicalBlock.document_version_id, CanonicalBlock.ordinal)
             .limit(limit)
         )
@@ -326,6 +516,8 @@ async def _load_current_ready_versions_checked(
     principal: VerifiedPrincipal,
     *,
     version_ids: set[str] | list[str] | tuple[str, ...] | None = None,
+    include_superseded: bool = False,
+    reference_time: datetime | None = None,
 ) -> dict[str, _ReadyVersion]:
     """Recheck mappings and collect only versions from each version's latest verified attempt."""
     if not sources or not principal.tenant_id or not principal.allowed_partition_ids:
@@ -337,7 +529,9 @@ async def _load_current_ready_versions_checked(
     source_ids = sorted(source_by_id)
     partition_ids = sorted(principal.allowed_partition_ids)
     partition_expression = DocumentVersion.metadata_json["security_partition_id"].as_string()
-    current_time = datetime.now(UTC)
+    eval_time = _as_utc(reference_time) if reference_time is not None else datetime.now(UTC)
+    assert eval_time is not None
+    wall_now = datetime.now(UTC)
     hidden_document_ids = await _hidden_reprocess_document_ids(session, source_ids)
 
     unit_exists_clause = (
@@ -353,6 +547,11 @@ async def _load_current_ready_versions_checked(
         await session.execute(
             select(
                 DocumentVersion.id.label("document_version_id"),
+                DocumentVersion.document_id.label("document_id"),
+                DocumentVersion.valid_to.label("valid_to"),
+                DocumentVersion.authority_tier.label("authority_tier"),
+                DocumentVersion.effective_from.label("effective_from"),
+                DocumentVersion.scope_tags_json.label("scope_tags_json"),
                 Document.source_id,
                 Document.project_id,
                 Document.tenant_id,
@@ -380,10 +579,11 @@ async def _load_current_ready_versions_checked(
                     ]
                 ),
                 Document.id.notin_(hidden_document_ids) if hidden_document_ids else True,
+                DocumentVersion.status != "REVOKED",
                 DocumentVersion.search_status.in_(("READY", "SEARCH_READY")),
-                DocumentVersion.valid_from <= current_time,
+                DocumentVersion.valid_from <= eval_time,
                 DocumentVersion.search_ready_at.is_not(None),
-                DocumentVersion.valid_to > current_time,
+                True if include_superseded else (DocumentVersion.valid_to > eval_time),
                 partition_expression.in_(partition_ids),
                 unit_exists_clause,
             )
@@ -400,6 +600,7 @@ async def _load_current_ready_versions_checked(
             IngestionRun.project_id.label("project_id"),
             IngestionRun.tenant_id.label("tenant_id"),
             IngestionRun.started_at.label("started_at"),
+            IngestionRun.attempt_count.label("attempt_count"),
             func.row_number()
             .over(
                 partition_by=IngestionRun.document_version_id,
@@ -418,6 +619,7 @@ async def _load_current_ready_versions_checked(
                 ranked_runs.c.project_id,
                 ranked_runs.c.tenant_id,
                 ranked_runs.c.started_at,
+                ranked_runs.c.attempt_count,
             ).where(ranked_runs.c.attempt_rank == 1)
         )
     ).all()
@@ -438,6 +640,7 @@ async def _load_current_ready_versions_checked(
         stage_by_run.setdefault(stage.run_id, stage)
 
     versions: dict[str, _ReadyVersion] = {}
+    superseded_cutoff = max(eval_time, wall_now)
     for row in scoped_rows:
         version_id = str(row.document_version_id)
         run = run_by_version.get(version_id)
@@ -450,12 +653,42 @@ async def _load_current_ready_versions_checked(
         if (
             stage is None
             or stage.status != "SUCCESS"
-            or not _stage_belongs_to_current_attempt(run.started_at, stage)
+            or not _stage_belongs_to_current_attempt(
+                run.started_at,
+                stage,
+                attempt_count=getattr(run, "attempt_count", None),
+            )
             or not _verified_manifest(stage.metrics_json, project_id=str(row.project_id))
         ):
             continue
+        row_valid_to = getattr(row, "valid_to", None)
+        is_sup = False
+        if isinstance(row_valid_to, datetime):
+            vt_utc = _as_utc(row_valid_to)
+            assert vt_utc is not None
+            is_sup = vt_utc <= superseded_cutoff
+        raw_tier = getattr(row, "authority_tier", None)
+        norm_tier = (
+            int(raw_tier)
+            if isinstance(raw_tier, int) and not isinstance(raw_tier, bool) and 1 <= raw_tier <= 4
+            else None
+        )
+        raw_eff = getattr(row, "effective_from", None)
+        norm_eff = _as_utc(raw_eff) if isinstance(raw_eff, datetime) else None
+        raw_tags = getattr(row, "scope_tags_json", None)
+        norm_tags: tuple[str, ...] = ()
+        if raw_tags is not None:
+            try:
+                norm_tags = tuple(normalize_scope_tags(raw_tags))
+            except ValueError:
+                log.warning(
+                    "Ignoring malformed scope_tags_json on document_version=%s",
+                    version_id,
+                )
+                norm_tags = ()
         versions[version_id] = _ReadyVersion(
             document_version_id=version_id,
+            document_id=str(getattr(row, "document_id", "") or ""),
             source_id=str(row.source_id),
             project_id=str(row.project_id),
             tenant_id=str(row.tenant_id),
@@ -465,6 +698,11 @@ async def _load_current_ready_versions_checked(
             index_stage_run_id=str(stage.id),
             search_manifest_checksum=str(stage.metrics_json["manifest_checksum"]),
             source=source,
+            valid_to=row_valid_to,
+            is_superseded=is_sup,
+            authority_tier=norm_tier,
+            effective_from=norm_eff,
+            scope_tags=norm_tags,
         )
     return versions
 
@@ -724,52 +962,62 @@ _QWEN3_QUERY_INSTRUCT = (
 
 
 async def _query_vector(engine_manager: Any, group: _SearchGroup, query: str) -> list[float]:
-    from sag_api.services.search_index_service import (
-        get_cached_text_embedding,
-        put_cached_text_embedding,
-    )
-
-    model_name = (getattr(settings, "embedding_model", "") or "").lower()
-    if "qwen3-embedding" in model_name and not query.startswith("Instruct:"):
-        embed_query = f"{_QWEN3_QUERY_INSTRUCT}{query}"
-    else:
-        embed_query = query
-
     from sag_api.core.token_usage import (
         extract_embedding_usage,
         record_embedding_cache_hit,
         record_embedding_usage,
         token_usage_scope,
     )
+    from sag_api.services.search_index_service import (
+        build_embedding_model_signature,
+        get_cached_text_embedding,
+        put_cached_text_embedding,
+    )
 
-    cached = get_cached_text_embedding(embed_query)
+    settings_obj = getattr(engine_manager, "_settings", None) or settings
+    embedding = None
+    emb_exc: Exception | None = None
+    try:
+        embedding = await engine_manager.get_sag_embedding(group.source.sag_source_config_id, group.source)
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:  # noqa: BLE001 - upstream details may contain private URLs or credentials
+        emb_exc = error
+
+    emb_model = getattr(embedding, "model", None) or getattr(settings_obj, "embedding_model", "") or ""
+    model_name = str(emb_model).lower()
+    if "qwen3-embedding" in model_name and not query.startswith("Instruct:"):
+        embed_query = f"{_QWEN3_QUERY_INSTRUCT}{query}"
+    else:
+        embed_query = query
+
+    emb_sig = build_embedding_model_signature(embedding, settings_obj=settings_obj)
+    cached = get_cached_text_embedding(embed_query, model_signature=emb_sig)
     if cached is not None:
         record_embedding_cache_hit(
-            model=getattr(settings, "embedding_model", None),
+            model=emb_model or None,
             count=1,
             component="query_embedding",
             project_id=group.project_id,
         )
         return cached
-    if cached is not None:
-        return cached
     try:
-        embedding = await engine_manager.get_sag_embedding(group.source.sag_source_config_id, group.source)
+        if emb_exc is not None:
+            raise emb_exc
         with token_usage_scope(
             component="query_embedding",
             project_id=group.project_id,
             tenant_id=group.tenant_id,
         ):
-
             vector = [float(value) for value in await embedding.generate(embed_query)]
             if not getattr(embedding, "_sag_token_metered_cache_wrapped", False):
                 record_embedding_usage(
-                    model=getattr(settings, "embedding_model", None),
+                    model=emb_model or None,
                     usage=extract_embedding_usage(None, embed_query),
                 )
         if not vector or any(not math.isfinite(value) for value in vector):
             raise ValueError("invalid embedding vector")
-        put_cached_text_embedding(embed_query, vector)
+        put_cached_text_embedding(embed_query, vector, model_signature=emb_sig)
         return vector
     except asyncio.CancelledError:
         raise
@@ -874,6 +1122,7 @@ def _routing_trace(
     selection_fallback_reason: str | None = None,
     graph_expansion_attempted: bool = False,
     graph_expanded_candidates: int = 0,
+    temporal_bypass: bool = False,
 ) -> dict[str, Any]:
     routed_groups: list[dict[str, Any]] = []
     request_snapshot_ids: set[str] = set()
@@ -893,6 +1142,7 @@ def _routing_trace(
         if route and route.request_snapshot_id:
             request_snapshot_ids.add(route.request_snapshot_id)
         selected_nodes = list(route.selected_nodes) if route else []
+        is_temporal_bypass = temporal_bypass and route is None
         routed_groups.append(
             {
                 "project_id": group.project_id,
@@ -909,14 +1159,24 @@ def _routing_trace(
                 "entropy": route.entropy if route else None,
                 "margin": route.margin if route else None,
                 "broad_route": route.broad_route if route else False,
-                "reason_code": route.reason_code if route else "TREE_SNAPSHOT_UNAVAILABLE",
-                "fallback_reason": route.fallback_reason if route else "routing_snapshot_unavailable",
+                "reason_code": (
+                    route.reason_code
+                    if route
+                    else ("TEMPORAL_HISTORY_BYPASS_TREE" if is_temporal_bypass else "TREE_SNAPSHOT_UNAVAILABLE")
+                ),
+                "fallback_reason": (
+                    route.fallback_reason
+                    if route
+                    else ("temporal_superseded_scope" if is_temporal_bypass else "routing_snapshot_unavailable")
+                ),
                 "branch_local_candidates": len(local_ids),
                 "global_candidates": len(global_ids),
                 "escape_recovered_candidates": len(escape_ids - local_ids),
                 "escape_attempted": True,
                 "escape_trigger": (
-                    "tree_route_unavailable"
+                    "temporal_history_global_only"
+                    if is_temporal_bypass
+                    else "tree_route_unavailable"
                     if not route or not route.routed
                     else "local_path_failed"
                     if group.scope_key in local_failures
@@ -949,9 +1209,9 @@ def _routing_trace(
     }
 
 
-_ARTIFACT_CODE_RE = re.compile(
-    r"\b([a-z]{2,8})[\s_#-]+(\d{2,6}[a-z0-9]*)\b",
-    re.IGNORECASE,
+_ARTIFACT_CODE_RE = regex.compile(
+    r"(?<!\w)(\p{L}{2,8})[\s_#-]+(\d{2,6}[\p{L}\d]*)(?!\w)",
+    regex.IGNORECASE,
 )
 _NON_ARTIFACT_PREFIXES = frozenset(
     {
@@ -962,7 +1222,9 @@ _NON_ARTIFACT_PREFIXES = frozenset(
         "page", "pages", "step", "steps", "tier", "tiers", "part", "parts", "item", "items",
         "line", "lines", "table", "tables", "figure", "figures", "note", "notes", "top", "max", "min",
         "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
-        "ngay", "thang", "nam", "tuan", "gio", "phut", "giay", "trang", "buoc", "lan", "phan", "muc",
+        "ngay", "ngày", "thang", "tháng", "nam", "năm", "tuan", "tuần", "gio", "giờ",
+        "phut", "phút", "giay", "giây", "trang", "buoc", "bước", "lan", "lần",
+        "phan", "phần", "muc", "mục", "dieu", "điều", "khoan", "khoản", "chuong", "chương",
     }
 )
 _INTERNAL_URI_SLUG_RE = re.compile(
@@ -975,7 +1237,7 @@ def _extract_artifact_codes(text: str) -> set[str]:
     if not text:
         return set()
     codes: set[str] = set()
-    for match in _ARTIFACT_CODE_RE.finditer(text):
+    for match in _ARTIFACT_CODE_RE.finditer(unicodedata.normalize("NFC", text)):
         prefix = match.group(1).lower()
         if prefix in _NON_ARTIFACT_PREFIXES:
             continue
@@ -1033,6 +1295,10 @@ def _scope_knowledge_digest(current_versions: dict[str, _ReadyVersion]) -> str:
             v.tenant_id,
             v.project_id,
             v.source_id,
+            v.is_superseded,
+            v.authority_tier,
+            v.effective_from.isoformat() if isinstance(v.effective_from, datetime) else None,
+            v.scope_tags,
         )
         for v in sorted(current_versions.values(), key=lambda item: item.document_version_id)
     ]
@@ -1043,12 +1309,38 @@ async def _get_or_build_scope_knowledge_index(
     session: AsyncSession,
     current_versions: dict[str, _ReadyVersion],
     allowed_partitions: list[str],
+    *,
+    overlay_fingerprint: str = "",
+    reference_time: datetime | None = None,
+    organization_id: str | None = None,
 ) -> _ScopeKnowledgeIndex:
     version_ids = sorted(current_versions)
+    norm_partitions = sorted(set(allowed_partitions))
+    effective_overlay_fp = overlay_fingerprint
+    if not effective_overlay_fp and current_versions and norm_partitions:
+        scoped_tenants = sorted({v.tenant_id for v in current_versions.values() if v.tenant_id})
+        scoped_projects = sorted({v.project_id for v in current_versions.values() if v.project_id})
+        scoped_sources = sorted({v.source_id for v in current_versions.values() if v.source_id})
+        hidden_doc_ids = (
+            await _hidden_reprocess_document_ids(session, scoped_sources)
+            if scoped_sources
+            else set()
+        )
+        effective_overlay_fp = await compute_scope_supersession_digest(
+            session,
+            version_ids=version_ids,
+            tenant_ids=scoped_tenants,
+            project_ids=scoped_projects,
+            allowed_partitions=norm_partitions,
+            reference_time=reference_time or datetime.now(UTC),
+            organization_id=organization_id,
+            allowed_source_ids=scoped_sources or None,
+            hidden_document_ids=hidden_doc_ids,
+        )
     checksum_rows = (await session.execute(
         select(KnowledgeUnit.id, KnowledgeUnit.checksum, KnowledgeUnit.project_id).where(
             KnowledgeUnit.document_version_id.in_(version_ids), KnowledgeUnit.is_current.is_(True),
-            KnowledgeUnit.security_partition_id.in_(allowed_partitions),
+            KnowledgeUnit.security_partition_id.in_(norm_partitions),
         )
     )).all()
     checksums = {uid: value for uid, value, _project in checksum_rows}
@@ -1078,22 +1370,35 @@ async def _get_or_build_scope_knowledge_index(
                 candidates.append((build_id in active_graphs, len(relevant), build_id))
         if candidates:
             graph_ids.append(max(candidates)[2])
-    kg_edge_ids = sorted(
-        str(eid)
-        for (eid,) in (
-            await session.execute(
-                select(KnowledgeGraphEdge.id).where(
-                    KnowledgeGraphEdge.project_id.in_(projects),
-                    KnowledgeGraphEdge.edge_type.in_(("CONTRADICTS", "SUPERSEDES")),
+    kg_edge_ids: list[str] = []
+    if projects and norm_partitions and version_ids:
+        edge_src_su = aliased(SearchUnit)
+        edge_tgt_su = aliased(SearchUnit)
+        kg_edge_ids = sorted(
+            str(eid)
+            for (eid,) in (
+                await session.execute(
+                    select(KnowledgeGraphEdge.id)
+                    .join(edge_src_su, edge_src_su.id == KnowledgeGraphEdge.source_unit_id)
+                    .join(edge_tgt_su, edge_tgt_su.id == KnowledgeGraphEdge.target_unit_id)
+                    .where(
+                        KnowledgeGraphEdge.project_id.in_(projects),
+                        KnowledgeGraphEdge.edge_type.in_(("CONTRADICTS", "SUPERSEDES")),
+                        edge_src_su.document_version_id.in_(version_ids),
+                        edge_tgt_su.document_version_id.in_(version_ids),
+                        edge_src_su.security_partition_id.in_(norm_partitions),
+                        edge_tgt_su.security_partition_id.in_(norm_partitions),
+                    )
                 )
-            )
-        ).all()
-    )
+            ).all()
+        )
     digest = hashlib.sha256(repr((
         _scope_knowledge_digest(current_versions),
+        norm_partitions,
         sorted(checksums.items()),
         sorted(graph_ids),
         kg_edge_ids,
+        effective_overlay_fp,
     )).encode()).hexdigest()
     cached = _SCOPE_KNOWLEDGE_INDEX_CACHE.get(digest)
     if cached is not None:
@@ -1416,6 +1721,7 @@ async def _ensure_versions_hydrated(
                 Document.source_id.in_([source.id for source in sources]),
                 Document.is_active.is_(True),
             )
+            .order_by(start_block.ordinal.asc(), end_block.ordinal.asc(), SearchUnit.id.asc())
         )
     ).all()
     blocks_by_version: dict[str, list[tuple[int, str]]] = defaultdict(list)
@@ -1427,7 +1733,10 @@ async def _ensure_versions_hydrated(
                     CanonicalBlock.ordinal,
                     CanonicalBlock.normalized_text,
                 )
-                .where(CanonicalBlock.document_version_id.in_(unhydrated_version_ids))
+                .where(
+                    CanonicalBlock.document_version_id.in_(unhydrated_version_ids),
+                    CanonicalBlock.is_boilerplate.is_(False),
+                )
                 .order_by(CanonicalBlock.document_version_id, CanonicalBlock.ordinal)
             )
         ).all()
@@ -1453,12 +1762,14 @@ async def _ensure_versions_hydrated(
             or not anchor.strip()
         ):
             continue
-        unit_texts = [
-            b_text
+        from sag_api.services.search_index_service import resolve_search_unit_text
+
+        unit_blocks = [
+            SimpleNamespace(normalized_text=b_text)
             for b_ord, b_text in blocks_by_version.get(v_id_str, ())
             if int(s_ord) <= b_ord <= int(e_ord)
         ]
-        combined_text = "\n\n".join(unit_texts)
+        combined_text = resolve_search_unit_text(unit, unit_blocks)
         if (
             not combined_text.strip()
             or hashlib.sha256(combined_text.encode("utf-8")).hexdigest() != unit.content_hash
@@ -1487,6 +1798,11 @@ async def _ensure_versions_hydrated(
             page_from=int(unit.page_from),
             page_to=int(unit.page_to),
             anchor=anchor.strip(),
+            valid_to=ver.valid_to,
+            is_superseded=ver.is_superseded,
+            authority_tier=ver.authority_tier,
+            effective_from=ver.effective_from,
+            scope_tags=ver.scope_tags,
         )
         k_index.hydrated_su_by_version[v_id_str].append((sec_template, int(s_ord), int(e_ord)))
 
@@ -1498,6 +1814,13 @@ async def _hydrate_sibling_sections_for_top_versions(
     sources: list[SearchableSource],
     limit: int,
     index_holder: list[_ScopeKnowledgeIndex] | None = None,
+    superseded_units: Mapping[str, SupersededUnitInfo] | None = None,
+    active_conflict_unit_ids: frozenset[str] | set[str] | None = None,
+    include_unit_superseded: bool = False,
+    overlay_fingerprint: str = "",
+    allowed_partitions: list[str] | None = None,
+    reference_time: datetime | None = None,
+    organization_id: str | None = None,
 ) -> list[RetrievedSection]:
     """Hydrate sibling SearchUnits of top admitted documents so context completion stays coherent."""
     if not sections or not current_versions:
@@ -1515,13 +1838,22 @@ async def _hydrate_sibling_sections_for_top_versions(
         return []
 
     existing_ids = {str(s.search_unit_id or s.chunk_id or "") for s in sections}
-    allowed_partitions = sorted({v.partition_id for v in current_versions.values()})
+    eff_partitions = (
+        sorted(set(allowed_partitions))
+        if allowed_partitions is not None
+        else sorted({v.partition_id for v in current_versions.values()})
+    )
+    sup_map = superseded_units or {}
+    conflict_ids = active_conflict_unit_ids or frozenset()
     try:
         async with SessionLocal() as session:
             k_index = await _get_or_build_scope_knowledge_index(
                 session,
                 current_versions,
-                allowed_partitions,
+                eff_partitions,
+                overlay_fingerprint=overlay_fingerprint,
+                reference_time=reference_time,
+                organization_id=organization_id,
             )
             if index_holder is not None:
                 index_holder.append(k_index)
@@ -1542,29 +1874,29 @@ async def _hydrate_sibling_sections_for_top_versions(
                     u_id = str(sec_template.search_unit_id or sec_template.chunk_id or "")
                     if not u_id or u_id in existing_ids:
                         continue
-                    existing_ids.add(u_id)
                     decay = max(0.55, 0.72 - 0.03 * idx_su)
-                    siblings.append(
-                        sec_template.model_copy(
-                            update={
-                                "score": round(parent_score * decay, 6),
-                                "rank": len(sections) + len(siblings),
-                            }
-                        )
+                    stamped = _apply_unit_overlay_to_section(
+                        sec_template,
+                        superseded_units=sup_map,
+                        active_conflict_unit_ids=conflict_ids,
+                        include_unit_superseded=include_unit_superseded,
+                        extra_updates={
+                            "score": round(parent_score * decay, 6),
+                            "rank": len(sections) + len(siblings),
+                        },
                     )
+                    if stamped is None:
+                        continue
+                    existing_ids.add(u_id)
+                    siblings.append(stamped)
             return siblings
-    except Exception:  # noqa: BLE001 - sibling hydration is best-effort
+    except (SQLAlchemyError, TimeoutError, AttributeError, ValueError) as exc:
+        log.debug("Skipping sibling SearchUnit hydration: %s", type(exc).__name__)
         return []
 
 
 _CONTINUOUS_ENTITY_CHAR_RE = re.compile(
     r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\u0e00-\u0eff\u1780-\u17ff\u1000-\u109f]"
-)
-_CONFLICT_LINEAGE_CUE_RE = re.compile(
-    r"(?<!\w)(?:contradict\w*|conflict\w*|discrepanc\w*|mismatch\w*|inconsisten\w*|"
-    r"differ\w*|versus|vs\.?|compare|comparison|reconcil\w*|"
-    r"mâu\s+thuẫn|xung\s+đột|khác\s+nhau|sai\s+lệch|đối\s+chiếu|so\s+sánh)(?!\w)",
-    flags=re.IGNORECASE | re.UNICODE,
 )
 
 
@@ -1585,6 +1917,14 @@ async def _expand_multi_hop_sections(
     query: str = "",
     allow_contradiction_lineage: bool = True,
     preloaded_k_index: _ScopeKnowledgeIndex | None = None,
+    allows_superseded: bool = False,
+    reference_time: datetime | None = None,
+    superseded_units: Mapping[str, SupersededUnitInfo] | None = None,
+    active_conflict_unit_ids: frozenset[str] | set[str] | None = None,
+    include_unit_superseded: bool | None = None,
+    overlay_fingerprint: str = "",
+    allowed_partitions: list[str] | None = None,
+    organization_id: str | None = None,
 ) -> list[RetrievedSection]:
     """HippoRAG 2 associative passage expansion over ACL-scoped KnowledgeUnitEdge + Artifact Bridges + Stage 2B Lineage."""
     if not seed_sections or not current_versions:
@@ -1611,14 +1951,23 @@ async def _expand_multi_hop_sections(
         return []
 
     seed_version_ids = {str(item[0]) for item in seed_ranges}
-    allowed_partitions = sorted({v.partition_id for v in current_versions.values()})
-    query_folded = re.sub(r"[\s_-]+", " ", (query or "").lower()).strip()
-    query_single_words = set(re.findall(r"[^\W_]+", query_folded, flags=re.UNICODE))
-    allowed_lineage_kinds = (
-        {"SUPERSEDED_BY", "CONTRADICTS"}
-        if (not lineage_only or allow_contradiction_lineage or bool(_CONFLICT_LINEAGE_CUE_RE.search(query or "")))
-        else {"SUPERSEDED_BY"}
+    eff_partitions = (
+        sorted(set(allowed_partitions))
+        if allowed_partitions is not None
+        else sorted({v.partition_id for v in current_versions.values()})
     )
+    eff_include_unit_superseded = (
+        allows_superseded if include_unit_superseded is None else include_unit_superseded
+    )
+    sup_map = superseded_units or {}
+    conflict_ids = active_conflict_unit_ids or frozenset()
+    query_folded = re.sub(r"[\s_-]+", " ", normalize_text(query or "").lower()).strip()
+    query_single_words = set(re.findall(r"[^\W_]+", query_folded, flags=re.UNICODE))
+    allowed_lineage_kinds: set[str] = {"SUPERSEDED_BY"}
+    if not lineage_only or allow_contradiction_lineage:
+        allowed_lineage_kinds.add("CONTRADICTS")
+    if allows_superseded:
+        allowed_lineage_kinds.add("SUPERSEDES")
     try:
         k_index = preloaded_k_index
         if k_index is None:
@@ -1626,7 +1975,10 @@ async def _expand_multi_hop_sections(
                 k_index = await _get_or_build_scope_knowledge_index(
                     session,
                     current_versions,
-                    allowed_partitions,
+                    eff_partitions,
+                    overlay_fingerprint=overlay_fingerprint,
+                    reference_time=reference_time,
+                    organization_id=organization_id,
                 )
         valid_neighbors: dict[str, list[tuple[int, float]]] = defaultdict(list)
 
@@ -1637,7 +1989,7 @@ async def _expand_multi_hop_sections(
                     for tgt_ver, t_lo, t_hi, rel_weight, rel_kind in k_index.lineage_by_version_ordinal.get(
                         (v_id, ord_cursor), ()
                     ):
-                        if lineage_only and rel_kind not in allowed_lineage_kinds:
+                        if rel_kind not in allowed_lineage_kinds:
                             continue
                         if tgt_ver not in current_versions:
                             continue
@@ -1657,7 +2009,7 @@ async def _expand_multi_hop_sections(
                         seed_ku_scores[ku.id] = max(seed_ku_scores.get(ku.id, 0.0), s_score)
                         if idx_r < 2 or s_score >= 0.85 * max_seed_score:
                             for ent in ku.entities_raw:
-                                ent_clean = re.sub(r"[\s_-]+", " ", ent.lower()).strip()
+                                ent_clean = re.sub(r"[\s_-]+", " ", normalize_text(ent or "").lower()).strip()
                                 is_cont = _is_cjk_or_continuous_entity(ent_clean)
                                 if len(ent_clean) < (2 if is_cont else 3):
                                     continue
@@ -1716,7 +2068,7 @@ async def _expand_multi_hop_sections(
                         b_ent for b_ent in top_seed_entities if _is_cjk_or_continuous_entity(b_ent)
                     }
                     path_patterns: dict[str, re.Pattern[str]] = {
-                        b_ent: re.compile(rf"\b{re.escape(b_ent)}\b")
+                        b_ent: re.compile(rf"(?<!\w){re.escape(b_ent)}(?!\w)")
                         for b_ent in top_seed_entities
                         if b_ent not in cont_entities and len(b_ent) >= 5
                     }
@@ -1846,6 +2198,8 @@ async def _expand_multi_hop_sections(
                     sources,
                 )
 
+        from sag_api.services.retrieval_service import _is_superseded_section
+
         per_version_cap = max(2, limit // 4)
         expanded: list[RetrievedSection] = []
         for v_id_str in neighbor_version_ids:
@@ -1854,20 +2208,30 @@ async def _expand_multi_hop_sections(
             for sec_template, s_ord, e_ord in k_index.hydrated_su_by_version.get(v_id_str, ()):
                 if sec_template.search_unit_id in existing_unit_ids:
                     continue
+                if not allows_superseded and _is_superseded_section(
+                    sec_template,
+                    reference_time=reference_time,
+                ):
+                    continue
                 best_score = max(
                     (score for ku_ord, score in ord_scores if s_ord <= ku_ord <= e_ord),
                     default=0.0,
                 )
                 if best_score <= 0.0:
                     continue
-                ver_candidates.append(
-                    sec_template.model_copy(
-                        update={
-                            "score": round(best_score, 4),
-                            "rank": len(seed_sections) + len(expanded),
-                        }
-                    )
+                stamped = _apply_unit_overlay_to_section(
+                    sec_template,
+                    superseded_units=sup_map,
+                    active_conflict_unit_ids=conflict_ids,
+                    include_unit_superseded=eff_include_unit_superseded,
+                    extra_updates={
+                        "score": round(best_score, 4),
+                        "rank": len(seed_sections) + len(expanded),
+                    },
                 )
+                if stamped is None:
+                    continue
+                ver_candidates.append(stamped)
             ver_candidates.sort(
                 key=lambda s: (
                     -s.score,
@@ -1924,18 +2288,13 @@ async def retrieve_search_unit_sections(
     if top_k is not None and plan.retrieval_plan.cardinality.requested_n != top_k:
         from dataclasses import replace
 
-        from sag_api.services.retrieval_plan import build_retrieval_plan
+        from sag_api.services.retrieval_plan import rebuild_retrieval_plan_with_top_k
 
         plan = replace(
             plan,
-            retrieval_plan=build_retrieval_plan(
-                query,
-                requested_top_k=top_k,
-                strategy_mode=plan.primary_strategy.value,
-                clauses=plan.retrieval_plan.decomposition.subqueries,
-                multi_hop=plan.multi_hop_eligible,
-                exact_lookup=plan.primary_strategy.value == "EXACT",
-                constraints=plan.retrieval_plan.constraints,
+            retrieval_plan=rebuild_retrieval_plan_with_top_k(
+                plan.retrieval_plan,
+                top_k,
             ),
         )
     effective_top_k = plan.retrieval_plan.cardinality.effective_n
@@ -2008,16 +2367,40 @@ async def _retrieve_search_unit_sections(
     deadline: float,
 ) -> SearchOutcome:
     """Query only currently authorized versions with a verified Phase 2C manifest."""
-    import unicodedata
+    from sag_api.services.retrieval_service import _is_superseded_section, rerank_sections
 
-    from sag_api.services.retrieval_service import rerank_sections
-
-    query = unicodedata.normalize("NFC", query or "")
+    query = normalize_text(query or "")
     requested_limit = min(top_k, settings.search_unit_candidate_limit) if top_k is not None else candidate_limit
     selection_limit = requested_limit if top_k is not None else None
     strategy_plan = query_strategy_plan or plan_query(query, requested_top_k=top_k)
+    temporal_mode = strategy_plan.retrieval_plan.temporal_mode
+    as_of = strategy_plan.retrieval_plan.as_of
+    effective_temporal_mode = (
+        "past_point"
+        if as_of is not None and temporal_mode != "change_lineage"
+        else temporal_mode
+    )
+    pinned_now = datetime.now(UTC)
+    if as_of is not None and temporal_mode != "change_lineage":
+        reference_time = _as_utc(as_of) or pinned_now
+        load_include_superseded = False
+        allows_superseded = True
+    elif effective_temporal_mode == "past_point":
+        reference_time = pinned_now
+        load_include_superseded = True
+        allows_superseded = True
+    elif effective_temporal_mode == "change_lineage":
+        reference_time = pinned_now
+        load_include_superseded = True
+        allows_superseded = True
+    else:
+        reference_time = pinned_now
+        load_include_superseded = False
+        allows_superseded = False
+    include_unit_superseded = load_include_superseded
     per_doc_limit = strategy_plan.retrieval_plan.per_document_limit
     retrieval_stats = {
+        "effective_strategy": "canonical_hybrid",
         "requested_top_k": requested_limit,
         "candidate_top_k": candidate_limit,
         "candidate_unit_pool_limit": settings.search_unit_candidate_limit,
@@ -2032,6 +2415,7 @@ async def _retrieve_search_unit_sections(
             stats={
                 "canonical_index": True,
                 "ready_versions": 0,
+                "ready_documents": 0,
                 **retrieval_stats,
                 "routing": _empty_routing_trace(strategy_plan, "no_authorized_scope"),
                 "stage_latencies_ms": {
@@ -2050,11 +2434,20 @@ async def _retrieve_search_unit_sections(
     try:
         async with asyncio.timeout_at(deadline):
             async with SessionLocal() as session:
-                ready_versions = await _load_current_ready_versions(session, sources, principal)
+                ready_versions = await _load_current_ready_versions(
+                    session,
+                    sources,
+                    principal,
+                    include_superseded=load_include_superseded,
+                    reference_time=reference_time,
+                )
     except TimeoutError as error:
         log.warning("canonical search authorization exceeded query budget")
         raise ServiceUnavailableError("Canonical search exceeded the query budget") from error
     t_auth_ms = round((time.perf_counter() - t_auth_start) * 1000, 2)
+    ready_documents_count = len(
+        {(v.document_id or v.document_version_id) for v in ready_versions.values()}
+    )
     groups = _groups(ready_versions)
     if not groups:
         total_ms = round((time.perf_counter() - t_start) * 1000, 2)
@@ -2064,6 +2457,7 @@ async def _retrieve_search_unit_sections(
             stats={
                 "canonical_index": True,
                 "ready_versions": 0,
+                "ready_documents": 0,
                 **retrieval_stats,
                 "routing": _empty_routing_trace(strategy_plan, "no_verified_search_ready_group"),
                 "stage_latencies_ms": {
@@ -2123,16 +2517,20 @@ async def _retrieve_search_unit_sections(
                 if len(raw_subqueries) >= 2
                 else ()
             )
-            decisions = await capture_routing_decisions(
-                engine_manager,
-                groups,
-                query=query,
-                planner_trace=strategy_plan.as_trace(),
-                principal=principal,
-                timeout_seconds=snapshot_budget,
-                query_vector_tasks_by_scope=scope_vector_tasks,
-            )
-            t_route_ms = round((time.perf_counter() - t_route_start) * 1000, 2)
+            if allows_superseded:
+                decisions = {}
+                t_route_ms = 0.0
+            else:
+                decisions = await capture_routing_decisions(
+                    engine_manager,
+                    groups,
+                    query=query,
+                    planner_trace=strategy_plan.as_trace(),
+                    principal=principal,
+                    timeout_seconds=snapshot_budget,
+                    query_vector_tasks_by_scope=scope_vector_tasks,
+                )
+                t_route_ms = round((time.perf_counter() - t_route_start) * 1000, 2)
 
             async def bounded(group: _SearchGroup):
                 async with semaphore:
@@ -2175,11 +2573,12 @@ async def _retrieve_search_unit_sections(
                     local_deadline = deadline - local_reserve
                     escape_deadline = deadline - 0.05
                     confident_local = (
-                        not route.broad_route
+                        not allows_superseded
+                        and not route.broad_route
                         and route.reason_code == "ROUTE_DESCENDED"
                         and float(route.margin or 0.0) >= 0.22
                         and not strategy_plan.multi_hop_eligible
-                        and strategy_plan.primary_strategy.value not in {"MULTI_HOP", "GLOBAL_SUMMARY"}
+                        and strategy_plan.primary_strategy.value not in {"MULTI_HOP", "GLOBAL_TOPIC"}
                         and strategy_plan.retrieval_plan.target.value != "DOCUMENT"
                     )
                     eff_escape_limit = max(8, candidate_limit // 2) if confident_local else candidate_limit
@@ -2343,9 +2742,30 @@ async def _retrieve_search_unit_sections(
         tuple[str, str, str, str, str, str],
         list[tuple[str, SearchUnitHit]],
     ] = defaultdict(list)
+    from sag_api.services.search_index_service import build_embedding_model_signature
+
+    active_settings = getattr(engine_manager, "_settings", None) or settings
+    configured_dim = getattr(active_settings, "embedding_dimensions", None)
+    default_active_emb_sig = build_embedding_model_signature(
+        settings_obj=active_settings
+    )
     max_dense_raw_score = 0.0
     max_sparse_raw_score = 0.0
     for group, _route, origin, semantic_hits, lexical_hits in channel_results:
+        config_key = group.source.sag_source_config_id or group.source.id
+        v_task = vector_tasks.get(config_key)
+        query_vector = (
+            v_task.result()
+            if v_task is not None and v_task.done() and not v_task.cancelled() and v_task.exception() is None
+            else None
+        )
+        if configured_dim is None and isinstance(query_vector, (list, tuple)) and len(query_vector) > 0:
+            active_emb_sig = build_embedding_model_signature(
+                settings_obj=active_settings,
+                dimensions=len(query_vector),
+            )
+        else:
+            active_emb_sig = default_active_emb_sig
         for channel_hits, channel in ((semantic_hits, "dense"), (lexical_hits, "sparse")):
             max_score = max((max(0.0, hit.score) for hit in channel_hits), default=0.0)
             if channel == "dense":
@@ -2353,6 +2773,18 @@ async def _retrieve_search_unit_sections(
             else:
                 max_sparse_raw_score = max(max_sparse_raw_score, max_score)
             for rank, hit in enumerate(channel_hits):
+                hit_emb_sig = hit.payload.get("embedding_model_signature")
+                if (
+                    isinstance(hit_emb_sig, str)
+                    and hit_emb_sig.strip()
+                    and hit_emb_sig.strip() != active_emb_sig
+                ):
+                    log.warning(
+                        "Qdrant hit embedding_model_signature mismatch: index=%r active=%r",
+                        hit_emb_sig,
+                        active_emb_sig,
+                    )
+                    raise ServiceUnavailableError("Canonical search index embedding model mismatch")
                 unit_id = str(hit.payload.get("search_unit_id") or "")
                 if (
                     not unit_id
@@ -2407,6 +2839,7 @@ async def _retrieve_search_unit_sections(
             graph_skip_reason="phase5_adapter_unavailable"
             if effective_plan.primary_strategy.value == "MULTI_HOP"
             else None,
+            temporal_bypass=allows_superseded,
         )
         total_ms = round((time.perf_counter() - t_start) * 1000, 2)
         return SearchOutcome(
@@ -2415,6 +2848,7 @@ async def _retrieve_search_unit_sections(
             stats={
                 "canonical_index": True,
                 "ready_versions": len(ready_versions),
+                "ready_documents": ready_documents_count,
                 **retrieval_stats,
                 "routing": routing,
                 "stage_latencies_ms": {
@@ -2436,23 +2870,53 @@ async def _retrieve_search_unit_sections(
         for (_g, hit, _s, _r, _o) in hits.values()
         if hit.payload.get("document_version_id")
     }
+    scoped_source_ids = sorted({source.id for source in sources})
+    principal_partitions = sorted(principal.allowed_partition_ids)
     try:
         async with asyncio.timeout_at(deadline):
             async with SessionLocal() as session:
-                try:
-                    verified_candidate_versions = await _load_current_ready_versions(
-                        session,
-                        sources,
-                        principal,
-                        version_ids=candidate_version_ids,
-                    )
-                    current_versions = {
-                        vid: ver
-                        for vid, ver in ready_versions.items()
-                        if vid not in candidate_version_ids
-                    } | verified_candidate_versions
-                except TypeError:
-                    current_versions = await _load_current_ready_versions(session, sources, principal)
+                verified_candidate_versions = await _load_current_ready_versions(
+                    session,
+                    sources,
+                    principal,
+                    version_ids=candidate_version_ids,
+                    include_superseded=load_include_superseded,
+                    reference_time=reference_time,
+                )
+                current_versions = {
+                    vid: ver
+                    for vid, ver in ready_versions.items()
+                    if vid not in candidate_version_ids
+                } | verified_candidate_versions
+                scoped_tenants = sorted({v.tenant_id for v in current_versions.values() if v.tenant_id})
+                scoped_projects = sorted({v.project_id for v in current_versions.values() if v.project_id})
+                hidden_document_ids = (
+                    await _hidden_reprocess_document_ids(session, scoped_source_ids)
+                    if current_versions
+                    else set()
+                )
+                superseded_units = await load_superseded_unit_ids_for_scope(
+                    session,
+                    loser_version_ids=sorted(current_versions),
+                    tenant_ids=scoped_tenants,
+                    project_ids=scoped_projects,
+                    allowed_partitions=principal_partitions,
+                    reference_time=reference_time,
+                    organization_id=principal.organization_id,
+                    allowed_source_ids=scoped_source_ids,
+                    hidden_document_ids=hidden_document_ids,
+                )
+                active_conflict_unit_ids = await load_active_conflict_unit_ids_for_scope(
+                    session,
+                    version_ids=sorted(current_versions),
+                    tenant_ids=scoped_tenants,
+                    project_ids=scoped_projects,
+                    allowed_partitions=principal_partitions,
+                    reference_time=reference_time,
+                    organization_id=principal.organization_id,
+                    allowed_source_ids=scoped_source_ids,
+                    hidden_document_ids=hidden_document_ids,
+                )
                 start_block = aliased(CanonicalBlock)
                 end_block = aliased(CanonicalBlock)
                 rows = (
@@ -2488,6 +2952,7 @@ async def _retrieve_search_unit_sections(
         log.warning("canonical evidence hydration exceeded query budget")
         raise ServiceUnavailableError("Canonical search exceeded the query budget") from error
     t_hydration_ms = round((time.perf_counter() - t_hydration_start) * 1000, 2)
+    overlay_fingerprint = _overlay_fingerprint_from_state(superseded_units, active_conflict_unit_ids)
 
     unit_by_id: dict[str, tuple[SearchUnit, dict[str, Any]]] = {}
     unit_ordinals: dict[str, tuple[int, int]] = {}
@@ -2507,8 +2972,31 @@ async def _retrieve_search_unit_sections(
             or not anchor.strip()
         ):
             continue
-        unit_ordinals[str(unit.id)] = (int(start_ordinal), int(end_ordinal))
-        unit_by_id[str(unit.id)] = (
+        unit_id_str = str(unit.id)
+        sup_info = superseded_units.get(unit_id_str)
+        if sup_info is not None and not include_unit_superseded:
+            continue
+        base_is_superseded = (
+            bool(version.is_superseded)
+            if allows_superseded
+            else bool(
+                isinstance(version.valid_to, datetime)
+                and (_as_utc(version.valid_to) or reference_time) <= reference_time
+            )
+        )
+        effective_valid_to = (
+            _min_utc(version.valid_to, sup_info.effective_valid_to)
+            if sup_info is not None
+            else version.valid_to
+        )
+        is_unit_superseded = base_is_superseded or (sup_info is not None)
+        conflict_status: str | None = (
+            "SUPERSEDED_BY_UNIT"
+            if sup_info is not None
+            else ("ACTIVE_CONFLICT" if unit_id_str in active_conflict_unit_ids else None)
+        )
+        unit_ordinals[unit_id_str] = (int(start_ordinal), int(end_ordinal))
+        unit_by_id[unit_id_str] = (
             unit,
             {
                 "document_id": str(document_id),
@@ -2529,6 +3017,12 @@ async def _retrieve_search_unit_sections(
                 "project_id": version.project_id,
                 "tenant_id": version.tenant_id,
                 "security_partition_id": version.partition_id,
+                "valid_to": effective_valid_to,
+                "is_superseded": is_unit_superseded,
+                "authority_tier": version.authority_tier,
+                "effective_from": version.effective_from,
+                "scope_tags": version.scope_tags,
+                "conflict_status": conflict_status,
             },
         )
 
@@ -2617,6 +3111,11 @@ async def _retrieve_search_unit_sections(
                 },
             )
             sections_by_key[section_key] = section
+        if channel == "dense":
+            raw_dense_val = float(hit.score) if math.isfinite(float(hit.score)) else None
+            if raw_dense_val is not None and section.raw_dense_score != raw_dense_val:
+                section = section.model_copy(update={"raw_dense_score": raw_dense_val})
+                sections_by_key[section_key] = section
         interleaved_rank = rank if origin == "global_only" else rank * 2 + int(origin != "branch_local")
         ranked_by_channel_and_scope[(channel, scope_key)].append(
             section.model_copy(update={"score": score, "rank": interleaved_rank})
@@ -2652,19 +3151,59 @@ async def _retrieve_search_unit_sections(
     diversity_stats: dict[str, Any] = {}
     initial_pool: list[RetrievedSection] = []
     if rerank_remaining <= settings.search_rerank_min_remaining_seconds:
+        from sag_api.services.query_analysis import analyze_query
+        from sag_api.services.retrieval_service import (
+            _is_boilerplate,
+            _passes_lexical_floor_bypass,
+            _section_key,
+        )
+
         selection_fallback_reason = "rerank_budget_exhausted"
-        fallback_pool = _fair_rank_merge([semantic, lexical])
+        raw_fallback_pool = _fair_rank_merge([semantic, lexical])
+        lexical_keys = {_section_key(sec) for sec in lexical}
+        min_dense = float(settings.search_min_dense_score)
+        fallback_analysis = analyze_query(
+            query,
+            segmentation_enabled=settings.search_chinese_segmentation_enabled,
+            subqueries=strategy_plan.retrieval_plan.decomposition.subqueries,
+        )
+        fallback_pool: list[RetrievedSection] = []
+        for sec in raw_fallback_pool:
+            sec_key = _section_key(sec)
+            sec_uid = str(sec.search_unit_id or sec.chunk_id or "")
+            in_lexical = sec_key in lexical_keys
+            if _is_boilerplate(sec):
+                continue
+            if not include_unit_superseded and sec_uid in superseded_units:
+                continue
+            if not allows_superseded and _is_superseded_section(sec, reference_time=reference_time):
+                continue
+            eff_dense = (
+                float(sec.raw_dense_score)
+                if sec.raw_dense_score is not None
+                else float(sec.score or 0.0)
+            )
+            if eff_dense < min_dense and not (
+                in_lexical
+                and _passes_lexical_floor_bypass(query, sec, analysis=fallback_analysis)
+            ):
+                continue
+            fallback_pool.append(sec)
         initial_pool = fallback_pool
         if per_doc_limit == 1 and selection_limit is not None:
             from sag_api.services.retrieval_plan import group_sections_by_document
 
-            selected = group_sections_by_document(fallback_pool, limit=selection_limit)
+            selected = group_sections_by_document(
+                fallback_pool,
+                limit=selection_limit,
+                temporal_mode=effective_temporal_mode,
+            )
         else:
             selected = fallback_pool[:selection_limit]
         rerank_stats = {
-            "candidates": len(fallback_pool),
-            "relevant": None,
-            "filtered_irrelevant": None,
+            "candidates": len(raw_fallback_pool),
+            "relevant": len(fallback_pool),
+            "filtered_irrelevant": len(raw_fallback_pool) - len(fallback_pool),
         }
         coverage = {
             "status": "unknown",
@@ -2685,7 +3224,16 @@ async def _retrieve_search_unit_sections(
         t_diversity_ms = round((time.perf_counter() - t_rerank_start) * 1000, 2)
     else:
         t_fusion_start = time.perf_counter()
-        fused = rerank_sections(query, semantic, lexical=lexical, limit=None)
+        fused = rerank_sections(
+            query,
+            semantic,
+            lexical=lexical,
+            limit=None,
+            subqueries=strategy_plan.retrieval_plan.decomposition.subqueries,
+            entities=strategy_plan.retrieval_plan.entities,
+            temporal_mode=effective_temporal_mode,
+            reference_time=reference_time,
+        )
         t_fusion_ms = round((time.perf_counter() - t_fusion_start) * 1000, 2)
         rerank_stats = {
             "candidates": fused.candidate_count,
@@ -2695,6 +3243,7 @@ async def _retrieve_search_unit_sections(
         t_div_start = time.perf_counter()
         is_multi_hop_query = (
             strategy_plan.primary_strategy.value == "MULTI_HOP"
+            or strategy_plan.multi_hop_eligible
             or "MULTI_HOP_CANDIDATE" in strategy_plan.reason_codes
         )
         sibling_sections = (
@@ -2704,6 +3253,13 @@ async def _retrieve_search_unit_sections(
                 sources=sources,
                 limit=requested_limit,
                 index_holder=scope_k_index_holder,
+                superseded_units=superseded_units,
+                active_conflict_unit_ids=active_conflict_unit_ids,
+                include_unit_superseded=include_unit_superseded,
+                overlay_fingerprint=overlay_fingerprint,
+                allowed_partitions=principal_partitions,
+                reference_time=reference_time,
+                organization_id=principal.organization_id,
             )
             if not is_multi_hop_query and requested_limit > 1 and fused.sections and per_doc_limit != 1
             else []
@@ -2716,13 +3272,20 @@ async def _retrieve_search_unit_sections(
                 limit=selection_limit,
                 deadline=selection_deadline,
                 per_document_limit=per_doc_limit,
+                multi_hop=is_multi_hop_query,
+                entities=strategy_plan.retrieval_plan.entities,
+                temporal_mode=effective_temporal_mode,
             )
         except TimeoutError:
             selection_fallback_reason = "diversity_budget_exhausted"
             if per_doc_limit == 1 and selection_limit is not None:
                 from sag_api.services.retrieval_plan import group_sections_by_document
 
-                selected = group_sections_by_document(fused.sections, limit=selection_limit)
+                selected = group_sections_by_document(
+                    fused.sections,
+                    limit=selection_limit,
+                    temporal_mode=effective_temporal_mode,
+                )
             else:
                 selected = fused.sections[:selection_limit]
             diversity_stats = {"candidate_count": len(initial_pool), "deduplicated_count": 0,
@@ -2777,7 +3340,15 @@ async def _retrieve_search_unit_sections(
                 for s in initial_pool
                 if (s.search_unit_id or s.chunk_id)
             }
+            from sag_api.services.retrieval_plan import AnswerShape
+
             has_required_anchors = int((diversity_stats or {}).get("required_anchor_count", 0) or 0) > 0
+            allow_contradiction = bool(
+                has_required_anchors
+                or effective_temporal_mode == "change_lineage"
+                or effective_plan.retrieval_plan.answer_shape == AnswerShape.MULTI_FACET_COMPARE
+                or effective_plan.primary_strategy.value in {"ENTITY_RELATIONAL", "MULTI_HOP"}
+            )
             t_graph_start = time.perf_counter()
             expanded_sections = await _expand_multi_hop_sections(
                 seed_sections=list(seed_pool),
@@ -2789,10 +3360,31 @@ async def _retrieve_search_unit_sections(
                 limit=min(settings.search_unit_candidate_limit, max(8, requested_limit * 2)),
                 lineage_only=not is_multi_hop_mode,
                 query=query,
-                allow_contradiction_lineage=has_required_anchors,
+                allow_contradiction_lineage=allow_contradiction,
                 preloaded_k_index=(scope_k_index_holder[0] if scope_k_index_holder else None),
+                allows_superseded=allows_superseded,
+                reference_time=reference_time,
+                superseded_units=superseded_units,
+                active_conflict_unit_ids=active_conflict_unit_ids,
+                include_unit_superseded=include_unit_superseded,
+                overlay_fingerprint=overlay_fingerprint,
+                allowed_partitions=principal_partitions,
+                organization_id=principal.organization_id,
             )
             t_graph_expansion_ms = round((time.perf_counter() - t_graph_start) * 1000, 2)
+            if expanded_sections:
+                if not allows_superseded:
+                    expanded_sections = [
+                        s
+                        for s in expanded_sections
+                        if not _is_superseded_section(s, reference_time=reference_time)
+                    ]
+                if not include_unit_superseded and superseded_units:
+                    expanded_sections = [
+                        s
+                        for s in expanded_sections
+                        if str(s.search_unit_id or s.chunk_id or "") not in superseded_units
+                    ]
             graph_expanded_candidates = len(expanded_sections)
             if expanded_sections:
                 graph_expansion_attempted = True
@@ -2839,6 +3431,9 @@ async def _retrieve_search_unit_sections(
                         limit=selection_limit,
                         deadline=selection_deadline,
                         per_document_limit=per_doc_limit,
+                        multi_hop=is_multi_hop_mode,
+                        entities=effective_plan.retrieval_plan.entities,
+                        temporal_mode=effective_temporal_mode,
                     )
                 except TimeoutError:
                     diversity_stats = {**diversity_stats, "reason": "diversity_budget_exhausted"}
@@ -2870,17 +3465,20 @@ async def _retrieve_search_unit_sections(
         selection_fallback_reason=selection_fallback_reason,
         graph_expansion_attempted=graph_expansion_attempted,
         graph_expanded_candidates=graph_expanded_candidates,
+        temporal_bypass=allows_superseded,
     )
-    from sag_api.services.retrieval_plan import OutputMode, is_unfiltered_scope_catalog_query
+    from sag_api.services.retrieval_plan import OutputMode
 
     max_catalog_slots = selection_limit if selection_limit is not None else requested_limit
     if (
         per_doc_limit == 1
         and strategy_plan.retrieval_plan.output in {OutputMode.LIST, OutputMode.COUNT}
+        and strategy_plan.retrieval_plan.is_unfiltered_catalog
         and len(selected) < max_catalog_slots
-        and is_unfiltered_scope_catalog_query(query, [s.name for s in sources])
     ):
         represented_vids = {str(section.document_version_id or "") for section in selected}
+        backfill_slots = max(0, max_catalog_slots - len(selected))
+        superseded_buffer = len(superseded_units) if not include_unit_superseded else 0
         missing_vids = [
             vid
             for vid in sorted(
@@ -2888,18 +3486,20 @@ async def _retrieve_search_unit_sections(
                 key=lambda v: (str(getattr(current_versions[v], "document_name", "") or ""), v),
             )
             if vid not in represented_vids
-        ][: max(0, max_catalog_slots - len(selected))]
+        ][: backfill_slots + superseded_buffer]
         if missing_vids and (deadline - loop.time()) > 0.15:
             try:
                 from sag_api.services.search_index_service import generate_search_unit_point_id
 
-                allowed_partitions = sorted({v.partition_id for v in current_versions.values()})
                 async with asyncio.timeout_at(deadline):
                     async with SessionLocal() as session:
                         k_index = await _get_or_build_scope_knowledge_index(
                             session,
                             current_versions,
-                            allowed_partitions,
+                            principal_partitions,
+                            overlay_fingerprint=overlay_fingerprint,
+                            reference_time=reference_time,
+                            organization_id=principal.organization_id,
                         )
                         await _ensure_versions_hydrated(
                             session,
@@ -2917,48 +3517,89 @@ async def _retrieve_search_unit_sections(
                         hydrated_items = k_index.hydrated_su_by_version.get(vid, ())
                         if not hydrated_items:
                             continue
-                        sec_template = hydrated_items[0][0]
                         ver = current_versions[vid]
-                        expected_point_id = generate_search_unit_point_id(
-                            f"search_units_{ver.project_id}",
-                            str(sec_template.search_unit_id or sec_template.chunk_id or ""),
-                        )
-                        point = await verify_store.get_point(
-                            f"search_units_{ver.project_id}",
-                            expected_point_id,
-                        )
-                        if point is None:
-                            continue
-                        p_load = point.payload
-                        if (
-                            point.point_id != expected_point_id
-                            or p_load.get("search_unit_id") != sec_template.search_unit_id
-                            or p_load.get("document_version_id") != vid
-                            or p_load.get("project_id") != ver.project_id
-                            or p_load.get("tenant_id") != ver.tenant_id
-                            or p_load.get("security_partition_id") != ver.partition_id
-                            or p_load.get("content_hash") != sec_template.content_hash
-                        ):
-                            continue
-                        selected.append(
-                            sec_template.model_copy(
-                                update={
+                        chosen_section: RetrievedSection | None = None
+                        for sec_template, _s_ord, _e_ord in hydrated_items:
+                            candidate_section = _apply_unit_overlay_to_section(
+                                sec_template,
+                                superseded_units=superseded_units,
+                                active_conflict_unit_ids=active_conflict_unit_ids,
+                                include_unit_superseded=include_unit_superseded,
+                                extra_updates={
                                     "score": round(max(0.25, min_existing_score - 0.001), 6),
                                     "rank": len(selected),
-                                }
+                                },
                             )
-                        )
+                            if candidate_section is None:
+                                continue
+                            expected_point_id = generate_search_unit_point_id(
+                                f"search_units_{ver.project_id}",
+                                str(candidate_section.search_unit_id or candidate_section.chunk_id or ""),
+                            )
+                            point = await verify_store.get_point(
+                                f"search_units_{ver.project_id}",
+                                expected_point_id,
+                            )
+                            if point is None:
+                                continue
+                            p_load = point.payload
+                            if (
+                                point.point_id != expected_point_id
+                                or p_load.get("search_unit_id") != candidate_section.search_unit_id
+                                or p_load.get("document_version_id") != vid
+                                or p_load.get("project_id") != ver.project_id
+                                or p_load.get("tenant_id") != ver.tenant_id
+                                or p_load.get("security_partition_id") != ver.partition_id
+                                or p_load.get("content_hash") != candidate_section.content_hash
+                            ):
+                                continue
+                            chosen_section = candidate_section
+                            break
+                        if chosen_section is not None:
+                            selected.append(chosen_section)
             except (TimeoutError, SQLAlchemyError, SearchIndexUnavailable):
                 pass
     selected_version_ids = {str(section.document_version_id or "") for section in selected}
+    selected_unit_ids = {
+        str(section.search_unit_id or section.chunk_id or "")
+        for section in selected
+        if (section.search_unit_id or section.chunk_id)
+    }
     if selected_version_ids:
         try:
             async with asyncio.timeout_at(deadline):
                 async with SessionLocal() as session:
                     refreshed = await _load_current_ready_versions(
-                        session, sources, principal, version_ids=selected_version_ids,
+                        session,
+                        sources,
+                        principal,
+                        version_ids=selected_version_ids,
+                        include_superseded=load_include_superseded,
+                        reference_time=reference_time,
                     )
-            _verify_selection_scope(selected_version_ids, current_versions, refreshed)
+                    refreshed_superseded_units: dict[str, SupersededUnitInfo] = {}
+                    if not include_unit_superseded and refreshed and selected_unit_ids:
+                        refreshed_tenants = sorted({v.tenant_id for v in refreshed.values() if v.tenant_id})
+                        refreshed_projects = sorted({v.project_id for v in refreshed.values() if v.project_id})
+                        refreshed_hidden = await _hidden_reprocess_document_ids(session, scoped_source_ids)
+                        refreshed_superseded_units = await load_superseded_unit_ids_for_scope(
+                            session,
+                            loser_version_ids=sorted(refreshed),
+                            tenant_ids=refreshed_tenants,
+                            project_ids=refreshed_projects,
+                            allowed_partitions=principal_partitions,
+                            reference_time=reference_time,
+                            organization_id=principal.organization_id,
+                            allowed_source_ids=scoped_source_ids,
+                            hidden_document_ids=refreshed_hidden,
+                        )
+            _verify_selection_scope(
+                selected_version_ids,
+                current_versions,
+                refreshed,
+                selected_unit_ids=selected_unit_ids,
+                superseded_unit_ids=refreshed_superseded_units,
+            )
         except (TimeoutError, SQLAlchemyError) as error:
             raise ServiceUnavailableError("Search scope could not be revalidated") from error
     _schedule_routed_query_demand(groups, decisions)
@@ -2969,6 +3610,7 @@ async def _retrieve_search_unit_sections(
         stats={
             "canonical_index": True,
             "ready_versions": len(ready_versions),
+            "ready_documents": ready_documents_count,
             **retrieval_stats,
             "semantic_candidates": semantic_candidate_count,
             "lexical_candidates": lexical_candidate_count,
@@ -2981,6 +3623,8 @@ async def _retrieve_search_unit_sections(
             "coverage": coverage,
             "routing": routing,
             "selection_fallback_reason": selection_fallback_reason,
+            "degraded": bool(selection_fallback_reason),
+            "degraded_reason": selection_fallback_reason,
             "stage_latencies_ms": {
                 "auth_scope": t_auth_ms,
                 "tree_route": t_route_ms,
@@ -3054,6 +3698,9 @@ async def _get_search_unit_citation_checked(
                 Document.project_id,
                 Document.tenant_id,
                 DocumentVersion.version_no,
+                DocumentVersion.valid_to,
+                DocumentVersion.authority_tier,
+                DocumentVersion.effective_from,
                 start_block.source_anchor,
                 start_block.ordinal,
                 end_block.ordinal,
@@ -3086,7 +3733,21 @@ async def _get_search_unit_citation_checked(
     if row is None:
         raise NotFoundError("原文分块不存在")
 
-    unit, document_id, filename, source_id, project_id, tenant_id, version_no, anchor, start_ordinal, end_ordinal = row
+    (
+        unit,
+        document_id,
+        filename,
+        source_id,
+        project_id,
+        tenant_id,
+        version_no,
+        ver_valid_to,
+        ver_authority_tier,
+        ver_effective_from,
+        anchor,
+        start_ordinal,
+        end_ordinal,
+    ) = row
     if document_id in await _hidden_reprocess_document_ids(session, [source.id]):
         raise NotFoundError("原文分块不存在")
     if (
@@ -3122,6 +3783,7 @@ async def _get_search_unit_citation_checked(
         or not _stage_belongs_to_current_attempt(
             latest_run.started_at,
             latest_index_stage,
+            attempt_count=latest_run.attempt_count,
         )
         or not _verified_manifest(latest_index_stage.metrics_json, project_id=project_id)
     ):
@@ -3156,7 +3818,69 @@ async def _get_search_unit_citation_checked(
     ):
         raise NotFoundError("原文分块不存在")
 
-    return {
+    citation_now = datetime.now(UTC)
+    project_source_ids = sorted(
+        {
+            str(sid)
+            for sid in (
+                await session.scalars(
+                    select(SourceProjectMapping.source_id).where(
+                        SourceProjectMapping.project_id == project_id,
+                        SourceProjectMapping.organization_id == principal.organization_id,
+                        SourceProjectMapping.state == "CONFIRMED",
+                    )
+                )
+            ).all()
+            if sid
+        }
+        | {str(source.id)}
+    )
+    hidden_project_doc_ids = await _hidden_reprocess_document_ids(session, project_source_ids)
+    superseded_units = await load_superseded_unit_ids_for_scope(
+        session,
+        loser_version_ids=[str(unit.document_version_id)],
+        tenant_ids=[str(tenant_id)],
+        project_ids=[str(project_id)],
+        allowed_partitions=principal.allowed_partition_ids,
+        reference_time=citation_now,
+        organization_id=principal.organization_id,
+        allowed_source_ids=project_source_ids,
+        hidden_document_ids=hidden_project_doc_ids,
+    )
+    active_conflict_unit_ids = await load_active_conflict_unit_ids_for_scope(
+        session,
+        version_ids=[str(unit.document_version_id)],
+        tenant_ids=[str(tenant_id)],
+        project_ids=[str(project_id)],
+        allowed_partitions=principal.allowed_partition_ids,
+        reference_time=citation_now,
+        organization_id=principal.organization_id,
+        allowed_source_ids=project_source_ids,
+        hidden_document_ids=hidden_project_doc_ids,
+    )
+    sup_info = superseded_units.get(str(unit.id))
+    ver_valid_to_utc = _as_utc(ver_valid_to)
+    ver_eff_utc = _as_utc(ver_effective_from)
+    norm_tier = (
+        int(ver_authority_tier)
+        if isinstance(ver_authority_tier, int)
+        and not isinstance(ver_authority_tier, bool)
+        and 1 <= ver_authority_tier <= 4
+        else None
+    )
+    ver_is_superseded = bool(ver_valid_to_utc is not None and ver_valid_to_utc <= citation_now)
+    effective_valid_to = (
+        _min_utc(ver_valid_to_utc, sup_info.effective_valid_to)
+        if sup_info is not None
+        else ver_valid_to_utc
+    )
+    conflict_status: str | None = (
+        "SUPERSEDED_BY_UNIT"
+        if sup_info is not None
+        else ("ACTIVE_CONFLICT" if str(unit.id) in active_conflict_unit_ids else None)
+    )
+
+    result: dict[str, Any] = {
         "chunk_id": unit.id,
         "search_unit_id": unit.id,
         "block_from_id": unit.block_from_id,
@@ -3174,7 +3898,15 @@ async def _get_search_unit_citation_checked(
         "rank": 0,
         "source_id": source_id,
         "source_name": source.name,
+        "is_superseded": ver_is_superseded or (sup_info is not None),
+        "valid_to": effective_valid_to.isoformat() if effective_valid_to is not None else None,
+        "authority_tier": norm_tier,
+        "effective_from": ver_eff_utc.isoformat() if ver_eff_utc is not None else None,
+        "conflict_status": conflict_status,
     }
+    if sup_info is not None:
+        result["superseded_by_unit_id"] = sup_info.winner_unit_id
+    return result
 
 
 def _point_id(collection: str, unit_id: str) -> str:

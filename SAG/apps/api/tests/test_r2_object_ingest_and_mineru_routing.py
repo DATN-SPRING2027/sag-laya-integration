@@ -1,6 +1,11 @@
+"""MinerU routing, batch presigned upload, local parsers, and upload-to-READY persistence tests.
+
+Note: R2 zero-buffer object-ingest and post-index Disk GC were permanently removed;
+MinerU routing, Mode 2 batch upload, local parsers, and local snapshot retention remain.
+"""
+
 from __future__ import annotations
 
-import hashlib
 import io
 import json
 import os
@@ -17,7 +22,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from sag_api.core.config import Settings
-from sag_api.core.errors import ValidationError
 from sag_api.db.base import Base
 from sag_api.db.models import (
     CanonicalBlock,
@@ -39,17 +43,12 @@ from sag_api.parsing.local_worker import (
 )
 from sag_api.parsing.mineru import MinerUClient, _markdown_from_zip_path
 from sag_api.parsing.mineru_official import OfficialMinerUClient
-from sag_api.parsing.remote_object import (
-    stream_remote_object_to_snapshot,
-    validate_remote_object_url,
-)
 from sag_api.parsing.service import (
     ooxml_has_visual_content,
-    prepare_document,
     should_route_to_mineru,
 )
 from sag_api.services import search_index_service, settings_service
-from sag_api.services.document_service import handle_document_object_ingest
+from sag_api.services.document_service import handle_document_upload
 
 
 def _make_settings(**overrides) -> Settings:
@@ -156,107 +155,28 @@ def test_smart_hybrid_mineru_routing_option_a_official_only(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_official_mineru_v4_direct_r2_url_task_and_batch_upload_fallback(
+async def test_official_mineru_v4_batch_presigned_upload(
     tmp_path, monkeypatch
 ) -> None:
     cfg = _make_settings(mineru_official_api_token="secret-official-token-51chars")
     sample_pdf = tmp_path / "scanned.pdf"
     sample_pdf.write_bytes(b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n%%EOF\n")
     zip_bytes = _build_mineru_result_zip_bytes()
-    r2_presigned_url = (
-        "https://acct123.r2.cloudflarestorage.com/datn/scanned.pdf"
-        "?X-Amz-Signature=supersecret"
-    )
 
     monkeypatch.setattr(
         "sag_api.parsing.mineru._assert_public_host",
         AsyncMock(return_value=None),
     )
 
-    # Case A: Zero-upload direct URL task succeeds via POST /api/v4/extract/task
-    seen_requests: list[tuple[str, str, str | None]] = []
-    poll_counter = {"count": 0}
+    assert not hasattr(OfficialMinerUClient, "_create_url_task")
+    assert not hasattr(OfficialMinerUClient, "_poll_task")
 
-    def _direct_url_handler(request: httpx.Request) -> httpx.Response:
-        auth = request.headers.get("authorization")
-        seen_requests.append((request.method, str(request.url), auth))
-        if request.method == "POST" and str(request.url) == "https://mineru.net/api/v4/extract/task":
-            assert auth == "Bearer secret-official-token-51chars"
-            body = json.loads(request.content.decode("utf-8"))
-            assert body["url"] == r2_presigned_url
-            assert body["model_version"] == "vlm"
-            return httpx.Response(
-                200,
-                json={"code": 0, "msg": "ok", "data": {"task_id": "task-v4-direct-1"}},
-            )
-        if request.method == "GET" and str(request.url) == "https://mineru.net/api/v4/extract/task/task-v4-direct-1":
-            assert auth == "Bearer secret-official-token-51chars"
-            poll_counter["count"] += 1
-            if poll_counter["count"] == 1:
-                return httpx.Response(
-                    200,
-                    json={"code": 0, "data": {"task_id": "task-v4-direct-1", "state": "running"}},
-                )
-            return httpx.Response(
-                200,
-                json={
-                    "code": 0,
-                    "data": {
-                        "task_id": "task-v4-direct-1",
-                        "state": "done",
-                        "full_zip_url": "https://cdn-mineru.openxlab.org.cn/results/res1.zip",
-                    },
-                },
-            )
-        if request.method == "GET" and str(request.url) == "https://cdn-mineru.openxlab.org.cn/results/res1.zip":
-            # Must NEVER leak Authorization header to CDN result download URL
-            assert auth is None
-            return httpx.Response(
-                200,
-                headers={"content-type": "application/zip"},
-                content=zip_bytes,
-            )
-        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
-
-    orig_client = httpx.AsyncClient
-    monkeypatch.setattr(
-        "sag_api.parsing.mineru_official.httpx.AsyncClient",
-        lambda **kw: orig_client(transport=httpx.MockTransport(_direct_url_handler), **kw),
-    )
-    monkeypatch.setattr(
-        "sag_api.parsing.mineru.httpx.AsyncClient",
-        lambda **kw: orig_client(transport=httpx.MockTransport(_direct_url_handler), **kw),
-    )
-
-    emitted_states: list[dict] = []
-
-    async def _record_state(st: dict) -> None:
-        # Secret R2 presigned URL must NEVER appear in persisted state
-        assert r2_presigned_url not in json.dumps(st)
-        emitted_states.append(dict(st))
-
-    client = MinerUClient(cfg)
-    md = await client.parse(
-        str(sample_pdf),
-        on_state=_record_state,
-        remote_source_url=r2_presigned_url,
-    )
-    assert "<!-- PAGE 1 -->" in md
-    assert "<!-- PAGE 2 -->" in md
-    assert "MinerU Official V4" in md
-    assert any(st.get("upload_source") == "remote_presigned" for st in emitted_states)
-    assert emitted_states[-1]["status"] == "done"
-
-    # Case B: Direct URL task rejected by upstream -> automatic fallback to file-urls/batch + PUT streaming
     uploaded_bytes = bytearray()
+    seen_requests: list[tuple[str, str]] = []
 
-    def _fallback_batch_handler(request: httpx.Request) -> httpx.Response:
+    def _batch_handler(request: httpx.Request) -> httpx.Response:
         auth = request.headers.get("authorization")
-        if request.method == "POST" and str(request.url) == "https://mineru.net/api/v4/extract/task":
-            return httpx.Response(
-                200,
-                json={"code": -60001, "msg": "url query signature not supported"},
-            )
+        seen_requests.append((request.method, str(request.url)))
         if request.method == "POST" and str(request.url) == "https://mineru.net/api/v4/file-urls/batch":
             assert auth == "Bearer secret-official-token-51chars"
             body = json.loads(request.content.decode("utf-8"))
@@ -298,30 +218,32 @@ async def test_official_mineru_v4_direct_r2_url_task_and_batch_upload_fallback(
             return httpx.Response(200, content=zip_bytes)
         raise AssertionError(f"Unexpected request: {request.method} {request.url}")
 
+    orig_client = httpx.AsyncClient
     monkeypatch.setattr(
         "sag_api.parsing.mineru_official.httpx.AsyncClient",
-        lambda **kw: orig_client(transport=httpx.MockTransport(_fallback_batch_handler), **kw),
+        lambda **kw: orig_client(transport=httpx.MockTransport(_batch_handler), **kw),
     )
     monkeypatch.setattr(
         "sag_api.parsing.mineru.httpx.AsyncClient",
-        lambda **kw: orig_client(transport=httpx.MockTransport(_fallback_batch_handler), **kw),
+        lambda **kw: orig_client(transport=httpx.MockTransport(_batch_handler), **kw),
     )
 
     batch_states: list[dict] = []
 
     async def _record_batch_state(st: dict) -> None:
-        assert r2_presigned_url not in json.dumps(st)
         batch_states.append(dict(st))
 
-    md_fallback = await MinerUClient(cfg).parse(
+    md = await MinerUClient(cfg).parse(
         str(sample_pdf),
         on_state=_record_batch_state,
-        remote_source_url=r2_presigned_url,
     )
     assert bytes(uploaded_bytes) == sample_pdf.read_bytes()
-    assert "<!-- PAGE 1 -->" in md_fallback
-    assert "<!-- PAGE 2 -->" in md_fallback
+    assert "<!-- PAGE 1 -->" in md
+    assert "<!-- PAGE 2 -->" in md
+    assert "MinerU Official V4" in md
     assert any(st.get("batch_id") == "batch-v4-99" for st in batch_states)
+    assert batch_states[-1]["status"] == "done"
+    assert all("extract/task" not in url for _, url in seen_requests)
 
 
 def test_mineru_zip_streaming_injects_monotonic_page_markers(tmp_path) -> None:
@@ -333,7 +255,7 @@ def test_mineru_zip_streaming_injects_monotonic_page_markers(tmp_path) -> None:
         "| --- | --- |\n"
         "| Vector | Qdrant |\n\n"
         "## Worker Queue\n\n"
-        "BullMQ coordinates asynchronous R2 object ingestion."
+        "BullMQ coordinates asynchronous document ingestion."
     )
     content_list = [
         {"type": "text", "text": "System Architecture", "text_level": 1, "page_idx": 0},
@@ -341,7 +263,7 @@ def test_mineru_zip_streaming_injects_monotonic_page_markers(tmp_path) -> None:
         {"type": "text", "text": "Storage Layer", "text_level": 2, "page_idx": 1},
         {"type": "table", "table_body": "<table><tr><td>Vector</td><td>Qdrant</td></tr></table>", "page_idx": 1},
         {"type": "text", "text": "Worker Queue", "text_level": 2, "page_idx": 2},
-        {"type": "text", "text": "BullMQ coordinates asynchronous R2 object ingestion.", "page_idx": 2},
+        {"type": "text", "text": "BullMQ coordinates asynchronous document ingestion.", "page_idx": 2},
     ]
     zip_path = str(tmp_path / "mineru_result.zip")
     with zipfile.ZipFile(zip_path, "w") as zf:
@@ -386,12 +308,12 @@ def test_local_streaming_parsers_xlsx_pptx_docx_rtf_and_bomb_guard(tmp_path) -> 
       <p:cSld><p:spTree>
         <p:sp>
           <p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr>
-          <p:txBody><a:p><a:r><a:t>Zero-Buffer R2 Bridge</a:t></a:r></a:p></p:txBody>
+          <p:txBody><a:p><a:r><a:t>Streaming Parser Bridge</a:t></a:r></a:p></p:txBody>
         </p:sp>
         <p:sp>
           <p:nvSpPr><p:nvPr/></p:nvSpPr>
           <p:txBody>
-            <a:p><a:r><a:t>Presigned PUT upload</a:t></a:r></a:p>
+            <a:p><a:r><a:t>Multipart upload</a:t></a:r></a:p>
             <a:p><a:r><a:t>64KB streaming worker</a:t></a:r></a:p>
           </p:txBody>
         </p:sp>
@@ -414,13 +336,15 @@ def test_local_streaming_parsers_xlsx_pptx_docx_rtf_and_bomb_guard(tmp_path) -> 
     )
     pptx_md = _extract_pptx_streaming(pptx_path)
     assert "<!-- PAGE 1 -->" in pptx_md
-    assert "Zero-Buffer R2 Bridge" in pptx_md
+    assert "Streaming Parser Bridge" in pptx_md
     assert "Emphasize zero RAM overhead on BFF." in pptx_md
 
     # 3. DOCX disk-to-disk media stripping sanitizer
     rels_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
     <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-      <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/big.png"/>
+      <Relationship Id="rId1"
+        Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+        Target="media/big.png"/>
     </Relationships>"""
     doc_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
     <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -464,37 +388,22 @@ def test_local_streaming_parsers_xlsx_pptx_docx_rtf_and_bomb_guard(tmp_path) -> 
 
 
 @pytest.mark.asyncio
-async def test_r2_object_ingest_e2e_streaming_verification_and_disk_gc(
+async def test_normal_upload_reaches_ready_and_preserves_local_file_without_disk_gc(
     tmp_path, monkeypatch
 ) -> None:
-    cfg = _make_settings(
-        mineru_official_api_token=None,
-        remote_snapshot_gc_enabled=True,
-    )
+    cfg = _make_settings(mineru_official_api_token=None)
     cfg.activate_data_dir(tmp_path / "engine_data")
     monkeypatch.setattr(tasks, "settings", cfg)
     monkeypatch.setattr("sag_api.services.document_service.settings", cfg)
 
-    # Reject untrusted hosts immediately
-    with pytest.raises(ValidationError) as exc_info:
-        validate_remote_object_url("https://attacker.example.com/malicious.pdf", cfg)
-    assert exc_info.value.code == "UNTRUSTED_OBJECT_HOST"
-
-    # Build a valid XLSX payload in memory to serve from simulated R2 presigned URL
     buf = io.BytesIO()
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "R2_Spec"
+    ws.title = "Spec"
     ws.append(["Module", "Owner"])
     ws.append(["IngestionWorker", "PlatformTeam"])
     wb.save(buf)
     xlsx_bytes = buf.getvalue()
-    xlsx_sha256 = hashlib.sha256(xlsx_bytes).hexdigest()
-
-    r2_url = (
-        "https://acct123.r2.cloudflarestorage.com/datn-bucket/projects/p1/spec.xlsx"
-        "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=secret123"
-    )
 
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as conn:
@@ -502,61 +411,20 @@ async def test_r2_object_ingest_e2e_streaming_verification_and_disk_gc(
     factory = async_sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setattr(tasks, "SessionLocal", factory)
 
-    # Register zero-buffer object ingest
     async with factory() as session:
-        resp = await handle_document_object_ingest(
+        resp = await handle_document_upload(
             session,
             tenant_id="tenant-1",
             project_id="proj-1",
             owner_id="user-1",
             security_partition_id="part-proj-1",
-            client_token="idem-r2-xlsx-1",
-            source_url=r2_url,
+            client_token="idem-upload-xlsx-1",
+            file_bytes=xlsx_bytes,
             original_filename="spec.xlsx",
-            expected_sha256=xlsx_sha256,
-            expected_size_bytes=len(xlsx_bytes),
             content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             logical_source_id="continuum:project_document:doc-99",
         )
         assert resp.is_duplicate is False
-        assert resp.file_hash == xlsx_sha256
-
-        # Idempotent retry returns duplicate immediately
-        dup = await handle_document_object_ingest(
-            session,
-            tenant_id="tenant-1",
-            project_id="proj-1",
-            owner_id="user-1",
-            security_partition_id="part-proj-1",
-            client_token="idem-r2-xlsx-1",
-            source_url=r2_url,
-            original_filename="spec.xlsx",
-            expected_sha256=xlsx_sha256,
-            expected_size_bytes=len(xlsx_bytes),
-            logical_source_id="continuum:project_document:doc-99",
-        )
-        assert dup.is_duplicate is True
-        assert dup.run_id == resp.run_id
-
-    # Mock DNS public check & httpx streaming from R2
-    monkeypatch.setattr(
-        "sag_api.parsing.remote_object._assert_public_host",
-        AsyncMock(return_value=None),
-    )
-
-    def _mock_transport(request: httpx.Request) -> httpx.Response:
-        assert str(request.url) == r2_url
-        return httpx.Response(
-            200,
-            headers={"content-length": str(len(xlsx_bytes))},
-            content=xlsx_bytes,
-        )
-
-    orig_async_client = httpx.AsyncClient
-    monkeypatch.setattr(
-        "sag_api.parsing.remote_object.httpx.AsyncClient",
-        lambda **kw: orig_async_client(transport=httpx.MockTransport(_mock_transport), **kw),
-    )
 
     async def _fake_index(session, *, document_version, **kwargs):
         document_version.search_status = "SEARCH_READY"
@@ -574,13 +442,16 @@ async def test_r2_object_ingest_e2e_streaming_verification_and_disk_gc(
         doc = await session.get(Document, resp.document_id)
         assert job is not None and doc is not None
         raw_snapshot_path = doc.storage_path
-        # Zero bytes existed on disk before worker ran!
-        assert not os.path.exists(raw_snapshot_path)
+        assert os.path.isfile(raw_snapshot_path)
+
+        # Even if a legacy job payload carries remote_object_sourced=True,
+        # post-index Disk GC must NOT delete the local snapshot file.
+        job.payload = {**(job.payload or {}), "remote_object_sourced": True}
+        await session.commit()
 
         await tasks._process_document_unlocked(session, job, engine_manager=manager)
 
         await session.refresh(doc)
-        await session.refresh(job)
         run = await session.get(IngestionRun, resp.run_id)
         ver = await session.get(DocumentVersion, resp.version_id)
         blocks = (
@@ -594,29 +465,7 @@ async def test_r2_object_ingest_e2e_streaming_verification_and_disk_gc(
         assert run is not None and run.status == "SUCCEEDED" and run.current_stage == "COMPLETE"
         assert ver is not None and ver.search_status == "SEARCH_READY"
         assert any("IngestionWorker" in b.normalized_text for b in blocks)
-        # Presigned URL scrubbed from job.payload after completion
-        assert "remote_source_url" not in (job.payload or {})
-        # Raw heavy binary was GC'd after COMPLETE, while .parsed.markitdown.md sidecar remains!
-        assert not os.path.exists(raw_snapshot_path)
-        parsed_cache_path = f"{raw_snapshot_path}.parsed.markitdown.md"
-        assert os.path.isfile(parsed_cache_path)
-
-    # Reprocessing / prepare_document recovers directly from sidecar cache without raw binary!
-    recovered = await prepare_document(raw_snapshot_path, cfg)
-    assert recovered.cached is True
-    assert recovered.path == parsed_cache_path
-
-    # Verify SHA-256 mismatch & extension spoofing fail-closed during streaming
-    bad_target = str(tmp_path / "spoofed.pdf")
-    with pytest.raises(ValidationError, match="PDF"):
-        await stream_remote_object_to_snapshot(
-            r2_url,
-            target_path=bad_target,
-            original_filename="spoofed.pdf",
-            expected_sha256=xlsx_sha256,
-            expected_size_bytes=len(xlsx_bytes),
-            settings=cfg,
-        )
-    assert not os.path.exists(bad_target)
+        assert os.path.isfile(raw_snapshot_path)
+        assert os.path.isfile(f"{raw_snapshot_path}.parsed.markitdown.md")
 
     await engine.dispose()

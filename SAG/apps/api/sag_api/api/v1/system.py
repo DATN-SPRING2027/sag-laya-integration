@@ -162,6 +162,7 @@ def _capabilities() -> dict:
         "vector_provider": settings.sag_vector_provider,
         "language": settings.sag_language,
         "search_strategy": settings.search_strategy,
+        "canonical_search_strategy": "canonical_hybrid",
         "search_strategies": strategy_report["enabled"],
         "search_strategies_disabled": strategy_report["disabled"],
         "timezone": settings.timezone,
@@ -236,10 +237,13 @@ async def metrics(request: Request, format: str = "prometheus") -> Response:
     knowledge_ready = bool(runtime and runtime.ready)
     qdrant_ready = await _qdrant_ready(request)
 
-    from sag_api.core.token_usage import get_runtime_token_usage
+    from sag_api.core.text_utils import get_tiktoken_fallback_status
+    from sag_api.core.token_usage import get_router_degraded_metrics, get_runtime_token_usage
     from sag_api.services.route_cache_service import route_decision_cache
 
     runtime_token_usage = get_runtime_token_usage()
+    degraded_counts = get_router_degraded_metrics()
+    tiktoken_fallback = get_tiktoken_fallback_status()
 
     cache_size = len(route_decision_cache)
     cache_max = route_decision_cache.max_entries
@@ -251,6 +255,11 @@ async def metrics(request: Request, format: str = "prometheus") -> Response:
                 "status": "ok",
                 "system_up": 1,
                 "token_usage": runtime_token_usage,
+                "tiktoken_fallback": tiktoken_fallback,
+                "decision_router_degraded": {
+                    "total": sum(degraded_counts.values()),
+                    "by_reason": degraded_counts,
+                },
                 "db_ready": db_ready,
                 "knowledge_runtime_ready": knowledge_ready,
                 "qdrant_ready": qdrant_ready,
@@ -318,7 +327,22 @@ async def metrics(request: Request, format: str = "prometheus") -> Response:
         "# HELP sag_token_cost_usd_total Estimated cumulative USD cost of measured tokens since process start",
         "# TYPE sag_token_cost_usd_total counter",
         f'sag_token_cost_usd_total {float(runtime_token_usage["cost_usd"]):.8f}',
+        "# HELP sag_token_cost_known Whether USD pricing is known for metered token usage (1=known, 0=unknown)",
+        "# TYPE sag_token_cost_known gauge",
+        f'sag_token_cost_known {1 if runtime_token_usage.get("cost_known", True) else 0}',
+        "# HELP sag_decision_router_degraded_total Total times decision router degraded to fail-closed fallback",
+        "# TYPE sag_decision_router_degraded_total counter",
+        f'sag_decision_router_degraded_total{{reason="all"}} {sum(degraded_counts.values())}',
+        "# HELP sag_tiktoken_degraded Whether cl100k_base tiktoken fell back to offline heuristic (1=degraded, 0=ok)",
+        "# TYPE sag_tiktoken_degraded gauge",
+        f'sag_tiktoken_degraded {1 if tiktoken_fallback["degraded"] else 0}',
+        "# HELP sag_tiktoken_fallback_total Total recorded tiktoken cl100k_base fallback events",
+        "# TYPE sag_tiktoken_fallback_total counter",
+        f'sag_tiktoken_fallback_total {int(tiktoken_fallback["fallback_count"])}',
     ]
+    for degraded_reason, degraded_count in sorted(degraded_counts.items()):
+        safe_reason = degraded_reason.replace('"', "")
+        lines.append(f'sag_decision_router_degraded_total{{reason="{safe_reason}"}} {degraded_count}')
     if qdrant_ready is not None:
         lines.extend(
             [

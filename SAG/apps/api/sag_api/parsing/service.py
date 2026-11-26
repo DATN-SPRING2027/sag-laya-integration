@@ -143,20 +143,6 @@ async def _acquire_lane(
             yield
 
 
-def has_cached_prepared_document(path: str, settings: Settings) -> bool:
-    """Return True when either a raw Markdown file or a valid current-signature parsed sidecar exists on disk."""
-    if not path:
-        return False
-    suffix = os.path.splitext(path)[1].lower()
-    if suffix in {".md", ".markdown"}:
-        return os.path.isfile(path)
-    for candidate_provider in ("mineru", "markitdown"):
-        sig = _signature(candidate_provider, settings)
-        if _is_cached(f"{path}.parsed.{sig}.md"):
-            return True
-    return False
-
-
 async def prepare_document(
     path: str,
     settings: Settings,
@@ -164,26 +150,29 @@ async def prepare_document(
     state: dict[str, Any] | None = None,
     on_state: ParseStateCallback | None = None,
     should_pause: PauseCallback | None = None,
-    remote_source_url: str | None = None,
     project_id: str | None = None,
+    ignore_fallback_cache: bool = False,
 ) -> PreparedDocument:
     """Trả về đường dẫn Markdown có thể chuyển trực tiếp cho canonical/zleap-sag."""
     suffix = os.path.splitext(path)[1].lower()
     if suffix in {".md", ".markdown"}:
+        if not os.path.isfile(path):
+            raise ValidationError("Tệp Markdown nguồn không tồn tại trên đĩa")
         return PreparedDocument(path=path, provider="original")
 
     # Fast sidecar cache recovery even when raw binary snapshot was garbage-collected
     if not os.path.isfile(path):
-        for candidate_provider in ("mineru", "markitdown"):
-            sig = _signature(candidate_provider, settings)
-            candidate_cache = f"{path}.parsed.{sig}.md"
-            if _is_cached(candidate_cache):
-                await _emit_cached_state(
-                    state, candidate_provider, sig, candidate_cache, settings, on_state
-                )
-                return PreparedDocument(
-                    path=candidate_cache, provider=candidate_provider, cached=True
-                )
+        recovered = await _recover_missing_source_sidecar(
+            path,
+            settings,
+            suffix=suffix,
+            state=state,
+            on_state=on_state,
+            ignore_fallback_cache=ignore_fallback_cache,
+        )
+        if recovered is not None:
+            return recovered
+        raise ValidationError("Tệp nguồn không tồn tại trên đĩa và không có bản đệm phân tích hợp lệ")
 
     use_mineru = await asyncio.to_thread(should_route_to_mineru, path, settings)
     provider: Literal["markitdown", "mineru"] = "mineru" if use_mineru else "markitdown"
@@ -194,12 +183,13 @@ async def prepare_document(
             state, provider, signature, cache_path, settings, on_state
         )
         return PreparedDocument(path=cache_path, provider=provider, cached=True)
-    cached_fallback = _cached_fallback_document(path, provider, signature, settings)
-    if cached_fallback:
-        await _emit_cached_fallback_state(
-            state, signature, cached_fallback, settings, on_state
-        )
-        return cached_fallback
+    if not ignore_fallback_cache:
+        cached_fallback = _cached_fallback_document(path, provider, signature, settings)
+        if cached_fallback:
+            await _emit_cached_fallback_state(
+                state, signature, cached_fallback, settings, on_state
+            )
+            return cached_fallback
 
     async with _lock_for(cache_path):
         if _is_cached(cache_path):
@@ -207,12 +197,13 @@ async def prepare_document(
                 state, provider, signature, cache_path, settings, on_state
             )
             return PreparedDocument(path=cache_path, provider=provider, cached=True)
-        cached_fallback = _cached_fallback_document(path, provider, signature, settings)
-        if cached_fallback:
-            await _emit_cached_fallback_state(
-                state, signature, cached_fallback, settings, on_state
-            )
-            return cached_fallback
+        if not ignore_fallback_cache:
+            cached_fallback = _cached_fallback_document(path, provider, signature, settings)
+            if cached_fallback:
+                await _emit_cached_fallback_state(
+                    state, signature, cached_fallback, settings, on_state
+                )
+                return cached_fallback
         return await _prepare_and_cache(
             path,
             cache_path,
@@ -222,9 +213,96 @@ async def prepare_document(
             state=state,
             on_state=on_state,
             should_pause=should_pause,
-            remote_source_url=remote_source_url,
             project_id=project_id,
+            ignore_fallback_cache=ignore_fallback_cache,
         )
+
+
+async def _recover_missing_source_sidecar(
+    path: str,
+    settings: Settings,
+    *,
+    suffix: str,
+    state: dict[str, Any] | None,
+    on_state: ParseStateCallback | None,
+    ignore_fallback_cache: bool,
+) -> PreparedDocument | None:
+    """Recover a verified sidecar `.parsed.<sig>.md` when the raw source file is absent."""
+    effective = settings.effective_document_parser
+    if effective == "mineru":
+        if suffix in _MINERU_DIRECT_EXTENSIONS or (
+            suffix in _MINERU_HYBRID_OOXML_EXTENSIONS and settings.document_parser == "mineru"
+        ):
+            allowed_providers: list[Literal["mineru", "markitdown"]] = ["mineru"]
+            mineru_sig = _signature("mineru", settings)
+            if not ignore_fallback_cache and _is_cached(
+                _fallback_marker_path(path, mineru_sig, settings)
+            ):
+                allowed_providers.append("markitdown")
+        elif suffix in _MINERU_HYBRID_OOXML_EXTENSIONS:
+            allowed_providers = ["mineru", "markitdown"]
+        else:
+            allowed_providers = ["markitdown"]
+    else:
+        allowed_providers = ["markitdown"]
+
+    is_fallback_state = False
+    if isinstance(state, dict) and state:
+        state_status = str(state.get("status") or "").lower()
+        state_provider = state.get("provider")
+        state_sig = state.get("signature")
+        if state_status == "fallback_done" and isinstance(state.get("fallback"), dict):
+            if ignore_fallback_cache:
+                return None
+            fb = state["fallback"]
+            if (
+                "markitdown" not in allowed_providers
+                or fb.get("provider") != "markitdown"
+                or fb.get("signature") != _signature("markitdown", settings)
+                or (state_sig and state_sig != _signature("mineru", settings))
+            ):
+                return None
+            allowed_providers = ["markitdown"]
+            is_fallback_state = True
+        elif state_provider in ("mineru", "markitdown"):
+            if state_provider not in allowed_providers:
+                return None
+            expected_sig = _signature(state_provider, settings)
+            if state_sig and state_sig != expected_sig:
+                return None
+            if state_provider == "mineru":
+                if state.get("base_url") and state.get("base_url") != settings.mineru_base_url:
+                    return None
+                if (
+                    "key_fingerprint" in state
+                    and state.get("key_fingerprint") != _mineru_key_fingerprint(settings)
+                ):
+                    return None
+            allowed_providers = [state_provider]
+
+    for candidate_provider in allowed_providers:
+        sig = _signature(candidate_provider, settings)
+        candidate_cache = f"{path}.parsed.{sig}.md"
+        if _is_cached(candidate_cache):
+            if is_fallback_state:
+                fallback_doc = PreparedDocument(
+                    path=candidate_cache,
+                    provider="markitdown",
+                    cached=True,
+                    fallback_from="mineru",
+                    fallback_error="MinerU từng phân tích thất bại; đã dùng lại bản đệm MarkItDown",
+                )
+                await _emit_cached_fallback_state(
+                    state, _signature("mineru", settings), fallback_doc, settings, on_state
+                )
+                return fallback_doc
+            await _emit_cached_state(
+                state, candidate_provider, sig, candidate_cache, settings, on_state
+            )
+            return PreparedDocument(
+                path=candidate_cache, provider=candidate_provider, cached=True
+            )
+    return None
 
 
 async def _emit_cached_fallback_state(
@@ -282,10 +360,16 @@ async def _prepare_and_cache(
     state: dict[str, Any] | None,
     on_state: ParseStateCallback | None,
     should_pause: PauseCallback | None = None,
-    remote_source_url: str | None = None,
     project_id: str | None = None,
+    ignore_fallback_cache: bool = False,
 ) -> PreparedDocument:
-    parser_state = _compatible_state(state, provider, signature, settings)
+    effective_input_state = state
+    if ignore_fallback_cache and isinstance(state, dict):
+        cleaned_state = {k: v for k, v in state.items() if k != "fallback"}
+        if str(cleaned_state.get("status") or "").startswith("fallback"):
+            cleaned_state.pop("status", None)
+        effective_input_state = cleaned_state
+    parser_state = _compatible_state(effective_input_state, provider, signature, settings)
     current_state = dict(parser_state)
 
     async def track_state(next_state: dict[str, Any]) -> None:
@@ -301,8 +385,10 @@ async def _prepare_and_cache(
         fallback_signature = _signature("markitdown", settings)
         fallback_cache_path = f"{path}.parsed.{fallback_signature}.md"
         fallback_marker_path = _fallback_marker_path(path, signature, settings)
-        fallback = _compatible_fallback(
-            parser_state, fallback_signature, fallback_cache_path
+        fallback = (
+            None
+            if ignore_fallback_cache
+            else _compatible_fallback(parser_state, fallback_signature, fallback_cache_path)
         )
         if fallback and parser_state.get("status") == "fallback_done" and _is_cached(
             fallback_cache_path
@@ -345,7 +431,6 @@ async def _prepare_and_cache(
                     state=parser_state,
                     on_state=track_state,
                     should_pause=should_pause,
-                    remote_source_url=remote_source_url,
                 )
         except ApiError as mineru_error:
             return await _prepare_markitdown_fallback(
@@ -360,6 +445,8 @@ async def _prepare_and_cache(
                 mineru_error_code=mineru_error.code,
                 on_state=track_state,
             )
+        await asyncio.to_thread(_remove_fallback_marker, fallback_marker_path)
+        current_state.pop("fallback", None)
     else:
         if is_plain_text_path(path):
             async with _acquire_lane("fast_text", settings.fast_parse_concurrency):
@@ -519,6 +606,13 @@ def _fallback_marker_path(path: str, signature: str, settings: Settings) -> str:
 
 def _write_fallback_marker(path: str) -> None:
     _write_markdown(path, "markitdown\n")
+
+
+def _remove_fallback_marker(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def _is_cached(path: str) -> bool:

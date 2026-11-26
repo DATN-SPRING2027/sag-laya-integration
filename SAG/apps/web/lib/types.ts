@@ -1110,3 +1110,125 @@ export interface OctxTransfer {
   created_at: string;
   updated_at: string;
 }
+
+export type ConflictSubtype =
+  | "DIRECT_SUPERSEDES"
+  | "HARD_CONTRADICTION"
+  | "SCOPED_EXCEPTION"
+  | "DIFFERENT_PERSPECTIVE"
+  | "SUPPORTS_OR_EQUIVALENT";
+
+export type ConflictResolutionStatus =
+  | "PENDING_REVIEW"
+  | "ACTIVE"
+  | "DISMISSED_SCOPED"
+  | "REVOKED_WINNER"
+  | "NEEDS_REVALIDATION"
+  | "SUPERSEDED_BY_UPDATE";
+
+export type ConflictResolutionMode =
+  | "AUTO_POLICY"
+  | "MANUAL_HITL"
+  | "UNRESOLVED"
+  | "KEEP_BOTH_SCOPED";
+
+export type ConflictResolveAction =
+  | "WINNER_B"
+  | "WINNER_A"
+  | "KEEP_BOTH_SCOPED";
+
+export interface ConflictSide {
+  document_id: string;
+  document_name: string;
+  version_id: string;
+  version_no: number | null;
+  unit_id: string;
+  section_path: string;
+  page_from: number | null;
+  page_to: number | null;
+  text_snapshot: string;
+  authority_tier: number | null;
+  effective_from: string | null;
+  security_partition_id: string;
+}
+
+export interface ConflictAuditEntry {
+  action: string;
+  actor: string;
+  reason?: string | null;
+  from_status?: string | null;
+  to_status: string;
+  at?: string | null;
+  timestamp?: string | null;
+}
+
+export interface ConflictItem {
+  id: string;
+  tenant_id: string;
+  project_id: string;
+  security_partition_id: string;
+  winner_security_partition_id: string;
+  pair_key: string;
+  conflict_subtype: ConflictSubtype;
+  status: ConflictResolutionStatus;
+  resolution_mode: ConflictResolutionMode;
+  confidence: number;
+  cosine_similarity: number | null;
+  effective_valid_to: string | null;
+  scope_difference_summary: string | null;
+  reason: string;
+  degraded_fallback: boolean;
+  graph_edge_id: string | null;
+  resolved_by: string | null;
+  resolved_at: string | null;
+  created_at: string;
+  updated_at: string;
+  audit_history: ConflictAuditEntry[];
+  side_a: ConflictSide;
+  side_b: ConflictSide;
+}
+
+export interface ConflictListResponse {
+  items: ConflictItem[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface ConflictActionResponse {
+  id: string;
+  tenant_id: string;
+  project_id: string;
+  security_partition_id: string;
+  winner_security_partition_id: string;
+  pair_key: string;
+  conflict_subtype: ConflictSubtype;
+  status: ConflictResolutionStatus;
+  resolution_mode: ConflictResolutionMode;
+  winner_document_id: string;
+  winner_version_id: string;
+  winner_unit_id: string;
+  loser_document_id: string;
+  loser_version_id: string;
+  loser_unit_id: string;
+  effective_valid_to: string | null;
+  reason: string;
+  degraded_fallback: boolean;
+  graph_edge_id: string | null;
+  resolved_by: string | null;
+  resolved_at: string | null;
+  created_at: string;
+  updated_at: string;
+  audit_history: ConflictAuditEntry[];
+}
+
+export interface ConflictListParams {
+  project_id?: string;
+  source_id?: string;
+  status?: ConflictResolutionStatus[];
+  conflict_subtype?: ConflictSubtype[];
+  document_id?: string;
+  include_inactive?: boolean;
+  limit?: number;
+  offset?: number;
+}

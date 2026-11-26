@@ -72,7 +72,7 @@ This project is a complete knowledge base application for individuals and Agents
 
 **sources and documents → structured knowledge → search and source tracing → cited Agent answers → reuse through API or MCP**
 
-Upload a document once. SAG parses it, splits it into chunks, embeds it, extracts events and entities, and keeps every retrieval result connected to the original text. You can then search across sources, inspect the event-entity graph, ask questions with citations, or expose the same knowledge to another application.
+Upload a document once. SAG parses it, splits it into chunks, embeds it into PostgreSQL + Qdrant (`SearchUnit`), runs deterministic `E0/E1` `FOUNDATION` knowledge indexing ([`docs/adr-remove-e2-llm-enrichment.md`](docs/adr-remove-e2-llm-enrichment.md)), and keeps every retrieval result connected to the original text (optional legacy per-chunk event extraction is disabled by default via `SAG_DOCUMENT_EVENT_EXTRACTION_ENABLED=false`). You can then search across sources, inspect the event-entity graph, ask questions with citations, or expose the same knowledge to another application.
 
 | Capability | What it gives you |
 | --- | --- |
@@ -129,12 +129,14 @@ The semantic and structural paths inside SAG are native parts of the SAG pipelin
 
 ### How retrieval works
 
+> **Note:** The `Technology` section above summarizes the original SAG paper architecture. In the current SAG runtime, per-chunk Tier E2 LLM enrichment was removed per [`docs/adr-remove-e2-llm-enrichment.md`](docs/adr-remove-e2-llm-enrichment.md) and replaced by `Phase 2C SearchUnit` + `Phase 5A FOUNDATION (E0/E1 + DenseGraph + Leiden)`.
+
 **Offline indexing**
 
 1. Parse a document into semantically coherent chunks.
-2. Extract one event and multiple entities from each chunk in parallel.
-3. Persist chunks, events, entities, and event-entity associations to relational storage.
-4. Persist chunk, event, and entity representations to vector/full-text indexes.
+2. Build `SearchUnit` hybrid indexes and deterministic `E0/E1` `FOUNDATION` knowledge graphs (without per-chunk LLM calls by default).
+3. Persist chunks, deterministic knowledge units, and associations to relational storage.
+4. Persist chunk and foundation representations to vector/full-text indexes.
 
 **Online retrieval**
 
@@ -199,11 +201,11 @@ On first launch:
 3. Create a source, upload documents, and wait until their status is **Ready**.
 4. Search, open the original source, or start a cited conversation.
 
-The UI and services still start without model credentials. Embeddings are required for indexing/vector retrieval; the LLM is required for event extraction and generated answers. The optional Decision Router classifies query intent.
+The UI and services still start without model credentials. Embeddings are required for indexing/vector retrieval; the LLM is required for generated answers (default ingestion uses deterministic `E0/E1` `FOUNDATION` without per-chunk LLM calls, per [`docs/adr-remove-e2-llm-enrichment.md`](docs/adr-remove-e2-llm-enrichment.md); optional legacy event extraction is disabled by default). The optional Decision Router classifies query intent.
 
 ### Decision Router
 
-SAG uses Kev-4B through SiliconFlow's System One API (`POST https://api.siliconflow.com/v1/systemone`). Set `SAG_SILICONFLOW_API_KEY` or enter the key in **Settings → Models** to enable cloud classification. Query text and supplied decision context are sent to SiliconFlow. If the key is missing or the request fails, SAG keeps retrieval enabled. Set the provider to `disabled` to skip decision classification. Saved model settings in the database remain authoritative over `.env` defaults.
+SAG uses Kev-4B through SiliconFlow's System One API (`POST https://api.siliconflow.com/v1/systemone`) via `services/decision_router.py` (replacing the legacy Laya Local Router, which was permanently removed per [`docs/adr-remove-laya-and-r2.md`](docs/adr-remove-laya-and-r2.md)). Set `SAG_SILICONFLOW_API_KEY` or enter the key in **Settings → Models** to enable cloud classification. Query text and supplied decision context are sent to SiliconFlow. If the key is missing or the request fails, SAG keeps retrieval enabled. Set the provider to `disabled` to skip decision classification. Saved model settings in the database remain authoritative over `.env` defaults.
 
 After changing the API key in `.env`, restart the API container:
 
@@ -219,7 +221,7 @@ To make the deployment configuration mandatory, set `SAG_LOCK_LLM_CONFIG=true`. 
 
 ### Import knowledge
 
-Create a source and add Markdown, text, PDF, Office, or other supported documents. SAG normalizes documents to Markdown, then runs chunking, embedding, event extraction, and entity extraction in the background.
+Create a source and add Markdown, text, PDF, Office, or other supported documents via local upload. SAG normalizes documents to Markdown, then runs chunking, embedding, and deterministic `E0/E1` `FOUNDATION` knowledge + routing-tree indexing in the background (per-chunk E2 LLM enrichment and R2 object-ingest were removed per [`docs/adr-remove-e2-llm-enrichment.md`](docs/adr-remove-e2-llm-enrichment.md) and [`docs/adr-remove-laya-and-r2.md`](docs/adr-remove-laya-and-r2.md)).
 
 <p align="center">
   <img src="docs/assets/readme/product-import.png" alt="Import a document into SAG" width="940" />

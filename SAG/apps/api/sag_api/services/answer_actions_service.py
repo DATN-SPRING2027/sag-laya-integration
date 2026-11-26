@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import binascii
 import hashlib
 import hmac
@@ -1096,9 +1095,10 @@ async def prepare_regenerate(
     owner_key: str,
     llm: Any = None,
     user_name: str | None = None,
+    web_enabled: bool = False,
 ) -> AskPlan:
     from sag_api.api.v1.attachments import attachment_path
-    from sag_api.services.decision_router import route_query
+    from sag_api.services.decision_router import route_query_async
     from sag_api.services.session_context.runtime import _extract_visible_records
 
     thread = await get_thread(session, agent.id, thread.id, owner_key=owner_key)
@@ -1175,18 +1175,30 @@ async def prepare_regenerate(
 
     if settings.session_context_mode == "on" and scoped_prior:
         prior_records, _ = _extract_visible_records(scoped_prior)
-        ephemeral_index = IncrementalSessionIndex(thread.id)
-        await ephemeral_index.append_messages(prior_records)
+        principal_tenant = getattr(principal, "tenant_id", None)
+        ephemeral_index = IncrementalSessionIndex(thread.id, tenant_id=principal_tenant or "")
+        await ephemeral_index.append_messages(prior_records, llm=llm, tenant_id=principal_tenant)
         allowed_turns = set(ephemeral_index.turns_by_id.keys())
-        decision = await asyncio.to_thread(
-            route_query,
-            query_text,
-            {
-                "has_thread_history": bool(allowed_turns),
-                "turn_count": len(allowed_turns),
-                "active_decisions_count": len(ephemeral_index.active_decisions),
-            },
-        )
+        prior_turns_payload = [
+            {"role": str(rec.get("role") or ""), "content": str(rec.get("content") or "")}
+            for rec in prior_records
+            if rec.get("role") in {"user", "assistant"} and rec.get("content")
+        ]
+        decision = (
+            await route_query_async(
+                query_text,
+                prior_turns=prior_turns_payload or None,
+                has_thread_history=bool(allowed_turns),
+                has_sources=True,
+                web_enabled=web_enabled,
+                context={
+                    "has_thread_history": bool(allowed_turns),
+                    "turn_count": len(allowed_turns),
+                    "active_decisions_count": len(ephemeral_index.active_decisions),
+                },
+                llm_client=llm if settings.decision_provider == "llm" else None,
+            )
+        ).to_dict()
         pack = await build_ecce_context_pack(
             ephemeral_index,
             query=query_text,
@@ -1203,6 +1215,16 @@ async def prepare_regenerate(
     else:
         raw_history = [{"role": m.role.value, "content": m.content} for m in scoped_prior]
         history = await compress_history(raw_history, llm=llm, budget_tokens=budget_tokens)
+        route_decision = (
+            await route_query_async(
+                query_text,
+                prior_turns=history,
+                has_thread_history=bool(history),
+                has_sources=True,
+                web_enabled=web_enabled,
+                llm_client=llm if settings.decision_provider == "llm" else None,
+            )
+        ).to_dict()
 
     effective_user_name = await resolve_user_display_name(
         session,

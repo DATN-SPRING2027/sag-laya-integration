@@ -16,17 +16,27 @@ from __future__ import annotations
 import hashlib
 import uuid
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import quote
 
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sag_api.core.bm25_tokenizer import (
+    BM25_STEM_WEIGHT,
+    english_stem,
+    token_hash_bucket,
+    tokenize_bm25_tokens,
+)
+from sag_api.core.bm25_tokenizer import (
+    COMMON_STOPWORDS as COMMON_STOPWORDS,
+)
 from sag_api.core.config import settings
-from sag_api.core.logging import get_logger
-from sag_api.core.errors import ApiError, is_retryable_error
 from sag_api.core.error_taxonomy import ErrorLayer, ErrorStage
+from sag_api.core.errors import ApiError, is_retryable_error
+from sag_api.core.logging import get_logger
 from sag_api.core.sanitizer import sanitize_error_message
 from sag_api.db.models.routing_rag import (
     CanonicalBlock,
@@ -34,12 +44,128 @@ from sag_api.db.models.routing_rag import (
     SearchUnit,
     StageRun,
 )
+from sag_api.enums import normalize_scope_tags
 
 log = get_logger("sag.search_index")
 
-# Bounded LRU cache mapping sha256([model_signature + NUL +] text) -> dense vector
+_MAX_VALID_TO = datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC)
+
+
+def _as_utc(dt: datetime | str | None) -> datetime | None:
+    if dt is None:
+        return None
+    if isinstance(dt, str):
+        parsed = datetime.fromisoformat(dt)
+    else:
+        parsed = dt
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+# Bounded LRU cache mapping sha256(model_signature + NUL + text) -> dense vector
 _SHARED_TEXT_EMBEDDING_CACHE: dict[str, list[float]] = {}
 _SHARED_TEXT_EMBEDDING_CACHE_MAX = 16384
+
+_KNOWN_EMBEDDING_DIMENSIONS: dict[str, int] = {
+    "bge-large-en-v1.5": 1024,
+    "baai/bge-large-en-v1.5": 1024,
+    "baai/bge-m3": 1024,
+    "bge-m3": 1024,
+    "qwen/qwen3-embedding-4b": 1024,
+    "qwen3-embedding-4b": 1024,
+    "qwen/qwen3-embedding-0.6b": 1024,
+    "qwen3-embedding-0.6b": 1024,
+    "qwen/qwen3-embedding-8b": 4096,
+    "qwen3-embedding-8b": 4096,
+    "text-embedding-3-small": 1536,
+    "openai/text-embedding-3-small": 1536,
+    "text-embedding-3-large": 3072,
+    "openai/text-embedding-3-large": 3072,
+    "text-embedding-ada-002": 1536,
+    "openai/text-embedding-ada-002": 1536,
+    "nomic-embed-text": 768,
+    "mxbai-embed-large": 1024,
+}
+
+
+def resolve_embedding_dimensions(
+    model_name: str | None = None,
+    configured_dimensions: int | None = None,
+) -> int:
+    """Resolve embedding vector dimensions from explicit config or model registry (default 1024)."""
+    if configured_dimensions is not None and configured_dimensions != "":
+        if isinstance(configured_dimensions, bool):
+            raise ValueError(f"Invalid embedding dimensions: {configured_dimensions!r}")
+        dim = int(configured_dimensions)
+        if dim <= 0:
+            raise ValueError(f"Embedding dimensions must be positive, got {dim}")
+        return dim
+    normalized = str(model_name or "").strip().lower()
+    if normalized in _KNOWN_EMBEDDING_DIMENSIONS:
+        return _KNOWN_EMBEDDING_DIMENSIONS[normalized]
+    return 1024
+
+
+def _attr_from_embedder_or_delegates(embedder: Any | None, *names: str) -> Any:
+    if embedder is None:
+        return None
+    candidates: list[Any] = [embedder]
+    cfg = getattr(embedder, "config", None)
+    if cfg is not None:
+        candidates.append(cfg)
+    for delegate_attr in ("inner", "_inner", "client", "_client", "_delegate"):
+        delegate = getattr(embedder, delegate_attr, None)
+        if delegate is not None:
+            candidates.append(delegate)
+            d_cfg = getattr(delegate, "config", None)
+            if d_cfg is not None:
+                candidates.append(d_cfg)
+    for obj in candidates:
+        for name in names:
+            val = getattr(obj, name, None)
+            if val is not None and val != "":
+                return val
+    return None
+
+
+def build_embedding_model_signature(
+    embedder: Any | None = None,
+    *,
+    settings_obj: Any | None = None,
+    model: str | None = None,
+    base_url: str | None = None,
+    dimensions: int | None = None,
+) -> str:
+    """Build canonical cache/index signature capturing base_url, model, and resolved dimensions."""
+    s = settings_obj if settings_obj is not None else settings
+    emb_model = (
+        model
+        if isinstance(model, str) and model.strip()
+        else _attr_from_embedder_or_delegates(embedder, "model", "_model", "model_name")
+    )
+    settings_model = str(getattr(s, "embedding_model", "") or "").strip()
+    resolved_model = str(emb_model or settings_model).strip()
+
+    emb_base_url = (
+        base_url
+        if isinstance(base_url, str) and base_url.strip()
+        else _attr_from_embedder_or_delegates(embedder, "base_url", "_base_url")
+    )
+    settings_base_url = getattr(s, "effective_embedding_base_url", None) or getattr(s, "embedding_base_url", None)
+    resolved_base_url = str(emb_base_url or settings_base_url or "").strip().rstrip("/").lower()
+
+    raw_dim: Any = dimensions
+    if raw_dim is None:
+        raw_dim = _attr_from_embedder_or_delegates(embedder, "schema_dimensions", "dimensions", "dim")
+    if raw_dim is None and (not emb_model or str(emb_model).strip() == settings_model):
+        raw_dim = getattr(s, "embedding_dimensions", None)
+    resolved_dim = resolve_embedding_dimensions(resolved_model, raw_dim)
+    return f"emb:{resolved_base_url}|{resolved_model}|{resolved_dim}"
+
+
+def collection_meta_point_id(collection_name: str) -> str:
+    """Deterministic UUIDv5 point ID for Qdrant collection embedding identity metadata."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"sag:qdrant:collection_meta:{collection_name}"))
 
 
 def contextualize_block_text(section_path: str | None, text: str) -> str:
@@ -51,13 +177,15 @@ def contextualize_block_text(section_path: str | None, text: str) -> str:
     return raw_t
 
 
-def _embedding_cache_key(text: str, model_signature: str = "") -> str:
+def _embedding_cache_key(text: str, model_signature: str) -> str:
+    if not isinstance(model_signature, str) or not model_signature.strip():
+        raise ValueError("model_signature must be a non-empty string for _SHARED_TEXT_EMBEDDING_CACHE")
     sig = model_signature.strip()
-    payload = f"{sig}\x00{text}" if sig else text
+    payload = f"{sig}\x00{text}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def get_cached_text_embedding(text: str, *, model_signature: str = "") -> list[float] | None:
+def get_cached_text_embedding(text: str, *, model_signature: str) -> list[float] | None:
     key = _embedding_cache_key(text, model_signature)
     vec = _SHARED_TEXT_EMBEDDING_CACHE.get(key)
     return list(vec) if vec is not None else None
@@ -67,7 +195,7 @@ def put_cached_text_embedding(
     text: str,
     vector: Sequence[float],
     *,
-    model_signature: str = "",
+    model_signature: str,
 ) -> None:
     key = _embedding_cache_key(text, model_signature)
     if (
@@ -90,24 +218,6 @@ def generate_search_unit_point_id(collection_name: str, unit_id: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"sag:qdrant:{collection_name}:{unit_id}"))
 
 
-COMMON_STOPWORDS: frozenset[str] = frozenset(
-    {
-        # English function words & question particles
-        "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with",
-        "by", "from", "up", "about", "into", "over", "after", "is", "are", "was", "were",
-        "be", "been", "being", "have", "has", "had", "do", "does", "did", "can", "could",
-        "this", "that", "these", "those", "it", "its", "as",
-        "what", "when", "where", "who", "whom", "whose", "which", "why", "how",
-        # Vietnamese function words, prepositions, conjunctions & question particles
-        "là", "và", "của", "cho", "với", "trong", "được", "có", "đã", "đang", "sẽ",
-        "các", "những", "một", "này", "đó", "tại", "về", "từ", "theo", "khi", "như",
-        "bởi", "vì", "nếu", "thì", "mà", "để", "đến", "tới", "ra", "vào", "lên", "xuống",
-        "cũng", "vẫn", "đều", "chỉ", "rất", "quá", "lắm", "rồi", "hay", "hoặc", "nhưng",
-        "gì", "nào", "ai", "đâu", "sao", "thế", "bao", "nhiêu", "không", "chưa", "phải",
-    }
-)
-
-
 def compute_sparse_bm25_vector(
     text: str,
     *,
@@ -117,68 +227,19 @@ def compute_sparse_bm25_vector(
     corpus_doc_freqs: dict[str, int] | None = None,
     total_corpus_docs: int = 1000,
 ) -> dict[str, list]:
-    """Compute BM25 saturated term-frequency sparse vector (relying on Qdrant native IDF when corpus_doc_freqs is None)."""
+    """Compute BM25 saturated term-frequency sparse vector using the unified Unicode tokenizer."""
     import math
-    import re
-    import unicodedata
     from collections import Counter
 
-    continuous_script_re = re.compile(
-        r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
-        r"\u0e00-\u0e7f\u0e80-\u0eff\u1780-\u17ff\u1000-\u109f]+"
-    )
-
-    # Normalize Unicode to NFC first so decomposed Vietnamese marks never split tokens,
-    # then normalize thousand-separated numbers (1,577 -> 1577) and ampersand initialisms (R&D -> rd)
-    nfc_text = unicodedata.normalize("NFC", text or "")
-    cleaned_text = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", nfc_text.lower())
-    cleaned_text = re.sub(r"\b([a-z]{1,2})\s*&\s*([a-z]{1,2})\b", r"\1\2", cleaned_text)
-    raw_word_tokens = re.findall(r"\w+", cleaned_text)
-    if not raw_word_tokens:
+    tokenized = tokenize_bm25_tokens(text, filter_stopwords=True)
+    if not tokenized.tokens:
         return {"indices": [], "values": []}
 
-    if continuous_script_re.search(cleaned_text):
-        tokens: list[str] = []
-        for tok in raw_word_tokens:
-            if not continuous_script_re.search(tok):
-                tokens.append(tok)
-                continue
-            last_end = 0
-            for match in continuous_script_re.finditer(tok):
-                if match.start() > last_end:
-                    prefix = tok[last_end : match.start()]
-                    if prefix:
-                        tokens.append(prefix)
-                run = match.group(0)
-                if len(run) == 1:
-                    tokens.append(run)
-                else:
-                    for pos in range(len(run) - 1):
-                        tokens.append(run[pos : pos + 2])
-                last_end = match.end()
-            if last_end < len(tok):
-                suffix = tok[last_end:]
-                if suffix:
-                    tokens.append(suffix)
-    else:
-        tokens = raw_word_tokens
-
-    # Expand glued alphanumeric tokens (e.g. fy2018 -> fy2018, 2018) so years/codes match either form
-    expanded_tokens: list[str] = list(tokens)
-    for tok in tokens:
-        if tok.isalnum() and not tok.isalpha() and not tok.isdigit() and len(tok) >= 3:
-            for sub in re.findall(r"[a-z]+|\d{2,}", tok):
-                if len(sub) >= 2:
-                    expanded_tokens.append(sub)
-
-    doc_len = len(tokens)
-    counts = Counter(expanded_tokens)
+    doc_len = len(tokenized.tokens)
+    counts = Counter(tokenized.expanded_tokens)
     sparse_map: dict[int, float] = {}
 
     for word, tf in counts.items():
-        # When corpus_doc_freqs is explicitly provided, apply Robertson-Spärck Jones IDF locally;
-        # otherwise emit pure BM25 length-normalized TF so Qdrant's native `modifier: "idf"` computes
-        # exact corpus-wide IDF across every language without hardcoded stopword distortion.
         if corpus_doc_freqs is not None:
             if word in corpus_doc_freqs:
                 df = corpus_doc_freqs[word]
@@ -188,28 +249,19 @@ def compute_sparse_bm25_vector(
         else:
             idf = 1.0
 
-        # BM25 term saturation with document-length normalization
         len_norm = 1.0 - b + b * (doc_len / avg_doc_len)
         tf_weight = (tf * (k1 + 1.0)) / (tf + k1 * len_norm)
         bm25_weight = idf * tf_weight
 
-        # Deterministic 32-bit token hash index for Qdrant sparse vector
-        token_idx = int(hashlib.md5(word.encode("utf-8")).hexdigest()[:8], 16) % 1000000
-        # Deduplicate indices and preserve highest weight on hash collision for Qdrant uniqueness
+        token_idx = token_hash_bucket(word)
         sparse_map[token_idx] = max(sparse_map.get(token_idx, 0.0), round(bm25_weight, 4))
-        if word.isascii() and word.isalpha():
-            stem = (
-                word[:-3]
-                if len(word) >= 7 and word.endswith("ing")
-                else word[:-2]
-                if len(word) >= 6 and word.endswith("ed") and not word.endswith("eed")
-                else word[:-1]
-                if len(word) >= 5 and word.endswith("s") and not word.endswith(("ss", "us", "is"))
-                else None
+        stem = english_stem(word)
+        if stem:
+            stem_idx = token_hash_bucket(stem)
+            sparse_map[stem_idx] = max(
+                sparse_map.get(stem_idx, 0.0),
+                round(bm25_weight * BM25_STEM_WEIGHT, 4),
             )
-            if stem and len(stem) >= 4:
-                stem_idx = int(hashlib.md5(stem.encode("utf-8")).hexdigest()[:8], 16) % 1000000
-                sparse_map[stem_idx] = max(sparse_map.get(stem_idx, 0.0), round(bm25_weight * 0.55, 4))
 
     sorted_indices = sorted(sparse_map.keys())
     return {
@@ -236,20 +288,49 @@ PAYLOAD_INDEX_FIELDS = [
     ("tree_version_b", "keyword"),
     ("secondary_node_ids_a", "keyword"),
     ("secondary_node_ids_b", "keyword"),
+    ("authority_tier", "integer"),
+    ("effective_from_ts", "integer"),
+    ("scope_tags", "keyword"),
 ]
 
-_VERIFIED_CLIENT_COLLECTIONS: WeakKeyDictionary[Any, set[tuple[str, int]]] = WeakKeyDictionary()
+_VERIFIED_CLIENT_COLLECTIONS: WeakKeyDictionary[Any, set[tuple[str, int, str]]] = WeakKeyDictionary()
 _CLIENT_COLLECTION_LOCKS: WeakKeyDictionary[Any, dict[str, asyncio.Lock]] = WeakKeyDictionary()
 
 
 async def ensure_qdrant_collection_and_indexes(
     qdrant_client: httpx.AsyncClient,
     collection_name: str,
-    vector_dim: int = 1536,
+    vector_dim: int | None = None,
+    *,
+    embedding_signature: str | None = None,
+    embedding_model: str | None = None,
+    embedding_base_url: str | None = None,
 ) -> None:
-    """Ensure per-project collection exists with dense+sparse config and pre-provisioned payload indexes."""
+    """Ensure per-project collection exists with dense+sparse config, model metadata, and payload indexes."""
+    if vector_dim is None or isinstance(vector_dim, bool) or int(vector_dim) <= 0:
+        raise ValueError(
+            f"Qdrant collection {collection_name} requires a positive vector_dim, got {vector_dim!r}"
+        )
+    vector_dim = int(vector_dim)
+    resolved_model = (embedding_model or getattr(settings, "embedding_model", "") or "").strip()
+    resolved_base_url = (
+        embedding_base_url
+        or getattr(settings, "effective_embedding_base_url", None)
+        or getattr(settings, "embedding_base_url", None)
+        or ""
+    ).strip().rstrip("/").lower()
+    resolved_sig = (
+        embedding_signature.strip()
+        if isinstance(embedding_signature, str) and embedding_signature.strip()
+        else build_embedding_model_signature(
+            model=resolved_model,
+            base_url=resolved_base_url,
+            dimensions=vector_dim,
+        )
+    )
+
     verified_set = _VERIFIED_CLIENT_COLLECTIONS.get(qdrant_client)
-    if verified_set is not None and (collection_name, vector_dim) in verified_set:
+    if verified_set is not None and (collection_name, vector_dim, resolved_sig) in verified_set:
         return
 
     locks_by_col = _CLIENT_COLLECTION_LOCKS.get(qdrant_client)
@@ -263,60 +344,71 @@ async def ensure_qdrant_collection_and_indexes(
 
     async with col_lock:
         verified_set = _VERIFIED_CLIENT_COLLECTIONS.get(qdrant_client)
-        if verified_set is not None and (collection_name, vector_dim) in verified_set:
+        if verified_set is not None and (collection_name, vector_dim, resolved_sig) in verified_set:
             return
 
         # 0. Check if collection already exists to verify vector dimension compatibility and existing indexes
         collection_ready = False
         collection_verified = False
         existing_indexed_fields: set[str] = set()
+        info_res: httpx.Response | None = None
         try:
             info_res = await qdrant_client.get(f"/collections/{collection_name}")
-            if info_res.is_success:
-                result_data = info_res.json().get("result", {})
-                if isinstance(result_data, dict):
-                    cfg = result_data.get("config", {})
-                    existing_vectors = cfg.get("params", {}).get("vectors", {})
-                    existing_sparse = cfg.get("params", {}).get("sparse_vectors", {})
-                    if isinstance(existing_vectors, dict) and "content_vector" in existing_vectors:
-                        existing_dim = existing_vectors["content_vector"].get("size")
-                        if existing_dim and existing_dim != vector_dim:
-                            raise ValueError(
-                                f"Qdrant collection {collection_name} dimension mismatch: "
-                                f"existing {existing_dim} vs required {vector_dim}"
-                            )
-                        if isinstance(existing_sparse, dict) and "bm25_sparse" in existing_sparse:
-                            sparse_cfg = existing_sparse.get("bm25_sparse")
-                            if isinstance(sparse_cfg, dict) and sparse_cfg.get("modifier") != "idf":
-                                try:
-                                    patch_res = await qdrant_client.patch(
-                                        f"/collections/{collection_name}",
-                                        json={"sparse_vectors": {"bm25_sparse": {"modifier": "idf"}}},
-                                    )
-                                    if patch_res.status_code >= 400:
-                                        log.warning(
-                                            "Could not enable Qdrant IDF modifier on %s: HTTP %s",
-                                            collection_name,
-                                            patch_res.status_code,
-                                        )
-                                except Exception as patch_exc:
-                                    log.debug(
-                                        "Skipping Qdrant IDF modifier patch on %s: %s",
+        except (httpx.HTTPError, TimeoutError, OSError) as check_exc:
+            log.warning("Collection check skipped or non-fatal: %s", sanitize_error_message(check_exc))
+            info_res = None
+
+        if info_res is not None and info_res.is_success:
+            try:
+                raw_info = info_res.json()
+                result_data = raw_info.get("result", {}) if isinstance(raw_info, dict) else {}
+            except (ValueError, TypeError) as parse_exc:
+                log.warning(
+                    "Invalid JSON from Qdrant collection check on %s: %s",
+                    collection_name,
+                    sanitize_error_message(parse_exc),
+                )
+                result_data = {}
+            if isinstance(result_data, dict):
+                cfg = result_data.get("config", {})
+                existing_vectors = cfg.get("params", {}).get("vectors", {})
+                existing_sparse = cfg.get("params", {}).get("sparse_vectors", {})
+                if isinstance(existing_vectors, dict) and "content_vector" in existing_vectors:
+                    existing_dim = existing_vectors["content_vector"].get("size")
+                    if existing_dim and existing_dim != vector_dim:
+                        raise ValueError(
+                            f"Qdrant collection {collection_name} dimension mismatch: "
+                            f"existing {existing_dim} vs required {vector_dim}"
+                        )
+                    if isinstance(existing_sparse, dict) and "bm25_sparse" in existing_sparse:
+                        sparse_cfg = existing_sparse.get("bm25_sparse")
+                        if isinstance(sparse_cfg, dict) and sparse_cfg.get("modifier") != "idf":
+                            try:
+                                patch_res = await qdrant_client.patch(
+                                    f"/collections/{collection_name}",
+                                    json={"sparse_vectors": {"bm25_sparse": {"modifier": "idf"}}},
+                                )
+                                if patch_res.status_code >= 400:
+                                    log.warning(
+                                        "Could not enable Qdrant IDF modifier on %s: HTTP %s",
                                         collection_name,
-                                        sanitize_error_message(patch_exc),
+                                        patch_res.status_code,
                                     )
-                            collection_ready = True
-                            collection_verified = True
-                    payload_schema = result_data.get("payload_schema")
-                    if isinstance(payload_schema, dict):
-                        existing_indexed_fields = set(payload_schema.keys())
-        except Exception as check_exc:
-            if isinstance(check_exc, ValueError):
-                raise
-            log.debug("Collection check skipped or non-fatal: %s", sanitize_error_message(check_exc))
+                            except (httpx.HTTPError, TimeoutError, OSError) as patch_exc:
+                                log.warning(
+                                    "Skipping Qdrant IDF modifier patch on %s: %s",
+                                    collection_name,
+                                    sanitize_error_message(patch_exc),
+                                )
+                        collection_ready = True
+                        collection_verified = True
+                payload_schema = result_data.get("payload_schema")
+                if isinstance(payload_schema, dict):
+                    existing_indexed_fields = set(payload_schema.keys())
 
         # 1. Create collection with dense and sparse vectors when not already verified
         if not collection_ready:
+            col_res: httpx.Response | None = None
             try:
                 col_res = await qdrant_client.put(
                     f"/collections/{collection_name}",
@@ -334,6 +426,13 @@ async def ensure_qdrant_collection_and_indexes(
                         }
                     },
                 )
+            except (httpx.HTTPError, TimeoutError, OSError) as exc:
+                log.warning(
+                    "Could not ensure Qdrant collection %s: %s",
+                    collection_name,
+                    sanitize_error_message(exc),
+                )
+            if col_res is not None:
                 if col_res.status_code >= 400 and col_res.status_code != 409:
                     err_text = col_res.text.lower()
                     if "already exists" not in err_text:
@@ -341,10 +440,6 @@ async def ensure_qdrant_collection_and_indexes(
                             f"Failed to create Qdrant collection {collection_name}: HTTP {col_res.status_code} - {col_res.text}"
                         )
                 collection_verified = True
-            except Exception as exc:
-                if isinstance(exc, (RuntimeError, ValueError)):
-                    raise
-                log.warning("Could not ensure Qdrant collection %s: %s", collection_name, sanitize_error_message(exc))
 
         # 2. Pre-provision missing payload indexes for fast filtering; fail stage if index creation fails
         missing_index_fields = [
@@ -373,13 +468,66 @@ async def ensure_qdrant_collection_and_indexes(
                 *(_create_payload_index(fname, fschema) for fname, fschema in missing_index_fields)
             )
 
+        # 3. Validate or record deterministic collection embedding metadata marker point
+        meta_id = collection_meta_point_id(collection_name)
+        meta_exists_matching = False
+        meta_res = await qdrant_client.get(
+            f"/collections/{collection_name}/points/{meta_id}",
+            params={"with_payload": "true", "with_vector": "false"},
+        )
+        if meta_res.is_success:
+            meta_result = meta_res.json().get("result")
+            meta_payload = meta_result.get("payload") if isinstance(meta_result, dict) else None
+            if isinstance(meta_payload, dict) and meta_payload.get("_collection_meta") is True:
+                existing_sig = str(meta_payload.get("embedding_signature") or "").strip()
+                if existing_sig and existing_sig != resolved_sig:
+                    raise ValueError(
+                        f"Qdrant collection {collection_name} embedding model signature mismatch: "
+                        f"existing {existing_sig!r} vs required {resolved_sig!r}"
+                    )
+                if existing_sig == resolved_sig:
+                    meta_exists_matching = True
+        elif meta_res.status_code != 404:
+            raise RuntimeError(
+                f"Failed to inspect collection metadata marker for {collection_name}: "
+                f"HTTP {meta_res.status_code} - {meta_res.text}"
+            )
+
+        if not meta_exists_matching:
+            meta_put = await qdrant_client.put(
+                f"/collections/{collection_name}/points?wait=true",
+                json={
+                    "points": [
+                        {
+                            "id": meta_id,
+                            "payload": {
+                                "_collection_meta": True,
+                                "payload_only": True,
+                                "embedding_model": resolved_model,
+                                "embedding_base_url": resolved_base_url,
+                                "embedding_dimensions": vector_dim,
+                                "embedding_signature": resolved_sig,
+                            },
+                            "vector": {
+                                "content_vector": [0.0] * vector_dim,
+                            },
+                        }
+                    ]
+                },
+            )
+            if meta_put.status_code >= 400:
+                raise RuntimeError(
+                    f"Failed to write collection metadata marker for {collection_name}: "
+                    f"HTTP {meta_put.status_code} - {meta_put.text}"
+                )
+
         if collection_verified:
             try:
                 vset = _VERIFIED_CLIENT_COLLECTIONS.get(qdrant_client)
                 if vset is None:
                     vset = set()
                     _VERIFIED_CLIENT_COLLECTIONS[qdrant_client] = vset
-                vset.add((collection_name, vector_dim))
+                vset.add((collection_name, vector_dim, resolved_sig))
             except TypeError:
                 pass
 
@@ -531,6 +679,64 @@ def _segment_section_body_blocks_dp(
     return cuts
 
 
+def resolve_search_unit_text(unit: Any, unit_blocks: Sequence[Any]) -> str:
+    """Resolve exact SearchUnit text, preferring text_snapshot or single-block [char_start:char_end] slice."""
+    snapshot = getattr(unit, "text_snapshot", None)
+    if snapshot is not None and snapshot != "":
+        return str(snapshot)
+
+    block_from_id = getattr(unit, "block_from_id", None)
+    block_to_id = getattr(unit, "block_to_id", None)
+    char_start = getattr(unit, "char_start", None)
+    char_end = getattr(unit, "char_end", None)
+    if (
+        unit_blocks
+        and block_from_id is not None
+        and block_from_id == block_to_id
+        and char_start is not None
+        and char_end is not None
+    ):
+        base_text = str(getattr(unit_blocks[0], "normalized_text", "") or "")
+        start_i = int(char_start)
+        end_i = int(char_end)
+        if 0 <= start_i <= end_i <= len(base_text):
+            return base_text[start_i:end_i]
+
+    return "\n\n".join(
+        str(getattr(b, "normalized_text", "") or "")
+        for b in unit_blocks
+        if getattr(b, "normalized_text", None)
+        and not bool(getattr(b, "is_boilerplate", False))
+    )
+
+
+def _locate_monotonic_span(norm_text: str, body_text: str, cursor: int) -> tuple[int, int]:
+    """Locate monotonic (char_start, char_end) bounds in norm_text starting at cursor."""
+    n = len(norm_text)
+    safe_cursor = max(0, min(cursor, n))
+    if not body_text:
+        return safe_cursor, safe_cursor
+
+    exact_pos = norm_text.find(body_text, safe_cursor)
+    if exact_pos != -1:
+        return exact_pos, exact_pos + len(body_text)
+
+    tokens = body_text.split()
+    if not tokens:
+        return safe_cursor, safe_cursor
+
+    start_pos = norm_text.find(tokens[0], safe_cursor)
+    if start_pos == -1:
+        return safe_cursor, safe_cursor
+
+    scan_pos = start_pos + len(tokens[0])
+    for tok in tokens[1:]:
+        found = norm_text.find(tok, scan_pos)
+        if found != -1:
+            scan_pos = found + len(tok)
+    return start_pos, max(start_pos, min(scan_pos, n))
+
+
 def build_search_units_from_blocks(
     blocks: Sequence[CanonicalBlock],
     *,
@@ -543,8 +749,10 @@ def build_search_units_from_blocks(
     from sag_api.parsing.canonical import _split_atomic_spans, estimate_unicode_tokens
 
     units: list[SearchUnit] = []
-    if not blocks:
+    filtered_blocks = [b for b in blocks if not bool(getattr(b, "is_boilerplate", False))]
+    if not filtered_blocks:
         return units
+    has_body_blocks = any(b.block_type != "heading" for b in filtered_blocks)
 
     def _emit_group(group: Sequence[CanonicalBlock], *, is_subblock_split: bool = False) -> None:
         if not group:
@@ -566,6 +774,9 @@ def build_search_units_from_blocks(
             page_from=first.page_from,
             page_to=last.page_to,
             section_path=last.section_path or first.section_path,
+            char_start=None,
+            char_end=None,
+            text_snapshot=None,
         )
         unit._text_content = combined_text
         unit._body_block_ids = [b.id for b in group if b.block_type != "heading"]
@@ -573,7 +784,9 @@ def build_search_units_from_blocks(
         units.append(unit)
 
     def _emit_oversized_block(block: CanonicalBlock) -> None:
-        lines = block.normalized_text.splitlines()
+        norm_text = block.normalized_text or ""
+        lines = norm_text.splitlines()
+        sub_entries: list[tuple[str, str]] = []
         if len(lines) > 1:
             table_header_lines: list[str] = []
             body_start = 0
@@ -587,14 +800,14 @@ def build_search_units_from_blocks(
                     body_start = 2
             header_tokens = sum(estimate_unicode_tokens(hl) for hl in table_header_lines)
             effective_budget = max(64, max_tokens_per_unit - header_tokens)
-            sub_chunks: list[str] = []
             cur_lines: list[str] = []
             cur_toks = 0
             for ln in lines[body_start:]:
                 ln_toks = max(1, estimate_unicode_tokens(ln))
                 if cur_lines and (cur_toks + ln_toks) > effective_budget:
                     prefix = table_header_lines if table_header_lines else []
-                    sub_chunks.append("\n".join([*prefix, *cur_lines]))
+                    body_text = "\n".join(cur_lines)
+                    sub_entries.append(("\n".join([*prefix, *cur_lines]), body_text))
                     cur_lines = [ln]
                     cur_toks = ln_toks
                 else:
@@ -602,38 +815,60 @@ def build_search_units_from_blocks(
                     cur_toks += ln_toks
             if cur_lines:
                 prefix = table_header_lines if table_header_lines else []
-                sub_chunks.append("\n".join([*prefix, *cur_lines]))
+                body_text = "\n".join(cur_lines)
+                sub_entries.append(("\n".join([*prefix, *cur_lines]), body_text))
+            if not sub_entries and table_header_lines:
+                header_text = "\n".join(table_header_lines)
+                sub_entries.append((header_text, header_text))
+            elif not sub_entries and norm_text.strip():
+                sub_entries.append((norm_text, norm_text))
         else:
-            atomic_spans = _split_atomic_spans(block.normalized_text, max_span_tokens=max_tokens_per_unit)
-            sub_chunks = []
+            atomic_spans = _split_atomic_spans(norm_text, max_span_tokens=max_tokens_per_unit)
             cur_spans: list[str] = []
             cur_toks = 0
             for sp in atomic_spans:
                 sp_toks = max(1, estimate_unicode_tokens(sp))
                 if sp_toks > max_tokens_per_unit:
                     if cur_spans:
-                        sub_chunks.append(" ".join(cur_spans))
+                        chunk_t = " ".join(cur_spans)
+                        sub_entries.append((chunk_t, chunk_t))
                         cur_spans = []
                         cur_toks = 0
                     words = sp.split()
                     if len(words) > max_tokens_per_unit:
                         for i in range(0, len(words), max_tokens_per_unit):
-                            sub_chunks.append(" ".join(words[i : i + max_tokens_per_unit]))
+                            chunk_t = " ".join(words[i : i + max_tokens_per_unit])
+                            sub_entries.append((chunk_t, chunk_t))
                     else:
                         for i in range(0, len(sp), max_tokens_per_unit):
-                            sub_chunks.append(sp[i : i + max_tokens_per_unit])
+                            chunk_t = sp[i : i + max_tokens_per_unit]
+                            sub_entries.append((chunk_t, chunk_t))
                 elif cur_spans and (cur_toks + sp_toks) > max_tokens_per_unit:
-                    sub_chunks.append(" ".join(cur_spans))
+                    chunk_t = " ".join(cur_spans)
+                    sub_entries.append((chunk_t, chunk_t))
                     cur_spans = [sp]
                     cur_toks = sp_toks
                 else:
                     cur_spans.append(sp)
                     cur_toks += sp_toks
             if cur_spans:
-                sub_chunks.append(" ".join(cur_spans))
+                chunk_t = " ".join(cur_spans)
+                sub_entries.append((chunk_t, chunk_t))
 
-        is_split = len(sub_chunks) > 1
-        for chunk_text in sub_chunks:
+        is_split = len(sub_entries) > 1
+        cursor = 0
+        for chunk_text, body_anchor in sub_entries:
+            pos = norm_text.find(chunk_text, cursor)
+            if pos != -1:
+                char_start = pos
+                char_end = pos + len(chunk_text)
+                text_snapshot: str | None = None
+                cursor = char_end
+            else:
+                char_start, char_end = _locate_monotonic_span(norm_text, body_anchor, cursor)
+                text_snapshot = chunk_text
+                cursor = char_end
+
             chunk_tok_count = max(1, estimate_unicode_tokens(chunk_text))
             chunk_hash = hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()
             ordinal = len(units)
@@ -648,6 +883,9 @@ def build_search_units_from_blocks(
                 page_from=block.page_from,
                 page_to=block.page_to,
                 section_path=block.section_path,
+                char_start=char_start,
+                char_end=char_end,
+                text_snapshot=text_snapshot,
             )
             unit._text_content = chunk_text
             unit._body_block_ids = [block.id] if block.block_type != "heading" else []
@@ -662,7 +900,8 @@ def build_search_units_from_blocks(
         if not lead_headings and not section_body:
             return
         if not section_body:
-            _emit_group(lead_headings)
+            if not has_body_blocks:
+                _emit_group(lead_headings)
             lead_headings = []
             return
 
@@ -681,28 +920,31 @@ def build_search_units_from_blocks(
                 seg_tok_sum = sum(body_toks[a:b])
                 if (lead_toks + seg_tok_sum) <= max_tokens_per_unit:
                     seg_blocks = [*lead_headings, *seg_blocks]
-                else:
-                    _emit_group(lead_headings)
             _emit_group(seg_blocks)
         lead_headings = []
         section_body = []
 
-    for block in blocks:
+    for block in filtered_blocks:
         block_tokens = max(1, estimate_unicode_tokens(block.normalized_text))
         if block.block_type == "heading":
             if section_body:
                 _flush_section()
             if block_tokens > max_tokens_per_unit:
-                if lead_headings:
-                    _emit_group(lead_headings)
-                    lead_headings = []
-                _emit_oversized_block(block)
+                if not has_body_blocks:
+                    if lead_headings:
+                        _emit_group(lead_headings)
+                        lead_headings = []
+                    _emit_oversized_block(block)
             else:
                 lead_headings.append(block)
             continue
 
         if block_tokens > max_tokens_per_unit:
-            _flush_section()
+            if section_body:
+                _flush_section()
+            else:
+                # Section heading is already attached via block.section_path; never emit a heading-only unit.
+                lead_headings = []
             _emit_oversized_block(block)
             continue
 
@@ -725,10 +967,20 @@ def build_qdrant_payload(
     block_from_id: str | None = None,
     block_to_id: str | None = None,
     source_anchor: str | None = None,
+    embedding_model_signature: str | None = None,
 ) -> dict[str, Any]:
     """Build Qdrant point payload including pre-provisioned tree routing fields and retrieval locators."""
-    valid_from_ts = int(version.valid_from.timestamp()) if version.valid_from else None
-    valid_to_ts = int(version.valid_to.timestamp()) if version.valid_to else None
+    valid_from_utc = _as_utc(version.valid_from)
+    valid_to_utc = _as_utc(version.valid_to)
+    effective_from_utc = _as_utc(getattr(version, "effective_from", None))
+    valid_from_iso = valid_from_utc.isoformat() if valid_from_utc else None
+    valid_to_iso = valid_to_utc.isoformat() if valid_to_utc else None
+    valid_from_ts = int(valid_from_utc.timestamp()) if valid_from_utc else None
+    valid_to_ts = int(valid_to_utc.timestamp()) if valid_to_utc else None
+    effective_from_iso = effective_from_utc.isoformat() if effective_from_utc else None
+    effective_from_ts = int(effective_from_utc.timestamp()) if effective_from_utc else None
+    authority_tier = getattr(version, "authority_tier", None)
+    scope_tags = normalize_scope_tags(getattr(version, "scope_tags_json", None))
 
     return {
         "_sag_id": unit.id,
@@ -743,18 +995,23 @@ def build_qdrant_payload(
         "block_from_id": block_from_id or getattr(unit, "block_from_id", None),
         "block_to_id": block_to_id or getattr(unit, "block_to_id", None),
         "source_anchor": source_anchor,
-        "valid_from": version.valid_from.isoformat() if version.valid_from else None,
-        "valid_to": version.valid_to.isoformat() if version.valid_to else None,
+        "valid_from": valid_from_iso,
+        "valid_to": valid_to_iso,
         "valid_from_ts": valid_from_ts,
         "valid_to_ts": valid_to_ts,
-        "valid_from_iso": version.valid_from.isoformat() if version.valid_from else None,
-        "valid_to_iso": version.valid_to.isoformat() if version.valid_to else None,
+        "valid_from_iso": valid_from_iso,
+        "valid_to_iso": valid_to_iso,
+        "authority_tier": authority_tier,
+        "effective_from": effective_from_iso,
+        "effective_from_ts": effective_from_ts,
+        "scope_tags": scope_tags,
         "token_count": unit.token_count,
         "section_path": unit.section_path,
         "page_from": unit.page_from,
         "page_to": unit.page_to,
         "content_hash": unit.content_hash,
         "content": content or getattr(unit, "_text_content", ""),
+        "embedding_model_signature": embedding_model_signature,
         # Pre-provisioned fields for Tree Routing (Phases 6/8)
         "primary_node_a": None,
         "secondary_node_ids_a": [],
@@ -815,12 +1072,19 @@ async def precompute_canonical_block_embeddings(
         token_usage_scope,
     )
 
-    non_heading = [b for b in blocks if b.block_type != "heading" and (b.normalized_text or "").strip()]
+    non_heading = [
+        b
+        for b in blocks
+        if b.block_type != "heading"
+        and not bool(getattr(b, "is_boilerplate", False))
+        and (b.normalized_text or "").strip()
+    ]
     if not non_heading or embedder is None:
         return {}, TokenLedger().to_summary()
 
     use_cache = hasattr(embedder, "batch_generate")
     emb_model = getattr(embedder, "model", None) or getattr(settings, "embedding_model", None)
+    emb_sig = build_embedding_model_signature(embedder, settings_obj=settings)
     block_ctx_by_id: dict[str, str] = {
         b.id: contextualize_block_text(b.section_path, b.normalized_text)
         for b in non_heading
@@ -832,7 +1096,7 @@ async def precompute_canonical_block_embeddings(
 
     if use_cache:
         for txt in unique_texts:
-            cached = get_cached_text_embedding(txt)
+            cached = get_cached_text_embedding(txt, model_signature=emb_sig)
             if cached is not None:
                 resolved_by_text[txt] = cached
                 cache_hits += 1
@@ -855,7 +1119,7 @@ async def precompute_canonical_block_embeddings(
             for txt, vec in zip(missing_texts, fetched_vecs, strict=True):
                 vec_f = [float(x) for x in vec]
                 if use_cache:
-                    put_cached_text_embedding(txt, vec_f)
+                    put_cached_text_embedding(txt, vec_f, model_signature=emb_sig)
                 resolved_by_text[txt] = vec_f
         pre_ledger.set_metadata(
             canonical_block_texts_count=len(unique_texts),
@@ -906,16 +1170,23 @@ async def index_search_units_to_qdrant(
     contextual_texts: list[str] = []
     for u in units:
         t = getattr(u, "_text_content", None)
-        if not t and blocks_by_id:
-            b1 = blocks_by_id.get(u.block_from_id)
-            b2 = blocks_by_id.get(u.block_to_id)
-            if b1 and b2:
-                if b1.id == b2.id:
-                    t = b1.normalized_text
-                else:
-                    lo, hi = min(b1.ordinal, b2.ordinal), max(b1.ordinal, b2.ordinal)
-                    span = [b.normalized_text for b in ordered_blocks if lo <= b.ordinal <= hi]
-                    t = "\n\n".join(span) if span else f"{b1.normalized_text}\n\n{b2.normalized_text}"
+        if not t:
+            if getattr(u, "text_snapshot", None):
+                t = resolve_search_unit_text(u, [])
+            elif blocks_by_id:
+                b1 = blocks_by_id.get(u.block_from_id)
+                b2 = blocks_by_id.get(u.block_to_id)
+                if b1 and b2:
+                    if b1.id == b2.id:
+                        unit_blocks = [b1]
+                    else:
+                        lo, hi = min(b1.ordinal, b2.ordinal), max(b1.ordinal, b2.ordinal)
+                        unit_blocks = [
+                            b
+                            for b in ordered_blocks
+                            if lo <= b.ordinal <= hi and not bool(getattr(b, "is_boilerplate", False))
+                        ] or [b1, b2]
+                    t = resolve_search_unit_text(u, unit_blocks)
         raw_t = t or u.section_path or u.content_hash
         texts.append(raw_t)
         contextual_texts.append(contextualize_block_text(u.section_path, raw_t))
@@ -929,6 +1200,7 @@ async def index_search_units_to_qdrant(
     _preload_est_tokens = 0
     use_cache = hasattr(embedder, "batch_generate")
     emb_model = getattr(embedder, "model", None) or getattr(settings, "embedding_model", None)
+    emb_sig = build_embedding_model_signature(embedder, settings_obj=settings)
 
     if block_vectors:
         resolved_vectors: dict[int, list[float]] = {}
@@ -947,7 +1219,9 @@ async def index_search_units_to_qdrant(
                     body_ids = [
                         b.id
                         for b in ordered_blocks
-                        if lo <= b.ordinal <= hi and b.block_type != "heading"
+                        if lo <= b.ordinal <= hi
+                        and b.block_type != "heading"
+                        and not bool(getattr(b, "is_boilerplate", False))
                     ]
             if (
                 not is_subblock
@@ -969,7 +1243,7 @@ async def index_search_units_to_qdrant(
                         [block_vectors[bid] for bid in body_ids],
                         weights,
                     )
-            elif use_cache and (cached_v := get_cached_text_embedding(ctx_t)) is not None:
+            elif use_cache and (cached_v := get_cached_text_embedding(ctx_t, model_signature=emb_sig)) is not None:
                 resolved_vectors[idx] = cached_v
                 cache_hits += 1
             else:
@@ -991,7 +1265,7 @@ async def index_search_units_to_qdrant(
                     for idx, txt, vec in zip(fallback_indices, fallback_texts, fetched, strict=True):
                         vec_f = [float(x) for x in vec]
                         if use_cache:
-                            put_cached_text_embedding(txt, vec_f)
+                            put_cached_text_embedding(txt, vec_f, model_signature=emb_sig)
                         resolved_vectors[idx] = vec_f
             combined_ledger.merge_summary(extra_ledger.to_summary())
 
@@ -1008,10 +1282,18 @@ async def index_search_units_to_qdrant(
                 extra_block_texts: list[str] = []
                 seen_texts = set(contextual_texts)
                 for blk in blocks_by_id.values():
-                    if blk.block_type == "heading" or not (blk.normalized_text or "").strip():
+                    if (
+                        blk.block_type == "heading"
+                        or bool(getattr(blk, "is_boilerplate", False))
+                        or not (blk.normalized_text or "").strip()
+                    ):
                         continue
                     bt = contextualize_block_text(blk.section_path, blk.normalized_text)
-                    if bt and bt not in seen_texts and get_cached_text_embedding(bt) is None:
+                    if (
+                        bt
+                        and bt not in seen_texts
+                        and get_cached_text_embedding(bt, model_signature=emb_sig) is None
+                    ):
                         seen_texts.add(bt)
                         extra_block_texts.append(bt)
                 _preload_block_count = len(extra_block_texts)
@@ -1019,13 +1301,13 @@ async def index_search_units_to_qdrant(
                 combined_batch = list(contextual_texts) + extra_block_texts
                 all_vectors = await compute_unit_embeddings(embedder, combined_batch)
                 for txt, vec in zip(combined_batch, all_vectors, strict=True):
-                    put_cached_text_embedding(txt, vec)
+                    put_cached_text_embedding(txt, vec, model_signature=emb_sig)
                 vectors = all_vectors[: len(contextual_texts)]
             else:
                 vectors = await compute_unit_embeddings(embedder, contextual_texts)
                 if use_cache:
                     for txt, vec in zip(contextual_texts, vectors, strict=True):
-                        put_cached_text_embedding(txt, vec)
+                        put_cached_text_embedding(txt, vec, model_signature=emb_sig)
         combined_ledger.merge_summary(direct_ledger.to_summary())
 
     combined_ledger.set_metadata(
@@ -1035,13 +1317,34 @@ async def index_search_units_to_qdrant(
         knowledge_block_preload_estimated_tokens=_preload_est_tokens,
     )
     try:
-        setattr(version, "_last_search_index_token_usage", combined_ledger.to_summary())
-    except Exception:
+        version._last_search_index_token_usage = combined_ledger.to_summary()
+    except AttributeError:
         pass
-    vector_dim = len(vectors[0]) if vectors and len(vectors[0]) > 0 else 1536
+    if not vectors or not vectors[0] or len(vectors[0]) <= 0:
+        raise ValueError(
+            "Cannot index SearchUnits to Qdrant: embedding vectors are empty or zero-dimensional"
+        )
+    vector_dim = len(vectors[0])
+    if any(len(vec) != vector_dim for vec in vectors):
+        raise ValueError(
+            f"Cannot index SearchUnits to Qdrant: inconsistent vector dimensions (expected {vector_dim})"
+        )
 
-    # 1. Ensure collection exists and payload indexes are created
-    await ensure_qdrant_collection_and_indexes(qdrant_client, collection_name, vector_dim=vector_dim)
+    # 1. Ensure collection exists, model metadata matches, and payload indexes are created
+    emb_base_url = _attr_from_embedder_or_delegates(embedder, "base_url", "_base_url")
+    emb_sig_for_collection = build_embedding_model_signature(
+        embedder,
+        settings_obj=settings,
+        dimensions=vector_dim,
+    )
+    await ensure_qdrant_collection_and_indexes(
+        qdrant_client,
+        collection_name,
+        vector_dim=vector_dim,
+        embedding_signature=emb_sig_for_collection,
+        embedding_model=emb_model,
+        embedding_base_url=emb_base_url,
+    )
 
     # 2. Build points with both dense and sparse representations (Qdrant native IDF modifier handles IDF)
     points = []
@@ -1064,6 +1367,7 @@ async def index_search_units_to_qdrant(
             block_from_id=unit.block_from_id,
             block_to_id=unit.block_to_id,
             source_anchor=s_anchor,
+            embedding_model_signature=emb_sig_for_collection,
         )
         sparse_vec = compute_sparse_bm25_vector(
             ctx_text,
@@ -1120,58 +1424,446 @@ async def delete_document_points_from_qdrant(
     return len(document_version_ids)
 
 
+class TemporalPayloadSyncError(RuntimeError):
+    """Structured error raised when one or more Qdrant set_payload temporal sync calls fail."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failed_version_ids: Sequence[str],
+        synced_version_ids: Sequence[str] = (),
+        errors_by_version: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.failed_version_ids: list[str] = [str(v) for v in failed_version_ids]
+        self.synced_version_ids: list[str] = [str(v) for v in synced_version_ids]
+        self.errors_by_version: dict[str, str] = dict(errors_by_version or {})
+
+
+def build_mutated_version_entries(
+    versions: Sequence[DocumentVersion],
+) -> list[dict[str, Any]]:
+    """Build canonical mutated-version payload sync entries from ORM DocumentVersion rows."""
+    entries: list[dict[str, Any]] = []
+    for v in versions:
+        cur_from = _as_utc(v.valid_from)
+        cur_to = _as_utc(v.valid_to)
+        eff_from = _as_utc(getattr(v, "effective_from", None))
+        entries.append(
+            {
+                "version_id": str(v.id),
+                "valid_from": cur_from,
+                "valid_to": cur_to,
+                "is_superseded": bool(cur_to is not None and cur_to < _MAX_VALID_TO),
+                "authority_tier": getattr(v, "authority_tier", None),
+                "effective_from": eff_from,
+                "scope_tags": normalize_scope_tags(getattr(v, "scope_tags_json", None)),
+            }
+        )
+    return entries
+
+
+def _build_temporal_payload_patch(entry: dict[str, Any]) -> dict[str, Any]:
+    """Build the 10-key Qdrant set_payload patch for temporal validity & authority metadata."""
+    valid_from_utc = _as_utc(entry.get("valid_from"))
+    valid_to_utc = _as_utc(entry.get("valid_to"))
+    effective_from_utc = _as_utc(entry.get("effective_from"))
+
+    valid_from_iso = valid_from_utc.isoformat() if valid_from_utc else None
+    valid_to_iso = valid_to_utc.isoformat() if valid_to_utc else None
+    valid_from_ts = int(valid_from_utc.timestamp()) if valid_from_utc else None
+    valid_to_ts = int(valid_to_utc.timestamp()) if valid_to_utc else None
+    effective_from_iso = effective_from_utc.isoformat() if effective_from_utc else None
+    effective_from_ts = int(effective_from_utc.timestamp()) if effective_from_utc else None
+
+    return {
+        "valid_from": valid_from_iso,
+        "valid_to": valid_to_iso,
+        "valid_from_ts": valid_from_ts,
+        "valid_to_ts": valid_to_ts,
+        "valid_from_iso": valid_from_iso,
+        "valid_to_iso": valid_to_iso,
+        "authority_tier": entry.get("authority_tier"),
+        "effective_from": effective_from_iso,
+        "effective_from_ts": effective_from_ts,
+        "scope_tags": normalize_scope_tags(entry.get("scope_tags")),
+    }
+
+
+async def sync_version_temporal_payloads_to_qdrant(
+    qdrant_client: httpx.AsyncClient,
+    *,
+    project_id: str,
+    mutated_versions: Sequence[dict[str, Any]],
+    request_timeout: float | None = None,
+    allow_missing_collection: bool = False,
+) -> list[str]:
+    """Sync temporal & authority payload fields in Qdrant via POST /points/payload?wait=true."""
+    deduped: dict[str, dict[str, Any]] = {}
+    for entry in mutated_versions:
+        vid = str(entry.get("version_id") or "").strip()
+        if not vid:
+            continue
+        deduped[vid] = entry
+
+    if not deduped:
+        return []
+
+    encoded_col = quote(f"search_units_{project_id}", safe="")
+    payload_url = f"/collections/{encoded_col}/points/payload?wait=true"
+    index_url = f"/collections/{encoded_col}/index?wait=true"
+
+    req_kwargs: dict[str, Any] = {}
+    if isinstance(request_timeout, httpx.Timeout):
+        req_kwargs["timeout"] = request_timeout
+    elif request_timeout is not None:
+        timeout_sec = max(1.0, float(request_timeout))
+        req_kwargs["timeout"] = httpx.Timeout(timeout_sec, connect=min(10.0, timeout_sec))
+
+    synced_ids: list[str] = []
+    failed_ids: list[str] = []
+    errors_by_version: dict[str, str] = {}
+
+    for vid, entry in deduped.items():
+        patch = _build_temporal_payload_patch(entry)
+        body = {
+            "payload": patch,
+            "filter": {
+                "must": [
+                    {"key": "project_id", "match": {"value": str(project_id)}},
+                    {"key": "document_version_id", "match": {"value": vid}},
+                ]
+            },
+        }
+        try:
+            res = await qdrant_client.post(payload_url, json=body, **req_kwargs)
+            if res.status_code == 400 and "index required but not found" in res.text.lower():
+                lower_text = res.text.lower()
+                missing_fields = [
+                    field_name
+                    for field_name in ("project_id", "document_version_id")
+                    if field_name in lower_text
+                ]
+                if not missing_fields:
+                    missing_fields = ["project_id", "document_version_id"]
+                for field_name in missing_fields:
+                    idx_res = await qdrant_client.put(
+                        index_url,
+                        json={"field_name": field_name, "field_schema": "keyword"},
+                        **req_kwargs,
+                    )
+                    if (
+                        idx_res.status_code >= 400
+                        and idx_res.status_code != 409
+                        and "already exists" not in idx_res.text.lower()
+                    ):
+                        idx_res.raise_for_status()
+                res = await qdrant_client.post(payload_url, json=body, **req_kwargs)
+
+            if res.status_code == 404 and allow_missing_collection:
+                synced_ids.append(vid)
+                continue
+            if res.status_code >= 400:
+                failed_ids.append(vid)
+                errors_by_version[vid] = sanitize_error_message(
+                    f"HTTP {res.status_code} - {res.text}"
+                )
+                continue
+            synced_ids.append(vid)
+        except Exception as exc:
+            failed_ids.append(vid)
+            errors_by_version[vid] = sanitize_error_message(exc)
+
+    if failed_ids:
+        raise TemporalPayloadSyncError(
+            f"Failed to sync temporal payloads in Qdrant for versions {failed_ids}",
+            failed_version_ids=failed_ids,
+            synced_version_ids=synced_ids,
+            errors_by_version=errors_by_version,
+        )
+    return synced_ids
+
+
+async def reconcile_version_temporal_payloads(
+    session: AsyncSession,
+    qdrant_client: httpx.AsyncClient,
+    *,
+    project_id: str,
+    version_ids: Sequence[str] | None = None,
+    request_timeout: float = 30.0,
+) -> dict[str, int]:
+    """Repair Qdrant temporal & authority payloads from PostgreSQL truth and clear degraded flags."""
+    from sag_api.db.models.document import Document
+
+    if version_ids is None:
+        proj_versions = (
+            await session.execute(
+                select(DocumentVersion)
+                .join(Document, Document.id == DocumentVersion.document_id)
+                .where(Document.project_id == project_id)
+            )
+        ).scalars().all()
+        discovered_ids: list[str] = []
+        for ver in proj_versions:
+            meta = ver.metadata_json or {}
+            if meta.get("qdrant_temporal_sync_degraded") is not True:
+                continue
+            raw_failed = meta.get("qdrant_temporal_sync_failed_version_ids")
+            failed_list = (
+                [str(x).strip() for x in raw_failed if str(x).strip()]
+                if isinstance(raw_failed, list)
+                else []
+            )
+            if failed_list:
+                discovered_ids.extend(failed_list)
+            else:
+                discovered_ids.append(str(ver.id))
+        unique_ids = list(dict.fromkeys(discovered_ids))
+    else:
+        unique_ids = list(dict.fromkeys(str(v).strip() for v in version_ids if str(v).strip()))
+
+    if not unique_ids:
+        return {"synced_versions": 0, "requested_versions": 0}
+
+    versions = (
+        await session.execute(
+            select(DocumentVersion)
+            .join(Document, Document.id == DocumentVersion.document_id)
+            .where(
+                Document.project_id == project_id,
+                Document.is_active.is_(True),
+                DocumentVersion.id.in_(unique_ids),
+                DocumentVersion.status.notin_(("FAILED", "REVOKED")),
+                DocumentVersion.search_status.in_(("SEARCH_READY", "READY")),
+            )
+        )
+    ).scalars().all()
+
+    synced_ids: list[str] = []
+    if versions:
+        entries = build_mutated_version_entries(versions)
+        synced_ids = await sync_version_temporal_payloads_to_qdrant(
+            qdrant_client,
+            project_id=project_id,
+            mutated_versions=entries,
+            request_timeout=request_timeout,
+            allow_missing_collection=True,
+        )
+
+    synced_set = set(synced_ids)
+    proj_rows = (
+        await session.execute(
+            select(DocumentVersion, Document.is_active)
+            .join(Document, Document.id == DocumentVersion.document_id)
+            .where(Document.project_id == project_id)
+        )
+    ).all()
+    active_ready_ids = {
+        str(ver.id)
+        for ver, doc_is_active in proj_rows
+        if bool(doc_is_active)
+        and ver.status not in ("FAILED", "REVOKED")
+        and ver.search_status in ("SEARCH_READY", "READY")
+    }
+
+    mutated_any = False
+    for ver, _doc_is_active in proj_rows:
+        meta = dict(ver.metadata_json or {})
+        has_degraded_marker = (
+            meta.get("qdrant_temporal_sync_degraded") is True
+            or "qdrant_temporal_sync_failed_version_ids" in meta
+            or "qdrant_temporal_sync_degraded_reason" in meta
+            or "qdrant_temporal_sync_error" in meta
+        )
+        if not has_degraded_marker:
+            continue
+        raw_failed = meta.get("qdrant_temporal_sync_failed_version_ids")
+        failed_list = (
+            [str(x).strip() for x in raw_failed if str(x).strip()]
+            if isinstance(raw_failed, list)
+            else []
+        )
+        ver_id = str(ver.id)
+        if failed_list:
+            resolved_ids = {
+                fid for fid in failed_list if fid in synced_set or fid not in active_ready_ids
+            }
+            if not resolved_ids and ver_id not in synced_set:
+                continue
+            remaining_failed = [fid for fid in failed_list if fid not in resolved_ids]
+        else:
+            if ver_id not in synced_set and ver_id in active_ready_ids:
+                continue
+            remaining_failed = []
+        if not remaining_failed:
+            meta["qdrant_temporal_sync_degraded"] = False
+            meta.pop("qdrant_temporal_sync_degraded_reason", None)
+            meta.pop("qdrant_temporal_sync_error", None)
+            meta.pop("qdrant_temporal_sync_failed_version_ids", None)
+        else:
+            meta["qdrant_temporal_sync_degraded"] = True
+            meta["qdrant_temporal_sync_failed_version_ids"] = remaining_failed
+            meta["qdrant_temporal_sync_degraded_reason"] = (
+                f"temporal_payload_sync_failed:{','.join(remaining_failed)}"
+            )
+        ver.metadata_json = meta
+        session.add(ver)
+        mutated_any = True
+    if mutated_any:
+        await session.flush()
+
+    return {"synced_versions": len(synced_ids), "requested_versions": len(unique_ids)}
+
+
 async def reconcile_orphan_search_units(
     session: AsyncSession,
     qdrant_client: httpx.AsyncClient,
     *,
     project_id: str,
+    preserve_superseded: bool = True,
+    prune_version_ids: Sequence[str] | None = None,
+    inflight_grace_minutes: int = 15,
+    request_timeout: float = 30.0,
 ) -> dict[str, int]:
-    """Identify and delete orphan Qdrant points that no longer exist in PostgreSQL."""
+    """Identify and delete orphan Qdrant points while protecting in-flight indexing and active history."""
+    from sag_api.db.models.document import Document
+
     collection_name = f"search_units_{project_id}"
+    timeout_sec = max(30.0, float(request_timeout))
+    reconcile_timeout = httpx.Timeout(timeout_sec, connect=min(10.0, timeout_sec))
+
     all_points: list[dict[str, Any]] = []
     next_offset = None
     while True:
         payload: dict[str, Any] = {
             "limit": 500,
-            "with_payload": ["search_unit_id", "document_version_id"],
+            "with_payload": ["search_unit_id", "document_version_id", "_collection_meta"],
             "with_vector": False,
         }
         if next_offset is not None:
             payload["offset"] = next_offset
-        res = await qdrant_client.post(f"/collections/{collection_name}/points/scroll", json=payload)
+        res = await qdrant_client.post(
+            f"/collections/{collection_name}/points/scroll",
+            json=payload,
+            timeout=reconcile_timeout,
+        )
         if not res.is_success:
-            break
+            if res.status_code == 404 and next_offset is None and not all_points:
+                return {"scanned": 0, "orphans_deleted": 0}
+            raise RuntimeError(
+                f"Failed to scroll Qdrant collection {collection_name}: HTTP {res.status_code} - {res.text}"
+            )
         data = res.json().get("result", {})
         points = data.get("points", [])
         all_points.extend(points)
+        prev_offset = next_offset
         next_offset = data.get("next_page_offset")
-        if next_offset is None or not points:
+        if next_offset is None or not points or next_offset == prev_offset:
             break
 
     if not all_points:
         return {"scanned": 0, "orphans_deleted": 0}
 
-    point_unit_map = {p["id"]: p.get("payload", {}).get("search_unit_id") for p in all_points if p.get("id")}
-    valid_unit_ids = set()
-    unit_ids = [uid for uid in point_unit_map.values() if uid]
+    point_entries: list[tuple[Any, Any, Any]] = []
+    for p in all_points:
+        pid = p.get("id")
+        if not pid:
+            continue
+        pt_payload = p.get("payload") or {}
+        if pt_payload.get("_collection_meta") is True:
+            continue
+        point_entries.append(
+            (pid, pt_payload.get("search_unit_id"), pt_payload.get("document_version_id"))
+        )
+
+    now = datetime.now(UTC)
+    grace_cutoff = now - timedelta(minutes=max(0, int(inflight_grace_minutes)))
+
+    targeted_prune_ids = {
+        str(vid).strip() for vid in (prune_version_ids or ()) if str(vid).strip()
+    }
+    valid_unit_ids: set[str] = set()
+    unit_ids = sorted({str(uid) for _pid, uid, _vid in point_entries if uid})
     if unit_ids:
+        if preserve_superseded:
+            if targeted_prune_ids:
+                ready_condition = DocumentVersion.search_status.in_(("SEARCH_READY", "READY")) & (
+                    DocumentVersion.id.notin_(targeted_prune_ids) | (DocumentVersion.valid_to > now)
+                )
+            else:
+                ready_condition = DocumentVersion.search_status.in_(("SEARCH_READY", "READY"))
+        else:
+            ready_condition = DocumentVersion.search_status.in_(("SEARCH_READY", "READY")) & (
+                DocumentVersion.valid_to > now
+            )
+        inflight_or_grace = or_(
+            DocumentVersion.search_status.in_(("INDEXING", "PENDING")),
+            ready_condition,
+            (
+                DocumentVersion.search_status.notin_(("INDEX_FAILED", "SEARCH_READY", "READY"))
+                & (DocumentVersion.created_at >= grace_cutoff)
+            ),
+        )
         for i in range(0, len(unit_ids), 500):
             batch = unit_ids[i : i + 500]
             rows = (
-                await session.execute(select(SearchUnit.id).where(SearchUnit.id.in_(batch)))
+                await session.execute(
+                    select(SearchUnit.id)
+                    .join(DocumentVersion, DocumentVersion.id == SearchUnit.document_version_id)
+                    .join(Document, Document.id == DocumentVersion.document_id)
+                    .where(
+                        SearchUnit.id.in_(batch),
+                        Document.is_active.is_(True),
+                        DocumentVersion.status.notin_(("FAILED", "REVOKED")),
+                        inflight_or_grace,
+                    )
+                )
             ).scalars().all()
-            valid_unit_ids.update(rows)
+            valid_unit_ids.update(str(row) for row in rows)
+
+    # Also protect uncommitted SearchUnit points whose DocumentVersion is actively INDEXING/PENDING
+    inflight_version_ids: set[str] = set()
+    candidate_vids = sorted(
+        {
+            str(vid)
+            for _pid, uid, vid in point_entries
+            if vid and (not uid or str(uid) not in valid_unit_ids)
+        }
+    )
+    if candidate_vids:
+        for i in range(0, len(candidate_vids), 500):
+            v_batch = candidate_vids[i : i + 500]
+            v_rows = (
+                await session.execute(
+                    select(DocumentVersion.id)
+                    .join(Document, Document.id == DocumentVersion.document_id)
+                    .where(
+                        DocumentVersion.id.in_(v_batch),
+                        Document.is_active.is_(True),
+                        DocumentVersion.status.notin_(("FAILED", "REVOKED")),
+                        DocumentVersion.search_status.in_(("INDEXING", "PENDING")),
+                    )
+                )
+            ).scalars().all()
+            inflight_version_ids.update(str(row) for row in v_rows)
 
     orphan_point_ids = [
-        pid for pid, uid in point_unit_map.items() if not uid or uid not in valid_unit_ids
+        pid
+        for pid, uid, vid in point_entries
+        if not uid
+        or (str(uid) not in valid_unit_ids and (not vid or str(vid) not in inflight_version_ids))
     ]
     if orphan_point_ids:
-        del_res = await qdrant_client.post(
-            f"/collections/{collection_name}/points/delete?wait=true",
-            json={"points": orphan_point_ids},
-        )
-        if del_res.status_code >= 400 and del_res.status_code != 404:
-            raise RuntimeError(f"Failed to delete orphan points: {del_res.text}")
+        for i in range(0, len(orphan_point_ids), 500):
+            batch_ids = orphan_point_ids[i : i + 500]
+            del_res = await qdrant_client.post(
+                f"/collections/{collection_name}/points/delete?wait=true",
+                json={"points": batch_ids},
+                timeout=reconcile_timeout,
+            )
+            if del_res.status_code >= 400 and del_res.status_code != 404:
+                raise RuntimeError(f"Failed to delete orphan points: {del_res.text}")
 
     return {"scanned": len(all_points), "orphans_deleted": len(orphan_point_ids)}
 
@@ -1190,18 +1882,22 @@ async def run_search_indexing_stage(
     """Execute Phase 2C chunking, PostgreSQL persistence, and Qdrant indexing with audit."""
     start_time = datetime.now(UTC)
     collection_name = f"search_units_{project_id}"
+    try:
+        document_version._last_reconcile_job_id = None
+    except AttributeError:
+        pass
 
     # Resolve authoritative tenant_id and doc from Document or IngestionRun
     from sag_api.db.models.document import Document
     from sag_api.db.models.routing_rag import IngestionRun
+
     doc = await session.get(Document, document_version.document_id)
+    ing_run = await session.get(IngestionRun, run_id) if run_id else None
     if not tenant_id:
         if doc and doc.tenant_id:
             tenant_id = doc.tenant_id
-        elif run_id:
-            ing_run = await session.get(IngestionRun, run_id)
-            if ing_run and ing_run.tenant_id:
-                tenant_id = ing_run.tenant_id
+        elif ing_run and ing_run.tenant_id:
+            tenant_id = ing_run.tenant_id
     if not tenant_id:
         tenant_id = "tenant_default"
 
@@ -1232,8 +1928,8 @@ async def run_search_indexing_stage(
             )
             if pre_embed_summary is not None:
                 try:
-                    setattr(document_version, "_last_search_index_token_usage", pre_embed_summary)
-                except Exception:
+                    document_version._last_search_index_token_usage = pre_embed_summary
+                except AttributeError:
                     pass
         except Exception as exc:
             indexing_error = str(exc)
@@ -1434,6 +2130,8 @@ async def run_search_indexing_stage(
         # Strict fail-closed manifest verification: checksum must match
         manifest_verified = (qdrant_checksum == manifest_checksum)
 
+    sync_degraded = False
+    sync_degraded_reason: str | None = None
     if manifest_verified and units:
         from sag_api.services.dedup_and_temporal_service import resolve_temporal_supersedes
 
@@ -1446,25 +2144,88 @@ async def run_search_indexing_stage(
             current_version=document_version,
             document_id=document_version.document_id,
         )
-        superseded_version_id = temporal_info.get("supersedes_id") if isinstance(temporal_info, dict) else None
-        if (
-            qdrant_client is not None
-            and isinstance(temporal_info, dict)
-            and temporal_info.get("action") == "SUPERSEDED"
-            and superseded_version_id
-        ):
+        versions_to_sync: list[dict[str, Any]] = []
+        if isinstance(temporal_info, dict) and temporal_info.get("mutated_versions"):
+            versions_to_sync = list(temporal_info["mutated_versions"])
+        else:
+            versions_to_sync = build_mutated_version_entries([document_version])
+            superseded_version_id = (
+                temporal_info.get("supersedes_id") if isinstance(temporal_info, dict) else None
+            )
+            if (
+                isinstance(temporal_info, dict)
+                and temporal_info.get("action") == "SUPERSEDED"
+                and superseded_version_id
+            ):
+                superseded_ver = await session.get(DocumentVersion, str(superseded_version_id))
+                if superseded_ver is not None:
+                    versions_to_sync.extend(build_mutated_version_entries([superseded_ver]))
+                else:
+                    versions_to_sync.append(
+                        {
+                            "version_id": str(superseded_version_id),
+                            "valid_from": None,
+                            "valid_to": _as_utc(document_version.valid_from),
+                            "is_superseded": True,
+                            "authority_tier": None,
+                            "effective_from": None,
+                            "scope_tags": [],
+                        }
+                    )
+
+        if qdrant_client is not None and versions_to_sync:
             try:
-                await delete_document_points_from_qdrant(
+                await sync_version_temporal_payloads_to_qdrant(
                     qdrant_client,
                     project_id=project_id,
-                    document_version_ids=[str(superseded_version_id)],
+                    mutated_versions=versions_to_sync,
                 )
             except Exception as exc:
-                log.warning(
-                    "Failed to prune superseded version %s from Qdrant: %s",
-                    superseded_version_id,
-                    exc,
+                failed_ids = (
+                    list(exc.failed_version_ids)
+                    if isinstance(exc, TemporalPayloadSyncError)
+                    else [
+                        str(entry["version_id"])
+                        for entry in versions_to_sync
+                        if entry.get("version_id")
+                    ]
                 )
+                sync_degraded = True
+                sync_degraded_reason = f"temporal_payload_sync_failed:{','.join(failed_ids)}"
+                err_safe = sanitize_error_message(exc)
+                log.warning(
+                    "Failed to sync temporal payloads in Qdrant for versions %s "
+                    "(marking degraded & scheduling reconcile): %s",
+                    failed_ids,
+                    err_safe,
+                )
+                document_version.metadata_json = {
+                    **(document_version.metadata_json or {}),
+                    "qdrant_temporal_sync_degraded": True,
+                    "qdrant_temporal_sync_degraded_reason": sync_degraded_reason,
+                    "qdrant_temporal_sync_error": err_safe,
+                    "qdrant_temporal_sync_failed_version_ids": failed_ids,
+                }
+                from sag_api.db.models import Job
+                from sag_api.enums import JobStatus, JobType
+
+                reconcile_job = Job(
+                    id=str(uuid.uuid4()),
+                    type=JobType.RECONCILE_SEARCH_INDEX,
+                    status=JobStatus.QUEUED,
+                    source_id=doc.source_id if doc else None,
+                    document_id=document_version.document_id,
+                    payload={
+                        "project_id": project_id,
+                        "reason": "temporal_payload_sync_failed",
+                        "sync_version_ids": failed_ids,
+                    },
+                )
+                session.add(reconcile_job)
+                try:
+                    document_version._last_reconcile_job_id = reconcile_job.id
+                except AttributeError:
+                    pass
         document_version.search_status = "SEARCH_READY"
         document_version.search_ready_at = datetime.now(UTC)
     else:
@@ -1498,6 +2259,33 @@ async def run_search_indexing_stage(
                 else "Qdrant client missing or manifest count/checksum mismatch"
             )
 
+        stage_created_at = datetime.now(UTC)
+        if ing_run is not None and ing_run.started_at is not None:
+            run_started = _as_utc(ing_run.started_at)
+            if run_started is not None and stage_created_at < run_started:
+                stage_created_at = run_started
+
+        stage_metrics: dict[str, Any] = {
+            "search_unit_count": len(units),
+            "pg_count": pg_count,
+            "qdrant_count": qdrant_count,
+            "qdrant_indexed_count": indexed_count,
+            "manifest_checksum": manifest_checksum,
+            "qdrant_checksum": qdrant_checksum,
+            "manifest_verified": manifest_verified,
+            "degraded": sync_degraded,
+            "degraded_reason": sync_degraded_reason,
+            "collection_name": collection_name,
+            "token_usage": _idx_token_usage,
+            "error": (
+                sanitize_error_message(indexing_error)
+                if indexing_error
+                else (err_text if not is_success else None)
+            ),
+        }
+        if ing_run is not None and getattr(ing_run, "attempt_count", None) is not None:
+            stage_metrics["attempt_count"] = ing_run.attempt_count
+
         stage_run = StageRun(
             id=str(uuid.uuid4()),
             run_id=run_id,
@@ -1505,22 +2293,8 @@ async def run_search_indexing_stage(
             status="SUCCESS" if is_success else "FAILED",
             error_message=err_text,
             duration_ms=duration_ms,
-            metrics_json={
-                "search_unit_count": len(units),
-                "pg_count": pg_count,
-                "qdrant_count": qdrant_count,
-                "qdrant_indexed_count": indexed_count,
-                "manifest_checksum": manifest_checksum,
-                "qdrant_checksum": qdrant_checksum,
-                "manifest_verified": manifest_verified,
-                "collection_name": collection_name,
-                "token_usage": _idx_token_usage,
-                "error": (
-                    sanitize_error_message(indexing_error)
-                    if indexing_error
-                    else (err_text if not is_success else None)
-                ),
-            },
+            metrics_json=stage_metrics,
+            created_at=stage_created_at,
         )
         session.add(stage_run)
 

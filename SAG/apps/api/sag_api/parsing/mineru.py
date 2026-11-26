@@ -30,6 +30,8 @@ from sag_api.core.errors import (
     ServiceUnavailableError,
     UpstreamError,
 )
+from sag_api.core.sanitizer import decode_bytes_safely
+from sag_api.core.text_utils import normalize_text
 
 if TYPE_CHECKING:
     from sag_api.parsing.mineru_official import OfficialMinerUClient
@@ -104,7 +106,15 @@ async def download_mineru_result_markdown(
             except OSError:
                 pass
 
-    text = raw_bytes.decode(encoding, errors="replace")
+    try:
+        text, _, _ = decode_bytes_safely(
+            raw_bytes,
+            encoding=encoding,
+            context="mineru_download",
+            raise_on_severe=True,
+        )
+    except ValueError as exc:
+        raise UpstreamError("MinerU 解析结果包含过多乱码字符（U+FFFD）") from exc
     return _require_markdown(text)
 
 
@@ -316,9 +326,13 @@ def _markdown_from_zip_archive(archive: zipfile.ZipFile, size_limit: int) -> str
     content_list: list[Any] | None = None
     if content_list_candidates:
         try:
-            parsed_json = json.loads(
-                archive.read(content_list_candidates[0]).decode("utf-8", errors="replace")
+            cl_text, _, _ = decode_bytes_safely(
+                archive.read(content_list_candidates[0]),
+                encoding="utf-8",
+                context="mineru_content_list",
+                raise_on_severe=False,
             )
+            parsed_json = json.loads(cl_text)
             if isinstance(parsed_json, list):
                 content_list = parsed_json
         except (ValueError, OSError):
@@ -334,7 +348,15 @@ def _markdown_from_zip_archive(archive: zipfile.ZipFile, size_limit: int) -> str
         chosen = md_candidates[0]
         if chosen.file_size > size_limit:
             raise UpstreamError("MinerU Markdown 结果超过允许大小")
-        raw_md = archive.read(chosen).decode("utf-8", errors="replace")
+        try:
+            raw_md, _, _ = decode_bytes_safely(
+                archive.read(chosen),
+                encoding="utf-8",
+                context="mineru_zip_markdown",
+                raise_on_severe=True,
+            )
+        except ValueError as exc:
+            raise UpstreamError("MinerU 压缩包 Markdown 包含过多乱码字符（U+FFFD）") from exc
         if content_list:
             raw_md = _inject_page_markers_from_content_list(raw_md, content_list)
         return _require_markdown(raw_md)
@@ -348,13 +370,15 @@ def _markdown_from_zip_archive(archive: zipfile.ZipFile, size_limit: int) -> str
 
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
-_MD_DECORATION_RE = re.compile(r"^[#>*\-\d.\s|`]+")
+_MD_DECORATION_RE = re.compile(r"^(?:[#>*\-|`\s]+|\d+[.)]\s+)+")
+_FENCE_LINE_RE = re.compile(r"^(`{3,}|~{3,})(.*)$")
 
 
 def _normalize_anchor_line(text: str) -> str:
     cleaned = _HTML_TAG_RE.sub(" ", text)
     cleaned = html.unescape(cleaned)
-    cleaned = _MD_DECORATION_RE.sub("", cleaned.strip())
+    cleaned = normalize_text(cleaned, preserve_code=True, strip=True)
+    cleaned = _MD_DECORATION_RE.sub("", cleaned).strip()
     return " ".join(cleaned.split()).casefold()
 
 
@@ -414,27 +438,39 @@ def _inject_page_markers_from_content_list(
     md_lines = raw_md.splitlines()
     norm_md_lines: list[str] = []
     safe_break_line: list[bool] = []
-    in_fence = False
+    fence_char: str | None = None
+    fence_len = 0
     prev_is_table = False
 
     for line in md_lines:
         stripped = line.strip()
-        if stripped.startswith("```"):
-            safe_break_line.append(not in_fence)
-            in_fence = not in_fence
+        if fence_char is not None:
+            is_close = len(stripped) >= fence_len and set(stripped) == {fence_char}
+            safe_break_line.append(False)
+            if is_close:
+                fence_char = None
+                fence_len = 0
             prev_is_table = False
             norm_md_lines.append("")
             continue
-        is_table_row = stripped.startswith("|") and stripped.endswith("|")
+        fence_match = _FENCE_LINE_RE.match(stripped)
+        if fence_match and not (fence_match.group(1)[0] == "`" and "`" in fence_match.group(2)):
+            safe_break_line.append(True)
+            fence_char = fence_match.group(1)[0]
+            fence_len = len(fence_match.group(1))
+            prev_is_table = False
+            norm_md_lines.append("")
+            continue
+        is_table_row = stripped.startswith("|") and (stripped.endswith("|") or "---" in stripped)
         # Allow inserting a page marker right before the FIRST row of a table, never mid-table
-        is_safe = (not in_fence) and (not (is_table_row and prev_is_table))
+        is_safe = not (is_table_row and prev_is_table)
         safe_break_line.append(is_safe)
         prev_is_table = is_table_row
         norm_md_lines.append(_normalize_anchor_line(line) if stripped else "")
 
-    insert_before: dict[int, list[int]] = {0: [first_page]}
-    cursor = 0
     total_lines = len(md_lines)
+    matched_positions: dict[int, int] = {first_page: 0}
+    cursor = 0
 
     for page_no in ordered_pages[1:]:
         anchors = page_anchors.get(page_no) or []
@@ -454,8 +490,48 @@ def _inject_page_markers_from_content_list(
             if matched_idx is not None:
                 break
         if matched_idx is not None:
-            insert_before.setdefault(matched_idx, []).append(page_no)
+            matched_positions[page_no] = matched_idx
             cursor = matched_idx + 1
+
+    assigned_positions: dict[int, int] = dict(matched_positions)
+    num_pages = len(ordered_pages)
+    for pos, page_no in enumerate(ordered_pages):
+        if page_no in assigned_positions:
+            continue
+        prev_pos = pos - 1
+        prev_line = assigned_positions[ordered_pages[prev_pos]]
+        next_pos = num_pages
+        next_line = total_lines
+        has_next_match = False
+        for look in range(pos + 1, num_pages):
+            if ordered_pages[look] in matched_positions:
+                next_pos = look
+                next_line = matched_positions[ordered_pages[look]]
+                has_next_match = True
+                break
+
+        target_idx = prev_line + round(
+            (next_line - prev_line) * (pos - prev_pos) / max(1, next_pos - prev_pos)
+        )
+        max_bound = (
+            max(prev_line, next_line - 1)
+            if has_next_match
+            else max(0, total_lines - 1)
+        )
+        low = min(prev_line + 1, max_bound) if prev_line < max_bound else prev_line
+        high = max(low, max_bound)
+        candidates = [i for i in range(low, high + 1) if safe_break_line[i]]
+        if not candidates:
+            candidates = [i for i in range(prev_line, high + 1) if safe_break_line[i]]
+        if candidates:
+            chosen_idx = min(candidates, key=lambda i: (abs(i - target_idx), i))
+        else:
+            chosen_idx = min(max(low, target_idx), high)
+        assigned_positions[page_no] = chosen_idx
+
+    insert_before: dict[int, list[int]] = {}
+    for page_no in ordered_pages:
+        insert_before.setdefault(assigned_positions[page_no], []).append(page_no)
 
     output_lines: list[str] = []
     for idx, line in enumerate(md_lines):
@@ -464,6 +540,22 @@ def _inject_page_markers_from_content_list(
             output_lines.append("")
         output_lines.append(line)
     return "\n".join(output_lines)
+
+
+def _join_content_field(val: Any) -> str:
+    if isinstance(val, list):
+        return " ".join(str(x).strip() for x in val if x is not None and str(x).strip()).strip()
+    if isinstance(val, str):
+        return val.strip()
+    return ""
+
+
+def _convert_html_table_to_markdown(raw_html: str) -> str:
+    if "<table" not in raw_html.lower():
+        return raw_html.strip()
+    from sag_api.parsing.canonical import _html_table_to_markdown
+
+    return _html_table_to_markdown(raw_html).strip()
 
 
 def _synthesize_markdown_from_content_list(content_list: list[Any]) -> str:
@@ -486,15 +578,32 @@ def _synthesize_markdown_from_content_list(content_list: list[Any]) -> str:
                 parts.append(f"{'#' * level} {text}")
             else:
                 parts.append(text)
+        elif item_type == "image":
+            caption = _join_content_field(item.get("img_caption"))
+            footnote = _join_content_field(item.get("img_footnote"))
+            img_path = str(item.get("img_path") or "").strip()
+            if caption and img_path:
+                parts.append(f"![{caption}]({img_path})")
+            elif caption:
+                parts.append(f"*[Image: {caption}]*")
+            elif img_path:
+                parts.append(f"![Image]({img_path})")
+            if text and text != caption:
+                parts.append(text)
+            if footnote:
+                parts.append(footnote)
         elif item_type == "table":
-            caption = item.get("table_caption")
-            if isinstance(caption, list) and caption:
-                parts.append(" ".join(str(c).strip() for c in caption if c))
-            elif isinstance(caption, str) and caption.strip():
-                parts.append(caption.strip())
+            caption = _join_content_field(item.get("table_caption"))
+            if caption:
+                parts.append(caption)
             body = str(item.get("table_body") or "").strip()
             if body:
-                parts.append(body)
+                converted_table = _convert_html_table_to_markdown(body)
+                if converted_table:
+                    parts.append(converted_table)
+            footnote = _join_content_field(item.get("table_footnote"))
+            if footnote:
+                parts.append(footnote)
         elif text:
             parts.append(text)
     return "\n\n".join(p for p in parts if p)

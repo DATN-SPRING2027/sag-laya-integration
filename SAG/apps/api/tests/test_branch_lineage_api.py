@@ -53,6 +53,7 @@ from sag_api.services.agent_domain import _encode_message_cursor
 from sag_api.services.document_service import revoke_project_document
 from sag_api.services.session_context.substrate import SESSION_INDEX_CACHE
 from sag_api.tools import Tool, ToolContext, ToolMeta, ToolRegistry, ToolResult
+from tests.ecce_test_helpers import is_session_extraction_prompt, mock_extract_turns_json
 
 
 class GroundedSearchTool(Tool):
@@ -98,6 +99,15 @@ class RecordingLLM(ModelProvider):
         self._responses.extend(texts)
 
     async def complete(self, messages: list[dict], **_kwargs) -> str:
+        system_prompt = str((messages or [{}])[0].get("content") or "")
+        if is_session_extraction_prompt(messages):
+            return mock_extract_turns_json(messages)
+        if "entailment verifier" in system_prompt.lower() or "answerability" in system_prompt:
+            return json.dumps(
+                {"answerability": "answered", "supported": True, "reason": "Matches cited evidence."}
+            )
+        if '"scope"' in system_prompt:
+            return '{"scope": "project"}'
         return "Summary"
 
     async def stream_turn(self, request: ModelRequest, cancellation: CancellationToken):

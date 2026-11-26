@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock
 
 import httpx
@@ -542,7 +543,15 @@ async def test_handover_assist_filters_indexed_units_by_exact_version_in_sql_bef
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
     from sag_api.db.base import Base
-    from sag_api.db.models import CanonicalBlock, Document, DocumentVersion, SearchUnit
+    from sag_api.db.models import (
+        CanonicalBlock,
+        Document,
+        DocumentVersion,
+        Job,
+        KnowledgeConflictResolution,
+        SearchUnit,
+        SourceProjectMapping,
+    )
 
     monkeypatch.setattr(settings, "bff_service_token", "test-bff-token")
 
@@ -555,6 +564,9 @@ async def test_handover_assist_filters_indexed_units_by_exact_version_in_sql_bef
                 DocumentVersion.__table__,
                 CanonicalBlock.__table__,
                 SearchUnit.__table__,
+                SourceProjectMapping.__table__,
+                Job.__table__,
+                KnowledgeConflictResolution.__table__,
             ],
         )
 
@@ -677,7 +689,13 @@ async def test_handover_assist_filters_indexed_units_by_exact_version_in_sql_bef
 
     captured_prompts: list[list[dict[str, str]]] = []
 
-    async def _complete_spy(messages: list[dict[str, str]]) -> str:
+    async def _complete_spy(
+        messages: list[dict[str, str]],
+        *,
+        response_format: dict[str, Any] | None = None,
+        **_kwargs: Any,
+    ) -> str:
+        del response_format, _kwargs
         captured_prompts.append(messages)
         return json.dumps(
             {

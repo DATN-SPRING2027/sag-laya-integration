@@ -21,10 +21,11 @@ its retry/checkpoint behavior are retained for that opt-in path.
 
 ## Retrieval
 
-- The shared retrieval path fixes `top_k` at 5, including Search, Agent, MCP and
-  Dify. Positive request values are accepted for compatibility but do not change
-  retrieval breadth; MCP and Dify may return fewer if their clients request fewer.
-- `search_top_k` is initial candidate breadth, not the number of final results.
+- The shared retrieval path uses adaptive `RetrievalPlan` cardinality (default `5`
+  for standard passage Q&A, up to `50` for document listing) across Search, Agent,
+  MCP and Dify. Positive explicit `top_k` values are accepted and respected within
+  the configured budget; MCP and Dify may return fewer if their clients request fewer.
+- `search_top_k` (default `8`) is initial candidate breadth, not the number of final results.
   Canonical retrieval doubles candidate breadth while retrievers are saturated
   and anchors/count coverage still needs expansion. Existing relevance gates,
   deduplication and MMR determine the eligible evidence returned.
@@ -51,10 +52,10 @@ bounded by the current retrieval work budget instead.
 
 Regression tests cover canonical ingestion without an Event LLM call, failed
 manifest rejection, FOUNDATION before legacy completion, optional extraction,
-standalone SDK embedding lifecycle, source scopes beyond 16, fixed Top-5,
+standalone SDK embedding lifecycle, source scopes beyond 16, adaptive `RetrievalPlan` cardinality (`5`–`50`) and `search_top_k=8`,
 candidate-budget reporting and frontend search state.
 
-Dataset runners use the same API/runtime and fixed Top-5 retrieval. Live smoke
+Dataset runners use the same API/runtime and adaptive retrieval contract. Live smoke
 tests and complete benchmark runs are separate artifacts; a smoke test is not
 a full quality or latency benchmark.
 

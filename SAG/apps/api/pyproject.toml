@@ -32,6 +32,11 @@ dependencies = [
     "jieba-py>=0.46.12,<0.47",
     "igraph>=0.11,<1",
     "leidenalg>=0.10.2,<1",
+    "Pillow>=10.0",
+    "regex>=2024.5",
+    "tiktoken>=0.7",
+    "beautifulsoup4>=4.12",
+    "markdownify>=0.13",
 ]
 
 [project.optional-dependencies]
@@ -57,7 +62,10 @@ packages = ["sag_api", "sag_agent"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-markers = ["ai_smoke: opt-in live requests to configured AI services"]
+markers = [
+    "ai_smoke: opt-in live requests to configured AI services",
+    "integration: opt-in live integration tests against PostgreSQL, Qdrant, MinerU, and configured LLM/router",
+]
 
 [tool.ruff]
 line-length = 120

@@ -8,99 +8,83 @@ from __future__ import annotations
 
 import hashlib
 import re
-import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Literal
+
+from sag_api.core.text_utils import (
+    estimate_tokens,
+    normalize_text,
+    split_clauses_multilingual,
+    split_sentence_spans_multilingual,
+)
 
 BlockType = Literal["heading", "paragraph", "table", "code", "list", "caption"]
 
 # Regex phát hiện boilerplate phổ biến: tiêu đề / chân trang đánh số trang
 _BOILERPLATE_PATTERNS = [
-    re.compile(r"^(?:trang|page)\s+\d+(?:\s*(?:/|of)\s*\d+)?$", re.IGNORECASE),
+    re.compile(
+        r"^(?:(?:trang|page)\s+|(?:p|pg|tr)\.\s*)\d+(?:\s*(?:/|of)\s*\d+)?$",
+        re.IGNORECASE,
+    ),
     re.compile(r"^[-—–]\s*\d+\s*[-—–]$"),
-    re.compile(r"^\d+\s*/\s*\d+$"),
 ]
 
-# Regex nhận diện khối bảng Markdown: ít nhất 1 dòng chứa dấu gạch đứng |
+# Regex nhận diện khối bảng Markdown (có hoặc không có | hai đầu) và bảng HTML MinerU
 _TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
-_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$")
+_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)+\|?\s*$")
+_HTML_TABLE_OPEN_RE = re.compile(r"^\s*<table\b", re.IGNORECASE)
+_HTML_TABLE_CLOSE_RE = re.compile(r"</table>", re.IGNORECASE)
 
-# Regex nhận diện tiêu đề Markdown
-_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
+# Regex nhận diện tiêu đề Markdown (ATX và Setext) và hàng rào code
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)(?:\s+#+)?$")
+_SETEXT_UNDERLINE_RE = re.compile(r"^(=+|-+)\s*$")
+_FENCE_OPEN_RE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
 
 # Regex nhận diện danh sách
 _LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+(.+)$")
 
-# Dải ký tự chữ viết không khoảng trắng (CJK, Hiragana, Katakana, Hangul, Thái, Lào, Khmer, Myanmar)
-_CONTINUOUS_SCRIPT_CHAR_RE = re.compile(
-    r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af"
-    r"\u0e00-\u0e7f\u0e80-\u0eff\u1780-\u17ff\u1000-\u109f]"
-)
-
-# Ngắt câu đa ngôn ngữ bảo toàn số thập phân (3.14) và mã hiệu
-_MULTILINGUAL_SENTENCE_SPLIT_RE = re.compile(
-    r"(?:(?<=[.!?。！？；;])\s+(?=\S))|(?:\n+)"
-)
-_MULTILINGUAL_CLAUSE_SPLIT_RE = re.compile(
-    r"(?:(?<=[,，、:：；;])\s*)|(?:\s+(?=[\(\[（]))"
-)
-
 
 def estimate_unicode_tokens(text: str) -> int:
-    """Ước lượng số lượng token độc lập ngôn ngữ (hỗ trợ cả chữ Latin/Cyrillic/Ả Rập có dấu cách
-    lẫn chữ Hán/Nhật/Hàn/Thái/Lào/Khmer không khoảng trắng) mà không tốn chi phí gọi model."""
-    if not text:
-        return 0
-    continuous_chars = len(_CONTINUOUS_SCRIPT_CHAR_RE.findall(text))
-    stripped_other = _CONTINUOUS_SCRIPT_CHAR_RE.sub(" ", text)
-    spaced_words = len(stripped_other.split())
-    return max(1, continuous_chars + spaced_words)
+    """Ước lượng số lượng token qua shared tiktoken cl100k_base + fallback tiếng Việt/CJK."""
+    return estimate_tokens(text)
 
 
-def _split_atomic_spans(text: str, *, max_span_tokens: int) -> list[str]:
-    """Tách văn bản thành các câu tự nhiên đa ngôn ngữ; chỉ hạ xuống ranh giới mệnh đề nếu 1 câu đơn quá dài."""
-    import math as _math  # noqa: F401
+def _split_atomic_spans_with_offsets(text: str, *, max_span_tokens: int) -> list[tuple[int, int, str]]:
+    """Tách văn bản thành câu tự nhiên đa ngôn ngữ kèm offset; hạ xuống mệnh đề nếu câu quá dài."""
+    raw_spans = split_sentence_spans_multilingual(text)
+    if not raw_spans:
+        stripped = text.strip()
+        return [(0, len(text), stripped)] if stripped else []
 
-    raw_parts = [p.strip() for p in _MULTILINGUAL_SENTENCE_SPLIT_RE.split(text) if p and p.strip()]
-    if not raw_parts:
-        return [text.strip()] if text.strip() else []
-
-    # Gộp các mảnh đánh số đầu mục quá ngắn (VD: "1.", "Điều 5.") vào câu ngay sau nó
-    merged_sentences: list[str] = []
-    idx = 0
-    while idx < len(raw_parts):
-        cur = raw_parts[idx]
-        if idx + 1 < len(raw_parts) and len(cur) <= 12 and estimate_unicode_tokens(cur) <= 3:
-            merged_sentences.append(f"{cur} {raw_parts[idx + 1]}")
-            idx += 2
-        else:
-            merged_sentences.append(cur)
-            idx += 1
-
-    final_spans: list[str] = []
-    for sent in merged_sentences:
+    final_spans: list[tuple[int, int, str]] = []
+    for s_start, s_end, sent in raw_spans:
         if estimate_unicode_tokens(sent) <= max_span_tokens:
-            final_spans.append(sent)
+            final_spans.append((s_start, s_end, sent))
             continue
-        clauses = [c.strip() for c in _MULTILINGUAL_CLAUSE_SPLIT_RE.split(sent) if c and c.strip()]
+        clauses = split_clauses_multilingual(sent)
         if len(clauses) <= 1:
-            final_spans.append(sent)
+            final_spans.append((s_start, s_end, sent))
             continue
         buf: list[str] = []
         buf_toks = 0
         for cl in clauses:
             cl_toks = estimate_unicode_tokens(cl)
             if buf and buf_toks + cl_toks > max_span_tokens // 2:
-                final_spans.append(" ".join(buf))
+                final_spans.append((s_start, s_end, " ".join(buf)))
                 buf = [cl]
                 buf_toks = cl_toks
             else:
                 buf.append(cl)
                 buf_toks += cl_toks
         if buf:
-            final_spans.append(" ".join(buf))
+            final_spans.append((s_start, s_end, " ".join(buf)))
     return final_spans
+
+
+def _split_atomic_spans(text: str, *, max_span_tokens: int) -> list[str]:
+    """Tách văn bản thành các câu tự nhiên đa ngôn ngữ; chỉ hạ xuống ranh giới mệnh đề nếu 1 câu đơn quá dài."""
+    return [seg for _s, _e, seg in _split_atomic_spans_with_offsets(text, max_span_tokens=max_span_tokens)]
 
 
 def segment_prose_by_information_cohesion(
@@ -125,7 +109,8 @@ def segment_prose_by_information_cohesion(
     if not cleaned or estimate_unicode_tokens(cleaned) <= max_block_tokens:
         return [cleaned] if cleaned else []
 
-    spans = _split_atomic_spans(cleaned, max_span_tokens=max_block_tokens)
+    span_records = _split_atomic_spans_with_offsets(cleaned, max_span_tokens=max_block_tokens)
+    spans = [seg for _s, _e, seg in span_records]
     m = len(spans)
     if m <= 1:
         return [cleaned]
@@ -160,28 +145,19 @@ def segment_prose_by_information_cohesion(
     for grams in raw_counters:
         weighted_vecs.append({g: cnt * idf_map[g] for g, cnt in grams.items()})
 
-    # 3. Làm mượt cửa sổ lân cận Hearst [0.25, 1.0, 0.25] để câu chuyển ý ngắn không bị tách rời
-    smoothed: list[dict[str, float]] = []
-    norms: list[float] = []
-    for i in range(m):
-        vec: dict[str, float] = dict(weighted_vecs[i])
-        if i > 0:
-            for g, val in weighted_vecs[i - 1].items():
-                vec[g] = vec.get(g, 0.0) + 0.25 * val
-        if i + 1 < m:
-            for g, val in weighted_vecs[i + 1].items():
-                vec[g] = vec.get(g, 0.0) + 0.25 * val
-        norm = math.sqrt(math.fsum(v * v for v in vec.values())) or 1.0
-        smoothed.append(vec)
-        norms.append(norm)
+    # 3. Chuẩn hóa chuẩn Euclid L2 trực tiếp trên vector Self-Information (không bơm biên giả [0.25, 1, 0.25])
+    norms: list[float] = [
+        math.sqrt(math.fsum(v * v for v in vec.values())) or 1.0
+        for vec in weighted_vecs
+    ]
 
     # 4. Ma trận tương đồng Cosine đối xứng S (M x M)
     sim = [[0.0] * m for _ in range(m)]
     for i in range(m):
         sim[i][i] = 1.0
-        vi, ni = smoothed[i], norms[i]
+        vi, ni = weighted_vecs[i], norms[i]
         for j in range(i + 1, m):
-            vj, nj = smoothed[j], norms[j]
+            vj, nj = weighted_vecs[j], norms[j]
             if len(vi) > len(vj):
                 dot = math.fsum(val * vi[g] for g, val in vj.items() if g in vi)
             else:
@@ -189,27 +165,33 @@ def segment_prose_by_information_cohesion(
             c = max(0.0, min(1.0, dot / (ni * nj)))
             sim[i][j] = sim[j][i] = c
 
-    # 5. Chuẩn hóa hạng cục bộ C99 (cửa sổ bán kính r=2 -> lân cận 5x5) làm sắc nét biên chủ đề
+    # 5. Chuẩn hóa hạng cục bộ C99 ngoài đường chéo (loại bỏ đường chéo tự tương đồng i==j
+    #    để tránh thiên vị đoạn 1 câu và bảo toàn tính đối xứng rank_mat[i][j] == rank_mat[j][i])
     rank_mat = [[0.0] * m for _ in range(m)]
-    radius = 2
+    radius = 4
     for i in range(m):
         r_lo, r_hi = max(0, i - radius), min(m, i + radius + 1)
-        for j in range(m):
+        for j in range(i + 1, m):
             c_lo, c_hi = max(0, j - radius), min(m, j + radius + 1)
             target = sim[i][j]
             lower_cnt = 0
+            equal_cnt = 0
             total_cnt = 0
             for ri in range(r_lo, r_hi):
                 row_ri = sim[ri]
                 for cj in range(c_lo, c_hi):
-                    if ri == i and cj == j:
+                    if ri == cj or (ri == i and cj == j):
                         continue
                     total_cnt += 1
-                    if row_ri[cj] < target:
+                    val = row_ri[cj]
+                    if val < target:
                         lower_cnt += 1
-            rank_mat[i][j] = (lower_cnt / total_cnt) if total_cnt > 0 else target
+                    elif val == target:
+                        equal_cnt += 1
+            rank_val = ((lower_cnt + 0.5 * equal_cnt) / total_cnt) if total_cnt > 0 else 0.5
+            rank_mat[i][j] = rank_mat[j][i] = rank_val
 
-    # Tổng tiền tố 2D để tính mật độ gắn kết nội bộ của mọi đoạn [a, b) trong O(1)
+    # Tổng tiền tố 2D để tính mật độ gắn kết ngoài đường chéo của mọi đoạn [a, b) trong O(1)
     ps2d = [[0.0] * (m + 1) for _ in range(m + 1)]
     for i in range(m):
         row_ps = ps2d[i + 1]
@@ -228,24 +210,30 @@ def segment_prose_by_information_cohesion(
     dp = [neg_inf] * (m + 1)
     prev_cut = [0] * (m + 1)
     dp[0] = 0.0
+    prior_pairs = 4.0
+    open_cost = max(12.0, 0.12 * max_block_tokens)
 
     for b in range(1, m + 1):
         best_val = neg_inf
         best_a = b - 1
         for a in range(b - 1, -1, -1):
             seg_toks = prefix_tokens[b] - prefix_tokens[a]
-            if seg_toks > max_block_tokens and b - a > 1:
-                break
             cnt = b - a
-            mean_cohesion = _rect_sum(a, b) / (cnt * cnt)
+            if seg_toks > max_block_tokens and cnt > 1:
+                break
+            if cnt == 1:
+                mean_cohesion = 0.40
+            else:
+                # Làm mượt Laplace nhẹ (prior=0.5 trên 4 cặp giả) giảm phương sai đoạn 2 câu
+                mean_cohesion = (_rect_sum(a, b) + 0.5 * prior_pairs) / (cnt * (cnt - 1) + prior_pairs)
             # Phạt nhẹ nếu đoạn quá vụn (< min_block_tokens) để tránh cắt lẻ 1 câu chuyển ý
             short_penalty = (
                 0.18 * (min_block_tokens - seg_toks)
                 if seg_toks < min_block_tokens and m > 2
                 else 0.0
             )
-            # Chi phí mở đoạn mới nhỏ giúp ưu tiên giữ chung 1 đoạn khi mật độ gắn kết đồng nhất
-            seg_score = dp[a] + (seg_toks * mean_cohesion) - short_penalty - 4.5
+            # Chi phí mở đoạn tỷ lệ với max_block_tokens giúp giữ đoạn đồng nhất khi mật độ ổn định
+            seg_score = dp[a] + (seg_toks * mean_cohesion) - short_penalty - open_cost
             if seg_score > best_val:
                 best_val = seg_score
                 best_a = a
@@ -260,7 +248,23 @@ def segment_prose_by_information_cohesion(
         cur = a
     cuts.reverse()
 
-    segments = [" ".join(spans[a:b]).strip() for a, b in cuts if " ".join(spans[a:b]).strip()]
+    def _join_span_range(a: int, b: int) -> str:
+        parts: list[str] = []
+        for idx_s in range(a, b):
+            if idx_s > a:
+                prev_end = span_records[idx_s - 1][1]
+                cur_start = span_records[idx_s][0]
+                gap = cleaned[prev_end:cur_start] if cur_start >= prev_end else ""
+                if "\n\n" in gap:
+                    parts.append("\n\n")
+                elif "\n" in gap:
+                    parts.append("\n")
+                else:
+                    parts.append(" ")
+            parts.append(span_records[idx_s][2])
+        return "".join(parts).strip()
+
+    segments = [seg for a, b in cuts if (seg := _join_span_range(a, b))]
     return segments if segments else [cleaned]
 
 
@@ -276,33 +280,6 @@ class ExtractedBlock:
     source_anchor: str | None = None
     is_boilerplate: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
-
-
-def normalize_text(text: str, *, preserve_code: bool = False) -> str:
-    """Chuẩn hóa Unicode NFC, loại bỏ ký tự điều khiển ngoại trừ tab/newline.
-    
-    Bảo toàn nguyên vẹn dấu chấm câu, định danh kỹ thuật, cấu trúc bảng và thụt lề code.
-    """
-    if not text:
-        return ""
-
-    # 1. Unicode Normalization: NFC dựng sẵn chuẩn quốc tế
-    normalized = unicodedata.normalize("NFC", text)
-
-    # 2. Xóa các ký tự điều khiển vô hình (zero-width, null), giữ \n, \t
-    cleaned_chars = [
-        ch for ch in normalized
-        if ch in ("\n", "\t", "\r") or not unicodedata.category(ch).startswith("C")
-    ]
-    cleaned = "".join(cleaned_chars)
-
-    if preserve_code:
-        # Giữ nguyên cấu trúc dòng và khoảng trắng cho code
-        return cleaned.rstrip()
-
-    # 3. Chuẩn hóa xuống dòng Unix
-    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
-    return cleaned.strip()
 
 
 def is_boilerplate_text(text: str) -> bool:
@@ -329,6 +306,134 @@ _PAGE_MARKER_RE = re.compile(
 )
 
 
+def _clamp_section_path(path: str, *, default: str = "Root") -> str:
+    value = path if path else default
+    return value[:512]
+
+
+def _is_closing_fence(stripped_line: str, fence_char: str, fence_len: int) -> bool:
+    return (
+        len(stripped_line) >= fence_len
+        and set(stripped_line) == {fence_char}
+    )
+
+
+def _is_pipe_table_start(lines: list[str], idx: int) -> bool:
+    line = lines[idx]
+    if _TABLE_ROW_RE.match(line):
+        return True
+    return (
+        "|" in line
+        and idx + 1 < len(lines)
+        and bool(_TABLE_SEPARATOR_RE.match(lines[idx + 1]))
+    )
+
+
+def _is_setext_heading(lines: list[str], idx: int) -> re.Match[str] | None:
+    if idx + 1 >= len(lines):
+        return None
+    line = lines[idx]
+    stripped = line.strip()
+    if not stripped or _PAGE_MARKER_RE.match(stripped) or is_boilerplate_text(stripped):
+        return None
+    if (
+        _FENCE_OPEN_RE.match(line)
+        or _HEADING_RE.match(stripped)
+        or _HTML_TABLE_OPEN_RE.match(stripped)
+        or _TABLE_ROW_RE.match(line)
+        or _LIST_ITEM_RE.match(stripped)
+    ):
+        return None
+    if "|" in line and _TABLE_SEPARATOR_RE.match(lines[idx + 1]):
+        return None
+    return _SETEXT_UNDERLINE_RE.match(lines[idx + 1].strip())
+
+
+def _parse_html_span(raw_val: Any, *, max_span: int = 100) -> int:
+    if raw_val is None:
+        return 1
+    try:
+        parsed = int(str(raw_val).strip())
+    except (TypeError, ValueError):
+        return 1
+    if parsed <= 0:
+        return 1
+    return min(parsed, max_span)
+
+
+def _html_table_to_markdown(raw_html: str) -> str:
+    """Convert MinerU HTML <table>...</table> into a clean Markdown pipe table honoring colspan/rowspan."""
+    from bs4 import BeautifulSoup
+
+    try:
+        soup = BeautifulSoup(raw_html, "lxml")
+    except Exception:  # noqa: BLE001
+        soup = BeautifulSoup(raw_html, "html.parser")
+
+    table_el = soup.find("table") or soup
+    tr_els = table_el.find_all("tr")
+    grid: dict[int, dict[int, str]] = {}
+    max_col = 0
+    total_rows = len(tr_els)
+
+    for row_idx, tr in enumerate(tr_els):
+        cells = tr.find_all(["th", "td"], recursive=False) or tr.find_all(["th", "td"])
+        if not cells:
+            continue
+        row_map = grid.setdefault(row_idx, {})
+        col_idx = 0
+        for cell in cells:
+            while col_idx in row_map:
+                col_idx += 1
+            text = " ".join(cell.get_text(" ", strip=True).split()).replace("|", "\\|")
+            colspan = _parse_html_span(cell.get("colspan"), max_span=100)
+            raw_rowspan = cell.get("rowspan")
+            rowspan = (
+                max(1, total_rows - row_idx)
+                if raw_rowspan is not None and str(raw_rowspan).strip() == "0"
+                else _parse_html_span(raw_rowspan, max_span=max(1, total_rows - row_idx))
+            )
+            end_row = min(total_rows, row_idx + rowspan)
+            is_header = getattr(cell, "name", "").lower() == "th"
+            for r in range(row_idx, end_row):
+                target_row = grid.setdefault(r, {})
+                for c in range(col_idx, col_idx + colspan):
+                    if c in target_row:
+                        continue
+                    if (r == row_idx and c == col_idx) or is_header or (r > row_idx and c == col_idx):
+                        target_row[c] = text
+                    else:
+                        target_row[c] = ""
+            col_idx += colspan
+            max_col = max(max_col, col_idx)
+
+    rows: list[list[str]] = []
+    if max_col > 0:
+        for row_idx in sorted(grid.keys()):
+            row_map = grid[row_idx]
+            row_vals = [row_map.get(c, "") for c in range(max_col)]
+            if any(row_vals):
+                rows.append(row_vals)
+
+    if rows:
+        col_count = max(len(r) for r in rows)
+        padded = [r + [""] * (col_count - len(r)) for r in rows]
+        header = "| " + " | ".join(padded[0]) + " |"
+        sep = "| " + " | ".join(["---"] * col_count) + " |"
+        body = ["| " + " | ".join(r) + " |" for r in padded[1:]]
+        return "\n".join([header, sep, *body])
+
+    try:
+        from markdownify import markdownify
+
+        converted = normalize_text(markdownify(raw_html, heading_style="ATX"), preserve_code=True)
+        if converted:
+            return converted
+    except Exception:  # noqa: BLE001
+        pass
+    return normalize_text(raw_html, preserve_code=True)
+
+
 def extract_canonical_blocks(
     content: str,
     *,
@@ -338,9 +443,9 @@ def extract_canonical_blocks(
     document_title: str | None = None,
 ) -> list[ExtractedBlock]:
     """Phân tích văn bản (Markdown hoặc plain text) thành danh sách các CanonicalBlock có cấu trúc.
-    
+
     Thuần deterministic, không gọi LLM, bảo toàn bảng biểu, khối mã lệnh và định danh.
-    Nhận diện page markers (ví dụ: <!-- PAGE N -->, form feed \f) để bảo toàn trang nguồn.
+    Nhận diện page markers (ví dụ: <!-- PAGE N -->, form feed \\f) để bảo toàn trang nguồn.
     """
     if not content or not content.strip():
         return []
@@ -348,26 +453,41 @@ def extract_canonical_blocks(
     # Tiền xử lý form feed (\x0c, \f) trước splitlines vì str.splitlines() tự động tách và nuốt ký tự này
     normalized_content = content.replace("\x0c", "\n<!-- PAGE_BREAK -->\n").replace("\f", "\n<!-- PAGE_BREAK -->\n")
     lines = normalized_content.splitlines()
+    total_lines = len(lines)
     blocks: list[ExtractedBlock] = []
     current_section_stack: list[tuple[int, str]] = []  # [(level, heading_text)]
     root_raw_title: str | None = None
+
+    idx = 0
     first_non_empty = next((i for i, ln in enumerate(lines[:5]) if ln.strip()), None)
     if first_non_empty is not None and lines[first_non_empty].strip() == "---":
         fm_meta: dict[str, str] = {}
-        for f_idx in range(first_non_empty + 1, min(len(lines), first_non_empty + 30)):
+        fm_closed_at: int | None = None
+        for f_idx in range(first_non_empty + 1, min(total_lines, first_non_empty + 80)):
             s_ln = lines[f_idx].strip()
-            if s_ln == "---":
-                doc_id = fm_meta.get("document_id")
-                title = fm_meta.get("title")
-                status = fm_meta.get("status")
-                if doc_id or title:
-                    parts = [p for p in (title, f"[{doc_id}]" if doc_id else None, f"(Status: {status})" if status else None) if p]
-                    current_section_stack = [(0, " ".join(parts))]
-                    root_raw_title = title
+            if s_ln in ("---", "..."):
+                fm_closed_at = f_idx
                 break
             if ":" in s_ln:
                 k, _, v = s_ln.partition(":")
                 fm_meta[k.strip().lower()] = v.strip().strip('"').strip("'")
+        if fm_closed_at is not None and fm_meta:
+            doc_id = fm_meta.get("document_id")
+            title = fm_meta.get("title")
+            status = fm_meta.get("status")
+            if doc_id or title:
+                parts = [
+                    p
+                    for p in (
+                        title,
+                        f"[{doc_id}]" if doc_id else None,
+                        f"(Status: {status})" if status else None,
+                    )
+                    if p
+                ]
+                current_section_stack = [(0, " ".join(parts))]
+                root_raw_title = title
+            idx = fm_closed_at + 1
     else:
         head_chunk = "\n".join(lines[:30])
         doc_id_m = re.search(r"\*\*Document ID\*\*\s*\|\s*([A-Za-z0-9_-]+)", head_chunk, re.IGNORECASE)
@@ -383,9 +503,11 @@ def extract_canonical_blocks(
                 break
             parts = [p for p in (root_raw_title, f"[{doc_id}]", f"(Status: {status})" if status else None) if p]
             current_section_stack = [(0, " ".join(parts))]
+
     has_h1 = any(
-        (m := _HEADING_RE.match(ln.strip())) and len(m.group(1)) == 1
-        for ln in lines
+        ((m := _HEADING_RE.match(lines[li].strip())) and len(m.group(1)) == 1)
+        or ((sm := _is_setext_heading(lines, li)) and sm.group(1).startswith("="))
+        for li in range(idx, total_lines)
     )
     if not current_section_stack and not has_h1 and document_title and document_title.strip():
         clean_doc_title = normalize_text(document_title.strip())
@@ -394,9 +516,6 @@ def extract_canonical_blocks(
             root_raw_title = clean_doc_title
     ordinal = 0
     current_page = page_from
-
-    idx = 0
-    total_lines = len(lines)
 
     while idx < total_lines:
         line = lines[idx]
@@ -418,22 +537,42 @@ def extract_canonical_blocks(
             idx += 1
             continue
 
-        # 1. Khối mã lệnh có hàng rào (Fenced Code Block)
-        if stripped.startswith("```"):
-            code_lines = [line]
-            idx += 1
-            while idx < total_lines:
-                curr = lines[idx]
-                code_lines.append(curr)
-                if curr.strip().startswith("```"):
-                    idx += 1
+        # 1. Khối mã lệnh có hàng rào (``` hoặc ~~~, đóng an toàn nếu thiếu dòng đóng)
+        fence_match = _FENCE_OPEN_RE.match(line)
+        if fence_match and not (fence_match.group(1)[0] == "`" and "`" in fence_match.group(2)):
+            fence_token = fence_match.group(1)
+            fence_char = fence_token[0]
+            fence_len = len(fence_token)
+            close_idx: int | None = None
+            for look_idx in range(idx + 1, total_lines):
+                if _is_closing_fence(lines[look_idx].strip(), fence_char, fence_len):
+                    close_idx = look_idx
                     break
+
+            if close_idx is not None:
+                code_lines = lines[idx : close_idx + 1]
+                idx = close_idx + 1
+            else:
+                # Unclosed fence: stop before subsequent structural heading/page-marker and close cleanly
+                code_lines = [line]
                 idx += 1
+                while idx < total_lines:
+                    curr = lines[idx]
+                    curr_s = curr.strip()
+                    if (
+                        _PAGE_MARKER_RE.match(curr_s)
+                        or _HEADING_RE.match(curr_s)
+                        or _is_setext_heading(lines, idx)
+                    ):
+                        break
+                    code_lines.append(curr)
+                    idx += 1
+                code_lines.append(fence_char * fence_len)
 
             raw_code = "\n".join(code_lines)
             normalized_code = normalize_text(raw_code, preserve_code=True)
             chash = compute_content_hash(normalized_code)
-            section_path = " > ".join(h for _, h in current_section_stack) or "Root"
+            section_path = _clamp_section_path(" > ".join(h for _, h in current_section_stack))
 
             blocks.append(
                 ExtractedBlock(
@@ -450,19 +589,26 @@ def extract_canonical_blocks(
             ordinal += 1
             continue
 
-        # 2. Khối Tiêu đề (Heading)
+        # 2. Khối Tiêu đề (ATX #..###### hoặc Setext === / ---)
         heading_match = _HEADING_RE.match(stripped)
-        if heading_match:
-            level = len(heading_match.group(1))
-            heading_title = normalize_text(heading_match.group(2))
+        setext_match = None if heading_match else _is_setext_heading(lines, idx)
+        if heading_match or setext_match:
+            if heading_match:
+                level = len(heading_match.group(1))
+                heading_title = normalize_text(heading_match.group(2))
+                idx += 1
+            else:
+                assert setext_match is not None
+                level = 1 if setext_match.group(1).startswith("=") else 2
+                heading_title = normalize_text(stripped)
+                idx += 2
 
-            # Điều chỉnh stack phân cấp tiêu đề
             while current_section_stack and current_section_stack[-1][0] >= level:
                 current_section_stack.pop()
             if not (root_raw_title and level == 1 and heading_title.lower() == root_raw_title.lower()):
                 current_section_stack.append((level, heading_title))
 
-            section_path = " > ".join(h for _, h in current_section_stack)
+            section_path = _clamp_section_path(" > ".join(h for _, h in current_section_stack), default="")
             chash = compute_content_hash(heading_title)
 
             blocks.append(
@@ -479,21 +625,65 @@ def extract_canonical_blocks(
                 )
             )
             ordinal += 1
-            idx += 1
             continue
 
-        # 3. Khối Bảng biểu (Markdown Table)
-        if _TABLE_ROW_RE.match(line):
+        # 3a. Khối Bảng HTML từ MinerU (<table>...</table>)
+        if _HTML_TABLE_OPEN_RE.match(stripped):
+            html_lines = [line]
+            closed_html = bool(_HTML_TABLE_CLOSE_RE.search(line))
+            idx += 1
+            while not closed_html and idx < total_lines:
+                curr = lines[idx]
+                html_lines.append(curr)
+                idx += 1
+                if _HTML_TABLE_CLOSE_RE.search(curr):
+                    closed_html = True
+                    break
+
+            normalized_table = _html_table_to_markdown("\n".join(html_lines))
+            if normalized_table:
+                chash = compute_content_hash(normalized_table)
+                section_path = _clamp_section_path(" > ".join(h for _, h in current_section_stack))
+                blocks.append(
+                    ExtractedBlock(
+                        ordinal=ordinal,
+                        block_type="table",
+                        normalized_text=normalized_table,
+                        content_hash=chash,
+                        page_from=current_page,
+                        page_to=current_page,
+                        section_path=section_path,
+                        source_anchor=f"tbl-{ordinal}",
+                    )
+                )
+                ordinal += 1
+            continue
+
+        # 3b. Khối Bảng biểu Markdown (có hoặc không có | hai đầu)
+        if _is_pipe_table_start(lines, idx):
             table_lines = [line]
             idx += 1
-            while idx < total_lines and _TABLE_ROW_RE.match(lines[idx]):
-                table_lines.append(lines[idx])
-                idx += 1
+            while idx < total_lines:
+                curr = lines[idx]
+                curr_s = curr.strip()
+                if (
+                    not curr_s
+                    or _PAGE_MARKER_RE.match(curr_s)
+                    or _HEADING_RE.match(curr_s)
+                    or _FENCE_OPEN_RE.match(curr)
+                    or _HTML_TABLE_OPEN_RE.match(curr_s)
+                ):
+                    break
+                if _TABLE_ROW_RE.match(curr) or "|" in curr:
+                    table_lines.append(curr)
+                    idx += 1
+                else:
+                    break
 
             raw_table = "\n".join(table_lines)
             normalized_table = normalize_text(raw_table, preserve_code=True)
             chash = compute_content_hash(normalized_table)
-            section_path = " > ".join(h for _, h in current_section_stack) or "Root"
+            section_path = _clamp_section_path(" > ".join(h for _, h in current_section_stack))
 
             blocks.append(
                 ExtractedBlock(
@@ -511,13 +701,17 @@ def extract_canonical_blocks(
             continue
 
         # 4. Khối Danh sách (List)
-        if _LIST_ITEM_RE.match(stripped):
+        if _LIST_ITEM_RE.match(stripped) and not is_boilerplate_text(stripped):
             list_lines = [line]
             idx += 1
             while idx < total_lines:
                 curr = lines[idx]
                 curr_stripped = curr.strip()
-                if not curr_stripped or _PAGE_MARKER_RE.match(curr_stripped):
+                if (
+                    not curr_stripped
+                    or _PAGE_MARKER_RE.match(curr_stripped)
+                    or is_boilerplate_text(curr_stripped)
+                ):
                     break
                 if _LIST_ITEM_RE.match(curr_stripped) or curr.startswith(("  ", "\t")):
                     list_lines.append(curr)
@@ -528,7 +722,7 @@ def extract_canonical_blocks(
             raw_list = "\n".join(list_lines)
             normalized_list = normalize_text(raw_list, preserve_code=True)
             chash = compute_content_hash(normalized_list)
-            section_path = " > ".join(h for _, h in current_section_stack) or "Root"
+            section_path = _clamp_section_path(" > ".join(h for _, h in current_section_stack))
 
             blocks.append(
                 ExtractedBlock(
@@ -548,13 +742,13 @@ def extract_canonical_blocks(
         # 5. Khối Đoạn văn bản thông thường (Paragraph)
         para_lines = [line]
         idx += 1
-        while idx < total_lines:
+        while idx < total_lines and not is_boilerplate_text(stripped):
             curr = lines[idx]
             curr_stripped = curr.strip()
             if not curr_stripped:
                 # Coalesce PDF/OCR-extracted table cells split by whitespace-only lines
                 last_stripped = para_lines[-1].strip()
-                if len(para_lines) < 45 and len(last_stripped) <= 56:
+                if len(para_lines) < 45 and len(last_stripped) <= 56 and not is_boilerplate_text(last_stripped):
                     peek_idx = idx + 1
                     while peek_idx < min(total_lines, idx + 8) and not lines[peek_idx].strip():
                         peek_idx += 1
@@ -563,10 +757,13 @@ def extract_canonical_blocks(
                         peek_stripped = peek_line.strip()
                         if (
                             len(peek_stripped) <= 56
+                            and not is_boilerplate_text(peek_stripped)
                             and not _PAGE_MARKER_RE.match(peek_stripped)
-                            and not peek_stripped.startswith("```")
+                            and not _FENCE_OPEN_RE.match(peek_line)
                             and not _HEADING_RE.match(peek_stripped)
-                            and not _TABLE_ROW_RE.match(peek_line)
+                            and not _is_setext_heading(lines, peek_idx)
+                            and not _HTML_TABLE_OPEN_RE.match(peek_stripped)
+                            and not _is_pipe_table_start(lines, peek_idx)
                             and not _LIST_ITEM_RE.match(peek_stripped)
                             and (
                                 any(ch.isdigit() or ch in "$%()" for ch in (last_stripped + peek_stripped))
@@ -581,9 +778,12 @@ def extract_canonical_blocks(
             # Dừng paragraph khi gặp page break, heading, code block, hoặc table
             if (
                 _PAGE_MARKER_RE.match(curr_stripped)
-                or curr_stripped.startswith("```")
+                or is_boilerplate_text(curr_stripped)
+                or _FENCE_OPEN_RE.match(curr)
                 or _HEADING_RE.match(curr_stripped)
-                or _TABLE_ROW_RE.match(curr)
+                or _is_setext_heading(lines, idx)
+                or _HTML_TABLE_OPEN_RE.match(curr_stripped)
+                or _is_pipe_table_start(lines, idx)
                 or _LIST_ITEM_RE.match(curr_stripped)
             ):
                 break
@@ -592,7 +792,7 @@ def extract_canonical_blocks(
 
         raw_para = "\n".join(para_lines)
         normalized_para = normalize_text(raw_para)
-        section_path = " > ".join(h for _, h in current_section_stack) or "Root"
+        section_path = _clamp_section_path(" > ".join(h for _, h in current_section_stack))
         para_segments = (
             segment_prose_by_information_cohesion(normalized_para, max_block_tokens=360)
             if estimate_unicode_tokens(normalized_para) > 360

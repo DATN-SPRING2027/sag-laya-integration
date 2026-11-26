@@ -2,6 +2,7 @@
 
 from sag_api.db.models.agent import Agent, AgentBinding, Message, Thread
 from sag_api.db.models.answer_actions import AnswerFeedback, AnswerShare
+from sag_api.db.models.conflict_resolution import KnowledgeConflictResolution
 from sag_api.db.models.document import Document
 from sag_api.db.models.job import Job
 from sag_api.db.models.knowledge import (
@@ -73,6 +74,7 @@ __all__ = [
     "ExplorationStep",
     "IngestionRun",
     "Job",
+    "KnowledgeConflictResolution",
     "KnowledgeGraphEdge",
     "KnowledgeEvidence",
     "KnowledgeGap",

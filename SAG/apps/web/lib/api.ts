@@ -43,6 +43,10 @@ import type {
   ExplorationSession,
   OctxImportAction,
   OctxTransfer,
+  ConflictActionResponse,
+  ConflictListParams,
+  ConflictListResponse,
+  ConflictResolveAction,
 } from "./types";
 
 /** 浏览器通过局域网 IP 打开前端时，自动将 API 指向同主机 8000 端口。 */
@@ -1254,4 +1258,76 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ query }),
     }),
+
+  // Knowledge conflict resolution inbox
+  listConflicts: (
+    params?: ConflictListParams,
+    opts?: { redirectOnUnauthorized?: boolean; signal?: AbortSignal },
+  ) => {
+    const query = new URLSearchParams();
+    if (params?.project_id?.trim()) {
+      query.set("project_id", params.project_id.trim());
+    }
+    if (params?.source_id?.trim()) {
+      query.set("source_id", params.source_id.trim());
+    }
+    if (params?.status?.length) {
+      for (const status of params.status) {
+        if (status) query.append("status", status);
+      }
+    }
+    if (params?.conflict_subtype?.length) {
+      for (const subtype of params.conflict_subtype) {
+        if (subtype) query.append("conflict_subtype", subtype);
+      }
+    }
+    if (params?.document_id?.trim()) {
+      query.set("document_id", params.document_id.trim());
+    }
+    if (params?.include_inactive === true) {
+      query.set("include_inactive", "true");
+    }
+    if (params?.limit != null) {
+      query.set("limit", String(params.limit));
+    }
+    if (params?.offset != null && params.offset > 0) {
+      query.set("offset", String(params.offset));
+    }
+    const qs = query.toString() ? `?${query.toString()}` : "";
+    return request<ConflictListResponse>(`/api/v1/conflicts${qs}`, {
+      redirectOnUnauthorized: opts?.redirectOnUnauthorized,
+      signal: opts?.signal,
+    });
+  },
+  resolveConflict: (
+    resolutionId: string,
+    body: { action: ConflictResolveAction; reason?: string },
+  ) => {
+    const payload: { action: ConflictResolveAction; reason?: string } = {
+      action: body.action,
+    };
+    const trimmedReason = body.reason?.trim();
+    if (trimmedReason) payload.reason = trimmedReason;
+    return request<ConflictActionResponse>(
+      `/api/v1/conflicts/${encodeURIComponent(resolutionId)}/resolve`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+    );
+  },
+  reopenConflict: (
+    resolutionId: string,
+    body?: { reason?: string },
+  ) => {
+    const trimmedReason = body?.reason?.trim();
+    const payload = trimmedReason ? { reason: trimmedReason } : {};
+    return request<ConflictActionResponse>(
+      `/api/v1/conflicts/${encodeURIComponent(resolutionId)}/reopen`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+    );
+  },
 };

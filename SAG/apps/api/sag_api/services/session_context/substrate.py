@@ -19,6 +19,9 @@ from typing import Any
 
 import igraph as ig
 
+from sag_api.core.bm25_tokenizer import tokenize_bm25_tokens
+from sag_api.core.logging import get_logger
+from sag_api.core.text_utils import normalize_text
 from sag_api.generation.prompt import estimate_tokens
 from sag_api.services.search_index_service import (
     COMMON_STOPWORDS,
@@ -28,10 +31,10 @@ from sag_api.services.search_index_service import (
     put_cached_text_embedding,
 )
 from sag_api.services.session_context.extractor import (
-    classify_epistemic_state,
+    ExtractedTurnAnalysis,
     extract_content_terms,
-    extract_superseded_entity_keys,
-    extract_turn_entities_and_sentences,
+    extract_structural_entities_and_sentences,
+    extract_turns_structured_batch,
     normalize_session_text,
 )
 from sag_api.services.session_context.models import (
@@ -44,6 +47,7 @@ from sag_api.services.session_context.models import (
 )
 
 FALLBACK_VECTOR_DIM = 256
+log = get_logger("sag.session_context.substrate")
 EPISODE_TIME_GAP_SECONDS = 1800.0  # 30 minutes
 EPISODE_CENTROID_COS_THRESHOLD = 0.72
 EPISODE_LEXICAL_JACCARD_THRESHOLD = 0.18
@@ -98,17 +102,10 @@ def deterministic_ngram_vector(text: str, dim: int = FALLBACK_VECTOR_DIM) -> tup
 
 def tokenize_bm25_terms(text: str) -> tuple[dict[str, int], int]:
     """Tokenize text identically to search_index_service.compute_sparse_bm25_vector for dynamic corpus IDF."""
-    cleaned_text = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", normalize_session_text(text).lower())
-    tokens = re.findall(r"\w+", cleaned_text)
-    if not tokens:
+    tokenized = tokenize_bm25_tokens(text, filter_stopwords=True)
+    if not tokenized.tokens:
         return {}, 1
-    expanded_tokens: list[str] = list(tokens)
-    for tok in tokens:
-        if tok.isalnum() and not tok.isalpha() and not tok.isdigit() and len(tok) >= 3:
-            for sub in re.findall(r"[a-z]+|\d{2,}", tok):
-                if len(sub) >= 2:
-                    expanded_tokens.append(sub)
-    return dict(Counter(expanded_tokens)), max(1, len(tokens))
+    return dict(Counter(tokenized.expanded_tokens)), max(1, len(tokenized.tokens))
 
 
 def declared_embedder_dim(embedder: Any | None) -> int | None:
@@ -160,12 +157,15 @@ async def embed_texts_with_provenance(
         return [deterministic_ngram_vector(t) for t in texts], "deterministic-ngram-v1"
 
     emb_sig = compute_embedding_signature(embedder)
+    from sag_api.services.search_index_service import build_embedding_model_signature
+
+    cache_sig = build_embedding_model_signature(embedder)
     expected_dim = declared_embedder_dim(embedder)
     results: list[tuple[float, ...] | None] = [None] * len(texts)
     missing_indices: list[int] = []
     missing_texts: list[str] = []
     for idx, txt in enumerate(texts):
-        cached = get_cached_text_embedding(txt, model_signature=emb_sig)
+        cached = get_cached_text_embedding(txt, model_signature=cache_sig)
         if (
             cached is not None
             and len(cached) > 0
@@ -188,9 +188,14 @@ async def embed_texts_with_provenance(
                     raise ValueError(
                         f"Embedder {emb_sig} returned dim={len(raw_vec)}, expected {expected_dim}"
                     )
-                put_cached_text_embedding(txt, raw_vec, model_signature=emb_sig)
+                put_cached_text_embedding(txt, raw_vec, model_signature=cache_sig)
                 results[idx] = l2_normalize(raw_vec)
-        except Exception:  # noqa: BLE001 - fail-open to deterministic local projection if HTTP embedder errors
+        except Exception as exc:  # noqa: BLE001 - fail-open to deterministic local projection if HTTP embedder errors
+            log.warning(
+                "Session embedder failed during batch embed (sig=%s); falling back to deterministic-ngram-v1: %s",
+                emb_sig,
+                type(exc).__name__,
+            )
             return [deterministic_ngram_vector(t) for t in texts], "deterministic-ngram-v1"
 
     finalized = [
@@ -210,10 +215,16 @@ async def embed_texts_with_provenance(
                     raise ValueError("Inconsistent vector dimensions within single embedder batch")
                 rebuilt: list[tuple[float, ...]] = []
                 for txt, raw_vec in zip(texts, recomputed, strict=True):
-                    put_cached_text_embedding(txt, raw_vec, model_signature=emb_sig)
+                    put_cached_text_embedding(txt, raw_vec, model_signature=cache_sig)
                     rebuilt.append(l2_normalize(raw_vec))
                 return rebuilt, emb_sig
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "Session embedder failed during dimension-drift recompute "
+                    "(sig=%s); falling back to deterministic-ngram-v1: %s",
+                    emb_sig,
+                    type(exc).__name__,
+                )
                 return [deterministic_ngram_vector(t) for t in texts], "deterministic-ngram-v1"
 
     return finalized, emb_sig
@@ -266,9 +277,10 @@ def min_max_normalize(scores: dict[str, float]) -> dict[str, float]:
 class IncrementalSessionIndex:
     """Append-only multi-view session memory substrate (O(Delta) per turn, 0 full-cache resets)."""
 
-    def __init__(self, thread_id: str, *, scope_signature: str = "") -> None:
+    def __init__(self, thread_id: str, *, scope_signature: str = "", tenant_id: str = "") -> None:
         self.thread_id = thread_id
         self.scope_signature = scope_signature
+        self.tenant_id = tenant_id
         self.embedding_mode: str = "unset"
         self.turns: list[IndexedTurn] = []
         self.turns_by_id: dict[str, IndexedTurn] = {}
@@ -302,6 +314,10 @@ class IncrementalSessionIndex:
         self.inherited_decision_count: int = 0
         self.force_new_episode_next: bool = False
         self.inherited_lineage_signature: str = ""
+        self.extraction_degraded: bool = False
+        self.extraction_degraded_reason: str | None = None
+        self.embedding_degraded: bool = False
+        self.embedding_degraded_reason: str | None = None
 
     def seal_inherited_boundary(self) -> None:
         """Freeze inherited ancestor prefix boundaries so own units never reference ancestor Message IDs."""
@@ -325,13 +341,15 @@ class IncrementalSessionIndex:
         raw_messages: Sequence[dict[str, Any]],
         *,
         embedder: Any | None = None,
+        llm: Any | None = None,
         project_aliases: Sequence[tuple[str, str]] = (),
+        tenant_id: str | None = None,
     ) -> int:
         """Incrementally index only unseen messages in chronological order."""
         target_mode = compute_embedding_signature(embedder)
         if self.embedding_mode not in {"unset", target_mode}:
             # Vector space changed -> rebuild cleanly in the new vector space
-            self.__init__(self.thread_id, scope_signature=self.scope_signature)
+            self.__init__(self.thread_id, scope_signature=self.scope_signature, tenant_id=self.tenant_id)
 
         pending: list[dict[str, Any]] = []
         for msg in raw_messages:
@@ -350,23 +368,33 @@ class IncrementalSessionIndex:
                 self.embedding_mode = target_mode
             return 0
 
-        # Pre-extract entities & sentences for all pending turns (0 LLM calls)
-        extracted_per_msg: list[tuple[list[EntityMention], list[tuple[str, tuple[str, ...]]]]] = []
+        # Structured LLM turn analysis (batched & tenant/thread-scoped cached) + structural E0/E1 spans
+        base_ordinal = len(self.turns)
+        eff_tenant = (
+            str(tenant_id or self.tenant_id or (f"scope:{self.scope_signature}" if self.scope_signature else ""))
+            .strip()
+            or None
+        )
+        analyses, batch_degraded, batch_degraded_reason = await extract_turns_structured_batch(
+            pending,
+            llm=llm,
+            project_aliases=project_aliases,
+            base_ordinal=base_ordinal,
+            tenant_id=eff_tenant,
+            thread_id=self.thread_id,
+        )
+        if batch_degraded:
+            self.extraction_degraded = True
+            self.extraction_degraded_reason = self.extraction_degraded_reason or batch_degraded_reason
+
+        extracted_per_msg: list[ExtractedTurnAnalysis] = analyses
         texts_to_embed: list[str] = []
         turn_vec_offsets: list[int] = []
         sent_vec_ranges: list[tuple[int, int]] = []
 
-        base_ordinal = len(self.turns)
         for offset, msg in enumerate(pending):
-            t_id = str(msg["id"])
             content = normalize_session_text(str(msg["content"]))
-            mentions, sent_items = extract_turn_entities_and_sentences(
-                t_id,
-                base_ordinal + offset,
-                content,
-                project_aliases=project_aliases,
-            )
-            extracted_per_msg.append((mentions, sent_items))
+            sent_items = extracted_per_msg[offset].sentences
             turn_vec_offsets.append(len(texts_to_embed))
             texts_to_embed.append(content)
             s_start_idx = len(texts_to_embed)
@@ -376,6 +404,11 @@ class IncrementalSessionIndex:
 
         # Single batch embedding call across all new turns + sentences (with provenance verification)
         all_vectors, actual_sig = await embed_texts_with_provenance(texts_to_embed, embedder=embedder)
+        if embedder is not None and actual_sig == "deterministic-ngram-v1":
+            self.embedding_degraded = True
+            self.embedding_degraded_reason = (
+                self.embedding_degraded_reason or "http_embedder_fallback_deterministic_ngram"
+            )
         if self.turns and actual_sig != self.embedding_mode:
             # HTTP embedder degraded mid-thread -> re-project entire thread in uniform fallback space
             prior_records = [
@@ -390,19 +423,35 @@ class IncrementalSessionIndex:
             ]
             inh_k = self.inherited_turn_count
             inh_sig = self.inherited_lineage_signature
-            self.__init__(self.thread_id, scope_signature=self.scope_signature)
+            saved_tenant = self.tenant_id
+            was_emb_degraded = self.embedding_degraded
+            emb_degraded_reason = self.embedding_degraded_reason
+            self.__init__(
+                self.thread_id,
+                scope_signature=self.scope_signature,
+                tenant_id=saved_tenant,
+            )
+            if was_emb_degraded or actual_sig == "deterministic-ngram-v1":
+                self.embedding_degraded = True
+                self.embedding_degraded_reason = (
+                    emb_degraded_reason or "http_embedder_degraded_mid_thread"
+                )
             if inh_k > 0:
                 await self.append_messages(
                     prior_records[:inh_k],
                     embedder=None,
+                    llm=llm,
                     project_aliases=project_aliases,
+                    tenant_id=eff_tenant,
                 )
                 self.seal_inherited_boundary()
                 self.inherited_lineage_signature = inh_sig
             await self.append_messages(
                 [*prior_records[inh_k:], *pending],
                 embedder=None,
+                llm=llm,
                 project_aliases=project_aliases,
+                tenant_id=eff_tenant,
             )
             return len(pending)
         self.embedding_mode = actual_sig
@@ -423,7 +472,9 @@ class IncrementalSessionIndex:
                 ts = float(ordinal * 60)
                 iso = ""
 
-            mentions, sent_items = extracted_per_msg[offset]
+            analysis = extracted_per_msg[offset]
+            mentions = list(analysis.entities)
+            sent_items = list(analysis.sentences)
             t_vec = all_vectors[turn_vec_offsets[offset]]
             s_lo, s_hi = sent_vec_ranges[offset]
             s_vecs = all_vectors[s_lo:s_hi]
@@ -454,8 +505,10 @@ class IncrementalSessionIndex:
                 corpus_doc_freqs=self.doc_freqs,
                 total_corpus_docs=max(50, ordinal + 1),
             )
-            epistemic_status, slot_key, is_anaphoric = classify_epistemic_state(content, role=role)
-            superseded_ent_keys = extract_superseded_entity_keys(content, mentions)
+            epistemic_status = analysis.epistemic_status
+            slot_key = analysis.topic_slot_key
+            is_anaphoric = analysis.is_anaphoric_or_short
+            superseded_ent_keys = analysis.superseded_entity_keys
 
             episode = self._assign_or_open_episode(
                 turn_id=t_id,
@@ -464,7 +517,7 @@ class IncrementalSessionIndex:
                 ts=ts,
             )
 
-            # Anaphoric confirmation resolution ("Chốt phương án 2 như anh Minh vừa đề xuất nhé")
+            # Anaphoric confirmation resolution
             companion_ids: tuple[str, ...] = ()
             if (
                 epistemic_status == "CONFIRMED"
@@ -506,6 +559,9 @@ class IncrementalSessionIndex:
                 topic_slot_key=slot_key,
                 superseded_entity_keys=superseded_ent_keys,
                 is_anaphoric_or_short=is_anaphoric,
+                is_interrogative=analysis.is_interrogative,
+                intrinsic_epistemic_status=epistemic_status,
+                extraction_degraded=analysis.degraded,
                 cited_source_ids=cited_sources,
             )
             self.turns.append(turn_obj)
@@ -617,10 +673,12 @@ class IncrementalSessionIndex:
         window.content_terms = frozenset(merged_terms)
 
     def _register_turn_entities(self, turn: IndexedTurn) -> None:
+        norm_content_cf = normalize_text(turn.content, preserve_code=True).casefold()
         for mention in turn.entities:
             self.entity_surfaces.setdefault(mention.key, mention.surface)
             turn_counts = self.entity_to_turn_counts.setdefault(mention.key, {})
-            occ = max(1, turn.content.casefold().count(mention.surface.casefold()))
+            norm_surface_cf = normalize_text(mention.surface, preserve_code=True).casefold()
+            occ = max(1, norm_content_cf.count(norm_surface_cf)) if norm_surface_cf else 1
             turn_counts[turn.turn_id] = turn_counts.get(turn.turn_id, 0) + occ
             for alias_key in mention.soft_aliases:
                 self.soft_alias_neighbors.setdefault(mention.key, set()).add(alias_key)
@@ -854,15 +912,20 @@ class IncrementalSessionIndex:
         hybrid_scores: dict[str, float],
         *,
         allowed_turn_ids: set[str] | None = None,
+        query_entities: Sequence[EntityMention] = (),
     ) -> dict[str, float]:
-        """V2: Zero-Mem Query-Conditioned Entity-Sentence Sparse Activation + Bounded igraph PPR."""
+        """V2: Query-Conditioned Entity-Sentence Sparse Activation + Bounded igraph PPR."""
         visible_turns = [
             t for t in self.turns if allowed_turn_ids is None or t.turn_id in allowed_turn_ids
         ]
         if not visible_turns:
             return {}
 
-        q_mentions, _ = extract_turn_entities_and_sentences("query", 0, query)
+        struct_mentions, _ = extract_structural_entities_and_sentences("query", 0, query)
+        q_mentions_by_key: dict[str, EntityMention] = {m.key: m for m in struct_mentions}
+        for m in query_entities:
+            q_mentions_by_key.setdefault(m.key, m)
+        q_mentions = list(q_mentions_by_key.values())
         q_terms = extract_content_terms(query)
 
         # 1. Seed entity activations (exact + lexical surface overlap + soft alias expansion)
@@ -1014,15 +1077,13 @@ class IncrementalSessionIndex:
         hybrid_scores: dict[str, float],
         *,
         temporal_mode: str = "atemporal",
+        hierarchy_bias: str = "none",
         allowed_turn_ids: set[str] | None = None,
     ) -> dict[str, float]:
         """V3: 4-Level Temporal-Semantic Hierarchy (Session -> Drift Episode -> 3-Turn Window -> Turn)."""
         q_terms = extract_content_terms(query)
-        q_lower = query.casefold()
-        prefers_early = bool(re.search(r"\b(?:đầu\s+phiên|đầu\s+buổi|lúc\s+đầu|ban\s+đầu|first|beginning)\b", q_lower))
-        prefers_recent = bool(
-            re.search(r"\b(?:vừa\s+bàn|lúc\s+nãy|mới\s+nhất|gần\s+nhất|tiếp\s+tục|just\s+now|latest)\b", q_lower)
-        )
+        prefers_early = hierarchy_bias == "early"
+        prefers_recent = hierarchy_bias == "recent"
 
         ep_scores: dict[str, float] = {}
         n_eps = max(1, len(self.episodes))

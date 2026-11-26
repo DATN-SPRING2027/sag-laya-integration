@@ -17,6 +17,7 @@ from sag_api.core.errors import (
     ValidationError,
 )
 from sag_api.core.principal_assertion import VerifiedPrincipal, require_principal_assertion
+from sag_api.core.text_utils import normalize_text
 from sag_api.sag import EngineManager
 from sag_api.schemas.dify import (
     DifyRetrievalRecord,
@@ -60,7 +61,7 @@ async def retrieval(
     """Adapt one SAG source to Dify's external knowledge retrieval contract."""
 
     knowledge_id = body.knowledge_id.strip()
-    query = body.query.strip()
+    query = normalize_text(body.query)
     if not knowledge_id and not query:
         return DifyRetrievalResponse()
     if not knowledge_id or not query:
@@ -102,24 +103,32 @@ async def retrieval(
         or strategy
     )
     fallback_used = bool(outcome.stats.get("fallback_used", False))
-    records = [
-        DifyRetrievalRecord(
-            content=section.content,
-            title=_section_title(source.name, section.heading),
-            score=section.score,
-            metadata={
-                "document_id": section.document_id or (
-                    f"{source.id}:{section.chunk_id}" if section.chunk_id else source.id
-                ),
-                "source_id": source.id,
-                "source_name": source.name,
-                "chunk_id": getattr(section, "search_unit_id", None) or section.chunk_id or "",
-                "heading": section.heading,
-                "retrieval_strategy": effective_strategy,
-                "fallback_used": fallback_used,
-            },
+    records = []
+    for section in outcome.sections:
+        semantic_score = float(
+            section.raw_dense_score
+            if section.raw_dense_score is not None
+            else section.score
         )
-        for section in outcome.sections
-        if section.score >= body.retrieval_setting.score_threshold
-    ]
+        if semantic_score < body.retrieval_setting.score_threshold:
+            continue
+        records.append(
+            DifyRetrievalRecord(
+                content=section.content,
+                title=_section_title(source.name, section.heading),
+                score=max(0.0, semantic_score),
+                metadata={
+                    "document_id": section.document_id or (
+                        f"{source.id}:{section.chunk_id}" if section.chunk_id else source.id
+                    ),
+                    "source_id": source.id,
+                    "source_name": source.name,
+                    "chunk_id": getattr(section, "search_unit_id", None) or section.chunk_id or "",
+                    "heading": section.heading,
+                    "hybrid_score": section.score,
+                    "retrieval_strategy": effective_strategy,
+                    "fallback_used": fallback_used,
+                },
+            )
+        )
     return DifyRetrievalResponse(records=records[:body.retrieval_setting.top_k])

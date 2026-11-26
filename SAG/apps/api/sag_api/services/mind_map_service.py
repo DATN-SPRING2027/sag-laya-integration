@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import inspect
 import json
 import math
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any, Literal
 
 from pydantic import ValidationError as PydanticValidationError
@@ -24,6 +24,7 @@ from sqlalchemy.orm import aliased
 from sag_api.core.errors import ForbiddenError, ServiceUnavailableError
 from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal
+from sag_api.core.text_utils import normalize_text
 from sag_api.core.token_usage import extract_chat_usage, token_usage_scope
 from sag_api.db.base import new_id
 from sag_api.db.models import (
@@ -39,6 +40,8 @@ from sag_api.db.models import (
     StageRun,
 )
 from sag_api.enums import DocumentStatus, JobStatus, JobType
+from sag_api.generation.json_parser import decode_json_object
+from sag_api.generation.llm import StructuredLLMClient
 from sag_api.schemas.mind_map import (
     MindMapCitationOut,
     MindMapCoverageOut,
@@ -47,14 +50,17 @@ from sag_api.schemas.mind_map import (
     MindMapOut,
     MindMapUsageOut,
 )
+from sag_api.services.unit_supersession_overlay import (
+    build_active_superseded_unit_exists,
+    compute_scope_supersession_digest,
+)
 
 log = get_logger("services.mind_map")
 
-_CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.DOTALL)
 _CONTINUUM_DOC_ID_RE = re.compile(
     r"^(?:continuum:project_document:|project-document:)?([0-9a-fA-F]{24})\Z"
 )
-_SECTION_SPLIT_RE = re.compile(r"\s*(?:>|/|→|\|)\s*")
+_SECTION_SPLIT_RE = re.compile(r"\s*(?:>|→|\|)\s*")
 _WORD_TOKEN_RE = re.compile(r"[\w]{2,}", re.UNICODE)
 
 _MAX_DOCUMENTS = 24
@@ -90,6 +96,8 @@ class _ReadyDocumentScope:
     total_unit_count: int
     updated_sort_key: float
     project_id: str = ""
+    authority_tier: int | None = None
+    effective_from_iso: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,7 +165,7 @@ def _topic_terms(topic: str | None) -> list[str]:
     if not topic:
         return []
     seen: list[str] = []
-    for match in _WORD_TOKEN_RE.findall(topic.casefold()):
+    for match in _WORD_TOKEN_RE.findall(normalize_text(topic).casefold()):
         if match not in seen:
             seen.append(match)
         if len(seen) >= 8:
@@ -175,10 +183,10 @@ def _score_text_against_topic(
 ) -> float:
     if not topic:
         return 0.0
-    needle = topic.casefold()
-    fname_l = filename.casefold()
-    sec_l = section_path.casefold()
-    body_l = content.casefold()
+    needle = normalize_text(topic).casefold()
+    fname_l = normalize_text(filename).casefold()
+    sec_l = normalize_text(section_path).casefold()
+    body_l = normalize_text(content).casefold()
     score = 0.0
     if needle in sec_l:
         score += 12.0
@@ -355,12 +363,23 @@ async def _load_project_scope_snapshot(
         unit_counts: dict[str, int] = {}
         manifest_by_ver: dict[str, str] = {}
         if candidate_ready_ver_ids:
+            active_superseded_exists = build_active_superseded_unit_exists(
+                SearchUnit.id,
+                tenant_id=tenant_id,
+                project_ids=scoped_project_ids,
+                allowed_partitions=allowed_partitions,
+                reference_time=now,
+                organization_id=principal.organization_id,
+                allowed_source_ids=source_ids,
+                hidden_document_ids=hidden_ids,
+            )
             count_rows = (
                 await session.execute(
                     select(SearchUnit.document_version_id, func.count(SearchUnit.id))
                     .where(
                         SearchUnit.document_version_id.in_(sorted(candidate_ready_ver_ids)),
                         SearchUnit.security_partition_id.in_(sorted(allowed_partitions)),
+                        ~active_superseded_exists,
                     )
                     .group_by(SearchUnit.document_version_id)
                 )
@@ -420,6 +439,7 @@ async def _load_project_scope_snapshot(
             if chosen_ready is not None:
                 vid_str = str(chosen_ready.id)
                 updated_dt = _as_utc(getattr(doc, "updated_at", None) or getattr(doc, "created_at", None))
+                eff_dt = _as_utc(chosen_ready.effective_from)
                 ready_docs.append(
                     _ReadyDocumentScope(
                         sag_document_id=doc_id_str,
@@ -435,6 +455,12 @@ async def _load_project_scope_snapshot(
                         total_unit_count=unit_counts[vid_str],
                         updated_sort_key=updated_dt.timestamp() if updated_dt else 0.0,
                         project_id=str(doc.project_id or ""),
+                        authority_tier=(
+                            int(chosen_ready.authority_tier)
+                            if chosen_ready.authority_tier is not None
+                            else None
+                        ),
+                        effective_from_iso=eff_dt.isoformat() if eff_dt is not None else "",
                     )
                 )
             elif (usable or not all_vers) and (
@@ -449,12 +475,32 @@ async def _load_project_scope_snapshot(
             ).hexdigest()
             return [], pending_count, fp
 
-        fp_payload = "|".join(
-            f"{d.sag_document_id}:{d.document_version_id}:{d.version_no}:{d.manifest_fingerprint}"
-            for d in sorted(ready_docs, key=lambda item: (item.sag_document_id, item.document_version_id))
+        supersession_digest = await compute_scope_supersession_digest(
+            session,
+            version_ids=candidate_ready_ver_ids,
+            tenant_ids=[tenant_id],
+            project_ids=scoped_project_ids,
+            allowed_partitions=allowed_partitions,
+            reference_time=now,
+            organization_id=principal.organization_id,
+            allowed_source_ids=source_ids,
+            hidden_document_ids=hidden_ids,
         )
+
+        fp_parts: list[str] = []
+        for d in sorted(ready_docs, key=lambda item: (item.sag_document_id, item.document_version_id)):
+            meta_suffix = (
+                f":at={d.authority_tier}:ef={d.effective_from_iso}"
+                if (d.authority_tier is not None or d.effective_from_iso)
+                else ""
+            )
+            fp_parts.append(
+                f"{d.sag_document_id}:{d.document_version_id}:{d.version_no}:{d.manifest_fingerprint}{meta_suffix}"
+            )
+        fp_payload = "|".join(fp_parts)
+        sup_suffix = f":sup={supersession_digest}" if supersession_digest != "none" else ""
         scope_fp = hashlib.sha256(
-            f"ready:{tenant_id}:{project_id}:{fp_payload}".encode()
+            f"ready:{tenant_id}:{project_id}:{fp_payload}{sup_suffix}".encode()
         ).hexdigest()
         return ready_docs, pending_count, scope_fp
     except SQLAlchemyError as error:
@@ -470,7 +516,8 @@ def _stratify_documents_across_projects(
     ordered_docs: list[_ReadyDocumentScope],
     limit: int,
 ) -> list[_ReadyDocumentScope]:
-    """Select up to `limit` documents in round-robin across project buckets so multi-project ('all') scopes stay balanced."""
+    """Select up to `limit` documents in round-robin across project buckets
+    so multi-project ('all') scopes stay balanced."""
     if len(ordered_docs) <= limit:
         return list(ordered_docs)
     project_buckets: dict[str, list[_ReadyDocumentScope]] = {}
@@ -508,9 +555,21 @@ async def _select_evidence_catalog(
     ready_docs: list[_ReadyDocumentScope],
     pending_count: int,
     topic: str | None,
+    project_id: str | None = None,
+    reference_time: datetime | None = None,
 ) -> tuple[list[_CatalogEvidence], MindMapCoverageOut, dict[str, list[str]]]:
     terms = _topic_terms(topic)
     allowed_partitions = sorted(principal.allowed_partition_ids)
+    tenant_id = (principal.tenant_id or principal.organization_id or "").strip()
+    now_utc = reference_time or datetime.now(UTC)
+    if project_id and project_id != "all":
+        scoped_project_ids = [project_id]
+    else:
+        scoped_project_ids = (
+            sorted({d.project_id for d in ready_docs if d.project_id})
+            or sorted(principal.allowed_project_ids)
+        )
+    confirmed_source_ids = sorted({d.source_id for d in ready_docs if d.source_id})
 
     try:
         ordered_docs = list(ready_docs)
@@ -564,6 +623,7 @@ async def _select_evidence_catalog(
         unit_order = (
             SearchUnit.page_from.asc(),
             start_block.ordinal.asc(),
+            func.coalesce(SearchUnit.char_start, 0).asc(),
             SearchUnit.id.asc(),
         )
         if topic:
@@ -595,10 +655,47 @@ async def _select_evidence_catalog(
                 .scalar_subquery()
             )
             unit_order = ((heading_score + func.coalesce(span_score, 0.0)).desc(), *unit_order)
+        confirmed_spm_source_ids = (
+            list(
+                (
+                    await session.scalars(
+                        select(SourceProjectMapping.source_id)
+                        .where(
+                            SourceProjectMapping.organization_id == principal.organization_id,
+                            SourceProjectMapping.project_id.in_(scoped_project_ids),
+                            SourceProjectMapping.state == "CONFIRMED",
+                        )
+                        .distinct()
+                    )
+                ).all()
+            )
+            if scoped_project_ids and principal.organization_id
+            else []
+        )
+        all_confirmed_source_ids = sorted(
+            {str(sid) for sid in confirmed_spm_source_ids if sid}
+            | set(confirmed_source_ids)
+        )
+        hidden_ids = await _hidden_control_document_ids(session, all_confirmed_source_ids)
+        active_superseded_exists = build_active_superseded_unit_exists(
+            SearchUnit.id,
+            tenant_id=tenant_id,
+            project_ids=scoped_project_ids,
+            allowed_partitions=allowed_partitions,
+            reference_time=now_utc,
+            organization_id=principal.organization_id,
+            allowed_source_ids=all_confirmed_source_ids or None,
+            hidden_document_ids=hidden_ids,
+        )
         ranked_units = (
             select(
                 SearchUnit.id.label("unit_id"),
                 SearchUnit.document_version_id.label("document_version_id"),
+                SearchUnit.block_from_id.label("block_from_id"),
+                SearchUnit.block_to_id.label("block_to_id"),
+                SearchUnit.char_start.label("char_start"),
+                SearchUnit.char_end.label("char_end"),
+                SearchUnit.text_snapshot.label("text_snapshot"),
                 SearchUnit.page_from.label("page_from"),
                 SearchUnit.page_to.label("page_to"),
                 SearchUnit.section_path.label("section_path"),
@@ -618,6 +715,7 @@ async def _select_evidence_catalog(
                 SearchUnit.security_partition_id.in_(allowed_partitions),
                 start_block.document_version_id == SearchUnit.document_version_id,
                 end_block.document_version_id == SearchUnit.document_version_id,
+                ~active_superseded_exists,
             )
             .subquery()
         )
@@ -629,9 +727,32 @@ async def _select_evidence_catalog(
         unit_rows = (await session.execute(unit_stmt)).all()
 
         selected_subq = unit_stmt.subquery()
+        is_sliced_unit = or_(
+            and_(selected_subq.c.text_snapshot.is_not(None), selected_subq.c.text_snapshot != ""),
+            and_(
+                selected_subq.c.block_from_id == selected_subq.c.block_to_id,
+                selected_subq.c.char_start.is_not(None),
+                selected_subq.c.char_end.is_not(None),
+                selected_subq.c.char_end >= selected_subq.c.char_start,
+            ),
+        )
+        block_text_expr = case(
+            (and_(selected_subq.c.text_snapshot.is_not(None), selected_subq.c.text_snapshot != ""), ""),
+            (
+                and_(
+                    selected_subq.c.block_from_id == selected_subq.c.block_to_id,
+                    selected_subq.c.char_start.is_not(None),
+                    selected_subq.c.char_end.is_not(None),
+                    selected_subq.c.char_end >= selected_subq.c.char_start,
+                ),
+                func.substr(CanonicalBlock.normalized_text, 1, selected_subq.c.char_end),
+            ),
+            else_=func.substr(CanonicalBlock.normalized_text, 1, _MAX_UNIT_CHARS),
+        )
         block_window = (
             select(
                 selected_subq.c.unit_id,
+                is_sliced_unit.label("is_sliced_unit"),
                 func.length(CanonicalBlock.normalized_text).label("text_length"),
                 func.count().over(partition_by=selected_subq.c.unit_id).label("block_total"),
                 func.row_number()
@@ -640,7 +761,7 @@ async def _select_evidence_catalog(
                     order_by=(CanonicalBlock.ordinal.asc(), CanonicalBlock.id.asc()),
                 )
                 .label("block_rn"),
-                func.substr(CanonicalBlock.normalized_text, 1, _MAX_UNIT_CHARS).label("text_slice"),
+                block_text_expr.label("text_slice"),
             )
             .join(
                 CanonicalBlock,
@@ -652,23 +773,26 @@ async def _select_evidence_catalog(
             )
             .subquery()
         )
-        blk_rows = (
-            await session.execute(
-                select(block_window)
-                .where(block_window.c.block_rn <= _MAX_BLOCKS_PER_UNIT)
-                .order_by(block_window.c.unit_id.asc(), block_window.c.block_rn.asc())
-            )
-        ).all()
+        blk_stmt = (
+            select(block_window)
+            .where(block_window.c.block_rn <= _MAX_BLOCKS_PER_UNIT)
+            .order_by(block_window.c.unit_id.asc(), block_window.c.block_rn.asc())
+        )
+        blk_rows = (await session.execute(blk_stmt)).all()
     except SQLAlchemyError as error:
         log.warning("mind map evidence hydration failed error_type=%s", type(error).__name__)
         raise ServiceUnavailableError("Mind map evidence is temporarily unavailable") from error
 
-    blocks_by_unit: dict[str, list[str]] = defaultdict(list)
+    from sag_api.services.search_index_service import resolve_search_unit_text
+
+    blocks_by_unit: dict[str, list[SimpleNamespace]] = defaultdict(list)
     truncated_unit_ids: set[str] = set()
-    for unit_id, text_length, block_total, _block_rn, text_slice in blk_rows:
+    for unit_id, sliced_flag, text_length, block_total, _block_rn, text_slice in blk_rows:
         uid = str(unit_id)
-        blocks_by_unit[uid].append(str(text_slice or ""))
-        if int(block_total or 0) > _MAX_BLOCKS_PER_UNIT or int(text_length or 0) > _MAX_UNIT_CHARS:
+        blocks_by_unit[uid].append(SimpleNamespace(normalized_text=str(text_slice or "")))
+        if not sliced_flag and (
+            int(block_total or 0) > _MAX_BLOCKS_PER_UNIT or int(text_length or 0) > _MAX_UNIT_CHARS
+        ):
             truncated_unit_ids.add(uid)
 
     per_doc_candidates: dict[str, list[_CandidateUnit]] = defaultdict(list)
@@ -680,9 +804,14 @@ async def _select_evidence_catalog(
         if doc is None or int(row.start_ordinal) > int(row.end_ordinal):
             continue
         uid = str(row.unit_id)
-        raw_joined = "\n\n".join(
-            part.strip() for part in blocks_by_unit.get(uid, ()) if part and part.strip()
-        ).strip()
+        unit_proxy = SimpleNamespace(
+            block_from_id=row.block_from_id,
+            block_to_id=row.block_to_id,
+            char_start=row.char_start,
+            char_end=row.char_end,
+            text_snapshot=row.text_snapshot,
+        )
+        raw_joined = resolve_search_unit_text(unit_proxy, blocks_by_unit.get(uid, ())).strip()
         if not raw_joined:
             continue
         was_truncated = uid in truncated_unit_ids or len(raw_joined) > _MAX_UNIT_CHARS
@@ -876,21 +1005,7 @@ def _render_llm_prompt(
 
 
 def _extract_json_dict(raw: str) -> dict[str, Any] | None:
-    cleaned = _CODE_FENCE_RE.sub("", (raw or "").strip()).strip()
-    if not cleaned:
-        return None
-    try:
-        parsed = json.loads(cleaned)
-    except json.JSONDecodeError:
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start == -1 or end <= start:
-            return None
-        try:
-            parsed = json.loads(cleaned[start : end + 1])
-        except json.JSONDecodeError:
-            return None
-    return parsed if isinstance(parsed, dict) else None
+    return decode_json_object(raw or "")
 
 
 def _parse_valid_citation_indices(raw_node: dict[str, Any], max_index: int) -> list[int]:
@@ -1259,18 +1374,11 @@ def _build_outline_fallback_tree(
     return _finalize_draft_tree(root_draft, by_index)
 
 
-async def _call_llm_json(llm: Any, messages: list[dict[str, str]]) -> str:
-    sig = inspect.signature(llm.complete)
-    params = sig.parameters
-    supports_rf = "response_format" in params or any(
-        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+async def _call_llm_json(llm: StructuredLLMClient, messages: list[dict[str, str]]) -> str:
+    return await asyncio.wait_for(
+        llm.complete(messages, response_format=_MIND_MAP_RESPONSE_FORMAT),
+        timeout=_MIND_MAP_LLM_TIMEOUT_SECONDS,
     )
-    coro = (
-        llm.complete(messages, response_format=_MIND_MAP_RESPONSE_FORMAT)
-        if supports_rf
-        else llm.complete(messages)
-    )
-    return await asyncio.wait_for(coro, timeout=_MIND_MAP_LLM_TIMEOUT_SECONDS)
 
 
 def _partition_scope_hash(principal: VerifiedPrincipal) -> str:
@@ -1633,6 +1741,8 @@ async def generate_project_mind_map(
         ready_docs=ready_docs,
         pending_count=pending_count,
         topic=topic_display,
+        project_id=project_id,
+        reference_time=now,
     )
     if not catalog:
         await _evict_snapshot(

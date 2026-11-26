@@ -5,9 +5,12 @@ from __future__ import annotations
 import hashlib
 import os
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
+import httpx
 from sqlalchemy import case, func, select, tuple_, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,6 +27,8 @@ from sag_api.core.identity import (
 )
 from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal as AssertionVerifiedPrincipal
+from sag_api.core.sanitizer import sanitize_error_message
+from sag_api.core.text_utils import estimate_tokens
 from sag_api.db.base import new_id
 from sag_api.db.models import Document, Job, Source, SourceProjectMapping
 from sag_api.db.models.routing_rag import (
@@ -35,11 +40,20 @@ from sag_api.db.models.routing_rag import (
     StageRun,
     UploadIdempotencyKey,
 )
-from sag_api.enums import ConnectorKind, DocumentStatus, JobStatus, JobType, SourceType
+from sag_api.enums import (
+    ConnectorKind,
+    DocumentStatus,
+    JobStatus,
+    JobType,
+    SourceType,
+    normalize_authority_tier,
+    normalize_scope_tags,
+)
 from sag_api.jobs import JobQueue
 from sag_api.jobs.scheduling import DELETE_PRIORITY, RESUME_PRIORITY, set_scheduler
 from sag_api.schemas.routing_rag import (
     DocumentExtractedChunkItem,
+    DocumentMetadataPatchResponse,
     DocumentRevokeResponse,
     DocumentUploadResponse,
     DocumentVersionChunksResponse,
@@ -52,6 +66,280 @@ from sag_api.schemas.routing_rag import (
 from sag_api.services.source_operation_service import touch_source_revision
 
 log = get_logger("services.document")
+
+_SENTINEL_EFFECTIVE_CUTOFF = datetime(9999, 1, 1, 0, 0, 0, tzinfo=UTC)
+_MAX_VALID_TO = datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC)
+_UNSET: Any = object()
+
+
+def _as_utc_dt(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def _normalize_timestamp_input(
+    value: datetime | None,
+    *,
+    field_name: str,
+    reject_sentinel: bool = False,
+) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, datetime):
+        raise ValidationError(
+            f"Invalid {field_name} timestamp",
+            layer=ErrorLayer.CLIENT,
+            stage=ErrorStage.UPLOAD,
+        )
+    dt = _as_utc_dt(value)
+    assert dt is not None
+    if reject_sentinel and dt >= _SENTINEL_EFFECTIVE_CUTOFF:
+        raise ValidationError(
+            f"{field_name} must be earlier than 9999-01-01T00:00:00Z",
+            layer=ErrorLayer.CLIENT,
+            stage=ErrorStage.UPLOAD,
+        )
+    return dt
+
+
+def _validate_version_metadata(
+    *,
+    authority_tier: int | str | None = None,
+    effective_from: datetime | None = None,
+    scope_tags: list[str] | tuple[str, ...] | set[str] | None = None,
+    source_published_at: datetime | None = None,
+) -> tuple[int | None, datetime | None, list[str] | None, datetime | None]:
+    try:
+        norm_tier = normalize_authority_tier(authority_tier)
+    except ValueError as exc:
+        raise ValidationError(
+            str(exc),
+            layer=ErrorLayer.CLIENT,
+            stage=ErrorStage.UPLOAD,
+        ) from exc
+
+    norm_eff = _normalize_timestamp_input(
+        effective_from,
+        field_name="effective_from",
+        reject_sentinel=True,
+    )
+    norm_pub = _normalize_timestamp_input(
+        source_published_at,
+        field_name="source_published_at",
+        reject_sentinel=False,
+    )
+
+    if scope_tags is None:
+        norm_tags: list[str] | None = None
+    else:
+        if isinstance(scope_tags, (list, tuple, set, frozenset)) and len(scope_tags) > 16:
+            raise ValidationError(
+                "scope_tags cannot exceed 16 tags",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            )
+        try:
+            cleaned = normalize_scope_tags(scope_tags)
+        except ValueError as exc:
+            raise ValidationError(
+                str(exc),
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            ) from exc
+        norm_tags = cleaned or None
+
+    return norm_tier, norm_eff, norm_tags, norm_pub
+
+
+async def _recompute_document_temporal_intervals(
+    session: AsyncSession,
+    *,
+    target_ver: DocumentVersion,
+    document_id: str,
+    old_valid_from: datetime | None,
+    old_valid_to: datetime | None,
+    old_supersedes_id: str | None,
+) -> list[dict[str, Any]]:
+    """Re-position target_ver along document timeline and return Qdrant sync entries."""
+    from sag_api.services.dedup_and_temporal_service import resolve_temporal_supersedes
+    from sag_api.services.search_index_service import build_mutated_version_entries
+
+    ready_versions = list(
+        (
+            await session.scalars(
+                select(DocumentVersion)
+                .where(
+                    DocumentVersion.document_id == document_id,
+                    DocumentVersion.search_status.in_(("SEARCH_READY", "READY")),
+                    DocumentVersion.status.notin_(("REVOKED", "FAILED")),
+                )
+                .order_by(DocumentVersion.version_no.asc())
+                .with_for_update()
+            )
+        ).all()
+    )
+    if all(v.id != target_ver.id for v in ready_versions):
+        ready_versions.append(target_ver)
+
+    before_state: dict[str, tuple[datetime | None, datetime | None, str | None]] = {}
+    for ver in ready_versions:
+        if ver.id == target_ver.id:
+            before_state[ver.id] = (old_valid_from, old_valid_to, old_supersedes_id)
+        else:
+            before_state[ver.id] = (
+                _as_utc_dt(ver.valid_from),
+                _as_utc_dt(ver.valid_to),
+                ver.supersedes_id,
+            )
+
+    # Heal target_ver's previous slot before re-inserting it at its new effective_from
+    # so resolve_temporal_supersedes never leaves a gap or clips target_ver to its old boundary.
+    healed_any = False
+    for ver in ready_versions:
+        if ver.id == target_ver.id:
+            continue
+        if old_valid_from is not None and _as_utc_dt(ver.valid_to) == old_valid_from:
+            ver.valid_to = old_valid_to or _MAX_VALID_TO
+            session.add(ver)
+            healed_any = True
+        if ver.supersedes_id == target_ver.id:
+            ver.supersedes_id = old_supersedes_id
+            session.add(ver)
+            healed_any = True
+    if healed_any:
+        await session.flush()
+
+    await resolve_temporal_supersedes(
+        session,
+        current_version=target_ver,
+        document_id=document_id,
+    )
+
+    sync_versions: list[DocumentVersion] = [target_ver]
+    seen_ids: set[str] = {str(target_ver.id)}
+    for ver in ready_versions:
+        after = (_as_utc_dt(ver.valid_from), _as_utc_dt(ver.valid_to), ver.supersedes_id)
+        if after != before_state[ver.id]:
+            ver.knowledge_status = "NOT_STARTED"
+            session.add(ver)
+            if str(ver.id) not in seen_ids:
+                sync_versions.append(ver)
+                seen_ids.add(str(ver.id))
+
+    return build_mutated_version_entries(sync_versions)
+
+
+async def _sync_temporal_payloads_with_reconcile(
+    session: AsyncSession,
+    *,
+    project_id: str,
+    doc: Document,
+    target_ver: DocumentVersion,
+    versions_to_sync: list[dict[str, Any]],
+    qdrant_client: Any | None = None,
+    engine_manager: Any | None = None,
+    job_queue: JobQueue | None = None,
+) -> tuple[bool, bool, str | None]:
+    """Sync mutated temporal/authority payloads to Qdrant outside DB locks with degraded reconcile fallback."""
+    if not versions_to_sync:
+        return (False, False, None)
+
+    from sag_api.services.search_index_service import (
+        TemporalPayloadSyncError,
+        sync_version_temporal_payloads_to_qdrant,
+    )
+
+    resolved_client = qdrant_client
+    should_close = False
+    try:
+        if resolved_client is None:
+            if engine_manager is not None and hasattr(engine_manager, "get_search_unit_qdrant_client"):
+                resolved_client = await engine_manager.get_search_unit_qdrant_client()
+            elif settings.sag_vector_provider == "qdrant":
+                qdrant_url = getattr(settings, "sag_qdrant_url", "http://localhost:6333").rstrip("/")
+                qdrant_headers = {}
+                if getattr(settings, "sag_qdrant_api_key", None):
+                    qdrant_headers["api-key"] = settings.sag_qdrant_api_key
+                resolved_client = httpx.AsyncClient(
+                    base_url=qdrant_url,
+                    headers=qdrant_headers,
+                    timeout=15.0,
+                )
+                should_close = True
+            else:
+                return (False, False, None)
+
+        await sync_version_temporal_payloads_to_qdrant(
+            resolved_client,
+            project_id=project_id,
+            mutated_versions=versions_to_sync,
+            request_timeout=15.0,
+        )
+
+        existing_meta = dict(target_ver.metadata_json or {})
+        if existing_meta.get("qdrant_temporal_sync_degraded") is True:
+            existing_meta["qdrant_temporal_sync_degraded"] = False
+            existing_meta.pop("qdrant_temporal_sync_degraded_reason", None)
+            existing_meta.pop("qdrant_temporal_sync_error", None)
+            existing_meta.pop("qdrant_temporal_sync_failed_version_ids", None)
+            target_ver.metadata_json = existing_meta
+            session.add(target_ver)
+            await session.commit()
+        return (True, False, None)
+    except Exception as exc:  # noqa: BLE001 - explicit degraded fallback + reconcile job
+        failed_ids = (
+            list(exc.failed_version_ids)
+            if isinstance(exc, TemporalPayloadSyncError)
+            else [
+                str(entry["version_id"])
+                for entry in versions_to_sync
+                if entry.get("version_id")
+            ]
+        )
+        err_safe = sanitize_error_message(exc)
+        log.warning(
+            "Failed to sync temporal payloads in Qdrant project=%s doc=%s versions=%s degraded=True: %s",
+            project_id,
+            doc.id,
+            failed_ids,
+            err_safe,
+        )
+        target_ver.metadata_json = {
+            **(target_ver.metadata_json or {}),
+            "qdrant_temporal_sync_degraded": True,
+            "qdrant_temporal_sync_degraded_reason": "temporal_payload_sync_failed",
+            "qdrant_temporal_sync_error": err_safe,
+            "qdrant_temporal_sync_failed_version_ids": failed_ids,
+        }
+        session.add(target_ver)
+        reconcile_job = Job(
+            id=str(uuid.uuid4()),
+            type=JobType.RECONCILE_SEARCH_INDEX,
+            status=JobStatus.QUEUED,
+            source_id=doc.source_id,
+            document_id=doc.id,
+            payload={
+                "project_id": project_id,
+                "reason": "temporal_payload_sync_failed",
+                "sync_version_ids": failed_ids,
+            },
+        )
+        session.add(reconcile_job)
+        await session.commit()
+        if job_queue is not None:
+            try:
+                await _enqueue_persisted_job(job_queue, reconcile_job.id)
+            except Exception as queue_exc:  # noqa: BLE001
+                log.warning(
+                    "Failed to enqueue temporal payload reconcile job %s: %s",
+                    reconcile_job.id,
+                    sanitize_error_message(queue_exc),
+                )
+        return (False, True, "temporal_payload_sync_failed")
+    finally:
+        if should_close and resolved_client is not None:
+            await resolved_client.aclose()
 
 
 async def _enqueue_persisted_job(job_queue: JobQueue, job_id: str) -> None:
@@ -193,7 +481,13 @@ async def ingest_content(
     title: str | None = None,
     messages: list[dict] | None = None,
     logical_source_id: str | None = None,
+    source_published_at: datetime | None = None,
+    authority_tier: int | str | None = None,
+    effective_from: datetime | None = None,
+    scope_tags: list[str] | None = None,
     job_queue: JobQueue | None = None,
+    engine_manager: Any | None = None,
+    qdrant_client: Any | None = None,
 ) -> Document:
     """Normalize text or messages and send them through canonical partitioned ingestion."""
     from sag_api.core.errors import ValidationError
@@ -217,9 +511,17 @@ async def ingest_content(
         file_bytes=content.encode("utf-8"),
         original_filename=filename,
         content_type="text/markdown",
-        logical_source_id=logical_source_id or f"source:{source.id}:{filename}",
+        logical_source_id=compact_logical_source_id(
+            logical_source_id or f"source:{source.id}:{filename}"
+        ),
+        source_published_at=source_published_at,
+        authority_tier=authority_tier,
+        effective_from=effective_from,
+        scope_tags=scope_tags,
         job_queue=job_queue,
         source_id=source.id,
+        engine_manager=engine_manager,
+        qdrant_client=qdrant_client,
     )
     document = await session.get(Document, result.document_id)
     if document is None:
@@ -233,25 +535,36 @@ async def reprocess_document(
     document_id: str,
     *,
     job_queue: JobQueue,
-    remote_source_url: str | None = None,
-    expected_sha256: str | None = None,
-    expected_size_bytes: int | None = None,
-    original_filename: str | None = None,
 ) -> Job:
-    if remote_source_url:
-        from sag_api.parsing.remote_object import validate_remote_object_url
-
-        validate_remote_object_url(remote_source_url, settings)
     document = await get_document(session, source, document_id)
     if document.status in {DocumentStatus.DELETING, DocumentStatus.DELETE_FAILED}:
         raise ConflictError("Document is deleting or deletion failed, cannot reprocess")
-    latest = await session.scalar(select(Job).where(Job.document_id == document.id).order_by(Job.created_at.desc()))
-    if latest is not None and latest.status in {
-        JobStatus.QUEUED,
-        JobStatus.RUNNING,
-        JobStatus.PAUSED,
-    }:
-        return latest
+    lifecycle_types = [
+        JobType.PROCESS_DOCUMENT,
+        JobType.REPROCESS_DOCUMENT,
+        JobType.DELETE_DOCUMENT,
+    ]
+    active_job = await session.scalar(
+        select(Job)
+        .where(
+            Job.document_id == document.id,
+            Job.type.in_(lifecycle_types),
+            Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.PAUSED]),
+        )
+        .order_by(Job.created_at.desc(), Job.id.desc())
+        .limit(1)
+    )
+    if active_job is not None:
+        return active_job
+    latest = await session.scalar(
+        select(Job)
+        .where(
+            Job.document_id == document.id,
+            Job.type.in_(lifecycle_types),
+        )
+        .order_by(Job.created_at.desc(), Job.id.desc())
+        .limit(1)
+    )
     restart_from_scratch = document.status == DocumentStatus.READY
     retrying_cleanup = bool(
         latest is not None and latest.type == JobType.REPROCESS_DOCUMENT and latest.status == JobStatus.FAILED
@@ -325,44 +638,24 @@ async def reprocess_document(
     payload.pop("pause_requested", None)
     payload.pop("resume_requested", None)
     payload.pop("canonical_checkpoint_stage", None)
-    remote_payload: dict = {}
-    if remote_source_url:
-        remote_payload = {
-            "remote_object_sourced": True,
-            "remote_source_url": remote_source_url,
-            **(
-                {"expected_sha256": expected_sha256.strip().lower()}
-                if expected_sha256
-                else {}
-            ),
-            **(
-                {"expected_size_bytes": int(expected_size_bytes)}
-                if expected_size_bytes
-                else {}
-            ),
-            **(
-                {"original_filename": original_filename}
-                if original_filename
-                else {}
-            ),
-        }
     if restart_from_scratch:
         payload = set_scheduler(
             {
                 "target_document_id": document.id,
                 "derived_source_ids": sorted(derived_source_ids),
-                **remote_payload,
+                "ignore_fallback_cache": True,
             },
             priority=DELETE_PRIORITY,
         )
     elif retrying_cleanup:
+        payload["ignore_fallback_cache"] = True
         payload = set_scheduler(
-            {**payload, **remote_payload},
+            payload,
             priority=DELETE_PRIORITY,
             blocked_reason=None,
         )
-    elif remote_payload:
-        payload = {**payload, **remote_payload}
+    else:
+        payload["ignore_fallback_cache"] = True
     job = Job(
         type=(JobType.REPROCESS_DOCUMENT if requires_maintenance else JobType.PROCESS_DOCUMENT),
         source_id=source.id,
@@ -758,6 +1051,17 @@ async def delete_document(
             )
         ).all()
     )
+    active_conflict_jobs = list(
+        (
+            await session.scalars(
+                select(Job).where(
+                    Job.document_id == document.id,
+                    Job.type == JobType.CONFLICT_RESOLUTION,
+                    Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]),
+                )
+            )
+        ).all()
+    )
 
     # A document whose processor has never started cannot have written any
     # engine-side records. Delete it inside this request so it is never held up
@@ -864,6 +1168,23 @@ async def delete_document(
             finished_at=completed_at,
         )
         session.add(completed)
+        for cjob in active_conflict_jobs:
+            cjob.payload = {**(cjob.payload or {}), "pause_requested": True}
+            if cjob.status == JobStatus.QUEUED:
+                cjob.status = JobStatus.PAUSED
+        from sqlalchemy import delete as sa_delete
+        from sqlalchemy import or_ as sa_or
+
+        from sag_api.db.models.conflict_resolution import KnowledgeConflictResolution
+
+        await session.execute(
+            sa_delete(KnowledgeConflictResolution).where(
+                sa_or(
+                    KnowledgeConflictResolution.winner_document_id == target_document_id,
+                    KnowledgeConflictResolution.loser_document_id == target_document_id,
+                )
+            )
+        )
         await session.delete(document)
         await session.flush()
         remaining_path_refs = 0
@@ -926,7 +1247,7 @@ async def delete_document(
             return existing
         await session.refresh(document)
 
-    for job in active_jobs:
+    for job in [*active_jobs, *active_conflict_jobs]:
         job.payload = {**(job.payload or {}), "pause_requested": True}
         if job.status == JobStatus.QUEUED:
             job.status = JobStatus.PAUSED
@@ -1097,6 +1418,19 @@ async def get_or_create_project_source(
     return source
 
 
+_LOGICAL_SOURCE_ID_MAX_LEN = 512
+
+
+def compact_logical_source_id(value: str, *, max_length: int = _LOGICAL_SOURCE_ID_MAX_LEN) -> str:
+    """Bound logical_source_id deterministically within VARCHAR(512) without losing uniqueness."""
+    cleaned = (value or "").strip()
+    if len(cleaned) <= max_length:
+        return cleaned
+    digest = hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:16]
+    prefix_len = max(1, max_length - len(digest) - 1)
+    return f"{cleaned[:prefix_len]}:{digest}"
+
+
 async def handle_document_upload(
     session: AsyncSession,
     *,
@@ -1111,9 +1445,14 @@ async def handle_document_upload(
     content_hash: str | None = None,
     logical_source_id: str | None = None,
     source_published_at: datetime | None = None,
+    authority_tier: int | str | None = None,
+    effective_from: datetime | None = None,
+    scope_tags: list[str] | None = None,
     research_task_id: str | None = None,
     job_queue: JobQueue | None = None,
     source_id: str | None = None,
+    engine_manager: Any | None = None,
+    qdrant_client: Any | None = None,
 ) -> DocumentUploadResponse:
     """Process an upload request with strict ACL partition, idempotency, and versioning.
 
@@ -1127,10 +1466,18 @@ async def handle_document_upload(
         raise ValidationError("Idempotency-Key header is required for upload")
 
     _check_upload_file(original_filename, file_bytes)
+    norm_authority_tier, norm_effective_from, norm_scope_tags, norm_source_published_at = (
+        _validate_version_metadata(
+            authority_tier=authority_tier,
+            effective_from=effective_from,
+            scope_tags=scope_tags,
+            source_published_at=source_published_at,
+        )
+    )
 
     payload_hash = compute_payload_hash(file_bytes)
     idempotency_key = normalize_idempotency_key(client_token)
-    logical_id = (logical_source_id or original_filename).strip()
+    logical_id = compact_logical_source_id(logical_source_id or original_filename)
 
     # Step 1: Pre-allocation lookup by (tenant_id, project_id, idempotency_key)
     existing_run = await _find_upload_run(
@@ -1202,6 +1549,11 @@ async def handle_document_upload(
     # Step 3: Attempt creation in transaction with serialization and retry on race conditions
     max_retries = 3
     duplicate_response: DocumentUploadResponse | None = None
+    duplicate_metadata_updated = False
+    duplicate_sync_doc: Document | None = None
+    duplicate_sync_ver: DocumentVersion | None = None
+    duplicate_versions_to_sync: list[dict[str, Any]] = []
+    duplicate_conflict_job_id: str | None = None
     for attempt in range(max_retries):
         try:
             async with session.begin_nested():
@@ -1260,14 +1612,115 @@ async def handle_document_upload(
                             code="DOCUMENT_PARTITION_MISMATCH",
                             retryable=False,
                         )
+                    is_latest_failed = (
+                        latest_ver.status == "FAILED"
+                        or latest_ver.search_status in ("FAILED", "INDEX_FAILED")
+                        or doc.status == DocumentStatus.FAILED
+                    )
                     if (
                         latest_ver
                         and latest_ver.file_hash == payload_hash
                         and latest_ver.status != "REVOKED"
+                        and not is_latest_failed
                         and doc.is_active
                     ):
                         # Exact duplicate: Cùng hash + cùng source identity
                         # Duplicate policy: Do NOT parse again or schedule pipeline!
+                        # Apply explicitly supplied metadata changes cleanly if any differ.
+                        tier_changed = (
+                            norm_authority_tier is not None
+                            and latest_ver.authority_tier != norm_authority_tier
+                        )
+                        eff_changed = (
+                            norm_effective_from is not None
+                            and _as_utc_dt(latest_ver.effective_from) != norm_effective_from
+                        )
+                        pub_changed = (
+                            norm_source_published_at is not None
+                            and _as_utc_dt(latest_ver.source_published_at) != norm_source_published_at
+                        )
+                        existing_tags = (
+                            list(latest_ver.scope_tags_json)
+                            if latest_ver.scope_tags_json is not None
+                            else None
+                        )
+                        tags_changed = norm_scope_tags is not None and existing_tags != norm_scope_tags
+
+                        if tier_changed or eff_changed or pub_changed or tags_changed:
+                            old_valid_from = _as_utc_dt(latest_ver.valid_from)
+                            old_valid_to = _as_utc_dt(latest_ver.valid_to)
+                            old_supersedes_id = latest_ver.supersedes_id
+                            if tier_changed:
+                                latest_ver.authority_tier = norm_authority_tier
+                            if eff_changed:
+                                latest_ver.effective_from = norm_effective_from
+                            if pub_changed:
+                                latest_ver.source_published_at = norm_source_published_at
+                            if tags_changed:
+                                latest_ver.scope_tags_json = norm_scope_tags
+                            session.add(latest_ver)
+
+                            is_ready = latest_ver.search_status in ("SEARCH_READY", "READY")
+                            if (eff_changed or pub_changed) and is_ready:
+                                duplicate_versions_to_sync = (
+                                    await _recompute_document_temporal_intervals(
+                                        session,
+                                        target_ver=latest_ver,
+                                        document_id=doc.id,
+                                        old_valid_from=old_valid_from,
+                                        old_valid_to=old_valid_to,
+                                        old_supersedes_id=old_supersedes_id,
+                                    )
+                                )
+                            elif is_ready:
+                                from sag_api.services.search_index_service import (
+                                    build_mutated_version_entries,
+                                )
+
+                                duplicate_versions_to_sync = build_mutated_version_entries(
+                                    [latest_ver]
+                                )
+
+                            if doc.source_id:
+                                await touch_source_revision(session, doc.source_id)
+                            if is_ready:
+                                from sag_api.services.knowledge_conflict_service import (
+                                    enqueue_conflict_resolution_job,
+                                    has_active_cross_document_peer,
+                                    reevaluate_resolutions_after_metadata_update,
+                                )
+
+                                dup_reeval = await reevaluate_resolutions_after_metadata_update(
+                                    session,
+                                    updated_version=latest_ver,
+                                    temporal_changed=(eff_changed or pub_changed),
+                                    authority_changed=tier_changed,
+                                )
+                                if settings.conflict_resolution_job_enabled and (
+                                    dup_reeval["needs_revalidation"] > 0
+                                    or await has_active_cross_document_peer(
+                                        session,
+                                        tenant_id=tenant_id,
+                                        project_id=project_id,
+                                        security_partition_id=security_partition_id,
+                                        exclude_document_id=doc.id,
+                                    )
+                                ):
+                                    dup_cjob = await enqueue_conflict_resolution_job(
+                                        session,
+                                        tenant_id=tenant_id,
+                                        project_id=project_id,
+                                        source_id=doc.source_id,
+                                        document_id=doc.id,
+                                        document_version_id=latest_ver.id,
+                                        security_partition_id=security_partition_id,
+                                        reason="metadata_updated",
+                                    )
+                                    duplicate_conflict_job_id = dup_cjob.id if dup_cjob is not None else None
+                            duplicate_metadata_updated = True
+                            duplicate_sync_doc = doc
+                            duplicate_sync_ver = latest_ver
+
                         run_stmt = (
                             select(IngestionRun)
                             .where(IngestionRun.document_version_id == latest_ver.id)
@@ -1312,10 +1765,10 @@ async def handle_document_upload(
                         )
                         break
                     elif latest_ver:
-                        # Đóng khoảng hiệu lực của phiên bản cũ tại thời điểm phiên bản mới bắt đầu (Comment #13)
-                        latest_ver.valid_to = now_utc
+                        # Keep latest_ver.valid_to open until replacement version commits SEARCH_READY
+                        # via resolve_temporal_supersedes; failed retries must not hide active predecessors.
                         version_no = latest_ver.version_no + 1
-                        supersedes_id = latest_ver.id
+                        supersedes_id = latest_ver.id if not is_latest_failed else latest_ver.supersedes_id
                     else:
                         version_no = 1
                         supersedes_id = None
@@ -1343,12 +1796,15 @@ async def handle_document_upload(
                         version_no=version_no,
                         file_hash=payload_hash,
                         supersedes_id=supersedes_id,
-                        source_published_at=source_published_at,
+                        source_published_at=norm_source_published_at,
                         valid_from=now_utc,
-                        valid_to=datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC),
+                        valid_to=_MAX_VALID_TO,
                         status="RECEIVED",
                         search_status="PENDING",
                         knowledge_status="NOT_STARTED",
+                        authority_tier=norm_authority_tier,
+                        effective_from=norm_effective_from,
+                        scope_tags_json=norm_scope_tags,
                         metadata_json={"security_partition_id": security_partition_id},
                     )
                     session.add(doc_version)
@@ -1365,6 +1821,22 @@ async def handle_document_upload(
                     )
                     session.add(snapshot)
                 else:
+                    if existing_ver.file_hash != payload_hash:
+                        raise ConflictError(
+                            "Document version already exists with a different content hash",
+                            layer=ErrorLayer.CLIENT,
+                            stage=ErrorStage.UPLOAD,
+                            code="VERSION_HASH_MISMATCH",
+                            retryable=False,
+                        )
+                    if (existing_ver.metadata_json or {}).get("security_partition_id") != security_partition_id:
+                        raise ConflictError(
+                            "Document version already belongs to a different security partition",
+                            layer=ErrorLayer.CLIENT,
+                            stage=ErrorStage.UPLOAD,
+                            code="DOCUMENT_PARTITION_MISMATCH",
+                            retryable=False,
+                        )
                     doc_version = existing_ver
 
                 run_id = str(uuid.uuid4())
@@ -1473,6 +1945,30 @@ async def handle_document_upload(
     await session.commit()
 
     if duplicate_response is not None:
+        if duplicate_metadata_updated:
+            from sag_api.api.v1.universe import clear_universe_caches
+
+            clear_universe_caches(project_id)
+            if duplicate_versions_to_sync and duplicate_sync_doc and duplicate_sync_ver:
+                await _sync_temporal_payloads_with_reconcile(
+                    session,
+                    project_id=project_id,
+                    doc=duplicate_sync_doc,
+                    target_ver=duplicate_sync_ver,
+                    versions_to_sync=duplicate_versions_to_sync,
+                    qdrant_client=qdrant_client,
+                    engine_manager=engine_manager,
+                    job_queue=job_queue,
+                )
+            if duplicate_conflict_job_id and job_queue is not None:
+                try:
+                    await _enqueue_persisted_job(job_queue, duplicate_conflict_job_id)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "Failed to enqueue conflict job %s after duplicate upload metadata update: %s",
+                        duplicate_conflict_job_id,
+                        sanitize_error_message(exc),
+                    )
         return duplicate_response
 
     # Durable enqueue after transaction commit
@@ -1481,421 +1977,6 @@ async def handle_document_upload(
             await _enqueue_persisted_job(job_queue, job.id)
         except Exception as exc:
             log.warning("Failed to enqueue job %s to queue: %s", job.id, exc)
-
-    return DocumentUploadResponse(
-        document_id=doc.id,
-        version_no=doc_version.version_no,
-        version_id=doc_version.id,
-        run_id=run.id,
-        file_hash=payload_hash,
-        status=doc_version.status,
-        search_status=doc_version.search_status,
-        knowledge_status=doc_version.knowledge_status,
-        is_duplicate=False,
-    )
-
-
-def _check_object_ingest_metadata(filename: str, expected_size_bytes: int) -> None:
-    if expected_size_bytes <= 0:
-        raise ValidationError("Object size must be positive")
-    max_size = getattr(settings, "max_upload_size_bytes", None) or (settings.max_upload_mb * 1024 * 1024)
-    if expected_size_bytes > max_size:
-        raise ValidationError(
-            f"File size exceeds maximum allowed ({max_size} bytes)",
-            layer=ErrorLayer.CLIENT,
-            stage=ErrorStage.UPLOAD,
-        )
-    allowed = settings.allowed_upload_exts
-    if allowed:
-        ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-        if ext not in allowed:
-            pretty = ", ".join(sorted(e.lstrip(".") for e in allowed))
-            raise ValidationError(
-                f"Unsupported file extension. Allowed: {pretty}",
-                layer=ErrorLayer.CLIENT,
-                stage=ErrorStage.UPLOAD,
-            )
-
-
-async def handle_document_object_ingest(
-    session: AsyncSession,
-    *,
-    tenant_id: str,
-    project_id: str,
-    owner_id: str,
-    security_partition_id: str,
-    client_token: str,
-    source_url: str,
-    original_filename: str,
-    expected_sha256: str,
-    expected_size_bytes: int,
-    content_type: str = "application/octet-stream",
-    logical_source_id: str | None = None,
-    source_published_at: datetime | None = None,
-    job_queue: JobQueue | None = None,
-    source_id: str | None = None,
-) -> DocumentUploadResponse:
-    """Zero-buffer control-plane registration for an object already uploaded to R2.
-
-    Validates ACL partition, idempotency, extension, size budget, and R2 host allowlist,
-    then persists Document/DocumentVersion/IngestionRun/Job so the background worker
-    streams the object in 64KB chunks directly to disk.
-    """
-    from sag_api.parsing.remote_object import (
-        resolve_snapshot_target_path,
-        validate_remote_object_url,
-    )
-
-    if not security_partition_id or not security_partition_id.strip():
-        raise ValidationError(
-            "X-Continuum-Security-Partition header is required to enforce data isolation"
-        )
-    if not client_token or not client_token.strip():
-        raise ValidationError("Idempotency-Key header is required for object ingest")
-
-    safe_filename = os.path.basename(original_filename.replace("\\", "/")) or "upload"
-    _check_object_ingest_metadata(safe_filename, expected_size_bytes)
-    validate_remote_object_url(source_url, settings)
-
-    payload_hash = expected_sha256.strip().lower()
-    if len(payload_hash) != 64:
-        raise ValidationError(
-            "expected_sha256 must be a 64-character hex SHA-256 digest",
-            layer=ErrorLayer.CLIENT,
-            stage=ErrorStage.UPLOAD,
-        )
-    idempotency_key = normalize_idempotency_key(client_token)
-    logical_id = (logical_source_id or safe_filename).strip()
-
-    existing_run = await _find_upload_run(
-        session, tenant_id=tenant_id, project_id=project_id, idempotency_key=idempotency_key
-    )
-    if existing_run:
-        if existing_run.payload_hash != payload_hash:
-            raise ConflictError(
-                f"Idempotency key is already bound to a different file payload hash. "
-                f"(incoming={payload_hash}, existing={existing_run.payload_hash})",
-                layer=ErrorLayer.CLIENT,
-                stage=ErrorStage.UPLOAD,
-                code="IDEMPOTENCY_PAYLOAD_MISMATCH",
-                retryable=False,
-            )
-        doc_ver = await session.get(DocumentVersion, existing_run.document_version_id)
-        if doc_ver:
-            bound_partition = (doc_ver.metadata_json or {}).get("security_partition_id")
-            if bound_partition != security_partition_id:
-                raise ConflictError(
-                    "Idempotency key is already bound to a different security partition",
-                    layer=ErrorLayer.CLIENT,
-                    stage=ErrorStage.UPLOAD,
-                    code="IDEMPOTENCY_PARTITION_MISMATCH",
-                    retryable=False,
-                )
-            bound_doc = await session.get(Document, doc_ver.document_id)
-            if bound_doc and bound_doc.logical_source_id != logical_id:
-                raise ConflictError(
-                    f"Idempotency key is already bound to logical source '{bound_doc.logical_source_id}'.",
-                    layer=ErrorLayer.CLIENT,
-                    stage=ErrorStage.UPLOAD,
-                    code="IDEMPOTENCY_IDENTITY_MISMATCH",
-                    retryable=False,
-                )
-            is_revoked_replay = (
-                doc_ver.status == "REVOKED"
-                or doc_ver.search_status == "REVOKED"
-                or (bound_doc is not None and not bound_doc.is_active)
-            )
-        else:
-            is_revoked_replay = False
-        if is_revoked_replay:
-            idempotency_key = normalize_idempotency_key(
-                f"{client_token}:revoked_resync:{uuid.uuid4().hex}"
-            )
-        else:
-            return DocumentUploadResponse(
-                document_id=doc_ver.document_id if doc_ver else "",
-                version_no=doc_ver.version_no if doc_ver else 1,
-                version_id=existing_run.document_version_id,
-                run_id=existing_run.id,
-                file_hash=payload_hash,
-                status=doc_ver.status if doc_ver else "RECEIVED",
-                search_status=doc_ver.search_status if doc_ver else "PENDING",
-                knowledge_status=doc_ver.knowledge_status if doc_ver else "NOT_STARTED",
-                is_duplicate=True,
-            )
-
-    if not source_id:
-        proj_source = await get_or_create_project_source(session, tenant_id, project_id)
-        source_id = proj_source.id
-
-    storage_path = resolve_snapshot_target_path(
-        settings.effective_data_dir, payload_hash, safe_filename
-    )
-
-    max_retries = 3
-    duplicate_response: DocumentUploadResponse | None = None
-    for attempt in range(max_retries):
-        try:
-            async with session.begin_nested():
-                doc_stmt = (
-                    select(Document)
-                    .where(
-                        Document.tenant_id == tenant_id,
-                        Document.project_id == project_id,
-                        Document.logical_source_id == logical_id,
-                    )
-                    .with_for_update()
-                )
-                doc = (await session.execute(doc_stmt)).scalar_one_or_none()
-
-                now_utc = datetime.now(UTC)
-                is_new_doc = False
-                if not doc:
-                    is_new_doc = True
-                    doc_id = generate_doc_id(tenant_id, project_id, logical_id)
-                    doc = Document(
-                        id=doc_id,
-                        tenant_id=tenant_id,
-                        project_id=project_id,
-                        owner_id=owner_id,
-                        logical_source_id=logical_id,
-                        source_id=source_id,
-                        filename=safe_filename,
-                        content_type=content_type,
-                        size_bytes=expected_size_bytes,
-                        storage_path=storage_path,
-                        status=DocumentStatus.PENDING,
-                    )
-                    session.add(doc)
-                    await session.flush()
-                    version_no = 1
-                    supersedes_id = None
-                else:
-                    v_stmt = (
-                        select(DocumentVersion)
-                        .where(DocumentVersion.document_id == doc.id)
-                        .order_by(DocumentVersion.version_no.desc())
-                        .limit(1)
-                        .with_for_update()
-                    )
-                    latest_ver = (await session.execute(v_stmt)).scalar_one_or_none()
-                    if latest_ver is None or (
-                        (latest_ver.metadata_json or {}).get("security_partition_id")
-                        != security_partition_id
-                    ):
-                        raise ConflictError(
-                            "Logical document already belongs to a different security partition",
-                            layer=ErrorLayer.CLIENT,
-                            stage=ErrorStage.UPLOAD,
-                            code="DOCUMENT_PARTITION_MISMATCH",
-                            retryable=False,
-                        )
-                    if (
-                        latest_ver
-                        and latest_ver.file_hash == payload_hash
-                        and latest_ver.status != "REVOKED"
-                        and doc.is_active
-                    ):
-                        run_stmt = (
-                            select(IngestionRun)
-                            .where(IngestionRun.document_version_id == latest_ver.id)
-                            .order_by(IngestionRun.created_at.desc())
-                            .limit(1)
-                        )
-                        existing_run = (await session.execute(run_stmt)).scalar_one_or_none()
-                        if existing_run is None:
-                            existing_run = IngestionRun(
-                                id=str(uuid.uuid4()),
-                                tenant_id=tenant_id,
-                                project_id=project_id,
-                                document_version_id=latest_ver.id,
-                                idempotency_key=idempotency_key,
-                                payload_hash=payload_hash,
-                                content_hash=payload_hash,
-                                current_stage="DUPLICATE",
-                                status="SUCCEEDED",
-                                completed_at=now_utc,
-                            )
-                            session.add(existing_run)
-                        else:
-                            session.add(
-                                UploadIdempotencyKey(
-                                    tenant_id=tenant_id,
-                                    project_id=project_id,
-                                    idempotency_key=idempotency_key,
-                                    run_id=existing_run.id,
-                                )
-                            )
-                        await session.flush()
-                        duplicate_response = DocumentUploadResponse(
-                            document_id=doc.id,
-                            version_no=latest_ver.version_no,
-                            version_id=latest_ver.id,
-                            run_id=existing_run.id,
-                            file_hash=payload_hash,
-                            status=latest_ver.status,
-                            search_status=latest_ver.search_status,
-                            knowledge_status=latest_ver.knowledge_status,
-                            is_duplicate=True,
-                        )
-                        break
-                    elif latest_ver:
-                        latest_ver.valid_to = now_utc
-                        version_no = latest_ver.version_no + 1
-                        supersedes_id = latest_ver.id
-                    else:
-                        version_no = 1
-                        supersedes_id = None
-                    doc.storage_path = storage_path
-                    doc.is_active = True
-                    doc.status = DocumentStatus.PENDING
-                    doc.progress = 0
-                    doc.filename = safe_filename
-                    doc.content_type = content_type
-                    doc.size_bytes = expected_size_bytes
-                    doc.error = None
-                    doc.error_layer = None
-                    doc.error_stage = None
-                    if source_id and not doc.source_id:
-                        doc.source_id = source_id
-
-                version_id = generate_version_id(doc.id, version_no)
-                existing_ver = await session.get(DocumentVersion, version_id)
-                if not existing_ver:
-                    doc_version = DocumentVersion(
-                        id=version_id,
-                        document_id=doc.id,
-                        version_no=version_no,
-                        file_hash=payload_hash,
-                        supersedes_id=supersedes_id,
-                        source_published_at=source_published_at,
-                        valid_from=now_utc,
-                        valid_to=datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC),
-                        status="RECEIVED",
-                        search_status="PENDING",
-                        knowledge_status="NOT_STARTED",
-                        metadata_json={
-                            "security_partition_id": security_partition_id,
-                            "remote_object_sourced": True,
-                        },
-                    )
-                    session.add(doc_version)
-                    await session.flush()
-
-                    snapshot = SourceSnapshot(
-                        id=str(uuid.uuid4()),
-                        document_version_id=version_id,
-                        storage_uri=storage_path,
-                        original_filename=safe_filename,
-                        mime_type=content_type,
-                        byte_size=expected_size_bytes,
-                        checksum_sha256=payload_hash,
-                    )
-                    session.add(snapshot)
-                else:
-                    doc_version = existing_ver
-
-                run_id = str(uuid.uuid4())
-                initial_status = "QUEUED" if job_queue is not None else "PENDING_DISPATCH"
-                run = IngestionRun(
-                    id=run_id,
-                    tenant_id=tenant_id,
-                    project_id=project_id,
-                    document_version_id=doc_version.id,
-                    idempotency_key=idempotency_key,
-                    payload_hash=payload_hash,
-                    content_hash=payload_hash,
-                    current_stage="RECEIVE",
-                    status=initial_status,
-                )
-                session.add(run)
-
-                job = Job(
-                    type=JobType.PROCESS_DOCUMENT,
-                    source_id=doc.source_id,
-                    document_id=doc.id,
-                    status=JobStatus.QUEUED,
-                    payload={
-                        "run_id": run_id,
-                        "document_version_id": doc_version.id,
-                        "project_id": project_id,
-                        "tenant_id": tenant_id,
-                        "storage_path": storage_path,
-                        "remote_object_sourced": True,
-                        "remote_source_url": source_url,
-                        "expected_sha256": payload_hash,
-                        "expected_size_bytes": expected_size_bytes,
-                        "original_filename": safe_filename,
-                    },
-                )
-                session.add(job)
-
-                if source_id and is_new_doc:
-                    await session.execute(
-                        update(Source)
-                        .where(Source.id == source_id)
-                        .values(document_count=Source.document_count + 1)
-                    )
-                    await touch_source_revision(session, source_id)
-
-                await session.flush()
-                break
-        except IntegrityError:
-            existing = await _find_upload_run(
-                session, tenant_id=tenant_id, project_id=project_id, idempotency_key=idempotency_key
-            )
-            if existing:
-                if existing.payload_hash != payload_hash:
-                    raise ConflictError(
-                        "Idempotency key is already bound to a different file payload hash.",
-                        layer=ErrorLayer.CLIENT,
-                        stage=ErrorStage.UPLOAD,
-                        code="IDEMPOTENCY_PAYLOAD_MISMATCH",
-                        retryable=False,
-                    ) from None
-                doc_ver = await session.get(DocumentVersion, existing.document_version_id)
-                if doc_ver:
-                    if (doc_ver.metadata_json or {}).get("security_partition_id") != security_partition_id:
-                        raise ConflictError(
-                            "Idempotency key is already bound to a different security partition",
-                            layer=ErrorLayer.CLIENT,
-                            stage=ErrorStage.UPLOAD,
-                            code="IDEMPOTENCY_PARTITION_MISMATCH",
-                            retryable=False,
-                        ) from None
-                    bound_doc = await session.get(Document, doc_ver.document_id)
-                    if bound_doc and bound_doc.logical_source_id != logical_id:
-                        raise ConflictError(
-                            f"Idempotency key is already bound to logical source '{bound_doc.logical_source_id}'.",
-                            layer=ErrorLayer.CLIENT,
-                            stage=ErrorStage.UPLOAD,
-                            code="IDEMPOTENCY_IDENTITY_MISMATCH",
-                            retryable=False,
-                        ) from None
-                return DocumentUploadResponse(
-                    document_id=doc_ver.document_id if doc_ver else "",
-                    version_no=doc_ver.version_no if doc_ver else 1,
-                    version_id=existing.document_version_id,
-                    run_id=existing.id,
-                    file_hash=payload_hash,
-                    status=doc_ver.status if doc_ver else "RECEIVED",
-                    search_status=doc_ver.search_status if doc_ver else "PENDING",
-                    knowledge_status=doc_ver.knowledge_status if doc_ver else "NOT_STARTED",
-                    is_duplicate=True,
-                )
-            if attempt == max_retries - 1:
-                raise
-
-    await session.commit()
-
-    if duplicate_response is not None:
-        return duplicate_response
-
-    if job_queue is not None:
-        try:
-            await _enqueue_persisted_job(job_queue, job.id)
-        except Exception as exc:
-            log.warning("Failed to enqueue object ingest job %s to queue: %s", job.id, exc)
 
     return DocumentUploadResponse(
         document_id=doc.id,
@@ -2030,6 +2111,28 @@ async def get_document_version_status(
     ):
         current_stage = "PAUSED" if doc.status == DocumentStatus.PAUSED else "PAUSING"
 
+    version_unit_count = int(
+        (
+            await session.scalar(
+                select(func.count(SearchUnit.id)).where(
+                    SearchUnit.document_version_id == doc_ver.id
+                )
+            )
+        )
+        or 0
+    )
+    resolved_chunk_count = (
+        version_unit_count
+        if (
+            version_unit_count > 0
+            or (
+                not doc.sag_source_id
+                and (doc_ver.version_no > 1 or doc_ver.search_status == "SEARCH_READY")
+            )
+        )
+        else int(doc.chunk_count or 0)
+    )
+
     return DocumentVersionStatusResponse(
         document_id=doc_ver.document_id,
         version_no=doc_ver.version_no,
@@ -2048,10 +2151,198 @@ async def get_document_version_status(
         document_status=doc_status_str,
         parser_provider=doc.parser_provider,
         parser_status=doc.parser_status,
-        chunk_count=int(doc.chunk_count or 0),
+        chunk_count=resolved_chunk_count,
         event_count=int(doc.event_count or 0),
         token_usage=int(doc.token_usage or 0),
     )
+
+
+async def resolve_document_canonical_outline(
+    session: AsyncSession,
+    *,
+    document: Document,
+    principal: object,
+) -> list[dict[str, object]]:
+    """Build outline rows from active, partition-authorized CanonicalBlocks."""
+    now = datetime.now(UTC)
+    is_service = bool(getattr(principal, "is_service", False))
+    allowed_partitions = getattr(principal, "allowed_partition_ids", None) or getattr(
+        principal, "allowed_partitions", None
+    )
+    if not is_service and not allowed_partitions:
+        return []
+
+    stmt = (
+        select(DocumentVersion.id)
+        .where(
+            DocumentVersion.document_id == document.id,
+            DocumentVersion.search_status.in_(("READY", "SEARCH_READY")),
+            DocumentVersion.search_ready_at.is_not(None),
+            DocumentVersion.valid_from <= now,
+            DocumentVersion.valid_to > now,
+        )
+        .order_by(DocumentVersion.version_no.desc())
+        .limit(1)
+    )
+    if not is_service and allowed_partitions:
+        partition_expr = DocumentVersion.metadata_json["security_partition_id"].as_string()
+        stmt = stmt.where(partition_expr.in_(sorted(allowed_partitions)))
+
+    version_id = (await session.execute(stmt)).scalar_one_or_none()
+    if not version_id:
+        return []
+
+    blocks = (
+        await session.scalars(
+            select(CanonicalBlock)
+            .where(CanonicalBlock.document_version_id == version_id)
+            .order_by(CanonicalBlock.ordinal.asc())
+        )
+    ).all()
+    heading_blocks = [b for b in blocks if b.block_type == "heading"]
+    outline_rows: list[dict[str, object]] = []
+    if heading_blocks:
+        for rank, blk in enumerate(heading_blocks):
+            heading_text = (blk.normalized_text or blk.section_path or "").strip()
+            if heading_text:
+                outline_rows.append(
+                    {"rank": rank, "heading": heading_text, "chunk_id": blk.id}
+                )
+    else:
+        seen_paths: set[str] = set()
+        for blk in blocks:
+            sp = (blk.section_path or "").strip()
+            if sp and sp not in seen_paths:
+                seen_paths.add(sp)
+                outline_rows.append(
+                    {"rank": len(outline_rows), "heading": sp, "chunk_id": blk.id}
+                )
+    return outline_rows
+
+
+async def resolve_document_parsed_markdown(
+    session: AsyncSession,
+    *,
+    document: Document,
+    source: Source,
+    principal: object | None = None,
+    engine_manager: object | None = None,
+) -> str | None:
+    """Resolve full parsed Markdown for a Document via sidecar -> CanonicalBlock -> legacy engine."""
+    from sag_api.parsing.service import _signature, parsed_sidecar_paths
+
+    # Enforce partition authorization before reading any disk sidecar when DocumentVersion rows exist.
+    now = datetime.now(UTC)
+    is_service = bool(getattr(principal, "is_service", False)) if principal is not None else True
+    allowed_partitions = (
+        getattr(principal, "allowed_partition_ids", None)
+        or getattr(principal, "allowed_partitions", None)
+        if principal is not None
+        else None
+    )
+    authorized_version_id: str | None = None
+    if is_service or allowed_partitions:
+        ver_stmt = (
+            select(DocumentVersion.id)
+            .where(
+                DocumentVersion.document_id == document.id,
+                DocumentVersion.status != "REVOKED",
+                DocumentVersion.valid_to > now,
+            )
+            .order_by(
+                case((DocumentVersion.search_status == "SEARCH_READY", 0), else_=1),
+                DocumentVersion.version_no.desc(),
+            )
+            .limit(1)
+        )
+        if not is_service and allowed_partitions:
+            partition_expr = DocumentVersion.metadata_json["security_partition_id"].as_string()
+            ver_stmt = ver_stmt.where(partition_expr.in_(sorted(allowed_partitions)))
+        authorized_version_id = (await session.execute(ver_stmt)).scalar_one_or_none()
+
+    if principal is not None and not is_service and authorized_version_id is None:
+        has_any_version = (
+            await session.execute(
+                select(DocumentVersion.id)
+                .where(DocumentVersion.document_id == document.id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if has_any_version is not None:
+            return None
+
+    # Step 1: Resolve on-disk markdown or parsed sidecar
+    storage_path = document.storage_path or ""
+    if storage_path:
+        suffix = os.path.splitext(storage_path)[1].lower()
+        if suffix in {".md", ".markdown"} and os.path.isfile(storage_path):
+            try:
+                with open(storage_path, encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+                if text.strip():
+                    return text
+            except OSError:
+                pass
+
+        candidate_paths: list[str] = []
+        if document.parser_provider in {"mineru", "markitdown"}:
+            sig = _signature(document.parser_provider, settings)
+            candidate_paths.append(f"{storage_path}.parsed.{sig}.md")
+        for prov in ("mineru", "markitdown"):
+            sig = _signature(prov, settings)
+            p = f"{storage_path}.parsed.{sig}.md"
+            if p not in candidate_paths:
+                candidate_paths.append(p)
+        for p in parsed_sidecar_paths(storage_path):
+            if ".fallback-" not in os.path.basename(p) and p not in candidate_paths:
+                candidate_paths.append(p)
+
+        for candidate in candidate_paths:
+            if os.path.isfile(candidate):
+                try:
+                    with open(candidate, encoding="utf-8", errors="replace") as f:
+                        text = f.read()
+                    if text.strip():
+                        return text
+                except OSError:
+                    continue
+
+    # Step 2: Reconstruct from latest active, partition-authorized DocumentVersion + CanonicalBlocks
+    if authorized_version_id:
+        blocks = (
+            await session.scalars(
+                select(CanonicalBlock)
+                .where(CanonicalBlock.document_version_id == authorized_version_id)
+                .order_by(CanonicalBlock.ordinal.asc())
+            )
+        ).all()
+        if blocks:
+            parts: list[str] = []
+            last_page: int | None = None
+            for blk in blocks:
+                page_no = int(blk.page_from or 1)
+                if page_no >= 1 and page_no != last_page:
+                    parts.append(f"<!-- PAGE {page_no} -->")
+                    last_page = page_no
+                txt = (blk.normalized_text or "").strip()
+                if not txt:
+                    continue
+                if blk.block_type == "heading":
+                    level = min(6, max(1, (blk.section_path or "").count(" > ") + 1))
+                    parts.append(f"{'#' * level} {txt}")
+                else:
+                    parts.append(txt)
+            if parts:
+                return "\n\n".join(parts) + "\n"
+
+    # Step 3: Legacy sag_source_id fallback
+    if document.sag_source_id and engine_manager is not None:
+        return await engine_manager.get_document_markdown(
+            source.sag_source_config_id,
+            document.sag_source_id,
+            source=source,
+        )
+    return None
 
 
 async def get_project_document_readiness_batch(
@@ -2096,6 +2387,17 @@ async def get_project_document_readiness_batch(
         (version.document_id, version.version_no): (version, document)
         for version, document in rows.all()
     }
+    version_ids = [version.id for version, _doc in visible_by_key.values()]
+    unit_counts_by_version: dict[str, int] = {}
+    if version_ids:
+        count_rows = await session.execute(
+            select(SearchUnit.document_version_id, func.count(SearchUnit.id))
+            .where(SearchUnit.document_version_id.in_(version_ids))
+            .group_by(SearchUnit.document_version_id)
+        )
+        unit_counts_by_version = {
+            str(ver_id): int(cnt or 0) for ver_id, cnt in count_rows.all()
+        }
 
     items: list[ProjectDocumentReadinessItem] = []
     for document_id, version_no in refs:
@@ -2119,11 +2421,11 @@ async def get_project_document_readiness_batch(
         status_value = getattr(version.status, "value", version.status)
         search_status_value = getattr(version.search_status, "value", version.search_status)
         document_status_value = getattr(document.status, "value", document.status)
+        version_unit_count = unit_counts_by_version.get(version.id, 0)
         is_ready = (
             document.status == DocumentStatus.READY
             and version.search_status == "SEARCH_READY"
             and version.search_ready_at is not None
-            and int(document.chunk_count or 0) > 0
         )
         items.append(
             ProjectDocumentReadinessItem(
@@ -2134,7 +2436,11 @@ async def get_project_document_readiness_batch(
                 search_status=str(search_status_value),
                 search_ready=is_ready,
                 document_status=str(document_status_value),
-                chunk_count=int(document.chunk_count or 0),
+                chunk_count=(
+                    version_unit_count
+                    if (version_unit_count > 0 or not document.sag_source_id)
+                    else int(document.chunk_count or 0)
+                ),
             )
         )
 
@@ -2238,10 +2544,13 @@ async def get_document_version_chunks(
     safe_limit = max(1, min(200, int(limit)))
 
     if units:
+        from sag_api.services.search_index_service import resolve_search_unit_text
+
         block_index_by_id = {b.id: idx for idx, b in enumerate(blocks)}
         units.sort(
             key=lambda u: (
                 block_index_by_id.get(u.block_from_id, 0),
+                u.char_start if u.char_start is not None else 0,
                 int(u.page_from or 0),
                 str(u.id),
             )
@@ -2254,11 +2563,7 @@ async def get_document_version_chunks(
             if end_idx < start_idx:
                 start_idx, end_idx = end_idx, start_idx
             unit_blocks = blocks[start_idx : end_idx + 1]
-            combined_text = "\n\n".join(
-                b.normalized_text.strip()
-                for b in unit_blocks
-                if b.normalized_text and b.normalized_text.strip()
-            ).strip()
+            combined_text = resolve_search_unit_text(unit, unit_blocks).strip()
             if not combined_text:
                 continue
             tok = int(unit.token_count or 0)
@@ -2291,7 +2596,7 @@ async def get_document_version_chunks(
         content = (block.normalized_text or "").strip()
         if not content:
             continue
-        est_tokens = max(1, len(content.split()))
+        est_tokens = estimate_tokens(content)
         total_tokens += est_tokens
         ordinal = len(block_items) + 1
         block_items.append(
@@ -2427,7 +2732,13 @@ async def revoke_project_document(
             await session.scalars(
                 select(Job).where(
                     Job.document_id == doc.id,
-                    Job.type.in_([JobType.PROCESS_DOCUMENT, JobType.REPROCESS_DOCUMENT]),
+                    Job.type.in_(
+                        [
+                            JobType.PROCESS_DOCUMENT,
+                            JobType.REPROCESS_DOCUMENT,
+                            JobType.CONFLICT_RESOLUTION,
+                        ]
+                    ),
                     Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]),
                 )
             )
@@ -2459,6 +2770,14 @@ async def revoke_project_document(
             meta["revoke_reason"] = reason
         ver.metadata_json = meta
 
+    from sag_api.services.knowledge_conflict_service import handle_document_revoked_conflicts
+
+    await handle_document_revoked_conflicts(
+        session,
+        document_id=doc.id,
+        reason=reason,
+    )
+
     if doc.source_id:
         source = await session.get(Source, doc.source_id)
         if source is not None:
@@ -2470,3 +2789,317 @@ async def revoke_project_document(
 
     clear_universe_caches(project_id)
     return DocumentRevokeResponse(status="REVOKED", document_id=doc.id)
+
+
+@dataclass(slots=True)
+class PreparedMetadataPatchSync:
+    """Committed PostgreSQL metadata patch state awaiting post-lease Qdrant payload sync."""
+
+    project_id: str
+    doc: Document
+    target_ver: DocumentVersion
+    versions_to_sync: list[dict[str, Any]]
+    temporal_recomputed: bool
+    conflict_job_id: str | None = None
+
+
+async def commit_document_version_metadata_patch(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    project_id: str,
+    document_id: str,
+    allowed_partition_ids: frozenset[str] | set[str],
+    version_no: int | None = None,
+    authority_tier: int | str | None = _UNSET,
+    effective_from: datetime | None = _UNSET,
+    scope_tags: list[str] | None = _UNSET,
+) -> PreparedMetadataPatchSync:
+    """Apply and commit a tri-state metadata PATCH in PostgreSQL with fail-closed partition ACL."""
+    fields_to_update = {
+        field_name
+        for field_name, field_value in (
+            ("authority_tier", authority_tier),
+            ("effective_from", effective_from),
+            ("scope_tags", scope_tags),
+        )
+        if field_value is not _UNSET
+    }
+    if not fields_to_update:
+        raise ValidationError(
+            "At least one metadata field (authority_tier, effective_from, scope_tags) must be provided",
+            layer=ErrorLayer.CLIENT,
+            stage=ErrorStage.UPLOAD,
+        )
+
+    norm_tier: int | None = None
+    norm_eff: datetime | None = None
+    norm_tags: list[str] | None = None
+    if "authority_tier" in fields_to_update:
+        norm_tier, _, _, _ = _validate_version_metadata(authority_tier=authority_tier)
+    if "effective_from" in fields_to_update:
+        _, norm_eff, _, _ = _validate_version_metadata(effective_from=effective_from)
+    if "scope_tags" in fields_to_update:
+        _, _, norm_tags, _ = _validate_version_metadata(scope_tags=scope_tags)
+
+    doc = (
+        await session.execute(
+            select(Document)
+            .where(
+                Document.tenant_id == tenant_id,
+                Document.project_id == project_id,
+                Document.id == document_id,
+            )
+            .with_for_update()
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if doc is None:
+        raise NotFoundError(f"Document '{document_id}' not found in project '{project_id}'")
+    if doc.status in {DocumentStatus.DELETING, DocumentStatus.DELETE_FAILED}:
+        raise ConflictError("Document is deleting or deletion failed, cannot update metadata")
+
+    if version_no is not None:
+        target_ver = (
+            await session.execute(
+                select(DocumentVersion)
+                .where(
+                    DocumentVersion.document_id == doc.id,
+                    DocumentVersion.version_no == version_no,
+                )
+                .with_for_update()
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+    else:
+        target_ver = (
+            await session.execute(
+                select(DocumentVersion)
+                .where(
+                    DocumentVersion.document_id == doc.id,
+                    DocumentVersion.status != "REVOKED",
+                )
+                .order_by(DocumentVersion.version_no.desc())
+                .with_for_update()
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if target_ver is None:
+            target_ver = (
+                await session.execute(
+                    select(DocumentVersion)
+                    .where(DocumentVersion.document_id == doc.id)
+                    .order_by(DocumentVersion.version_no.desc())
+                    .with_for_update()
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+
+    if target_ver is None:
+        raise NotFoundError(
+            f"Document version not found for document '{doc.id}' in project '{project_id}'"
+        )
+
+    # Explicit fail-closed security partition authorization (closes _resolve_project_document_with_source gap).
+    sec_partition = (target_ver.metadata_json or {}).get("security_partition_id")
+    if (
+        not isinstance(sec_partition, str)
+        or not sec_partition.strip()
+        or sec_partition not in allowed_partition_ids
+    ):
+        raise ForbiddenError(
+            "Principal is not authorized to update metadata for this security partition"
+        )
+
+    if target_ver.status == "REVOKED" or target_ver.search_status == "REVOKED":
+        raise ConflictError("Cannot update metadata of a revoked document version")
+    if not doc.is_active:
+        raise NotFoundError(f"Document '{document_id}' not found in project '{project_id}'")
+
+    old_authority_tier = target_ver.authority_tier
+    old_scope_tags = (
+        list(target_ver.scope_tags_json) if target_ver.scope_tags_json is not None else None
+    )
+    old_effective_from = _as_utc_dt(target_ver.effective_from)
+    old_valid_from = _as_utc_dt(target_ver.valid_from)
+    old_valid_to = _as_utc_dt(target_ver.valid_to)
+    old_supersedes_id = target_ver.supersedes_id
+
+    if "authority_tier" in fields_to_update:
+        target_ver.authority_tier = norm_tier
+    if "effective_from" in fields_to_update:
+        target_ver.effective_from = norm_eff
+    if "scope_tags" in fields_to_update:
+        target_ver.scope_tags_json = norm_tags
+    session.add(target_ver)
+
+    is_search_ready = target_ver.search_status in ("SEARCH_READY", "READY")
+    authority_changed = (
+        "authority_tier" in fields_to_update and target_ver.authority_tier != old_authority_tier
+    )
+    effective_from_changed = (
+        "effective_from" in fields_to_update
+        and _as_utc_dt(target_ver.effective_from) != old_effective_from
+    )
+    new_scope_tags = (
+        list(target_ver.scope_tags_json) if target_ver.scope_tags_json is not None else None
+    )
+    scope_tags_changed = "scope_tags" in fields_to_update and new_scope_tags != old_scope_tags
+
+    temporal_recomputed = False
+    versions_to_sync: list[dict[str, Any]] = []
+    if effective_from_changed and is_search_ready:
+        versions_to_sync = await _recompute_document_temporal_intervals(
+            session,
+            target_ver=target_ver,
+            document_id=doc.id,
+            old_valid_from=old_valid_from,
+            old_valid_to=old_valid_to,
+            old_supersedes_id=old_supersedes_id,
+        )
+        temporal_recomputed = True
+    elif is_search_ready:
+        from sag_api.services.search_index_service import build_mutated_version_entries
+
+        versions_to_sync = build_mutated_version_entries([target_ver])
+
+    conflict_job_id: str | None = None
+    if is_search_ready and (authority_changed or effective_from_changed or scope_tags_changed):
+        from sag_api.services.knowledge_conflict_service import (
+            enqueue_conflict_resolution_job,
+            has_active_cross_document_peer,
+            reevaluate_resolutions_after_metadata_update,
+        )
+
+        reeval = await reevaluate_resolutions_after_metadata_update(
+            session,
+            updated_version=target_ver,
+            temporal_changed=effective_from_changed,
+            authority_changed=authority_changed,
+        )
+        if settings.conflict_resolution_job_enabled and (
+            reeval["needs_revalidation"] > 0
+            or await has_active_cross_document_peer(
+                session,
+                tenant_id=tenant_id,
+                project_id=project_id,
+                security_partition_id=sec_partition,
+                exclude_document_id=doc.id,
+            )
+        ):
+            conflict_job = await enqueue_conflict_resolution_job(
+                session,
+                tenant_id=tenant_id,
+                project_id=project_id,
+                source_id=doc.source_id,
+                document_id=doc.id,
+                document_version_id=target_ver.id,
+                security_partition_id=sec_partition,
+                reason="metadata_updated",
+            )
+            conflict_job_id = conflict_job.id if conflict_job is not None else None
+
+    if doc.source_id:
+        await touch_source_revision(session, doc.source_id)
+
+    await session.commit()
+    from sag_api.api.v1.universe import clear_universe_caches
+
+    clear_universe_caches(project_id)
+    return PreparedMetadataPatchSync(
+        project_id=project_id,
+        doc=doc,
+        target_ver=target_ver,
+        versions_to_sync=versions_to_sync,
+        temporal_recomputed=temporal_recomputed,
+        conflict_job_id=conflict_job_id,
+    )
+
+
+async def finalize_document_version_metadata_sync(
+    session: AsyncSession,
+    prepared: PreparedMetadataPatchSync,
+    *,
+    qdrant_client: Any | None = None,
+    engine_manager: Any | None = None,
+    job_queue: JobQueue | None = None,
+) -> DocumentMetadataPatchResponse:
+    """Sync committed metadata changes to Qdrant outside mutation leases and format response."""
+    doc = prepared.doc
+    target_ver = prepared.target_ver
+    qdrant_payload_synced, degraded, degraded_reason = (
+        await _sync_temporal_payloads_with_reconcile(
+            session,
+            project_id=prepared.project_id,
+            doc=doc,
+            target_ver=target_ver,
+            versions_to_sync=prepared.versions_to_sync,
+            qdrant_client=qdrant_client,
+            engine_manager=engine_manager,
+            job_queue=job_queue,
+        )
+    )
+    if prepared.conflict_job_id and job_queue is not None:
+        try:
+            await _enqueue_persisted_job(job_queue, prepared.conflict_job_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "Failed to enqueue conflict resolution job %s after metadata patch: %s",
+                prepared.conflict_job_id,
+                sanitize_error_message(exc),
+            )
+
+    return DocumentMetadataPatchResponse(
+        document_id=doc.id,
+        version_id=target_ver.id,
+        version_no=target_ver.version_no,
+        authority_tier=target_ver.authority_tier,
+        effective_from=_as_utc_dt(target_ver.effective_from),
+        scope_tags=(
+            list(target_ver.scope_tags_json)
+            if target_ver.scope_tags_json is not None
+            else None
+        ),
+        valid_from=_as_utc_dt(target_ver.valid_from) or datetime.now(UTC),
+        valid_to=_as_utc_dt(target_ver.valid_to) or _MAX_VALID_TO,
+        temporal_recomputed=prepared.temporal_recomputed,
+        qdrant_payload_synced=qdrant_payload_synced,
+        degraded=degraded,
+        degraded_reason=degraded_reason,
+    )
+
+
+async def update_document_version_metadata(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    project_id: str,
+    document_id: str,
+    allowed_partition_ids: frozenset[str] | set[str],
+    version_no: int | None = None,
+    authority_tier: int | str | None = _UNSET,
+    effective_from: datetime | None = _UNSET,
+    scope_tags: list[str] | None = _UNSET,
+    qdrant_client: Any | None = None,
+    engine_manager: Any | None = None,
+    job_queue: JobQueue | None = None,
+) -> DocumentMetadataPatchResponse:
+    """Apply a tri-state metadata PATCH to a DocumentVersion with fail-closed partition ACL."""
+    prepared = await commit_document_version_metadata_patch(
+        session,
+        tenant_id=tenant_id,
+        project_id=project_id,
+        document_id=document_id,
+        allowed_partition_ids=allowed_partition_ids,
+        version_no=version_no,
+        authority_tier=authority_tier,
+        effective_from=effective_from,
+        scope_tags=scope_tags,
+    )
+    return await finalize_document_version_metadata_sync(
+        session,
+        prepared,
+        qdrant_client=qdrant_client,
+        engine_manager=engine_manager,
+        job_queue=job_queue,
+    )

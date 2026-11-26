@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
-from sag_api.core.config import FIXED_SEARCH_TOP_K, settings
+from sag_api.core.config import settings
 from sag_api.core.db import get_session
 from sag_api.core.deps import (
     get_current_user,
@@ -22,6 +22,7 @@ from sag_api.core.error_taxonomy import ErrorCode
 from sag_api.core.errors import ApiError, ValidationError
 from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import VerifiedPrincipal, require_project_read_principal
+from sag_api.core.text_utils import normalize_text
 from sag_api.core.token_usage import TokenLedger, token_usage_scope
 from sag_api.db.models import Source, User
 from sag_api.enums import SEARCH_STRATEGIES, normalize_search_strategy
@@ -41,7 +42,7 @@ from sag_api.schemas.search import (
     SearchSourceHitOut,
     SectionOut,
 )
-from sag_api.services.decision_router import CHAT_HIGH_CONFIDENCE, route_query
+from sag_api.services.decision_router import CHAT_HIGH_CONFIDENCE, route_query_async
 from sag_api.services.eval.llm_judge import judge_pairwise
 from sag_api.services.query_analysis import analyze_query
 from sag_api.services.query_strategy_planner import QueryStrategyPlan, plan_query
@@ -100,33 +101,61 @@ async def _build_query_route(
     requested_retrieval_mode: str | None = None,
     *,
     requested_top_k: int | None = None,
+    as_of: datetime | None = None,
     trace_strategy_plan: bool = False,
+    llm: LLMClient | None = None,
 ) -> _QueryRoutePlan:
-    analysis = analyze_query(query, segmentation_enabled=settings.search_chinese_segmentation_enabled)
     route_error = False
     try:
-        decision = await asyncio.to_thread(route_query, query)
+        decision = (
+            await route_query_async(
+                query,
+                scoped=bool(source_ids),
+                has_sources=True,
+                llm_client=llm if settings.decision_provider == "llm" else None,
+            )
+        ).to_dict()
     except Exception:  # noqa: BLE001 - Decision Router must never break retrieval
         decision = {
             "coarse_intent": "AMBIGUOUS",
+            "question_scope": "unknown",
             "is_chitchat": False,
             "need_retrieval": True,
             "suggested_strategy": "multi",
             "answer_shape": "fact_answer",
+            "intent_flags": {"needs_retrieval": True},
             "confidence": 0.0,
             "model": "fallback",
+            "degraded": True,
+            "degraded_reason": "decision_route_error",
             "fallback_used": True,
             "fallback_reason": "decision_route_error",
             "reason_codes": ["DECISION_ROUTE_ERROR"],
+            "order_mode": "relevance",
+            "explicit_count": None,
+            "target_unit": "passage",
+            "is_catalog_query": False,
+            "retrieval_mode_hint": "auto",
+            "subqueries": [],
+            "entities": [],
         }
         route_error = True
 
+    routed_subqueries = tuple(str(s).strip() for s in (decision.get("subqueries") or ()) if str(s).strip())
+    routed_multi_hop_hint = str(decision.get("retrieval_mode_hint") or "").strip().lower() in {"multi_hop", "multi"}
+    analysis = analyze_query(
+        query,
+        segmentation_enabled=settings.search_chinese_segmentation_enabled,
+        subqueries=routed_subqueries,
+        multi_hop_hint=routed_multi_hop_hint,
+    )
     strategy_plan = plan_query(
         query,
         requested_mode=requested_retrieval_mode,
         features=analysis.features,
         requested_top_k=requested_top_k,
-        answer_shape=str(decision.get("answer_shape") or "") or None,
+        route_decision=decision,
+        as_of=as_of,
     )
 
     confidence = decision.get("confidence", 0.0)
@@ -156,10 +185,10 @@ async def _build_query_route(
     if effective_strategy not in SEARCH_STRATEGIES:
         effective_strategy = configured_strategy if configured_strategy in SEARCH_STRATEGIES else "vector"
 
-    fallback_used = bool(decision.get("fallback_used")) or route_error
-    fallback_reason = decision.get("fallback_reason")
+    degraded = bool(decision.get("degraded") or decision.get("fallback_used")) or route_error
+    degraded_reason = decision.get("degraded_reason") or decision.get("fallback_reason")
     if route_error:
-        fallback_reason = "decision_route_error"
+        degraded_reason = "decision_route_error"
     reason_codes = [str(value) for value in (decision.get("reason_codes") or [])]
     if requested_strategy:
         reason_codes.append("EXPLICIT_STRATEGY")
@@ -169,14 +198,19 @@ async def _build_query_route(
         "query_original": query,
         "scope_source_ids": list(source_ids) if source_ids is not None else None,
         "coarse_intent": coarse_intent,
+        "question_scope": str(decision.get("question_scope") or "unknown"),
+        "answer_shape": str(decision.get("answer_shape") or "fact_answer"),
+        "intent_flags": dict(decision.get("intent_flags") or {}),
         "confidence": round(confidence, 4),
         "model": decision.get("model", "fallback"),
         "suggested_strategy": suggested_strategy,
         "requested_strategy": requested_strategy or "auto",
         "effective_strategy": effective_strategy,
-        "retrieval": "skipped" if not need_retrieval else "fallback" if fallback_used else "required",
-        "fallback_used": fallback_used,
-        "fallback_reason": fallback_reason,
+        "retrieval": "skipped" if not need_retrieval else "fallback" if degraded else "required",
+        "degraded": degraded,
+        "degraded_reason": degraded_reason,
+        "fallback_used": degraded,
+        "fallback_reason": degraded_reason,
         "reason_codes": reason_codes,
         "query_analysis": {
             "normalized_phrase": analysis.normalized_phrase,
@@ -209,6 +243,9 @@ def _with_query_route_stats(
         trace["fallback_used"] = True
         trace["retrieval"] = "fallback"
         trace["fallback_reason"] = trace["fallback_reason"] or "retrieval_strategy_fallback"
+    route_degraded = bool(trace.get("degraded"))
+    merged["degraded"] = bool(merged.get("degraded") or route_degraded)
+    merged["degraded_reason"] = merged.get("degraded_reason") or trace.get("degraded_reason")
     merged["query_route"] = trace
     return merged
 
@@ -320,6 +357,7 @@ async def _prepare_global_search(
     body: GlobalSearchRequest,
     *,
     principal: VerifiedPrincipal,
+    llm: LLMClient | None = None,
 ) -> _PreparedGlobalSearch:
     sources = await search_source_candidates(
         session,
@@ -332,15 +370,18 @@ async def _prepare_global_search(
     # request never occupies a pooled database connection while waiting on the
     # engine or model. SessionLocal uses expire_on_commit=False.
     await session.commit()
+    query = normalize_text(body.query)
     resolved_project_id = _resolve_search_project_id(principal, sources)
     with token_usage_scope(project_id=resolved_project_id, tenant_id=principal.tenant_id):
         route_plan = await _build_query_route(
-            body.query,
+            query,
             body.source_ids,
             body.strategy,
             body.retrieval_mode,
             requested_top_k=body.top_k,
+            as_of=body.as_of if isinstance(body.as_of, datetime) else None,
             trace_strategy_plan=True,
+            llm=llm,
         )
         if not route_plan.need_retrieval:
             stats = _with_query_route_stats(
@@ -352,21 +393,35 @@ async def _prepare_global_search(
                 },
                 route_plan,
             )
-            outcome = SearchOutcome(query=body.query, sections=[], stats=stats)
+            outcome = SearchOutcome(query=query, sections=[], stats=stats)
             return _PreparedGlobalSearch(
                 sources=[],
                 outcome=outcome,
-                response=SearchResponse(query=body.query, sections=[], stats=stats, answer_status="skipped"),
+                response=SearchResponse(
+                    query=query,
+                    sections=[],
+                    stats=stats,
+                    answer_status="skipped",
+                    degraded=bool(stats.get("degraded", False)),
+                    degraded_reason=stats.get("degraded_reason"),
+                ),
                 answer_skipped=True,
             )
 
         if not sources:
             stats = _with_query_route_stats({"sources": 0}, route_plan)
-            outcome = SearchOutcome(query=body.query, sections=[], stats=stats)
+            outcome = SearchOutcome(query=query, sections=[], stats=stats)
             return _PreparedGlobalSearch(
                 sources=[],
                 outcome=outcome,
-                response=SearchResponse(query=body.query, sections=[], stats=stats, answer_status="pending"),
+                response=SearchResponse(
+                    query=query,
+                    sections=[],
+                    stats=stats,
+                    answer_status="pending",
+                    degraded=bool(stats.get("degraded", False)),
+                    degraded_reason=stats.get("degraded_reason"),
+                ),
             )
 
         refs = {source.sag_source_config_id: source for source in sources}
@@ -375,7 +430,7 @@ async def _prepare_global_search(
         outcome = await retrieve_search_unit_sections(
             engine_manager,
             sources,
-            body.query,
+            query,
             principal=principal,
             top_k=body.top_k,
             query_strategy_plan=route_plan.strategy_plan,
@@ -415,12 +470,14 @@ async def _prepare_global_search(
 
     return _PreparedGlobalSearch(
         sources=sources,
-        outcome=SearchOutcome(query=body.query, sections=outcome.sections, stats=stats),
+        outcome=SearchOutcome(query=query, sections=outcome.sections, stats=stats),
         response=SearchResponse(
-            query=body.query,
+            query=query,
             sections=section_outputs,
             stats=stats,
             answer_status="pending",
+            degraded=bool(stats.get("degraded", False)),
+            degraded_reason=stats.get("degraded_reason"),
         ),
     )
 
@@ -463,12 +520,16 @@ async def _complete_global_search(
 
     if prepared.answer_skipped:
         return prepared.response.model_copy(update={"summary": "", "answer_status": "skipped"})
+    degraded = bool(prepared.response.degraded or answer.degraded)
+    degraded_reason = answer.degraded_reason or prepared.response.degraded_reason
     return prepared.response.model_copy(
         update={
             "summary": answer.text,
             "citations": [SearchCitationOut.model_validate(citation) for citation in answer.citations],
             "answer_status": answer.status,
             "no_answer_reason": answer.no_answer_reason,
+            "degraded": degraded,
+            "degraded_reason": degraded_reason,
             "exploration_id": exploration_id,
         }
     )
@@ -519,6 +580,7 @@ async def search(
         from sag_api.core.errors import NotFoundError
 
         raise NotFoundError("信源不存在")
+    query = normalize_text(body.query)
     project_id = _resolve_search_project_id(principal, [source])
     with token_usage_scope(
         component="search_request",
@@ -527,10 +589,12 @@ async def search(
     ) as search_token_ledger:
         partitioned = source.id in await versioned_source_ids(session, [source.id])
         route_plan = await _build_query_route(
-            body.query,
+            query,
             [source_id],
             body.strategy,
             requested_top_k=body.top_k,
+            as_of=body.as_of if isinstance(body.as_of, datetime) else None,
+            llm=llm,
         )
         if route_plan.need_retrieval:
             if partitioned:
@@ -539,7 +603,7 @@ async def search(
                 outcome = await retrieve_search_unit_sections(
                     engine_manager,
                     [source],
-                    body.query,
+                    query,
                     principal=principal,
                     top_k=body.top_k,
                     query_strategy_plan=route_plan.strategy_plan,
@@ -550,13 +614,14 @@ async def search(
                     retrieve_relevant_sections(
                         engine_manager,
                         [source],
-                        body.query,
+                        query,
                         strategy=route_plan.strategy,
                         top_k=body.top_k,
+                        query_strategy_plan=route_plan.strategy_plan,
                     ),
                     recall_event_scores(
                         engine_manager,
-                        body.query,
+                        query,
                         {source.sag_source_config_id: source},
                         limit=route_plan.strategy_plan.retrieval_plan.cardinality.effective_n,
                     ),
@@ -568,7 +633,7 @@ async def search(
                 },
                 route_plan,
             )
-            outcome = SearchOutcome(query=body.query, sections=outcome.sections, stats=stats)
+            outcome = SearchOutcome(query=query, sections=outcome.sections, stats=stats)
         else:
             event_scores = {}
             stats = _with_query_route_stats(
@@ -580,7 +645,7 @@ async def search(
                 },
                 route_plan,
             )
-            outcome = SearchOutcome(query=body.query, sections=[], stats=stats)
+            outcome = SearchOutcome(query=query, sections=[], stats=stats)
         for section in outcome.sections:
             section.source_config_id = section.source_config_id or source.sag_source_config_id
         graph_fields = (
@@ -594,15 +659,21 @@ async def search(
             )
         )
         answer = (
-            await synthesize_search_answer(body.query, outcome.sections, llm=llm, sources=[source])
+            await synthesize_search_answer(query, outcome.sections, llm=llm, sources=[source])
             if route_plan.need_retrieval
             else SearchAnswer("", [], "skipped")
         )
         # 对外 source_id = sag 信源 id（可路由 / 取原文），不泄漏引擎内部 id
+        retrieval_degraded = bool(outcome.stats.get("degraded", False))
+        retrieval_degraded_reason = outcome.stats.get("degraded_reason")
         return SearchResponse(
-            query=body.query,
+            query=query,
             sections=[
-                SectionOut(**{**s.model_dump(), "source_id": source.id}, source_name=source.name) for s in outcome.sections
+                SectionOut(
+                    **{**s.model_dump(), "source_id": source.id},
+                    source_name=source.name,
+                )
+                for s in outcome.sections
             ],
             **graph_fields,
             source_hits=_source_hits(graph_fields["events"]),
@@ -610,6 +681,8 @@ async def search(
             citations=answer.citations,
             answer_status=answer.status,
             no_answer_reason=answer.no_answer_reason,
+            degraded=bool(retrieval_degraded or answer.degraded),
+            degraded_reason=answer.degraded_reason or retrieval_degraded_reason,
             stats={
                 **outcome.stats,
                 "event_hits": len(graph_fields["events"]),
@@ -636,7 +709,7 @@ async def global_search(
         project_id=default_project_id,
         tenant_id=principal.tenant_id,
     ) as search_token_ledger:
-        prepared = await _prepare_global_search(session, engine_manager, body, principal=principal)
+        prepared = await _prepare_global_search(session, engine_manager, body, principal=principal, llm=llm)
         prepared.response = _with_token_usage_stats(prepared.response, search_token_ledger)
         if request.state.auth_kind == "connector":
             return prepared.response.model_copy(
@@ -686,7 +759,7 @@ async def global_search_stream(
                 # Run retrieval inside the response task: EventSourceResponse can
                 # send keep-alive pings immediately and cancel this work as soon as
                 # the browser starts a newer search or disconnects.
-                prepared = await _prepare_global_search(session, engine_manager, body, principal=principal)
+                prepared = await _prepare_global_search(session, engine_manager, body, principal=principal, llm=llm)
                 prepared.response = _with_token_usage_stats(prepared.response, search_token_ledger)
                 yield _sse("result", prepared.response.model_dump(mode="json"))
                 if prepared.answer_skipped:
@@ -709,6 +782,8 @@ async def global_search_stream(
                                     update.citations or [],
                                     update.status,
                                     update.no_answer_reason,
+                                    degraded=update.degraded,
+                                    degraded_reason=update.degraded_reason,
                                 )
 
                 completed = await _complete_global_search(
@@ -837,6 +912,7 @@ async def eval_compare(
 
     source_refs = {source.sag_source_config_id: source for source in sources}
     partitioned_ids = await versioned_source_ids(session, [source.id for source in sources])
+    query = normalize_text(body.query)
     if not sources:
         empty_results = [
             EvalStrategyResultOut(
@@ -847,7 +923,7 @@ async def eval_compare(
             for strategy in ordered_strategies
         ]
         return EvalCompareResponse(
-            query=body.query,
+            query=query,
             results=empty_results,
             judges=[],
             judge_enabled=False,
@@ -859,7 +935,7 @@ async def eval_compare(
             _run_one_strategy(
                 engine_manager,
                 sources,
-                body.query,
+                query,
                 strategy,
                 body.top_k,
                 source_refs,
@@ -905,7 +981,7 @@ async def eval_compare(
             ]
             verdict = await judge_pairwise(
                 llm,
-                body.query,
+                query,
                 a,
                 a_sections,
                 b,
@@ -926,7 +1002,7 @@ async def eval_compare(
             judge_reason = "所有 pairwise judge 都失败,已回退空结果"
 
     return EvalCompareResponse(
-        query=body.query,
+        query=query,
         results=list(results),
         judges=judges,
         judge_enabled=judge_enabled,

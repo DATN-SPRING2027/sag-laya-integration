@@ -1102,6 +1102,7 @@ async def _resolve_session_history(
     source_ids: list[str] | None,
     llm: Any,
     budget_tokens: int,
+    web_enabled: bool = False,
 ) -> tuple[list[dict[str, str]], dict[str, Any] | None, dict[str, Any] | None, list[dict[str, Any]]]:
     mode = settings.session_context_mode
     if mode == "off":
@@ -1120,6 +1121,8 @@ async def _resolve_session_history(
                 owner_key=owner_key,
                 requested_source_ids=source_ids,
                 budget_tokens=budget_tokens,
+                llm=llm,
+                web_enabled=web_enabled,
             )
             pack.audit_trace.mode = "shadow"
             log_session_audit_trace(thread_id, pack.audit_trace)
@@ -1138,6 +1141,8 @@ async def _resolve_session_history(
             owner_key=owner_key,
             requested_source_ids=source_ids,
             budget_tokens=budget_tokens,
+            llm=llm,
+            web_enabled=web_enabled,
         )
         log_session_audit_trace(thread_id, pack.audit_trace)
         return (
@@ -1219,6 +1224,7 @@ async def prepare_ask(
     owner_key: str,
     llm=None,
     user_name: str | None = None,
+    web_enabled: bool = False,
 ) -> AskPlan:
     """落库用户消息（含图片附件 meta）、解析历史（超上下文阈值时主动压缩），组装计划。"""
     from sag_api.api.v1.attachments import attachment_path
@@ -1276,7 +1282,21 @@ async def prepare_ask(
         source_ids=source_ids,
         llm=llm,
         budget_tokens=int(settings.llm_context_window * 0.4),
+        web_enabled=web_enabled,
     )
+    if route_decision is None:
+        from sag_api.services.decision_router import route_query_async
+
+        routed = await route_query_async(
+            query,
+            prior_turns=history,
+            has_thread_history=bool(history),
+            has_sources=(source_ids is None or bool(source_ids)),
+            web_enabled=web_enabled,
+            scoped=bool(source_ids),
+            llm_client=llm if settings.decision_provider == "llm" else None,
+        )
+        route_decision = routed.to_dict()
     effective_user_name = await resolve_user_display_name(
         session,
         user_name=user_name,

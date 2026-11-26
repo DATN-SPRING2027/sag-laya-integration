@@ -240,18 +240,25 @@ async def test_canonical_embedding_reuses_sdk_client_without_starting_event_stor
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("prune_fails", [False, True])
+@pytest.mark.parametrize("sync_fails", [False, True])
 @pytest.mark.parametrize("missing_index", [False, True])
-async def test_verified_new_version_publishes_even_when_old_point_cleanup_fails(ingestion_db, monkeypatch, prune_fails, missing_index):
+async def test_verified_new_version_publishes_even_when_old_point_cleanup_fails(
+    ingestion_db, monkeypatch, sync_fails, missing_index
+):
     import json
+    from datetime import UTC, datetime, timedelta
 
     import httpx
 
     from sag_api.services import dedup_and_temporal_service as temporal
 
     points = []
-    deleted = []
+    deleted_superseded = []
+    synced_payloads: dict[str, dict] = {}
     created_indexes = []
+    now = datetime.now(UTC)
+    t_old = now - timedelta(days=5)
+    max_valid_to = datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC)
 
     async def index(_client, *, units, **kwargs):
         points.extend(
@@ -272,13 +279,22 @@ async def test_verified_new_version_publishes_even_when_old_point_cleanup_fails(
             return httpx.Response(200, json={"result": {"count": len(points)}})
         if request.url.path.endswith("/points/scroll"):
             return httpx.Response(200, json={"result": {"points": points}})
+        if request.url.path.endswith("/points/payload"):
+            must = (body.get("filter") or {}).get("must") or []
+            vid = next(
+                (c["match"]["value"] for c in must if c.get("key") == "document_version_id"),
+                None,
+            )
+            if vid is not None:
+                synced_payloads[vid] = dict(body.get("payload") or {})
+            if vid == "old-version" and sync_fails:
+                return httpx.Response(503, text="unavailable")
+            return httpx.Response(200, json={"result": {}})
         match = body["filter"]["must"][0]["match"]
         if missing_index and match.get("value") == "version" and not created_indexes:
             return httpx.Response(400, text='Index required but not found for "document_version_id"')
-        if match.get("any") == ["old-version"]:
-            deleted.append(match["any"])
-            if prune_fails:
-                return httpx.Response(503, text="unavailable")
+        if match.get("any") == ["old-version"] or match.get("value") == "old-version":
+            deleted_superseded.append(match)
         return httpx.Response(200, json={"result": {}})
 
     monkeypatch.setattr(search_index_service, "index_search_units_to_qdrant", index)
@@ -288,7 +304,29 @@ async def test_verified_new_version_publishes_even_when_old_point_cleanup_fails(
         AsyncMock(
             return_value={
                 "action": "SUPERSEDED",
+                "active_version_id": "version",
+                "current_version_id": "version",
                 "supersedes_id": "old-version",
+                "mutated_versions": [
+                    {
+                        "version_id": "version",
+                        "valid_from": now,
+                        "valid_to": max_valid_to,
+                        "is_superseded": False,
+                        "authority_tier": None,
+                        "effective_from": None,
+                        "scope_tags": [],
+                    },
+                    {
+                        "version_id": "old-version",
+                        "valid_from": t_old,
+                        "valid_to": now,
+                        "is_superseded": True,
+                        "authority_tier": None,
+                        "effective_from": None,
+                        "scope_tags": [],
+                    },
+                ],
             }
         ),
     )
@@ -322,8 +360,20 @@ async def test_verified_new_version_publishes_even_when_old_point_cleanup_fails(
             )
         assert units
         assert version.search_status == "SEARCH_READY"
-        assert deleted == [["old-version"]]
+        assert deleted_superseded == []
+        assert {"version", "old-version"} <= set(synced_payloads.keys())
+        assert synced_payloads["old-version"]["valid_to_ts"] == int(now.timestamp())
+        assert synced_payloads["old-version"]["valid_to_iso"] == now.isoformat()
         assert created_indexes == (["document_version_id"] if missing_index else [])
+        if sync_fails:
+            assert (version.metadata_json or {}).get("qdrant_temporal_sync_degraded") is True
+            assert (version.metadata_json or {}).get("qdrant_temporal_sync_failed_version_ids") == ["old-version"]
+            reconcile_job = await session.scalar(
+                select(Job).where(Job.type == JobType.RECONCILE_SEARCH_INDEX)
+            )
+            assert reconcile_job is not None
+            assert (reconcile_job.payload or {}).get("reason") == "temporal_payload_sync_failed"
+            assert (reconcile_job.payload or {}).get("sync_version_ids") == ["old-version"]
 
 
 @pytest.mark.asyncio
@@ -630,7 +680,7 @@ async def test_get_document_version_chunks_orders_units_and_enforces_partition_a
 
     markdown_body = (
         "# System Architecture\n\n"
-        "Multi-tenant RBAC boundary isolates project data across Cloudflare R2 and PostgreSQL.\n\n"
+        "Multi-tenant RBAC boundary isolates project data across object storage and PostgreSQL.\n\n"
         "## Sharding Strategy\n\n"
         "| Shard | Region | Capacity |\n"
         "| --- | --- | --- |\n"
@@ -781,13 +831,11 @@ async def test_revoked_resync_with_same_idempotency_key_and_project_source_contr
     from sag_api.core.config import settings
     from sag_api.core.principal_assertion import VerifiedPrincipal as BffVerifiedPrincipal
     from sag_api.services.document_service import (
-        handle_document_object_ingest,
         handle_document_upload,
         revoke_project_document,
     )
 
     monkeypatch.setattr(settings, "data_dir", str(tmp_path))
-    monkeypatch.setattr(settings, "object_ingest_allowed_hosts", ["r2.example.internal"])
 
     async with ingestion_db() as session:
         first = await handle_document_upload(
@@ -855,49 +903,6 @@ async def test_revoked_resync_with_same_idempotency_key_and_project_source_contr
         assert resynced.status == "RECEIVED"
         assert resynced.search_status == "PENDING"
 
-        # Also verify Direct-to-R2 object ingest path with same client_token after revoke
-        sha = "a" * 64
-        obj_v1 = await handle_document_object_ingest(
-            session,
-            tenant_id="tenant-resync",
-            project_id="project-resync",
-            owner_id="leader-1",
-            security_partition_id="project-resync",
-            client_token="continuum:project_document:doc-r2:v1:aaaa1111",
-            source_url="https://r2.example.internal/bucket/doc.pdf?X-Amz-Signature=1",
-            original_filename="doc.pdf",
-            expected_sha256=sha,
-            expected_size_bytes=2048,
-            content_type="application/pdf",
-            logical_source_id="continuum:project_document:doc-r2",
-        )
-        assert obj_v1.version_no == 1
-        await revoke_project_document(
-            session,
-            tenant_id="tenant-resync",
-            project_id="project-resync",
-            document_id=obj_v1.document_id,
-            reason="MANUAL_REVOKE",
-        )
-        obj_v2 = await handle_document_object_ingest(
-            session,
-            tenant_id="tenant-resync",
-            project_id="project-resync",
-            owner_id="leader-1",
-            security_partition_id="project-resync",
-            client_token="continuum:project_document:doc-r2:v1:aaaa1111",
-            source_url="https://r2.example.internal/bucket/doc.pdf?X-Amz-Signature=2",
-            original_filename="doc.pdf",
-            expected_sha256=sha,
-            expected_size_bytes=2048,
-            content_type="application/pdf",
-            logical_source_id="continuum:project_document:doc-r2",
-        )
-        assert obj_v2.version_no == 2
-        assert obj_v2.is_duplicate is False
-        assert obj_v2.status == "RECEIVED"
-        assert obj_v2.search_status == "PENDING"
-
 
 @pytest.mark.asyncio
 async def test_reprocess_ready_project_document_completes_without_legacy_engine_schema(
@@ -924,7 +929,6 @@ async def test_reprocess_ready_project_document_completes_without_legacy_engine_
 
     monkeypatch.setattr(tasks.settings, "data_dir", str(tmp_path))
     monkeypatch.setattr(tasks.settings, "document_event_extraction_enabled", False)
-    monkeypatch.setattr(tasks.settings, "object_ingest_allowed_hosts", ["r2.example.internal"])
 
     fake_queue = SimpleNamespace(
         enqueue=AsyncMock(),
@@ -940,8 +944,17 @@ async def test_reprocess_ready_project_document_completes_without_legacy_engine_
 
     monkeypatch.setattr(search_index_service, "run_search_indexing_stage", fake_index)
 
+    import httpx
+
+    # P3 (S1-11): _reprocess_document_task_unlocked cleans Qdrant points when SEARCH_READY;
+    # provide a mock Qdrant client on manager so offline unit test does not dial localhost:6333.
+    mock_qdrant_client = httpx.AsyncClient(
+        base_url="http://qdrant.local",
+        transport=httpx.MockTransport(lambda _req: httpx.Response(200, json={"result": {"status": "completed"}})),
+    )
     manager = SimpleNamespace(
         get_sag_embedding=AsyncMock(return_value=None),
+        get_search_unit_qdrant_client=AsyncMock(return_value=mock_qdrant_client),
         process_document=AsyncMock(side_effect=AssertionError("Legacy extractor should not run")),
         delete_document_data=AsyncMock(side_effect=AssertionError("Legacy delete_document_data must not run for Phase 2-only project documents")),
     )
@@ -975,8 +988,6 @@ async def test_reprocess_ready_project_document_completes_without_legacy_engine_
             source,
             doc.id,
             job_queue=fake_queue,
-            remote_source_url="https://r2.example.internal/bucket/arch.md?X-Amz-Signature=fresh",
-            original_filename="arch.md",
         )
         assert reproc_job.type == JobType.REPROCESS_DOCUMENT
         reproc_job.status = JobStatus.RUNNING
@@ -985,7 +996,6 @@ async def test_reprocess_ready_project_document_completes_without_legacy_engine_
         await tasks._reprocess_document_task_unlocked(session, reproc_job, engine_manager=manager, job_queue=fake_queue)
         reproc_job.status = JobStatus.SUCCEEDED
         await session.commit()
-        assert "remote_source_url" not in (reproc_job.payload or {})
 
         proc_job_id = (reproc_job.payload or {}).get("process_job_id")
         assert proc_job_id
@@ -1009,6 +1019,7 @@ async def test_reprocess_ready_project_document_completes_without_legacy_engine_
         assert final_status.search_ready is True
         assert final_status.current_stage == "COMPLETE"
         assert final_status.document_status == "ready"
+    await mock_qdrant_client.aclose()
 
 
 @pytest.mark.asyncio
@@ -1025,6 +1036,38 @@ async def test_project_document_readiness_batch_requires_confirmed_project_mappi
         ready_version.status = "READY"
         ready_version.search_status = "SEARCH_READY"
         ready_version.search_ready_at = datetime.now(UTC)
+
+        # S1-10: version readiness reports SearchUnit counts scoped to the DocumentVersion
+        # instead of trusting document-level chunk_count.
+        from sag_api.db.models.routing_rag import CanonicalBlock, SearchUnit
+
+        blk = CanonicalBlock(
+            id="ready-blk-1",
+            document_version_id="version",
+            ordinal=0,
+            block_type="paragraph",
+            page_from=1,
+            page_to=1,
+            section_path="Root",
+            normalized_text="Ready content",
+            content_hash="r" * 64,
+        )
+        session.add(blk)
+        await session.flush()
+        session.add(
+            SearchUnit(
+                id="ready-unit-1",
+                document_version_id="version",
+                block_from_id="ready-blk-1",
+                block_to_id="ready-blk-1",
+                security_partition_id="project",
+                content_hash="r" * 64,
+                token_count=2,
+                page_from=1,
+                page_to=1,
+                section_path="Root",
+            )
+        )
 
         session.add(Source(id="pending-source", name="Pending", sag_source_config_id="pending-config"))
         await session.flush()
@@ -1082,7 +1125,7 @@ async def test_project_document_readiness_batch_requires_confirmed_project_mappi
 
     assert result.items[0].found is True
     assert result.items[0].search_ready is True
-    assert result.items[0].chunk_count == 8
+    assert result.items[0].chunk_count == 1
     assert result.items[1].found is False
     assert result.items[1].search_ready is False
     assert result.items[2].found is False
@@ -1098,7 +1141,12 @@ async def test_project_document_readiness_batch_route_enforces_bff_project_scope
     from sag_api.api.v1.documents import project_router
     from sag_api.core.db import get_session
     from sag_api.core.errors import ApiError
-    from sag_api.core.principal_assertion import require_project_bff_principal
+    from sag_api.core.principal_assertion import (
+        VerifiedPrincipal as BffVerifiedPrincipal,
+    )
+    from sag_api.core.principal_assertion import (
+        require_project_bff_principal,
+    )
 
     async with ingestion_db() as session:
         app = FastAPI()
@@ -1111,10 +1159,16 @@ async def test_project_document_readiness_batch_route_enforces_bff_project_scope
                 content=exc.to_envelope(),
             )
 
-        principal = SimpleNamespace(
+        principal = BffVerifiedPrincipal(
             subject="user",
-            tenant_id="tenant",
+            organization_id="tenant",
             allowed_project_ids=frozenset({"project"}),
+            issuer="continuum-bff",
+            key_id="kid-1",
+            token_id="jti-1",
+            issued_at=1_700_000_000,
+            expires_at=1_700_000_900,
+            tenant_id="tenant",
             allowed_partition_ids=frozenset({"project"}),
         )
         app.dependency_overrides[require_project_bff_principal] = lambda: principal
@@ -1156,3 +1210,173 @@ async def test_project_document_readiness_batch_route_enforces_bff_project_scope
     ]
     assert denied.status_code == 403
     assert duplicate.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_ingest_object_endpoint_removed_returns_404(ingestion_db) -> None:
+    import httpx
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse
+
+    from sag_api.api.v1.documents import project_router
+    from sag_api.core.db import get_session
+    from sag_api.core.errors import ApiError
+    from sag_api.core.principal_assertion import (
+        VerifiedPrincipal as BffVerifiedPrincipal,
+    )
+    from sag_api.core.principal_assertion import (
+        require_project_bff_principal,
+    )
+
+    async with ingestion_db() as session:
+        app = FastAPI()
+        app.include_router(project_router)
+
+        @app.exception_handler(ApiError)
+        async def handle_api_error(request, exc):
+            return JSONResponse(status_code=exc.status_code, content=exc.to_envelope())
+
+        principal = BffVerifiedPrincipal(
+            subject="user",
+            organization_id="tenant",
+            allowed_project_ids=frozenset({"project"}),
+            issuer="continuum-bff",
+            key_id="kid-1",
+            token_id="jti-1",
+            issued_at=1_700_000_000,
+            expires_at=1_700_000_900,
+            tenant_id="tenant",
+            allowed_partition_ids=frozenset({"project"}),
+        )
+        app.dependency_overrides[require_project_bff_principal] = lambda: principal
+        app.dependency_overrides[get_session] = lambda: session
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/projects/project/documents/ingest-object",
+                headers={"Idempotency-Key": "removed-r2-endpoint"},
+                json={
+                    "source_url": "https://acct.r2.cloudflarestorage.com/bucket/doc.pdf",
+                    "original_filename": "doc.pdf",
+                    "expected_sha256": "a" * 64,
+                    "expected_size_bytes": 1024,
+                },
+            )
+
+    assert response.status_code in (404, 405)
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_project_reprocess_endpoint_works_without_body_and_r2_schemas_removed(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse
+
+    from sag_api.api.v1 import documents as documents_api
+    from sag_api.core.db import get_session
+    from sag_api.core.deps import get_job_queue
+    from sag_api.core.errors import ApiError
+    from sag_api.core.principal_assertion import (
+        VerifiedPrincipal as BffVerifiedPrincipal,
+    )
+    from sag_api.core.principal_assertion import (
+        require_project_bff_principal,
+    )
+    from sag_api.schemas import routing_rag
+
+    assert not hasattr(routing_rag, "DocumentObjectIngestRequest")
+    assert not hasattr(routing_rag, "DocumentReprocessRequest")
+    assert not hasattr(Settings, "object_ingest_allowed_hosts")
+    assert not hasattr(Settings, "object_ingest_allow_private_hosts_in_dev")
+    assert not hasattr(Settings, "object_ingest_timeout_seconds")
+    assert not hasattr(Settings, "remote_snapshot_gc_enabled")
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(documents_api, "SessionLocal", factory)
+
+    doc_file = tmp_path / "sample.md"
+    doc_file.write_text("# Sample\n\nBody text.", encoding="utf-8")
+    digest = hashlib.sha256(doc_file.read_bytes()).hexdigest()
+
+    fake_queue = SimpleNamespace(
+        enqueue=AsyncMock(),
+        begin_source_maintenance=lambda *_args, **_kwargs: None,
+    )
+
+    async with factory() as session:
+        session.add(Source(id="source", name="Source", sag_source_config_id="config"))
+        await session.flush()
+        session.add(
+            SourceProjectMapping(
+                source_id="source",
+                organization_id="tenant",
+                project_id="project",
+                state="CONFIRMED",
+                confirmed_at=datetime.now(UTC),
+                confirmed_by="user",
+                approval_ref="test",
+            )
+        )
+        session.add(
+            Document(
+                id="document",
+                source_id="source",
+                tenant_id="tenant",
+                project_id="project",
+                filename=doc_file.name,
+                storage_path=str(doc_file),
+                status=DocumentStatus.FAILED,
+            )
+        )
+        await session.flush()
+        session.add(
+            DocumentVersion(
+                id="version",
+                document_id="document",
+                version_no=1,
+                file_hash=digest,
+                metadata_json={"security_partition_id": "project"},
+            )
+        )
+        await session.commit()
+
+        app = FastAPI()
+        app.include_router(documents_api.project_router)
+
+        @app.exception_handler(ApiError)
+        async def handle_api_error(request, exc):
+            return JSONResponse(status_code=exc.status_code, content=exc.to_envelope())
+
+        principal = BffVerifiedPrincipal(
+            subject="user",
+            organization_id="tenant",
+            allowed_project_ids=frozenset({"project"}),
+            issuer="continuum-bff",
+            key_id="kid-1",
+            token_id="jti-1",
+            issued_at=1_700_000_000,
+            expires_at=1_700_000_900,
+            tenant_id="tenant",
+            allowed_partition_ids=frozenset({"project"}),
+        )
+        app.dependency_overrides[require_project_bff_principal] = lambda: principal
+        app.dependency_overrides[get_session] = lambda: session
+        app.dependency_overrides[get_job_queue] = lambda: fake_queue
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post("/projects/project/documents/document/reprocess")
+
+    await engine.dispose()
+    assert response.status_code == 200
+    assert response.json()["type"] == "process_document"

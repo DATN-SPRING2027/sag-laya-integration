@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import codecs
 import concurrent.futures
 import concurrent.futures.process
 import multiprocessing
@@ -29,6 +30,7 @@ from sag_api.core.errors import (
     UpstreamError,
     ValidationError,
 )
+from sag_api.core.text_utils import normalize_text
 
 _IMAGE_RELATIONSHIP_TYPE = (
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
@@ -210,6 +212,12 @@ def _is_meaningful_markdown(markdown: str) -> bool:
 def _extract_pdf_streaming(path: str) -> str:
     pages_out: list[str] = []
     page_count = 0
+    has_any_text = False
+    scanned_msg = (
+        "Tệp PDF không có lớp văn bản (scanned PDF). "
+        "Vui lòng cấu hình SAG_MINERU_OFFICIAL_API_TOKEN để bật MinerU OCR."
+    )
+    blank_note = "*(Trang {page_no} trống hoặc chỉ chứa hình ảnh/scan không có lớp văn bản)*"
 
     # Priority 1: PyMuPDF (fitz) — C-speed page-by-page extraction with table awareness
     try:
@@ -224,20 +232,85 @@ def _extract_pdf_streaming(path: str) -> str:
                 page = doc.load_page(idx)
                 page_no = idx + 1
                 parts: list[str] = []
+                table_mds: list[str] = []
+                if hasattr(page, "find_tables"):
+                    try:
+                        found = page.find_tables()
+                        for tbl in getattr(found, "tables", None) or []:
+                            rows = tbl.extract() or []
+                            clean_rows = [
+                                [_escape_md_cell(str(c or "")) for c in row]
+                                for row in rows
+                                if row and any(c is not None and str(c).strip() for c in row)
+                            ]
+                            if clean_rows:
+                                table_mds.append(_format_markdown_table(clean_rows))
+                    except Exception:  # noqa: BLE001
+                        table_mds = []
                 text = (page.get_text("text") or "").strip()
                 if text:
                     parts.append(text)
+                parts.extend(table_mds)
                 if parts:
+                    has_any_text = True
                     pages_out.append(f"<!-- PAGE {page_no} -->\n\n" + "\n\n".join(parts))
-        combined = "\n\n".join(pages_out).strip()
-        if _is_meaningful_markdown(combined):
-            return combined
+                else:
+                    pages_out.append(f"<!-- PAGE {page_no} -->\n\n{blank_note.format(page_no=page_no)}")
+        if has_any_text:
+            return "\n\n".join(pages_out).strip()
         if page_count > 0:
-            raise _LocalParseValidationError(
-                "Tệp PDF không có lớp văn bản (scanned PDF). Vui lòng cấu hình SAG_MINERU_OFFICIAL_API_TOKEN để bật MinerU OCR."
-            )
+            raise _LocalParseValidationError(scanned_msg)
 
-    # Priority 2: pypdf page-by-page
+    # Priority 2: pdfplumber — table-aware page-by-page extraction without duplicating table cells
+    try:
+        import pdfplumber  # type: ignore[import-untyped]
+    except ImportError:
+        pdfplumber = None
+
+    if pdfplumber is not None:
+        with pdfplumber.open(path) as pdf:
+            page_count = len(pdf.pages)
+            for page_no, page in enumerate(pdf.pages, start=1):
+                parts = []
+                tables = page.find_tables() or []
+                table_bboxes = [t.bbox for t in tables if getattr(t, "bbox", None)]
+                if table_bboxes:
+                    def _outside_tables(obj: dict[str, Any], bboxes=table_bboxes) -> bool:
+                        if obj.get("object_type") != "char":
+                            return True
+                        cx = (float(obj.get("x0", 0.0)) + float(obj.get("x1", 0.0))) / 2.0
+                        cy = (float(obj.get("top", 0.0)) + float(obj.get("bottom", 0.0))) / 2.0
+                        for bx0, btop, bx1, bbottom in bboxes:
+                            if bx0 <= cx <= bx1 and btop <= cy <= bbottom:
+                                return False
+                        return True
+
+                    prose_page = page.filter(_outside_tables)
+                else:
+                    prose_page = page
+                prose_text = (prose_page.extract_text() or "").strip()
+                if prose_text:
+                    parts.append(prose_text)
+                for tbl in tables:
+                    raw_rows = tbl.extract() or []
+                    clean_rows = [
+                        [_escape_md_cell(str(c or "")) for c in row]
+                        for row in raw_rows
+                        if row and any(c is not None and str(c).strip() for c in row)
+                    ]
+                    if clean_rows:
+                        parts.append(_format_markdown_table(clean_rows))
+                if parts:
+                    has_any_text = True
+                    pages_out.append(f"<!-- PAGE {page_no} -->\n\n" + "\n\n".join(parts))
+                else:
+                    pages_out.append(f"<!-- PAGE {page_no} -->\n\n{blank_note.format(page_no=page_no)}")
+        if has_any_text:
+            return "\n\n".join(pages_out).strip()
+        if page_count > 0:
+            raise _LocalParseValidationError(scanned_msg)
+
+    # Priority 3: pypdf page-by-page
     try:
         from pypdf import PdfReader
     except ImportError:
@@ -249,21 +322,19 @@ def _extract_pdf_streaming(path: str) -> str:
         for page_no, page in enumerate(reader.pages, start=1):
             text = (page.extract_text() or "").strip()
             if text:
+                has_any_text = True
                 pages_out.append(f"<!-- PAGE {page_no} -->\n\n{text}")
-        combined = "\n\n".join(pages_out).strip()
-        if _is_meaningful_markdown(combined):
-            return combined
+            else:
+                pages_out.append(f"<!-- PAGE {page_no} -->\n\n{blank_note.format(page_no=page_no)}")
+        if has_any_text:
+            return "\n\n".join(pages_out).strip()
         if page_count > 0:
-            raise _LocalParseValidationError(
-                "Tệp PDF không có lớp văn bản (scanned PDF). Vui lòng cấu hình SAG_MINERU_OFFICIAL_API_TOKEN để bật MinerU OCR."
-            )
+            raise _LocalParseValidationError(scanned_msg)
 
-    # Priority 3: MarkItDown fallback
+    # Priority 4: MarkItDown fallback
     md = _convert_via_markitdown(path)
     if not _is_meaningful_markdown(md):
-        raise _LocalParseValidationError(
-            "Tệp PDF không có lớp văn bản (scanned PDF). Vui lòng cấu hình SAG_MINERU_OFFICIAL_API_TOKEN để bật MinerU OCR."
-        )
+        raise _LocalParseValidationError(scanned_msg)
     return md
 
 
@@ -389,6 +460,22 @@ def _without_dangling_image_relationships(
     )
 
 
+def _extract_image_alt_text(container: ElementTree.Element[str]) -> str:
+    candidates: list[str] = []
+    for elem in container.iter():
+        local_tag = elem.tag.rsplit("}", 1)[-1]
+        if local_tag == "docPr":
+            for attr in ("descr", "title"):
+                val = (elem.get(attr) or "").strip()
+                if val and val not in candidates:
+                    candidates.append(val)
+        elif local_tag == "imagedata":
+            val = (elem.get("alt") or "").strip()
+            if val and val not in candidates:
+                candidates.append(val)
+    return "; ".join(candidates).strip()
+
+
 def _without_image_relationship_references(
     *,
     content: bytes,
@@ -396,7 +483,8 @@ def _without_image_relationship_references(
 ) -> bytes:
     root = ElementTree.fromstring(content)
     parents = {child: parent for parent in root.iter() for child in parent}
-    containers: set[ElementTree.Element[str]] = set()
+    containers: list[ElementTree.Element[str]] = []
+    seen_containers: set[ElementTree.Element[str]] = set()
     for element in root.iter():
         rel_id = element.get(_RELATIONSHIP_EMBED_ATTRIBUTE) or element.get(
             _RELATIONSHIP_ID_ATTRIBUTE
@@ -406,7 +494,9 @@ def _without_image_relationship_references(
         curr: ElementTree.Element[str] | None = element
         while curr is not None:
             if curr.tag in {_DRAWING_TAG, _PICT_TAG}:
-                containers.add(curr)
+                if curr not in seen_containers:
+                    seen_containers.add(curr)
+                    containers.append(curr)
                 break
             curr = parents.get(curr)
     if not containers:
@@ -414,13 +504,55 @@ def _without_image_relationship_references(
     for container in containers:
         parent = parents.get(container)
         if parent is not None:
+            alt_text = _extract_image_alt_text(container)
+            try:
+                insert_idx = list(parent).index(container)
+            except ValueError:
+                insert_idx = len(parent)
             parent.remove(container)
+            if alt_text:
+                t_elem = ElementTree.Element(f"{{{_WORDPROCESSING_NAMESPACE}}}t")
+                t_elem.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+                t_elem.text = f" [Image: {alt_text}] "
+                if parent.tag == f"{{{_WORDPROCESSING_NAMESPACE}}}r":
+                    parent.insert(insert_idx, t_elem)
+                else:
+                    r_elem = ElementTree.Element(f"{{{_WORDPROCESSING_NAMESPACE}}}r")
+                    r_elem.append(t_elem)
+                    parent.insert(insert_idx, r_elem)
     return ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
 # ---------------------------------------------------------------------------
 # 3. PPTX Streaming Slide XML Extractor (<!-- PAGE N --> per slide, skips media)
 # ---------------------------------------------------------------------------
+
+
+def _resolve_pptx_notes_entry(
+    archive: zipfile.ZipFile,
+    names: set[str],
+    slide_no: int,
+    slide_entry: str,
+) -> str | None:
+    rels_entry = f"ppt/slides/_rels/{posixpath.basename(slide_entry)}.rels"
+    if rels_entry in names:
+        try:
+            rels_root = ElementTree.fromstring(archive.read(rels_entry))
+            for rel in rels_root.findall(_RELATIONSHIP_TAG):
+                rel_type = rel.get("Type") or ""
+                if rel_type.endswith("/notesSlide"):
+                    target = rel.get("Target")
+                    if target:
+                        resolved = posixpath.normpath(
+                            posixpath.join(posixpath.dirname(slide_entry), target)
+                        )
+                        if resolved in names:
+                            return resolved
+        except ElementTree.ParseError:
+            pass
+        return None
+    fallback_entry = f"ppt/notesSlides/notesSlide{slide_no}.xml"
+    return fallback_entry if fallback_entry in names else None
 
 
 def _extract_pptx_streaming(path: str) -> str:
@@ -439,8 +571,8 @@ def _extract_pptx_streaming(path: str) -> str:
                 slide_xml = archive.read(slide_entry)
                 slide_parts = _parse_pptx_slide_xml(slide_xml, slide_no)
 
-                notes_entry = f"ppt/notesSlides/notesSlide{slide_no}.xml"
-                if notes_entry in names:
+                notes_entry = _resolve_pptx_notes_entry(archive, names, slide_no, slide_entry)
+                if notes_entry is not None:
                     notes_text = _parse_pptx_notes_xml(archive.read(notes_entry))
                     if notes_text:
                         slide_parts.append(f"**Speaker Notes:**\n{notes_text}")
@@ -528,14 +660,39 @@ def _parse_pptx_slide_xml(xml_bytes: bytes, slide_no: int) -> list[str]:
 
 def _parse_pptx_notes_xml(xml_bytes: bytes) -> str:
     root = ElementTree.fromstring(xml_bytes)
+    p_sp = f"{{{_PRESENTATIONML_NS}}}sp"
+    p_nvSpPr = f"{{{_PRESENTATIONML_NS}}}nvSpPr"
+    p_nvPr = f"{{{_PRESENTATIONML_NS}}}nvPr"
+    p_ph = f"{{{_PRESENTATIONML_NS}}}ph"
     a_p = f"{{{_DRAWINGML_NS}}}p"
     a_t = f"{{{_DRAWINGML_NS}}}t"
+    a_fld = f"{{{_DRAWINGML_NS}}}fld"
+
     lines: list[str] = []
-    for para in root.iter(a_p):
-        text = "".join(t.text for t in para.iter(a_t) if t.text).strip()
-        # Ignore standalone slide-number placeholders
-        if text and not text.isdigit():
-            lines.append(text)
+    shapes = root.findall(f".//{p_sp}")
+    if shapes:
+        for sp in shapes:
+            is_slide_num_placeholder = False
+            nv = sp.find(p_nvSpPr)
+            if nv is not None:
+                nv_pr = nv.find(p_nvPr)
+                if nv_pr is not None:
+                    ph = nv_pr.find(p_ph)
+                    if ph is not None and ph.get("type") == "sldNum":
+                        is_slide_num_placeholder = True
+            if is_slide_num_placeholder:
+                continue
+            for para in sp.iter(a_p):
+                if any(fld.get("type") == "slidenum" for fld in para.iter(a_fld)):
+                    continue
+                text = "".join(t.text for t in para.iter(a_t) if t.text).strip()
+                if text:
+                    lines.append(text)
+    else:
+        for para in root.iter(a_p):
+            text = "".join(t.text for t in para.iter(a_t) if t.text).strip()
+            if text:
+                lines.append(text)
     return "\n".join(lines).strip()
 
 
@@ -563,10 +720,13 @@ def _extract_xlsx_streaming(
             collected_rows: list[list[str]] = []
             max_used_col = 0
             truncated_rows = False
+            truncated_cols = False
 
             for raw_row in ws.iter_rows(values_only=True):
                 if raw_row is None:
                     continue
+                if len(raw_row) > max_cols and any(_format_excel_cell(val) for val in raw_row[max_cols:]):
+                    truncated_cols = True
                 sliced = list(raw_row[:max_cols])
                 cells = [_format_excel_cell(val) for val in sliced]
                 # Trim trailing empty cells on this row
@@ -597,6 +757,10 @@ def _extract_xlsx_streaming(
             if truncated_rows:
                 sheet_parts.append(
                     f"*(Sheet truncated at {max_rows} non-empty rows)*"
+                )
+            if truncated_cols:
+                sheet_parts.append(
+                    f"*(Sheet truncated at {max_cols} columns)*"
                 )
             sheets_out.append("\n\n".join(sheet_parts))
     finally:
@@ -716,30 +880,51 @@ _SKIP_RTF_DESTINATIONS = {
 }
 
 
+def _resolve_rtf_codepage(cpg_arg: str) -> str:
+    if cpg_arg == "65001":
+        return "utf-8"
+    candidate = f"cp{cpg_arg}"
+    try:
+        codecs.lookup(candidate)
+        return candidate
+    except LookupError:
+        return "cp1252"
+
+
 def _decode_rtf_bytes(data: bytes) -> str:
-    """Lightweight streaming RTF text extractor that skips {\\pict ...} binary dumps."""
+    """Lightweight streaming RTF text extractor with codepage, \\ucN, and buffered \\'hh decoding."""
     src = data.decode("latin1", errors="ignore")
     out: list[str] = []
-    stack: list[bool] = []
+    stack: list[tuple[bool, int]] = []
     skip_group = False
+    uc_skip = 1
+    codepage = "cp1252"
+    hex_buf = bytearray()
     i = 0
     n = len(src)
+
+    def _flush_hex() -> None:
+        if hex_buf:
+            out.append(bytes(hex_buf).decode(codepage, errors="replace"))
+            hex_buf.clear()
 
     while i < n:
         ch = src[i]
         if ch == "{":
-            stack.append(skip_group)
-            # Check if group starts with \* or a skipped destination control word
+            _flush_hex()
+            stack.append((skip_group, uc_skip))
             m = re.match(r"^\{\\(?:(\*)|([a-zA-Z]+))", src[i : i + 32])
             if m and (m.group(1) == "*" or (m.group(2) or "").lower() in _SKIP_RTF_DESTINATIONS):
                 skip_group = True
             i += 1
         elif ch == "}":
+            _flush_hex()
             if stack:
-                skip_group = stack.pop()
+                skip_group, uc_skip = stack.pop()
             i += 1
         elif ch == "\\":
             if i + 1 < n and src[i + 1] in "\\{}":
+                _flush_hex()
                 if not skip_group:
                     out.append(src[i + 1])
                 i += 2
@@ -748,17 +933,28 @@ def _decode_rtf_bytes(data: bytes) -> str:
                 hex_code = src[i + 2 : i + 4]
                 if not skip_group:
                     try:
-                        out.append(bytes.fromhex(hex_code).decode("cp1252", errors="replace"))
+                        hex_buf.append(int(hex_code, 16))
                     except ValueError:
-                        pass
+                        _flush_hex()
                 i += 4
                 continue
+            _flush_hex()
             m = re.match(r"^\\([a-zA-Z]+)(-?\d+)? ?", src[i : i + 32])
             if m:
                 word = m.group(1).lower()
                 arg = m.group(2)
                 if word in _SKIP_RTF_DESTINATIONS:
                     skip_group = True
+                elif word == "ansicpg" and arg is not None:
+                    codepage = _resolve_rtf_codepage(arg)
+                elif word == "mac":
+                    codepage = "mac_roman"
+                elif word == "pc":
+                    codepage = "cp437"
+                elif word == "pca":
+                    codepage = "cp850"
+                elif word == "uc" and arg is not None:
+                    uc_skip = max(0, int(arg))
                 elif not skip_group:
                     if word in {"par", "line", "row"}:
                         out.append("\n")
@@ -770,22 +966,32 @@ def _decode_rtf_bytes(data: bytes) -> str:
                             codepoint += 65536
                         if 0 <= codepoint <= 0x10FFFF:
                             out.append(chr(codepoint))
-                        # Skip fallback ANSI replacement character '?'
                         end_idx = i + m.end()
-                        if end_idx < n and src[end_idx] == "?":
-                            i = end_idx + 1
-                            continue
+                        for _ in range(uc_skip):
+                            if end_idx >= n:
+                                break
+                            if src[end_idx : end_idx + 2] == "\\'" and end_idx + 4 <= n:
+                                end_idx += 4
+                            elif src[end_idx] in "{}\\":
+                                break
+                            else:
+                                end_idx += 1
+                        i = end_idx
+                        continue
                 i += m.end()
             else:
                 i += 2
         elif ch in "\r\n":
             i += 1
         else:
+            _flush_hex()
             if not skip_group:
                 out.append(ch)
             i += 1
 
-    return re.sub(r"\n{3,}", "\n\n", "".join(out)).strip()
+    _flush_hex()
+    cleaned = re.sub(r"\n{3,}", "\n\n", "".join(out)).strip()
+    return normalize_text(cleaned, preserve_code=True, strip=True)
 
 
 def _verify_image_dimensions_safe(path: str, max_pixels: int) -> None:

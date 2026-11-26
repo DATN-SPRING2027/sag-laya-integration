@@ -589,7 +589,10 @@
       "cancelled": "Import cancelled",
       "expired": "Import expired"
     },
-    "exportOctx": "Export as .octx"
+    "exportOctx": "Export as .octx",
+    "conflicts": "Conflicts",
+    "conflictsPendingAria": "{count, plural, one {# pending conflict} other {# pending conflicts}}",
+    "sourceConflicts": "Source conflicts"
   },
   "SearchStrategies": {
     "vectorLabel": "Fast (vector)",
@@ -1920,6 +1923,131 @@
       "supersessionChainTitle": "Decision supersession chain #{index, number}",
       "decisionStateTitle": "Decision state #{index, number}",
       "supersededTransition": "Superseded by newer confirmed decision"
+    }
+  },
+  "ConflictInbox": {
+    "title": "Knowledge Conflict Inbox",
+    "description": "Arbitrate contradictory passages across versions and authorities. Decisions update active retrieval precedence and audit history immediately.",
+    "refresh": "Refresh",
+    "retry": "Retry",
+    "tabs": {
+      "aria": "Filter conflicts by status",
+      "pending": "Pending review",
+      "active": "Active",
+      "scoped": "Scoped",
+      "all": "All"
+    },
+    "filters": {
+      "subtypeAria": "Filter by conflict subtype",
+      "allSubtypes": "All subtypes",
+      "documentPlaceholder": "Filter by document ID or logical source…",
+      "documentAria": "Filter by document ID",
+      "clearDocument": "Clear document filter",
+      "includeInactive": "Include inactive",
+      "sourceChip": "Source: {sourceId}",
+      "clearSource": "Clear source filter",
+      "resetAll": "Reset filters"
+    },
+    "summary": {
+      "showing": "Showing {start, number}–{end, number} of {total, number} conflicts",
+      "zero": "0 conflicts matching current filters",
+      "page": "Page {page, number} / {totalPages, number}"
+    },
+    "statuses": {
+      "PENDING_REVIEW": "Pending review",
+      "NEEDS_REVALIDATION": "Needs revalidation",
+      "ACTIVE": "Active",
+      "DISMISSED_SCOPED": "Scoped coexistence",
+      "REVOKED_WINNER": "Revoked winner",
+      "SUPERSEDED_BY_UPDATE": "Superseded by update"
+    },
+    "subtypes": {
+      "DIRECT_SUPERSEDES": "Direct supersedes",
+      "HARD_CONTRADICTION": "Hard contradiction",
+      "SCOPED_EXCEPTION": "Scoped exception",
+      "DIFFERENT_PERSPECTIVE": "Different perspective",
+      "SUPPORTS_OR_EQUIVALENT": "Supports or equivalent"
+    },
+    "modes": {
+      "AUTO_POLICY": "Auto policy",
+      "MANUAL_HITL": "Manual review",
+      "UNRESOLVED": "Unresolved",
+      "KEEP_BOTH_SCOPED": "Keep both scoped"
+    },
+    "tiers": {
+      "tier1": "Official",
+      "tier2": "Policy",
+      "tier3": "Reference",
+      "tier4": "Draft",
+      "badge": "{code} · {label}"
+    },
+    "precedence": {
+      "bHigher": "Side B higher ({codeB} > {codeA})",
+      "aHigher": "Side A higher ({codeA} > {codeB})",
+      "equal": "Equal authority ({codeA} = {codeB})"
+    },
+    "metrics": {
+      "confidence": "Conf {value}",
+      "cosine": "Cos {value}"
+    },
+    "degraded": {
+      "title": "Heuristic fallback active",
+      "description": "Automated LLM classification fell back to heuristic signals for this pair. Please review both excerpts carefully before recording a decision."
+    },
+    "sides": {
+      "baselineA": "Side A · Baseline",
+      "proposedB": "Side B · Proposed",
+      "activeWinner": "Side B · Active winner",
+      "superseded": "Side A · Superseded",
+      "scopedA": "Side A · Scoped",
+      "scopedB": "Side B · Scoped",
+      "sideA": "Side A · Archived",
+      "sideB": "Side B · Archived",
+      "version": "v{version, number}",
+      "effectiveFrom": "Effective {date}",
+      "partition": "Partition {id}",
+      "noExcerpt": "No text snapshot recorded for this unit."
+    },
+    "details": {
+      "reason": "Assessment rationale",
+      "scopeDifference": "Scope difference",
+      "effectiveValidTo": "Baseline valid until {date}",
+      "resolvedBy": "Resolved by {actor}",
+      "resolvedAt": "Resolved {at}"
+    },
+    "actions": {
+      "reasonLabel": "Arbitration rationale (optional)",
+      "reasonPlaceholder": "Optional rationale for the audit log (max 2,000 chars)…",
+      "keepSideB": "Keep Side B",
+      "keepSideA": "Keep Side A",
+      "keepBothScoped": "Keep Both (Scoped)",
+      "reopen": "Reopen for review",
+      "archivedNotice": "This conflict record is archived and read-only because one of its versions was revoked or superseded."
+    },
+    "audit": {
+      "toggle": "Audit trail ({count, number})",
+      "empty": "No audit entries recorded yet.",
+      "actor": "Actor: {actor}",
+      "transition": "{from} → {to}"
+    },
+    "pagination": {
+      "previous": "Previous",
+      "next": "Next"
+    },
+    "empty": {
+      "title": "No conflicts found",
+      "description": "There are no unresolved or recorded knowledge conflicts in this queue right now.",
+      "filteredDescription": "No conflict records match your current status, subtype, or source filters."
+    },
+    "errors": {
+      "loadFailed": "Failed to load conflicts"
+    },
+    "toasts": {
+      "resolvedWinnerB": "Decision saved: Side B is now the active authoritative source.",
+      "resolvedWinnerA": "Decision saved: Side A has been kept as the authoritative source.",
+      "resolvedKeepBoth": "Decision saved: both sides kept as scoped coexistence.",
+      "reopened": "Conflict reopened and returned to pending review.",
+      "actionError": "Failed to update conflict resolution."
     }
   }
 }

@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from zleap.sag import EngineConfig
 from zleap.sag.config import (
@@ -40,7 +41,7 @@ def extract_postgres_search_path(database_url: str) -> str | None:
     """Extract ?search_path=... from a PostgreSQL SQLAlchemy URL so zleap-sag shares sag_api's schema."""
     try:
         url = make_url(database_url)
-    except Exception:
+    except ArgumentError:
         return None
     if not url.drivername.startswith("postgresql"):
         return None
@@ -100,14 +101,14 @@ _zleap_registry.register("relational", "postgres", PostgresRelationalStore)
 
 
 def _build_vector(settings: Settings) -> Any:
+    """Build initial zleap-sag VectorConfig union member before Qdrant model_copy replacement."""
     provider = settings.sag_vector_provider
     if provider == "es":
-        # 0.8.2 要求 hosts;SAG 未提供 ES 地址配置时退回本地默认。
-        # TODO(REQ-7/配置):新增 SAG_ES_HOSTS 设置项,生产显式配置。
+        # zleap-sag requires explicit hosts on ElasticsearchVectorConfig; default to local ES.
         return ElasticsearchVectorConfig(hosts=["http://localhost:9200"])
     if provider == "qdrant":
-        # zleap-sag 0.12's EngineConfig has no Qdrant model; the validated
-        # config is replaced with QdrantVectorConfig after construction below.
+        # zleap-sag 0.12's EngineConfig union lacks a Qdrant model; pass a valid
+        # ElasticsearchVectorConfig placeholder here and swap in QdrantVectorConfig below.
         return ElasticsearchVectorConfig(hosts=[settings.sag_qdrant_url])
     if provider == "pgvector":
         conn = PostgresConnectionConfig(
@@ -175,12 +176,17 @@ def build_engine_config(settings: Settings, *, overrides: dict[str, Any] | None 
         max_retries=settings.llm_max_retries,
         structured_output_mode=_structured_output_mode(settings),
     )
+    from sag_api.services.search_index_service import resolve_embedding_dimensions
+
     emb_kwargs: dict[str, Any] = {
         "model": settings.embedding_model,
         "base_url": settings.effective_embedding_base_url,
         "api_key": settings.effective_embedding_api_key or _PLACEHOLDER,
-        # 当前引擎以该值预建向量 schema；未显式配置时保持既有 1024 维默认值。
-        "dimensions": settings.embedding_dimensions or 1024,
+        # Resolve dimensions from explicit config or known model registry (default 1024).
+        "dimensions": resolve_embedding_dimensions(
+            settings.embedding_model,
+            settings.embedding_dimensions,
+        ),
         "timeout": settings.embedding_timeout,
     }
     if "max_tokens" in getattr(EmbeddingConfig, "model_fields", {}):
@@ -194,7 +200,9 @@ def build_engine_config(settings: Settings, *, overrides: dict[str, Any] | None 
         relational=_build_relational(settings),
         vector=_build_vector(settings),
         data_dir=str(overrides.get("data_dir") or settings.data_dir),
-        language="en",
+        # zleap-sag==0.12.0 EngineConfig.language only permits Literal["zh", "en"];
+        # map "vi" -> "en" at the EngineConfig boundary while sag_api retains "vi".
+        language="zh" if settings.sag_language == "zh" else "en",
         runtime_limits=RuntimeLimits(
             llm_concurrency=max(6, min(256, settings.document_extract_concurrency)),
             embedding_concurrency=settings.embedding_concurrency,

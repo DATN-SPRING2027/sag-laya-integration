@@ -1,5 +1,7 @@
 # SAG + Laya Local Integration
 
+> **SUPERSEDED (2026-11-25):** Kiến trúc tích hợp **Laya Local Router** (`laya_router.py`, `api/v1/laya.py`, `SAG_ENABLE_LAYA`, `SAG_LAYA_*`) đã được **loại bỏ vĩnh viễn** theo [`SAG/docs/adr-remove-laya-and-r2.md`](SAG/docs/adr-remove-laya-and-r2.md). Định tuyến truy vấn hiện sử dụng `SAG/apps/api/sag_api/services/decision_router.py` (provider ngoài cấu hình qua Settings, mặc định SiliconFlow `Kev-4b`). Thư mục `laya/` ở gốc chỉ là demo độc lập lịch sử. Xem hướng dẫn vận hành hiện hành tại [`SAG/README.md`](SAG/README.md).
+
 Workspace phục vụ phát triển và kiểm thử luồng:
 
 ```text

@@ -34,7 +34,12 @@ class ModelProviderSpec:
         return normalized if normalized.startswith(prefix) else f"{prefix}{normalized}"
 
     def resolve_temperature(self, configured: float) -> float:
-        return configured if self.temperature_configurable else self.default_temperature
+        if not self.temperature_configurable:
+            return self.default_temperature
+        value = float(configured)
+        if self.id == "anthropic":
+            return max(0.0, min(1.0, value))
+        return value
 
     def to_public_dict(self) -> dict[str, object]:
         value = asdict(self)
@@ -61,11 +66,11 @@ _PROVIDER_SPECS = (
         display_name="Anthropic",
         protocol="anthropic_messages",
         litellm_prefix="anthropic",
-        default_model="claude-sonnet-5",
+        default_model="claude-sonnet-4-20250514",
         default_base_url=None,
         default_context_window=1_000_000,
-        default_temperature=1.0,
-        temperature_configurable=False,
+        default_temperature=0.3,
+        temperature_configurable=True,
         can_reuse_embedding_credentials=False,
         api_key_placeholder="sk-ant-…",
     ),

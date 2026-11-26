@@ -7,23 +7,28 @@ Bên trong bộ xử lý chịu trách nhiệm cập nhật trạng thái giai �
 from __future__ import annotations
 
 import os
-import re
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import httpx
-from sqlalchemy import update
+from sqlalchemy import delete, select, update
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
+from zleap.sag.exceptions import SagError
 
 from sag_api.core.config import settings
 from sag_api.core.db import SessionLocal
 from sag_api.core.error_taxonomy import ErrorLayer, ErrorStage
 from sag_api.core.errors import ApiError, NotFoundError, is_retryable_error
 from sag_api.core.logging import get_logger
-from sag_api.core.sanitizer import sanitize_error_message
+from sag_api.core.sanitizer import (
+    inspect_replacement_chars,
+    redact_parser_reason,
+    sanitize_error_message,
+)
 from sag_api.db.models import Document, Job, Source
 from sag_api.db.models.routing_rag import DocumentVersion, IngestionRun, StageRun
 from sag_api.enums import DocumentStatus, JobStatus, JobType
@@ -71,10 +76,7 @@ _PARSER_UPLOAD_STATES = {"uploading", "uploaded"}
 _PARSER_QUEUE_STATES = {"created", "pending", "queued", "queueing"}
 _PARSER_DONE_STATES = {"done", "success", "succeeded", "completed", "finished"}
 _PARSER_FAILED_STATES = {"failed", "failure", "error", "cancelled", "canceled", "fallback_failed"}
-_SECRET_QUERY_KEYS = re.compile(r"(?i)([?&](?:token|key|signature|credential|authorization|x-amz-[^=]+)=)[^&#\s]+")
-_BEARER_TOKEN = re.compile(r"(?i)bearer\s+\S+")
-_API_KEY = re.compile(r"(?i)\b(?:sk|ak)-[a-z0-9._-]{6,}\b")
-_URL = re.compile(r"https?://[^\s；，,]+")
+_redact_parser_reason = redact_parser_reason
 
 
 async def _finalize_research_task_for_run(session: AsyncSession, run_id: str | None) -> None:
@@ -97,19 +99,6 @@ def _mineru_details(state: dict[str, Any] | None = None) -> tuple[str, str]:
     model = current.get("mineru_model")
     default_model = settings.mineru_official_model if settings.mineru_official_model in {"vlm", "pipeline"} else "vlm"
     return "official", model if model in {"vlm", "pipeline"} else default_model
-
-
-def _redact_parser_reason(value: object) -> str | None:
-    if value is None:
-        return None
-    message = " ".join(str(value).split())
-    if not message:
-        return None
-    message = _SECRET_QUERY_KEYS.sub(r"\1[REDACTED]", message)
-    message = _BEARER_TOKEN.sub("Bearer [REDACTED]", message)
-    message = _API_KEY.sub("[REDACTED]", message)
-    message = _URL.sub("[URL REDACTED]", message)
-    return message[:300]
 
 
 def _fallback_reason(state: dict[str, Any]) -> str | None:
@@ -390,12 +379,6 @@ async def _process_document_unlocked(
         parser_stage = False
         initial_payload = dict(job.payload or {})
         target_storage_path = initial_payload.get("storage_path") or document.storage_path
-        remote_object_sourced = bool(initial_payload.get("remote_object_sourced"))
-        remote_source_url = (
-            initial_payload.get("remote_source_url")
-            if isinstance(initial_payload.get("remote_source_url"), str)
-            else None
-        )
         job_project_id = (
             str(initial_payload.get("project_id"))
             if initial_payload.get("project_id")
@@ -408,65 +391,9 @@ async def _process_document_unlocked(
             and canonical_checkpoint in ("PARSE", "DEDUP_TEMPORAL")
         )
         if not checkpoint.chunk_ids and not skip_initial_prepare:
-            from sag_api.parsing.service import has_cached_prepared_document
-
-            needs_remote_fetch = bool(
-                remote_object_sourced
-                and remote_source_url
-                and not (
-                    target_storage_path
-                    and (
-                        os.path.isfile(target_storage_path)
-                        or has_cached_prepared_document(target_storage_path, settings)
-                    )
-                )
-            )
-            if needs_remote_fetch and remote_source_url:
-                import time as _time
-
-                from sag_api.parsing.remote_object import stream_remote_object_to_snapshot
-
-                await _advance_canonical_stage("RECEIVE", 10, DocumentStatus.LOADING)
-                dl_start = _time.monotonic()
-                try:
-                    target_storage_path = await stream_remote_object_to_snapshot(
-                        remote_source_url,
-                        target_path=target_storage_path,
-                        original_filename=str(
-                            initial_payload.get("original_filename") or document.filename
-                        ),
-                        expected_sha256=str(initial_payload.get("expected_sha256") or ""),
-                        expected_size_bytes=int(
-                            initial_payload.get("expected_size_bytes") or document.size_bytes or 0
-                        ),
-                        settings=settings,
-                        should_pause=should_pause,
-                    )
-                except ParsePaused:
-                    await _pause_or_yield()
-                dl_ms = round((_time.monotonic() - dl_start) * 1000, 2)
-                if run_id:
-                    session.add(
-                        StageRun(
-                            id=str(uuid.uuid4()),
-                            run_id=run_id,
-                            stage="receive",
-                            status="SUCCESS",
-                            duration_ms=dl_ms,
-                            metrics_json={
-                                "byte_size": int(
-                                    initial_payload.get("expected_size_bytes")
-                                    or document.size_bytes
-                                    or 0
-                                ),
-                                "source": "remote_object_stream",
-                            },
-                        )
-                    )
-                    await session.commit()
-
             parser_stage = True
             await _advance_canonical_stage("PARSE", 25, DocumentStatus.LOADING)
+            ignore_fallback = bool((job.payload or {}).get("ignore_fallback_cache"))
             try:
                 prepared = await prepare_document(
                     target_storage_path,
@@ -474,20 +401,19 @@ async def _process_document_unlocked(
                     state=(job.payload or {}).get("document_parser"),
                     on_state=on_parser_state,
                     should_pause=should_pause,
-                    remote_source_url=remote_source_url,
                     project_id=job_project_id,
+                    ignore_fallback_cache=ignore_fallback,
                 )
             except ParsePaused:
                 await _pause_or_yield()
             parser_stage = False
+            if ignore_fallback:
+                next_payload = dict(job.payload or {})
+                next_payload.pop("ignore_fallback_cache", None)
+                job.payload = next_payload
             parser_state = (job.payload or {}).get("document_parser")
             for field, value in _prepared_parser_values(prepared, parser_state).items():
                 setattr(document, field, value)
-            if remote_source_url:
-                scrubbed_payload = await refresh_payload()
-                if "remote_source_url" in scrubbed_payload:
-                    scrubbed_payload.pop("remote_source_url", None)
-                    job.payload = scrubbed_payload
             await session.commit()
             if prepared.fallback_from:
                 log.warning(
@@ -521,6 +447,7 @@ async def _process_document_unlocked(
                     await _advance_canonical_stage("PARSE", 35, DocumentStatus.LOADING)
                     # [P2 Fix]: Safe prepared document resolution on resume to prevent raw binary UTF-8 decoding
                     if prepared is None:
+                        ignore_fallback = bool((job.payload or {}).get("ignore_fallback_cache"))
                         try:
                             prepared = await prepare_document(
                                 target_storage_path,
@@ -529,9 +456,14 @@ async def _process_document_unlocked(
                                 on_state=on_parser_state,
                                 should_pause=should_pause,
                                 project_id=job_project_id,
+                                ignore_fallback_cache=ignore_fallback,
                             )
                         except ParsePaused:
                             await _pause_or_yield()
+                        if ignore_fallback:
+                            next_payload = dict(job.payload or {})
+                            next_payload.pop("ignore_fallback_cache", None)
+                            job.payload = next_payload
 
                     if prepared is None or not prepared.path or not os.path.exists(prepared.path):
                         raise RuntimeError(f"Prepared markdown path missing for document {document.id}")
@@ -539,10 +471,38 @@ async def _process_document_unlocked(
                     with open(prepared.path, "r", encoding="utf-8", errors="replace") as f:
                         doc_content = f.read()
 
+                    r_count, r_ratio = inspect_replacement_chars(doc_content)
+                    if r_count > 0:
+                        log.warning(
+                            "Replacement characters U+FFFD detected doc=%s version=%s count=%d ratio=%.4f",
+                            document.id,
+                            doc_ver.id,
+                            r_count,
+                            r_ratio,
+                        )
+                        doc_ver.metadata_json = {
+                            **(doc_ver.metadata_json or {}),
+                            "replacement_char_count": r_count,
+                            "replacement_char_ratio": round(r_ratio, 6),
+                        }
+
                     from sag_api.services.canonical_service import parse_and_persist_document_content
                     await parse_and_persist_document_content(
                         session, doc_ver.id, doc_content, run_id=run_id
                     )
+                    if r_count > 0:
+                        parse_stage_run = await session.scalar(
+                            select(StageRun)
+                            .where(StageRun.run_id == run_id, StageRun.stage == "PARSE")
+                            .order_by(StageRun.created_at.desc())
+                            .limit(1)
+                        )
+                        if parse_stage_run is not None:
+                            parse_stage_run.metrics_json = {
+                                **(parse_stage_run.metrics_json or {}),
+                                "replacement_char_count": r_count,
+                                "replacement_char_ratio": round(r_ratio, 6),
+                            }
                     job.payload = {
                         **(await refresh_payload()),
                         "canonical_checkpoint_stage": "PARSE",
@@ -597,7 +557,19 @@ async def _process_document_unlocked(
                 if engine_manager is not None and hasattr(engine_manager, "get_search_unit_qdrant_client"):
                     try:
                         shared_qdrant_client = await engine_manager.get_search_unit_qdrant_client()
-                    except Exception:
+                    except (
+                        ApiError,
+                        SagError,
+                        httpx.HTTPError,
+                        TimeoutError,
+                        OSError,
+                        SQLAlchemyError,
+                        ValueError,
+                    ) as qdrant_exc:
+                        log.warning(
+                            "Could not get shared Qdrant client: %s",
+                            sanitize_error_message(qdrant_exc),
+                        )
                         shared_qdrant_client = None
                 if shared_qdrant_client is not None:
                     search_units = await run_search_indexing_stage(
@@ -626,10 +598,69 @@ async def _process_document_unlocked(
                             embedder=embedder,
                             run_id=run_id,
                         )
+                reconcile_job_id = getattr(doc_ver, "_last_reconcile_job_id", None)
                 next_payload = await refresh_payload()
                 next_payload.pop("canonical_checkpoint_stage", None)
                 job.payload = next_payload
                 await session.commit()
+                if reconcile_job_id and job_queue is not None:
+                    from sag_api.services.document_service import _enqueue_persisted_job
+
+                    await _enqueue_persisted_job(job_queue, str(reconcile_job_id))
+
+                # Phase 2 Post-SEARCH_READY Hook: carry-forward/revalidation + async conflict job.
+                # Strictly isolated: errors here MUST NEVER fail Document.status or search_status.
+                if doc_ver.search_status == "SEARCH_READY":
+                    try:
+                        from sag_api.services.knowledge_conflict_service import (
+                            enqueue_conflict_resolution_job,
+                            has_active_cross_document_peer,
+                            reconcile_resolutions_after_version_ready,
+                        )
+
+                        reconcile_summary = await reconcile_resolutions_after_version_ready(
+                            session,
+                            new_version=doc_ver,
+                        )
+                        conflict_job_id: str | None = None
+                        if settings.conflict_resolution_job_enabled and (
+                            reconcile_summary.needs_revalidation_count > 0
+                            or await has_active_cross_document_peer(
+                                session,
+                                tenant_id=ing_run.tenant_id,
+                                project_id=ing_run.project_id,
+                                security_partition_id=sec_partition,
+                                exclude_document_id=document.id,
+                            )
+                        ):
+                            conflict_job = await enqueue_conflict_resolution_job(
+                                session,
+                                tenant_id=ing_run.tenant_id,
+                                project_id=ing_run.project_id,
+                                source_id=source.id,
+                                document_id=document.id,
+                                document_version_id=doc_ver.id,
+                                security_partition_id=sec_partition,
+                                reason=(
+                                    "version_revalidation"
+                                    if reconcile_summary.needs_revalidation_count > 0
+                                    else "document_search_ready"
+                                ),
+                            )
+                            conflict_job_id = conflict_job.id if conflict_job is not None else None
+                        await session.commit()
+                        if conflict_job_id and job_queue is not None:
+                            from sag_api.services.document_service import _enqueue_persisted_job
+
+                            await _enqueue_persisted_job(job_queue, conflict_job_id)
+                    except Exception as conflict_hook_err:  # noqa: BLE001 - non-blocking post-SEARCH_READY hook
+                        await session.rollback()
+                        log.warning(
+                            "Post-SEARCH_READY conflict hook degraded doc=%s version=%s degraded=True: %s",
+                            document.id,
+                            doc_ver.id,
+                            sanitize_error_message(conflict_hook_err),
+                        )
             except ParsePaused:
                 await _pause_or_yield()
             except (JobPaused, JobYielded):
@@ -681,6 +712,15 @@ async def _process_document_unlocked(
                             "DEDUP_TEMPORAL" if current_pipeline_stage == "DEDUP" else "INGEST"
                         )
                     )
+                    failed_created_at = datetime.now(UTC)
+                    if ing_run.started_at is not None:
+                        run_started = (
+                            ing_run.started_at.replace(tzinfo=UTC)
+                            if ing_run.started_at.tzinfo is None
+                            else ing_run.started_at.astimezone(UTC)
+                        )
+                        if failed_created_at < run_started:
+                            failed_created_at = run_started
                     failed_stage_run = StageRun(
                         id=str(uuid.uuid4()),
                         run_id=run_id,
@@ -689,6 +729,7 @@ async def _process_document_unlocked(
                         error_message=pipe_err_str,
                         duration_ms=0.0,
                         metrics_json={"error": pipe_err_str},
+                        created_at=failed_created_at,
                     )
                     session.add(failed_stage_run)
 
@@ -761,16 +802,36 @@ async def _process_document_unlocked(
             parser_failure_values = _parser_state_values(parser_state)
             parser_failure_values["parser_status"] = "failed"
             parser_failure_values["fallback_reason"] = _redact_parser_reason(message)
-        # Kiểm tra xem tài liệu đã đạt SEARCH_READY trước đó hay chưa (Phase 2C đã commit)
-        is_search_ready = False
+        # Kiểm tra xem phiên bản hiện tại (hoặc phiên bản tiền nhiệm đang hiệu lực) đã đạt SEARCH_READY hay chưa
+        current_ver_search_ready = False
+        current_ver_id: str | None = None
         if run_id:
             ing_run_chk = await session.get(IngestionRun, run_id)
             if ing_run_chk:
+                current_ver_id = str(ing_run_chk.document_version_id)
                 ver_chk = await session.get(DocumentVersion, ing_run_chk.document_version_id)
                 if ver_chk and ver_chk.search_status == "SEARCH_READY":
-                    is_search_ready = True
+                    current_ver_search_ready = True
 
-        doc_target_status = DocumentStatus.READY if is_search_ready else DocumentStatus.FAILED
+        has_active_ready_predecessor = False
+        if not current_ver_search_ready:
+            now_utc = datetime.now(UTC)
+            pred_stmt = select(DocumentVersion.id).where(
+                DocumentVersion.document_id == document.id,
+                DocumentVersion.search_status == "SEARCH_READY",
+                DocumentVersion.status != "REVOKED",
+                DocumentVersion.valid_from <= now_utc,
+                DocumentVersion.valid_to > now_utc,
+            )
+            if current_ver_id:
+                pred_stmt = pred_stmt.where(DocumentVersion.id != current_ver_id)
+            has_active_ready_predecessor = (await session.scalar(pred_stmt.limit(1))) is not None
+
+        doc_target_status = (
+            DocumentStatus.READY
+            if (current_ver_search_ready or has_active_ready_predecessor)
+            else DocumentStatus.FAILED
+        )
 
         failed = await session.execute(
             update(Document)
@@ -809,7 +870,7 @@ async def _process_document_unlocked(
                 if ver:
                     # Nếu Phase 2C đã hoàn tất và SEARCH_READY, lỗi extraction/LLM hoặc enrichment
                     # phía sau không được phép hạ cấp hoặc xóa trạng thái tìm kiếm
-                    if is_search_ready:
+                    if current_ver_search_ready:
                         ver.status = "SEARCH_READY"
                         ver.knowledge_status = "FAILED"
                     else:
@@ -891,6 +952,21 @@ async def _process_document_unlocked(
             event_count=Source.event_count + outcome.event_count,
         )
     )
+    if outcome.source_id:
+        from sag_api.sag.octx_vector_protocol import configured_embedding_identity, embedding_identity
+
+        emb_client = None
+        if engine_manager is not None and hasattr(engine_manager, "get_sag_embedding"):
+            try:
+                emb_client = await engine_manager.get_sag_embedding(source.sag_source_config_id, source)
+            except Exception:  # noqa: BLE001
+                emb_client = None
+        vec_identity = embedding_identity(emb_client) or configured_embedding_identity(settings)
+        if vec_identity is not None:
+            src_row = await session.get(Source, source.id)
+            if src_row is not None:
+                src_row.config = {**(src_row.config or {}), "octx_vector_identity": vec_identity}
+                session.add(src_row)
     await touch_source_revision(session, source.id)
     if run_id:
         ingestion_run = await session.get(IngestionRun, run_id)
@@ -915,49 +991,6 @@ async def _process_document_unlocked(
     await session.commit()
     await session.refresh(document)
     await _finalize_research_task_for_run(session, run_id)
-
-    # Post-index Disk GC: when the immutable raw binary lives permanently on R2,
-    # reclaim heavy binary snapshots on local SAG disk while retaining the lightweight
-    # `.parsed.<signature>.md` sidecar cache for fast re-chunking / reprocessing.
-    from sag_api.parsing.service import has_cached_prepared_document
-
-    if (
-        getattr(settings, "remote_snapshot_gc_enabled", True)
-        and remote_object_sourced
-        and target_storage_path
-        and prepared is not None
-        and prepared.path != target_storage_path
-        and os.path.splitext(target_storage_path)[1].lower() not in {".md", ".markdown"}
-        and os.path.isfile(prepared.path)
-        and os.path.isfile(target_storage_path)
-        and has_cached_prepared_document(target_storage_path, settings)
-    ):
-        try:
-            import asyncio as _asyncio
-
-            from sqlalchemy import select as _select
-
-            active_sibling = await session.scalar(
-                _select(Document.id)
-                .where(
-                    Document.storage_path == target_storage_path,
-                    Document.id != document.id,
-                    Document.status.in_(
-                        [
-                            DocumentStatus.PENDING,
-                            DocumentStatus.LOADING,
-                            DocumentStatus.EXTRACTING,
-                            DocumentStatus.PAUSED,
-                            DocumentStatus.PAUSING,
-                        ]
-                    ),
-                )
-                .limit(1)
-            )
-            if active_sibling is None:
-                await _asyncio.to_thread(os.remove, target_storage_path)
-        except Exception as gc_err:  # noqa: BLE001
-            log.debug("Skipped post-index raw snapshot GC for %s: %s", document.id, gc_err)
 
     log.info(
         "Xử lý tài liệu hoàn thành doc=%s parser=%s cached=%s chunks=%d events=%d tokens=%d",
@@ -985,6 +1018,88 @@ async def _process_document_unlocked(
                 document.id,
                 source.id,
                 sanitize_error_message(uni_err),
+            )
+
+
+async def _resolve_document_qdrant_project_ids(
+    session: AsyncSession,
+    document: Document,
+    *,
+    version_ids: Sequence[str] | None = None,
+) -> list[str]:
+    project_ids: list[str] = []
+    seen: set[str] = set()
+
+    def _add(pid: object) -> None:
+        if isinstance(pid, str):
+            clean = pid.strip()
+            if clean and clean not in seen:
+                seen.add(clean)
+                project_ids.append(clean)
+
+    _add(getattr(document, "project_id", None))
+
+    from sag_api.db.models import SourceProjectMapping
+    from sag_api.db.models.routing_rag import IngestionRun
+
+    if version_ids:
+        run_pids = (
+            await session.scalars(
+                select(IngestionRun.project_id)
+                .where(IngestionRun.document_version_id.in_(list(version_ids)))
+                .distinct()
+            )
+        ).all()
+        for pid in run_pids:
+            _add(pid)
+
+    if getattr(document, "source_id", None):
+        mapping_pids = (
+            await session.scalars(
+                select(SourceProjectMapping.project_id)
+                .where(SourceProjectMapping.source_id == document.source_id)
+                .distinct()
+            )
+        ).all()
+        for pid in mapping_pids:
+            _add(pid)
+
+    return project_ids
+
+
+async def _delete_qdrant_points_for_versions(
+    engine_manager: EngineManager | None,
+    *,
+    project_ids: Sequence[str],
+    document_version_ids: Sequence[str],
+) -> None:
+    if not project_ids or not document_version_ids:
+        return
+    from sag_api.services.search_index_service import delete_document_points_from_qdrant
+
+    shared_qdrant_client = None
+    if engine_manager is not None and hasattr(engine_manager, "get_search_unit_qdrant_client"):
+        shared_qdrant_client = await engine_manager.get_search_unit_qdrant_client()
+
+    if shared_qdrant_client is not None:
+        for pid in project_ids:
+            await delete_document_points_from_qdrant(
+                shared_qdrant_client,
+                project_id=pid,
+                document_version_ids=document_version_ids,
+            )
+        return
+
+    qdrant_url = getattr(settings, "sag_qdrant_url", "http://localhost:6333").rstrip("/")
+    qdrant_headers = {}
+    if getattr(settings, "sag_qdrant_api_key", None):
+        qdrant_headers["api-key"] = settings.sag_qdrant_api_key
+    async with httpx.AsyncClient(base_url=qdrant_url, headers=qdrant_headers, timeout=30.0) as qdrant_client:
+        for pid in project_ids:
+            await delete_document_points_from_qdrant(
+                qdrant_client,
+                project_id=pid,
+                document_version_ids=document_version_ids,
             )
 
 
@@ -1027,27 +1142,21 @@ async def _delete_document_task_unlocked(
     )
 
     # Phase 2 Cleanup: Delete Qdrant points for all document versions belonging to this document
-    from sqlalchemy import select
-
-    from sag_api.db.models.routing_rag import DocumentVersion
     version_ids = (
         await session.execute(
             select(DocumentVersion.id).where(DocumentVersion.document_id == document.id)
         )
     ).scalars().all()
-    if version_ids and document.project_id:
-        qdrant_url = getattr(settings, "sag_qdrant_url", "http://localhost:6333").rstrip("/")
-        qdrant_headers = {}
-        if getattr(settings, "sag_qdrant_api_key", None):
-            qdrant_headers["api-key"] = settings.sag_qdrant_api_key
+    target_project_ids = await _resolve_document_qdrant_project_ids(
+        session, document, version_ids=version_ids
+    )
+    if version_ids and target_project_ids:
         try:
-            async with httpx.AsyncClient(base_url=qdrant_url, headers=qdrant_headers, timeout=30.0) as qdrant_client:
-                from sag_api.services.search_index_service import delete_document_points_from_qdrant
-                await delete_document_points_from_qdrant(
-                    qdrant_client,
-                    project_id=document.project_id,
-                    document_version_ids=version_ids,
-                )
+            await _delete_qdrant_points_for_versions(
+                engine_manager,
+                project_ids=target_project_ids,
+                document_version_ids=version_ids,
+            )
         except Exception as qdel_err:
             log.error("Failed to delete Qdrant points on document deletion %s: %s", document.id, qdel_err)
             raise RuntimeError(f"Qdrant cleanup failed during document deletion: {qdel_err}") from qdel_err
@@ -1056,6 +1165,18 @@ async def _delete_document_task_unlocked(
     job.payload = {**(job.payload or {}), "target_document_id": document.id}
     job.document_id = None
     await session.flush()
+    from sqlalchemy import or_ as sa_or
+
+    from sag_api.db.models.conflict_resolution import KnowledgeConflictResolution
+
+    await session.execute(
+        delete(KnowledgeConflictResolution).where(
+            sa_or(
+                KnowledgeConflictResolution.winner_document_id == document.id,
+                KnowledgeConflictResolution.loser_document_id == document.id,
+            )
+        )
+    )
     await session.delete(document)
     await session.flush()
     remaining_path_refs = 0
@@ -1177,17 +1298,83 @@ async def _reprocess_document_task_unlocked(
     if source is None:
         raise NotFoundError("Nguồn dữ liệu không tồn tại")
 
+    from sag_api.db.models.routing_rag import CanonicalBlock, SearchUnit
+
+    latest_ver = (
+        await session.execute(
+            select(DocumentVersion)
+            .where(DocumentVersion.document_id == document.id)
+            .order_by(DocumentVersion.version_no.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
     payload = dict(job.payload or {})
     derived_source_ids = sorted(
         {value.strip() for value in payload.get("derived_source_ids", []) if isinstance(value, str) and value.strip()}
     )
     if not payload.get("cleanup_completed"):
+        stale_conflict_jobs = list(
+            (
+                await session.scalars(
+                    select(Job).where(
+                        Job.document_id == document.id,
+                        Job.type == JobType.CONFLICT_RESOLUTION,
+                        Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]),
+                    )
+                )
+            ).all()
+        )
+        for stale_cjob in stale_conflict_jobs:
+            stale_cjob.payload = {**(stale_cjob.payload or {}), "pause_requested": True}
+            if stale_cjob.status == JobStatus.QUEUED:
+                stale_cjob.status = JobStatus.PAUSED
         await _cleanup_legacy_engine_document_data(
             engine_manager,
             source,
             document,
             derived_source_ids,
         )
+        if latest_ver is not None:
+            had_units = (
+                await session.scalar(
+                    select(SearchUnit.id)
+                    .where(SearchUnit.document_version_id == latest_ver.id)
+                    .limit(1)
+                )
+            ) is not None
+            target_project_ids = await _resolve_document_qdrant_project_ids(
+                session, document, version_ids=[latest_ver.id]
+            )
+            if target_project_ids and (
+                had_units or latest_ver.search_status in ("SEARCH_READY", "INDEX_FAILED", "INDEXING")
+            ):
+                try:
+                    await _delete_qdrant_points_for_versions(
+                        engine_manager,
+                        project_ids=target_project_ids,
+                        document_version_ids=[latest_ver.id],
+                    )
+                except Exception as qdel_err:
+                    log.error(
+                        "Failed to delete Qdrant points on document reprocess %s: %s",
+                        document.id,
+                        qdel_err,
+                    )
+                    raise RuntimeError(
+                        f"Qdrant cleanup failed during document reprocess: {qdel_err}"
+                    ) from qdel_err
+            await session.execute(
+                delete(SearchUnit).where(SearchUnit.document_version_id == latest_ver.id)
+            )
+            await session.execute(
+                delete(CanonicalBlock).where(CanonicalBlock.document_version_id == latest_ver.id)
+            )
+            latest_ver.status = "RECEIVED"
+            latest_ver.search_status = "PENDING"
+            latest_ver.search_ready_at = None
+            latest_ver.knowledge_status = "NOT_STARTED"
+            latest_ver.knowledge_ready_at = None
 
     await session.refresh(document)
     if document.status in _DELETE_CONTROL_STATES:
@@ -1210,34 +1397,14 @@ async def _reprocess_document_task_unlocked(
         session.add(process_job)
         await session.flush()
 
-    # Create an IngestionRun for Phase 2 processing on reprocess
-    from sqlalchemy import select
-
-    from sag_api.db.models.routing_rag import DocumentVersion, IngestionRun
-    latest_ver = (
-        await session.execute(
-            select(DocumentVersion)
-            .where(DocumentVersion.document_id == document.id)
-            .order_by(DocumentVersion.version_no.desc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-
     new_run_id = None
     process_job_payload = {
         **(process_job.payload or {}),
     }
+    if payload.get("ignore_fallback_cache"):
+        process_job_payload["ignore_fallback_cache"] = True
     if document.storage_path and "storage_path" not in process_job_payload:
         process_job_payload["storage_path"] = document.storage_path
-    for forwarded_key in (
-        "remote_object_sourced",
-        "remote_source_url",
-        "expected_sha256",
-        "expected_size_bytes",
-        "original_filename",
-    ):
-        if forwarded_key in payload and payload[forwarded_key] is not None:
-            process_job_payload[forwarded_key] = payload[forwarded_key]
     if latest_ver and document.project_id:
         new_run_id = str(uuid.uuid4())
         tenant_id = document.tenant_id or "tenant_default"
@@ -1247,8 +1414,8 @@ async def _reprocess_document_task_unlocked(
         latest_ver.status = "RECEIVED"
         latest_ver.search_status = "PENDING"
         latest_ver.search_ready_at = None
-        if latest_ver.knowledge_status in ("FAILED", "REVOKED"):
-            latest_ver.knowledge_status = "NOT_STARTED"
+        latest_ver.knowledge_status = "NOT_STARTED"
+        latest_ver.knowledge_ready_at = None
         ing_run = IngestionRun(
             id=new_run_id,
             tenant_id=tenant_id,
@@ -1278,10 +1445,8 @@ async def _reprocess_document_task_unlocked(
         )
     process_job.payload = process_job_payload
 
-    scrubbed_reprocess_payload = dict(payload)
-    scrubbed_reprocess_payload.pop("remote_source_url", None)
     job.payload = {
-        **scrubbed_reprocess_payload,
+        **payload,
         "cleanup_completed": True,
         "process_job_id": process_job.id,
     }
@@ -1305,37 +1470,114 @@ async def sync_source(session: AsyncSession, job: Job, *, engine_manager=None, j
 
 
 async def _sync_source_unlocked(session: AsyncSession, job: Job, *, job_queue=None) -> None:
-    """Đồng bộ connector động: discover → fetch → đăng ký tài liệu và xếp hàng xử lý (tái sử dụng pipeline ingest→extract)."""
+    """Đồng bộ connector động: discover → fetch → chuẩn hóa qua handle_document_upload vào Canonical RAG."""
     # Import trễ để tránh phụ thuộc vòng với package jobs
+    import hashlib
+
     from sag_api.connectors import registry
-    from sag_api.core.config import settings
-    from sag_api.services.document_service import create_document_from_upload
+    from sag_api.core.errors import ValidationError
+    from sag_api.db.models import SourceProjectMapping
+    from sag_api.services.document_service import (
+        compact_logical_source_id,
+        compute_payload_hash,
+        handle_document_upload,
+    )
 
     source = await session.get(Source, job.source_id) if job.source_id else None
     if source is None:
         raise NotFoundError("Nguồn dữ liệu không tồn tại")
 
+    job_payload = dict(job.payload or {})
+    source_cfg = source.config if isinstance(source.config, dict) else {}
+    tenant_id = str(job_payload.get("tenant_id") or "").strip()
+    project_id = str(job_payload.get("project_id") or "").strip()
+    if not tenant_id or not project_id:
+        mapping = await session.scalar(
+            select(SourceProjectMapping)
+            .where(
+                SourceProjectMapping.source_id == source.id,
+                SourceProjectMapping.state == "CONFIRMED",
+            )
+            .order_by(SourceProjectMapping.created_at.asc())
+            .limit(1)
+        )
+        if mapping is not None:
+            tenant_id = tenant_id or str(mapping.organization_id or "").strip()
+            project_id = project_id or str(mapping.project_id or "").strip()
+    if not tenant_id:
+        tenant_id = str(source_cfg.get("tenant_id") or "").strip()
+    if not project_id:
+        project_id = str(source_cfg.get("project_id") or "").strip()
+    if not tenant_id or not project_id:
+        raise ValidationError(
+            "Nguồn dữ liệu chưa được gắn tenant/project hợp lệ để đồng bộ vào Canonical RAG"
+        )
+
+    owner_id = str(
+        job_payload.get("owner_id")
+        or source_cfg.get("owner_id")
+        or f"connector:{source.id}"
+    ).strip()
+    explicit_partition = str(
+        job_payload.get("security_partition_id")
+        or source_cfg.get("security_partition_id")
+        or ""
+    ).strip()
+
     connector = registry.get(source.connector_kind)
-    discovered = await connector.discover(source.config or {})
+    discovered = await connector.discover(source_cfg)
     fetched = 0
+    deduped = 0
     for d in discovered:
         try:
-            local = await connector.fetch(source.config or {}, d)
+            local = await connector.fetch(source_cfg, d)
         except Exception as e:  # noqa: BLE001 - Thất bại từng bài không ảnh hưởng đến đồng bộ tổng thể
             log.warning("Đồng bộ thu thập thất bại %s: %s", d.external_id, getattr(e, "message", None) or e)
             continue
         try:
             with open(local.path, "rb") as f:
                 data = f.read()
-            await create_document_from_upload(
+            logical_id = compact_logical_source_id(f"source:{source.id}:{d.external_id}")
+            security_partition_id = explicit_partition
+            if not security_partition_id:
+                existing_ver = await session.scalar(
+                    select(DocumentVersion)
+                    .join(Document, Document.id == DocumentVersion.document_id)
+                    .where(
+                        Document.tenant_id == tenant_id,
+                        Document.project_id == project_id,
+                        Document.logical_source_id == logical_id,
+                        Document.is_active.is_(True),
+                        DocumentVersion.status != "REVOKED",
+                    )
+                    .order_by(DocumentVersion.version_no.desc())
+                    .limit(1)
+                )
+                if existing_ver is not None and isinstance(existing_ver.metadata_json, dict):
+                    security_partition_id = str(
+                        existing_ver.metadata_json.get("security_partition_id") or ""
+                    ).strip()
+            if not security_partition_id:
+                security_partition_id = project_id
+            ext_digest = hashlib.sha256(str(d.external_id).encode("utf-8")).hexdigest()[:16]
+            content_digest = compute_payload_hash(data)[:16]
+            client_token = f"sync:{source.id}:{ext_digest}:{content_digest}"
+            upload_resp = await handle_document_upload(
                 session,
-                source,
-                filename=local.filename,
+                tenant_id=tenant_id,
+                project_id=project_id,
+                owner_id=owner_id,
+                security_partition_id=security_partition_id,
+                client_token=client_token,
+                file_bytes=data,
+                original_filename=local.filename,
                 content_type=local.content_type,
-                data=data,
-                upload_dir=settings.upload_dir,
+                logical_source_id=logical_id,
                 job_queue=job_queue,
+                source_id=source.id,
             )
+            if upload_resp.is_duplicate:
+                deduped += 1
         finally:
             try:
                 os.remove(local.path)
@@ -1343,10 +1585,22 @@ async def _sync_source_unlocked(session: AsyncSession, job: Job, *, job_queue=No
                 pass
         fetched += 1
 
-    job.progress = 1.0
-    job.payload = {**(job.payload or {}), "discovered": len(discovered), "fetched": fetched}
+    refreshed_job = await session.get(Job, job.id) or job
+    refreshed_job.progress = 1.0
+    refreshed_job.payload = {
+        **job_payload,
+        "discovered": len(discovered),
+        "fetched": fetched,
+        "deduped": deduped,
+    }
     await session.commit()
-    log.info("Đồng bộ hoàn tất source=%s tìm thấy=%d thu thập=%d", source.id, len(discovered), fetched)
+    log.info(
+        "Đồng bộ hoàn tất source=%s tìm thấy=%d thu thập=%d trùng=%d",
+        source.id,
+        len(discovered),
+        fetched,
+        deduped,
+    )
 
 
 async def index_universe(session: AsyncSession, job: Job, *, engine_manager: EngineManager, job_queue=None) -> None:
@@ -1457,6 +1711,279 @@ async def rebuild_universe_tree(
     await session.commit()
 
 
+class _TimeoutBoundQdrantClient:
+    """Delegate Qdrant HTTP calls with a >=30s reconcile timeout without mutating a shared client."""
+
+    def __init__(self, client: httpx.AsyncClient, timeout: httpx.Timeout) -> None:
+        self._client = client
+        self.timeout = timeout
+        self.base_url = getattr(client, "base_url", "")
+        self.headers = getattr(client, "headers", {})
+
+    async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+        kwargs.setdefault("timeout", self.timeout)
+        return await self._client.get(url, **kwargs)
+
+    async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+        kwargs.setdefault("timeout", self.timeout)
+        return await self._client.post(url, **kwargs)
+
+    async def put(self, url: str, **kwargs: Any) -> httpx.Response:
+        kwargs.setdefault("timeout", self.timeout)
+        return await self._client.put(url, **kwargs)
+
+    async def delete(self, url: str, **kwargs: Any) -> httpx.Response:
+        kwargs.setdefault("timeout", self.timeout)
+        return await self._client.delete(url, **kwargs)
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _reconcile_qdrant_timeout() -> httpx.Timeout:
+    timeout_sec = max(30.0, float(getattr(settings, "search_source_timeout", 30.0) or 30.0))
+    return httpx.Timeout(timeout_sec, connect=min(10.0, timeout_sec))
+
+
+async def reconcile_search_index(
+    session: AsyncSession,
+    job: Job,
+    *,
+    engine_manager: EngineManager | None = None,
+    job_queue=None,
+) -> None:
+    """Reconcile orphan Qdrant points against PostgreSQL SearchUnit/DocumentVersion truth."""
+    from sag_api.services.search_index_service import (
+        reconcile_orphan_search_units,
+        reconcile_version_temporal_payloads,
+    )
+
+    payload = dict(job.payload or {})
+    reconcile_timeout = _reconcile_qdrant_timeout()
+    reconcile_timeout_sec = max(30.0, float(getattr(settings, "search_source_timeout", 30.0) or 30.0))
+
+    qdrant_client: Any = None
+    should_close = False
+    if engine_manager is not None and hasattr(engine_manager, "get_search_unit_qdrant_client"):
+        base_client = await engine_manager.get_search_unit_qdrant_client()
+        if base_client is not None:
+            qdrant_client = _TimeoutBoundQdrantClient(base_client, reconcile_timeout)
+    elif settings.sag_vector_provider == "qdrant":
+        q_headers = {"api-key": settings.sag_qdrant_api_key} if settings.sag_qdrant_api_key else {}
+        qdrant_client = httpx.AsyncClient(
+            base_url=settings.sag_qdrant_url.rstrip("/"),
+            headers=q_headers,
+            timeout=reconcile_timeout,
+        )
+        should_close = True
+
+    if qdrant_client is None:
+        job.progress = 1.0
+        job.payload = {**payload, "scanned": 0, "orphans_deleted": 0, "skipped": "no_qdrant_client"}
+        await session.commit()
+        return
+
+    total_scanned = 0
+    total_deleted = 0
+    total_temporal_synced = 0
+    per_project: dict[str, dict[str, int]] = {}
+    try:
+        requested_pid = payload.get("project_id")
+        if isinstance(requested_pid, str) and requested_pid.strip():
+            project_ids = [requested_pid.strip()]
+        else:
+            rows = (
+                await session.scalars(
+                    select(Document.project_id)
+                    .where(Document.project_id.is_not(None))
+                    .distinct()
+                )
+            ).all()
+            discovered_pids: set[str] = {
+                str(pid).strip() for pid in rows if isinstance(pid, str) and pid.strip()
+            }
+            try:
+                col_res = await qdrant_client.get("/collections", timeout=reconcile_timeout)
+                if col_res.is_success:
+                    raw_cols = col_res.json()
+                    cols = (
+                        (raw_cols.get("result") or {}).get("collections")
+                        if isinstance(raw_cols, dict)
+                        else None
+                    )
+                    if isinstance(cols, list):
+                        prefix = "search_units_"
+                        for item in cols:
+                            col_name = item.get("name") if isinstance(item, dict) else None
+                            if isinstance(col_name, str) and col_name.startswith(prefix):
+                                pid_from_col = col_name[len(prefix) :].strip()
+                                if pid_from_col:
+                                    discovered_pids.add(pid_from_col)
+            except (httpx.HTTPError, TimeoutError, OSError, ValueError, TypeError) as col_exc:
+                log.warning(
+                    "Could not list Qdrant collections during reconcile (using DB projects): %s",
+                    sanitize_error_message(col_exc),
+                )
+            project_ids = sorted(discovered_pids)
+
+        if not project_ids:
+            job.progress = 1.0
+            job.payload = {**payload, "scanned": 0, "orphans_deleted": 0, "projects": []}
+            await session.commit()
+            return
+
+        raw_superseded_vid = payload.get("superseded_version_id")
+        targeted_superseded_vids = (
+            [raw_superseded_vid.strip()]
+            if isinstance(raw_superseded_vid, str) and raw_superseded_vid.strip()
+            else []
+        )
+        is_superseded_prune_failure = payload.get("reason") == "superseded_prune_failed"
+        explicit_prune_superseded = payload.get("prune_superseded") is True
+
+        raw_sync_vids = payload.get("sync_version_ids")
+        targeted_sync_vids = (
+            [str(vid).strip() for vid in raw_sync_vids if isinstance(vid, str) and vid.strip()]
+            if isinstance(raw_sync_vids, (list, tuple))
+            else []
+        )
+        is_temporal_sync_failure = payload.get("reason") == "temporal_payload_sync_failed"
+        explicit_sync_payloads = payload.get("sync_temporal_payloads") is True
+
+        for idx, pid in enumerate(project_ids):
+            if (is_temporal_sync_failure or targeted_sync_vids) and not (
+                explicit_prune_superseded or is_superseded_prune_failure
+            ):
+                sync_stats = await reconcile_version_temporal_payloads(
+                    session,
+                    qdrant_client,
+                    project_id=pid,
+                    version_ids=targeted_sync_vids or None,
+                    request_timeout=reconcile_timeout_sec,
+                )
+                synced_count = int(sync_stats.get("synced_versions", 0))
+                total_temporal_synced += synced_count
+                per_project[pid] = {
+                    "scanned": 0,
+                    "orphans_deleted": 0,
+                    "temporal_payloads_synced": synced_count,
+                    "temporal_payloads_requested": int(sync_stats.get("requested_versions", 0)),
+                }
+                job.progress = (idx + 1) / len(project_ids)
+                continue
+
+            if targeted_superseded_vids and (is_superseded_prune_failure or explicit_prune_superseded):
+                stats = await reconcile_orphan_search_units(
+                    session,
+                    qdrant_client,
+                    project_id=pid,
+                    preserve_superseded=True,
+                    prune_version_ids=targeted_superseded_vids,
+                )
+            elif explicit_prune_superseded or is_superseded_prune_failure:
+                stats = await reconcile_orphan_search_units(
+                    session,
+                    qdrant_client,
+                    project_id=pid,
+                    preserve_superseded=False,
+                )
+            else:
+                stats = await reconcile_orphan_search_units(session, qdrant_client, project_id=pid)
+
+            if explicit_sync_payloads or not is_superseded_prune_failure:
+                sweep_stats = await reconcile_version_temporal_payloads(
+                    session,
+                    qdrant_client,
+                    project_id=pid,
+                    version_ids=targeted_sync_vids or None,
+                    request_timeout=reconcile_timeout_sec,
+                )
+                synced_count = int(sweep_stats.get("synced_versions", 0))
+                if synced_count > 0 or explicit_sync_payloads:
+                    total_temporal_synced += synced_count
+                    stats = {**stats, "temporal_payloads_synced": synced_count}
+
+            per_project[pid] = stats
+            total_scanned += int(stats.get("scanned", 0))
+            total_deleted += int(stats.get("orphans_deleted", 0))
+            job.progress = (idx + 1) / len(project_ids)
+    finally:
+        if should_close:
+            await qdrant_client.aclose()
+
+    job.progress = 1.0
+    next_job_payload: dict[str, Any] = {
+        **payload,
+        "scanned": total_scanned,
+        "orphans_deleted": total_deleted,
+        "projects": per_project,
+    }
+    if (
+        is_temporal_sync_failure
+        or targeted_sync_vids
+        or explicit_sync_payloads
+        or total_temporal_synced > 0
+    ):
+        next_job_payload["temporal_payloads_synced"] = total_temporal_synced
+    job.payload = next_job_payload
+    await session.commit()
+
+
+async def resolve_document_conflicts(
+    session: AsyncSession,
+    job: Job,
+    *,
+    engine_manager: EngineManager | None = None,
+    job_queue=None,
+    qdrant_client: Any | None = None,
+    llm_client: Any | None = None,
+) -> None:
+    """Async Stage 2A/2B cross-document conflict detection worker (isolated from ingestion readiness)."""
+    from sag_api.generation.llm import LLMClient
+    from sag_api.services.knowledge_conflict_service import resolve_document_conflicts_service
+
+    job_id = str(job.id)
+    payload = dict(job.payload or {})
+    timeout = _reconcile_qdrant_timeout()
+    resolved_qdrant: Any = qdrant_client
+    should_close_qdrant = False
+    if resolved_qdrant is None:
+        if engine_manager is not None and hasattr(engine_manager, "get_search_unit_qdrant_client"):
+            base_client = await engine_manager.get_search_unit_qdrant_client()
+            if base_client is not None:
+                resolved_qdrant = _TimeoutBoundQdrantClient(base_client, timeout)
+        elif settings.sag_vector_provider == "qdrant":
+            q_headers = {"api-key": settings.sag_qdrant_api_key} if settings.sag_qdrant_api_key else {}
+            resolved_qdrant = httpx.AsyncClient(
+                base_url=settings.sag_qdrant_url.rstrip("/"),
+                headers=q_headers,
+                timeout=timeout,
+            )
+            should_close_qdrant = True
+
+    resolved_llm = llm_client if llm_client is not None else LLMClient(settings)
+
+    try:
+        result = await resolve_document_conflicts_service(
+            session,
+            job=job,
+            qdrant_client=resolved_qdrant,
+            llm=resolved_llm,
+            lease_session_factory=SessionLocal,
+        )
+    finally:
+        if should_close_qdrant and resolved_qdrant is not None:
+            await resolved_qdrant.aclose()
+
+    refreshed_job = await session.get(Job, job_id, populate_existing=True) or job
+    expected_payload = {**dict(refreshed_job.payload or payload), **result.to_payload_dict()}
+    if refreshed_job.progress != 1.0 or refreshed_job.payload != expected_payload:
+        refreshed_job.progress = 1.0
+        refreshed_job.payload = expected_payload
+        session.add(refreshed_job)
+        await session.commit()
+
+
 TASK_HANDLERS: dict[JobType, TaskHandler] = {
     JobType.PROCESS_DOCUMENT: process_document,
     JobType.REPROCESS_DOCUMENT: reprocess_document_task,
@@ -1464,6 +1991,8 @@ TASK_HANDLERS: dict[JobType, TaskHandler] = {
     JobType.SYNC_SOURCE: sync_source,
     JobType.INDEX_UNIVERSE: index_universe,
     JobType.REBUILD_UNIVERSE_TREE: rebuild_universe_tree,
+    JobType.RECONCILE_SEARCH_INDEX: reconcile_search_index,
+    JobType.CONFLICT_RESOLUTION: resolve_document_conflicts,
     JobType.OCTX_PREFLIGHT: preflight_octx,
     JobType.OCTX_IMPORT: import_octx,
     JobType.OCTX_EXPORT: export_octx,

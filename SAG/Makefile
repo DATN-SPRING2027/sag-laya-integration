@@ -23,8 +23,14 @@ api: ## 启动后端（PostgreSQL + Qdrant，热重载，局域网可访问）
 web: ## 启动前端（Next dev，局域网可访问）
 	cd apps/web && npm run dev -- -H 0.0.0.0
 
-test: ## 提示：单元测试已被移除
-	@echo "Unit test suites have been removed from the repository."
+test: ## 运行后端 pytest 回归测试套件
+	@if [ -x apps/api/.venv/Scripts/python.exe ]; then \
+		cd apps/api && ./.venv/Scripts/python.exe -m pytest -v --tb=short; \
+	elif [ -x apps/api/.venv/bin/python ]; then \
+		cd apps/api && ./.venv/bin/python -m pytest -v --tb=short; \
+	else \
+		cd apps/api && python -m pytest -v --tb=short; \
+	fi
 
 build: ## 构建前端产物
 	cd apps/web && npm run build

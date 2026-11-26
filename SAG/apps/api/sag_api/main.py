@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +15,7 @@ from fastapi.responses import JSONResponse
 from sag_api import __version__
 from sag_api.api.v1 import api_router
 from sag_api.branding import PRODUCT_NAME
-from sag_api.core.config import settings
+from sag_api.core.config import _INSECURE_SECRETS, settings
 from sag_api.core.db import SessionLocal, dispose_db, init_db
 from sag_api.core.error_taxonomy import ErrorCode, ErrorLayer, ErrorStage
 from sag_api.core.errors import ApiError
@@ -24,18 +26,22 @@ from sag_api.runtime import KnowledgeRuntime
 log = get_logger("app")
 
 
-# 已知不安全的默认密钥（生产环境拒绝启动）
-_INSECURE_SECRETS = {
-    "dev-insecure-secret-change-me-in-production-0123456789",
-    "please-change-this-in-production-0123456789",
-    "dev-secret-change-me",
-}
+async def _drain_warm_manifest_task(warm_task: asyncio.Task[Any]) -> None:
+    try:
+        await warm_task
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        log.debug("Warm manifest cache task ended on shutdown: %s", type(exc).__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging("DEBUG" if settings.debug else "INFO")
-    if settings.environment == "prod" and settings.secret_key in _INSECURE_SECRETS:
+    stripped_secret = (settings.secret_key or "").strip()
+    if settings.environment == "prod" and (
+        not stripped_secret or len(stripped_secret) < 32 or stripped_secret in _INSECURE_SECRETS
+    ):
         raise RuntimeError(
             "生产环境禁止使用默认 SAG_SECRET_KEY。请设置强随机值（≥32 字节），例如：openssl rand -hex 32"
         )
@@ -66,14 +72,16 @@ async def lifespan(app: FastAPI):
         async with principal_assertion_lifespan():
             await runtime.start(app)
             knowledge_worker.job_queue = app.state.job_queue
-            if getattr(app.state, "engine_manager", None) is not None and knowledge_worker.embed is None:
+            knowledge_worker.engine_manager = getattr(app.state, "engine_manager", None)
+            app.state.knowledge_worker = knowledge_worker
+            runtime.attach_knowledge_worker(knowledge_worker)
+            if knowledge_worker.engine_manager is not None and knowledge_worker.embed is None:
                 try:
-                    knowledge_worker.embed = await app.state.engine_manager.get_sag_embedding()
+                    await knowledge_worker.engine_manager.get_sag_embedding()
                 except Exception as error:  # noqa: BLE001
-                    log.warning("Failed to initialize knowledge worker embedder: %s", error)
+                    log.warning("Failed to warm knowledge worker embedder: %s", error)
             if settings.knowledge_worker_enabled:
                 await knowledge_worker.start()
-            import asyncio
             from sag_api.services.universe_knowledge_service import warm_active_tree_manifest_cache
 
             warm_task = asyncio.create_task(
@@ -85,10 +93,7 @@ async def lifespan(app: FastAPI):
             finally:
                 if not warm_task.done():
                     warm_task.cancel()
-                    try:
-                        await warm_task
-                    except BaseException:  # noqa: BLE001
-                        pass
+                await _drain_warm_manifest_task(warm_task)
     finally:
         failures: list[BaseException] = []
         for cleanup in (

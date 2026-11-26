@@ -23,8 +23,10 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 
+from sag_agent import ToolCapability
 from sag_api.core.error_taxonomy import ErrorCode
 from sag_api.core.logging import get_logger
+from sag_api.generation.json_parser import decode_json_values, extract_fenced_blocks_and_outside
 from sag_api.tools.base import Tool, ToolContext, ToolMeta, ToolResult
 
 log = get_logger("mcp.client")
@@ -57,7 +59,6 @@ class MCPToolsBundle:
 
 
 _URL_PATTERN = re.compile(r"https?://[^\s<>\"'`，。；：！？、（）【】《》]+", re.IGNORECASE)
-_JSON_FENCE_PATTERN = re.compile(r"```(?:json)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
 _URL_KEYS = frozenset(
     {
         "url",
@@ -138,15 +139,13 @@ def _short_snippet(value: Any) -> str:
 
     # Some search MCPs put their complete JSON response in a field named
     # ``content``.  That payload is transport data, not a citation excerpt.
-    json_candidate = snippet
-    fenced = _JSON_FENCE_PATTERN.fullmatch(snippet)
-    if fenced:
-        json_candidate = fenced.group(1).strip()
-    try:
-        parsed = json.loads(json_candidate)
-    except (TypeError, ValueError):
-        pass
-    else:
+    fenced_bodies, _outside = extract_fenced_blocks_and_outside(value)
+    candidates = [snippet, *fenced_bodies]
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except (TypeError, ValueError):
+            continue
         if isinstance(parsed, (dict, list)):
             return ""
 
@@ -225,21 +224,66 @@ def _external_references(result: Any) -> list[dict[str, str]]:
             continue
         stripped_text = text.strip()
         full_text_is_json = False
-        candidates = [stripped_text, *_JSON_FENCE_PATTERN.findall(text)]
-        for index, candidate in enumerate(candidates):
-            try:
-                parsed = json.loads(candidate)
-            except (TypeError, ValueError):
-                continue
-            if index == 0 and isinstance(parsed, (dict, list)):
-                full_text_is_json = True
-            walk(parsed)
+        fenced_bodies, outside_text = extract_fenced_blocks_and_outside(text)
+        try:
+            parsed_full = json.loads(stripped_text)
+        except (TypeError, ValueError):
+            parsed_full = None
+        if isinstance(parsed_full, (dict, list)):
+            full_text_is_json = True
+            walk(parsed_full)
+        else:
+            for candidate in fenced_bodies:
+                for parsed in decode_json_values(candidate, expected_type=(dict, list)):
+                    walk(parsed)
         if not full_text_is_json:
             # JSON fences were already processed structurally.  Excluding them
             # from the raw URL scan prevents links embedded in serialized
             # snippets from leaking out as standalone references.
-            walk(_JSON_FENCE_PATTERN.sub("", text))
+            walk(outside_text)
     return list(references.values())
+
+
+def _parse_capability_items(raw: Any) -> frozenset[ToolCapability]:
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        return frozenset()
+    parsed: set[ToolCapability] = set()
+    for item in raw:
+        if isinstance(item, ToolCapability):
+            parsed.add(item)
+        elif isinstance(item, str):
+            norm = item.strip().lower()
+            for cap in ToolCapability:
+                if cap.value == norm:
+                    parsed.add(cap)
+                    break
+    return frozenset(parsed)
+
+
+def _extract_mcp_capabilities(
+    remote_tool: Any,
+    *,
+    configured_capabilities: Any = None,
+) -> frozenset[ToolCapability]:
+    """Read explicit ToolCapability metadata from binding config or MCP annotations/meta."""
+    caps: set[ToolCapability] = set()
+    remote_name = str(getattr(remote_tool, "name", "") or "")
+    if isinstance(configured_capabilities, dict):
+        caps.update(_parse_capability_items(configured_capabilities.get("*")))
+        if remote_name:
+            caps.update(_parse_capability_items(configured_capabilities.get(remote_name)))
+    elif isinstance(configured_capabilities, (list, tuple, set, frozenset)):
+        caps.update(_parse_capability_items(configured_capabilities))
+
+    for attr_name in ("annotations", "meta", "_meta"):
+        container = getattr(remote_tool, attr_name, None)
+        if container is None:
+            continue
+        if isinstance(container, dict):
+            caps.update(_parse_capability_items(container.get("capabilities")))
+        else:
+            caps.update(_parse_capability_items(getattr(container, "capabilities", None)))
+    return frozenset(caps)
 
 
 class MCPTool(Tool):
@@ -253,10 +297,16 @@ class MCPTool(Tool):
         local_name: str,
         description: str,
         parameters: dict[str, Any],
+        capabilities: frozenset[ToolCapability] = frozenset(),
     ) -> None:
         self._session = session
         self._remote_name = remote_name
-        self.meta = ToolMeta(name=local_name, description=description, parameters=parameters)
+        self.meta = ToolMeta(
+            name=local_name,
+            description=description,
+            parameters=parameters,
+            capabilities=capabilities,
+        )
 
     async def invoke(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         result = await self._session.call_tool(self._remote_name, args or {})
@@ -266,12 +316,18 @@ class MCPTool(Tool):
         return ToolResult(content=text, data={"external_references": _external_references(result)})
 
 
-async def tools_from_session(session: ClientSession, *, namespace: str) -> list[MCPTool]:
+async def tools_from_session(
+    session: ClientSession,
+    *,
+    namespace: str,
+    configured_capabilities: Any = None,
+) -> list[MCPTool]:
     """列出远端工具并逐个适配（本地名 = mcp__<namespace>__<remote>）。"""
     listed = await session.list_tools()
     tools: list[MCPTool] = []
     for t in listed.tools:
         params = t.inputSchema or {"type": "object", "properties": {}}
+        caps = _extract_mcp_capabilities(t, configured_capabilities=configured_capabilities)
         tools.append(
             MCPTool(
                 session,
@@ -279,6 +335,7 @@ async def tools_from_session(session: ClientSession, *, namespace: str) -> list[
                 local_name=f"mcp__{namespace}__{t.name}",
                 description=t.description or f"远端 MCP 工具 {t.name}",
                 parameters=params,
+                capabilities=caps,
             )
         )
     return tools
@@ -322,7 +379,14 @@ async def open_agent_mcp_tools(specs: list[tuple[str, dict]]) -> AsyncIterator[M
         for label, config in specs:
             try:
                 session = await stack.enter_async_context(_open_session(config))
-                tools.extend(await tools_from_session(session, namespace=_namespace(label)))
+                configured_caps = config.get("tool_capabilities") or config.get("capabilities")
+                tools.extend(
+                    await tools_from_session(
+                        session,
+                        namespace=_namespace(label),
+                        configured_capabilities=configured_caps,
+                    )
+                )
             except Exception:  # noqa: BLE001
                 log.warning("MCP 连接失败 %s", label, exc_info=True)
                 warnings.append(

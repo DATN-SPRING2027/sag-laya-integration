@@ -1,4 +1,9 @@
-"""Automated regression & ablation benchmark verification (V0 -> V5) for SAG-ECCE."""
+"""SYNTHETIC OFFLINE BENCHMARK — Automated regression & ablation verification (V0 -> V5) for SAG-ECCE.
+
+Runs on the deterministic synthetic corpus in `tests/eval_ecce_baseline/benchmark_suite.py` with
+simulated routing, deterministic hash embeddings, and `session_context_mode` explicitly enabled
+(production default in `Settings` is `session_context_mode="off"`).
+"""
 
 from __future__ import annotations
 

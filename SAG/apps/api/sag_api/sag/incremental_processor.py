@@ -29,6 +29,7 @@ zleap 职责(0.8.2 已内置,不再由 SAG 实现):实体数契约
 from __future__ import annotations
 
 import asyncio
+import unicodedata
 from collections.abc import Awaitable, Callable
 from hashlib import sha256
 from pathlib import Path
@@ -66,12 +67,42 @@ StageCallback = Callable[[str], Awaitable[None]]
 
 log = get_logger("sag.incremental")
 
+_VIETNAMESE_DIACRITICS = frozenset(
+    "ăâđêôơưĂÂĐÊÔƠƯ"
+    "àáảãạằắẳẵặầấẩẫậèéẻẽẹềếểễệìíỉĩịòóỏõọồốổỗộờớởỡợùúủũụừứửữựỳýỷỹỵ"
+    "ÀÁẢÃẠẰẮẲẴẶẦẤẨẪẬÈÉẺẼẸỀẾỂỄỆÌÍỈĨỊÒÓỎÕỌỒỐỔỖỘỜỚỞỠỢÙÚỦŨỤỪỨỬỮỰỲÝỶỸỴ"
+)
+
+
 def detect_document_language(text: str, configured: str | None = None) -> str:
-    """Resolve extraction prompt language. Chinese ('zh') is disabled to prevent language drift."""
+    """Resolve extraction prompt language from explicit setting or NFC-normalized text."""
+    if configured is not None:
+        normalized_cfg = str(configured).strip().lower()
+        if normalized_cfg in {"en", "zh", "vi"}:
+            return normalized_cfg
+        if normalized_cfg and normalized_cfg != "auto":
+            raise ValueError(f"Unsupported sag_language: {configured!r}")
+    normalized_text = unicodedata.normalize("NFC", text or "")
+    if any(ch in _VIETNAMESE_DIACRITICS for ch in normalized_text):
+        return "vi"
+    if any("\u4e00" <= ch <= "\u9fff" for ch in normalized_text):
+        return "zh"
     return "en"
 
 
 _KNOWLEDGE_EVENT_REQUIREMENTS = {
+    "zh": (
+        '对于书籍、报告、论文等非新闻文档，"事项"也包括可独立理解的观点、事实、定义、\n'
+        "机制、因果关系、论证和结论，不要求必须包含日期、人物动作或新闻事件。\n"
+        "只有目录、页眉页脚、广告、乱码、纯链接，或确实与文档主题无关的片段才可返回空结果；\n"
+        "正文只要包含可复用的知识，就至少保留一个有效的顶级事项。\n"
+        "每个事项的内容保持精炼（1 到 3 句事实陈述，保留精确数字、指标和标识），不要整段照抄。\n"
+        '每个实体必须严格使用 {"type":"实体类型","name":"实体名称","description":"作用说明"}；\n'
+        "有效实体类型为：person, organization, location, topic, product, time, event, other\n"
+        "（法律、规范、任务、指标或概念请使用 'topic' 或 'other'）。\n"
+        "禁止把实体类型写成字段名，例如不能输出\n"
+        '{"location":"中东","name":"中东","description":"地区"}。'
+    ),
     "en": (
         'For books, reports, papers, and other non-news documents, an "event" also includes\n'
         "independently understandable viewpoints, facts, definitions, mechanisms, causal\n"
@@ -107,11 +138,11 @@ class IncrementalDocumentProcessor:
         document_title: str | None = None,
         max_entities_per_event: int = 20,
         write_event_entity_vectors: bool = False,
-        enable_strict_filtering: bool = False,
         event_entity_attempts: int = 2,
         extraction_profile: str = "concise",
         document_version_id: str | None = None,
         extract_events: bool = False,
+        configured_language: str | None = None,
     ) -> None:
         self._engine = engine
         self._source_config_id = source_config_id
@@ -124,13 +155,11 @@ class IncrementalDocumentProcessor:
         self._extraction_profile = extraction_profile if extraction_profile in {"standard", "concise"} else "concise"
         self._document_version_id = document_version_id
         self._extract_events = extract_events
+        self._configured_language = configured_language
         self._detected_language: str | None = None
 
-        # 0.8.2 已内置契约与修复重试,以下 0.7.1 参数仅保留接口兼容:
-        # - enable_strict_filtering → zleap 无对应开关(REQ 待对齐),忽略并记录;
+        # 0.8.2 已内置契约与修复重试:
         # - event_entity_attempts → zleap ExtractionOptions.max_retries(默认 5)接管。
-        if enable_strict_filtering:
-            log.warning("0.8.2 无严格过滤开关,忽略 enable_strict_filtering(REQ 待对齐)")
         self._event_entity_attempts = max(1, min(3, event_entity_attempts))
 
     async def _sample_language(self, path: str | Path | None) -> None:
@@ -144,12 +173,20 @@ class IncrementalDocumentProcessor:
 
                     sample = await asyncio.to_thread(_read_head)
                     if sample.strip():
-                        self._detected_language = detect_document_language(sample)
+                        self._detected_language = detect_document_language(
+                            sample, configured=self._configured_language
+                        )
                         return
             except Exception:  # noqa: BLE001
                 pass
         if self._document_title:
-            self._detected_language = detect_document_language(self._document_title)
+            self._detected_language = detect_document_language(
+                self._document_title, configured=self._configured_language
+            )
+        elif self._configured_language:
+            self._detected_language = detect_document_language(
+                "", configured=self._configured_language
+            )
 
     # ── 主流程 ────────────────────────────────────────────────────────────
     async def process(
@@ -247,15 +284,26 @@ class IncrementalDocumentProcessor:
         if not blocks or not units:
             return False
 
+        from sag_api.services.search_index_service import resolve_search_unit_text
+
         block_index_by_id = {b.id: idx for idx, b in enumerate(blocks)}
-        units.sort(key=lambda u: block_index_by_id.get(u.block_from_id, 0))
+        units.sort(
+            key=lambda u: (
+                block_index_by_id.get(u.block_from_id, 0),
+                u.char_start if u.char_start is not None else 0,
+                int(u.page_from or 0),
+                str(u.id),
+            )
+        )
 
         chunk_items: list[ChunkItem] = []
         for idx, unit in enumerate(units):
             start_idx = block_index_by_id.get(unit.block_from_id, 0)
             end_idx = block_index_by_id.get(unit.block_to_id, start_idx)
+            if end_idx < start_idx:
+                start_idx, end_idx = end_idx, start_idx
             unit_blocks = blocks[start_idx : end_idx + 1]
-            combined_text = "\n\n".join(b.normalized_text for b in unit_blocks if b.normalized_text).strip()
+            combined_text = resolve_search_unit_text(unit, unit_blocks).strip()
             if not combined_text:
                 continue
             heading = (unit.section_path or self._document_title or f"Section {idx + 1}").strip()[:500]
@@ -472,18 +520,28 @@ class IncrementalDocumentProcessor:
     ) -> tuple[bool, Any]:
         """整批抽取;暂停由 CancellationToken + 后台轮询驱动,进度经 observer 透出。"""
         prompt_manager = getattr(self._engine.resources, "prompts", None)
+        detected = (
+            self._detected_language
+            or self._configured_language
+            or getattr(prompt_manager, "language", None)
+            or "en"
+        )
+        # zleap-sag==0.12.0 PromptManager._normalize_language only accepts
+        # Literal["zh", "en"] and raises PromptError on "vi"; map "vi" -> "en"
+        # strictly at this third-party adapter boundary.
+        prompt_lang = "zh" if detected == "zh" else "en"
         if (
             prompt_manager is not None
-            and getattr(prompt_manager, "language", None) != "en"
+            and getattr(prompt_manager, "language", None) != prompt_lang
             and hasattr(prompt_manager, "templates")
             and hasattr(prompt_manager, "template_data")
             and hasattr(prompt_manager, "load_templates")
         ):
-            prompt_manager.language = "en"
+            prompt_manager.language = prompt_lang
             prompt_manager.templates.clear()
             prompt_manager.template_data.clear()
             prompt_manager.load_templates()
-        requirements = _KNOWLEDGE_EVENT_REQUIREMENTS["en"]
+        requirements = _KNOWLEDGE_EVENT_REQUIREMENTS[prompt_lang]
 
         is_concise = self._extraction_profile == "concise"
         concise_rule = (

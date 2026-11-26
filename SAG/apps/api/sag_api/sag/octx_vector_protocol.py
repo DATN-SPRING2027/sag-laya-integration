@@ -42,8 +42,8 @@ ROLE_RECIPES: dict[str, dict[str, Any]] = {
 ROLE_STORAGE = {
     "chunk.heading": ("source_chunks", "heading_vector"),
     "chunk.content": ("source_chunks", "content_vector"),
-    "event.title": ("event_vectors", "title_vector"),
-    "event.content": ("event_vectors", "content_vector"),
+    "event.title": ("event_vectors_wide", "title_vector"),
+    "event.content": ("event_vectors_wide", "content_vector"),
     "entity.name": ("entity_vectors", "vector"),
     "event_entity.relation": ("event_entity_vectors", "vector"),
 }
@@ -92,6 +92,16 @@ def input_sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _resolved_client_dimensions(embedding_client: Any) -> int | None:
+    raw = getattr(embedding_client, "schema_dimensions", None)
+    if raw is None:
+        raw = getattr(embedding_client, "dimensions", None)
+    if raw is None or isinstance(raw, bool):
+        return None
+    val = int(raw)
+    return val if val > 0 else None
+
+
 def model_fingerprint(embedding_client: Any) -> str:
     identity = {
         "implementation": "openai-compatible/1",
@@ -99,14 +109,14 @@ def model_fingerprint(embedding_client: Any) -> str:
         # The endpoint is hashed, never serialized. This prevents two providers
         # from reusing vectors merely because they expose the same mutable alias.
         "base_url": str(getattr(embedding_client, "base_url", "") or ""),
-        "dimensions": getattr(embedding_client, "dimensions", None),
+        "dimensions": _resolved_client_dimensions(embedding_client),
     }
     encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
     return "sag-config:sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def embedding_identity(embedding_client: Any) -> dict[str, Any] | None:
-    dimensions = getattr(embedding_client, "dimensions", None)
+    dimensions = _resolved_client_dimensions(embedding_client)
     model = str(getattr(embedding_client, "model", "")).strip()
     if not model or dimensions is None:
         return None
@@ -121,12 +131,29 @@ def embedding_identity(embedding_client: Any) -> dict[str, Any] | None:
 
 
 def configured_embedding_identity(settings: Any) -> dict[str, Any] | None:
+    from sag_api.services.search_index_service import resolve_embedding_dimensions
+
     class Configuration:
         model = settings.embedding_model
         base_url = settings.effective_embedding_base_url
-        dimensions = settings.embedding_dimensions
+        dimensions = resolve_embedding_dimensions(
+            settings.embedding_model,
+            getattr(settings, "embedding_dimensions", None),
+        )
 
     return embedding_identity(Configuration())
+
+
+def _is_missing_collection_error(error: Exception) -> bool:
+    status_code = getattr(error, "status_code", None)
+    if status_code is None:
+        status_code = getattr(getattr(error, "response", None), "status_code", None)
+    if status_code == 404:
+        return True
+    msg = str(error).lower()
+    if any(code in msg for code in ("(500)", "(502)", "(503)", "(504)", "(401)", "(403)")):
+        return False
+    return "(404)" in msg or "doesn't exist" in msg or "does not exist" in msg or "not found" in msg
 
 
 def vector_profile(role: str, embedding_client: Any, dimensions: int) -> dict[str, Any]:
@@ -394,8 +421,10 @@ async def write_existing_vector_payload(
                 if completed != total:
                     complete = False
             except Exception as error:
+                if not _is_missing_collection_error(error):
+                    raise
                 complete = False
-                logger.warning("OCTX vector role export skipped role=%s error=%s", role, error)
+                logger.warning("OCTX vector role export skipped missing collection role=%s error=%s", role, error)
             finally:
                 if writer is not None:
                     writer.close()

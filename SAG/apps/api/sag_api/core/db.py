@@ -110,7 +110,7 @@ _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
         "tenant_id": "VARCHAR(64) NOT NULL DEFAULT 'tenant_continuum_default'",
         "project_id": "VARCHAR(64)",
         "owner_id": "VARCHAR(256)",
-        "logical_source_id": "VARCHAR(128)",
+        "logical_source_id": "VARCHAR(512)",
     },
     "threads": {
         "archived": "BOOLEAN NOT NULL DEFAULT FALSE",
@@ -131,13 +131,31 @@ _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
     "universe_dirty_sources": {"revision": "INTEGER NOT NULL DEFAULT 1"},
     "tree_manifests": {"manifest_json": "JSON NOT NULL DEFAULT '{}'"},
     "tree_routing_profiles": {"document_version_id": "VARCHAR(128) NOT NULL DEFAULT ''"},
-    "knowledge_jobs": {"result_json": "JSON", "usage_json": "JSON", "extractor_version": "VARCHAR(128)", "tree_requested_at": "TIMESTAMP WITH TIME ZONE"},
+    "knowledge_jobs": {
+        "result_json": "JSON",
+        "usage_json": "JSON",
+        "extractor_version": "VARCHAR(128)",
+        "tree_requested_at": "TIMESTAMP WITH TIME ZONE",
+    },
     "knowledge_graph_builds": {"input_fingerprint": "VARCHAR(64)"},
-    "canonical_blocks": {"dedup_signature_json": "JSON"},
+    "canonical_blocks": {
+        "is_boilerplate": "BOOLEAN NOT NULL DEFAULT FALSE",
+        "dedup_signature_json": "JSON",
+    },
+    "search_units": {
+        "char_start": "INTEGER",
+        "char_end": "INTEGER",
+        "text_snapshot": "TEXT",
+    },
     "research_tasks": {"execution_json": "JSON NOT NULL DEFAULT '{}'"},
     "ingestion_runs": {
         "content_hash": "VARCHAR(64)",
         "research_task_id": "VARCHAR(36) REFERENCES research_tasks(id) ON DELETE SET NULL",
+    },
+    "document_versions": {
+        "authority_tier": "INTEGER",
+        "effective_from": "TIMESTAMP WITH TIME ZONE",
+        "scope_tags_json": "JSON",
     },
 }
 
@@ -145,7 +163,10 @@ _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
 # idempotent for local/embedded upgrades; production deployments can express
 # the same DDL in their migration runner.
 _INDEX_UPGRADES = (
-    "CREATE UNIQUE INDEX IF NOT EXISTS ix_knowledge_graph_input ON knowledge_graph_builds (tenant_id, project_id, input_fingerprint)",
+    (
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_knowledge_graph_input "
+        "ON knowledge_graph_builds (tenant_id, project_id, input_fingerprint)"
+    ),
     "CREATE INDEX IF NOT EXISTS ix_messages_thread_created_id ON messages (thread_id, created_at, id)",
     "CREATE INDEX IF NOT EXISTS ix_messages_reply_to_message_id ON messages (reply_to_message_id)",
     "CREATE INDEX IF NOT EXISTS ix_messages_regenerated_from_message_id ON messages (regenerated_from_message_id)",
@@ -173,6 +194,32 @@ _INDEX_UPGRADES = (
         "CREATE INDEX IF NOT EXISTS idx_tree_routing_profiles_version_scope "
         "ON tree_routing_profiles (project_id, tree_version, source_id, document_version_id, partition_id)"
     ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_document_versions_effective_authority "
+        "ON document_versions (document_id, effective_from, authority_tier)"
+    ),
+    (
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_kcr_project_pair "
+        "ON knowledge_conflict_resolutions (project_id, pair_key)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_kcr_project_status_partition "
+        "ON knowledge_conflict_resolutions (tenant_id, project_id, status, security_partition_id)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_kcr_loser_unit_status "
+        "ON knowledge_conflict_resolutions (project_id, loser_unit_id, status)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_kcr_winner_version_status "
+        "ON knowledge_conflict_resolutions (winner_version_id, status)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_kcr_loser_version_status "
+        "ON knowledge_conflict_resolutions (loser_version_id, status)"
+    ),
+    "CREATE INDEX IF NOT EXISTS idx_kcr_winner_document ON knowledge_conflict_resolutions (winner_document_id)",
+    "CREATE INDEX IF NOT EXISTS idx_kcr_loser_document ON knowledge_conflict_resolutions (loser_document_id)",
 )
 
 
@@ -281,6 +328,15 @@ async def _ensure_document_schema_widths() -> None:
                       AND atttypid = 'character varying'::regtype AND atttypmod = 260
                   )
                   OR EXISTS (
+                    SELECT 1 FROM pg_attribute
+                    WHERE attrelid = 'documents'::regclass AND attname = 'logical_source_id'
+                      AND attnum > 0 AND NOT attisdropped
+                      AND (
+                        atttypid <> 'character varying'::regtype
+                        OR atttypmod <> 516
+                      )
+                  )
+                  OR EXISTS (
                     SELECT 1
                     FROM pg_constraint fk
                     CROSS JOIN LATERAL unnest(fk.conkey, fk.confkey) AS keys(local_attnum, target_attnum)
@@ -322,6 +378,7 @@ async def _ensure_document_schema_widths() -> None:
               END LOOP;
               ALTER TABLE documents ALTER COLUMN id TYPE VARCHAR(36);
               ALTER TABLE documents ALTER COLUMN owner_id TYPE VARCHAR(256);
+              ALTER TABLE documents ALTER COLUMN logical_source_id TYPE VARCHAR(512);
               FOR fk IN SELECT * FROM sag_document_fk_columns LOOP
                 EXECUTE format('ALTER TABLE %s ALTER COLUMN %I TYPE VARCHAR(36)', fk.rel, fk.column_name);
               END LOOP;
@@ -331,6 +388,154 @@ async def _ensure_document_schema_widths() -> None:
             END $$;
             """
         )
+
+
+async def _ensure_search_unit_cascade_fks(conn) -> None:  # noqa: ANN001
+    """Ensure search_units.block_from_id and block_to_id have ON DELETE CASCADE."""
+    dialect_name = conn.dialect.name
+    if dialect_name == "postgresql":
+        await conn.exec_driver_sql(
+            """
+            DO $$
+            DECLARE
+                fk RECORD;
+            BEGIN
+                IF to_regclass('search_units') IS NOT NULL
+                   AND to_regclass('canonical_blocks') IS NOT NULL THEN
+                    FOR fk IN
+                        SELECT
+                            c.conname,
+                            local_col.attname AS column_name
+                        FROM pg_constraint c
+                        CROSS JOIN LATERAL unnest(c.conkey, c.confkey) AS keys(local_attnum, target_attnum)
+                        JOIN pg_attribute local_col
+                            ON local_col.attrelid = c.conrelid AND local_col.attnum = keys.local_attnum
+                        WHERE c.contype = 'f'
+                          AND c.conrelid = 'search_units'::regclass
+                          AND c.confrelid = 'canonical_blocks'::regclass
+                          AND c.confdeltype <> 'c'
+                          AND local_col.attname IN ('block_from_id', 'block_to_id')
+                    LOOP
+                        EXECUTE format('ALTER TABLE search_units DROP CONSTRAINT %I', fk.conname);
+                        EXECUTE format(
+                            'ALTER TABLE search_units ADD CONSTRAINT %I '
+                            'FOREIGN KEY (%I) REFERENCES canonical_blocks(id) ON DELETE CASCADE',
+                            fk.conname,
+                            fk.column_name
+                        );
+                    END LOOP;
+                END IF;
+            END $$;
+            """
+        )
+        return
+
+    if dialect_name != "sqlite":
+        return
+
+    has_table = (
+        await conn.exec_driver_sql(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='search_units'"
+        )
+    ).scalar_one_or_none()
+    if not has_table:
+        return
+
+    fk_rows = (await conn.exec_driver_sql("PRAGMA foreign_key_list('search_units')")).all()
+    cb_fks = {row[3]: str(row[6]).upper() for row in fk_rows if row[2] == "canonical_blocks"}
+    if (
+        cb_fks.get("block_from_id") == "CASCADE"
+        and cb_fks.get("block_to_id") == "CASCADE"
+    ):
+        return
+
+    col_rows = (await conn.exec_driver_sql("PRAGMA table_info('search_units')")).all()
+    existing_cols = {row[1] for row in col_rows}
+
+    def _col_expr(name: str) -> str:
+        return name if name in existing_cols else f"NULL AS {name}"
+
+    managed_tx = not conn.in_transaction()
+    await conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+    try:
+        if managed_tx:
+            await conn.exec_driver_sql("BEGIN")
+        await conn.exec_driver_sql(
+            """
+            CREATE TABLE _search_units_cascade_new (
+                id VARCHAR(36) NOT NULL,
+                document_version_id VARCHAR(36) NOT NULL,
+                block_from_id VARCHAR(36) NOT NULL,
+                block_to_id VARCHAR(36) NOT NULL,
+                security_partition_id VARCHAR(64) NOT NULL,
+                content_hash VARCHAR(64) NOT NULL,
+                token_count INTEGER NOT NULL,
+                page_from INTEGER NOT NULL,
+                page_to INTEGER NOT NULL,
+                section_path VARCHAR(512) NOT NULL,
+                char_start INTEGER,
+                char_end INTEGER,
+                text_snapshot TEXT,
+                created_at DATETIME DEFAULT (CURRENT_TIMESTAMP) NOT NULL,
+                PRIMARY KEY (id),
+                FOREIGN KEY(document_version_id) REFERENCES document_versions (id) ON DELETE CASCADE,
+                FOREIGN KEY(block_from_id) REFERENCES canonical_blocks (id) ON DELETE CASCADE,
+                FOREIGN KEY(block_to_id) REFERENCES canonical_blocks (id) ON DELETE CASCADE
+            )
+            """
+        )
+        await conn.exec_driver_sql(
+            f"""
+            INSERT INTO _search_units_cascade_new (
+                id,
+                document_version_id,
+                block_from_id,
+                block_to_id,
+                security_partition_id,
+                content_hash,
+                token_count,
+                page_from,
+                page_to,
+                section_path,
+                char_start,
+                char_end,
+                text_snapshot,
+                created_at
+            )
+            SELECT
+                id,
+                document_version_id,
+                block_from_id,
+                block_to_id,
+                security_partition_id,
+                content_hash,
+                token_count,
+                page_from,
+                page_to,
+                section_path,
+                {_col_expr("char_start")},
+                {_col_expr("char_end")},
+                {_col_expr("text_snapshot")},
+                created_at
+            FROM search_units
+            """
+        )
+        await conn.exec_driver_sql("DROP TABLE search_units")
+        await conn.exec_driver_sql("ALTER TABLE _search_units_cascade_new RENAME TO search_units")
+        await conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_search_units_version ON search_units (document_version_id)"
+        )
+        await conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_search_units_security ON search_units (security_partition_id)"
+        )
+        if managed_tx:
+            await conn.exec_driver_sql("COMMIT")
+    except Exception:
+        if managed_tx and conn.in_transaction():
+            await conn.exec_driver_sql("ROLLBACK")
+        raise
+    finally:
+        await conn.exec_driver_sql("PRAGMA foreign_keys=ON")
 
 
 async def init_db() -> None:
@@ -354,6 +559,13 @@ async def init_db() -> None:
             await conn.run_sync(Base.metadata.create_all)
     await _ensure_columns()
     await _ensure_document_schema_widths()
+    if engine.dialect.name == "postgresql":
+        async with engine.begin() as conn:
+            await _ensure_search_unit_cascade_fks(conn)
+    else:
+        async with engine.connect() as raw_conn:
+            conn = await raw_conn.execution_options(isolation_level="AUTOCOMMIT")
+            await _ensure_search_unit_cascade_fks(conn)
     await _ensure_indexes()
 
 

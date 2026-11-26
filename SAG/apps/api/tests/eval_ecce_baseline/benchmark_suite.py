@@ -1,4 +1,11 @@
-"""12-Scenario Vietnamese & Multi-Step Benchmark + Ablation Evaluator (V0 -> V5) for SAG-ECCE."""
+"""SYNTHETIC OFFLINE BENCHMARK — 12-Scenario Vietnamese & Multi-Step Ablation Evaluator (V0 -> V5).
+
+IMPORTANT: This suite runs against an offline, deterministic synthetic 236-turn corpus using
+simulated routing (`route_dec`), deterministic 256-d n-gram fallback embeddings, `StructuredExtractorTestLLM`,
+and an explicit `session_context_mode="on"` override (production default is `session_context_mode="off"`).
+Metrics reported here validate deterministic ECCE ablation logic only and do NOT represent default
+production configuration or live LLM/Qdrant/PostgreSQL behavior.
+"""
 
 from __future__ import annotations
 
@@ -7,10 +14,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sag_api.services.decision_router import infer_ecce_routing_signals
+from sag_api.services.session_context.extractor import clear_turn_extraction_cache
 from sag_api.services.session_context.models import AblationMode
 from sag_api.services.session_context.optimizer import build_ecce_context_pack
 from sag_api.services.session_context.substrate import IncrementalSessionIndex
+from tests.ecce_test_helpers import StructuredExtractorTestLLM
 
 ALL_ABLATION_MODES: tuple[AblationMode, ...] = (
     "V0_legacy",
@@ -30,6 +38,11 @@ class BenchmarkScenario:
     gold_turn_ids: tuple[str, ...]
     forbidden_stale_turn_ids: tuple[str, ...] = ()
     budget_tokens: int = 620
+    memory_scope: str = "session_history"
+    temporal_mode: str = "current_effective"
+    topic_slot_key: str | None = None
+    hierarchy_bias: str = "none"
+    entities: tuple[str, ...] = ()
 
 
 def build_shared_long_horizon_corpus() -> list[dict[str, Any]]:
@@ -254,6 +267,10 @@ def build_benchmark_scenarios() -> list[BenchmarkScenario]:
             query="Đầu dự án chúng ta đã chốt hạn mức ngân sách hạ tầng đám mây tối đa mỗi tháng là bao nhiêu?",
             gold_turn_ids=("gold_budget_t1",),
             budget_tokens=520,
+            memory_scope="session_history",
+            temporal_mode="current_effective",
+            topic_slot_key="slot:budget",
+            hierarchy_bias="early",
         ),
         BenchmarkScenario(
             case_id="C02_decision_drift_database",
@@ -262,6 +279,9 @@ def build_benchmark_scenarios() -> list[BenchmarkScenario]:
             gold_turn_ids=("gold_db_pg16",),
             forbidden_stale_turn_ids=("stale_db_mongo", "stale_db_cockroach"),
             budget_tokens=520,
+            memory_scope="session_history",
+            temporal_mode="current_effective",
+            topic_slot_key="slot:database",
         ),
         BenchmarkScenario(
             case_id="C03_decision_revert_queue",
@@ -270,6 +290,9 @@ def build_benchmark_scenarios() -> list[BenchmarkScenario]:
             gold_turn_ids=("gold_queue_revert_pg",),
             forbidden_stale_turn_ids=("stale_queue_redis",),
             budget_tokens=520,
+            memory_scope="session_history",
+            temporal_mode="current_effective",
+            topic_slot_key="slot:queue",
         ),
         BenchmarkScenario(
             case_id="C04_decision_lineage_why",
@@ -277,6 +300,9 @@ def build_benchmark_scenarios() -> list[BenchmarkScenario]:
             query="Vì sao chúng ta chuyển hàng đợi sự kiện từ Redis Streams quay lại dùng PostgreSQL LISTEN/NOTIFY?",
             gold_turn_ids=("stale_queue_redis", "gold_queue_issue", "gold_queue_revert_pg"),
             budget_tokens=680,
+            memory_scope="session_history",
+            temporal_mode="change_lineage",
+            topic_slot_key="slot:queue",
         ),
         BenchmarkScenario(
             case_id="C05_vi_anaphoric_confirmation",
@@ -284,6 +310,10 @@ def build_benchmark_scenarios() -> list[BenchmarkScenario]:
             query="Chúng ta đã chốt phương án kho vector nào mà anh Tuấn đề xuất?",
             gold_turn_ids=("gold_tuan_prop", "gold_tuan_confirm"),
             budget_tokens=520,
+            memory_scope="session_history",
+            temporal_mode="current_effective",
+            topic_slot_key="slot:vector_db",
+            entities=("Tuấn",),
         ),
         BenchmarkScenario(
             case_id="C06_vi_homonym_role_disambig",
@@ -292,6 +322,10 @@ def build_benchmark_scenarios() -> list[BenchmarkScenario]:
             gold_turn_ids=("gold_minh_be",),
             forbidden_stale_turn_ids=("gold_minh_fe",),
             budget_tokens=520,
+            memory_scope="session_history",
+            temporal_mode="current_effective",
+            topic_slot_key="slot:owner_backend",
+            entities=("Minh BE",),
         ),
         BenchmarkScenario(
             case_id="C07_temporal_filter_owner",
@@ -299,6 +333,11 @@ def build_benchmark_scenarios() -> list[BenchmarkScenario]:
             query="Trong buổi họp đầu phiên, chị Lan nhận phụ trách mảng nào?",
             gold_turn_ids=("gold_lan_owner",),
             budget_tokens=520,
+            memory_scope="session_history",
+            temporal_mode="current_effective",
+            topic_slot_key="slot:owner_owasp",
+            hierarchy_bias="early",
+            entities=("Lan",),
         ),
         BenchmarkScenario(
             case_id="C08_temporal_target_golive",
@@ -306,6 +345,9 @@ def build_benchmark_scenarios() -> list[BenchmarkScenario]:
             query="Lịch golive bản thử nghiệm Continuum giai đoạn 1 được ấn định vào ngày nào?",
             gold_turn_ids=("gold_golive_date",),
             budget_tokens=520,
+            memory_scope="session_history",
+            temporal_mode="past_point",
+            topic_slot_key="slot:golive",
         ),
         BenchmarkScenario(
             case_id="C09_multihop_entity_bridge",
@@ -313,6 +355,9 @@ def build_benchmark_scenarios() -> list[BenchmarkScenario]:
             query="Dịch vụ payment-gateway-v2 bắt buộc tuân theo chu kỳ xoay vòng chứng chỉ mTLS bao lâu một lần?",
             gold_turn_ids=("gold_hop1_gateway", "gold_hop2_vault"),
             budget_tokens=560,
+            memory_scope="session_history",
+            temporal_mode="current_effective",
+            entities=("payment-gateway-v2", "mTLS"),
         ),
         BenchmarkScenario(
             case_id="C10_hybrid_session_and_adr",
@@ -320,6 +365,10 @@ def build_benchmark_scenarios() -> list[BenchmarkScenario]:
             query="Đối chiếu cơ chế xác thực SSO chúng ta chốt trong cuộc chat với quy định tại tài liệu ADR-004.",
             gold_turn_ids=("gold_sso_keycloak",),
             budget_tokens=520,
+            memory_scope="hybrid_both",
+            temporal_mode="current_effective",
+            topic_slot_key="slot:auth",
+            entities=("ADR-004",),
         ),
         BenchmarkScenario(
             case_id="C11_redundant_spam_submodular",
@@ -327,6 +376,9 @@ def build_benchmark_scenarios() -> list[BenchmarkScenario]:
             query="Triển khai máy chủ sản phẩm dùng hệ điều hành gì và yêu cầu sao lưu pgBackRest RPO tối đa bao lâu?",
             gold_turn_ids=("gold_deploy_primary", "gold_backup_rpo"),
             budget_tokens=360,
+            memory_scope="session_history",
+            temporal_mode="current_effective",
+            entities=("pgBackRest",),
         ),
         BenchmarkScenario(
             case_id="C12_full_session_audit",
@@ -338,17 +390,21 @@ def build_benchmark_scenarios() -> list[BenchmarkScenario]:
                 "gold_tuan_confirm",
                 "gold_sso_keycloak",
             ),
-            budget_tokens=980,
+            # Calibrated for real tiktoken cl100k_base Vietnamese token counts across all 10 active decisions
+            budget_tokens=1180,
+            memory_scope="full_session_audit",
+            temporal_mode="change_lineage",
         ),
     ]
 
 
 async def run_ablation_benchmark() -> dict[str, dict[str, Any]]:
     """Run all 6 ablation modes (V0 -> V5) on the 12-scenario long-horizon benchmark."""
+    clear_turn_extraction_cache()
     corpus = build_shared_long_horizon_corpus()
     scenarios = build_benchmark_scenarios()
     index = IncrementalSessionIndex("bench-thread-main")
-    await index.append_messages(corpus)
+    await index.append_messages(corpus, llm=StructuredExtractorTestLLM())
 
     summary_by_mode: dict[str, dict[str, Any]] = {}
     for mode in ALL_ABLATION_MODES:
@@ -362,11 +418,15 @@ async def run_ablation_benchmark() -> dict[str, dict[str, Any]]:
         per_case: dict[str, dict[str, Any]] = {}
 
         for sc in scenarios:
-            mem_scope, temp_mode = infer_ecce_routing_signals(sc.query, coarse_intent="KNOWLEDGE")
+            mem_scope = sc.memory_scope
+            temp_mode = sc.temporal_mode
             route_dec = {
                 "coarse_intent": "KNOWLEDGE",
                 "memory_scope": mem_scope,
                 "temporal_mode": temp_mode,
+                "topic_slot_key": sc.topic_slot_key,
+                "hierarchy_bias": sc.hierarchy_bias,
+                "entities": list(sc.entities),
                 "model": "deterministic_benchmark",
                 "fallback_used": False,
             }

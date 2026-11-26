@@ -1,5 +1,7 @@
 # Kế hoạch triển khai SAG Knowledge Routing RAG
 
+> **SUPERSEDED (2026-11-25):** Kế hoạch triển khai lịch sử. Các hạng mục liên quan tới **Laya Local Router** và **Tier E2 LLM Enrichment** đã bị **thay thế** theo [adr-remove-laya-and-r2.md](../docs/adr-remove-laya-and-r2.md) và [adr-remove-e2-llm-enrichment.md](../docs/adr-remove-e2-llm-enrichment.md).
+
 Nguồn chuẩn: [Workflow v1.1](../docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1.md). Kế hoạch này chuyển các phase và Definition of Done trong đặc tả thành thứ tự triển khai có phụ thuộc và cổng nghiệm thu. Đây là kế hoạch mục tiêu; không coi các phase là tính năng đã có. Trước mỗi phase, đối chiếu code, schema, API và cách vận hành hiện tại rồi mới chọn nơi sửa.
 
 ## Mục tiêu và nguyên tắc

@@ -1,5 +1,7 @@
 # Todo — SAG Knowledge Routing RAG
 
+> **SUPERSEDED (2026-11-25):** Checklist tác nghiệp lịch sử (có tham chiếu **Laya Local**, **E2 LLM Enrichment** và một số tệp test cũ đã gỡ bỏ — mọi tệp test được gắn `[historical — removed from repo]` bên dưới đã bị xóa trong các đợt dọn kho trước đó). Kiến trúc hiện hành tuân theo [adr-remove-laya-and-r2.md](../docs/adr-remove-laya-and-r2.md) và [adr-remove-e2-llm-enrichment.md](../docs/adr-remove-e2-llm-enrichment.md).
+
 Nguồn chuẩn: [Workflow v1.1](../docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1.md). Thứ tự và phụ thuộc: [plan.md](plan.md). Các mục dưới đây là việc cần làm, chưa hàm ý trạng thái hiện tại của code.
 
 ## Phase 0 — Contracts & Foundations
@@ -19,7 +21,7 @@ Nguồn chuẩn: [Workflow v1.1](../docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1
 - [x] Kiểm tra bốn trường hợp cùng hash/cùng identity, cùng hash/khác nguồn, hash mới/cùng identity, hash mới/nguồn mới.
 - [x] Đảm bảo frontend retry dùng idempotency key, không tạo workflow trùng.
 - [x] Ghi stage/status/error cho worker; xác nhận status API và UI phản ánh tiến trình/lỗi/retry.
-- [x] Evidence: [test_phase_1_upload_and_versioning.py](../apps/api/tests/test_phase_1_upload_and_versioning.py) (34/34 passed).
+- [x] Evidence: [test_phase_1_upload_and_versioning.py](../apps/api/tests/test_phase_1_upload_and_versioning.py) *[historical — removed from repo]* (34/34 passed).
 
 ## Phase 2A — Canonical Extraction
 
@@ -28,7 +30,7 @@ Nguồn chuẩn: [Workflow v1.1](../docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1
 - [x] Kiểm tra normalization giữ bảng/code/punctuation/identifier và dấu vết boilerplate.
 - [x] Xác nhận LLM không được dùng để sửa text mặc định.
 - [x] Kiểm tra extraction output versioned/temp, retry và lỗi stage.
-- [x] Evidence: [test_phase_2a_canonical_extraction.py](../apps/api/tests/test_phase_2a_canonical_extraction.py) (8/8 passed).
+- [x] Evidence: [test_phase_2a_canonical_extraction.py](../apps/api/tests/test_phase_2a_canonical_extraction.py) *[historical — removed from repo]* (8/8 passed).
 
 ## Phase 2B — Dedup & Temporal
 
@@ -38,7 +40,7 @@ Nguồn chuẩn: [Workflow v1.1](../docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1
 - [x] Kiểm tra EQUIVALENT, SUPPORTS, CONTRADICTS, SUPERSEDES, RELATED và evidence mapping.
 - [x] Kiểm tra published/observed/ingested time, validity, supersedes lineage và truy vấn lịch sử.
 - [x] Xác nhận reprocess deterministic, retry an toàn và không mất lịch sử.
-- [x] Evidence: [test_phase_2b_dedup_and_temporal.py](../apps/api/tests/test_phase_2b_dedup_and_temporal.py) (5/5 passed).
+- [x] Evidence: [test_phase_2b_dedup_and_temporal.py](../apps/api/tests/test_phase_2b_dedup_and_temporal.py) *[historical — removed from repo]* (5/5 passed).
 
 ## Phase 2C — Search Index
 
@@ -49,7 +51,7 @@ Nguồn chuẩn: [Workflow v1.1](../docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1
 - [x] Upsert bằng stable point ID; kiểm tra reprocess không tạo point/vector trùng hoặc evidence cũ.
 - [x] Lưu/verify index manifest; chỉ bật search readiness sau index nhất quán.
 - [x] Xác nhận Qdrant có thể rebuild từ PostgreSQL/source artifacts.
-- [x] Evidence: [test_phase_2c_search_indexing.py](../apps/api/tests/test_phase_2c_search_indexing.py) (4/4 passed).
+- [x] Evidence: [test_phase_2c_search_indexing.py](../apps/api/tests/test_phase_2c_search_indexing.py) *[historical — removed from repo]* (4/4 passed).
 
 ## Phase 3 — Laya & Query Analyzer
 
@@ -74,13 +76,13 @@ Nguồn chuẩn: [Workflow v1.1](../docs/SAG_Knowledge_Routing_RAG_Workflow_v1.1
 - [x] Relevance gate semantic-only bất biến khi retriever score được scale dương; có regression test.
 - [x] Trước dense/lexical candidate generation, giao Project được ký với mapping CONFIRMED Project→Source; client Source IDs chỉ thu hẹp scope.
 Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL evidence-path inventory](../docs/security/acl-evidence-path-inventory.md).
-- [x] Collapse exact/near duplicate; kiểm tra MMR giữ evidence đa dạng (Đã kiểm chứng tại `retrieval_service.py:dedup_and_diversify_evidence_mmr`, 4 regression tests trong `test_retrieval_relevance.py:175-260` từ PR #13 / Checkpoint B2).
-- [x] Giới hạn candidate rerank và chỉ rerank khi còn latency budget (Đã kiểm chứng tại `search_unit_retrieval_service.py:_rerank_with_budget`, config `SAG_SEARCH_RERANK_MIN_REMAINING_SECONDS` và candidate cap trong `test_search_unit_retrieval_service.py`).
-- [x] Build context theo coverage/diversity và token budget (Đã kiểm chứng tại `search_context.py:build_evidence_context_pack`, token window calculation trong `test_retrieval_relevance.py` và Checkpoint A lane).
-- [x] Citation map được về source/version/block/page/anchor; kiểm tra no-answer khi evidence thiếu (Đã kiểm chứng tại `SearchCitationValidator` trong `citation_service.py`, fail-closed no-answer trong `test_search_unit_retrieval_service.py` và PR #13).
+- [x] Collapse exact/near duplicate; kiểm tra MMR giữ evidence đa dạng (Đã kiểm chứng tại `retrieval_service.py:dedup_and_diversify_evidence_mmr`, 4 regression tests trong `test_retrieval_relevance.py:175-260` từ PR #13 / Checkpoint B2). *[historical test file(s) — removed from repo]*
+- [x] Giới hạn candidate rerank và chỉ rerank khi còn latency budget (Đã kiểm chứng tại `search_unit_retrieval_service.py:_rerank_with_budget`, config `SAG_SEARCH_RERANK_MIN_REMAINING_SECONDS` và candidate cap trong `test_search_unit_retrieval_service.py`). *[historical test file(s) — removed from repo]*
+- [x] Build context theo coverage/diversity và token budget (Đã kiểm chứng tại `search_context.py:build_evidence_context_pack`, token window calculation trong `test_retrieval_relevance.py` và Checkpoint A lane). *[historical test file(s) — removed from repo]*
+- [x] Citation map được về source/version/block/page/anchor; kiểm tra no-answer khi evidence thiếu (Đã kiểm chứng tại `SearchCitationValidator` trong `citation_service.py`, fail-closed no-answer trong `test_search_unit_retrieval_service.py` và PR #13). *[historical test file(s) — removed from repo]*
 - [x] Xác nhận LLM Settings độc lập Laya và chỉ nhận evidence pack (Đã kiểm chứng tại `core/config.py`, pipeline prompt tách biệt Laya query analysis và chỉ nhận formatted SearchUnit evidence pack).
-- [x] Ghi stage latency, requested/effective strategy và fallback trong trace (Đã kiểm chứng tại `SearchTraceContext`, trường `stage_latencies_ms`, `query_route` trace và verified trong `test_search_strategy.py`, `test_search_stream.py`).
-- [x] Tạo/chạy retrieval regression corpus: bổ sung test suite `test_phase_4_fusion_retrieval.py` kiểm chứng scale invariance, Vietnamese domain queries, semantic paraphrase, exact identifiers và deterministic ordering; xem [phase-4-fusion-retrieval-evidence.md](../docs/tai_task/phase-4-fusion-retrieval-evidence.md).
+- [x] Ghi stage latency, requested/effective strategy và fallback trong trace (Đã kiểm chứng tại `SearchTraceContext`, trường `stage_latencies_ms`, `query_route` trace và verified trong `test_search_strategy.py`, `test_search_stream.py`). *[historical test file(s) — removed from repo]*
+- [x] Tạo/chạy retrieval regression corpus: bổ sung test suite `test_phase_4_fusion_retrieval.py` kiểm chứng scale invariance, Vietnamese domain queries, semantic paraphrase, exact identifiers và deterministic ordering; xem [phase-4-fusion-retrieval-evidence.md](../docs/tai_task/phase-4-fusion-retrieval-evidence.md). *[historical test file(s) — removed from repo]*
 
 ### P4 task proposal — Global retrieval, ACL và fusion
 
@@ -95,12 +97,12 @@ Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL ev
 - [x] Relevance gate xét tín hiệu lexical và semantic theo từng candidate; lexical hit của candidate khác không chặn dense evidence.
 - [x] Mô tả Search/Dify `score` là normalized RRF rank score; ghi rõ Dify `score_threshold` áp dụng trên thang này.
 - [x] Global `/search` và `/search/stream` bỏ event/graph retrieval trong P4; response giữ graph arrays rỗng. Source-scoped P3 path không đổi.
-- [x] Relevance/search strategy regressions: `test_retrieval_relevance.py`, `test_search_strategy.py`, `test_search_stream.py`, `test_phase_4_fusion_retrieval.py` pass (99/99 passed).
+- [x] Relevance/search strategy regressions: `test_retrieval_relevance.py`, `test_search_strategy.py`, `test_search_stream.py`, `test_phase_4_fusion_retrieval.py` pass (99/99 passed). *[historical test file(s) — removed from repo]*
 - [x] ACL seam regressions: implicit scope, requested∩authorized, unauthorized/empty request, dense/lexical cùng scope, empty authorization, missing scope fail-closed trên `/search` và `/search/stream`; test dùng fake scope.
 - [x] Không dùng Knowledge Graph/Tree trong global P4 retrieval; không sửa ingestion/index lane hoặc shared contract/config.
 - [ ] Propagate Source provenance qua các lượt assistant phụ thuộc history; kiểm tra revoke khi lượt sau tóm tắt evidence cũ nhưng không có citation/tool riêng. Bộ lọc hiện chỉ xác minh provenance được ghi trên từng message.
 
-**Implementation status (2026-10-12, DATN-67):** Toàn bộ 99/99 tests của tổ hợp Phase 4 Fusion & Retrieval đạt 100% passed (`test_phase_4_fusion_retrieval.py`, `test_retrieval_relevance.py`, `test_search_unit_retrieval_service.py`, `test_search_strategy.py`, `test_search_stream.py`). Đã kiểm chứng tính bất biến thang đo (scale invariance), consensus boost, fallback fingerprint khi thiếu chunk_id, tie-breaking xác định và các kịch bản tiếng Việt chuyên ngành. Xem chi tiết tại [phase-4-fusion-retrieval-evidence.md](../docs/tai_task/phase-4-fusion-retrieval-evidence.md).
+**Implementation status (2026-10-12, DATN-67):** Toàn bộ 99/99 tests của tổ hợp Phase 4 Fusion & Retrieval đạt 100% passed (`test_phase_4_fusion_retrieval.py`, `test_retrieval_relevance.py`, `test_search_unit_retrieval_service.py`, `test_search_strategy.py`, `test_search_stream.py`). Đã kiểm chứng tính bất biến thang đo (scale invariance), consensus boost, fallback fingerprint khi thiếu chunk_id, tie-breaking xác định và các kịch bản tiếng Việt chuyên ngành. Xem chi tiết tại [phase-4-fusion-retrieval-evidence.md](../docs/tai_task/phase-4-fusion-retrieval-evidence.md). *[historical test file(s) — removed from repo]*
 
 ### P4 evidence context / citation / no-answer — implementation status (2026-10-01)
 
@@ -125,7 +127,7 @@ Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL ev
 - [x] Search lane isolation: lỗi, trễ hoặc tắt knowledge enrichment/universe không chặn hoặc hạ cấp `SEARCH_READY`.
 - [x] Resilience & Zero Secret Leakage: parse/index/manifest failure, empty index fail-gracefully (`EMPTY_INDEX`), retry idempotent và sanitizer cho error/log/DB.
 - [x] Locator payload: `project_id`, `source_id`, `document_id`, `document_version_id`, `version_no`, `page_from`, `page_to`, `section_path`, `block_from_id`, `block_to_id`, `source_anchor`, `valid_from_ts`.
-- [x] Evidence: [test_checkpoint_a_ingestion.py](../apps/api/tests/test_checkpoint_a_ingestion.py), [checkpoint-a-ingestion-plan.md](../docs/tai_task/checkpoint-a-ingestion-plan.md) và [checkpoint-a-ingestion-evidence.md](../docs/tai_task/checkpoint-a-ingestion-evidence.md). Xem evidence report để biết từng case và kết quả; PR head hiện tại đã bổ sung regression cho các review finding.
+- [x] Evidence: [test_checkpoint_a_ingestion.py](../apps/api/tests/test_checkpoint_a_ingestion.py) *[historical — removed from repo]*, [checkpoint-a-ingestion-plan.md](../docs/tai_task/checkpoint-a-ingestion-plan.md) và [checkpoint-a-ingestion-evidence.md](../docs/tai_task/checkpoint-a-ingestion-evidence.md). Xem evidence report để biết từng case và kết quả; PR head hiện tại đã bổ sung regression cho các review finding.
 
 ### Retrieval / context / citation lane
 
@@ -163,7 +165,7 @@ Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL ev
 - [x] Rebuild từ PostgreSQL canonical/source artifacts; replay response E2 đã validate sau khi mất derived store, không gọi lại model hoặc tính thêm budget; operator retry qua CLI.
 - [x] Regression review: E2 chưa cấu hình/disabled backlog không chặn FOUNDATION; completion thắng lease recovery không bị claim/token charge lặp; old lease không ghi đè success/failure; rebuild sửa text/scope/ordinal bị hỏng từ canonical input.
 - [ ] Calibrate specialized E1 NER/RE và E2 provider thật trên corpus nghiệp vụ mở rộng khi có model/provider và gold labels được duyệt; hiện dùng E1 patterns và E2 validated fake-provider regressions.
-- [x] Evidence: [knowledge-foundation-evidence.md](../docs/tai_task/knowledge-foundation-evidence.md), [corpus results](../docs/tai_task/knowledge-corpus-results.json) và [test_knowledge_foundation.py](../apps/api/tests/test_knowledge_foundation.py).
+- [x] Evidence: [knowledge-foundation-evidence.md](../docs/tai_task/knowledge-foundation-evidence.md), [corpus results](../docs/tai_task/knowledge-corpus-results.json) và [test_knowledge_foundation.py](../apps/api/tests/test_knowledge_foundation.py) *[historical — removed from repo]*.
 
 ## Phase 6 — Knowledge Routing Tree
 
@@ -172,7 +174,7 @@ Operational ACL rollout/acceptance gates được theo dõi riêng trong [ACL ev
 - [x] Tạo node profile dense medoid, sparse terms, entities, temporal range và accessible-unit count; ID node ổn định theo tenant/project/partition/membership.
 - [x] Ghi manifest checksum theo input/config/edges/lineage, metrics cohesion, giant ratio, child-size entropy, edge cut, depth, routing recall và từng quality gate.
 - [x] Regression synthetic xác nhận deterministic rebuild, failed quality gate bị REJECTED và profile/edge không vượt security partition.
-- [x] Fixture contract sẵn sàng cho B2 planner/escape phát triển mock-first: [test_phase_6_routing_tree.py](../apps/api/tests/test_phase_6_routing_tree.py) và [phase-6-tree-evidence.md](../docs/phase-6-tree-evidence.md).
+- [x] Fixture contract sẵn sàng cho B2 planner/escape phát triển mock-first: [test_phase_6_routing_tree.py](../apps/api/tests/test_phase_6_routing_tree.py) *[historical — removed from repo]* và [phase-6-tree-evidence.md](../docs/phase-6-tree-evidence.md).
 - [x] Tích hợp producer Knowledge Unit/Graph Phase 5 với builder hiện có; persist versioned node/profile/manifest/lineage trong PostgreSQL dưới `knowledge-candidate.v1`, trạng thái INACTIVE hoặc REJECTED; verify input/config/edge/profile/lineage checksums.
 - [x] Benchmark từ 5 tài liệu repo thật và 13 query có gold source anchors: 402 units, 2.379 edges, recall@10 = 12/13 (92,3%) ≥ 80%; ghi quality thresholds, calibration và từng query. Hai tiến trình với PYTHONHASHSEED khác nhau tạo cùng candidate checksum.
 - [x] PostgreSQL/runtime regressions cho tenant/project/partition/source isolation, source revocation, checksum corruption và failed quality/ACL gates; candidate build không đổi active pointer.
@@ -212,7 +214,7 @@ Implementation slice B2 và các phụ thuộc Phase 5 là lịch sử riêng tr
 - [x] Rollback xác minh Qdrant slot rồi đổi active manifest/pointer/epoch cùng transaction PostgreSQL; retry cùng `target_tree_version` không toggle pointer hoặc tăng epoch.
 - [x] Giữ request snapshot/lease xuyên publish và rollback; slot có query đang dùng không bị ghi đè.
 
-**Implementation evidence (2026-10-05):** các mục trên có regression local bằng SQLite + `httpx.MockTransport`; focused suite `test_checkpoint_c_publish.py`, `test_checkpoint_c_failure_rollback.py`, `test_checkpoint_c_incremental.py`, `test_search_unit_retrieval_service.py` và `test_query_routing_service.py` đạt **64 passed**. Chi tiết từng failure, kết quả và giới hạn môi trường: [Checkpoint C failure/rollback evidence](../docs/Thang_Task/%5BSAG%5D%5BCheckpoint%20C%5D2/evidence.md). Rollback giữ version trước trong slot đối diện tới lần publish kế tiếp reserve slot đó; retry cùng target đã active giữ nguyên epoch; khi reserve slot cũ, PostgreSQL bỏ tham chiếu trước khi Qdrant bị sửa để partial write không thể được nhận nhầm là snapshot hợp lệ.
+**Implementation evidence (2026-10-05):** các mục trên có regression local bằng SQLite + `httpx.MockTransport`; focused suite `test_checkpoint_c_publish.py`, `test_checkpoint_c_failure_rollback.py`, `test_checkpoint_c_incremental.py`, `test_search_unit_retrieval_service.py` và `test_query_routing_service.py` đạt **64 passed**. Chi tiết từng failure, kết quả và giới hạn môi trường: [Checkpoint C failure/rollback evidence](../docs/Thang_Task/%5BSAG%5D%5BCheckpoint%20C%5D2/evidence.md). Rollback giữ version trước trong slot đối diện tới lần publish kế tiếp reserve slot đó; retry cùng target đã active giữ nguyên epoch; khi reserve slot cũ, PostgreSQL bỏ tham chiếu trước khi Qdrant bị sửa để partial write không thể được nhận nhầm là snapshot hợp lệ. *[historical test file(s) — removed from repo]*
 
 **Review follow-up (2026-10-06):** validate `source_routing_profiles` khi rehydrate manifest; rollback dọn lease hết hạn theo project bằng PostgreSQL time nhưng giữ lease còn hiệu lực; regression malformed-manifest và lease cleanup. Năm module focused đạt **66 passed**, Ruff, `compileall` và `git diff --check` đều đạt. Kiểm tra profile trong atomic switch vẫn chặn thay đổi xảy ra trong lúc xác minh Qdrant. Producer runtime DATN-58/59 vẫn mở.
 
@@ -244,7 +246,7 @@ Implementation slice B2 và các phụ thuộc Phase 5 là lịch sử riêng tr
 
 **Implementation evidence (2026-10-12):**
 
-- Focused command từ `SAG/apps/api`: `python -m pytest -q tests/test_knowledge_quality_service.py tests/test_knowledge_quality_persistence.py tests/test_knowledge_query_demand.py tests/test_search_unit_retrieval_service.py tests/test_query_routing_service.py tests/test_knowledge_foundation.py` → **77 passed, 2 skipped** sau review fixes.
+- Focused command từ `SAG/apps/api`: `python -m pytest -q tests/test_knowledge_quality_service.py tests/test_knowledge_quality_persistence.py tests/test_knowledge_query_demand.py tests/test_search_unit_retrieval_service.py tests/test_query_routing_service.py tests/test_knowledge_foundation.py` → **77 passed, 2 skipped** sau review fixes. *[historical test file(s) — removed from repo]*
 - Ruff trên các file Phase 9 đã đổi (`knowledge_quality_service.py`, `knowledge_quality_persistence.py`, `knowledge_quality_repository.py`, `knowledge_gap_question_service.py`, model/init, retrieval service và 3 test file) → **All checks passed**.
 - `ruff check sag_api/ sag_agent/ tests/` theo `SAG/CONTRIBUTING.md` → **162 lỗi lint** trên phạm vi repository, gồm nhiều file ngoài task; không dọn refactor/lint ngoài phạm vi.
 - Full API `python -m pytest -q` → **955 passed, 3 skipped, 23 failed** trong 450.57s. Lượt chạy bắt đầu trước thay đổi code Phase 9 cuối; code cuối đã được kiểm tra lại bằng focused suite bên trên. Failure nằm ở các test ngoài Phase 9: ask_stream, document_cleanup_coordinator, document_parsing, document_resume, dsh_integration, experience, hardening, octx_runtime, quick_model_setup và units. Cần phân loại riêng trước khi xem toàn API là green.
@@ -276,7 +278,7 @@ Implementation slice B2 và các phụ thuộc Phase 5 là lịch sử riêng tr
 - [x] Ingestion loop có giới hạn và dừng khi không có thông tin mới.
 
 **Implementation status (2026-10-12, Phase 10 & Checkpoint D):**
-- Đã hoàn tất toàn bộ 16/16 tests trong `test_research_planner.py` và `test_research_agent_checkpoint_d.py` (100% passed).
+- Đã hoàn tất toàn bộ 16/16 tests trong `test_research_planner.py` và `test_research_agent_checkpoint_d.py` (100% passed). *[historical test file(s) — removed from repo]*
 - Bổ sung manual redirect revalidation (tối đa 5 hops, recheck allowlist và SSRF tại mỗi hop), streaming response với `max_bytes_per_page`, cumulative task cap `max_total_bytes`, terminal task idempotency, failure classification, duplicate check scoped by security partition, và automatic bounded discovery từ gap/question.
 - Dữ liệu fetch chuyển tiếp thành công sang normal ingestion `handle_document_upload` và cập nhật cây tri thức `update_tree_incrementally`.
 - Chi tiết xem tại [researchtask.md](../docs/Thang_Task/[SAG][Phase%2010]/researchtask.md) và [evidence.md](../docs/Thang_Task/[SAG][Phase%2010]/evidence.md).

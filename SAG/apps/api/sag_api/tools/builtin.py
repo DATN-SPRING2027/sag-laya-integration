@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
+from sag_agent import ToolCapability
 from sag_api.connectors.web import extract_web_markdown, extract_web_title
 from sag_api.core.config import settings
 from sag_api.core.logging import get_logger
@@ -25,6 +26,7 @@ from sag_api.services.evidence_service import (
     build_tool_evidence_pack,
     has_traceable_locator,
 )
+from sag_api.services.temporal_metadata_format import format_evidence_metadata_suffix
 from sag_api.tools.base import Tool, ToolContext, ToolMeta, ToolResult
 
 log = get_logger("tools.web_search")
@@ -39,30 +41,6 @@ _WEB_PAGE_TEXT_LIMIT = 12_000
 _WEB_PAGE_MAX_REDIRECTS = 3
 _WEB_PAGE_CONTENT_TYPES = ("text/html", "text/plain", "application/xhtml+xml")
 _WEB_PAGE_PORTS = frozenset({80, 443, 8080, 8443})
-_RECENT_QUERY_MARKERS = (
-    "hôm nay",
-    "ngày mai",
-    "tuần này",
-    "tháng này",
-    "gần đây",
-    "mới nhất",
-    "thời gian thực",
-    "hiện tại",
-    "thời tiết",
-    "tin tức",
-    "giá",
-    "tỷ giá",
-    "lịch thi đấu",
-    "tỷ số",
-    "today",
-    "tomorrow",
-    "latest",
-    "current",
-    "live",
-    "weather",
-    "news",
-    "price",
-)
 
 
 def _events_by_section(events: list | None) -> dict[tuple[str, str], list]:
@@ -87,6 +65,8 @@ def _format_sections(
     event_refs = _events_by_section(events)
     blocks = []
     for i, s in enumerate(sections, start=1 + offset):
+        suffix = format_evidence_metadata_suffix(s)
+        suffix_str = f" {suffix}" if suffix else ""
         locator = (
             f"Locator: file={getattr(s, 'document_name', '')}; "
             f"document={getattr(s, 'document_id', '')}; "
@@ -106,7 +86,7 @@ def _format_sections(
             event = related_events[0]
             title = " ".join(str(getattr(event, "title", "") or "").split())
             summary = " ".join(str(getattr(event, "summary", "") or "").split())
-            lines = [f"[{i}] Sự kiện: {title or 'Sự kiện chưa có tên'}", locator]
+            lines = [f"[{i}] Sự kiện: {title or 'Sự kiện chưa có tên'}{suffix_str}", locator]
             if summary:
                 lines.append(f"Tóm tắt: {summary}")
             content = getattr(s, "content", "")
@@ -124,7 +104,7 @@ def _format_sections(
         body_text = str(getattr(s, "content", "") or "")
         if catalog_inventory and len(body_text) > 420:
             body_text = body_text[:420].rstrip() + "…"
-        blocks.append(f"[{i}] {heading}\n{locator}\n{catalog_line}{body_text}")
+        blocks.append(f"[{i}] {heading}{suffix_str}\n{locator}\n{catalog_line}{body_text}")
     return "\n\n".join(blocks)
 
 
@@ -152,10 +132,12 @@ class SearchContextTool(Tool):
             },
             "required": ["query"],
         },
+        capabilities=frozenset({ToolCapability.KNOWLEDGE_SEARCH, ToolCapability.RESEARCH}),
     )
 
     async def invoke(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         import unicodedata
+        from dataclasses import replace
 
         query = unicodedata.normalize("NFC", (args.get("query") or "")).strip()
         if not query or not ctx.sources:
@@ -168,15 +150,12 @@ class SearchContextTool(Tool):
         from sag_api.services.retrieval_plan import (
             OutputMode,
             TargetUnit,
-            is_unfiltered_scope_catalog_query,
+            rebuild_retrieval_plan_with_top_k,
         )
         from sag_api.services.search_unit_retrieval_service import retrieve_search_unit_sections
 
-        auto_plan = plan_query(query)
-        unfiltered_catalog = is_unfiltered_scope_catalog_query(
-            query,
-            [str(getattr(s, "name", "") or "") for s in ctx.sources],
-        )
+        auto_plan = plan_query(query, route_decision=ctx.route_decision)
+        unfiltered_catalog = auto_plan.retrieval_plan.is_unfiltered_catalog
         if auto_plan.retrieval_plan.target == TargetUnit.DOCUMENT and auto_plan.retrieval_plan.output in {
             OutputMode.LIST,
             OutputMode.COUNT,
@@ -184,13 +163,22 @@ class SearchContextTool(Tool):
             min_catalog_k = 50 if unfiltered_catalog else auto_plan.retrieval_plan.cardinality.effective_n
             limit = max(limit or 0, min_catalog_k)
 
+        effective_plan = (
+            replace(
+                auto_plan,
+                retrieval_plan=rebuild_retrieval_plan_with_top_k(auto_plan.retrieval_plan, limit),
+            )
+            if limit is not None
+            else auto_plan
+        )
+
         outcome = await retrieve_search_unit_sections(
             ctx.engine_manager,
             ctx.sources,
             query,
             principal=ctx.principal,
             top_k=limit,
-            query_strategy_plan=plan_query(query, requested_top_k=limit),
+            query_strategy_plan=effective_plan,
         )
         routing_trace = outcome.stats.get("routing")
         sections = [
@@ -259,7 +247,11 @@ class SearchContextTool(Tool):
         rendered_content = packed.content
         if unfiltered_catalog:
             unique_ids = {s.document_id for s in sections if s.document_id}
-            ready_total = int(outcome.stats.get("ready_versions") or len(unique_ids))
+            ready_total = int(
+                outcome.stats.get("ready_documents")
+                or outcome.stats.get("ready_versions")
+                or len(unique_ids)
+            )
             unique_packed_docs = len({s.document_id or s.document_name for s in sections})
             manifest_lines: list[str] = []
             seen_docs: set[str] = set()
@@ -280,12 +272,38 @@ class SearchContextTool(Tool):
                 f"{rendered_content}"
             )
         else:
+            has_conflict_or_authority_signal = (
+                any(
+                    str(getattr(s, "conflict_status", "") or "").strip().upper()
+                    in {"ACTIVE_CONFLICT", "SUPERSEDED_BY_UNIT"}
+                    or bool(getattr(s, "is_superseded", False))
+                    for s in sections
+                )
+                or len(
+                    {
+                        s.authority_tier
+                        for s in sections
+                        if isinstance(getattr(s, "authority_tier", None), int)
+                        and not isinstance(getattr(s, "authority_tier", None), bool)
+                    }
+                )
+                >= 2
+            )
+            conflict_guardrail = (
+                " Lưu ý thẩm quyền & xung đột: ưu tiên nguồn bậc cao hơn "
+                "(Chính thức > Quy chuẩn > Hướng dẫn > Nháp) và ngày Hiệu lực mới hơn; "
+                "không nêu (Bản cũ) là quy định đang áp dụng trừ khi hỏi về lịch sử thay đổi; "
+                "nếu còn (Xung đột) ngang bậc chưa phân giải, phải nêu rõ cả hai nguồn kèm ngày và nhãn [n]."
+                if has_conflict_or_authority_signal
+                else ""
+            )
             rendered_content = (
                 "(Bằng chứng tra cứu hợp lệ bên dưới: khi trả lời dựa trên các đoạn này, BẮT BUỘC gắn nhãn trích dẫn "
                 "[n] trong ngoặc vuông ngay sau mỗi mệnh đề, con số hoặc dòng bảng được đoạn đó hỗ trợ trực tiếp — "
                 "kể cả khi người dùng không yêu cầu trích dẫn, vì câu trả lời thiếu [n] sẽ bị cổng kiểm chứng từ chối. "
                 "Ngược lại, nếu các đoạn bên dưới KHÔNG chứa thông tin được hỏi hoặc thiếu tệp người dùng nêu đích danh, "
-                "hãy từ chối ngắn gọn và TUYỆT ĐỐI KHÔNG gắn bất kỳ nhãn [n] nào vào câu từ chối.)\n\n"
+                "hãy từ chối ngắn gọn và TUYỆT ĐỐI KHÔNG gắn bất kỳ nhãn [n] nào vào câu từ chối."
+                f"{conflict_guardrail})\n\n"
                 f"{rendered_content}"
             )
         return ToolResult(
@@ -318,27 +336,122 @@ class GetEntityTool(Tool):
             "properties": {"name": {"type": "string", "description": "Tên thực thể"}},
             "required": ["name"],
         },
+        capabilities=frozenset({ToolCapability.ENTITY_LOOKUP, ToolCapability.RESEARCH}),
     )
 
     async def invoke(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        name = (args.get("name") or "").strip()
+        import unicodedata
+
+        from sqlalchemy.exc import SQLAlchemyError
+
+        import sag_api.core.db as core_db
+        from sag_api.services.query_strategy_planner import plan_query
+        from sag_api.services.search_unit_retrieval_service import retrieve_search_unit_sections
+        from sag_api.services.source_service import versioned_source_ids
+
+        name = unicodedata.normalize("NFC", (args.get("name") or "")).strip()
         if not name or not ctx.sources:
             return ToolResult(content="(Không tìm thấy thực thể này.)")
+
+        try:
+            async with core_db.SessionLocal() as session:
+                partitioned_ids = await versioned_source_ids(
+                    session, [s.id for s in ctx.sources]
+                )
+        except SQLAlchemyError as error:
+            log.warning(
+                "get_entity failed closed on versioned_source_ids lookup (%s)",
+                type(error).__name__,
+            )
+            return ToolResult(content="(Không tìm thấy thực thể này.)")
+
+        canonical_sources = [s for s in ctx.sources if s.id in partitioned_ids]
+        legacy_sources = [s for s in ctx.sources if s.id not in partitioned_ids]
+
+        content_parts: list[str] = []
+        citations: list[dict[str, Any]] = []
+        data_payload: dict[str, Any] = {}
+
+        if canonical_sources and ctx.principal is not None:
+            outcome = await retrieve_search_unit_sections(
+                ctx.engine_manager,
+                canonical_sources,
+                name,
+                principal=ctx.principal,
+                top_k=6,
+                query_strategy_plan=plan_query(
+                    name,
+                    requested_top_k=6,
+                    route_decision=ctx.route_decision,
+                ),
+            )
+            sections = [
+                section
+                for section in outcome.sections
+                if section.canonical_evidence_verified and has_traceable_locator(section)
+            ]
+            if sections:
+                offset = max(0, ctx.citation_offset)
+                packed = build_tool_evidence_pack(
+                    sections,
+                    query=name,
+                    render=lambda candidate_sections: _format_sections(
+                        candidate_sections, offset
+                    ),
+                    context_budget_tokens=ctx.evidence_token_budget,
+                )
+                if packed.status == "sufficient" and packed.sections:
+                    source_refs = {
+                        s.sag_source_config_id: {"id": s.id, "name": s.name}
+                        for s in canonical_sources
+                    }
+                    citations = build_citations(packed.sections, source_refs)
+                    for citation in citations:
+                        citation["n"] = citation["n"] + offset
+                    content_parts.append(packed.content)
+                    data_payload.update(
+                        {
+                            "sections": packed.sections,
+                            "section_count": len(packed.sections),
+                            "entity_query": name,
+                            "source_ids": [s.id for s in canonical_sources],
+                            "_graph": SourceGraphInfo(),
+                        }
+                    )
+
         lowered = name.lower()
-        for source in ctx.sources:
+        for source in legacy_sources:
             scid = source.sag_source_config_id
             entities = await ctx.engine_manager.list_entities(scid, source=source, limit=200)
             match = next((e for e in entities if (e.name or "").lower() == lowered), None)
             if match is None:
                 match = next((e for e in entities if lowered in (e.name or "").lower()), None)
             if match is not None:
-                snippets = await ctx.engine_manager.entity_context(scid, match.id, source=source, limit=6)
-                body = "\n\n".join(snippets) if snippets else match.description or ""
-                return ToolResult(
-                    content=f"Thực thể “{match.name}” ({match.type}):\n{body}".strip(),
-                    data={"entity_id": match.id, "source_id": source.id},
+                snippets = await ctx.engine_manager.entity_context(
+                    scid, match.id, source=source, limit=6
                 )
-        return ToolResult(content="(Không tìm thấy thực thể này.)")
+                body = "\n\n".join(snippets) if snippets else match.description or ""
+                source_label = getattr(source, "name", None) or source.id
+                content_parts.append(
+                    f"Nguồn: {source_label}\nThực thể “{match.name}” ({match.type}):\n{body}".strip()
+                )
+                if "entity_id" not in data_payload:
+                    data_payload.update(
+                        {
+                            "entity_id": match.id,
+                            "source_id": source.id,
+                            "source_name": source_label,
+                        }
+                    )
+                break
+
+        if not content_parts:
+            return ToolResult(content="(Không tìm thấy thực thể này.)")
+        return ToolResult(
+            content="\n\n".join(content_parts),
+            citations=citations,
+            data=data_payload,
+        )
 
 
 class GetTimeTool(Tool):
@@ -361,6 +474,7 @@ class GetTimeTool(Tool):
             },
             "additionalProperties": False,
         },
+        capabilities=frozenset({ToolCapability.TIME_LOOKUP}),
     )
 
     async def invoke(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
@@ -580,6 +694,7 @@ class WebSearchTool(Tool):
             "required": ["query"],
             "additionalProperties": False,
         },
+        capabilities=frozenset({ToolCapability.WEB_SEARCH, ToolCapability.RESEARCH}),
     )
 
     @staticmethod
@@ -587,7 +702,6 @@ class WebSearchTool(Tool):
         return bool(_web_search_endpoint() and settings.llm_api_key)
 
     async def invoke(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        del ctx
         query = str(args.get("query") or "").strip()
         if not query:
             return ToolResult(content="(Thiếu nội dung truy vấn để tìm kiếm Internet.)", data={"section_count": 0})
@@ -612,8 +726,15 @@ class WebSearchTool(Tool):
         requested_time_range = str(args.get("time_range") or "").strip().lower()
         if requested_time_range in {"day", "week", "month", "year"}:
             request_payload["time_range"] = requested_time_range
-        elif any(marker in query.casefold() for marker in _RECENT_QUERY_MARKERS):
-            request_payload["time_range"] = "week"
+        else:
+            route_decision = ctx.route_decision if isinstance(ctx.route_decision, dict) else {}
+            route_flags = route_decision.get("intent_flags")
+            route_temporal = str(route_decision.get("temporal_mode") or "").strip().lower()
+            if (
+                (isinstance(route_flags, dict) and route_flags.get("needs_time"))
+                or route_temporal == "current_effective"
+            ):
+                request_payload["time_range"] = "week"
         category = str(args.get("category") or "").strip().lower()
         if category in {"general", "news"}:
             request_payload["category"] = category
@@ -687,6 +808,7 @@ class OpenWebPageTool(Tool):
             "required": ["url"],
             "additionalProperties": False,
         },
+        capabilities=frozenset({ToolCapability.WEB_FETCH, ToolCapability.RESEARCH}),
     )
 
     async def invoke(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:

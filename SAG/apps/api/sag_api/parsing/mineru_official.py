@@ -1,18 +1,13 @@
 """MinerU Official API v4 (`https://mineru.net/api/v4`) exclusive adapter.
 
-Supports two execution modes against Official MinerU v4:
-1. Zero-Upload Direct URL Task (`POST /api/v4/extract/task` + `GET /api/v4/extract/task/{task_id}`)
-   when an HTTPS Presigned R2 GET URL (`remote_source_url`) is available, never persisting
-   the secret URL into `state` / `job.payload`, and automatically falling back to batch
-   presigned upload if MinerU cannot pull the URL directly.
-2. Batch Presigned Streaming Upload (`POST /api/v4/file-urls/batch` + 256 KB streaming `PUT`
-   + `GET /api/v4/extract-results/batch/{batch_id}`) for local files up to 200 MB.
+Executes Batch Presigned Streaming Upload (`POST /api/v4/file-urls/batch` +
+256 KB streaming `PUT` + `GET /api/v4/extract-results/batch/{batch_id}`) for
+local files up to 200 MB.
 """
 
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 import time
 from collections.abc import AsyncIterator
@@ -23,7 +18,6 @@ import httpx
 
 from sag_api.core.config import Settings
 from sag_api.core.errors import (
-    ApiError,
     ConfigurationError,
     ServiceUnavailableError,
     UpstreamError,
@@ -37,8 +31,6 @@ from sag_api.parsing.mineru import (
     check_mineru_response,
     download_mineru_result_markdown,
 )
-
-log = logging.getLogger(__name__)
 
 _QUEUE_STATES = {"waiting-file", "pending", "queued"}
 _RUNNING_STATES = {"running", "processing", "converting"}
@@ -82,7 +74,6 @@ class OfficialMinerUClient:
         state: dict[str, Any] | None = None,
         on_state: StateCallback | None = None,
         should_pause: PauseCallback | None = None,
-        remote_source_url: str | None = None,
     ) -> str:
         filename = os.path.basename(path)
         current = dict(state or {})
@@ -93,58 +84,7 @@ class OfficialMinerUClient:
         current["mineru_service"] = "official"
         current["mineru_model"] = self._official_model
 
-        existing_task_id = current.get("task_id")
-        existing_batch_id = current.get("batch_id")
-        has_task_id = isinstance(existing_task_id, str) and bool(existing_task_id.strip())
-        has_batch_id = isinstance(existing_batch_id, str) and bool(existing_batch_id.strip())
-
-        # Mode 1: Zero-upload direct URL task via POST /api/v4/extract/task
-        if has_task_id or (
-            not has_batch_id
-            and isinstance(remote_source_url, str)
-            and remote_source_url.startswith("https://")
-        ):
-            try:
-                if not has_task_id:
-                    assert isinstance(remote_source_url, str)
-                    task_id = await self._create_url_task(remote_source_url)
-                    current.update(
-                        {
-                            "task_id": task_id,
-                            "filename": filename,
-                            "upload_source": "remote_presigned",
-                            "status": "queued",
-                        }
-                    )
-                    if on_state:
-                        await on_state(dict(current))
-                else:
-                    task_id = str(existing_task_id).strip()
-
-                result_url = await self._poll_task(
-                    task_id,
-                    state=current,
-                    on_state=on_state,
-                    should_pause=should_pause,
-                )
-                markdown = await self._download_markdown(result_url)
-                if on_state:
-                    await on_state({**current, "status": "done"})
-                return markdown
-            except (ConfigurationError, ParsePaused):
-                raise
-            except ApiError as remote_exc:
-                if not os.path.isfile(path):
-                    raise
-                log.info(
-                    "MinerU Official direct URL task fell back to batch presigned upload (%s): %s",
-                    type(remote_exc).__name__,
-                    remote_exc,
-                )
-                current.pop("task_id", None)
-                current.pop("upload_source", None)
-
-        # Mode 2: Batch presigned PUT streaming upload via POST /api/v4/file-urls/batch
+        # Batch presigned PUT streaming upload via POST /api/v4/file-urls/batch
         batch_id = current.get("batch_id")
         upload_url = current.get("upload_url")
         upload_completed = current.get("upload_completed") is True
@@ -186,61 +126,6 @@ class OfficialMinerUClient:
         if on_state:
             await on_state({**current, "status": "done"})
         return markdown
-
-    async def _create_url_task(self, remote_url: str) -> str:
-        payload: dict[str, Any] = {
-            "url": remote_url,
-            "model_version": self._official_model,
-        }
-        if self._parse_method == "txt":
-            payload["is_ocr"] = False
-        elif self._parse_method == "ocr":
-            payload["is_ocr"] = True
-
-        response = await self._official_request("POST", "extract/task", json=payload)
-        data = _official_data(response, "创建 URL 解析任务")
-        task_id = data.get("task_id")
-        if not isinstance(task_id, str) or not task_id.strip():
-            raise UpstreamError("MinerU 官方 URL 解析响应中没有 task_id")
-        return task_id.strip()
-
-    async def _poll_task(
-        self,
-        task_id: str,
-        *,
-        state: dict[str, Any] | None = None,
-        on_state: StateCallback | None = None,
-        should_pause: PauseCallback | None = None,
-    ) -> str:
-        deadline = time.monotonic() + self._poll_timeout
-        base_state = dict(state or {})
-        last_status: str | None = None
-        while True:
-            if should_pause is not None and await should_pause():
-                raise ParsePaused()
-            response = await self._official_request("GET", f"extract/task/{task_id}")
-            data = _official_data(response, "查询解析任务")
-            task_state = str(data.get("state") or "").lower()
-            if task_state == "done":
-                result_url = data.get("full_zip_url")
-                if not isinstance(result_url, str) or not result_url:
-                    raise UpstreamError("MinerU 官方任务已完成，但响应中没有 full_zip_url")
-                return result_url
-            if task_state == "failed":
-                message = str(data.get("err_msg") or "未知错误")
-                raise UpstreamError(f"MinerU 官方解析失败：{message}")
-            if task_state not in _PENDING_STATES:
-                raise UpstreamError(f"MinerU 官方返回未知任务状态：{task_state or '空'}")
-            mapped_status = _official_pending_status(task_state)
-            if mapped_status != last_status:
-                last_status = mapped_status
-                if on_state is not None:
-                    await on_state({**base_state, "status": mapped_status})
-            if time.monotonic() >= deadline:
-                raise ServiceUnavailableError(
-                    f"MinerU 官方解析等待超时（任务 {task_id}），后台将继续重试"
-                )
-            await asyncio.sleep(self._poll_interval)
 
     async def _request_upload(self, filename: str) -> tuple[str, str]:
         file_config: dict[str, Any] = {"name": filename}

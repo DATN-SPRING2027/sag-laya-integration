@@ -5,7 +5,6 @@ SAG-ECCE Session Context Engine (`off` | `shadow` | `on`).
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 from collections.abc import Collection
 from datetime import timedelta
@@ -22,7 +21,7 @@ from sag_api.core.principal_assertion import VerifiedPrincipal
 from sag_api.db.models.agent import Message
 from sag_api.db.models.session_context import SessionUnit
 from sag_api.enums import MessageRole, MessageStatus
-from sag_api.services.decision_router import route_query
+from sag_api.services.decision_router import route_query_async
 from sag_api.services.session_context import persistence as _persistence_mod
 from sag_api.services.session_context.models import AblationMode, ContextAuditTrace, SessionContextPack
 from sag_api.services.session_context.optimizer import build_ecce_context_pack
@@ -209,12 +208,15 @@ def _extract_visible_records(scoped_messages: list[Message]) -> tuple[list[dict[
     for msg in scoped_messages:
         msg_id = str(getattr(msg, "id", "") or "")
         content = str(getattr(msg, "content", "") or "")
+        role_val = msg.role.value if hasattr(msg.role, "value") else str(msg.role)
         if content == HIDDEN_SCOPE_PLACEHOLDER:
             had_hidden = True
+            if role_val == "assistant":
+                while records and records[-1]["role"] == "user":
+                    records.pop()
             continue
         if not msg_id or not content:
             continue
-        role_val = msg.role.value if hasattr(msg.role, "value") else str(msg.role)
         cited_ids: set[str] = {
             str(c["source_id"])
             for c in (getattr(msg, "citations", None) or [])
@@ -404,6 +406,8 @@ async def prepare_session_context_for_ask(
     ablation: AblationMode = "V5_ecce_full",
     embedder: Any | None = None,
     qdrant_client: httpx.AsyncClient | None = None,
+    llm: Any | None = None,
+    web_enabled: bool = False,
 ) -> SessionContextPack:
     """Build ACL-enforced, SiliconFlow-routed, durably-synced ECCE context pack."""
     from sag_api.services.agent_domain import filter_messages_for_scope
@@ -508,122 +512,127 @@ async def prepare_session_context_for_ask(
                     requested_source_ids=None,
                 )
                 delta_records, delta_hidden = _extract_visible_records(delta_scoped)
-
-                prev_turn_count = len(index.turns)
-                prev_win_count = len(index.windows)
-                prev_ep_count = len(index.episodes)
-                prev_ep_last_len = len(index.episodes[-1].turn_ids) if index.episodes else 0
-                prev_dec_count = len(index.decision_ledger)
-                prev_turn_state = {
-                    t.turn_id: (t.epistemic_status, t.superseded_by_turn_id) for t in index.turns
-                }
-
-                # Stage next cursor values locally; commit onto `index` ONLY AFTER DB write succeeds!
-                next_last_dt = delta_raw[-1].created_at
-                if (
-                    index.last_db_created_at is not None
-                    and next_last_dt is not None
-                    and abs((next_last_dt - index.last_db_created_at).total_seconds()) <= 1.0
-                ):
-                    next_boundary_ts_ids = set(index.boundary_ts_ids) | {
-                        str(m.id) for m in delta_raw
-                    }
-                else:
-                    next_boundary_ts_ids = {
-                        str(m.id)
-                        for m in delta_raw
-                        if next_last_dt is not None
-                        and m.created_at is not None
-                        and abs((next_last_dt - m.created_at).total_seconds()) <= 1.0
-                    }
-                next_last_id = str(delta_raw[-1].id)
-                next_seen_raw_ids = set(index.seen_raw_ids) | {str(m.id) for m in delta_raw}
-
-                added = await index.append_messages(delta_records, embedder=active_embedder)
-                if added > 0 and index.embedding_mode != target_emb_sig:
-                    # HTTP embedder degraded to deterministic fallback -> never poison DB/Qdrant
-                    persistence_stats = PersistenceSyncStats(status="degraded_unpersisted")
-                    evict_after_pack = True
-                elif added > 0:
-                    scope = await _resolve_scope_safe(
-                        session,
+                if delta_hidden:
+                    SESSION_INDEX_CACHE.invalidate_thread(thread_id)
+                    index = SESSION_INDEX_CACHE.get_or_create(
+                        scope_key=scope_key,
                         thread_id=thread_id,
-                        principal=principal,
-                        owner_key=owner_key,
-                        requested_source_ids=requested_source_ids,
-                        qdrant_client=qdrant_client,
-                        caller_had_pending_state=caller_had_pending_state,
+                        scope_signature=scope_sig,
                     )
-                    if scope is not None:
-                        if not index.persistence_active:
-                            persistence_stats = await _invoke_sync_storage(
-                                session,
-                                index=index,
-                                scope=scope,
-                                embedding_sig=target_emb_sig,
-                                mode="rebuild",
-                                embedder=active_embedder,
-                                qdrant_client=qdrant_client,
-                                caller_had_pending_state=caller_had_pending_state,
-                            )
-                            persistence_stats.status = "lazy_backfill"
-                        else:
-                            mutated_prior_turns = {
-                                tid
-                                for tid, old_st in prev_turn_state.items()
-                                if (
-                                    index.turns_by_id[tid].epistemic_status,
-                                    index.turns_by_id[tid].superseded_by_turn_id,
-                                )
-                                != old_st
-                            }
-                            grown_ep_ord = (
-                                prev_ep_count - 1
-                                if prev_ep_count > index.inherited_episode_count
-                                and len(index.episodes[prev_ep_count - 1].turn_ids) > prev_ep_last_len
-                                else None
-                            )
-                            persistence_stats = await _invoke_sync_storage(
-                                session,
-                                index=index,
-                                scope=scope,
-                                embedding_sig=target_emb_sig,
-                                mode="delta",
-                                start_turn_ordinal=prev_turn_count,
-                                start_window_ordinal=prev_win_count,
-                                start_episode_ordinal=prev_ep_count,
-                                start_decision_idx=prev_dec_count,
-                                mutated_prior_turn_ids=mutated_prior_turns,
-                                grown_episode_ordinal=grown_ep_ord,
-                                embedder=active_embedder,
-                                qdrant_client=qdrant_client,
-                                caller_had_pending_state=caller_had_pending_state,
-                            )
-                            persistence_stats.status = "delta_synced"
-                        index.persistence_active = True
+                    can_use_delta = False
+
+                if can_use_delta:
+                    prev_turn_count = len(index.turns)
+                    prev_win_count = len(index.windows)
+                    prev_ep_count = len(index.episodes)
+                    prev_ep_last_len = len(index.episodes[-1].turn_ids) if index.episodes else 0
+                    prev_dec_count = len(index.decision_ledger)
+                    prev_turn_state = {
+                        t.turn_id: (t.epistemic_status, t.superseded_by_turn_id) for t in index.turns
+                    }
+
+                    # Stage next cursor values locally; commit onto `index` ONLY AFTER DB write succeeds!
+                    next_last_dt = delta_raw[-1].created_at
+                    if (
+                        index.last_db_created_at is not None
+                        and next_last_dt is not None
+                        and abs((next_last_dt - index.last_db_created_at).total_seconds()) <= 1.0
+                    ):
+                        next_boundary_ts_ids = set(index.boundary_ts_ids) | {
+                            str(m.id) for m in delta_raw
+                        }
                     else:
-                        index.persistence_active = False
-                        persistence_stats = PersistenceSyncStats(status="memory_only")
+                        next_boundary_ts_ids = {
+                            str(m.id)
+                            for m in delta_raw
+                            if next_last_dt is not None
+                            and m.created_at is not None
+                            and abs((next_last_dt - m.created_at).total_seconds()) <= 1.0
+                        }
+                    next_last_id = str(delta_raw[-1].id)
+                    next_seen_raw_ids = set(index.seen_raw_ids) | {str(m.id) for m in delta_raw}
 
-                    index.persisted_embedding_signature = target_emb_sig
-                    if delta_hidden:
-                        index.had_hidden_acl_turns = True
-                    index.boundary_ts_ids = next_boundary_ts_ids
-                    index.last_db_created_at = next_last_dt
-                    index.last_db_id = next_last_id
-                    index.seen_raw_ids = next_seen_raw_ids
-                    index.seen_db_count = len(next_seen_raw_ids)
-                else:
-                    if delta_hidden:
-                        index.had_hidden_acl_turns = True
-                    index.boundary_ts_ids = next_boundary_ts_ids
-                    index.last_db_created_at = next_last_dt
-                    index.last_db_id = next_last_id
-                    index.seen_raw_ids = next_seen_raw_ids
-                    index.seen_db_count = len(next_seen_raw_ids)
-                    persistence_stats = PersistenceSyncStats(status="warm_clean")
+                    added = await index.append_messages(delta_records, embedder=active_embedder, llm=llm)
+                    if added > 0 and index.embedding_mode != target_emb_sig:
+                        # HTTP embedder degraded to deterministic fallback -> never poison DB/Qdrant
+                        persistence_stats = PersistenceSyncStats(status="degraded_unpersisted")
+                        evict_after_pack = True
+                    elif added > 0:
+                        scope = await _resolve_scope_safe(
+                            session,
+                            thread_id=thread_id,
+                            principal=principal,
+                            owner_key=owner_key,
+                            requested_source_ids=requested_source_ids,
+                            qdrant_client=qdrant_client,
+                            caller_had_pending_state=caller_had_pending_state,
+                        )
+                        if scope is not None:
+                            if not index.persistence_active:
+                                persistence_stats = await _invoke_sync_storage(
+                                    session,
+                                    index=index,
+                                    scope=scope,
+                                    embedding_sig=target_emb_sig,
+                                    mode="rebuild",
+                                    embedder=active_embedder,
+                                    qdrant_client=qdrant_client,
+                                    caller_had_pending_state=caller_had_pending_state,
+                                )
+                                persistence_stats.status = "lazy_backfill"
+                            else:
+                                mutated_prior_turns = {
+                                    tid
+                                    for tid, old_st in prev_turn_state.items()
+                                    if (
+                                        index.turns_by_id[tid].epistemic_status,
+                                        index.turns_by_id[tid].superseded_by_turn_id,
+                                    )
+                                    != old_st
+                                }
+                                grown_ep_ord = (
+                                    prev_ep_count - 1
+                                    if prev_ep_count > index.inherited_episode_count
+                                    and len(index.episodes[prev_ep_count - 1].turn_ids) > prev_ep_last_len
+                                    else None
+                                )
+                                persistence_stats = await _invoke_sync_storage(
+                                    session,
+                                    index=index,
+                                    scope=scope,
+                                    embedding_sig=target_emb_sig,
+                                    mode="delta",
+                                    start_turn_ordinal=prev_turn_count,
+                                    start_window_ordinal=prev_win_count,
+                                    start_episode_ordinal=prev_ep_count,
+                                    start_decision_idx=prev_dec_count,
+                                    mutated_prior_turn_ids=mutated_prior_turns,
+                                    grown_episode_ordinal=grown_ep_ord,
+                                    embedder=active_embedder,
+                                    qdrant_client=qdrant_client,
+                                    caller_had_pending_state=caller_had_pending_state,
+                                )
+                                persistence_stats.status = "delta_synced"
+                            index.persistence_active = True
+                        else:
+                            index.persistence_active = False
+                            persistence_stats = PersistenceSyncStats(status="memory_only")
 
-            if not delta_raw or persistence_stats.status == "warm_clean":
+                        index.persisted_embedding_signature = target_emb_sig
+                        index.boundary_ts_ids = next_boundary_ts_ids
+                        index.last_db_created_at = next_last_dt
+                        index.last_db_id = next_last_id
+                        index.seen_raw_ids = next_seen_raw_ids
+                        index.seen_db_count = len(next_seen_raw_ids)
+                    else:
+                        index.boundary_ts_ids = next_boundary_ts_ids
+                        index.last_db_created_at = next_last_dt
+                        index.last_db_id = next_last_id
+                        index.seen_raw_ids = next_seen_raw_ids
+                        index.seen_db_count = len(next_seen_raw_ids)
+                        persistence_stats = PersistenceSyncStats(status="warm_clean")
+
+            if can_use_delta and (not delta_raw or persistence_stats.status == "warm_clean"):
                 needs_qdrant_retry = index.qdrant_sync_pending or (
                     index.persistence_active
                     and persisted_state is not None
@@ -663,7 +672,7 @@ async def prepare_session_context_for_ask(
         except BaseException:
             SESSION_INDEX_CACHE.invalidate_thread(thread_id)
             raise
-    else:
+    if not can_use_delta:
         if index.turns:
             SESSION_INDEX_CACHE.invalidate_thread(thread_id)
             index = SESSION_INDEX_CACHE.get_or_create(
@@ -698,6 +707,7 @@ async def prepare_session_context_for_ask(
                 caller_had_pending_state=caller_had_pending_state,
                 ancestor_segments_records=ancestor_records,
                 lineage_signature=lineage_sig,
+                llm=llm,
             )
             if persistence_stats.status == "degraded_unpersisted":
                 evict_after_pack = True
@@ -725,10 +735,21 @@ async def prepare_session_context_for_ask(
         allowed_turn_ids = set(index.turns_by_id.keys())
     else:
         req_src_set = set(requested_source_ids)
+        turns = list(index.turns)
+        excluded_turn_ids: set[str] = set()
+        for idx_pos, t in enumerate(turns):
+            cited = set(t.cited_source_ids)
+            if cited and not cited.issubset(req_src_set):
+                excluded_turn_ids.add(t.turn_id)
+                if t.role == "assistant":
+                    prev_idx = idx_pos - 1
+                    while prev_idx >= 0 and turns[prev_idx].role == "user":
+                        excluded_turn_ids.add(turns[prev_idx].turn_id)
+                        prev_idx -= 1
         allowed_turn_ids = {
             t.turn_id
-            for t in index.turns
-            if t.role != "assistant" or set(t.cited_source_ids).issubset(req_src_set)
+            for t in turns
+            if t.turn_id not in excluded_turn_ids
         }
 
     # SiliconFlow System One routing (run off event loop; deterministic fallback if disabled/unconfigured)
@@ -739,7 +760,23 @@ async def prepare_session_context_for_ask(
             [d for d in index.active_decisions if d.turn_id in allowed_turn_ids]
         ),
     }
-    decision = await asyncio.to_thread(route_query, query, route_ctx)
+    prior_turns_payload = [
+        {"role": t.role, "content": t.content}
+        for t in index.turns
+        if t.turn_id in allowed_turn_ids and t.role in {"user", "assistant"} and t.content
+    ]
+    decision = (
+        await route_query_async(
+            query,
+            prior_turns=prior_turns_payload or None,
+            has_thread_history=bool(allowed_turn_ids),
+            has_sources=(requested_source_ids is None or bool(requested_source_ids)),
+            web_enabled=web_enabled,
+            scoped=bool(requested_source_ids),
+            context=route_ctx,
+            llm_client=llm if settings.decision_provider == "llm" else None,
+        )
+    ).to_dict()
 
     try:
         pack = await build_ecce_context_pack(

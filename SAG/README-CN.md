@@ -72,11 +72,11 @@ SAG 不是传统 RAG 与 GraphRAG 的融合，而是一套替代二者的原创�
 
 **信源与文档 → 结构化知识 → 检索与原文溯源 → 带引用的 Agent 回答 → 通过 API 或 MCP 复用**
 
-文档只需上传一次。SAG 会自动解析、分块、向量化，抽取事件与实体，并让每一条检索结果都能回到原文。你可以跨信源搜索、查看 event-entity 图谱、进行带引用的问答，也可以把同一份知识开放给其他应用。
+文档只需上传一次。SAG 会自动解析、分块、向量化并写入 PostgreSQL + Qdrant（`SearchUnit`），执行确定性的 `E0/E1` `FOUNDATION` 知识索引（参见 [`docs/adr-remove-e2-llm-enrichment.md`](docs/adr-remove-e2-llm-enrichment.md)），并让每一条检索结果都能回到原文（默认通过 `SAG_DOCUMENT_EVENT_EXTRACTION_ENABLED=false` 关闭逐块传统事件抽取）。你可以跨信源搜索、查看 event-entity 图谱、进行带引用的问答，也可以把同一份知识开放给其他应用。
 
 | 能力 | 解决的问题 |
 | --- | --- |
-| 知识导入 | 文件与网页信源、文档解析、分块、向量化、事件/实体抽取、后台处理 |
+| 知识导入 | 文件与网页信源、规范化解析、分块、向量化、`SearchUnit` + `E0/E1` FOUNDATION 索引、后台处理 |
 | 检索 | 全局或指定信源检索，支持快速（`vector`）与精确（`multi`）两种模式 |
 | 原文溯源 | 每条检索结果和引用都能打开对应的原文块 |
 | 知识图谱 | 查看事件、实体及其可查询的关联关系 |
@@ -131,8 +131,8 @@ SAG 内部的语义路径和结构路径都是 SAG 自己检索管线的组成�
 
 **离线索引**
 
-1. 将文档解析为语义连贯的 chunks。
-2. 从每个 chunk 并行抽取一个事件和多个实体。
+1. 将文档规范化解析为语义连贯的 `CanonicalBlock` 与 `SearchUnit`。
+2. 默认运行确定性 `E0/E1` `FOUNDATION` 索引（传统逐块 LLM 事件/实体抽取仅在显式开启 `SAG_DOCUMENT_EVENT_EXTRACTION_ENABLED=true` 时启用）。
 3. 将 chunks、事件、实体和 event-entity 关联写入关系型存储。
 4. 将 chunk、事件和实体表示写入向量与全文索引。
 
@@ -199,7 +199,7 @@ docker compose up -d --build
 3. 创建信源并上传文档，等待状态变为**就绪**。
 4. 开始检索、打开原文，或直接进行带引用的对话。
 
-没有模型密钥时，界面和服务仍可启动。Embedding 用于索引与向量检索；LLM 用于事件抽取、查询理解和生成回答。
+没有模型密钥时，界面和服务仍可启动。Embedding 用于索引与向量检索；LLM 用于查询理解、可选的传统事件抽取和生成回答。
 
 #### 模型配置优先级
 
@@ -209,7 +209,7 @@ Docker Compose 或 `.env` 中的 `SAG_LLM_*` 用于提供首次启动时的模�
 
 ### 导入知识
 
-创建信源后，可以添加 Markdown、文本、PDF、Office 等支持的文档。SAG 会先将文档规范化为 Markdown，再在后台完成分块、向量化、事件抽取和实体抽取。
+创建信源后，可以添加 Markdown、文本、PDF、Office 等支持的文档。SAG 会先将文档规范化为 Markdown，再在后台完成分块、向量化（`SearchUnit`）与确定性 `E0/E1` 知识索引（参见 [`docs/adr-remove-e2-llm-enrichment.md`](docs/adr-remove-e2-llm-enrichment.md)）。
 
 <p align="center">
   <img src="docs/assets/readme/product-import.png" alt="向 SAG 导入文档" width="940" />
@@ -452,7 +452,7 @@ Electron 客户端将同一套 Next.js 应用与本地 FastAPI 后端一起打�
 
 ### 直接使用 `zleap-sag`
 
-[`zleap-sag`](https://pypi.org/project/zleap-sag/) 是 SAG 应用底层持续维护的 Python 引擎。发行包名为 `zleap-sag`，导入路径为 `zleap.sag`，要求 Python 3.11+，采用 MIT 许可。当前应用要求 `zleap-sag>=0.7.1`。
+[`zleap-sag`](https://pypi.org/project/zleap-sag/) 是 SAG 应用底层持续维护的 Python 引擎。发行包名为 `zleap-sag`，导入路径为 `zleap.sag`，要求 Python 3.11+，采用 MIT 许可。当前应用使用 `zleap-sag>=0.12.0`（最低兼容声明 `>=0.7.1`）。
 
 安装 Python 引擎包：
 

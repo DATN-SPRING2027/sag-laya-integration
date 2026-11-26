@@ -19,7 +19,7 @@ from typing import Annotated, Literal
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import Field, PrivateAttr, field_validator, model_validator
+from pydantic import AliasChoices, Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from sag_api.core.model_providers import ModelProviderId, get_model_provider
@@ -27,6 +27,14 @@ from sag_api.enums import SearchStrategy, normalize_search_strategy
 
 _DEFAULT_LLM_PROVIDER = get_model_provider("openai")
 FIXED_SEARCH_TOP_K = 5
+_INSECURE_SECRETS = frozenset(
+    {
+        "dev-insecure-secret-change-me-in-production-0123456789",
+        "dev-secret-change-me-at-least-32-bytes",
+        "please-change-this-in-production-0123456789",
+        "dev-secret-change-me",
+    }
+)
 
 
 def _resolve_default_env_file() -> Path:
@@ -84,6 +92,15 @@ class Settings(BaseSettings):
     principal_assertion_max_project_ids: int = Field(default=256, ge=1, le=4096)
     # Shared only between Continuum BE and this API for project-scoped BFF calls.
     bff_service_token: str | None = None
+    # Optional dedicated internal service bearer key (must be explicit & non-empty).
+    service_api_key: str | None = None
+    # Optional JSON pricing override map for token_usage USD estimation.
+    token_pricing_json: str | None = None
+    # Optional stdio MCP source ID (legacy; stdio transport remains disabled).
+    mcp_source_id: str | None = None
+    # Desktop sidecar bind host/port.
+    desktop_host: str = "127.0.0.1"
+    desktop_port: int = Field(default=8000, ge=1, le=65535)
     # 供桌面端启动时写入本地 DSH 连接文件的公开地址与可选文件位置。
     dsh_public_url: str = "http://127.0.0.1:8000"
     dsh_connection_file: str | None = None
@@ -114,9 +131,6 @@ class Settings(BaseSettings):
     document_extraction_profile: Literal["standard", "concise"] = "concise"
     document_write_event_entity_vectors: bool = False
     document_event_entity_attempts: int = Field(default=2, ge=1, le=3)
-    # 上传文档已有独立的知识型过滤要求；默认关闭上游基于标题/摘要的严格过滤，
-    # 避免无摘要或标题缺失的书籍正文被误判为噪音。
-    document_strict_filtering: bool = False
     job_max_attempts: int = 3  # 可重试失败的最大尝试次数（含首次）
     engine_cache_size: int = 16  # 引擎槽 LRU 上限（超限逐出最久未用）
     engine_warmup_count: int = 4  # 启动时预热最近使用的信源引擎数
@@ -177,7 +191,7 @@ class Settings(BaseSettings):
     # ── zleap-sag 后端选择 ─────────────────────────────────────────────
     sag_vector_provider: Literal["es", "pgvector", "qdrant", "oceanbase"] = "qdrant"
     sag_relational_provider: Literal["sqlite", "postgres", "mysql", "oceanbase"] = "postgres"
-    sag_language: Literal["en", "zh"] = "en"
+    sag_language: Literal["en", "zh", "vi"] = "en"
 
     # PostgreSQL 元数据连接字段
     sag_pg_host: str = "localhost"
@@ -185,8 +199,14 @@ class Settings(BaseSettings):
     sag_pg_user: str = "sag"
     sag_pg_password: str = "sag"
     sag_pg_database: str = "sag"
-    sag_qdrant_url: str = "http://localhost:6333"
-    sag_qdrant_api_key: str | None = None
+    sag_qdrant_url: str = Field(
+        default="http://localhost:6333",
+        validation_alias=AliasChoices("SAG_QDRANT_URL", "SAG_SAG_QDRANT_URL"),
+    )
+    sag_qdrant_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("SAG_QDRANT_API_KEY", "SAG_SAG_QDRANT_API_KEY"),
+    )
 
     # ── LLM（答案生成 + 抽取）─────────────────────────────────────────
     # 协议、路由规则和技术默认值统一由 model_providers 注册表维护。
@@ -235,12 +255,7 @@ class Settings(BaseSettings):
     mineru_poll_timeout: float = 300.0
     mineru_result_max_mb: int = 100
 
-    # ── R2 Object Ingest & Multi-Lane Parsing ──────────────────────────
-    object_ingest_allowed_hosts: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: [".r2.cloudflarestorage.com"]
-    )
-    object_ingest_allow_private_hosts_in_dev: bool = False
-    object_ingest_timeout_seconds: float = Field(default=120.0, ge=5.0, le=900.0)
+    # ── Multi-Lane Parsing ─────────────────────────────────────────────
     local_parse_workers: int = Field(default=2, ge=1, le=16)
     local_parse_timeout_seconds: float = Field(default=90.0, ge=5.0, le=600.0)
     local_parse_max_tasks_per_child: int = Field(default=25, ge=1, le=500)
@@ -249,18 +264,18 @@ class Settings(BaseSettings):
     per_project_heavy_parse_limit: int = Field(default=3, ge=1, le=32)
     excel_max_rows_per_sheet: int = Field(default=5000, ge=10, le=100_000)
     excel_max_cols_per_sheet: int = Field(default=64, ge=4, le=512)
-    remote_snapshot_gc_enabled: bool = True
 
     # ── 检索默认 ────────────────────────────────────────────────────────
-    # multi_es_fast：默认策略。相关率平均比 vector 高 ~14 个百分点；
-    # vector store 不支持 lexical(pgvector/qdrant/oceanbase) 时由 engine_manager 自动降级为 vector。
-    search_strategy: SearchStrategy = "multi_es_fast"
+    # multi：默认策略（canonical search 实际执行 canonical_hybrid dense + BM25；
+    # legacy zleap-sag 引擎在 vector store 不支持 lexical 时自动降级为 vector）。
+    search_strategy: SearchStrategy = "multi"
     search_top_k: int = Field(default=8, ge=1)  # Initial adaptive search breadth, not a final result cap.
     # Optional scope budget rejects oversized scopes instead of silently truncating sources.
     search_source_candidate_limit: int = Field(default=0, ge=0)  # 0 = all authorized sources.
     search_source_concurrency: int = Field(default=4, ge=1, le=32)
     # Hard cap for canonical SearchUnits hydrated and reranked across all scopes.
     search_unit_candidate_limit: int = Field(default=1024, ge=1)
+    search_min_dense_score: float = Field(default=0.35, ge=0.0, le=1.0)
     search_rerank_min_remaining_seconds: float = Field(default=0.1, ge=0.0, le=2.0)
     search_tree_profile_limit: int = Field(default=8192, ge=256, le=16384)
     # Keep part of the routed query's deadline available to its ACL-scoped global escape.
@@ -278,6 +293,20 @@ class Settings(BaseSettings):
     # 精确模式（multi）含查询侧 LLM 往返；超时/失败/空结果自动回退快速模式（vector）。
     search_source_timeout: float = 25.0
     search_fallback_vector: bool = True
+    search_reconcile_interval_seconds: int = Field(default=3600, ge=0, le=86400)
+
+    # ── 时间线与冲突治理 (Temporal Authority & Conflict Resolution) ────────
+    temporal_authority_rerank_enabled: bool = True
+    authority_rerank_max_delta: float = Field(default=0.04, ge=0.0, le=0.04)
+
+    conflict_resolution_job_enabled: bool = True
+    conflict_vector_top_k: int = Field(default=5, ge=1, le=20)
+    conflict_vector_min_cosine: float = Field(default=0.72, ge=0.0, le=0.99)
+    conflict_vector_max_cosine: float = Field(default=0.995, ge=0.5, le=1.0)
+    conflict_auto_supersede_min_confidence: float = Field(default=0.85, ge=0.5, le=1.0)
+    conflict_max_pairs_per_version: int = Field(default=50, ge=1, le=500)
+    conflict_classifier_batch_size: int = Field(default=8, ge=1, le=20)
+    conflict_classifier_timeout_seconds: float = Field(default=20.0, ge=2.0, le=120.0)
 
     # ── 检索评测 ────────────────────────────────────────────────────────
     # LLM-as-judge 在评测端点/CLI 里默认开启；线上或不想烧 token 时可临时关闭。
@@ -309,6 +338,8 @@ class Settings(BaseSettings):
     history_keep_recent: int = 8  # 历史压缩时原文保留的最近消息数
     # 只装载最近有界窗口；更旧对话应进入滚动摘要，不做全表回放。
     history_load_limit: int = Field(default=200, ge=1, le=1000)
+    # Opt-in ECCE session memory; production default is "off" (legacy bounded history).
+    # Offline ECCE benchmark suites override this to "on" on a synthetic corpus.
     session_context_mode: Literal["off", "shadow", "on"] = "off"
     session_context_scope: Literal["thread", "project_owner"] = "thread"
     session_context_embedding_mode: Literal["zero_cost_local", "configured_http"] = "zero_cost_local"
@@ -316,10 +347,41 @@ class Settings(BaseSettings):
     session_context_qdrant_sync_enabled: bool = True
     session_context_max_messages: int = Field(default=5000, ge=50, le=50000)
     session_context_full_audit_max_batches: int = Field(default=6, ge=1, le=20)
-    decision_provider: Literal["siliconflow", "disabled"] = "siliconflow"
+    decision_provider: Literal["siliconflow", "openai_compatible", "llm", "disabled"] = "siliconflow"
+    decision_base_url: str | None = None
+    decision_api_key: str | None = None
     decision_model: str = Field(default="Kev-4b", min_length=1, max_length=200)
+    decision_timeout_ms: int = Field(default=10_000, ge=500, le=60_000)
     siliconflow_base_url: str = "https://api.siliconflow.com/v1"
     siliconflow_api_key: str | None = None
+
+    @field_validator("decision_base_url")
+    @classmethod
+    def _validate_decision_base_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().rstrip("/")
+        if not normalized:
+            return None
+        parsed = urlsplit(normalized)
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("decision_base_url must be an HTTP(S) base URL without credentials")
+        return normalized
+
+    @field_validator("decision_api_key", mode="before")
+    @classmethod
+    def _blank_decision_api_key_as_none(cls, value: object) -> object:
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return value
 
     @field_validator("siliconflow_base_url")
     @classmethod
@@ -352,7 +414,7 @@ class Settings(BaseSettings):
             data["decision_model"] = "Kev-4b"
         return data
 
-    @field_validator("cors_origins", "object_ingest_allowed_hosts", mode="before")
+    @field_validator("cors_origins", mode="before")
     @classmethod
     def _split_origins(cls, v: object) -> object:
         """允许用逗号分隔的字符串配置 CORS 源。"""
@@ -411,8 +473,13 @@ class Settings(BaseSettings):
 
     @field_validator("sag_language", mode="before")
     @classmethod
-    def _normalize_sag_language(cls, value: object) -> str:
-        return "en"
+    def _normalize_sag_language(cls, value: object) -> object:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"en", "zh", "vi"}:
+                return normalized
+            raise ValueError("sag_language must be one of: en, zh, vi")
+        return value
 
     @field_validator("timezone")
     @classmethod
@@ -427,10 +494,10 @@ class Settings(BaseSettings):
     @field_validator("principal_assertion_issuer")
     @classmethod
     def _validate_principal_assertion_issuer(cls, value: str | None) -> str | None:
-        if value is None:
+        if value is None or not value.strip():
             return None
         normalized = value.strip()
-        if not normalized or normalized != value or len(normalized) > 512:
+        if normalized != value or len(normalized) > 512:
             raise ValueError("principal_assertion_issuer must be a non-empty exact identifier")
         return normalized
 
@@ -445,7 +512,7 @@ class Settings(BaseSettings):
     @field_validator("principal_assertion_jwks_url")
     @classmethod
     def _validate_principal_assertion_jwks_url(cls, value: str | None) -> str | None:
-        if value is None:
+        if value is None or not value.strip():
             return None
         normalized = value.strip()
         parsed = urlsplit(normalized)
@@ -460,6 +527,14 @@ class Settings(BaseSettings):
         ):
             raise ValueError("principal_assertion_jwks_url must be a fixed HTTPS URL without credentials")
         return normalized
+
+    @field_validator("service_api_key", "token_pricing_json", "mcp_source_id", "sag_qdrant_api_key", mode="before")
+    @classmethod
+    def _blank_optional_str_as_none(cls, value: object) -> object:
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return value
 
     @field_validator("bff_service_token")
     @classmethod
@@ -499,6 +574,15 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _require_production_storage_backends(self) -> Settings:
         if self.environment == "prod":
+            if "debug" in self.model_fields_set and self.debug:
+                raise ValueError("SAG_DEBUG must be false when SAG_ENVIRONMENT=prod")
+            if self.debug:
+                object.__setattr__(self, "debug", False)
+            stripped_secret = (self.secret_key or "").strip()
+            if not stripped_secret or len(stripped_secret) < 32 or stripped_secret in _INSECURE_SECRETS:
+                raise ValueError(
+                    "SAG_SECRET_KEY must be a strong non-default secret (>= 32 chars) in prod"
+                )
             if urlsplit(self.database_url).scheme != "postgresql+asyncpg":
                 raise ValueError("SAG_DATABASE_URL must use PostgreSQL with asyncpg in prod")
             if self.sag_relational_provider != "postgres":
@@ -507,7 +591,15 @@ class Settings(BaseSettings):
                 raise ValueError("SAG_SAG_VECTOR_PROVIDER must be qdrant in prod")
             qdrant_url = urlsplit(self.sag_qdrant_url)
             if qdrant_url.scheme not in {"http", "https"} or not qdrant_url.hostname:
-                raise ValueError("SAG_SAG_QDRANT_URL must be an absolute HTTP(S) URL in prod")
+                raise ValueError("SAG_QDRANT_URL must be an absolute HTTP(S) URL in prod")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_conflict_thresholds(self) -> Settings:
+        if self.conflict_vector_min_cosine >= self.conflict_vector_max_cosine:
+            raise ValueError(
+                "SAG_CONFLICT_VECTOR_MIN_COSINE must be strictly less than SAG_CONFLICT_VECTOR_MAX_COSINE"
+            )
         return self
 
     @property
@@ -543,6 +635,26 @@ class Settings(BaseSettings):
     def effective_embedding_base_url(self) -> str | None:
         provider = get_model_provider(self.llm_provider)
         return self.embedding_base_url or (self.llm_base_url if provider.can_reuse_embedding_credentials else None)
+
+    @property
+    def effective_decision_base_url(self) -> str | None:
+        if self.decision_base_url:
+            return self.decision_base_url
+        if self.decision_provider == "siliconflow":
+            return self.siliconflow_base_url
+        if self.decision_provider == "llm":
+            return self.llm_base_url
+        return None
+
+    @property
+    def effective_decision_api_key(self) -> str | None:
+        if self.decision_api_key:
+            return self.decision_api_key
+        if self.decision_provider == "siliconflow":
+            return self.siliconflow_api_key
+        if self.decision_provider == "llm":
+            return self.llm_api_key
+        return None
 
     @property
     def mineru_configured(self) -> bool:

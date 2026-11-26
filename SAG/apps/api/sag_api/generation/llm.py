@@ -11,7 +11,7 @@ import asyncio
 import inspect
 import json
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from sag_agent import CancellationToken, ModelChunk, ModelRequest, Usage
 from sag_agent import ToolCall as RuntimeToolCall
@@ -26,6 +26,8 @@ from sag_api.core.errors import (
 from sag_api.core.litellm_policy import (
     _with_json_object,
     apply_litellm_completion_policy,
+    omit_stream_options_scope,
+    policy_settings_scope,
     should_downgrade_json_schema,
 )
 from sag_api.core.logging import get_logger
@@ -34,6 +36,35 @@ from sag_api.core.token_usage import extract_chat_usage, record_llm_usage
 log = get_logger("generation")
 
 Message = dict[str, Any]
+
+
+@runtime_checkable
+class StructuredLLMClient(Protocol):
+    """Unified protocol for any LLM client or test double supporting structured output."""
+
+    @property
+    def configured(self) -> bool: ...
+
+    async def complete(
+        self,
+        messages: list[Message],
+        *,
+        response_format: dict[str, Any] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> str: ...
+
+
+@runtime_checkable
+class StreamingStructuredLLMClient(StructuredLLMClient, Protocol):
+    """Extended protocol for clients that also support streaming structured completions."""
+
+    def stream_complete(
+        self,
+        messages: list[Message],
+        *,
+        response_format: dict[str, Any] | None = None,
+    ) -> AsyncIterator[str]: ...
 
 
 async def _litellm_completion(**kwargs: Any) -> Any:
@@ -114,15 +145,29 @@ class LLMClient:
         tools: list[dict] | None = None,
         tool_choice: str | dict | None = None,
         response_format: dict[str, Any] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> Any:
+        from sag_api.core.model_providers import get_model_provider
+
+        resolved_temperature = (
+            get_model_provider(self._settings.llm_provider).resolve_temperature(float(temperature))
+            if temperature is not None
+            else self._settings.effective_llm_temperature
+        )
+        resolved_max_tokens = (
+            max(1, min(int(max_tokens), int(self._settings.llm_context_window)))
+            if max_tokens is not None
+            else self._settings.llm_max_tokens
+        )
         request: dict[str, Any] = {
             "model": self._settings.routed_llm_model,
             "api_key": self._settings.llm_api_key,
             "timeout": self._settings.llm_timeout_ms / 1000,
             "num_retries": self._settings.llm_max_retries,
             "messages": messages,
-            "temperature": self._settings.effective_llm_temperature,
-            "max_tokens": self._settings.llm_max_tokens,
+            "temperature": resolved_temperature,
+            "max_tokens": resolved_max_tokens,
             "stream": stream,
         }
         if tools:
@@ -134,36 +179,43 @@ class LLMClient:
         if self._settings.llm_base_url:
             request["api_base"] = self._settings.llm_base_url
         normalized = apply_litellm_completion_policy(self._settings, request)
-        try:
-            return await _litellm_completion(**normalized)
-        except Exception as err:
-            if stream and "stream_options" in normalized and "stream_options" in str(err).casefold():
-                fallback_request = dict(request)
-                fallback_request["stream_options"] = None
-                return await _litellm_completion(
-                    **apply_litellm_completion_policy(self._settings, fallback_request)
-                )
-            if not stream and should_downgrade_json_schema(err, normalized, self._settings):
-                json_obj_req = _with_json_object(normalized)
-                try:
-                    return await _litellm_completion(**json_obj_req)
-                except Exception as inner_err:
-                    status = getattr(inner_err, "status_code", None)
-                    if status in {400, 422} and "response_format" in str(inner_err).casefold():
-                        plain_req = dict(json_obj_req)
-                        plain_req.pop("response_format", None)
-                        return await _litellm_completion(**plain_req)
-                    raise
-            if (
-                not stream
-                and "response_format" in normalized
-                and getattr(err, "status_code", None) in {400, 422}
-                and "response_format" in str(err).casefold()
-            ):
-                plain_req = dict(normalized)
-                plain_req.pop("response_format", None)
-                return await _litellm_completion(**plain_req)
-            raise
+        with policy_settings_scope(self._settings):
+            try:
+                return await _litellm_completion(**normalized)
+            except Exception as err:
+                if stream and "stream_options" in normalized and "stream_options" in str(err).casefold():
+                    fallback_request = dict(request)
+                    fallback_request["stream_options"] = None
+                    with omit_stream_options_scope(True):
+                        return await _litellm_completion(
+                            **apply_litellm_completion_policy(self._settings, fallback_request)
+                        )
+                if not stream and should_downgrade_json_schema(err, normalized, self._settings):
+                    json_obj_req = _with_json_object(normalized)
+                    try:
+                        return await _litellm_completion(**json_obj_req)
+                    except Exception as inner_err:
+                        status = getattr(inner_err, "status_code", None)
+                        if (
+                            self._settings.llm_structured_output_mode == "auto"
+                            and status in {400, 422}
+                            and "response_format" in str(inner_err).casefold()
+                        ):
+                            plain_req = dict(json_obj_req)
+                            plain_req.pop("response_format", None)
+                            return await _litellm_completion(**plain_req)
+                        raise
+                if (
+                    self._settings.llm_structured_output_mode == "auto"
+                    and not stream
+                    and "response_format" in normalized
+                    and getattr(err, "status_code", None) in {400, 422}
+                    and "response_format" in str(err).casefold()
+                ):
+                    plain_req = dict(normalized)
+                    plain_req.pop("response_format", None)
+                    return await _litellm_completion(**plain_req)
+                raise
 
     @staticmethod
     async def _close_stream(stream: Any) -> None:
@@ -193,12 +245,17 @@ class LLMClient:
         collected_parts: list[str] = []
         usage_recorded = False
         stream = None
+        req_meta = getattr(request, "metadata", None) or {}
+        req_temperature = req_meta.get("temperature")
+        req_max_tokens = req_meta.get("max_tokens")
         try:
             stream = await self._create_completion(
                 serialized_messages,
                 tools=list(request.tools) or None,
                 tool_choice=request.tool_choice if request.tools else None,
                 stream=True,
+                temperature=(float(req_temperature) if req_temperature is not None else None),
+                max_tokens=(int(req_max_tokens) if req_max_tokens is not None else None),
             )
             async for chunk in stream:
                 cancellation.raise_if_cancelled()
@@ -306,10 +363,17 @@ class LLMClient:
         messages: list[Message],
         *,
         response_format: dict[str, Any] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         self._ensure_configured()
         try:
-            resp = await self._create_completion(messages, response_format=response_format)
+            resp = await self._create_completion(
+                messages,
+                response_format=response_format,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
             choices = _attr(resp, "choices", []) or []
             if not choices:
                 raise UpstreamError(
@@ -329,7 +393,12 @@ class LLMClient:
         except Exception as e:  # noqa: BLE001
             raise _classify_llm_error(e, stage=ErrorStage.GENERATE) from e
 
-    async def stream_complete(self, messages: list[Message]) -> AsyncIterator[str]:
+    async def stream_complete(
+        self,
+        messages: list[Message],
+        *,
+        response_format: dict[str, Any] | None = None,
+    ) -> AsyncIterator[str]:
         """Stream plain text completion deltas without the Agent/tool protocol."""
 
         self._ensure_configured()
@@ -338,7 +407,11 @@ class LLMClient:
         collected_parts: list[str] = []
         usage_recorded = False
         try:
-            stream = await self._create_completion(messages, stream=True)
+            stream = await self._create_completion(
+                messages,
+                stream=True,
+                response_format=response_format,
+            )
             async for chunk in stream:
                 raw_usage = _attr(chunk, "usage")
                 if raw_usage is not None:

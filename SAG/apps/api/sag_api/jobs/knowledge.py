@@ -66,16 +66,19 @@ async def _embed_blocks(embed, non_heading_blocks: Sequence[tuple[str, str]]) ->
     metered = bool(getattr(embed, "_sag_token_metered_cache_wrapped", False))
     texts = [text for _, text in non_heading_blocks]
     if hasattr(embed, "batch_generate"):
+        from sag_api.core.config import settings as sag_settings
         from sag_api.services.search_index_service import (
+            build_embedding_model_signature,
             get_cached_text_embedding,
             put_cached_text_embedding,
         )
 
+        emb_sig = build_embedding_model_signature(embed, settings_obj=sag_settings)
         cached_by_idx: dict[int, list[float]] = {}
         missing_indices: list[int] = []
         missing_texts: list[str] = []
         for idx, t in enumerate(texts):
-            cached = get_cached_text_embedding(t)
+            cached = get_cached_text_embedding(t, model_signature=emb_sig)
             if cached is not None:
                 cached_by_idx[idx] = cached
             else:
@@ -93,7 +96,7 @@ async def _embed_blocks(embed, non_heading_blocks: Sequence[tuple[str, str]]) ->
                 )
             for idx, txt, vec in zip(missing_indices, missing_texts, fetched, strict=True):
                 vec_f = [float(v) for v in vec]
-                put_cached_text_embedding(txt, vec_f)
+                put_cached_text_embedding(txt, vec_f, model_signature=emb_sig)
                 cached_by_idx[idx] = vec_f
         vecs = [cached_by_idx[i] for i in range(len(texts))]
     elif hasattr(embed, "generate"):
@@ -274,6 +277,7 @@ class KnowledgeWorker:
         config: KnowledgeConfig = KnowledgeConfig(),
         policy: QueuePolicy | None = None,
         embed=None,
+        engine_manager=None,
         job_queue=None,
     ):
         self.sessions, self.settings, self.config = session_factory, settings, config
@@ -282,6 +286,9 @@ class KnowledgeWorker:
             capacity=settings.knowledge_queue_capacity,
         )
         self.embed = embed
+        self._pinned_embed = embed is not None
+        self.engine_manager = engine_manager
+        self._fallback_engine_manager = None
         self.job_queue = job_queue
         self.task = None
         self.running: set[asyncio.Task] = set()
@@ -387,6 +394,43 @@ class KnowledgeWorker:
                 job.tree_requested_at = datetime.now(UTC)
                 await session.commit()
 
+    async def _resolve_embedder(self):
+        """Resolve an open embedding client, preferring live EngineManager over stale references."""
+        if self.embed is not None:
+            return self.embed
+        if self.engine_manager is not None and hasattr(self.engine_manager, "get_sag_embedding"):
+            try:
+                return await self.engine_manager.get_sag_embedding()
+            except Exception as error:  # noqa: BLE001
+                log.warning("Managed knowledge embedder unavailable: %s", error)
+                return None
+        effective_key = getattr(self.settings, "effective_embedding_api_key", None) or getattr(
+            self.settings, "embedding_api_key", None
+        )
+        if not effective_key:
+            return None
+        try:
+            if self._fallback_engine_manager is None:
+                from sag_api.sag.engine_manager import EngineManager
+
+                self._fallback_engine_manager = EngineManager(self.settings)
+            return await self._fallback_engine_manager.get_sag_embedding()
+        except Exception as error:  # noqa: BLE001
+            log.warning("Fallback knowledge embedder unavailable: %s", error)
+            return None
+
+    async def reset_embedder(self, *, settings=None) -> None:
+        """Drop any cached embedder client after runtime hot-reload so the next job resolves a fresh client."""
+        if settings is not None:
+            self.settings = settings
+        if not self._pinned_embed:
+            self.embed = None
+        if self._fallback_engine_manager is not None:
+            manager = self._fallback_engine_manager
+            self._fallback_engine_manager = None
+            if hasattr(manager, "aclose_all"):
+                await manager.aclose_all()
+
     async def run_one(self) -> bool:
         from sag_api.core.token_usage import (
             TokenLedger,
@@ -410,15 +454,7 @@ class KnowledgeWorker:
         try:
             async with asyncio.timeout(timeout):
                 dense_by_block_id = None
-                embedder = self.embed
-                if embedder is None and getattr(self.settings, "embedding_api_key", None):
-                    try:
-                        from sag_api.sag.engine_manager import EngineManager
-
-                        embedder = await EngineManager(self.settings).get_sag_embedding()
-                        self.embed = embedder
-                    except Exception as error:  # noqa: BLE001
-                        log.warning("Fallback knowledge embedder unavailable: %s", error)
+                embedder = await self._resolve_embedder()
                 if embedder is not None:
                     async with self.sessions() as session:
                         from sag_api.services.search_index_service import contextualize_block_text
@@ -567,3 +603,4 @@ class KnowledgeWorker:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await self.reset_embedder()

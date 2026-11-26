@@ -12,6 +12,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from sag_agent import ToolCapability
+
 if TYPE_CHECKING:
     from sag_api.core.principal_assertion import VerifiedPrincipal
     from sag_api.db.models import Agent, Source
@@ -25,6 +27,7 @@ class ToolMeta:
     name: str
     description: str
     parameters: dict[str, Any] = field(default_factory=lambda: {"type": "object", "properties": {}})
+    capabilities: frozenset[ToolCapability] = field(default_factory=frozenset)
 
     def to_openai_schema(self) -> dict[str, Any]:
         return {
@@ -53,6 +56,8 @@ class ToolContext:
     search_context_called: bool = False
     search_context_no_answer_reason: str | None = None
     search_context_unavailable: bool = False
+    citation_numbers_by_call_id: dict[str, set[int]] = field(default_factory=dict)
+    route_decision: dict[str, Any] | None = None
 
 
 @dataclass

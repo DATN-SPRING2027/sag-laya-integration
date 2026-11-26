@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -100,9 +101,13 @@ def _record_from_point(point: dict[str, Any]) -> VectorRecord:
 class QdrantVectorStore:
     """Qdrant adapter using the stable REST API and named vectors."""
 
-    # zleap-sag 0.12's schema facade recognizes these built-in storage modes.
-    # The actual selected provider remains qdrant in EngineConfig/registry.
+    # zleap.sag.core.storage.schema.prepare_vector_schema (schema.py:80) skips
+    # all schema validation/creation unless adapter.provider is in
+    # ("lancedb", "es", "pgvector", "oceanbase"). Keep "es" solely as the
+    # zleap-sag schema-facade whitelist token; backend_provider & EngineConfig
+    # identify the actual Qdrant backend.
     provider = "es"
+    backend_provider = "qdrant"
     capabilities = frozenset({Capability.VECTOR_KNN, Capability.FILTERED_KNN})
 
     def __init__(
@@ -120,6 +125,7 @@ class QdrantVectorStore:
         self._client: httpx.AsyncClient | None = None
         self._payload_index_lock = asyncio.Lock()
         self._payload_indexes_ready: set[str] = set()
+        self._distance_cache: dict[tuple[str, str], str] = {}
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -282,11 +288,15 @@ class QdrantVectorStore:
                 for name, values in record.vectors.items()
                 if name in dimensions
             }
+            is_payload_only = False
             if not vectors and dimensions:
                 # ponytail: Qdrant requires a vector for each point; payload-only
-                # lite records use zero vectors because they are never searched.
+                # lite records use zero vectors and are tagged payload_only so vector queries exclude them.
                 vectors = {name: [0.0] * size for name, size in dimensions.items()}
+                is_payload_only = True
             payload = {"_sag_id": record.id, **_json_value(record.payload)}
+            if is_payload_only:
+                payload["payload_only"] = True
             points.append(
                 {
                     "id": _point_id(collection, record.id),
@@ -373,22 +383,52 @@ class QdrantVectorStore:
                 break
         return records[:limit]
 
+    async def _vector_distance(self, collection: str, vector_field: str) -> str:
+        cache_key = (collection, vector_field)
+        cached = self._distance_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        info = await self._collection_info(collection)
+        distance = "cosine"
+        if info is not None:
+            schema = self._vector_schema(info)
+            field_cfg = schema.get(vector_field) or schema.get("vector")
+            if isinstance(field_cfg, dict) and field_cfg.get("distance"):
+                distance = str(field_cfg["distance"]).strip().lower()
+        self._distance_cache[cache_key] = distance
+        return distance
+
+    @staticmethod
+    def _normalize_score(score: float, distance: str) -> float:
+        d = (distance or "cosine").strip().lower()
+        if d == "dot":
+            clamped = max(-50.0, min(50.0, score))
+            return 1.0 / (1.0 + math.exp(-clamped))
+        if d in {"euclid", "manhattan"}:
+            return 1.0 / (1.0 + max(0.0, score))
+        return (score + 1.0) / 2.0
+
     async def query(self, collection: str, request: VectorQuery) -> list[VectorHit]:
         if request.text:
             raise StorageError("Qdrant provider does not support lexical search")
         if request.filters is not None:
             await self._ensure_payload_indexes(collection)
         if request.vector is not None:
+            distance = await self._vector_distance(collection, request.vector_field)
+            qdrant_filter = _filter_to_qdrant(request.filters) or {}
+            must_not = list(qdrant_filter.get("must_not") or [])
+            payload_only_cond = {"key": "payload_only", "match": {"value": True}}
+            if payload_only_cond not in must_not:
+                must_not.append(payload_only_cond)
+            qdrant_filter["must_not"] = must_not
             body: dict[str, Any] = {
                 "query": [float(value) for value in request.vector],
                 "using": request.vector_field,
+                "filter": qdrant_filter,
                 "limit": request.limit,
                 "with_payload": True,
                 "with_vector": request.include_vectors,
             }
-            qdrant_filter = _filter_to_qdrant(request.filters)
-            if qdrant_filter:
-                body["filter"] = qdrant_filter
             data = await self._request("POST", self._path(collection, "/points/query"), json=body)
             points = (data.get("result") or {}).get("points", [])
             hits: list[VectorHit] = []
@@ -398,7 +438,7 @@ class QdrantVectorStore:
                 hits.append(
                     VectorHit(
                         id=record.id,
-                        score=(score + 1.0) / 2.0,
+                        score=self._normalize_score(score, distance),
                         payload=record.payload,
                         vectors=record.vectors if request.include_vectors else {},
                     )
@@ -413,10 +453,13 @@ class QdrantVectorStore:
         )
         if request.sort:
             for field, direction in reversed(request.sort):
-                records.sort(
-                    key=lambda record: (record.payload.get(field) is None, record.payload.get(field)),
+                present = [record for record in records if record.payload.get(field) is not None]
+                missing = [record for record in records if record.payload.get(field) is None]
+                present.sort(
+                    key=lambda record: record.payload.get(field),
                     reverse=direction == "desc",
                 )
+                records = present + missing
         if request.distinct_field:
             seen: set[Any] = set()
             records = [

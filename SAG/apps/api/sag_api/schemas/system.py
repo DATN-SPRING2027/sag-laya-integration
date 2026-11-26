@@ -52,7 +52,7 @@ class ModelConfigUpdate(BaseModel):
     llm_timeout_ms: int | None = Field(default=None, ge=1_000, le=600_000)
     llm_max_retries: int | None = Field(default=None, ge=0, le=10)
 
-    decision_provider: Literal["siliconflow", "disabled"] | None = None
+    decision_provider: Literal["siliconflow", "openai_compatible", "llm", "disabled"] | None = None
     decision_model: str | None = Field(default=None, min_length=1, max_length=200)
     siliconflow_api_key: str | None = Field(default=None, max_length=500)
 
@@ -74,12 +74,19 @@ class ModelConfigUpdate(BaseModel):
 
     search_strategy: SearchStrategy | None = None
     search_top_k: int | None = Field(default=None, ge=1)
-    sag_language: Literal["en", "zh"] | None = None
+    sag_language: Literal["en", "zh", "vi"] | None = None
 
     @field_validator("sag_language", mode="before")
     @classmethod
-    def normalize_sag_language(cls, value: str | None) -> str | None:
-        return "en" if value is not None else None
+    def normalize_sag_language(cls, value: object) -> object:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"en", "zh", "vi"}:
+                return normalized
+            raise ValueError("sag_language must be one of: en, zh, vi")
+        return value
 
     @field_validator("mineru_provider", mode="before")
     @classmethod

@@ -95,6 +95,8 @@ class MessageOut(BaseModel):
     status: MessageStatus = MessageStatus.OK
     # 失败/取消时的结构化错误 {code, message, retryable, details}；ok 时为 None。
     error: dict[str, Any] | None = None
+    degraded: bool = False
+    degraded_reason: str | None = None
     created_at: datetime
 
 

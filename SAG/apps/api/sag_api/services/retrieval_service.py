@@ -8,12 +8,23 @@ import re
 import threading
 import time
 import unicodedata
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, Literal
 
-from sag_api.core.config import FIXED_SEARCH_TOP_K, settings
+if TYPE_CHECKING:
+    from sag_api.services.query_strategy_planner import QueryStrategyPlan
+
+import httpx
+from sqlalchemy.exc import SQLAlchemyError
+from zleap.sag.exceptions import SagError
+
+from sag_api.core.config import settings
+from sag_api.core.errors import ApiError
 from sag_api.core.logging import get_logger
+from sag_api.core.text_utils import normalize_text, split_sentences_multilingual
+from sag_api.generation.json_parser import decode_json_values
 from sag_api.sag import RetrievedSection, SearchOutcome
 from sag_api.services.evidence_service import (
     SearchSource,
@@ -327,10 +338,9 @@ def _lexical_relevance(
     raw_terms = [term for term in raw_terms if term]
     filtered_terms = [term for term in raw_terms if term not in _LEXICAL_STOPWORDS]
     terms = filtered_terms if filtered_terms else raw_terms
-    from sag_api.services.query_analysis import _remove_query_noise
 
     phrase = effective.normalized_phrase
-    spaced_phrase = _normalize_spaced_lexical_text(_remove_query_noise(query))
+    spaced_phrase = _normalize_spaced_lexical_text(unicodedata.normalize("NFC", query or "").strip().lower())
 
     score = 0.0
     if _phrase_matches_text(phrase, spaced_phrase, text, spaceless_text=text_compact):
@@ -457,7 +467,10 @@ def _score_term_sequence(
     )
 
 
-def _document_identity(section: RetrievedSection) -> str:
+def _document_identity(section: RetrievedSection, *, distinguish_versions: bool = False) -> str:
+    if distinguish_versions and section.document_version_id:
+        base = str(section.document_id or section.document_name or "")
+        return f"{base}::ver::{section.document_version_id}" if base else str(section.document_version_id)
     return str(
         section.document_id
         or section.document_version_id
@@ -470,6 +483,8 @@ def _document_identity(section: RetrievedSection) -> str:
 def _compute_document_aware_effective_ranks(
     ranks: dict[tuple[str, str], int],
     representatives: dict[tuple[str, str], RetrievedSection],
+    *,
+    distinguish_versions: bool = False,
 ) -> dict[tuple[str, str], float]:
     """Combine chunk rank and distinct-document rank so long multi-chunk docs cannot bury doc #2/#3."""
     ordered = sorted(ranks.items(), key=lambda item: item[1])
@@ -478,7 +493,11 @@ def _compute_document_aware_effective_ranks(
     effective_ranks: dict[tuple[str, str], float] = {}
     for key, chunk_rank in ordered:
         sec = representatives.get(key)
-        d_id = _document_identity(sec) if sec is not None else str(key)
+        d_id = (
+            _document_identity(sec, distinguish_versions=distinguish_versions)
+            if sec is not None
+            else str(key)
+        )
         if d_id not in doc_first_rank:
             doc_first_rank[d_id] = len(doc_first_rank)
         within_doc_idx = doc_seen_count.get(d_id, 0)
@@ -489,8 +508,169 @@ def _compute_document_aware_effective_ranks(
 
 
 def _is_boilerplate(section: RetrievedSection) -> bool:
-    text = f"{section.heading}\n{section.content}"
+    text = normalize_text(f"{section.heading}\n{section.content}").lower()
     return sum(marker in text for marker in _BOILERPLATE) >= 2
+
+
+def _passes_lexical_floor_bypass(
+    query: str,
+    section: RetrievedSection,
+    *,
+    analysis: QueryAnalysis | None = None,
+    min_lexical_score: float = 0.35,
+) -> bool:
+    """Allow a below-min-dense lexical candidate to pass only on anchor match or strong lexical relevance."""
+    effective = analysis or analyze_query(
+        query,
+        segmentation_enabled=settings.search_chinese_segmentation_enabled,
+    )
+    contextual_heading = " ".join(
+        part
+        for part in (section.document_name, section.section_path, section.heading)
+        if part
+    )
+    head_spaced = _normalize_spaced_lexical_text(contextual_heading or section.heading)
+    body_spaced = _normalize_spaced_lexical_text(section.content)
+    full_spaced = (
+        f"{head_spaced}{body_spaced[1:]}"
+        if head_spaced and body_spaced
+        else (head_spaced or body_spaced)
+    )
+    full_compact = full_spaced.replace(" ", "")
+    full_roots = _extract_ascii_roots(full_spaced)
+    anchor_terms = frozenset(
+        norm
+        for term in (
+            *effective.features.exact_terms,
+            *effective.features.identifier_terms,
+            *effective.features.path_terms,
+        )
+        if (norm := _normalize_query_term(term))
+    )
+    if anchor_terms and any(
+        _term_matches_text(
+            anchor,
+            full_spaced,
+            spaceless_text=full_compact,
+            root_tokens=full_roots,
+        )
+        for anchor in anchor_terms
+    ):
+        return True
+    contextual_section = (
+        section.model_copy(update={"heading": contextual_heading})
+        if contextual_heading and contextual_heading != section.heading
+        else section
+    )
+    lexical_score = max(
+        _lexical_relevance(query, section, analysis=effective),
+        _lexical_relevance(query, contextual_section, analysis=effective),
+    )
+    return lexical_score >= min_lexical_score
+
+
+def _query_allows_superseded(query: str = "", *, temporal_mode: str | None = None) -> bool:
+    """Allow superseded document versions only when structured router temporal_mode targets history/lineage."""
+    del query
+    return str(temporal_mode or "").strip().lower() in {"change_lineage", "past_point"}
+
+
+_AUTHORITY_TILT_BY_TIER: dict[int, float] = {
+    1: +0.015,  # Chính thức (Official / Policy Binding)
+    2: +0.005,  # Quy chuẩn (Standard / Official Spec)
+    3: -0.005,  # Hướng dẫn (Operational Guide)
+    4: -0.010,  # Nháp (Informal Draft)
+}
+_RECENCY_HALF_LIFE_DAYS = 365.0
+_RECENCY_MAX_SPREAD = 0.015  # centered in [-0.0075, +0.0075]
+_BASE_TILT_MAX_SPREAD = 0.04
+
+
+def _compute_authority_recency_tilt(
+    section: RetrievedSection,
+    *,
+    reference_time: datetime,
+    temporal_mode: str | None,
+) -> float:
+    """Compute a bounded post-OOD tie-break tilt (spread <= authority_rerank_max_delta <= 0.04)."""
+    if not settings.temporal_authority_rerank_enabled:
+        return 0.0
+    if _query_allows_superseded(temporal_mode=temporal_mode):
+        return 0.0
+    max_delta = max(0.0, min(_BASE_TILT_MAX_SPREAD, float(settings.authority_rerank_max_delta)))
+    if max_delta <= 0.0:
+        return 0.0
+    auth_tilt = 0.0
+    if isinstance(section.authority_tier, int) and not isinstance(section.authority_tier, bool):
+        clamped_tier = max(1, min(4, section.authority_tier))
+        auth_tilt = _AUTHORITY_TILT_BY_TIER[clamped_tier]
+    recency_tilt = 0.0
+    if isinstance(section.effective_from, datetime):
+        eff_utc = (
+            section.effective_from.replace(tzinfo=UTC)
+            if section.effective_from.tzinfo is None
+            else section.effective_from.astimezone(UTC)
+        )
+        ref_utc = (
+            reference_time.replace(tzinfo=UTC)
+            if reference_time.tzinfo is None
+            else reference_time.astimezone(UTC)
+        )
+        age_days = max(0.0, (ref_utc - eff_utc).total_seconds() / 86400.0)
+        decay = math.exp(-math.log(2.0) * age_days / _RECENCY_HALF_LIFE_DAYS)
+        recency_tilt = _RECENCY_MAX_SPREAD * (decay - 0.5)
+    raw_tilt = auth_tilt + recency_tilt
+    if raw_tilt == 0.0:
+        return 0.0
+    return raw_tilt * (max_delta / _BASE_TILT_MAX_SPREAD)
+
+
+def _is_superseded_section(
+    sec: RetrievedSection,
+    *,
+    reference_time: datetime | None = None,
+) -> bool:
+    if bool(getattr(sec, "is_superseded", False)):
+        return True
+    valid_to = getattr(sec, "valid_to", None)
+    if isinstance(valid_to, datetime):
+        vt_utc = valid_to.replace(tzinfo=UTC) if valid_to.tzinfo is None else valid_to.astimezone(UTC)
+        ref_utc = (
+            (
+                reference_time.replace(tzinfo=UTC)
+                if reference_time.tzinfo is None
+                else reference_time.astimezone(UTC)
+            )
+            if isinstance(reference_time, datetime)
+            else datetime.now(UTC)
+        )
+        if vt_utc <= ref_utc:
+            return True
+    meta = normalize_text(
+        f"{sec.document_name or ''}\n{sec.section_path or ''}\n{sec.heading or ''}"
+    ).lower()
+    if any(
+        marker in meta
+        for marker in (
+            "superseded",
+            "[deprecated]",
+            "(deprecated)",
+            "[obsolete]",
+            "(obsolete)",
+            "[archived]",
+            "(archived)",
+        )
+    ):
+        return True
+    body = normalize_text(sec.content or "", preserve_code=True).lower()
+    body_norm = normalize_lexical_text(body)
+    return (
+        'status: "superseded"' in body
+        or "status: superseded" in body
+        or "status: deprecated" in body
+        or "statussuperseded" in body_norm
+        or "statusdeprecated" in body_norm
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -510,12 +690,27 @@ def rerank_sections(
     exact_lexical_keys: set[tuple[str, str]] | None = None,
     limit: int | None,
     analysis: QueryAnalysis | None = None,
+    subqueries: Sequence[str] = (),
+    entities: Sequence[str] = (),
+    temporal_mode: str | None = None,
+    reference_time: datetime | None = None,
 ) -> RerankResult:
     """Fuse retriever rank lists without assuming their scores share a scale."""
 
+    is_lineage = str(temporal_mode or "").strip().lower() == "change_lineage"
+    eval_ref_time = (
+        (
+            reference_time.replace(tzinfo=UTC)
+            if reference_time.tzinfo is None
+            else reference_time.astimezone(UTC)
+        )
+        if isinstance(reference_time, datetime)
+        else datetime.now(UTC)
+    )
     effective = analysis or analyze_query(
         query,
         segmentation_enabled=settings.search_chinese_segmentation_enabled,
+        subqueries=subqueries,
     )
     lexical = lexical or []
     lexical_keys = {_section_key(section) for section in lexical}
@@ -558,13 +753,19 @@ def rerank_sections(
                 float(previous.score or 0.0),
                 float(section.score or 0.0),
             )
+            raw_candidates = [
+                float(val)
+                for val in (previous.raw_dense_score, section.raw_dense_score)
+                if val is not None and math.isfinite(float(val))
+            ]
+            best_raw_dense = max(raw_candidates) if raw_candidates else None
             if current_preference > previous_preference:
                 representatives[key] = section.model_copy(
-                    update={"score": best_score}
+                    update={"score": best_score, "raw_dense_score": best_raw_dense}
                 )
             else:
                 representatives[key] = previous.model_copy(
-                    update={"score": best_score}
+                    update={"score": best_score, "raw_dense_score": best_raw_dense}
                 )
         preferred_keys = preferred_keys or set()
         ordered_keys = sorted(
@@ -576,9 +777,14 @@ def rerank_sections(
 
     semantic_ranks, semantic_by_key = unique_rankings(semantic)
     lexical_ranks, lexical_by_key = unique_rankings(lexical, preferred_keys=exact_keys)
-    semantic_eff_ranks = _compute_document_aware_effective_ranks(semantic_ranks, semantic_by_key)
-    lexical_eff_ranks = _compute_document_aware_effective_ranks(lexical_ranks, lexical_by_key)
+    semantic_eff_ranks = _compute_document_aware_effective_ranks(
+        semantic_ranks, semantic_by_key, distinguish_versions=is_lineage
+    )
+    lexical_eff_ranks = _compute_document_aware_effective_ranks(
+        lexical_ranks, lexical_by_key, distinguish_versions=is_lineage
+    )
     semantic_scores: dict[tuple[str, str], float] = {}
+    raw_dense_scores: dict[tuple[str, str], float] = {}
     for section in semantic:
         key = _section_key(section)
         if not key[1]:
@@ -586,6 +792,9 @@ def rerank_sections(
         score = float(section.score or 0.0)
         if math.isfinite(score):
             semantic_scores[key] = max(semantic_scores.get(key, 0.0), score, 0.0)
+        if section.raw_dense_score is not None and math.isfinite(float(section.raw_dense_score)):
+            raw_val = float(section.raw_dense_score)
+            raw_dense_scores[key] = max(raw_dense_scores.get(key, raw_val), raw_val)
     candidate_keys = set(semantic_ranks) | set(lexical_ranks)
     if not candidate_keys:
         return RerankResult([], 0, 0, 0, len(lexical))
@@ -612,7 +821,7 @@ def rerank_sections(
     raw_terms = [term for term in raw_terms if term]
     filtered_terms = [term for term in raw_terms if term not in _LEXICAL_STOPWORDS]
     query_term_list = tuple(filtered_terms if filtered_terms else raw_terms)
-    salient_terms = extract_salient_query_terms(query)
+    salient_terms = extract_salient_query_terms(query, entities=entities)
     anchor_terms = frozenset(
         norm
         for term in (
@@ -622,7 +831,15 @@ def rerank_sections(
         )
         if (norm := _normalize_query_term(term))
     )
-    clauses = decompose_query_clauses(query)
+    cleaned_subqueries = tuple(
+        dict.fromkeys(str(s).strip() for s in subqueries if str(s).strip())
+    )
+    if len(cleaned_subqueries) >= 2:
+        clauses = cleaned_subqueries[:4]
+    elif len(effective.features.clauses) >= 2:
+        clauses = effective.features.clauses
+    else:
+        clauses = decompose_query_clauses(query)
     if anchor_terms:
         query_term_list = tuple(dict.fromkeys([*query_term_list, *sorted(anchor_terms)]))
     clause_term_lists = (
@@ -660,7 +877,7 @@ def rerank_sections(
             head_roots,
             full_roots,
         )
-        d_id = _document_identity(section)
+        d_id = _document_identity(section, distinguish_versions=is_lineage)
         prev_spaced, prev_compact, prev_roots = doc_texts.get(d_id, ("", "", set()))
         next_spaced = (
             f"{prev_spaced}{full_spaced[1:]}"
@@ -701,9 +918,7 @@ def rerank_sections(
             idf *= 1.45
         term_weights[term] = idf
 
-    from sag_api.services.query_analysis import _remove_query_noise
-
-    spaced_query_phrase = _normalize_spaced_lexical_text(_remove_query_noise(query))
+    spaced_query_phrase = _normalize_spaced_lexical_text(unicodedata.normalize("NFC", query or "").strip().lower())
     top_semantic_score = max(semantic_scores.values(), default=0.0)
     lexical_scores: dict[tuple[str, str], float] = {}
     for key, section in merged.items():
@@ -773,7 +988,7 @@ def rerank_sections(
     }
     active_retrievers = int(bool(semantic_ranks)) + int(bool(lexical_ranks))
     ideal_rrf_score = active_retrievers / (_RRF_K + 1)
-    ranked: list[tuple[float, int, int, int, tuple[str, str], RetrievedSection]] = []
+    ranked: list[tuple[float, float, int, int, int, tuple[str, str], RetrievedSection]] = []
 
     for key in candidate_keys:
         section = merged[key]
@@ -793,7 +1008,7 @@ def rerank_sections(
             lex_eff = min(lex_eff, interaction_lex_ranks[key])
         exact = key in exact_keys
         lexical_match = lexical_rank is not None
-        if _is_boilerplate(section) and not lexical_match and lexical_score < 0.35:
+        if _is_boilerplate(section):
             continue
         reciprocal_rank_score = sum(
             1.0 / (_RRF_K + eff_rank + 1.0)
@@ -805,72 +1020,68 @@ def rerank_sections(
             1.0,
             0.56 * fused_score + 0.32 * lexical_score + 0.12 * relative_semantic_score,
         )
-        # Each candidate may pass through either retrieval signal. The relative
-        # semantic gate stays active even when another candidate has a lexical hit.
-        relevant = (
-            lexical_match
-            or lexical_score >= 0.2
-            or relative_semantic_score >= _SEMANTIC_RELATIVE_RELEVANCE_FLOOR
+        # Each candidate must either clear the semantic dense floor (S4-01) or earn a
+        # genuine lexical pass (explicit anchor match or strong lexical relevance when dense is OOD).
+        raw_dense = raw_dense_scores.get(key)
+        effective_raw_dense = raw_dense if raw_dense is not None else raw
+        min_dense = float(settings.search_min_dense_score)
+        semantic_relevant = (
+            semantic_rank is not None
+            and relative_semantic_score >= _SEMANTIC_RELATIVE_RELEVANCE_FLOOR
+            and effective_raw_dense >= min_dense
         )
+        _hs, full_spaced, _hc, full_compact, _hr, full_roots = section_norm_cache[key]
+        has_anchor_match = bool(
+            anchor_terms
+            and any(
+                _term_matches_text(
+                    anchor,
+                    full_spaced,
+                    spaceless_text=full_compact,
+                    root_tokens=full_roots,
+                )
+                for anchor in anchor_terms
+            )
+        )
+        dense_known_ood = raw_dense is not None and raw_dense < min_dense
+        strong_lexical = has_anchor_match or lexical_score >= 0.35
+        lexical_relevant = (
+            strong_lexical
+            if dense_known_ood
+            else (strong_lexical or (lexical_match and lexical_score >= 0.20))
+        )
+        relevant = semantic_relevant or lexical_relevant
         if not relevant:
             continue
         rank_sum = sum(rank for rank in (semantic_rank, lexical_rank) if rank is not None)
         retriever_coverage = int(semantic_rank is not None) + int(lexical_rank is not None)
+        if raw_dense is not None and section.raw_dense_score is None:
+            section = section.model_copy(update={"raw_dense_score": raw_dense})
+        tilt = _compute_authority_recency_tilt(
+            section,
+            reference_time=eval_ref_time,
+            temporal_mode=temporal_mode,
+        )
+        final_score = (
+            hybrid_score
+            if tilt == 0.0
+            else min(1.0, max(0.0, hybrid_score + tilt))
+        )
         ranked.append(
-            (hybrid_score, retriever_coverage, int(exact), rank_sum, key, section)
+            (final_score, tilt, retriever_coverage, int(exact), rank_sum, key, section)
         )
 
-    query_lower = query.lower()
-    allows_superseded = any(
-        cue in query_lower
-        for cue in (
-            "superseded",
-            "deprecated",
-            "obsolete",
-            "archived",
-            "historical",
-            "outdated",
-            "earlier",
-            "previous",
-            "bản cũ",
-            "đã thay thế",
-            "trước khi điều chỉnh",
-        )
-    )
-    if not allows_superseded and ranked:
-        def _is_superseded(sec: RetrievedSection) -> bool:
-            meta = f"{sec.document_name or ''}\n{sec.section_path or ''}\n{sec.heading or ''}".lower()
-            if any(
-                marker in meta
-                for marker in (
-                    "superseded",
-                    "[deprecated]",
-                    "(deprecated)",
-                    "[obsolete]",
-                    "(obsolete)",
-                    "[archived]",
-                    "(archived)",
-                )
-            ):
-                return True
-            body = (sec.content or "").lower()
-            body_norm = normalize_lexical_text(body)
-            return (
-                'status: "superseded"' in body
-                or "status: superseded" in body
-                or "status: deprecated" in body
-                or "statussuperseded" in body_norm
-                or "statusdeprecated" in body_norm
-            )
+    if not _query_allows_superseded(temporal_mode=temporal_mode) and ranked:
+        ranked = [
+            item
+            for item in ranked
+            if not _is_superseded_section(item[6], reference_time=eval_ref_time)
+        ]
 
-        active_ranked = [item for item in ranked if not _is_superseded(item[5])]
-        if active_ranked:
-            ranked = active_ranked
-
-    ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3], item[4]))
+    ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], -item[3], item[4], item[5]))
     selected = [
         section.model_copy(update={"score": round(score, 6), "rank": index})
-        for index, (score, _coverage, _exact, _rank_sum, _key, section) in enumerate(
+        for index, (score, _tilt, _coverage, _exact, _rank_sum, _key, section) in enumerate(
             ranked if limit is None else ranked[: max(1, limit)]
         )
     ]
@@ -918,11 +1129,15 @@ def select_diverse_sections(
     diversity_weight: float | None = None,
     near_duplicate_similarity: float | None = None,
     per_document_limit: int | None = None,
+    multi_hop: bool | None = None,
+    entities: Sequence[str] = (),
+    temporal_mode: str | None = None,
     _cancelled: threading.Event | None = None,
 ) -> tuple[list[RetrievedSection], dict[str, Any]]:
     """Collapse near-identical text and apply deterministic MMR without dropping query anchors."""
     if per_document_limit is not None and per_document_limit < 1:
         raise ValueError("per_document_limit must be positive")
+    is_lineage = str(temporal_mode or "").strip().lower() == "change_lineage"
     unbounded_limit = limit is None
     if limit is None:
         limit = len(candidates)
@@ -945,24 +1160,30 @@ def select_diverse_sections(
         raise ValueError("Near-duplicate similarity must be between 0.9 and one")
 
     features = extract_query_features(query)
-    required = tuple(
-        dict.fromkeys(
-            value
-            for term in (*features.exact_terms, *features.identifier_terms, *features.path_terms)
-            if (value := normalize_lexical_text(term))
+    effective_multi_hop = bool(multi_hop) if multi_hop is not None else features.multi_hop
+    required_groups: list[tuple[str, ...]] = []
+    seen_groups: set[tuple[str, ...]] = set()
+    for raw_group in features.anchor_groups:
+        norm_group = tuple(
+            dict.fromkeys(value for term in raw_group if (value := normalize_lexical_text(term)))
         )
-    )
+        if norm_group and norm_group not in seen_groups:
+            seen_groups.add(norm_group)
+            required_groups.append(norm_group)
+    required = tuple(required_groups)
 
-    def anchor_coverage(section: RetrievedSection) -> frozenset[str]:
+    def anchor_coverage(section: RetrievedSection) -> frozenset[int]:
         text = normalize_lexical_text(
             f"{section.document_name or ''}\n{section.section_path or ''}\n{section.heading}\n{section.content}"
         )
-        matched: set[str] = set()
-        for term in required:
-            if term in text:
-                matched.add(term)
-            elif (m_num := re.search(r"\d{4,}", term)) and m_num.group(0) in text:
-                matched.add(term)
+        matched: set[int] = set()
+        for group_idx, group in enumerate(required):
+            if any(
+                variant in text
+                or ((m_num := re.search(r"\d{4,}", variant)) is not None and m_num.group(0) in text)
+                for variant in group
+            ):
+                matched.add(group_idx)
         return frozenset(matched)
 
     def representative_key(section: RetrievedSection) -> tuple[Any, ...]:
@@ -986,7 +1207,7 @@ def select_diverse_sections(
     )
     unique: list[RetrievedSection] = []
     unique_shingles: list[frozenset[str]] = []
-    unique_coverage: list[frozenset[str]] = []
+    unique_coverage: list[frozenset[int]] = []
     def check_cancelled() -> None:
         if _cancelled is not None and _cancelled.is_set():
             raise InterruptedError("Diversity selection cancelled")
@@ -999,7 +1220,19 @@ def select_diverse_sections(
         for index, previous in enumerate(unique_shingles):
             if index % 32 == 0:
                 check_cancelled()
-            if coverage == unique_coverage[index] and _jaccard(shingles, previous) >= duplicate_threshold:
+            prev_sec = unique[index]
+            same_lineage_version = (
+                not is_lineage
+                or (
+                    (section.document_version_id or "") == (prev_sec.document_version_id or "")
+                    and bool(section.is_superseded) == bool(prev_sec.is_superseded)
+                )
+            )
+            if (
+                same_lineage_version
+                and coverage == unique_coverage[index]
+                and _jaccard(shingles, previous) >= duplicate_threshold
+            ):
                 duplicate_index = index
                 break
         if duplicate_index is None:
@@ -1011,6 +1244,9 @@ def select_diverse_sections(
             unique_shingles[duplicate_index] = shingles
 
     def doc_key(section: RetrievedSection) -> str:
+        if is_lineage and section.document_version_id:
+            base = str(section.document_id or section.document_name or "")
+            return f"{base}::ver::{section.document_version_id}" if base else str(section.document_version_id)
         return str(
             section.document_id
             or section.document_version_id
@@ -1020,15 +1256,21 @@ def select_diverse_sections(
         )
 
     selected_indices: list[int] = []
-    selected_anchors: set[str] = set()
-    for anchor in required:
-        if anchor in selected_anchors or len(selected_indices) >= limit:
+    selected_anchors: set[int] = set()
+    for anchor_idx in range(len(required)):
+        if anchor_idx in selected_anchors or len(selected_indices) >= limit:
             continue
         best = next(
             (
                 index
                 for index, coverage in enumerate(unique_coverage)
-                if anchor in coverage and index not in selected_indices and (len(unique) <= limit or float(unique[index].score or 0.0) >= min(0.55, 0.75 * float(unique[0].score or 0.0)))
+                if anchor_idx in coverage
+                and index not in selected_indices
+                and (
+                    len(unique) <= limit
+                    or float(unique[index].score or 0.0)
+                    >= min(0.55, 0.75 * float(unique[0].score or 0.0))
+                )
             ),
             None,
         )
@@ -1059,21 +1301,22 @@ def select_diverse_sections(
             doc_best_score[d_key] = float(sec.score or 0.0)
 
     top_doc_score = doc_best_score.get(ordered_docs[0], 0.0) if ordered_docs else 0.0
+    configured_admission_ratio = float(settings.search_doc_admission_ratio)
     admission_ratio = (
-        float(settings.search_doc_admission_ratio)
+        configured_admission_ratio
         if unbounded_limit
-        else min(0.75, float(settings.search_doc_admission_ratio))
-        if features.multi_hop or per_document_limit == 1
-        else max(0.94, float(settings.search_doc_admission_ratio))
+        else min(0.75, configured_admission_ratio)
+        if effective_multi_hop or per_document_limit == 1
+        else configured_admission_ratio
     )
     salient_doc_terms = {
-        term for term in extract_salient_query_terms(query) if len(term) >= 3
+        term for term in extract_salient_query_terms(query, entities=entities) if len(term) >= 3
     }
     admitted_docs: set[str] = {doc_key(unique[i]) for i in selected_indices}
     if ordered_docs:
         admitted_docs.add(ordered_docs[0])
-        allow_wide_docs = unbounded_limit or features.multi_hop or per_document_limit == 1
-        max_initial_docs = limit if allow_wide_docs else min(limit, 2)
+        allow_wide_docs = unbounded_limit or effective_multi_hop or per_document_limit == 1 or is_lineage
+        max_initial_docs = limit
         for doc_rank_idx, d_key in enumerate(ordered_docs[1:], start=1):
             if len(admitted_docs) >= max_initial_docs:
                 break
@@ -1082,7 +1325,8 @@ def select_diverse_sections(
                 admission_ratio
                 if (
                     unbounded_limit
-                    or (not features.multi_hop and per_document_limit != 1)
+                    or is_lineage
+                    or (not effective_multi_hop and per_document_limit != 1)
                     or doc_rank_idx == 1
                     or len(unique) <= limit + 1
                 )
@@ -1134,7 +1378,7 @@ def select_diverse_sections(
     fallback_doc_floor = max(0.20, admission_ratio * top_doc_score)
     same_doc_penalty_weight = (
         max(0.08, float(settings.search_same_doc_penalty_weight))
-        if features.multi_hop
+        if effective_multi_hop
         else float(settings.search_same_doc_penalty_weight)
     )
     compared = [0] * len(unique)
@@ -1142,10 +1386,20 @@ def select_diverse_sections(
 
     def max_redundancy(index: int) -> float:
         # Each pair is unchanged across MMR rounds; compare only newly selected evidence.
+        cand_sec = unique[index]
         for offset, chosen in enumerate(selected_indices[compared[index]:]):
             if offset % 32 == 0:
                 check_cancelled()
-            redundancy[index] = max(redundancy[index], _jaccard(unique_shingles[index], unique_shingles[chosen]))
+            sim = _jaccard(unique_shingles[index], unique_shingles[chosen])
+            if is_lineage:
+                chosen_sec = unique[chosen]
+                if (
+                    cand_sec.document_id
+                    and cand_sec.document_id == chosen_sec.document_id
+                    and (cand_sec.document_version_id or "") != (chosen_sec.document_version_id or "")
+                ):
+                    sim *= 0.25
+            redundancy[index] = max(redundancy[index], sim)
         compared[index] = len(selected_indices)
         return redundancy[index]
 
@@ -1169,7 +1423,8 @@ def select_diverse_sections(
             )
             allow_wide_sample = (
                 unbounded_limit
-                or features.multi_hop
+                or is_lineage
+                or effective_multi_hop
                 or per_document_limit == 1
                 or len(unique) <= limit + 1
             )
@@ -1177,10 +1432,10 @@ def select_diverse_sections(
                 max(0.20, 0.40 * top_doc_score)
                 if (per_document_limit == 1 and all_initial_single_chunk)
                 else fallback_doc_floor
-                if (unbounded_limit or per_document_limit == 1 or (features.multi_hop and len(unique) <= limit + 1))
-                else max(0.45, 0.78 * top_doc_score)
+                if (unbounded_limit or per_document_limit == 1 or (effective_multi_hop and len(unique) <= limit + 1))
+                else max(0.45, fallback_doc_floor)
                 if allow_wide_sample
-                else max(0.55, 0.88 * top_doc_score)
+                else fallback_doc_floor
             )
             next_doc = next(
                 (
@@ -1252,7 +1507,7 @@ def select_diverse_sections(
             "not_required"
             if not required
             else "complete"
-            if set(required) <= covered
+            if len(covered) == len(required)
             else "missing_required_anchor"
         ),
     }
@@ -1272,15 +1527,20 @@ async def _lexical_sections(
         return [], set()
 
     semaphore = asyncio.Semaphore(max(1, settings.search_source_concurrency))
-    expanded_keys = {
+    anchor_keys = {
         normalize_lexical_text(term)
-        for term in analysis.expanded_terms
+        for term in (
+            *analysis.features.exact_terms,
+            *analysis.features.identifier_terms,
+            *analysis.features.path_terms,
+        )
+        if normalize_lexical_text(term)
     }
 
     async def one(
         source: SearchSource,
         term: str,
-    ) -> tuple[list[RetrievedSection], bool]:
+    ) -> tuple[list[RetrievedSection], str | None]:
         async with semaphore:
             try:
                 options: dict[str, Any] = {
@@ -1306,8 +1566,13 @@ async def _lexical_sections(
                     term,
                     **options,
                 )
-            except Exception:  # noqa: BLE001
-                return [], False
+            except (ApiError, SagError, httpx.HTTPError, TimeoutError, OSError, SQLAlchemyError) as exc:
+                log.warning(
+                    "Lexical grep_chunks failed for source=%s error_type=%s",
+                    source.id,
+                    type(exc).__name__,
+                )
+                return [], None
         sections = [
             RetrievedSection(
                 chunk_id=row.get("chunk_id"),
@@ -1320,15 +1585,17 @@ async def _lexical_sections(
             )
             for index, row in enumerate(rows)
         ]
-        return sections, normalize_lexical_text(term) not in expanded_keys
+        term_key = normalize_lexical_text(term)
+        return sections, term_key if (anchor_keys and term_key in anchor_keys) else None
 
     groups = await asyncio.gather(*(one(source, term) for source in sources for term in terms))
-    sections = [section for group, _strong in groups for section in group]
+    sections = [section for group, _anchor_key in groups for section in group]
     exact_keys = {
         _section_key(section)
-        for group, strong in groups
-        if strong
+        for group, anchor_key in groups
+        if anchor_key
         for section in group
+        if anchor_key in normalize_lexical_text(f"{section.heading}\n{section.content}")
     }
     return sections, exact_keys
 
@@ -1340,21 +1607,43 @@ async def retrieve_relevant_sections(
     *,
     strategy: str | None = None,
     top_k: int | None = None,
+    query_strategy_plan: QueryStrategyPlan | None = None,
 ) -> SearchOutcome:
     """One retrieval contract for search UI and the Agent's search_context tool."""
-    from sag_api.services.retrieval_plan import TargetUnit, build_retrieval_plan, group_sections_by_document
+    from sag_api.services.retrieval_plan import (
+        TargetUnit,
+        build_retrieval_plan,
+        group_sections_by_document,
+        rebuild_retrieval_plan_with_top_k,
+    )
 
     total_start = time.perf_counter()
-    analysis = analyze_query(
-        query,
-        segmentation_enabled=settings.search_chinese_segmentation_enabled,
-    )
-    retrieval_plan = build_retrieval_plan(
-        query,
-        requested_top_k=top_k,
-        clauses=analysis.features.clauses,
-        multi_hop=analysis.features.multi_hop,
-    )
+    if query_strategy_plan is not None:
+        retrieval_plan = rebuild_retrieval_plan_with_top_k(query_strategy_plan.retrieval_plan, top_k)
+        subqueries = retrieval_plan.decomposition.subqueries
+        multi_hop_hint = bool(query_strategy_plan.multi_hop_eligible)
+        entities = retrieval_plan.entities
+        temporal_mode: str | None = retrieval_plan.temporal_mode
+        analysis = analyze_query(
+            query,
+            segmentation_enabled=settings.search_chinese_segmentation_enabled,
+            subqueries=subqueries,
+            multi_hop_hint=multi_hop_hint,
+        )
+    else:
+        subqueries = ()
+        entities = ()
+        temporal_mode = None
+        analysis = analyze_query(
+            query,
+            segmentation_enabled=settings.search_chinese_segmentation_enabled,
+        )
+        retrieval_plan = build_retrieval_plan(
+            query,
+            requested_top_k=top_k,
+            clauses=analysis.features.clauses,
+            multi_hop=analysis.features.multi_hop,
+        )
     effective_top_k = retrieval_plan.cardinality.effective_n
     requested_limit = min(effective_top_k, settings.search_unit_candidate_limit)
     candidate_limit = min(settings.search_unit_candidate_limit, max(requested_limit * 4, 20))
@@ -1411,9 +1700,16 @@ async def retrieve_relevant_sections(
         exact_lexical_keys=exact_lexical_keys,
         limit=rerank_pool_limit,
         analysis=analysis,
+        subqueries=subqueries,
+        entities=entities,
+        temporal_mode=temporal_mode,
     )
     final_sections = (
-        group_sections_by_document(reranked.sections, limit=requested_limit)
+        group_sections_by_document(
+            reranked.sections,
+            limit=requested_limit,
+            temporal_mode=temporal_mode,
+        )
         if retrieval_plan.target == TargetUnit.DOCUMENT
         else reranked.sections[:requested_limit]
     )
@@ -1511,13 +1807,13 @@ def _best_excerpt(
         query,
         segmentation_enabled=settings.search_chinese_segmentation_enabled,
     )
-    content = re.sub(r"\s+", " ", section.content).strip()
+    content = normalize_text(section.content, preserve_code=True)
     if not content:
         return section.heading.strip()
-    sentences = [part.strip() for part in re.split(r"(?<=[。！？.!?])", content) if part.strip()]
+    sentences = [" ".join(part.split()) for part in split_sentences_multilingual(content) if part.strip()]
     terms = [normalize_lexical_text(term) for term in effective.scoring_terms]
     best = max(
-        sentences or [content],
+        sentences or [" ".join(content.split())],
         key=lambda sentence: sum(term in normalize_lexical_text(sentence) for term in terms),
     )
     return best[:limit] + ("…" if len(best) > limit else "")
@@ -1538,29 +1834,6 @@ def fallback_search_answer(query: str, sections: list[RetrievedSection]) -> str:
 
 
 _MULTI_CITATION_BRACKET_RE = re.compile(r"\[(\d+(?:\s*[,;]\s*\d+)+)]")
-_ABSTENTION_PREFIX_RE = re.compile(
-    r"^\s*(?:insufficient[_\s-]evidence\b|"
-    r"the\s+(?:provided\s+|available\s+|retrieved\s+)?(?:evidence|documents?|context|sources?)\s+"
-    r"(?:do(?:es)?\s+not|cannot)\s+(?:contain|specify|mention|provide|include|state|answer)\b|"
-    r"based\s+on\s+the\s+(?:provided\s+|available\s+)?(?:evidence|documents?|context),\s+there\s+is\s+no\s+(?:information|mention)\b|"
-    r"(?:bằng\s+chứng|tài\s+liệu)\s+(?:được\s+cung\s+cấp\s+)?không\s+(?:chứa|đề\s+cập|nêu|có\s+thông\s+tin)\b)",
-    re.IGNORECASE,
-)
-_UNGROUNDED_REFUSAL_CUES = (
-    "does not contain",
-    "does not specify",
-    "does not mention",
-    "does not provide",
-    "do not contain",
-    "do not specify",
-    "do not mention",
-    "not mentioned in the provided",
-    "not specified in the provided",
-    "cannot be determined from the provided",
-    "insufficient evidence",
-    "không có thông tin",
-    "không đề cập",
-)
 
 
 def _normalize_citation_brackets(text: str) -> str:
@@ -1570,17 +1843,16 @@ def _normalize_citation_brackets(text: str) -> str:
     )
 
 
-def _is_abstention_response(answer: str) -> bool:
-    text = answer.strip()
-    if not text:
-        return False
-    lowered = text.lower()
-    if "insufficient_evidence" in lowered or _ABSTENTION_PREFIX_RE.search(text):
-        return True
-    normalized = _normalize_citation_brackets(text)
-    if not _CITATION_RE.findall(normalized) and any(cue in lowered for cue in _UNGROUNDED_REFUSAL_CUES):
-        return True
-    return False
+def _parse_structured_search_answer(raw_text: str) -> tuple[str | None, str | None]:
+    for obj in decode_json_values(raw_text, expected_type=dict):
+        answerability = obj.get("answerability")
+        if isinstance(answerability, str):
+            norm_ans = answerability.strip().lower()
+            if norm_ans in {"answered", "insufficient_evidence"}:
+                raw_ans = obj.get("answer")
+                ans_text = raw_ans.strip() if isinstance(raw_ans, str) else ""
+                return norm_ans, ans_text
+    return None, None
 
 
 def _validated_answer(answer: str, section_count: int) -> str | None:
@@ -1622,17 +1894,21 @@ def _build_search_citations(
 class SearchAnswerUpdate:
     kind: Literal["delta", "completed"]
     text: str
-    status: Literal["answered", "no_answer"] = "answered"
+    status: Literal["answered", "extractive_fallback", "no_answer"] = "answered"
     no_answer_reason: str | None = None
     citations: list[dict[str, Any]] | None = None
+    degraded: bool = False
+    degraded_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class SearchAnswer:
     text: str
     citations: list[dict[str, Any]]
-    status: Literal["answered", "no_answer", "skipped"]
+    status: Literal["answered", "extractive_fallback", "no_answer", "skipped"]
     no_answer_reason: str | None = None
+    degraded: bool = False
+    degraded_reason: str | None = None
 
 
 async def synthesize_search_answer(
@@ -1647,28 +1923,50 @@ async def synthesize_search_answer(
     verified_sections = await resolve_traceable_evidence(sections, sources or []) if sources is not None else sections
     pack = build_evidence_pack(query, verified_sections)
     if pack.status != "sufficient":
-        return SearchAnswer(no_answer_text(), [], "no_answer", pack.no_answer_reason)
+        return SearchAnswer(no_answer_text(query=query), [], "no_answer", pack.no_answer_reason)
 
     citations = _build_search_citations(pack.sections, sources or [])
     if len(citations) != len(pack.sections) or any(not citation.get("source_id") for citation in citations):
-        return SearchAnswer(no_answer_text(), [], "no_answer", "weak_evidence")
+        return SearchAnswer(no_answer_text(query=query), [], "no_answer", "weak_evidence")
     fallback = fallback_search_answer(query, pack.sections)
     if llm is None or not getattr(llm, "configured", False):
-        return SearchAnswer(fallback, _citations_used_by_answer(fallback, citations), "answered")
+        return SearchAnswer(
+            fallback,
+            _citations_used_by_answer(fallback, citations),
+            "extractive_fallback",
+            degraded=True,
+            degraded_reason="llm_unconfigured",
+        )
 
     from sag_api.core.token_usage import token_usage_scope
 
     try:
         with token_usage_scope(component="answer_generation"):
-            answer = await llm.complete(pack.messages)
+            answer = await llm.complete(pack.messages, response_format={"type": "json_object"})
     except Exception as error:  # noqa: BLE001
-        log.warning("搜索答案生成失败，回退证据摘要：%s", error)
-        return SearchAnswer(fallback, _citations_used_by_answer(fallback, citations), "answered")
-    if _is_abstention_response(answer):
-        return SearchAnswer(no_answer_text(), [], "no_answer", "insufficient_evidence")
-    validated = _validated_answer(answer, len(pack.sections))
-    canonical = validated or fallback
-    return SearchAnswer(canonical, _citations_used_by_answer(canonical, citations), "answered")
+        log.warning("Search synthesis failed; returning extractive fallback (%s)", type(error).__name__)
+        return SearchAnswer(
+            fallback,
+            _citations_used_by_answer(fallback, citations),
+            "extractive_fallback",
+            degraded=True,
+            degraded_reason=f"llm_error:{type(error).__name__}",
+        )
+    answerability, parsed_answer = _parse_structured_search_answer(answer)
+    if answerability == "insufficient_evidence":
+        return SearchAnswer(no_answer_text(query=query), [], "no_answer", "insufficient_evidence")
+    if answerability is None:
+        return SearchAnswer(
+            fallback,
+            _citations_used_by_answer(fallback, citations),
+            "extractive_fallback",
+            degraded=True,
+            degraded_reason="invalid_structured_output",
+        )
+    validated = _validated_answer(parsed_answer or "", len(pack.sections))
+    if validated is None:
+        return SearchAnswer(no_answer_text(query=query), [], "no_answer", "weak_evidence")
+    return SearchAnswer(validated, _citations_used_by_answer(validated, citations), "answered")
 
 
 async def stream_synthesize_search_answer(
@@ -1685,7 +1983,7 @@ async def stream_synthesize_search_answer(
     if pack.status != "sufficient":
         yield SearchAnswerUpdate(
             kind="completed",
-            text=no_answer_text(),
+            text=no_answer_text(query=query),
             status="no_answer",
             no_answer_reason=pack.no_answer_reason,
             citations=[],
@@ -1696,7 +1994,7 @@ async def stream_synthesize_search_answer(
     if len(citations) != len(pack.sections) or any(not citation.get("source_id") for citation in citations):
         yield SearchAnswerUpdate(
             kind="completed",
-            text=no_answer_text(),
+            text=no_answer_text(query=query),
             status="no_answer",
             no_answer_reason="weak_evidence",
             citations=[],
@@ -1705,8 +2003,21 @@ async def stream_synthesize_search_answer(
     fallback = fallback_search_answer(query, pack.sections)
     if llm is None or not getattr(llm, "configured", False):
         used_citations = _citations_used_by_answer(fallback, citations)
-        yield SearchAnswerUpdate(kind="delta", text=fallback)
-        yield SearchAnswerUpdate(kind="completed", text=fallback, citations=used_citations)
+        yield SearchAnswerUpdate(
+            kind="delta",
+            text=fallback,
+            status="extractive_fallback",
+            degraded=True,
+            degraded_reason="llm_unconfigured",
+        )
+        yield SearchAnswerUpdate(
+            kind="completed",
+            text=fallback,
+            status="extractive_fallback",
+            citations=used_citations,
+            degraded=True,
+            degraded_reason="llm_unconfigured",
+        )
         return
 
     from sag_api.core.token_usage import token_usage_scope
@@ -1714,35 +2025,73 @@ async def stream_synthesize_search_answer(
     parts: list[str] = []
     try:
         with token_usage_scope(component="answer_generation"):
-            async for delta in llm.stream_complete(pack.messages):
+            async for delta in llm.stream_complete(pack.messages, response_format={"type": "json_object"}):
                 if delta:
                     parts.append(delta)
     except asyncio.CancelledError:
         raise
     except Exception as error:  # noqa: BLE001
-        log.warning("搜索答案流生成失败，回退证据摘要：%s", error)
+        log.warning("Search stream synthesis failed; returning extractive fallback (%s)", type(error).__name__)
         fallback_citations = _citations_used_by_answer(fallback, citations)
+        reason = f"llm_error:{type(error).__name__}"
+        yield SearchAnswerUpdate(
+            kind="delta",
+            text=fallback,
+            status="extractive_fallback",
+            degraded=True,
+            degraded_reason=reason,
+        )
         yield SearchAnswerUpdate(
             kind="completed",
             text=fallback,
+            status="extractive_fallback",
             citations=fallback_citations,
+            degraded=True,
+            degraded_reason=reason,
         )
         return
 
     raw_answer = "".join(parts)
-    if _is_abstention_response(raw_answer):
+    answerability, parsed_answer = _parse_structured_search_answer(raw_answer)
+    if answerability == "insufficient_evidence":
         yield SearchAnswerUpdate(
             kind="completed",
-            text=no_answer_text(),
+            text=no_answer_text(query=query),
             status="no_answer",
             no_answer_reason="insufficient_evidence",
             citations=[],
         )
         return
-    validated = _validated_answer(raw_answer, len(pack.sections))
-    answer = validated or fallback
-    used_citations = _citations_used_by_answer(answer, citations)
+    if answerability is None:
+        fallback_citations = _citations_used_by_answer(fallback, citations)
+        yield SearchAnswerUpdate(
+            kind="delta",
+            text=fallback,
+            status="extractive_fallback",
+            degraded=True,
+            degraded_reason="invalid_structured_output",
+        )
+        yield SearchAnswerUpdate(
+            kind="completed",
+            text=fallback,
+            status="extractive_fallback",
+            citations=fallback_citations,
+            degraded=True,
+            degraded_reason="invalid_structured_output",
+        )
+        return
+    validated = _validated_answer(parsed_answer or "", len(pack.sections))
+    if validated is None:
+        yield SearchAnswerUpdate(
+            kind="completed",
+            text=no_answer_text(query=query),
+            status="no_answer",
+            no_answer_reason="weak_evidence",
+            citations=[],
+        )
+        return
+    used_citations = _citations_used_by_answer(validated, citations)
     # Provider deltas remain private until citation syntax is checked against
     # this exact pack. Only the canonical text is sent as a single delta.
-    yield SearchAnswerUpdate(kind="delta", text=answer)
-    yield SearchAnswerUpdate(kind="completed", text=answer, citations=used_citations)
+    yield SearchAnswerUpdate(kind="delta", text=validated)
+    yield SearchAnswerUpdate(kind="completed", text=validated, citations=used_citations)

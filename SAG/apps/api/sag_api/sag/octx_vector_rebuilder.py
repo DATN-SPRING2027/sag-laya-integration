@@ -195,7 +195,11 @@ async def rebuild_vectors(
         checkpoint["counts"] = dict(counts)
         await on_checkpoint(checkpoint)
 
-    dimensions = int(getattr(embedding, "dimensions", 0) or 0)
+    dimensions = int(
+        getattr(embedding, "schema_dimensions", None)
+        or getattr(embedding, "dimensions", 0)
+        or 0
+    )
 
     def kind_batch_size(roles: tuple[str, ...]) -> int:
         if dimensions and all(role in reusable for role in roles):

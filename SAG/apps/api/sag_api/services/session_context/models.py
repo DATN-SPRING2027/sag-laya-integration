@@ -75,6 +75,9 @@ class IndexedTurn:
     supersedes_turn_ids: tuple[str, ...] = ()
     superseded_entity_keys: tuple[str, ...] = ()
     is_anaphoric_or_short: bool = False
+    is_interrogative: bool = False
+    intrinsic_epistemic_status: EpistemicStatus | None = None
+    extraction_degraded: bool = False
     cited_source_ids: tuple[str, ...] = ()
 
 
@@ -179,6 +182,8 @@ class ContextAuditTrace:
     persistence_status: str = "memory_only"
     persisted_units_written: int = 0
     qdrant_points_upserted: int = 0
+    extraction_degraded: bool = False
+    extraction_degraded_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -229,6 +234,8 @@ class ContextAuditTrace:
             "persistence_status": self.persistence_status,
             "persisted_units_written": self.persisted_units_written,
             "qdrant_points_upserted": self.qdrant_points_upserted,
+            "extraction_degraded": self.extraction_degraded,
+            "extraction_degraded_reason": self.extraction_degraded_reason,
         }
 
 

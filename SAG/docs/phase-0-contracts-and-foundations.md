@@ -1,6 +1,8 @@
 # Đặc Tả Kiến Trúc & Hợp Đồng Dữ Liệu Nền Tảng (Phase 0 — Contracts & Foundations)
 ## SAG Knowledge Routing RAG • Baseline Research & Implementation Contracts
 
+> **SUPERSEDED (2026-11-25):** Các phần trong tài liệu này mô tả **Laya Local Router** (`services/laya_router.py`, `LayaIntentResult`, `error_layer="laya"`, `laya_ms`) và **Tier E2 LLM Enrichment** đã bị **thay thế vĩnh viễn** theo [adr-remove-laya-and-r2.md](adr-remove-laya-and-r2.md) và [adr-remove-e2-llm-enrichment.md](adr-remove-e2-llm-enrichment.md). Luồng thực tế dùng `services/decision_router.py` và `Phase 2C SearchUnit` + `Phase 5A FOUNDATION (E0/E1)`.
+
 > **Jira Ticket**: [DATN-23](https://trankimthang0207.atlassian.net/browse/DATN-23)  
 > **Người thực hiện**: Phan Thành Tài (Tài - DE190491)  
 > **Tài liệu tham chiếu chuẩn**: [SAG_Knowledge_Routing_RAG_Workflow_v1.1.md](SAG_Knowledge_Routing_RAG_Workflow_v1.1.md)  

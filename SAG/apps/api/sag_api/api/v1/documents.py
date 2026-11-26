@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 
 from fastapi import (
     APIRouter,
-    Body,
     Depends,
     File,
     Form,
@@ -38,8 +38,9 @@ from sag_api.core.principal_assertion import (
     require_project_bff_principal,
     require_project_read_principal,
 )
+from sag_api.core.text_utils import normalize_text
 from sag_api.db.models import Document, User
-from sag_api.enums import DocumentStatus
+from sag_api.enums import DocumentStatus, normalize_authority_tier, normalize_scope_tags
 from sag_api.jobs import JobQueue
 from sag_api.parsing.text import (
     TextDecodingError,
@@ -51,8 +52,8 @@ from sag_api.schemas.common import Ok
 from sag_api.schemas.document import DocumentOut, IngestRequest
 from sag_api.schemas.job import JobOut
 from sag_api.schemas.routing_rag import (
-    DocumentObjectIngestRequest,
-    DocumentReprocessRequest,
+    DocumentMetadataPatchRequest,
+    DocumentMetadataPatchResponse,
     DocumentRevokeRequest,
     DocumentRevokeResponse,
     DocumentUploadResponse,
@@ -62,17 +63,20 @@ from sag_api.schemas.routing_rag import (
     ProjectDocumentReadinessBatchResponse,
 )
 from sag_api.services.document_service import (
+    commit_document_version_metadata_patch,
+    compact_logical_source_id,
     delete_document,
+    finalize_document_version_metadata_sync,
     get_document_version_chunks,
     get_document_version_status,
     get_or_create_project_source,
     get_project_document_readiness_batch,
     get_public_document,
-    handle_document_object_ingest,
     handle_document_upload,
     ingest_content,
     pause_document,
     reprocess_document,
+    resolve_document_parsed_markdown,
     resolve_project_document,
     resume_document,
     revoke_project_document,
@@ -93,6 +97,119 @@ router = APIRouter(
 project_router = APIRouter(prefix="/projects/{project_id}/documents", tags=["documents"])
 log = get_logger("documents")
 
+_SENTINEL_EFFECTIVE_CUTOFF = datetime(9999, 1, 1, 0, 0, 0, tzinfo=UTC)
+
+
+def get_optional_engine_manager(request: Request) -> EngineManager | None:
+    return getattr(request.app.state, "engine_manager", None)
+
+
+def _parse_authority_tier_form(raw: str | None) -> int | None:
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    if not stripped:
+        return None
+    if stripped.casefold() in {"true", "false"}:
+        raise ValidationError(
+            "authority_tier cannot be a boolean",
+            layer=ErrorLayer.CLIENT,
+            stage=ErrorStage.UPLOAD,
+        )
+    try:
+        return normalize_authority_tier(stripped)
+    except ValueError as exc:
+        raise ValidationError(
+            str(exc),
+            layer=ErrorLayer.CLIENT,
+            stage=ErrorStage.UPLOAD,
+        ) from exc
+
+
+def _parse_effective_from_form(raw: str | None) -> datetime | None:
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    if not stripped:
+        return None
+    iso = f"{stripped[:-1]}+00:00" if stripped.endswith(("Z", "z")) else stripped
+    try:
+        parsed = datetime.fromisoformat(iso)
+    except ValueError as exc:
+        raise ValidationError(
+            "effective_from must be a valid ISO-8601 date or datetime",
+            layer=ErrorLayer.CLIENT,
+            stage=ErrorStage.UPLOAD,
+        ) from exc
+    dt = parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+    if dt >= _SENTINEL_EFFECTIVE_CUTOFF:
+        raise ValidationError(
+            "effective_from must be earlier than 9999-01-01T00:00:00Z",
+            layer=ErrorLayer.CLIENT,
+            stage=ErrorStage.UPLOAD,
+        )
+    return dt
+
+
+def _parse_scope_tags_form(raw: str | None) -> list[str] | None:
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    if not stripped:
+        return None
+    if stripped.startswith("["):
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            raise ValidationError(
+                "scope_tags JSON must be a valid array of strings",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            ) from exc
+        if not isinstance(parsed, list):
+            raise ValidationError(
+                "scope_tags JSON must be a list of strings",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            )
+        if len(parsed) > 16:
+            raise ValidationError(
+                "scope_tags cannot exceed 16 tags",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            )
+        tokens: list[object] = parsed
+    else:
+        tokens = [part.strip() for part in stripped.split(",") if part.strip()]
+        if not tokens:
+            return None
+        if len(tokens) > 16:
+            raise ValidationError(
+                "scope_tags cannot exceed 16 tags",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            )
+    try:
+        normalized = normalize_scope_tags(tokens)
+    except ValueError as exc:
+        raise ValidationError(
+            str(exc),
+            layer=ErrorLayer.CLIENT,
+            stage=ErrorStage.UPLOAD,
+        ) from exc
+    return normalized or None
+
+
+def _patch_metadata_kwargs(payload: DocumentMetadataPatchRequest) -> dict[str, object]:
+    kwargs: dict[str, object] = {}
+    if "authority_tier" in payload.model_fields_set:
+        kwargs["authority_tier"] = payload.authority_tier
+    if "effective_from" in payload.model_fields_set:
+        kwargs["effective_from"] = payload.effective_from
+    if "scope_tags" in payload.model_fields_set:
+        kwargs["scope_tags"] = payload.scope_tags
+    return kwargs
+
 
 def _check_extension(filename: str | None) -> None:
     """Validate upload extension against whitelist (empty whitelist = no limit)."""
@@ -106,8 +223,9 @@ def _check_extension(filename: str | None) -> None:
 
 
 def _upload_filename(filename: str | None) -> str:
-    """Strip client paths from multipart filenames on POSIX and Windows."""
-    return (filename or "upload").replace("\\", "/").rsplit("/", maxsplit=1)[-1] or "upload"
+    """Strip client paths from multipart filenames on POSIX and Windows and normalize to NFC."""
+    base = (filename or "upload").replace("\\", "/").rsplit("/", maxsplit=1)[-1] or "upload"
+    return normalize_text(base, preserve_code=True) or "upload"
 
 
 async def _source_upload_scope(
@@ -276,13 +394,21 @@ async def upload(
     file: UploadFile = File(...),
     project_id: str | None = Form(None),
     logical_source_id: str | None = Form(None),
+    source_published_at: datetime | None = Form(None),
+    authority_tier: str | None = Form(None),
+    effective_from: str | None = Form(None),
+    scope_tags: str | None = Form(None),
     idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
     x_continuum_security_partition: str | None = Header(None, alias="X-Continuum-Security-Partition"),
     _user: User = Depends(get_current_user_or_connector),
     principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
     job_queue: JobQueue | None = Depends(get_job_queue),
+    engine_manager: EngineManager | None = Depends(get_optional_engine_manager),
 ) -> DocumentOut:
+    parsed_authority_tier = _parse_authority_tier_form(authority_tier)
+    parsed_effective_from = _parse_effective_from_form(effective_from)
+    parsed_scope_tags = _parse_scope_tags_form(scope_tags)
     folder_import_header = request.headers.get("X-SAG-Folder-Import-Id") if request else None
     filename = _upload_filename(file.filename)
     request_id = getattr(request.state, "request_id", None) if request else None
@@ -325,6 +451,11 @@ async def upload(
                 project_id=project_id,
                 partition_id=x_continuum_security_partition,
             )
+            norm_logical_source_id = (
+                compact_logical_source_id(normalize_text(logical_source_id, preserve_code=True))
+                if logical_source_id
+                else None
+            )
             result = await handle_document_upload(
                 session,
                 tenant_id=tenant_id,
@@ -335,9 +466,15 @@ async def upload(
                 file_bytes=data,
                 original_filename=filename,
                 content_type=file.content_type or "application/octet-stream",
-                logical_source_id=logical_source_id or f"source:{source.id}:{filename}",
+                logical_source_id=norm_logical_source_id
+                or compact_logical_source_id(f"source:{source.id}:{filename}"),
+                source_published_at=source_published_at,
+                authority_tier=parsed_authority_tier,
+                effective_from=parsed_effective_from,
+                scope_tags=parsed_scope_tags,
                 job_queue=job_queue,
                 source_id=source.id,
+                engine_manager=engine_manager,
             )
             document = await session.get(Document, result.document_id)
             if document is None:
@@ -382,6 +519,7 @@ async def ingest(
     principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
     job_queue: JobQueue | None = Depends(get_job_queue),
+    engine_manager: EngineManager | None = Depends(get_optional_engine_manager),
 ) -> DocumentOut:
     """Unified ingestion endpoint: external systems continuously push text or messages into source."""
     async with source_document_mutation(SessionLocal, source_id, "document-ingest"):
@@ -393,6 +531,16 @@ async def ingest(
             project_id=body.project_id,
             partition_id=x_continuum_security_partition,
         )
+        norm_messages = None
+        if body.messages:
+            norm_messages = []
+            for m in body.messages:
+                d = m.model_dump()
+                if isinstance(d.get("text"), str):
+                    d["text"] = normalize_text(d["text"], preserve_code=True)
+                if isinstance(d.get("author"), str):
+                    d["author"] = normalize_text(d["author"])
+                norm_messages.append(d)
         document = await ingest_content(
             session,
             source,
@@ -401,13 +549,62 @@ async def ingest(
             owner_id=principal.subject,
             security_partition_id=partition_id,
             client_token=idempotency_key or f"source-ingest-{uuid.uuid4().hex}",
-            text=body.text,
-            title=body.title,
-            messages=[m.model_dump() for m in body.messages] if body.messages else None,
-            logical_source_id=body.logical_source_id,
+            text=normalize_text(body.text, preserve_code=True) if body.text else None,
+            title=normalize_text(body.title) if body.title else None,
+            messages=norm_messages,
+            logical_source_id=(
+                normalize_text(body.logical_source_id, preserve_code=True) if body.logical_source_id else None
+            ),
+            source_published_at=body.source_published_at,
+            authority_tier=body.authority_tier,
+            effective_from=body.effective_from,
+            scope_tags=body.scope_tags,
             job_queue=job_queue,
+            engine_manager=engine_manager,
         )
     return DocumentOut.model_validate(document)
+
+
+@router.patch("/{document_id}/metadata", response_model=DocumentMetadataPatchResponse)
+async def patch_source_document_metadata(
+    source_id: str,
+    document_id: str,
+    payload: DocumentMetadataPatchRequest,
+    _user: User = Depends(get_current_user_or_connector),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
+    session: AsyncSession = Depends(get_session),
+    job_queue: JobQueue | None = Depends(get_job_queue),
+    engine_manager: EngineManager | None = Depends(get_optional_engine_manager),
+) -> DocumentMetadataPatchResponse:
+    """Source-scoped tri-state partial update for document version authority/temporal metadata."""
+    source = await get_source(session, source_id)
+    doc = await get_public_document(session, source, document_id, principal=principal)
+    project_id = doc.project_id or await get_authorized_source_project(
+        session,
+        principal=principal,
+        source_id=source.id,
+        project_id=None,
+    )
+    if not principal.tenant_id or project_id not in principal.allowed_project_ids:
+        raise ForbiddenError(
+            f"Principal '{principal.subject}' is not authorized to access project '{project_id}'"
+        )
+    async with source_document_mutation(SessionLocal, source.id, "document-metadata-patch"):
+        prepared = await commit_document_version_metadata_patch(
+            session,
+            tenant_id=principal.tenant_id,
+            project_id=project_id,
+            document_id=doc.id,
+            allowed_partition_ids=principal.allowed_partition_ids,
+            version_no=payload.version_no,
+            **_patch_metadata_kwargs(payload),
+        )
+    return await finalize_document_version_metadata_sync(
+        session,
+        prepared,
+        engine_manager=engine_manager,
+        job_queue=job_queue,
+    )
 
 
 @router.get("/{document_id}", response_model=DocumentOut)
@@ -508,13 +705,13 @@ async def get_parsed(
         if document.status == DocumentStatus.FAILED:
             raise ConflictError(document.error or "Document parsing failed, no parsed content available")
         raise ConflictError("Document parsing is still in progress")
-    if not document.sag_source_id:
-        raise NotFoundError("Parsed content not found, please reprocess the document")
 
-    markdown = await engine_manager.get_document_markdown(
-        source.sag_source_config_id,
-        document.sag_source_id,
+    markdown = await resolve_document_parsed_markdown(
+        session,
+        document=document,
         source=source,
+        principal=principal,
+        engine_manager=engine_manager,
     )
     if not markdown:
         raise NotFoundError("Parsed content not found, please reprocess the document")
@@ -627,6 +824,9 @@ async def upload_document_version(
     file: UploadFile = File(...),
     source_published_at: datetime | None = Form(None),
     logical_source_id: str | None = Form(None),
+    authority_tier: str | None = Form(None),
+    effective_from: str | None = Form(None),
+    scope_tags: str | None = Form(None),
     idempotency_key: str = Header(..., alias="Idempotency-Key"),
     x_continuum_user_id: str | None = Header(None, alias="X-Continuum-User-Id"),
     x_continuum_security_partition: str | None = Header(None, alias="X-Continuum-Security-Partition"),
@@ -634,6 +834,7 @@ async def upload_document_version(
     principal: VerifiedPrincipal = Depends(require_project_bff_principal),
     session: AsyncSession = Depends(get_session),
     job_queue: JobQueue | None = Depends(get_job_queue),
+    engine_manager: EngineManager | None = Depends(get_optional_engine_manager),
 ) -> DocumentUploadResponse:
     # Scope check 1: Project membership boundary
     if project_id not in principal.allowed_project_ids:
@@ -666,6 +867,10 @@ async def upload_document_version(
             f"Principal '{principal.subject}' is not authorized for security partition '{partition}'"
         )
 
+    parsed_authority_tier = _parse_authority_tier_form(authority_tier)
+    parsed_effective_from = _parse_effective_from_form(effective_from)
+    parsed_scope_tags = _parse_scope_tags_form(scope_tags)
+
     filename = _upload_filename(file.filename)
     _check_extension(filename)
 
@@ -683,84 +888,23 @@ async def upload_document_version(
         file_bytes=file_bytes,
         original_filename=filename,
         content_type=file.content_type or "application/octet-stream",
-        logical_source_id=logical_source_id,
+        logical_source_id=(
+            compact_logical_source_id(normalize_text(logical_source_id, preserve_code=True))
+            if logical_source_id
+            else None
+        ),
         source_published_at=source_published_at,
+        authority_tier=parsed_authority_tier,
+        effective_from=parsed_effective_from,
+        scope_tags=parsed_scope_tags,
         job_queue=job_queue,
+        engine_manager=engine_manager,
     )
 
     if result.is_duplicate:
         response.status_code = status.HTTP_200_OK
     else:
         response.status_code = status.HTTP_201_CREATED
-
-    return result
-
-
-@project_router.post(
-    "/ingest-object",
-    response_model=DocumentUploadResponse,
-    summary="Zero-buffer ingest of a document version from an authorized R2/S3 presigned URL",
-)
-async def ingest_document_object_version(
-    project_id: str,
-    payload: DocumentObjectIngestRequest,
-    response: Response,
-    idempotency_key: str = Header(..., alias="Idempotency-Key"),
-    x_continuum_user_id: str | None = Header(None, alias="X-Continuum-User-Id"),
-    x_continuum_security_partition: str | None = Header(None, alias="X-Continuum-Security-Partition"),
-    x_continuum_tenant_id: str | None = Header(None, alias="X-Continuum-Tenant-Id"),
-    principal: VerifiedPrincipal = Depends(require_project_bff_principal),
-    session: AsyncSession = Depends(get_session),
-    job_queue: JobQueue | None = Depends(get_job_queue),
-) -> DocumentUploadResponse:
-    if project_id not in principal.allowed_project_ids:
-        raise ForbiddenError(
-            f"Principal '{principal.subject}' is not authorized to access project '{project_id}'"
-        )
-    if x_continuum_user_id and x_continuum_user_id != principal.subject:
-        raise ForbiddenError("X-Continuum-User-Id does not match the signed principal")
-    if not principal.tenant_id:
-        raise ForbiddenError("The signed principal assertion has no tenant scope")
-    if x_continuum_tenant_id and x_continuum_tenant_id != principal.tenant_id:
-        raise ForbiddenError("X-Continuum-Tenant-Id does not match the signed principal")
-
-    partition = x_continuum_security_partition
-    if not partition or not partition.strip():
-        if len(principal.allowed_partition_ids) == 1:
-            partition = next(iter(principal.allowed_partition_ids))
-        else:
-            raise ValidationError(
-                "X-Continuum-Security-Partition header is required to enforce data isolation"
-            )
-    if partition not in principal.allowed_partition_ids:
-        raise ForbiddenError(
-            f"Principal '{principal.subject}' is not authorized for security partition '{partition}'"
-        )
-
-    filename = _upload_filename(payload.original_filename)
-    _check_extension(filename)
-
-    result = await handle_document_object_ingest(
-        session,
-        tenant_id=principal.tenant_id,
-        project_id=project_id,
-        owner_id=principal.subject,
-        security_partition_id=partition,
-        client_token=idempotency_key,
-        source_url=payload.source_url,
-        original_filename=filename,
-        expected_sha256=payload.expected_sha256,
-        expected_size_bytes=payload.expected_size_bytes,
-        content_type=payload.content_type or "application/octet-stream",
-        logical_source_id=payload.logical_source_id,
-        source_published_at=payload.source_published_at,
-        job_queue=job_queue,
-    )
-
-    if result.is_duplicate:
-        response.status_code = status.HTTP_200_OK
-    else:
-        response.status_code = status.HTTP_202_ACCEPTED
 
     return result
 
@@ -948,8 +1092,6 @@ async def resume_project_document_endpoint(
     summary="Reprocess a project document from failed or ready state",
 )
 async def reprocess_project_document_endpoint(
-    payload: DocumentReprocessRequest | None = Body(default=None),
-    *,
     project_id: str,
     document_id: str,
     principal: VerifiedPrincipal = Depends(require_project_bff_principal),
@@ -965,10 +1107,6 @@ async def reprocess_project_document_endpoint(
             source,
             doc.id,
             job_queue=job_queue,
-            remote_source_url=payload.source_url if payload else None,
-            expected_sha256=payload.expected_sha256 if payload else None,
-            expected_size_bytes=payload.expected_size_bytes if payload else None,
-            original_filename=payload.original_filename if payload else None,
         )
     return JobOut.model_validate(job)
 
@@ -1005,4 +1143,50 @@ async def query_document_version_chunks(
             allowed_projects=principal.allowed_project_ids,
             allowed_partitions=principal.allowed_partition_ids,
         ),
+    )
+
+
+@project_router.patch(
+    "/{document_id}/metadata",
+    response_model=DocumentMetadataPatchResponse,
+    summary="Update authority_tier, effective_from, or scope_tags on a project document version",
+)
+async def patch_project_document_metadata(
+    project_id: str,
+    document_id: str,
+    payload: DocumentMetadataPatchRequest,
+    x_continuum_tenant_id: str | None = Header(None, alias="X-Continuum-Tenant-Id"),
+    principal: VerifiedPrincipal = Depends(require_project_bff_principal),
+    session: AsyncSession = Depends(get_session),
+    job_queue: JobQueue | None = Depends(get_job_queue),
+    engine_manager: EngineManager | None = Depends(get_optional_engine_manager),
+) -> DocumentMetadataPatchResponse:
+    if project_id not in principal.allowed_project_ids or not principal.tenant_id:
+        raise ForbiddenError(
+            f"Principal '{principal.subject}' is not authorized to access project '{project_id}'"
+        )
+    if x_continuum_tenant_id and x_continuum_tenant_id != principal.tenant_id:
+        raise ForbiddenError("X-Continuum-Tenant-Id does not match the signed principal")
+
+    doc, source = await _resolve_project_document_with_source(
+        session,
+        principal=principal,
+        project_id=project_id,
+        document_id=document_id,
+    )
+    async with source_document_mutation(SessionLocal, source.id, "document-metadata-patch"):
+        prepared = await commit_document_version_metadata_patch(
+            session,
+            tenant_id=principal.tenant_id,
+            project_id=project_id,
+            document_id=doc.id,
+            allowed_partition_ids=principal.allowed_partition_ids,
+            version_no=payload.version_no,
+            **_patch_metadata_kwargs(payload),
+        )
+    return await finalize_document_version_metadata_sync(
+        session,
+        prepared,
+        engine_manager=engine_manager,
+        job_queue=job_queue,
     )

@@ -235,9 +235,39 @@ async def mcp_descriptor(
 async def sync(
     source_id: str,
     _user: User = Depends(get_current_user),
-    _authorized_source: Source = Depends(require_path_source_access),
+    authorized_source: Source = Depends(require_path_source_access),
+    principal: VerifiedPrincipal = Depends(require_principal_assertion),
     session: AsyncSession = Depends(get_session),
     job_queue: JobQueue = Depends(get_job_queue),
 ) -> JobOut:
-    job = await sync_source(session, source_id, job_queue=job_queue)
+    from sag_api.db.models import SourceProjectMapping
+
+    mapping = await session.scalar(
+        select(SourceProjectMapping)
+        .where(
+            SourceProjectMapping.source_id == authorized_source.id,
+            SourceProjectMapping.state == "CONFIRMED",
+        )
+        .order_by(SourceProjectMapping.created_at.asc())
+        .limit(1)
+    )
+    project_id = (
+        mapping.project_id
+        if mapping and principal.has_project_access(mapping.project_id)
+        else (sorted(principal.allowed_project_ids)[0] if len(principal.allowed_project_ids) == 1 else None)
+    )
+    partition_id = (
+        project_id
+        if project_id and project_id in principal.allowed_partitions
+        else (sorted(principal.allowed_partitions)[0] if principal.allowed_partitions else None)
+    )
+    job = await sync_source(
+        session,
+        source_id,
+        job_queue=job_queue,
+        tenant_id=principal.tenant_id,
+        project_id=project_id,
+        owner_id=principal.subject,
+        security_partition_id=partition_id,
+    )
     return JobOut.model_validate(job)

@@ -40,6 +40,7 @@ from sag_api.services.session_context import (
     set_custom_session_qdrant_client_factory,
 )
 from sag_api.services.session_context.substrate import deterministic_ngram_vector
+from tests.ecce_test_helpers import StructuredExtractorTestLLM
 
 
 def _principal(*, org_id: str = "org-continuum", project_id: str = "proj-alpha") -> VerifiedPrincipal:
@@ -258,6 +259,12 @@ async def test_lazy_backfill_and_incremental_delta_sync_with_qdrant(monkeypatch)
     """Chặng 3.1: Lazy Backfill on legacy thread + O(Delta) append + trigger-safe EPISODE growth + Qdrant."""
     monkeypatch.setattr(settings, "session_context_mode", "on")
     monkeypatch.setattr(settings, "decision_provider", "disabled")
+    # S3-04: Qdrant sync skips deterministic-ngram-v1 fallback vectors; inject an HTTP embedder to test Qdrant sync.
+    http_embedder = _CountingHttpModelEmbedder(model="BAAI/bge-m3", dim=64)
+    monkeypatch.setattr(
+        "sag_api.services.session_context.runtime.resolve_session_embedder",
+        lambda e=None: e if e is not None else http_embedder,
+    )
 
     qdrant = _InMemoryQdrantEmulator()
     q_client = qdrant.make_client()
@@ -314,6 +321,7 @@ async def test_lazy_backfill_and_incremental_delta_sync_with_qdrant(monkeypatch)
         await session.commit()
 
         # 1. First ask triggers Lazy Backfill across all 4 tables + Qdrant!
+        extractor_llm = StructuredExtractorTestLLM()
         plan_1 = await agent_domain.prepare_ask(
             session,
             agent=agent,
@@ -321,6 +329,7 @@ async def test_lazy_backfill_and_incremental_delta_sync_with_qdrant(monkeypatch)
             query="Dịch vụ thanh toán lõi hiện chốt dùng database nào?",
             principal=principal,
             owner_key=owner_key,
+            llm=extractor_llm,
         )
         trace_1 = plan_1.session_audit_trace
         assert trace_1 is not None
@@ -404,7 +413,7 @@ async def test_lazy_backfill_and_incremental_delta_sync_with_qdrant(monkeypatch)
         for pt in qdrant.points[col_name].values():
             assert "content" not in pt["payload"]
             assert "summary_text" not in pt["payload"]
-            assert len(pt["vector"]["content_vector"]) == 256
+            assert len(pt["vector"]["content_vector"]) == 64
             assert "indices" in pt["vector"]["bm25_sparse"]
 
         # 2. Persist assistant reply & run 2nd ask on warm cache -> O(Delta) sync + grown EPISODE replacement!
@@ -421,6 +430,7 @@ async def test_lazy_backfill_and_incremental_delta_sync_with_qdrant(monkeypatch)
             query="Kiểm tra lại hạn mức kết nối connection pool?",
             principal=principal,
             owner_key=owner_key,
+            llm=extractor_llm,
         )
         trace_2 = plan_2.session_audit_trace
         assert trace_2 is not None
@@ -500,6 +510,7 @@ async def test_cold_start_worker_restart_hydrates_from_db_and_qdrant_with_zero_h
         current_q_msg = msgs[-1]
 
         # Initial cold materialization (embeds 4 historical turns + their sentences + query)
+        extractor_llm = StructuredExtractorTestLLM()
         pack_initial = await prepare_session_context_for_ask(
             session,
             thread_id=thread.id,
@@ -511,6 +522,7 @@ async def test_cold_start_worker_restart_hydrates_from_db_and_qdrant_with_zero_h
             budget_tokens=1200,
             embedder=http_embedder,
             qdrant_client=q_client,
+            llm=extractor_llm,
         )
         assert pack_initial.audit_trace.persistence_status == "lazy_backfill"
         assert len(http_embedder.batches) >= 2  # historical batch + query batch
@@ -531,6 +543,7 @@ async def test_cold_start_worker_restart_hydrates_from_db_and_qdrant_with_zero_h
             budget_tokens=1200,
             embedder=http_embedder,
             qdrant_client=q_client,
+            llm=extractor_llm,
         )
         assert pack_hydrated.audit_trace.persistence_status == "hydrated_clean"
         assert pack_hydrated.audit_trace.persisted_units_written == 0
@@ -565,6 +578,7 @@ async def test_cold_start_worker_restart_hydrates_from_db_and_qdrant_with_zero_h
             budget_tokens=1200,
             embedder=http_embedder,
             qdrant_client=q_client,
+            llm=extractor_llm,
         )
         assert pack_delta.audit_trace.persistence_status == "hydrated_delta"
         # First batch embeds ONLY `current_q_msg` ("Câu hỏi hiện tại?"), NEVER the 4 earlier turns!
@@ -583,6 +597,12 @@ async def test_middle_of_window_delete_via_raw_sql_and_api_reconciles_db_and_qdr
     """Chặng 3.3: Deleting middle message B in A-B-C reconciles ordinals, lineage, windows, and Qdrant."""
     monkeypatch.setattr(settings, "session_context_mode", "on")
     monkeypatch.setattr(settings, "decision_provider", "disabled")
+    # S3-04: Qdrant sync skips deterministic-ngram-v1 fallback vectors; inject an HTTP embedder to test Qdrant sync.
+    http_embedder = _CountingHttpModelEmbedder(model="BAAI/bge-m3", dim=64)
+    monkeypatch.setattr(
+        "sag_api.services.session_context.runtime.resolve_session_embedder",
+        lambda e=None: e if e is not None else http_embedder,
+    )
 
     qdrant = _InMemoryQdrantEmulator()
     q_client = qdrant.make_client()
@@ -624,6 +644,7 @@ async def test_middle_of_window_delete_via_raw_sql_and_api_reconciles_db_and_qdr
         session.add_all([msg_a, msg_b, msg_c])
         await session.commit()
 
+        extractor_llm = StructuredExtractorTestLLM()
         _ = await agent_domain.prepare_ask(
             session,
             agent=agent,
@@ -631,6 +652,7 @@ async def test_middle_of_window_delete_via_raw_sql_and_api_reconciles_db_and_qdr
             query="Module lưu vết kiểm toán đang chốt dùng gì?",
             principal=principal,
             owner_key=owner_key,
+            llm=extractor_llm,
         )
         # Before deleting B: A is SUPERSEDED by B
         dec_before = list(
@@ -670,6 +692,7 @@ async def test_middle_of_window_delete_via_raw_sql_and_api_reconciles_db_and_qdr
             query="Đề xuất hiện còn hiệu lực cho module lưu vết kiểm toán là gì?",
             principal=principal,
             owner_key=owner_key,
+            llm=extractor_llm,
         )
         assert plan_reconciled.session_audit_trace is not None
         assert plan_reconciled.session_audit_trace["persistence_status"] == "reconciled_rebuild"
@@ -716,6 +739,7 @@ async def test_middle_of_window_delete_via_raw_sql_and_api_reconciles_db_and_qdr
             query="Kiểm tra lại kế hoạch thứ Sáu?",
             principal=principal,
             owner_key=owner_key,
+            llm=extractor_llm,
         )
         assert len(qdrant.points[col_name]) > 0
         await agent_domain.delete_thread(session, agent.id, thread.id, owner_key=owner_key)
@@ -732,6 +756,12 @@ async def test_continuum_acl_revocation_purges_storage_and_cross_tenant_blocked_
     """Chặng 3.4: Source revocation purges persisted units & Qdrant; cross-tenant principal raises 403."""
     monkeypatch.setattr(settings, "session_context_mode", "on")
     monkeypatch.setattr(settings, "decision_provider", "disabled")
+    # S3-04: Qdrant sync skips deterministic-ngram-v1 fallback vectors; inject an HTTP embedder to test Qdrant sync.
+    http_embedder = _CountingHttpModelEmbedder(model="BAAI/bge-m3", dim=64)
+    monkeypatch.setattr(
+        "sag_api.services.session_context.runtime.resolve_session_embedder",
+        lambda e=None: e if e is not None else http_embedder,
+    )
 
     qdrant = _InMemoryQdrantEmulator()
     q_client = qdrant.make_client()
@@ -911,7 +941,8 @@ async def test_embedding_signature_drift_recreates_qdrant_and_orphan_reconciler(
         session.add_all([m0, m_ask])
         await session.commit()
 
-        # 1. Default deterministic_ngram (`dim=256`, `deterministic-ngram-v1`)
+        # 1. Default deterministic_ngram (`dim=256`, `deterministic-ngram-v1`):
+        #    S3-04 skips Qdrant upsert for fallback vectors so 256-d hashes never pollute Qdrant.
         pack_det = await prepare_session_context_for_ask(
             session,
             thread_id=thread.id,
@@ -925,7 +956,8 @@ async def test_embedding_signature_drift_recreates_qdrant_and_orphan_reconciler(
             qdrant_client=q_client,
         )
         assert pack_det.audit_trace.persistence_status == "lazy_backfill"
-        assert qdrant.collections[col_name]["vectors"]["content_vector"]["size"] == 256
+        assert pack_det.audit_trace.qdrant_points_upserted == 0
+        assert col_name not in qdrant.collections
 
         # 2. Switch to HTTP embedder (`http:BAAI/bge-m3`, `dim=64`) WITHOUT clearing warm cache!
         bge_embedder = _CountingHttpModelEmbedder(model="BAAI/bge-m3", dim=64)
@@ -996,6 +1028,12 @@ async def test_http_model_a_to_http_model_b_drift_with_warm_cache_and_provenance
 
     monkeypatch.setattr(settings, "session_context_mode", "on")
     monkeypatch.setattr(settings, "decision_provider", "disabled")
+    # S3-04: Qdrant sync skips deterministic-ngram-v1 fallback vectors; inject an HTTP embedder to test Qdrant sync.
+    http_embedder = _CountingHttpModelEmbedder(model="BAAI/bge-m3", dim=64)
+    monkeypatch.setattr(
+        "sag_api.services.session_context.runtime.resolve_session_embedder",
+        lambda e=None: e if e is not None else http_embedder,
+    )
 
     qdrant = _InMemoryQdrantEmulator()
     q_client = qdrant.make_client()
@@ -1055,8 +1093,10 @@ async def test_http_model_a_to_http_model_b_drift_with_warm_cache_and_provenance
         assert len(model_a.batches) >= 1
         assert qdrant.collections[col_name]["vectors"]["content_vector"]["size"] == 64
 
-        # 2. Switch to HTTP Model B (`dim=32`) WITHOUT clearing `_SHARED_TEXT_EMBEDDING_CACHE` or `SESSION_INDEX_CACHE`!
-        model_b = _CountingHttpModelEmbedder(model="provider/model-B", dim=32)
+        # 2. Switch to same-dim HTTP Model B (`dim=64`) WITHOUT clearing
+        #    `_SHARED_TEXT_EMBEDDING_CACHE` or `SESSION_INDEX_CACHE`!
+        #    S3-04: collection is never dropped on dimension mismatch; same-dim model swap updates points cleanly.
+        model_b = _CountingHttpModelEmbedder(model="provider/model-B", dim=64)
         pack_b = await prepare_session_context_for_ask(
             session,
             thread_id=thread.id,
@@ -1085,11 +1125,28 @@ async def test_http_model_a_to_http_model_b_drift_with_warm_cache_and_provenance
             .all()
         )
         assert sigs_b == {"http:provider/model-B"}
-        assert qdrant.collections[col_name]["vectors"]["content_vector"]["size"] == 32
+        assert qdrant.collections[col_name]["vectors"]["content_vector"]["size"] == 64
         assert len(qdrant.points[col_name]) == 5  # 2 TURN + 2 WINDOW + 1 EPISODE
         for pt in qdrant.points[col_name].values():
-            assert len(pt["vector"]["content_vector"]) == 32
+            assert len(pt["vector"]["content_vector"]) == 64
             assert pt["payload"]["embedding_model_signature"] == "http:provider/model-B"
+
+        # 2b. Mismatched-dim Model B2 (`dim=32`) MUST NOT delete the shared 64-d project collection!
+        model_b_32 = _CountingHttpModelEmbedder(model="provider/model-B-32", dim=32)
+        pack_b32 = await prepare_session_context_for_ask(
+            session,
+            thread_id=thread.id,
+            exclude_message_id=m_ask.id,
+            query="Cụm biên đang dùng API Gateway nào?",
+            principal=principal,
+            owner_key=owner_key,
+            requested_source_ids=None,
+            budget_tokens=900,
+            embedder=model_b_32,
+            qdrant_client=q_client,
+        )
+        assert pack_b32.audit_trace.qdrant_points_upserted == 0
+        assert qdrant.collections[col_name]["vectors"]["content_vector"]["size"] == 64
 
         # 3. Failing HTTP Model C (`503`) must NOT overwrite DB/Qdrant with fallback vectors
         class _FailingHttpEmbedder:
@@ -1121,8 +1178,8 @@ async def test_http_model_a_to_http_model_b_drift_with_warm_cache_and_provenance
             .scalars()
             .all()
         )
-        assert sigs_after_c == {"http:provider/model-B"}
-        assert qdrant.collections[col_name]["vectors"]["content_vector"]["size"] == 32
+        assert sigs_after_c == {"http:provider/model-B-32"}
+        assert qdrant.collections[col_name]["vectors"]["content_vector"]["size"] == 64
 
         # Direct provenance & dimension guard check on `sync_session_index_to_storage`
         bad_idx = IncrementalSessionIndex(thread.id)
@@ -1626,6 +1683,7 @@ async def test_multi_project_principal_resolves_unique_source_mapping_and_skips_
             owner_key=owner_key,
             requested_source_ids=None,
             budget_tokens=900,
+            embedder=_CountingHttpModelEmbedder(model="BAAI/bge-m3", dim=64),
             qdrant_client=q_client,
         )
         assert pack_beta.audit_trace.persistence_status == "lazy_backfill"
@@ -1958,3 +2016,79 @@ async def test_reconcile_orphan_session_units_enforces_acl_and_purges_revoked_un
 
     await q_client.aclose()
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_prepare_session_context_forwards_llm_client_to_route_query_async(monkeypatch):
+    from sag_api.services.decision_router import IntentFlags, UnifiedRouteDecision
+    from sag_api.services.session_context import runtime as sc_runtime
+
+    engine = await _make_fk_sqlite_engine()
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    principal = _principal(project_id="proj-llm-fwd")
+    owner_key = "owner-llm-fwd"
+    captured_calls: list[dict[str, Any]] = []
+
+    async def fake_route_query_async(query: str, **kwargs):
+        captured_calls.append({"query": query, **kwargs})
+        return UnifiedRouteDecision(
+            query=query,
+            coarse_intent="KNOWLEDGE",
+            question_scope="project",
+            memory_scope="project_documents",
+            temporal_mode="current_effective",
+            answer_shape="fact_answer",
+            intent_flags=IntentFlags(needs_retrieval=True),
+            domain="general",
+            confidence=0.95,
+        )
+
+    monkeypatch.setattr(sc_runtime, "route_query_async", fake_route_query_async)
+    custom_llm = StructuredExtractorTestLLM()
+
+    try:
+        async with session_factory() as session:
+            agent = Agent(owner_key=owner_key, name="LLM Fwd Agent")
+            session.add(agent)
+            await session.flush()
+            thread = Thread(agent_id=agent.id, owner_key=owner_key, title="LLM Fwd Thread")
+            session.add(thread)
+            await session.flush()
+            msg = Message(
+                id="msg-llm-fwd",
+                thread_id=thread.id,
+                role=MessageRole.USER,
+                content="Chính sách bảo mật là gì?",
+            )
+            session.add(msg)
+            await session.commit()
+
+            monkeypatch.setattr(sc_runtime.settings, "decision_provider", "llm")
+            await prepare_session_context_for_ask(
+                session,
+                thread_id=thread.id,
+                exclude_message_id=msg.id,
+                query=msg.content,
+                principal=principal,
+                owner_key=owner_key,
+                requested_source_ids=None,
+                budget_tokens=900,
+                llm=custom_llm,
+            )
+            assert captured_calls[-1]["llm_client"] is custom_llm
+
+            monkeypatch.setattr(sc_runtime.settings, "decision_provider", "siliconflow")
+            await prepare_session_context_for_ask(
+                session,
+                thread_id=thread.id,
+                exclude_message_id=msg.id,
+                query=msg.content,
+                principal=principal,
+                owner_key=owner_key,
+                requested_source_ids=None,
+                budget_tokens=900,
+                llm=custom_llm,
+            )
+            assert captured_calls[-1]["llm_client"] is None
+    finally:
+        await engine.dispose()

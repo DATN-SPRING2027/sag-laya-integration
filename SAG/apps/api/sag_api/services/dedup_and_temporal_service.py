@@ -26,13 +26,14 @@ from sqlalchemy import desc, inspect, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.logging import get_logger
+from sag_api.core.text_utils import normalize_text
 from sag_api.db.models.document import Document
 from sag_api.db.models.routing_rag import (
     CanonicalBlock,
     DocumentVersion,
-    KnowledgeGraphEdge,
     StageRun,
 )
+from sag_api.enums import normalize_scope_tags
 
 log = get_logger("services.dedup_temporal")
 
@@ -56,13 +57,16 @@ _MINHASH_PREFIXES = tuple(hashlib.md5(f"{i}:".encode()) for i in range(256))
 
 
 def compute_minhash_signature(tokens: Sequence[str], num_perm: int = 128) -> list[int]:
-    """Compute 128-permutation MinHash signature for token k-shingles (k=5 per Phase 2B plan)."""
+    """Compute 128-permutation MinHash signature (unigrams for <5 tokens, k=5 shingles otherwise)."""
     if not tokens:
         return [0] * num_perm
-    k = min(5, len(tokens))
-    shingles = {" ".join(tokens[i : i + k]) for i in range(len(tokens) - k + 1)}
-    if not shingles:
+    if len(tokens) < 5:
         shingles = set(tokens)
+    else:
+        k = 5
+        shingles = {" ".join(tokens[i : i + k]) for i in range(len(tokens) - k + 1)}
+        if not shingles:
+            shingles = set(tokens)
 
     encoded = [shingle.encode() for shingle in shingles]
     from_bytes = int.from_bytes
@@ -100,12 +104,12 @@ def tokenize_for_minhash(text: str) -> list[str]:
     """
     if not text:
         return []
-    return _MINHASH_TOKEN_RE.findall(text.casefold())
+    return _MINHASH_TOKEN_RE.findall(normalize_text(text).casefold())
 
 
 _MINHASH_CACHE: OrderedDict[str, list[int]] = OrderedDict()
 _MINHASH_LOCKS = WeakKeyDictionary()
-_MINHASH_ALGORITHM = "md5-128-k5-v2"
+_MINHASH_ALGORITHM = "md5-128-k5-v3"
 
 
 async def _block_signatures(blocks, *, persist_ids):
@@ -192,18 +196,19 @@ def compute_text_similarity(text1: str, text2: str) -> float:
 # ---------------------------------------------------------------------------
 # Pillar 3: Symmetric Structural Diff (Delta) for Relation Classification
 # ---------------------------------------------------------------------------
-_THOUSANDS_COMMA_RE = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
+# Multi-group thousands separator only (e.g. 1,000,000 -> 1000000); never corrupt single-comma decimals like 1,500.
+_MULTI_GROUP_THOUSANDS_RE = re.compile(r"\b\d{1,3}(?:,\d{3}){2,}\b")
 _EN_WON_T_RE = re.compile(r"\bwon['’]t\b")
 _EN_CAN_T_RE = re.compile(r"\b(?:can['’]t|cannot)\b")
 _EN_N_T_RE = re.compile(r"\b(\w+?)n['’]t\b")
 _DIFF_TOKEN_RE = re.compile(
     r"v\d+(?:\.\d+)+"
-    r"|\d+(?:[./:-]\d+)+%?"
+    r"|\d+(?:[.,/:-]\d+)+%?"
     r"|\d+(?:\.\d+)?%?"
     r"|[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u0e00-\u0eff\u1780-\u17ff\u1000-\u109f]"
     r"|\w+"
 )
-_QUANT_TOKEN_RE = re.compile(r"^(?:v\d+(?:\.\d+)+|\d+(?:[./:-]\d+)*%?)$")
+_QUANT_TOKEN_RE = re.compile(r"^(?:v\d+(?:\.\d+)+|\d+(?:[.,/:-]\d+)*%?)$")
 
 _SCALE_UNITS: dict[str, str] = {
     "b": "b", "bytes": "b", "byte": "b",
@@ -246,8 +251,9 @@ _NEUTRAL_AUX: frozenset[str] = frozenset({
     "được", "bị", "có", "là", "đã", "sẽ", "đang", "phải",
 })
 
+# Only unambiguous productive negation prefixes (avoid blind in-/dis-/un- collisions like formation/information)
 _NEG_MORPH_PREFIXES: tuple[str, ...] = (
-    "non", "dis", "un", "in", "im", "il", "ir", "не", "без", "бес", "des",
+    "non", "не",
 )
 
 _STATE_ANTONYM_PAIRS: frozenset[tuple[str, str]] = frozenset(
@@ -266,12 +272,78 @@ _STATE_ANTONYM_PAIRS: frozenset[tuple[str, str]] = frozenset(
         ("permitted", "forbidden"),
         ("permitted", "denied"),
         ("mandatory", "optional"),
+        ("required", "optional"),
         ("required", "prohibited"),
         ("required", "forbidden"),
         ("active", "inactive"),
+        ("valid", "invalid"),
+        ("visible", "invisible"),
+        ("compatible", "incompatible"),
+        ("complete", "incomplete"),
+        ("consistent", "inconsistent"),
+        ("correct", "incorrect"),
+        ("direct", "indirect"),
+        ("secure", "insecure"),
+        ("sufficient", "insufficient"),
+        ("accessible", "inaccessible"),
+        ("accurate", "inaccurate"),
+        ("eligible", "ineligible"),
+        ("reversible", "irreversible"),
+        ("mutable", "immutable"),
+        ("possible", "impossible"),
+        ("probable", "improbable"),
+        ("legal", "illegal"),
+        ("logical", "illogical"),
+        ("regular", "irregular"),
+        ("relevant", "irrelevant"),
+        ("available", "unavailable"),
+        ("authorized", "unauthorized"),
+        ("authenticated", "unauthenticated"),
+        ("encrypted", "unencrypted"),
+        ("verified", "unverified"),
+        ("safe", "unsafe"),
+        ("trusted", "untrusted"),
+        ("known", "unknown"),
+        ("locked", "unlocked"),
+        ("masked", "unmasked"),
+        ("signed", "unsigned"),
+        ("supported", "unsupported"),
+        ("restricted", "unrestricted"),
+        ("limited", "unlimited"),
+        ("changed", "unchanged"),
+        ("modified", "unmodified"),
+        ("stable", "unstable"),
+        ("healthy", "unhealthy"),
+        ("connect", "disconnect"),
+        ("connected", "disconnected"),
+        ("continued", "discontinued"),
+        ("approved", "disapproved"),
+        ("agreed", "disagreed"),
+        ("pass", "fail"),
+        ("passed", "failed"),
+        ("accept", "reject"),
+        ("accepted", "rejected"),
+        ("grant", "revoke"),
+        ("granted", "revoked"),
+        ("public", "private"),
+        ("open", "closed"),
         ("on", "off"),
-        ("yes", "no"),
-        ("cho", "cấm"),
+        ("bật", "tắt"),
+    )
+    for pair in ((a, b), (b, a))
+)
+
+# Direct phrase/particle antonym pairs evaluated before polarity-particle stripping
+_PHRASE_ANTONYM_PAIRS: frozenset[tuple[tuple[str, ...], tuple[str, ...]]] = frozenset(
+    pair
+    for a, b in (
+        (("yes",), ("no",)),
+        (("cho", "phép"), ("cấm",)),
+        (("được", "phép"), ("cấm",)),
+        (("cho",), ("cấm",)),
+        (("bắt", "buộc"), ("tùy", "chọn")),
+        (("bắt", "buộc"), ("cấm",)),
+        (("hợp", "lệ"), ("bất", "hợp", "lệ")),
     )
     for pair in ((a, b), (b, a))
 )
@@ -300,7 +372,10 @@ _LIFECYCLE_SUPERSEDE_JOINED: frozenset[str] = frozenset({
 
 
 def _tokenize_for_diff(text: str) -> list[str]:
-    norm = _THOUSANDS_COMMA_RE.sub("", text.casefold())
+    norm = _MULTI_GROUP_THOUSANDS_RE.sub(
+        lambda m: m.group(0).replace(",", ""),
+        normalize_text(text).casefold(),
+    )
     norm = _EN_WON_T_RE.sub("will not", norm)
     norm = _EN_CAN_T_RE.sub("can not", norm)
     norm = _EN_N_T_RE.sub(r"\1 not", norm)
@@ -363,6 +438,13 @@ def _hunk_is_polarity_flip(h1: list[str], h2: list[str]) -> bool:
     if max(len(h1), len(h2)) > 3:
         return False
 
+    if (tuple(h1), tuple(h2)) in _PHRASE_ANTONYM_PAIRS:
+        return True
+    core1 = tuple(tok for tok in h1 if tok not in _NEUTRAL_AUX)
+    core2 = tuple(tok for tok in h2 if tok not in _NEUTRAL_AUX)
+    if (core1, core2) in _PHRASE_ANTONYM_PAIRS:
+        return True
+
     sign1, rem1 = _decompose_polarity_hunk(h1)
     sign2, rem2 = _decompose_polarity_hunk(h2)
     if not rem1 and not rem2:
@@ -409,7 +491,6 @@ def detect_semantic_signals(
         return False, False, False
 
     is_contradiction = False
-    is_support = False
     is_supersede = False
 
     matcher = difflib.SequenceMatcher(None, toks1, toks2, autojunk=False)
@@ -447,7 +528,7 @@ def detect_semantic_signals(
         if _hunk_has_lifecycle_supersede(h1, h2):
             is_supersede = True
 
-    return is_contradiction, is_support, is_supersede
+    return is_contradiction, False, is_supersede
 
 
 # ---------------------------------------------------------------------------
@@ -623,49 +704,56 @@ def classify_relation_candidate(
         return RELATION_SUPPORTS
     if sim_score >= 0.85:
         return RELATION_EQUIVALENT
-    if sim_score >= 0.50:
-        return RELATION_RELATED
     return RELATION_RELATED
 
 
-async def register_relation_candidate(
-    session: AsyncSession,
+def _as_utc(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
+def _resolve_version_start(
+    version: DocumentVersion,
     *,
-    project_id: str,
-    source_unit_id: str,
-    target_unit_id: str,
-    edge_type: str,
-    weight: float,
-    evidence_mapping: dict[str, Any] | None = None,
-) -> KnowledgeGraphEdge:
-    """Record a semantic edge candidate.
+    include_valid_from: bool = True,
+    include_created_at: bool = True,
+    fallback: datetime | None = None,
+) -> datetime | None:
+    """Resolve canonical effective start timestamp.
 
-    Enforces that CONTRADICTS and SUPERSEDES relations remain isolated candidates
-    with provenance evidence, without destructive auto-merge.
+    Precedence: effective_from > source_published_at > observed_at [> valid_from] [> created_at] > fallback.
     """
-    if edge_type not in VALID_RELATIONS:
-        raise ValueError(f"Invalid relation type: {edge_type}. Must be one of {VALID_RELATIONS}")
-
-    metadata = evidence_mapping or {}
-    metadata.setdefault("is_candidate", True)
-    metadata.setdefault("auto_merged", False)
-
-    # In case of CONTRADICTS / SUPERSEDES, record strict audit trail
-    if edge_type in {RELATION_CONTRADICTS, RELATION_SUPERSEDES}:
-        metadata["requires_human_or_eval_resolution"] = True
-
-    edge = KnowledgeGraphEdge(
-        id=str(uuid.uuid4()),
-        project_id=project_id,
-        source_unit_id=source_unit_id,
-        target_unit_id=target_unit_id,
-        edge_type=edge_type,
-        weight=weight,
-        calibrated_weight=weight,
-        metadata_json=metadata,
+    raw = (
+        getattr(version, "effective_from", None)
+        or getattr(version, "source_published_at", None)
+        or getattr(version, "observed_at", None)
+        or (getattr(version, "valid_from", None) if include_valid_from else None)
+        or (getattr(version, "created_at", None) if include_created_at else None)
+        or fallback
     )
-    session.add(edge)
-    return edge
+    return _as_utc(raw)
+
+
+def _build_mutated_version_entry(
+    v: DocumentVersion,
+    *,
+    max_valid_to: datetime,
+) -> dict[str, Any]:
+    cur_from = _as_utc(v.valid_from)
+    cur_to = _as_utc(v.valid_to)
+    eff_from = _as_utc(getattr(v, "effective_from", None))
+    return {
+        "version_id": str(v.id),
+        "valid_from": cur_from,
+        "valid_to": cur_to,
+        "is_superseded": bool(cur_to is not None and cur_to < max_valid_to),
+        "authority_tier": getattr(v, "authority_tier", None),
+        "effective_from": eff_from,
+        "scope_tags": normalize_scope_tags(getattr(v, "scope_tags_json", None)),
+    }
 
 
 async def resolve_temporal_supersedes(
@@ -684,17 +772,26 @@ async def resolve_temporal_supersedes(
         .where(
             DocumentVersion.document_id == document_id,
             DocumentVersion.id != current_version.id,
-            DocumentVersion.search_status == "SEARCH_READY",
+            DocumentVersion.search_status.in_(("SEARCH_READY", "READY")),
+            DocumentVersion.status.notin_(("REVOKED", "FAILED")),
         )
         .order_by(DocumentVersion.valid_from.asc())
     )
     res = await session.execute(stmt)
     all_prev = list(res.scalars().all())
+    initial_intervals: dict[str, tuple[datetime | None, datetime | None]] = {
+        str(v.id): (_as_utc(v.valid_from), _as_utc(v.valid_to))
+        for v in [current_version, *all_prev]
+    }
 
     now_utc = datetime.now(UTC)
-    cur_start = current_version.source_published_at or current_version.observed_at or now_utc
-    if cur_start.tzinfo is None:
-        cur_start = cur_start.replace(tzinfo=UTC)
+    cur_start = _resolve_version_start(
+        current_version,
+        include_valid_from=False,
+        include_created_at=False,
+        fallback=now_utc,
+    )
+    assert cur_start is not None
 
     max_valid_to = datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC)
 
@@ -703,32 +800,35 @@ async def resolve_temporal_supersedes(
         current_version.valid_to = max_valid_to
         current_version.supersedes_id = None
         current_version.knowledge_status = "NOT_STARTED"
-        return {"action": "INITIAL", "active_version_id": current_version.id}
+        return {
+            "action": "INITIAL",
+            "active_version_id": current_version.id,
+            "current_version_id": current_version.id,
+            "supersedes_id": None,
+            "mutated_versions": [
+                _build_mutated_version_entry(current_version, max_valid_to=max_valid_to)
+            ],
+        }
 
     # Find the version active at cur_start: valid_from <= cur_start < valid_to
     active_at_start = None
+    active_v_from: datetime | None = None
     for v in all_prev:
-        raw_from = (
-            getattr(v, "source_published_at", None)
-            or getattr(v, "observed_at", None)
-            or getattr(v, "valid_from", None)
-            or getattr(v, "created_at", None)
-        )
-        v_from = raw_from.replace(tzinfo=UTC) if raw_from and raw_from.tzinfo is None else raw_from
-        raw_to = v.valid_to or max_valid_to
-        v_to = raw_to.replace(tzinfo=UTC) if raw_to and raw_to.tzinfo is None else raw_to
+        v_from = _resolve_version_start(v, include_valid_from=True, include_created_at=True)
+        v_to = _as_utc(v.valid_to or max_valid_to)
         if v_from and v_to and v_from <= cur_start < v_to:
             active_at_start = v
+            active_v_from = v_from
             break
 
     if active_at_start is not None:
         # Normal newer or mid-timeline version: current supersedes active_at_start
-        orig_active_valid_to = active_at_start.valid_to or max_valid_to
+        orig_active_valid_to = _as_utc(active_at_start.valid_to) or max_valid_to
         current_version.supersedes_id = active_at_start.id
         current_version.valid_from = cur_start
         current_version.valid_to = orig_active_valid_to
-        if v_from:
-            active_at_start.valid_from = v_from
+        if active_v_from is not None:
+            active_at_start.valid_from = active_v_from
         active_at_start.valid_to = cur_start
         session.add(active_at_start)
 
@@ -736,12 +836,11 @@ async def resolve_temporal_supersedes(
         # (e.g. v1 -> v2, inserting v_mid between their dates leaves v2 pointing to v_mid, maintaining continuous chain)
         for v in all_prev:
             if v.id != current_version.id and v.supersedes_id == active_at_start.id:
-                raw_v = (
-                    getattr(v, "source_published_at", None)
-                    or getattr(v, "observed_at", None)
-                    or getattr(v, "valid_from", None)
+                v_start = _resolve_version_start(
+                    v,
+                    include_valid_from=True,
+                    include_created_at=False,
                 )
-                v_start = raw_v.replace(tzinfo=UTC) if raw_v and raw_v.tzinfo is None else raw_v
                 if v_start and v_start >= cur_start:
                     v.supersedes_id = current_version.id
                     session.add(v)
@@ -751,8 +850,7 @@ async def resolve_temporal_supersedes(
             (
                 v
                 for v in all_prev
-                if v.valid_to
-                and (v.valid_to.replace(tzinfo=UTC) if v.valid_to.tzinfo is None else v.valid_to) >= max_valid_to
+                if (v_end := _as_utc(v.valid_to)) is not None and v_end >= max_valid_to
             ),
             current_version,
         )
@@ -762,15 +860,8 @@ async def resolve_temporal_supersedes(
         future_vers = []
         past_vers = []
         for v in all_prev:
-            raw_from = (
-                getattr(v, "source_published_at", None)
-                or getattr(v, "observed_at", None)
-                or getattr(v, "valid_from", None)
-                or getattr(v, "created_at", None)
-            )
-            vf = raw_from.replace(tzinfo=UTC) if raw_from and raw_from.tzinfo is None else raw_from
-            raw_to = v.valid_to or max_valid_to
-            vt = raw_to.replace(tzinfo=UTC) if raw_to and raw_to.tzinfo is None else raw_to
+            vf = _resolve_version_start(v, include_valid_from=True, include_created_at=True)
+            vt = _as_utc(v.valid_to or max_valid_to)
             if vf and vf > cur_start:
                 future_vers.append((v, vf))
             elif vt and vt <= cur_start:
@@ -794,23 +885,36 @@ async def resolve_temporal_supersedes(
             current_version.valid_to = max_valid_to
 
         action = "OUT_OF_ORDER_ARCHIVED"
-        active_v = next((v for v in all_prev if v.valid_to and v.valid_to >= max_valid_to), current_version)
+        active_v = next(
+            (
+                v
+                for v in all_prev
+                if (v_end := _as_utc(v.valid_to)) is not None and v_end >= max_valid_to
+            ),
+            current_version,
+        )
         active_id = active_v.id
 
-    # Strictly guarantee non-overlapping intervals across all versions
+    # Strictly guarantee non-overlapping intervals across all non-empty versions
+    c_from = _as_utc(current_version.valid_from)
+    c_to = _as_utc(current_version.valid_to)
     for v in all_prev:
-        if v.id == current_version.id:
+        if v.id == current_version.id or v.id == current_version.supersedes_id:
             continue
-        v_from = v.valid_from.replace(tzinfo=UTC) if v.valid_from and v.valid_from.tzinfo is None else v.valid_from
-        v_to = v.valid_to.replace(tzinfo=UTC) if v.valid_to and v.valid_to.tzinfo is None else v.valid_to
-        c_from = current_version.valid_from
-        c_to = current_version.valid_to
+        v_from = _as_utc(v.valid_from)
+        v_to = _as_utc(v.valid_to)
+        if v_from is None or v_to is None or c_from is None or c_to is None:
+            continue
+        if v_from >= v_to:
+            # Empty/closed superseded interval cannot overlap [c_from, c_to)
+            continue
 
         if v_from < c_from and v_to > c_from:
             v.valid_to = c_from
             session.add(v)
         elif c_from <= v_from < c_to:
             current_version.valid_to = v_from
+            c_to = v_from
 
     # Enrichment freezes validity/lineage; changed predecessors/successors need a new knowledge input.
     for version in [*all_prev, current_version]:
@@ -820,11 +924,21 @@ async def resolve_temporal_supersedes(
         ):
             version.knowledge_status = "NOT_STARTED"
 
+    mutated_versions: list[dict[str, Any]] = [
+        _build_mutated_version_entry(current_version, max_valid_to=max_valid_to)
+    ]
+    for v in all_prev:
+        if (_as_utc(v.valid_from), _as_utc(v.valid_to)) != initial_intervals[str(v.id)]:
+            mutated_versions.append(
+                _build_mutated_version_entry(v, max_valid_to=max_valid_to)
+            )
+
     return {
         "action": action,
         "active_version_id": active_id,
         "current_version_id": current_version.id,
         "supersedes_id": current_version.supersedes_id,
+        "mutated_versions": mutated_versions,
     }
 
 
@@ -993,6 +1107,7 @@ async def run_dedup_and_temporal_stage(
                 Document.is_active.is_(True),
                 DocumentVersion.status != "FAILED",
                 DocumentVersion.search_status != "FAILED",
+                DocumentVersion.valid_from <= start_time,
                 DocumentVersion.valid_to > start_time,
             )
         )
@@ -1009,31 +1124,39 @@ async def run_dedup_and_temporal_stage(
         block_embeddings: dict[str, list[float]] = {}
         if embedder is None:
             try:
-                from sag_api.services.search_index_service import get_cached_text_embedding
+                from sag_api.core.config import settings as sag_settings
+                from sag_api.services.search_index_service import (
+                    build_embedding_model_signature,
+                    get_cached_text_embedding,
+                )
 
+                emb_sig = build_embedding_model_signature(None, settings_obj=sag_settings)
                 curr_cached = {
                     b.id: vec
                     for b in curr_blocks
-                    if (vec := get_cached_text_embedding(b.normalized_text)) is not None
+                    if (vec := get_cached_text_embedding(b.normalized_text, model_signature=emb_sig)) is not None
                 }
                 if curr_cached:
                     prior_cached = {
                         pb.id: vec
                         for pb in prior_blocks
-                        if (vec := get_cached_text_embedding(pb.normalized_text)) is not None
+                        if (vec := get_cached_text_embedding(pb.normalized_text, model_signature=emb_sig)) is not None
                     }
                     if prior_cached:
                         block_embeddings.update(curr_cached)
                         block_embeddings.update(prior_cached)
-            except Exception:
+            except (TypeError, ValueError, AttributeError):
                 pass
         else:
             try:
+                from sag_api.core.config import settings as sag_settings
                 from sag_api.services.search_index_service import (
+                    build_embedding_model_signature,
                     get_cached_text_embedding,
                     put_cached_text_embedding,
                 )
 
+                emb_sig = build_embedding_model_signature(embedder, settings_obj=sag_settings)
                 texts_to_embed = [b.normalized_text for b in curr_blocks] + [pb.normalized_text for pb in prior_blocks]
                 ids_to_embed = [b.id for b in curr_blocks] + [pb.id for pb in prior_blocks]
                 if texts_to_embed:
@@ -1042,7 +1165,7 @@ async def run_dedup_and_temporal_stage(
                         missing_indices: list[int] = []
                         missing_texts: list[str] = []
                         for idx, txt in enumerate(texts_to_embed):
-                            cached = get_cached_text_embedding(txt)
+                            cached = get_cached_text_embedding(txt, model_signature=emb_sig)
                             if cached is not None:
                                 vecs_by_idx[idx] = cached
                             else:
@@ -1052,7 +1175,7 @@ async def run_dedup_and_temporal_stage(
                             fetched = await embedder.batch_generate(missing_texts)
                             for m_idx, txt, vec in zip(missing_indices, missing_texts, fetched, strict=False):
                                 if vec:
-                                    put_cached_text_embedding(txt, vec)
+                                    put_cached_text_embedding(txt, vec, model_signature=emb_sig)
                                 vecs_by_idx[m_idx] = vec
                         vecs = [vecs_by_idx.get(i, []) for i in range(len(texts_to_embed))]
                     elif hasattr(embedder, "generate"):

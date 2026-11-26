@@ -15,11 +15,15 @@ import math
 from collections import defaultdict
 from collections.abc import Mapping
 from datetime import datetime
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+import httpx
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from sqlalchemy.exc import SQLAlchemyError
+from zleap.sag.exceptions import SagError
 
 from sag_api.core.config import settings
+from sag_api.core.errors import ApiError
 from sag_api.services.route_cache_service import (
     ROUTE_DECISION_MODEL_VERSION,
     build_route_decision_cache_key,
@@ -67,8 +71,8 @@ class RoutingPolicy(BaseModel):
 
     beam_width: int = Field(default=3, ge=1, le=8)
     broad_entropy_threshold: float = Field(default=0.72, ge=0.0, le=1.0)
-    broad_margin_threshold: float = Field(default=0.10, ge=0.0, le=1.0)
-    decisive_margin: float = Field(default=0.18, ge=0.0, le=1.0)
+    broad_margin_threshold: float = Field(default=0.25, ge=0.0, le=1.0)
+    decisive_margin: float = Field(default=0.10, ge=0.0, le=1.0)
     membership_limit: int = Field(default=256, ge=1, le=256)
 
 
@@ -312,13 +316,29 @@ async def capture_routing_decisions(
                 return decisions
             fallback_code = "TREE_SNAPSHOT_UNAVAILABLE"
             fallback_reason = "routing_snapshot_unavailable"
-        except Exception as error:  # noqa: BLE001 - stale/malformed snapshots use global escape
+        except (
+            TimeoutError,
+            ValueError,
+            ValidationError,
+            httpx.HTTPError,
+            OSError,
+            SQLAlchemyError,
+            ApiError,
+            SagError,
+        ) as error:
             log.warning("request tree snapshot unavailable error_type=%s", type(error).__name__)
             release = getattr(engine_manager, "release_routing_snapshot", None)
             if request_snapshot_id and callable(release):
                 try:
                     await release(request_snapshot_id)
-                except Exception as release_error:  # noqa: BLE001 - cleanup must not hide safe fallback
+                except (
+                    TimeoutError,
+                    httpx.HTTPError,
+                    OSError,
+                    SQLAlchemyError,
+                    ApiError,
+                    SagError,
+                ) as release_error:
                     log.warning(
                         "could not release invalid request tree snapshot error_type=%s",
                         type(release_error).__name__,

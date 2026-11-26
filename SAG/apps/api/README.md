@@ -135,4 +135,4 @@ data connection is unavailable: this change does not add task queries or
 browsing-history storage. The classifier is not an authorization mechanism and
 grants no backend access.
 
-Run the offline regression tests with `python -m unittest discover -s tests -p test_question_scope.py`.
+Run the offline regression tests with `pytest -v --tb=short` (or `pytest tests/test_question_scope.py -v`). Opt-in live service tests can be enabled with `SAG_RUN_AI_SMOKE=1` or `SAG_RUN_LIVE_INTEGRATION=1`.

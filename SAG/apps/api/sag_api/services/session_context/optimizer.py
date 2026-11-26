@@ -12,13 +12,13 @@ from typing import Any
 from sag_api.generation.prompt import estimate_tokens
 from sag_api.services.session_context.extractor import (
     extract_content_terms,
-    extract_turn_entities_and_sentences,
-    infer_topic_slot,
-    is_interrogative_turn,
+    extract_structural_entities_and_sentences,
+    normalize_entity_key,
 )
 from sag_api.services.session_context.models import (
     AblationMode,
     ContextAuditTrace,
+    EntityMention,
     EpistemicStatus,
     IndexedTurn,
     RejectedCandidateTrace,
@@ -95,11 +95,11 @@ def _score_decision_state_view(
     query: str,
     *,
     temporal_mode: str,
+    q_slot: str | None = None,
+    q_mentions: Sequence[EntityMention] = (),
     allowed_turn_ids: set[str] | None = None,
 ) -> dict[str, float]:
     """Score turns against the Bi-Temporal Working & Decision State Ledger."""
-    q_slot = infer_topic_slot(query)
-    q_mentions, _ = extract_turn_entities_and_sentences("query", 0, query)
     q_ent_keys = {m.key for m in q_mentions}
     q_terms = extract_content_terms(query)
 
@@ -212,6 +212,7 @@ def _group_similarity(
 
 def _build_verbatim_session_citation(ref: str, turns: Sequence[IndexedTurn]) -> dict[str, Any]:
     primary = turns[-1]
+    snippet = "\n".join(f"[{t.role}]: {t.content}" for t in turns)[:1200]
     return {
         "kind": "session_memory",
         "ref": ref,
@@ -221,6 +222,7 @@ def _build_verbatim_session_citation(ref: str, turns: Sequence[IndexedTurn]) -> 
         "epistemic_status": primary.epistemic_status,
         "sha256": primary.content_hash,
         "cited_source_ids": sorted({sid for t in turns for sid in t.cited_source_ids}),
+        "snippet": snippet,
     }
 
 
@@ -265,6 +267,7 @@ def _format_inert_evidence_message(
                 "epistemic_status": grp.epistemic_status,
                 "sha256": primary.content_hash,
                 "cited_source_ids": sorted({sid for t in grp_turns for sid in t.cited_source_ids}),
+                "snippet": combined_text[:1200],
             }
         )
 
@@ -337,6 +340,8 @@ async def build_ecce_context_pack(
             llm_memory_calls=0,
             route_decision=decision,
             latency_ms=(time.perf_counter() - t_start) * 1000.0,
+            extraction_degraded=bool(index.extraction_degraded),
+            extraction_degraded_reason=index.extraction_degraded_reason,
         )
         return SessionContextPack(history_messages=[], selected_turn_ids=[], session_citations=[], audit_trace=trace)
 
@@ -379,6 +384,8 @@ async def build_ecce_context_pack(
             view_weights={"legacy_window": 1.0},
             recent_turn_ids=tuple(t.turn_id for t in chosen),
             latency_ms=(time.perf_counter() - t_start) * 1000.0,
+            extraction_degraded=bool(index.extraction_degraded),
+            extraction_degraded_reason=index.extraction_degraded_reason,
         )
         return SessionContextPack(
             history_messages=hist_msgs,
@@ -417,6 +424,8 @@ async def build_ecce_context_pack(
             view_weights={"short_verbatim": 1.0},
             recent_turn_ids=tuple(t.turn_id for t in visible_turns),
             latency_ms=(time.perf_counter() - t_start) * 1000.0,
+            extraction_degraded=bool(index.extraction_degraded),
+            extraction_degraded_reason=index.extraction_degraded_reason,
         )
         return SessionContextPack(
             history_messages=hist_msgs,
@@ -447,8 +456,22 @@ async def build_ecce_context_pack(
     q_vecs = await embed_texts_with_main_cache([query], embedder=query_embedder)
     q_vec = q_vecs[0]
     q_terms = extract_content_terms(query)
-    q_mentions, _ = extract_turn_entities_and_sentences("query", 0, query)
+    struct_q_mentions, _ = extract_structural_entities_and_sentences("query", 0, query)
+    q_mentions_by_key: dict[str, EntityMention] = {m.key: m for m in struct_q_mentions}
+    for raw_ent in decision.get("entities") or ():
+        if isinstance(raw_ent, str) and raw_ent.strip():
+            ent_key = normalize_entity_key(raw_ent)
+            q_mentions_by_key.setdefault(ent_key, EntityMention(key=ent_key, surface=raw_ent.strip()))
+    q_mentions = list(q_mentions_by_key.values())
     q_ent_keys = {m.key for m in q_mentions}
+    q_slot = decision.get("topic_slot_key")
+    if isinstance(q_slot, str) and q_slot.strip():
+        q_slot = q_slot.strip()
+        if not q_slot.startswith("slot:"):
+            q_slot = f"slot:{q_slot}"
+    else:
+        q_slot = None
+    hierarchy_bias = str(decision.get("hierarchy_bias") or "none")
 
     # ── Full-Session Audit Mode (Exhaustive Decision & Episode Inventory) ──
     if memory_scope == "full_session_audit" and ablation in {"V4_closure_temporal", "V5_ecce_full"}:
@@ -578,6 +601,8 @@ async def build_ecce_context_pack(
             recent_turn_ids=tuple(t.turn_id for t in recent_turns),
             rejected_candidates=rejected[:10],
             latency_ms=(time.perf_counter() - t_start) * 1000.0,
+            extraction_degraded=bool(index.extraction_degraded),
+            extraction_degraded_reason=index.extraction_degraded_reason,
         )
         return SessionContextPack(
             history_messages=out_msgs,
@@ -589,7 +614,13 @@ async def build_ecce_context_pack(
     # ── Multi-View Scoring (V1 -> V5) ──
     hybrid_scores = index.score_hybrid_view(query, q_vec, allowed_turn_ids=allowed_ids)
     graph_scores = (
-        index.score_graph_ppr_view(query, q_vec, hybrid_scores, allowed_turn_ids=allowed_ids)
+        index.score_graph_ppr_view(
+            query,
+            q_vec,
+            hybrid_scores,
+            allowed_turn_ids=allowed_ids,
+            query_entities=q_mentions,
+        )
         if ablation != "V1_hybrid"
         else {}
     )
@@ -599,6 +630,7 @@ async def build_ecce_context_pack(
             q_vec,
             hybrid_scores,
             temporal_mode=temporal_mode,
+            hierarchy_bias=hierarchy_bias,
             allowed_turn_ids=allowed_ids,
         )
         if ablation in {"V3_dual_hierarchy", "V4_closure_temporal", "V5_ecce_full"}
@@ -609,6 +641,8 @@ async def build_ecce_context_pack(
             index,
             query,
             temporal_mode=temporal_mode,
+            q_slot=q_slot,
+            q_mentions=q_mentions,
             allowed_turn_ids=allowed_ids,
         )
         if ablation in {"V4_closure_temporal", "V5_ecce_full"}
@@ -634,7 +668,7 @@ async def build_ecce_context_pack(
             + weights.get("hierarchy", 0.0) * hier_scores.get(tid, 0.0)
             + weights.get("state", 0.0) * state_norm.get(tid, 0.0)
         )
-        if turn.role == "user" and is_interrogative_turn(turn.content):
+        if turn.role == "user" and (turn.is_interrogative or turn.content.rstrip().endswith("?")):
             score *= 0.20
         if ablation in {"V4_closure_temporal", "V5_ecce_full"} and temporal_mode != "change_lineage":
             if turn.epistemic_status == "SUPERSEDED":
@@ -999,6 +1033,8 @@ async def build_ecce_context_pack(
         recent_turn_ids=tuple(t.turn_id for t in recent_turns),
         rejected_candidates=rejected[:10],
         latency_ms=(time.perf_counter() - t_start) * 1000.0,
+        extraction_degraded=bool(index.extraction_degraded),
+        extraction_degraded_reason=index.extraction_degraded_reason,
     )
     return SessionContextPack(
         history_messages=out_msgs,

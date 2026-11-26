@@ -21,8 +21,10 @@ import threading
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from functools import lru_cache
 from typing import Any
+
+from sag_api.core.text_utils import _tiktoken_encoding  # noqa: F401
+from sag_api.core.text_utils import estimate_text_tokens as _shared_estimate_text_tokens
 
 # Default serverless pricing per 1,000,000 tokens in USD (SiliconFlow / OpenAI-compatible).
 # Operators can override or extend entries via SAG_TOKEN_PRICING_JSON.
@@ -94,6 +96,10 @@ def get_model_pricing(model: str | None) -> dict[str, float]:
     key = _normalize_model_key(model)
     table = dict(DEFAULT_MODEL_PRICING_PER_1M_USD)
     override_raw = os.getenv("SAG_TOKEN_PRICING_JSON", "").strip()
+    if not override_raw:
+        from sag_api.core.config import settings
+
+        override_raw = (settings.token_pricing_json or "").strip()
     if override_raw:
         try:
             parsed = json.loads(override_raw)
@@ -111,6 +117,11 @@ def get_model_pricing(model: str | None) -> dict[str, float]:
         if key.endswith("/" + candidate_key) or candidate_key.endswith("/" + key):
             return rates
     return {}
+
+
+def has_model_pricing(model: str | None) -> bool:
+    """Return True iff USD pricing rates are known for the given model."""
+    return bool(get_model_pricing(model))
 
 
 def compute_bucket_cost_usd(model: str | None, bucket: Mapping[str, Any]) -> float:
@@ -137,26 +148,8 @@ def compute_bucket_cost_usd(model: str | None, bucket: Mapping[str, Any]) -> flo
     return round(cost, 8)
 
 
-@lru_cache(maxsize=1)
-def _tiktoken_encoding():
-    try:
-        import tiktoken
-
-        return tiktoken.get_encoding("cl100k_base")
-    except Exception:  # noqa: BLE001
-        return None
-
-
 def estimate_text_tokens(texts: Sequence[str] | str | None) -> int:
-    if not texts:
-        return 0
-    items = [texts] if isinstance(texts, str) else [t for t in texts if t]
-    if not items:
-        return 0
-    enc = _tiktoken_encoding()
-    if enc is not None:
-        return sum(len(enc.encode(t)) for t in items)
-    return sum(max(1, len(t.encode("utf-8")) // 4) for t in items)
+    return _shared_estimate_text_tokens(texts)
 
 
 def extract_embedding_usage(raw_usage: Any, texts: Sequence[str] | str | None = None) -> dict[str, Any]:
@@ -248,6 +241,7 @@ def empty_token_bucket() -> dict[str, Any]:
         "cache_hits": 0,
         "estimated_calls": 0,
         "cost_usd": 0.0,
+        "cost_known": True,
     }
 
 
@@ -287,9 +281,12 @@ def _accumulate_bucket(
                 "llm_output_tokens": llm_out,
             },
         )
+        delta_cost_known = has_model_pricing(model)
     else:
         delta_cost = float(delta.get("cost_usd", 0.0) or 0.0)
+        delta_cost_known = bool(delta.get("cost_known", True))
     target["cost_usd"] = round(float(target.get("cost_usd", 0.0)) + delta_cost, 8)
+    target["cost_known"] = bool(target.get("cost_known", True)) and delta_cost_known
 
 
 class TokenLedger:
@@ -370,6 +367,7 @@ class TokenLedger:
             "by_component": by_comp,
             "by_model": by_mod,
             "cost_usd": totals["cost_usd"],
+            "cost_known": bool(totals.get("cost_known", True)),
         }
         if meta:
             out["metadata"] = meta
@@ -443,9 +441,30 @@ class RuntimeTokenRegistry:
 
 RUNTIME_TOKEN_REGISTRY = RuntimeTokenRegistry()
 
+_ROUTER_DEGRADED_LOCK = threading.RLock()
+_ROUTER_DEGRADED_COUNTS: dict[str, int] = {}
+
+
+def record_router_degraded(reason: str) -> None:
+    key = (reason or "unknown").strip() or "unknown"
+    with _ROUTER_DEGRADED_LOCK:
+        _ROUTER_DEGRADED_COUNTS[key] = _ROUTER_DEGRADED_COUNTS.get(key, 0) + 1
+
+
+def get_router_degraded_metrics() -> dict[str, int]:
+    with _ROUTER_DEGRADED_LOCK:
+        return dict(_ROUTER_DEGRADED_COUNTS)
+
+
+def reset_router_degraded_metrics() -> None:
+    with _ROUTER_DEGRADED_LOCK:
+        _ROUTER_DEGRADED_COUNTS.clear()
+
 
 def reset_runtime_token_usage(project_id: str | None = None) -> None:
     RUNTIME_TOKEN_REGISTRY.reset(project_id=project_id)
+    if project_id is None:
+        reset_router_degraded_metrics()
 
 
 def get_runtime_token_usage(project_id: str | None = None) -> dict[str, Any]:
@@ -549,16 +568,28 @@ def record_embedding_cache_hit(
     )
 
 
-def wrap_embedding_client_with_cache_and_metering(emb: Any, *, default_model: str | None = None) -> None:
+def wrap_embedding_client_with_cache_and_metering(
+    emb: Any,
+    *,
+    default_model: str | None = None,
+    settings_obj: Any | None = None,
+    model_signature: str | None = None,
+) -> None:
     """Idempotently attach shared text-embedding cache and exact provider token metering."""
     if emb is None or getattr(emb, "_sag_token_metered_cache_wrapped", False):
         return
     from sag_api.services.search_index_service import (
+        build_embedding_model_signature,
         get_cached_text_embedding,
         put_cached_text_embedding,
     )
 
     emb_model = getattr(emb, "model", None) or default_model
+    emb_sig = (
+        model_signature.strip()
+        if isinstance(model_signature, str) and model_signature.strip()
+        else build_embedding_model_signature(emb, settings_obj=settings_obj, model=emb_model)
+    )
     raw_client = emb if hasattr(emb, "_create_embeddings") else None
     if raw_client is None:
         for attr_name in ("inner", "_inner", "client", "_client", "_delegate"):
@@ -589,7 +620,7 @@ def wrap_embedding_client_with_cache_and_metering(emb: Any, *, default_model: st
     emb._sag_orig_batch_generate = orig_batch_generate
 
     async def _cached_generate(text: str) -> list[float]:
-        cached = get_cached_text_embedding(text)
+        cached = get_cached_text_embedding(text, model_signature=emb_sig)
         if cached is not None:
             record_embedding_cache_hit(model=emb_model, count=1)
             return cached
@@ -600,7 +631,7 @@ def wrap_embedding_client_with_cache_and_metering(emb: Any, *, default_model: st
                 usage=extract_embedding_usage(None, text),
             )
         if vec:
-            put_cached_text_embedding(text, vec)
+            put_cached_text_embedding(text, vec, model_signature=emb_sig)
         return vec
 
     async def _cached_batch_generate(texts: list[str]) -> list[list[float]]:
@@ -610,7 +641,7 @@ def wrap_embedding_client_with_cache_and_metering(emb: Any, *, default_model: st
         missing_by_text: dict[str, list[int]] = {}
         cache_hits = 0
         for idx, txt in enumerate(texts):
-            cached = get_cached_text_embedding(txt)
+            cached = get_cached_text_embedding(txt, model_signature=emb_sig)
             if cached is not None:
                 results[idx] = cached
                 cache_hits += 1
@@ -628,7 +659,7 @@ def wrap_embedding_client_with_cache_and_metering(emb: Any, *, default_model: st
                 )
             for txt, vec in zip(unique_missing, fetched, strict=True):
                 if vec:
-                    put_cached_text_embedding(txt, vec)
+                    put_cached_text_embedding(txt, vec, model_signature=emb_sig)
                 for m_idx in missing_by_text[txt]:
                     results[m_idx] = vec
         return [vec or [] for vec in results]
@@ -637,6 +668,24 @@ def wrap_embedding_client_with_cache_and_metering(emb: Any, *, default_model: st
     emb.batch_generate = _cached_batch_generate
     emb._sag_shared_cache_wrapped = True
     emb._sag_token_metered_cache_wrapped = True
+
+
+def record_llm_cache_hit(
+    *,
+    model: str | None,
+    count: int = 1,
+    component: str | None = None,
+    project_id: str | None = None,
+) -> None:
+    if count <= 0:
+        return
+    _dispatch_event(
+        default_component="llm_completion",
+        model=model,
+        component=component,
+        project_id=project_id,
+        delta={"cache_hits": count},
+    )
 
 
 def record_llm_usage(
@@ -851,6 +900,7 @@ async def build_project_token_usage_report(
                 "by_model": fsummary["by_model"],
                 "totals": fsummary["totals"],
                 "cost_usd": fsummary["cost_usd"],
+                "cost_known": fsummary["cost_known"],
                 "metadata": fsummary.get("metadata", {}),
             }
         )
@@ -905,11 +955,15 @@ async def build_project_token_usage_report(
                 has_any = True
         if has_any:
             diff_bucket["cost_usd"] = compute_bucket_cost_usd(mod_name, diff_bucket)
+            diff_bucket["cost_known"] = has_model_pricing(mod_name)
             query_by_model[mod_name] = diff_bucket
 
     query_summary = query_ledger.to_summary()
     if query_by_model:
         query_summary["by_model"] = query_by_model
+        query_cost_known = all(bool(b.get("cost_known", True)) for b in query_by_model.values())
+        query_summary["cost_known"] = bool(query_summary.get("cost_known", True)) and query_cost_known
+        query_summary["totals"]["cost_known"] = query_summary["cost_known"]
 
     grand_total = merge_token_summaries(ingestion_summary, query_summary)
 
