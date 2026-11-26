@@ -131,7 +131,12 @@ _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
     "universe_dirty_sources": {"revision": "INTEGER NOT NULL DEFAULT 1"},
     "tree_manifests": {"manifest_json": "JSON NOT NULL DEFAULT '{}'"},
     "tree_routing_profiles": {"document_version_id": "VARCHAR(128) NOT NULL DEFAULT ''"},
-    "knowledge_jobs": {"result_json": "JSON", "usage_json": "JSON", "extractor_version": "VARCHAR(128)", "tree_requested_at": "TIMESTAMP WITH TIME ZONE"},
+    "knowledge_jobs": {
+        "result_json": "JSON",
+        "usage_json": "JSON",
+        "extractor_version": "VARCHAR(128)",
+        "tree_requested_at": "TIMESTAMP WITH TIME ZONE",
+    },
     "knowledge_graph_builds": {"input_fingerprint": "VARCHAR(64)"},
     "canonical_blocks": {
         "is_boilerplate": "BOOLEAN NOT NULL DEFAULT FALSE",
@@ -147,13 +152,21 @@ _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
         "content_hash": "VARCHAR(64)",
         "research_task_id": "VARCHAR(36) REFERENCES research_tasks(id) ON DELETE SET NULL",
     },
+    "document_versions": {
+        "authority_tier": "INTEGER",
+        "effective_from": "TIMESTAMP WITH TIME ZONE",
+        "scope_tags_json": "JSON",
+    },
 }
 
 # Existing tables also need newly introduced hot-path indexes. Keep these
 # idempotent for local/embedded upgrades; production deployments can express
 # the same DDL in their migration runner.
 _INDEX_UPGRADES = (
-    "CREATE UNIQUE INDEX IF NOT EXISTS ix_knowledge_graph_input ON knowledge_graph_builds (tenant_id, project_id, input_fingerprint)",
+    (
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_knowledge_graph_input "
+        "ON knowledge_graph_builds (tenant_id, project_id, input_fingerprint)"
+    ),
     "CREATE INDEX IF NOT EXISTS ix_messages_thread_created_id ON messages (thread_id, created_at, id)",
     "CREATE INDEX IF NOT EXISTS ix_messages_reply_to_message_id ON messages (reply_to_message_id)",
     "CREATE INDEX IF NOT EXISTS ix_messages_regenerated_from_message_id ON messages (regenerated_from_message_id)",
@@ -181,6 +194,32 @@ _INDEX_UPGRADES = (
         "CREATE INDEX IF NOT EXISTS idx_tree_routing_profiles_version_scope "
         "ON tree_routing_profiles (project_id, tree_version, source_id, document_version_id, partition_id)"
     ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_document_versions_effective_authority "
+        "ON document_versions (document_id, effective_from, authority_tier)"
+    ),
+    (
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_kcr_project_pair "
+        "ON knowledge_conflict_resolutions (project_id, pair_key)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_kcr_project_status_partition "
+        "ON knowledge_conflict_resolutions (tenant_id, project_id, status, security_partition_id)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_kcr_loser_unit_status "
+        "ON knowledge_conflict_resolutions (project_id, loser_unit_id, status)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_kcr_winner_version_status "
+        "ON knowledge_conflict_resolutions (winner_version_id, status)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_kcr_loser_version_status "
+        "ON knowledge_conflict_resolutions (loser_version_id, status)"
+    ),
+    "CREATE INDEX IF NOT EXISTS idx_kcr_winner_document ON knowledge_conflict_resolutions (winner_document_id)",
+    "CREATE INDEX IF NOT EXISTS idx_kcr_loser_document ON knowledge_conflict_resolutions (loser_document_id)",
 )
 
 

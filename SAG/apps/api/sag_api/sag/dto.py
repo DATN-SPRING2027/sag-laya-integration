@@ -38,6 +38,10 @@ class RetrievedSection(BaseModel):
     anchor: str | None = None
     valid_to: datetime | None = None
     is_superseded: bool = False
+    authority_tier: int | None = None
+    effective_from: datetime | None = None
+    scope_tags: tuple[str, ...] = ()
+    conflict_status: str | None = None
 
     @classmethod
     def from_section(cls, s: Any) -> RetrievedSection:
@@ -53,6 +57,24 @@ class RetrievedSection(BaseModel):
             raw_dense = s.get("raw_semantic_score")
         if raw_dense is None:
             raw_dense = metadata.get("raw_dense_score")
+        raw_authority_tier = s.get("authority_tier")
+        if raw_authority_tier is None:
+            raw_authority_tier = metadata.get("authority_tier")
+        raw_effective_from = s.get("effective_from")
+        if raw_effective_from is None:
+            raw_effective_from = metadata.get("effective_from")
+        raw_scope_tags = s.get("scope_tags")
+        if raw_scope_tags is None:
+            raw_scope_tags = metadata.get("scope_tags")
+        if isinstance(raw_scope_tags, (list, tuple)):
+            scope_tags = tuple(str(tag) for tag in raw_scope_tags)
+        elif isinstance(raw_scope_tags, (set, frozenset)):
+            scope_tags = tuple(sorted(str(tag) for tag in raw_scope_tags))
+        else:
+            scope_tags = ()
+        raw_conflict_status = s.get("conflict_status")
+        if raw_conflict_status is None:
+            raw_conflict_status = metadata.get("conflict_status")
         return cls(
             chunk_id=s.get("chunk_id") or s.get("id"),
             heading=(s.get("heading") or s.get("title") or metadata.get("heading") or "").strip(),
@@ -68,6 +90,15 @@ class RetrievedSection(BaseModel):
             section_path=s.get("section_path"),
             content_hash=s.get("content_hash"),
             canonical_evidence_verified=bool(s.get("canonical_evidence_verified")),
+            authority_tier=(
+                int(raw_authority_tier)
+                if isinstance(raw_authority_tier, int)
+                and not isinstance(raw_authority_tier, bool)
+                else None
+            ),
+            effective_from=raw_effective_from,
+            scope_tags=scope_tags,
+            conflict_status=(str(raw_conflict_status) if raw_conflict_status is not None else None),
         )
 
 

@@ -295,6 +295,19 @@ class Settings(BaseSettings):
     search_fallback_vector: bool = True
     search_reconcile_interval_seconds: int = Field(default=3600, ge=0, le=86400)
 
+    # ── 时间线与冲突治理 (Temporal Authority & Conflict Resolution) ────────
+    temporal_authority_rerank_enabled: bool = True
+    authority_rerank_max_delta: float = Field(default=0.04, ge=0.0, le=0.04)
+
+    conflict_resolution_job_enabled: bool = True
+    conflict_vector_top_k: int = Field(default=5, ge=1, le=20)
+    conflict_vector_min_cosine: float = Field(default=0.72, ge=0.0, le=0.99)
+    conflict_vector_max_cosine: float = Field(default=0.995, ge=0.5, le=1.0)
+    conflict_auto_supersede_min_confidence: float = Field(default=0.85, ge=0.5, le=1.0)
+    conflict_max_pairs_per_version: int = Field(default=50, ge=1, le=500)
+    conflict_classifier_batch_size: int = Field(default=8, ge=1, le=20)
+    conflict_classifier_timeout_seconds: float = Field(default=20.0, ge=2.0, le=120.0)
+
     # ── 检索评测 ────────────────────────────────────────────────────────
     # LLM-as-judge 在评测端点/CLI 里默认开启；线上或不想烧 token 时可临时关闭。
     eval_llm_judge_enabled: bool = True
@@ -579,6 +592,14 @@ class Settings(BaseSettings):
             qdrant_url = urlsplit(self.sag_qdrant_url)
             if qdrant_url.scheme not in {"http", "https"} or not qdrant_url.hostname:
                 raise ValueError("SAG_QDRANT_URL must be an absolute HTTP(S) URL in prod")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_conflict_thresholds(self) -> Settings:
+        if self.conflict_vector_min_cosine >= self.conflict_vector_max_cosine:
+            raise ValueError(
+                "SAG_CONFLICT_VECTOR_MIN_COSINE must be strictly less than SAG_CONFLICT_VECTOR_MAX_COSINE"
+            )
         return self
 
     @property

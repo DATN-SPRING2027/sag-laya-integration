@@ -12,6 +12,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     Float,
     ForeignKey,
     Index,
@@ -30,10 +31,20 @@ class DocumentVersion(Base):
     __tablename__ = "document_versions"
     __table_args__ = (
         UniqueConstraint("document_id", "version_no", name="uq_document_versions_doc_ver"),
+        CheckConstraint(
+            "authority_tier IS NULL OR (authority_tier >= 1 AND authority_tier <= 4)",
+            name="ck_document_versions_authority_tier",
+        ),
         Index("idx_document_versions_hash", "file_hash"),
         Index("idx_document_versions_temporal", "valid_from", "valid_to"),
         Index("idx_document_versions_search_status", "search_status"),
         Index("idx_document_versions_knowledge_status", "knowledge_status"),
+        Index(
+            "idx_document_versions_effective_authority",
+            "document_id",
+            "effective_from",
+            "authority_tier",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -63,6 +74,9 @@ class DocumentVersion(Base):
     knowledge_status: Mapped[str] = mapped_column(String(32), default="NOT_STARTED", nullable=False)
     search_ready_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     knowledge_ready_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    authority_tier: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    effective_from: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    scope_tags_json: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime(), server_default=func.now(), nullable=False
@@ -155,7 +169,10 @@ class StageRun(Base):
     metrics_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        UTCDateTime(), server_default=func.now(), nullable=False
+        UTCDateTime(),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+        nullable=False,
     )
 
 
