@@ -220,21 +220,40 @@ def _append_current_scene(
     return result
 
 
-def _find_closing_backticks(text: str, start: int, run_len: int) -> int:
-    """Find matching closing backtick run of exact length within the same paragraph, or -1."""
-    para_end = text.find("\n\n", start)
-    limit = len(text) if para_end == -1 else para_end
+def _index_paragraph_backtick_runs(text: str, start: int, limit: int) -> dict[int, list[int]]:
+    """Build a single-pass O(L) map of backtick run length -> sorted start offsets within [start, limit)."""
+    runs: dict[int, list[int]] = {}
     pos = start
     while pos < limit:
         idx = text.find("`", pos, limit)
         if idx == -1:
-            return -1
-        end = idx
+            break
+        end = idx + 1
         while end < limit and text[end] == "`":
             end += 1
-        if end - idx == run_len:
-            return idx
+        runs.setdefault(end - idx, []).append(idx)
         pos = end
+    return runs
+
+
+def _next_closing_backticks(
+    runs: dict[int, list[int]],
+    cursors: dict[int, int],
+    start: int,
+    run_len: int,
+) -> int:
+    """Return earliest matching backtick run offset >= start in amortized O(1) time, or -1."""
+    positions = runs.get(run_len)
+    if not positions:
+        return -1
+    cur = cursors.get(run_len, 0)
+    n_pos = len(positions)
+    while cur < n_pos and positions[cur] < start:
+        cur += 1
+    if cur < n_pos:
+        cursors[run_len] = cur + 1
+        return positions[cur]
+    cursors[run_len] = cur
     return -1
 
 
@@ -251,6 +270,9 @@ def _rewrite_prose_citation_brackets(
     index = 0
     length = len(text)
     code_fence: str | None = None
+    para_limit = -1
+    para_bt_runs: dict[int, list[int]] = {}
+    para_bt_cursors: dict[int, int] = {}
 
     def _flush_prose(end_idx: int) -> None:
         nonlocal prose_start
@@ -297,7 +319,13 @@ def _rewrite_prose_citation_brackets(
             run_len = 1
             while index + run_len < length and text[index + run_len] == "`":
                 run_len += 1
-            closing = _find_closing_backticks(text, index + run_len, run_len)
+            after_start = index + run_len
+            if index >= para_limit:
+                next_para = text.find("\n\n", after_start)
+                para_limit = length if next_para == -1 else next_para
+                para_bt_runs = _index_paragraph_backtick_runs(text, after_start, para_limit)
+                para_bt_cursors = {}
+            closing = _next_closing_backticks(para_bt_runs, para_bt_cursors, after_start, run_len)
             if closing != -1:
                 _flush_prose(index)
                 span_end = closing + run_len
@@ -306,7 +334,7 @@ def _rewrite_prose_citation_brackets(
                 index = span_end
                 continue
             # Unmatched stray backtick: treat as plain prose so citation parsing stays active.
-            index += run_len
+            index = after_start
             continue
 
         index += 1

@@ -1587,4 +1587,65 @@ async def test_p6_rework_16_four_char_fence_indented_backtick_and_multiline_inli
     assert out_long == canon_long
 
 
+# ---------------------------------------------------------------------------
+# Item 17 (AUD-R5 VETO): Strict O(N) backtick index on distinct run lengths
+# (openai.py + twin agent_service.py) & unterminated closing fence guard
+# ---------------------------------------------------------------------------
+
+
+def test_p6_rework_17_strict_linear_backtick_index_and_unterminated_closing_fence() -> None:
+    def _distinct_bt_runs(target_len: int) -> str:
+        parts: list[str] = []
+        total = 0
+        k = 1
+        while total < target_len:
+            seg = "`" * k + " "
+            parts.append(seg)
+            total += len(seg)
+            k += 1
+        return "".join(parts)
+
+    def _distinct_plus_double_tail(target_len: int) -> str:
+        parts: list[str] = ["` "]
+        total = 2
+        k = 3
+        while total < target_len // 2:
+            seg = "`" * k + " "
+            parts.append(seg)
+            total += len(seg)
+            k += 1
+        while total < target_len:
+            parts.append("`` ")
+            total += 3
+        return "".join(parts)
+
+    def _best_ms(fn, *args) -> float:
+        best = float("inf")
+        for _ in range(3):
+            t0 = time.perf_counter()
+            fn(*args)
+            best = min(best, (time.perf_counter() - t0) * 1000.0)
+        return best
+
+    for builder in (_distinct_bt_runs, _distinct_plus_double_tail):
+        s_2k = builder(2000)
+        s_32k = builder(32000)
+        assert _best_ms(openai_api._prose_segments, s_2k) < 10.0
+        assert _best_ms(openai_api._split_unbuffered_citation_tail_stateful, s_2k) < 10.0
+        assert _best_ms(agent_service._finalize_answer_citations, s_2k, []) < 10.0
+        assert _best_ms(openai_api._prose_segments, s_32k) < 40.0
+        assert _best_ms(openai_api._split_unbuffered_citation_tail_stateful, s_32k) < 50.0
+        assert _best_ms(agent_service._finalize_answer_citations, s_32k, []) < 50.0
+
+    # Unterminated closing fence line > 64 chars with no newline must NOT prematurely clear code_fence
+    _, _, next_ls, next_fence = openai_api._split_unbuffered_citation_tail_stateful(
+        "```" + " " * 70,
+        at_line_start=True,
+        code_fence="```",
+    )
+    assert next_ls is False
+    assert next_fence == "```"
+
+
+
 
