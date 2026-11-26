@@ -467,7 +467,10 @@ def _score_term_sequence(
     )
 
 
-def _document_identity(section: RetrievedSection) -> str:
+def _document_identity(section: RetrievedSection, *, distinguish_versions: bool = False) -> str:
+    if distinguish_versions and section.document_version_id:
+        base = str(section.document_id or section.document_name or "")
+        return f"{base}::ver::{section.document_version_id}" if base else str(section.document_version_id)
     return str(
         section.document_id
         or section.document_version_id
@@ -480,6 +483,8 @@ def _document_identity(section: RetrievedSection) -> str:
 def _compute_document_aware_effective_ranks(
     ranks: dict[tuple[str, str], int],
     representatives: dict[tuple[str, str], RetrievedSection],
+    *,
+    distinguish_versions: bool = False,
 ) -> dict[tuple[str, str], float]:
     """Combine chunk rank and distinct-document rank so long multi-chunk docs cannot bury doc #2/#3."""
     ordered = sorted(ranks.items(), key=lambda item: item[1])
@@ -488,7 +493,11 @@ def _compute_document_aware_effective_ranks(
     effective_ranks: dict[tuple[str, str], float] = {}
     for key, chunk_rank in ordered:
         sec = representatives.get(key)
-        d_id = _document_identity(sec) if sec is not None else str(key)
+        d_id = (
+            _document_identity(sec, distinguish_versions=distinguish_versions)
+            if sec is not None
+            else str(key)
+        )
         if d_id not in doc_first_rank:
             doc_first_rank[d_id] = len(doc_first_rank)
         within_doc_idx = doc_seen_count.get(d_id, 0)
@@ -566,13 +575,76 @@ def _query_allows_superseded(query: str = "", *, temporal_mode: str | None = Non
     return str(temporal_mode or "").strip().lower() in {"change_lineage", "past_point"}
 
 
-def _is_superseded_section(sec: RetrievedSection) -> bool:
+_AUTHORITY_TILT_BY_TIER: dict[int, float] = {
+    1: +0.015,  # Chính thức (Official / Policy Binding)
+    2: +0.005,  # Quy chuẩn (Standard / Official Spec)
+    3: -0.005,  # Hướng dẫn (Operational Guide)
+    4: -0.010,  # Nháp (Informal Draft)
+}
+_RECENCY_HALF_LIFE_DAYS = 365.0
+_RECENCY_MAX_SPREAD = 0.015  # centered in [-0.0075, +0.0075]
+_BASE_TILT_MAX_SPREAD = 0.04
+
+
+def _compute_authority_recency_tilt(
+    section: RetrievedSection,
+    *,
+    reference_time: datetime,
+    temporal_mode: str | None,
+) -> float:
+    """Compute a bounded post-OOD tie-break tilt (spread <= authority_rerank_max_delta <= 0.04)."""
+    if not settings.temporal_authority_rerank_enabled:
+        return 0.0
+    if _query_allows_superseded(temporal_mode=temporal_mode):
+        return 0.0
+    max_delta = max(0.0, min(_BASE_TILT_MAX_SPREAD, float(settings.authority_rerank_max_delta)))
+    if max_delta <= 0.0:
+        return 0.0
+    auth_tilt = 0.0
+    if isinstance(section.authority_tier, int) and not isinstance(section.authority_tier, bool):
+        clamped_tier = max(1, min(4, section.authority_tier))
+        auth_tilt = _AUTHORITY_TILT_BY_TIER[clamped_tier]
+    recency_tilt = 0.0
+    if isinstance(section.effective_from, datetime):
+        eff_utc = (
+            section.effective_from.replace(tzinfo=UTC)
+            if section.effective_from.tzinfo is None
+            else section.effective_from.astimezone(UTC)
+        )
+        ref_utc = (
+            reference_time.replace(tzinfo=UTC)
+            if reference_time.tzinfo is None
+            else reference_time.astimezone(UTC)
+        )
+        age_days = max(0.0, (ref_utc - eff_utc).total_seconds() / 86400.0)
+        decay = math.exp(-math.log(2.0) * age_days / _RECENCY_HALF_LIFE_DAYS)
+        recency_tilt = _RECENCY_MAX_SPREAD * (decay - 0.5)
+    raw_tilt = auth_tilt + recency_tilt
+    if raw_tilt == 0.0:
+        return 0.0
+    return raw_tilt * (max_delta / _BASE_TILT_MAX_SPREAD)
+
+
+def _is_superseded_section(
+    sec: RetrievedSection,
+    *,
+    reference_time: datetime | None = None,
+) -> bool:
     if bool(getattr(sec, "is_superseded", False)):
         return True
     valid_to = getattr(sec, "valid_to", None)
     if isinstance(valid_to, datetime):
         vt_utc = valid_to.replace(tzinfo=UTC) if valid_to.tzinfo is None else valid_to.astimezone(UTC)
-        if vt_utc <= datetime.now(UTC):
+        ref_utc = (
+            (
+                reference_time.replace(tzinfo=UTC)
+                if reference_time.tzinfo is None
+                else reference_time.astimezone(UTC)
+            )
+            if isinstance(reference_time, datetime)
+            else datetime.now(UTC)
+        )
+        if vt_utc <= ref_utc:
             return True
     meta = normalize_text(
         f"{sec.document_name or ''}\n{sec.section_path or ''}\n{sec.heading or ''}"
@@ -621,9 +693,20 @@ def rerank_sections(
     subqueries: Sequence[str] = (),
     entities: Sequence[str] = (),
     temporal_mode: str | None = None,
+    reference_time: datetime | None = None,
 ) -> RerankResult:
     """Fuse retriever rank lists without assuming their scores share a scale."""
 
+    is_lineage = str(temporal_mode or "").strip().lower() == "change_lineage"
+    eval_ref_time = (
+        (
+            reference_time.replace(tzinfo=UTC)
+            if reference_time.tzinfo is None
+            else reference_time.astimezone(UTC)
+        )
+        if isinstance(reference_time, datetime)
+        else datetime.now(UTC)
+    )
     effective = analysis or analyze_query(
         query,
         segmentation_enabled=settings.search_chinese_segmentation_enabled,
@@ -694,8 +777,12 @@ def rerank_sections(
 
     semantic_ranks, semantic_by_key = unique_rankings(semantic)
     lexical_ranks, lexical_by_key = unique_rankings(lexical, preferred_keys=exact_keys)
-    semantic_eff_ranks = _compute_document_aware_effective_ranks(semantic_ranks, semantic_by_key)
-    lexical_eff_ranks = _compute_document_aware_effective_ranks(lexical_ranks, lexical_by_key)
+    semantic_eff_ranks = _compute_document_aware_effective_ranks(
+        semantic_ranks, semantic_by_key, distinguish_versions=is_lineage
+    )
+    lexical_eff_ranks = _compute_document_aware_effective_ranks(
+        lexical_ranks, lexical_by_key, distinguish_versions=is_lineage
+    )
     semantic_scores: dict[tuple[str, str], float] = {}
     raw_dense_scores: dict[tuple[str, str], float] = {}
     for section in semantic:
@@ -790,7 +877,7 @@ def rerank_sections(
             head_roots,
             full_roots,
         )
-        d_id = _document_identity(section)
+        d_id = _document_identity(section, distinguish_versions=is_lineage)
         prev_spaced, prev_compact, prev_roots = doc_texts.get(d_id, ("", "", set()))
         next_spaced = (
             f"{prev_spaced}{full_spaced[1:]}"
@@ -901,7 +988,7 @@ def rerank_sections(
     }
     active_retrievers = int(bool(semantic_ranks)) + int(bool(lexical_ranks))
     ideal_rrf_score = active_retrievers / (_RRF_K + 1)
-    ranked: list[tuple[float, int, int, int, tuple[str, str], RetrievedSection]] = []
+    ranked: list[tuple[float, float, int, int, int, tuple[str, str], RetrievedSection]] = []
 
     for key in candidate_keys:
         section = merged[key]
@@ -970,17 +1057,31 @@ def rerank_sections(
         retriever_coverage = int(semantic_rank is not None) + int(lexical_rank is not None)
         if raw_dense is not None and section.raw_dense_score is None:
             section = section.model_copy(update={"raw_dense_score": raw_dense})
+        tilt = _compute_authority_recency_tilt(
+            section,
+            reference_time=eval_ref_time,
+            temporal_mode=temporal_mode,
+        )
+        final_score = (
+            hybrid_score
+            if tilt == 0.0
+            else min(1.0, max(0.0, hybrid_score + tilt))
+        )
         ranked.append(
-            (hybrid_score, retriever_coverage, int(exact), rank_sum, key, section)
+            (final_score, tilt, retriever_coverage, int(exact), rank_sum, key, section)
         )
 
     if not _query_allows_superseded(temporal_mode=temporal_mode) and ranked:
-        ranked = [item for item in ranked if not _is_superseded_section(item[5])]
+        ranked = [
+            item
+            for item in ranked
+            if not _is_superseded_section(item[6], reference_time=eval_ref_time)
+        ]
 
-    ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3], item[4]))
+    ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], -item[3], item[4], item[5]))
     selected = [
         section.model_copy(update={"score": round(score, 6), "rank": index})
-        for index, (score, _coverage, _exact, _rank_sum, _key, section) in enumerate(
+        for index, (score, _tilt, _coverage, _exact, _rank_sum, _key, section) in enumerate(
             ranked if limit is None else ranked[: max(1, limit)]
         )
     ]
@@ -1030,11 +1131,13 @@ def select_diverse_sections(
     per_document_limit: int | None = None,
     multi_hop: bool | None = None,
     entities: Sequence[str] = (),
+    temporal_mode: str | None = None,
     _cancelled: threading.Event | None = None,
 ) -> tuple[list[RetrievedSection], dict[str, Any]]:
     """Collapse near-identical text and apply deterministic MMR without dropping query anchors."""
     if per_document_limit is not None and per_document_limit < 1:
         raise ValueError("per_document_limit must be positive")
+    is_lineage = str(temporal_mode or "").strip().lower() == "change_lineage"
     unbounded_limit = limit is None
     if limit is None:
         limit = len(candidates)
@@ -1117,7 +1220,19 @@ def select_diverse_sections(
         for index, previous in enumerate(unique_shingles):
             if index % 32 == 0:
                 check_cancelled()
-            if coverage == unique_coverage[index] and _jaccard(shingles, previous) >= duplicate_threshold:
+            prev_sec = unique[index]
+            same_lineage_version = (
+                not is_lineage
+                or (
+                    (section.document_version_id or "") == (prev_sec.document_version_id or "")
+                    and bool(section.is_superseded) == bool(prev_sec.is_superseded)
+                )
+            )
+            if (
+                same_lineage_version
+                and coverage == unique_coverage[index]
+                and _jaccard(shingles, previous) >= duplicate_threshold
+            ):
                 duplicate_index = index
                 break
         if duplicate_index is None:
@@ -1129,6 +1244,9 @@ def select_diverse_sections(
             unique_shingles[duplicate_index] = shingles
 
     def doc_key(section: RetrievedSection) -> str:
+        if is_lineage and section.document_version_id:
+            base = str(section.document_id or section.document_name or "")
+            return f"{base}::ver::{section.document_version_id}" if base else str(section.document_version_id)
         return str(
             section.document_id
             or section.document_version_id
@@ -1197,7 +1315,7 @@ def select_diverse_sections(
     admitted_docs: set[str] = {doc_key(unique[i]) for i in selected_indices}
     if ordered_docs:
         admitted_docs.add(ordered_docs[0])
-        allow_wide_docs = unbounded_limit or effective_multi_hop or per_document_limit == 1
+        allow_wide_docs = unbounded_limit or effective_multi_hop or per_document_limit == 1 or is_lineage
         max_initial_docs = limit
         for doc_rank_idx, d_key in enumerate(ordered_docs[1:], start=1):
             if len(admitted_docs) >= max_initial_docs:
@@ -1207,6 +1325,7 @@ def select_diverse_sections(
                 admission_ratio
                 if (
                     unbounded_limit
+                    or is_lineage
                     or (not effective_multi_hop and per_document_limit != 1)
                     or doc_rank_idx == 1
                     or len(unique) <= limit + 1
@@ -1267,10 +1386,20 @@ def select_diverse_sections(
 
     def max_redundancy(index: int) -> float:
         # Each pair is unchanged across MMR rounds; compare only newly selected evidence.
+        cand_sec = unique[index]
         for offset, chosen in enumerate(selected_indices[compared[index]:]):
             if offset % 32 == 0:
                 check_cancelled()
-            redundancy[index] = max(redundancy[index], _jaccard(unique_shingles[index], unique_shingles[chosen]))
+            sim = _jaccard(unique_shingles[index], unique_shingles[chosen])
+            if is_lineage:
+                chosen_sec = unique[chosen]
+                if (
+                    cand_sec.document_id
+                    and cand_sec.document_id == chosen_sec.document_id
+                    and (cand_sec.document_version_id or "") != (chosen_sec.document_version_id or "")
+                ):
+                    sim *= 0.25
+            redundancy[index] = max(redundancy[index], sim)
         compared[index] = len(selected_indices)
         return redundancy[index]
 
@@ -1294,6 +1423,7 @@ def select_diverse_sections(
             )
             allow_wide_sample = (
                 unbounded_limit
+                or is_lineage
                 or effective_multi_hop
                 or per_document_limit == 1
                 or len(unique) <= limit + 1
@@ -1575,7 +1705,11 @@ async def retrieve_relevant_sections(
         temporal_mode=temporal_mode,
     )
     final_sections = (
-        group_sections_by_document(reranked.sections, limit=requested_limit)
+        group_sections_by_document(
+            reranked.sections,
+            limit=requested_limit,
+            temporal_mode=temporal_mode,
+        )
         if retrieval_plan.target == TargetUnit.DOCUMENT
         else reranked.sections[:requested_limit]
     )

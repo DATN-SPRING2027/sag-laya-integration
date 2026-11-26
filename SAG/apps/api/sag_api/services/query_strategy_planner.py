@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -15,6 +16,7 @@ from sag_api.services.retrieval_plan import (
     RetrievalPlan,
     build_retrieval_plan,
 )
+from sag_api.services.temporal_date_parser import extract_as_of_datetime
 
 
 class RetrievalMode(StrEnum):
@@ -72,6 +74,21 @@ def _route_field(route_decision: Any, name: str, default: Any = None) -> Any:
     return getattr(route_decision, name, default)
 
 
+def _coerce_utc_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+    return None
+
+
 def plan_query(
     query: str,
     *,
@@ -89,6 +106,8 @@ def plan_query(
     entities: tuple[str, ...] | list[str] = (),
     route_decision: Mapping[str, Any] | Any | None = None,
     constraints: tuple[FieldPredicate, ...] = (),
+    as_of: datetime | None = None,
+    reference_time: datetime | None = None,
 ) -> QueryStrategyPlan:
     """Select a stable primary mode and compile the 7-axis RetrievalPlan."""
     if route_decision is not None:
@@ -171,6 +190,30 @@ def plan_query(
     if multi_hop_eligible:
         reasons.append("MULTI_HOP_CANDIDATE")
 
+    clean_temporal = (str(temporal_mode or "")).strip().lower() or "atemporal"
+    resolved_as_of: datetime | None = None
+    if as_of is not None:
+        resolved_as_of = _coerce_utc_datetime(as_of)
+        if resolved_as_of is not None:
+            reasons.append("EXPLICIT_AS_OF")
+    elif clean_temporal == "past_point":
+        route_as_of = _coerce_utc_datetime(_route_field(route_decision, "as_of"))
+        if route_as_of is not None:
+            resolved_as_of = route_as_of
+        else:
+            resolved_as_of = extract_as_of_datetime(query, reference_time=reference_time)
+            if resolved_as_of is None and route_decision is not None:
+                route_query = _route_field(route_decision, "query")
+                if isinstance(route_query, str) and route_query.strip() and route_query != query:
+                    resolved_as_of = extract_as_of_datetime(
+                        route_query,
+                        reference_time=reference_time,
+                    )
+        if resolved_as_of is not None:
+            reasons.append("PARSED_PAST_POINT_AS_OF")
+        else:
+            reasons.append("PAST_POINT_UNPARSED_FALLBACK")
+
     exact_lookup = bool(
         effective_features.exact_terms
         or effective_features.identifier_terms
@@ -192,6 +235,7 @@ def plan_query(
         constraints=constraints,
         temporal_mode=str(temporal_mode) if temporal_mode else None,
         entities=tuple(str(e).strip() for e in entities if str(e).strip()),
+        as_of=resolved_as_of,
     )
     if retrieval_plan.target.value == "DOCUMENT":
         reasons.append(f"TARGET_DOCUMENT_{retrieval_plan.output.value}")

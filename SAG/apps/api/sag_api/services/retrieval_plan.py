@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import unicodedata
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -183,6 +184,7 @@ class RetrievalPlan:
     unsupported_reason: str | None = None
     temporal_mode: str = "atemporal"
     entities: tuple[str, ...] = ()
+    as_of: datetime | None = None
 
     @property
     def per_document_limit(self) -> int | None:
@@ -204,6 +206,8 @@ class RetrievalPlan:
             "per_document_limit": self.per_document_limit,
             "fallback_used": self.fallback_used,
             "unsupported_reason": self.unsupported_reason,
+            "temporal_mode": self.temporal_mode,
+            "as_of": self.as_of.isoformat() if self.as_of is not None else None,
         }
 
 
@@ -288,6 +292,7 @@ def build_retrieval_plan(
     cursor: str | None = None,
     temporal_mode: str | None = None,
     entities: tuple[str, ...] = (),
+    as_of: datetime | None = None,
 ) -> RetrievalPlan:
     """Compile structured routing signals + API parameters into a validated 7-axis RetrievalPlan."""
     query = unicodedata.normalize("NFC", query or "")
@@ -400,6 +405,11 @@ def build_retrieval_plan(
         )
 
     clean_temporal = (temporal_mode or "").strip().lower() or "atemporal"
+    normalized_as_of = (
+        (as_of.replace(tzinfo=UTC) if as_of.tzinfo is None else as_of.astimezone(UTC))
+        if isinstance(as_of, datetime)
+        else None
+    )
     clean_entities = tuple(
         dict.fromkeys(
             unicodedata.normalize("NFC", str(ent)).strip()
@@ -422,6 +432,7 @@ def build_retrieval_plan(
         unsupported_reason=unsupported_reason,
         temporal_mode=clean_temporal,
         entities=clean_entities,
+        as_of=normalized_as_of,
     )
 
 
@@ -464,26 +475,35 @@ def group_sections_by_document(
     limit: int,
     relative_floor: float = 0.50,
     absolute_floor: float = 0.35,
+    temporal_mode: str | None = None,
 ) -> list[Any]:
     """Group ACL-verified sections by document identity (1 representative section per document).
 
     Enforces a dynamic relevance cutoff so that if a user asks for 20 documents
     but only 7 documents are genuinely relevant, we return 7 instead of padding
-    with 13 irrelevant documents.
+    with 13 irrelevant documents. In ``change_lineage`` mode, distinct versions of
+    the same document keep independent slots so v1 and v2 survive side by side.
     """
     if not sections or limit <= 0:
         return []
 
+    is_lineage = str(temporal_mode or "").strip().lower() == "change_lineage"
     best_by_doc: dict[str, Any] = {}
     ordered_doc_keys: list[str] = []
     for section in sections:
-        doc_key = str(
-            getattr(section, "document_id", None)
-            or getattr(section, "document_version_id", None)
-            or getattr(section, "document_name", None)
-            or getattr(section, "chunk_id", None)
-            or ""
-        )
+        doc_id = getattr(section, "document_id", None)
+        ver_id = getattr(section, "document_version_id", None)
+        if is_lineage and ver_id:
+            base = str(doc_id or getattr(section, "document_name", None) or "")
+            doc_key = f"{base}::ver::{ver_id}" if base else str(ver_id)
+        else:
+            doc_key = str(
+                doc_id
+                or ver_id
+                or getattr(section, "document_name", None)
+                or getattr(section, "chunk_id", None)
+                or ""
+            )
         if not doc_key:
             continue
         score = float(getattr(section, "score", 0.0) or 0.0)
@@ -503,6 +523,7 @@ def group_sections_by_document(
             -float(getattr(sec, "score", 0.0) or 0.0),
             int(getattr(sec, "rank", 0) or 0),
             str(getattr(sec, "document_id", None) or ""),
+            str(getattr(sec, "document_version_id", None) or ""),
         ),
     )
     top_score = float(getattr(representatives[0], "score", 0.0) or 0.0)

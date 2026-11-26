@@ -11,7 +11,7 @@ import time
 import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, Protocol
 from weakref import WeakKeyDictionary
@@ -45,7 +45,7 @@ from sag_api.db.models import (
     StageRun,
     TreeManifest,
 )
-from sag_api.enums import DocumentStatus, JobStatus, JobType
+from sag_api.enums import DocumentStatus, JobStatus, JobType, normalize_scope_tags
 from sag_api.sag import RetrievedSection, SearchOutcome
 from sag_api.sag.search_unit_store import (
     SearchIndexUnavailable,
@@ -77,6 +77,7 @@ async def _select_diverse_sections(
     per_document_limit: int | None = None,
     multi_hop: bool | None = None,
     entities: tuple[str, ...] | list[str] = (),
+    temporal_mode: str | None = None,
 ):
     """Keep evidence scoring off the API loop and stop it when its request ends."""
     from sag_api.services.retrieval_service import select_diverse_sections
@@ -95,6 +96,7 @@ async def _select_diverse_sections(
                 per_document_limit=per_document_limit,
                 multi_hop=multi_hop,
                 entities=entities,
+                temporal_mode=temporal_mode,
                 _cancelled=cancelled,
             ))
             try:
@@ -157,6 +159,10 @@ class _ReadyVersion:
     search_manifest_checksum: str = ""
     valid_to: datetime | None = None
     is_superseded: bool = False
+    document_id: str = ""
+    authority_tier: int | None = None
+    effective_from: datetime | None = None
+    scope_tags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,12 +279,37 @@ def _verified_manifest(metrics: Any, *, project_id: str) -> bool:
     )
 
 
+_STAGE_CLOCK_SKEW_TOLERANCE = timedelta(seconds=1)
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
 def _stage_belongs_to_current_attempt(
     attempt_started_at: datetime | None,
     stage: StageRun,
+    *,
+    attempt_count: int | None = None,
 ) -> bool:
-    """A retry invalidates older SUCCESS manifests as soon as its run starts."""
-    return attempt_started_at is not None and stage.created_at >= attempt_started_at
+    """A retry invalidates older SUCCESS manifests while absorbing <=1s DB/SQLite clock skew."""
+    if attempt_started_at is None or stage.created_at is None:
+        return False
+    if attempt_count is not None and isinstance(stage.metrics_json, dict):
+        stage_attempt = stage.metrics_json.get("attempt_count")
+        if (
+            isinstance(stage_attempt, int)
+            and not isinstance(stage_attempt, bool)
+            and stage_attempt != attempt_count
+        ):
+            return False
+    attempt_utc = _as_utc(attempt_started_at)
+    stage_utc = _as_utc(stage.created_at)
+    if attempt_utc is None or stage_utc is None:
+        return False
+    return (stage_utc + _STAGE_CLOCK_SKEW_TOLERANCE) >= attempt_utc
 
 
 async def _load_current_ready_versions(
@@ -288,6 +319,7 @@ async def _load_current_ready_versions(
     *,
     version_ids: set[str] | list[str] | tuple[str, ...] | None = None,
     include_superseded: bool = False,
+    reference_time: datetime | None = None,
 ) -> dict[str, _ReadyVersion]:
     try:
         return await _load_current_ready_versions_checked(
@@ -296,6 +328,7 @@ async def _load_current_ready_versions(
             principal,
             version_ids=version_ids,
             include_superseded=include_superseded,
+            reference_time=reference_time,
         )
     except SQLAlchemyError as error:
         log.warning("canonical scope lookup unavailable error_type=%s", type(error).__name__)
@@ -339,6 +372,7 @@ async def _load_current_ready_versions_checked(
     *,
     version_ids: set[str] | list[str] | tuple[str, ...] | None = None,
     include_superseded: bool = False,
+    reference_time: datetime | None = None,
 ) -> dict[str, _ReadyVersion]:
     """Recheck mappings and collect only versions from each version's latest verified attempt."""
     if not sources or not principal.tenant_id or not principal.allowed_partition_ids:
@@ -350,7 +384,9 @@ async def _load_current_ready_versions_checked(
     source_ids = sorted(source_by_id)
     partition_ids = sorted(principal.allowed_partition_ids)
     partition_expression = DocumentVersion.metadata_json["security_partition_id"].as_string()
-    current_time = datetime.now(UTC)
+    eval_time = _as_utc(reference_time) if reference_time is not None else datetime.now(UTC)
+    assert eval_time is not None
+    wall_now = datetime.now(UTC)
     hidden_document_ids = await _hidden_reprocess_document_ids(session, source_ids)
 
     unit_exists_clause = (
@@ -366,7 +402,11 @@ async def _load_current_ready_versions_checked(
         await session.execute(
             select(
                 DocumentVersion.id.label("document_version_id"),
+                DocumentVersion.document_id.label("document_id"),
                 DocumentVersion.valid_to.label("valid_to"),
+                DocumentVersion.authority_tier.label("authority_tier"),
+                DocumentVersion.effective_from.label("effective_from"),
+                DocumentVersion.scope_tags_json.label("scope_tags_json"),
                 Document.source_id,
                 Document.project_id,
                 Document.tenant_id,
@@ -394,10 +434,11 @@ async def _load_current_ready_versions_checked(
                     ]
                 ),
                 Document.id.notin_(hidden_document_ids) if hidden_document_ids else True,
+                DocumentVersion.status != "REVOKED",
                 DocumentVersion.search_status.in_(("READY", "SEARCH_READY")),
-                DocumentVersion.valid_from <= current_time,
+                DocumentVersion.valid_from <= eval_time,
                 DocumentVersion.search_ready_at.is_not(None),
-                True if include_superseded else (DocumentVersion.valid_to > current_time),
+                True if include_superseded else (DocumentVersion.valid_to > eval_time),
                 partition_expression.in_(partition_ids),
                 unit_exists_clause,
             )
@@ -414,6 +455,7 @@ async def _load_current_ready_versions_checked(
             IngestionRun.project_id.label("project_id"),
             IngestionRun.tenant_id.label("tenant_id"),
             IngestionRun.started_at.label("started_at"),
+            IngestionRun.attempt_count.label("attempt_count"),
             func.row_number()
             .over(
                 partition_by=IngestionRun.document_version_id,
@@ -432,6 +474,7 @@ async def _load_current_ready_versions_checked(
                 ranked_runs.c.project_id,
                 ranked_runs.c.tenant_id,
                 ranked_runs.c.started_at,
+                ranked_runs.c.attempt_count,
             ).where(ranked_runs.c.attempt_rank == 1)
         )
     ).all()
@@ -452,6 +495,7 @@ async def _load_current_ready_versions_checked(
         stage_by_run.setdefault(stage.run_id, stage)
 
     versions: dict[str, _ReadyVersion] = {}
+    superseded_cutoff = max(eval_time, wall_now)
     for row in scoped_rows:
         version_id = str(row.document_version_id)
         run = run_by_version.get(version_id)
@@ -464,17 +508,42 @@ async def _load_current_ready_versions_checked(
         if (
             stage is None
             or stage.status != "SUCCESS"
-            or not _stage_belongs_to_current_attempt(run.started_at, stage)
+            or not _stage_belongs_to_current_attempt(
+                run.started_at,
+                stage,
+                attempt_count=getattr(run, "attempt_count", None),
+            )
             or not _verified_manifest(stage.metrics_json, project_id=str(row.project_id))
         ):
             continue
         row_valid_to = getattr(row, "valid_to", None)
         is_sup = False
         if isinstance(row_valid_to, datetime):
-            vt_utc = row_valid_to.replace(tzinfo=UTC) if row_valid_to.tzinfo is None else row_valid_to.astimezone(UTC)
-            is_sup = vt_utc <= current_time
+            vt_utc = _as_utc(row_valid_to)
+            assert vt_utc is not None
+            is_sup = vt_utc <= superseded_cutoff
+        raw_tier = getattr(row, "authority_tier", None)
+        norm_tier = (
+            int(raw_tier)
+            if isinstance(raw_tier, int) and not isinstance(raw_tier, bool) and 1 <= raw_tier <= 4
+            else None
+        )
+        raw_eff = getattr(row, "effective_from", None)
+        norm_eff = _as_utc(raw_eff) if isinstance(raw_eff, datetime) else None
+        raw_tags = getattr(row, "scope_tags_json", None)
+        norm_tags: tuple[str, ...] = ()
+        if raw_tags is not None:
+            try:
+                norm_tags = tuple(normalize_scope_tags(raw_tags))
+            except ValueError:
+                log.warning(
+                    "Ignoring malformed scope_tags_json on document_version=%s",
+                    version_id,
+                )
+                norm_tags = ()
         versions[version_id] = _ReadyVersion(
             document_version_id=version_id,
+            document_id=str(getattr(row, "document_id", "") or ""),
             source_id=str(row.source_id),
             project_id=str(row.project_id),
             tenant_id=str(row.tenant_id),
@@ -486,6 +555,9 @@ async def _load_current_ready_versions_checked(
             source=source,
             valid_to=row_valid_to,
             is_superseded=is_sup,
+            authority_tier=norm_tier,
+            effective_from=norm_eff,
+            scope_tags=norm_tags,
         )
     return versions
 
@@ -905,6 +977,7 @@ def _routing_trace(
     selection_fallback_reason: str | None = None,
     graph_expansion_attempted: bool = False,
     graph_expanded_candidates: int = 0,
+    temporal_bypass: bool = False,
 ) -> dict[str, Any]:
     routed_groups: list[dict[str, Any]] = []
     request_snapshot_ids: set[str] = set()
@@ -924,6 +997,7 @@ def _routing_trace(
         if route and route.request_snapshot_id:
             request_snapshot_ids.add(route.request_snapshot_id)
         selected_nodes = list(route.selected_nodes) if route else []
+        is_temporal_bypass = temporal_bypass and route is None
         routed_groups.append(
             {
                 "project_id": group.project_id,
@@ -940,14 +1014,24 @@ def _routing_trace(
                 "entropy": route.entropy if route else None,
                 "margin": route.margin if route else None,
                 "broad_route": route.broad_route if route else False,
-                "reason_code": route.reason_code if route else "TREE_SNAPSHOT_UNAVAILABLE",
-                "fallback_reason": route.fallback_reason if route else "routing_snapshot_unavailable",
+                "reason_code": (
+                    route.reason_code
+                    if route
+                    else ("TEMPORAL_HISTORY_BYPASS_TREE" if is_temporal_bypass else "TREE_SNAPSHOT_UNAVAILABLE")
+                ),
+                "fallback_reason": (
+                    route.fallback_reason
+                    if route
+                    else ("temporal_superseded_scope" if is_temporal_bypass else "routing_snapshot_unavailable")
+                ),
                 "branch_local_candidates": len(local_ids),
                 "global_candidates": len(global_ids),
                 "escape_recovered_candidates": len(escape_ids - local_ids),
                 "escape_attempted": True,
                 "escape_trigger": (
-                    "tree_route_unavailable"
+                    "temporal_history_global_only"
+                    if is_temporal_bypass
+                    else "tree_route_unavailable"
                     if not route or not route.routed
                     else "local_path_failed"
                     if group.scope_key in local_failures
@@ -1066,6 +1150,10 @@ def _scope_knowledge_digest(current_versions: dict[str, _ReadyVersion]) -> str:
             v.tenant_id,
             v.project_id,
             v.source_id,
+            v.is_superseded,
+            v.authority_tier,
+            v.effective_from.isoformat() if isinstance(v.effective_from, datetime) else None,
+            v.scope_tags,
         )
         for v in sorted(current_versions.values(), key=lambda item: item.document_version_id)
     ]
@@ -1527,6 +1615,9 @@ async def _ensure_versions_hydrated(
             anchor=anchor.strip(),
             valid_to=ver.valid_to,
             is_superseded=ver.is_superseded,
+            authority_tier=ver.authority_tier,
+            effective_from=ver.effective_from,
+            scope_tags=ver.scope_tags,
         )
         k_index.hydrated_su_by_version[v_id_str].append((sec_template, int(s_ord), int(e_ord)))
 
@@ -1620,6 +1711,8 @@ async def _expand_multi_hop_sections(
     query: str = "",
     allow_contradiction_lineage: bool = True,
     preloaded_k_index: _ScopeKnowledgeIndex | None = None,
+    allows_superseded: bool = False,
+    reference_time: datetime | None = None,
 ) -> list[RetrievedSection]:
     """HippoRAG 2 associative passage expansion over ACL-scoped KnowledgeUnitEdge + Artifact Bridges + Stage 2B Lineage."""
     if not seed_sections or not current_versions:
@@ -1649,11 +1742,11 @@ async def _expand_multi_hop_sections(
     allowed_partitions = sorted({v.partition_id for v in current_versions.values()})
     query_folded = re.sub(r"[\s_-]+", " ", normalize_text(query or "").lower()).strip()
     query_single_words = set(re.findall(r"[^\W_]+", query_folded, flags=re.UNICODE))
-    allowed_lineage_kinds = (
-        {"SUPERSEDED_BY", "CONTRADICTS"}
-        if (not lineage_only or allow_contradiction_lineage)
-        else {"SUPERSEDED_BY"}
-    )
+    allowed_lineage_kinds: set[str] = {"SUPERSEDED_BY"}
+    if not lineage_only or allow_contradiction_lineage:
+        allowed_lineage_kinds.add("CONTRADICTS")
+    if allows_superseded:
+        allowed_lineage_kinds.add("SUPERSEDES")
     try:
         k_index = preloaded_k_index
         if k_index is None:
@@ -1672,7 +1765,7 @@ async def _expand_multi_hop_sections(
                     for tgt_ver, t_lo, t_hi, rel_weight, rel_kind in k_index.lineage_by_version_ordinal.get(
                         (v_id, ord_cursor), ()
                     ):
-                        if lineage_only and rel_kind not in allowed_lineage_kinds:
+                        if rel_kind not in allowed_lineage_kinds:
                             continue
                         if tgt_ver not in current_versions:
                             continue
@@ -1881,6 +1974,8 @@ async def _expand_multi_hop_sections(
                     sources,
                 )
 
+        from sag_api.services.retrieval_service import _is_superseded_section
+
         per_version_cap = max(2, limit // 4)
         expanded: list[RetrievedSection] = []
         for v_id_str in neighbor_version_ids:
@@ -1888,6 +1983,11 @@ async def _expand_multi_hop_sections(
             ver_candidates: list[RetrievedSection] = []
             for sec_template, s_ord, e_ord in k_index.hydrated_su_by_version.get(v_id_str, ()):
                 if sec_template.search_unit_id in existing_unit_ids:
+                    continue
+                if not allows_superseded and _is_superseded_section(
+                    sec_template,
+                    reference_time=reference_time,
+                ):
                     continue
                 best_score = max(
                     (score for ku_ord, score in ord_scores if s_ord <= ku_ord <= e_ord),
@@ -2038,13 +2138,31 @@ async def _retrieve_search_unit_sections(
     deadline: float,
 ) -> SearchOutcome:
     """Query only currently authorized versions with a verified Phase 2C manifest."""
-    from sag_api.services.retrieval_service import _query_allows_superseded, rerank_sections
+    from sag_api.services.retrieval_service import _is_superseded_section, rerank_sections
 
     query = normalize_text(query or "")
     requested_limit = min(top_k, settings.search_unit_candidate_limit) if top_k is not None else candidate_limit
     selection_limit = requested_limit if top_k is not None else None
     strategy_plan = query_strategy_plan or plan_query(query, requested_top_k=top_k)
-    allows_superseded = _query_allows_superseded(temporal_mode=strategy_plan.retrieval_plan.temporal_mode)
+    temporal_mode = strategy_plan.retrieval_plan.temporal_mode
+    as_of = strategy_plan.retrieval_plan.as_of
+    pinned_now = datetime.now(UTC)
+    if temporal_mode == "past_point" and as_of is not None:
+        reference_time = _as_utc(as_of) or pinned_now
+        load_include_superseded = False
+        allows_superseded = True
+    elif temporal_mode == "past_point":
+        reference_time = pinned_now
+        load_include_superseded = True
+        allows_superseded = True
+    elif temporal_mode == "change_lineage":
+        reference_time = pinned_now
+        load_include_superseded = True
+        allows_superseded = True
+    else:
+        reference_time = pinned_now
+        load_include_superseded = False
+        allows_superseded = False
     per_doc_limit = strategy_plan.retrieval_plan.per_document_limit
     retrieval_stats = {
         "effective_strategy": "canonical_hybrid",
@@ -2062,6 +2180,7 @@ async def _retrieve_search_unit_sections(
             stats={
                 "canonical_index": True,
                 "ready_versions": 0,
+                "ready_documents": 0,
                 **retrieval_stats,
                 "routing": _empty_routing_trace(strategy_plan, "no_authorized_scope"),
                 "stage_latencies_ms": {
@@ -2084,12 +2203,16 @@ async def _retrieve_search_unit_sections(
                     session,
                     sources,
                     principal,
-                    include_superseded=allows_superseded,
+                    include_superseded=load_include_superseded,
+                    reference_time=reference_time,
                 )
     except TimeoutError as error:
         log.warning("canonical search authorization exceeded query budget")
         raise ServiceUnavailableError("Canonical search exceeded the query budget") from error
     t_auth_ms = round((time.perf_counter() - t_auth_start) * 1000, 2)
+    ready_documents_count = len(
+        {(v.document_id or v.document_version_id) for v in ready_versions.values()}
+    )
     groups = _groups(ready_versions)
     if not groups:
         total_ms = round((time.perf_counter() - t_start) * 1000, 2)
@@ -2099,6 +2222,7 @@ async def _retrieve_search_unit_sections(
             stats={
                 "canonical_index": True,
                 "ready_versions": 0,
+                "ready_documents": 0,
                 **retrieval_stats,
                 "routing": _empty_routing_trace(strategy_plan, "no_verified_search_ready_group"),
                 "stage_latencies_ms": {
@@ -2158,16 +2282,20 @@ async def _retrieve_search_unit_sections(
                 if len(raw_subqueries) >= 2
                 else ()
             )
-            decisions = await capture_routing_decisions(
-                engine_manager,
-                groups,
-                query=query,
-                planner_trace=strategy_plan.as_trace(),
-                principal=principal,
-                timeout_seconds=snapshot_budget,
-                query_vector_tasks_by_scope=scope_vector_tasks,
-            )
-            t_route_ms = round((time.perf_counter() - t_route_start) * 1000, 2)
+            if allows_superseded:
+                decisions = {}
+                t_route_ms = 0.0
+            else:
+                decisions = await capture_routing_decisions(
+                    engine_manager,
+                    groups,
+                    query=query,
+                    planner_trace=strategy_plan.as_trace(),
+                    principal=principal,
+                    timeout_seconds=snapshot_budget,
+                    query_vector_tasks_by_scope=scope_vector_tasks,
+                )
+                t_route_ms = round((time.perf_counter() - t_route_start) * 1000, 2)
 
             async def bounded(group: _SearchGroup):
                 async with semaphore:
@@ -2210,7 +2338,8 @@ async def _retrieve_search_unit_sections(
                     local_deadline = deadline - local_reserve
                     escape_deadline = deadline - 0.05
                     confident_local = (
-                        not route.broad_route
+                        not allows_superseded
+                        and not route.broad_route
                         and route.reason_code == "ROUTE_DESCENDED"
                         and float(route.margin or 0.0) >= 0.22
                         and not strategy_plan.multi_hop_eligible
@@ -2475,6 +2604,7 @@ async def _retrieve_search_unit_sections(
             graph_skip_reason="phase5_adapter_unavailable"
             if effective_plan.primary_strategy.value == "MULTI_HOP"
             else None,
+            temporal_bypass=allows_superseded,
         )
         total_ms = round((time.perf_counter() - t_start) * 1000, 2)
         return SearchOutcome(
@@ -2483,6 +2613,7 @@ async def _retrieve_search_unit_sections(
             stats={
                 "canonical_index": True,
                 "ready_versions": len(ready_versions),
+                "ready_documents": ready_documents_count,
                 **retrieval_stats,
                 "routing": routing,
                 "stage_latencies_ms": {
@@ -2512,7 +2643,8 @@ async def _retrieve_search_unit_sections(
                     sources,
                     principal,
                     version_ids=candidate_version_ids,
-                    include_superseded=allows_superseded,
+                    include_superseded=load_include_superseded,
+                    reference_time=reference_time,
                 )
                 current_versions = {
                     vid: ver
@@ -2596,7 +2728,17 @@ async def _retrieve_search_unit_sections(
                 "tenant_id": version.tenant_id,
                 "security_partition_id": version.partition_id,
                 "valid_to": version.valid_to,
-                "is_superseded": version.is_superseded,
+                "is_superseded": (
+                    bool(version.is_superseded)
+                    if allows_superseded
+                    else bool(
+                        isinstance(version.valid_to, datetime)
+                        and (_as_utc(version.valid_to) or reference_time) <= reference_time
+                    )
+                ),
+                "authority_tier": version.authority_tier,
+                "effective_from": version.effective_from,
+                "scope_tags": version.scope_tags,
             },
         )
 
@@ -2728,16 +2870,13 @@ async def _retrieve_search_unit_sections(
         from sag_api.services.query_analysis import analyze_query
         from sag_api.services.retrieval_service import (
             _is_boilerplate,
-            _is_superseded_section,
             _passes_lexical_floor_bypass,
-            _query_allows_superseded,
             _section_key,
         )
 
         selection_fallback_reason = "rerank_budget_exhausted"
         raw_fallback_pool = _fair_rank_merge([semantic, lexical])
         lexical_keys = {_section_key(sec) for sec in lexical}
-        allows_superseded = _query_allows_superseded(temporal_mode=strategy_plan.retrieval_plan.temporal_mode)
         min_dense = float(settings.search_min_dense_score)
         fallback_analysis = analyze_query(
             query,
@@ -2750,7 +2889,7 @@ async def _retrieve_search_unit_sections(
             in_lexical = sec_key in lexical_keys
             if _is_boilerplate(sec):
                 continue
-            if not allows_superseded and _is_superseded_section(sec):
+            if not allows_superseded and _is_superseded_section(sec, reference_time=reference_time):
                 continue
             eff_dense = (
                 float(sec.raw_dense_score)
@@ -2767,7 +2906,11 @@ async def _retrieve_search_unit_sections(
         if per_doc_limit == 1 and selection_limit is not None:
             from sag_api.services.retrieval_plan import group_sections_by_document
 
-            selected = group_sections_by_document(fallback_pool, limit=selection_limit)
+            selected = group_sections_by_document(
+                fallback_pool,
+                limit=selection_limit,
+                temporal_mode=temporal_mode,
+            )
         else:
             selected = fallback_pool[:selection_limit]
         rerank_stats = {
@@ -2801,7 +2944,8 @@ async def _retrieve_search_unit_sections(
             limit=None,
             subqueries=strategy_plan.retrieval_plan.decomposition.subqueries,
             entities=strategy_plan.retrieval_plan.entities,
-            temporal_mode=strategy_plan.retrieval_plan.temporal_mode,
+            temporal_mode=temporal_mode,
+            reference_time=reference_time,
         )
         t_fusion_ms = round((time.perf_counter() - t_fusion_start) * 1000, 2)
         rerank_stats = {
@@ -2836,13 +2980,18 @@ async def _retrieve_search_unit_sections(
                 per_document_limit=per_doc_limit,
                 multi_hop=is_multi_hop_query,
                 entities=strategy_plan.retrieval_plan.entities,
+                temporal_mode=temporal_mode,
             )
         except TimeoutError:
             selection_fallback_reason = "diversity_budget_exhausted"
             if per_doc_limit == 1 and selection_limit is not None:
                 from sag_api.services.retrieval_plan import group_sections_by_document
 
-                selected = group_sections_by_document(fused.sections, limit=selection_limit)
+                selected = group_sections_by_document(
+                    fused.sections,
+                    limit=selection_limit,
+                    temporal_mode=temporal_mode,
+                )
             else:
                 selected = fused.sections[:selection_limit]
             diversity_stats = {"candidate_count": len(initial_pool), "deduplicated_count": 0,
@@ -2902,6 +3051,7 @@ async def _retrieve_search_unit_sections(
             has_required_anchors = int((diversity_stats or {}).get("required_anchor_count", 0) or 0) > 0
             allow_contradiction = bool(
                 has_required_anchors
+                or temporal_mode == "change_lineage"
                 or effective_plan.retrieval_plan.answer_shape == AnswerShape.MULTI_FACET_COMPARE
                 or effective_plan.primary_strategy.value in {"ENTITY_RELATIONAL", "MULTI_HOP"}
             )
@@ -2918,8 +3068,16 @@ async def _retrieve_search_unit_sections(
                 query=query,
                 allow_contradiction_lineage=allow_contradiction,
                 preloaded_k_index=(scope_k_index_holder[0] if scope_k_index_holder else None),
+                allows_superseded=allows_superseded,
+                reference_time=reference_time,
             )
             t_graph_expansion_ms = round((time.perf_counter() - t_graph_start) * 1000, 2)
+            if expanded_sections and not allows_superseded:
+                expanded_sections = [
+                    s
+                    for s in expanded_sections
+                    if not _is_superseded_section(s, reference_time=reference_time)
+                ]
             graph_expanded_candidates = len(expanded_sections)
             if expanded_sections:
                 graph_expansion_attempted = True
@@ -2968,6 +3126,7 @@ async def _retrieve_search_unit_sections(
                         per_document_limit=per_doc_limit,
                         multi_hop=is_multi_hop_mode,
                         entities=effective_plan.retrieval_plan.entities,
+                        temporal_mode=temporal_mode,
                     )
                 except TimeoutError:
                     diversity_stats = {**diversity_stats, "reason": "diversity_budget_exhausted"}
@@ -2999,6 +3158,7 @@ async def _retrieve_search_unit_sections(
         selection_fallback_reason=selection_fallback_reason,
         graph_expansion_attempted=graph_expansion_attempted,
         graph_expanded_candidates=graph_expanded_candidates,
+        temporal_bypass=allows_superseded,
     )
     from sag_api.services.retrieval_plan import OutputMode
 
@@ -3089,7 +3249,8 @@ async def _retrieve_search_unit_sections(
                         sources,
                         principal,
                         version_ids=selected_version_ids,
-                        include_superseded=allows_superseded,
+                        include_superseded=load_include_superseded,
+                        reference_time=reference_time,
                     )
             _verify_selection_scope(selected_version_ids, current_versions, refreshed)
         except (TimeoutError, SQLAlchemyError) as error:
@@ -3102,6 +3263,7 @@ async def _retrieve_search_unit_sections(
         stats={
             "canonical_index": True,
             "ready_versions": len(ready_versions),
+            "ready_documents": ready_documents_count,
             **retrieval_stats,
             "semantic_candidates": semantic_candidate_count,
             "lexical_candidates": lexical_candidate_count,
@@ -3257,6 +3419,7 @@ async def _get_search_unit_citation_checked(
         or not _stage_belongs_to_current_attempt(
             latest_run.started_at,
             latest_index_stage,
+            attempt_count=latest_run.attempt_count,
         )
         or not _verified_manifest(latest_index_stage.metrics_json, project_id=project_id)
     ):
