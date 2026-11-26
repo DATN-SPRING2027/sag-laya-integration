@@ -2456,6 +2456,152 @@ async def test_p6_rework_22_ws_only_prefix_token_gluing_and_multiturn_tool_faile
     assert out_2t_fail == "Step 1.\n\nDone."
 
 
+# ---------------------------------------------------------------------------
+# Item 23 (CHAL-R11-1, CHAL-R11-2, & 2-turn Case C): Preserve column-0 opening
+# code fences after ws-only streamed prefixes, merge contiguous stripped
+# citation clusters, and deduplicate 2-turn Case C prefix extensions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_p6_rework_23_ws_prefix_opening_fence_citation_clusters_and_2turn_case_c(
+    monkeypatch,
+) -> None:
+    agent = SimpleNamespace(id="agent-r11", name="R11Bot", persona={"web_enabled": True})
+    monkeypatch.setattr(openai_api.svc, "get_agent", AsyncMock(return_value=agent))
+    monkeypatch.setattr(openai_api.svc, "resolve_sources", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        openai_api.svc,
+        "build_ask_context",
+        lambda **kw: SimpleNamespace(
+            source_ids=[],
+            citations=[],
+            session_citations=[],
+            route_decision={"coarse_intent": "CHAT", "degraded": False},
+        ),
+    )
+
+    async def _run_events(events: list[SimpleNamespace]) -> str:
+        async def fake_stream(*args, **kwargs):
+            for ev in events:
+                yield ev
+
+        monkeypatch.setattr(openai_api.agent_service, "generate_stream", fake_stream)
+        body = openai_api.ChatCompletionRequest(
+            messages=[openai_api.ChatMessage(role="user", content="check")],
+            stream=True,
+        )
+        resp = await openai_api.chat_completions(
+            agent_id="agent-r11",
+            body=body,
+            _user=SimpleNamespace(id="u-1", name="Tester"),
+            owner_key="owner-1",
+            principal=SimpleNamespace(tenant_id="t-1", organization_id="o-1", user_id="u-1"),
+            session=SimpleNamespace(),
+            engine_manager=SimpleNamespace(),
+            llm=SimpleNamespace(configured=True),
+            tool_registry=SimpleNamespace(),
+            agent_runtime=SimpleNamespace(),
+        )
+        out_chunks: list[str] = []
+        async for raw in resp.body_iterator:
+            text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+            for line in text.splitlines():
+                if not line.startswith("data: ") or line == "data: [DONE]":
+                    continue
+                payload = json.loads(line[len("data: ") :])
+                delta = (payload.get("choices") or [{}])[0].get("delta") or {}
+                if delta.get("content"):
+                    out_chunks.append(delta["content"])
+        return "".join(out_chunks)
+
+    # CHAL-R11-2: Whitespace-only prefix before column-0 opening fence MUST emit \n\n so fence stays valid
+    for raw_f in [
+        "\u3000[99]\n~~~py\nreturn xs[88]\n~~~",
+        "\u00a0[99]\n```py\nx = 1\n\nreturn xs[88]\n```",
+        " \r[99]\n~~~py\nreturn xs[88]\n~~~",
+    ]:
+        canon_f, _ = agent_service._finalize_answer_citations(raw_f, [])
+        for chunks in ([raw_f], list(raw_f)):
+            out_f = await _run_events(
+                [
+                    SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}}),
+                    *[
+                        SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": c}})
+                        for c in chunks
+                    ],
+                    SimpleNamespace(
+                        type=EventType.RUN_COMPLETED.value,
+                        data={"payload": {"output": canon_f, "citations": [], "degraded": False}},
+                    ),
+                ]
+            )
+            segs_f, _, fence_f = agent_service._scan_markdown_prose_segments(out_f, hold_incomplete=False)
+            assert fence_f is None
+            prose_f = "".join(out_f[s:e] for s, e in segs_f)
+            assert "[88]" not in prose_f and "[99]" not in prose_f
+            assert "return xs[88]" in out_f
+
+    # 3-backtick inline code (NOT an opening fence) still does NOT get spurious \n\n
+    out_bt_inline = await _run_events(
+        [
+            SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}}),
+            SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": " ```inline```"}}),
+            SimpleNamespace(
+                type=EventType.RUN_COMPLETED.value,
+                data={"payload": {"output": "```inline```", "citations": [], "degraded": False}},
+            ),
+        ]
+    )
+    assert out_bt_inline == " ```inline```"
+
+    # CHAL-R11-1: Contiguous stripped citation clusters clean space before punct/ws without gluing tokens
+    for raw_c, expected_c in [
+        ("A [99][88].", "A."),
+        ("A [99][88] .", "A."),
+        ("A [99][88]:", "A:"),
+        ("A [99][88], next", "A, next"),
+        ("结论 [99][88]。", "结论。"),
+        ("A [99] [88][77].", "A."),
+        ("A [99][88] B", "A B"),
+        ("Range [99][88][0, 1]", "Range [0, 1]"),
+        ("Use [99][88]`config.yaml`", "Use `config.yaml`"),
+    ]:
+        for chunks in ([raw_c], list(raw_c)):
+            out_c = await _run_events(
+                [
+                    SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}}),
+                    *[
+                        SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": c}})
+                        for c in chunks
+                    ],
+                    SimpleNamespace(type=EventType.TOOL_STARTED.value, data={"payload": {"name": "web_search"}}),
+                    SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": "Done."}}),
+                    SimpleNamespace(
+                        type=EventType.RUN_COMPLETED.value,
+                        data={"payload": {"output": "Done.", "citations": [], "degraded": False}},
+                    ),
+                ]
+            )
+            assert out_c == f"{expected_c}\n\nDone."
+
+    # 2-turn Case C prefix extension must NOT duplicate Turn 2
+    out_2t_case_c = await _run_events(
+        [
+            SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}}),
+            SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": "Step 1."}}),
+            SimpleNamespace(type=EventType.TOOL_STARTED.value, data={"payload": {"name": "web_search"}}),
+            SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": "Let me check. "}}),
+            SimpleNamespace(type=EventType.TOOL_STARTED.value, data={"payload": {"name": "search_context"}}),
+            SimpleNamespace(
+                type=EventType.RUN_COMPLETED.value,
+                data={"payload": {"output": "Let me check. Final.", "citations": [], "degraded": False}},
+            ),
+        ]
+    )
+    assert out_2t_case_c == "Step 1.\n\nLet me check. Final."
+
+
 
 
 

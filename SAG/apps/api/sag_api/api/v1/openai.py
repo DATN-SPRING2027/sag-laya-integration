@@ -216,6 +216,18 @@ def _split_unbuffered_citation_tail(text: str) -> tuple[str, str]:
     return flushed, pending
 
 
+def _starts_with_opening_fence(text: str) -> bool:
+    """Return True if ``text`` starts at column 0 with a CommonMark §4.5 opening code fence."""
+    match = agent_service._FENCE_OPEN_RE.match(text)
+    if not match:
+        return False
+    if match.group(2)[0] != "`":
+        return True
+    nl_idx = text.find("\n", match.end())
+    line_end = len(text) if nl_idx == -1 else nl_idx
+    return text.find("`", match.end(), line_end) == -1
+
+
 def _resolve_turn_eof_pending(
     pending: str,
     *,
@@ -242,17 +254,25 @@ def _resolve_turn_eof_pending(
         if seg_start > cursor:
             out.append(pending[cursor:seg_start])
         seg = pending[seg_start:seg_end]
-        seg_parts: list[str] = []
-        pos = 0
+        clusters: list[tuple[int, int]] = []
         for match in _COMPLETE_CITATION_BRACKET_RE.finditer(seg):
             if _is_zero_math_bracket(match.group(1)):
                 continue
+            m_start, m_end = match.start(), match.end()
+            if clusters and not seg[clusters[-1][1] : m_start].strip(" \t"):
+                clusters[-1] = (clusters[-1][0], m_end)
+            else:
+                clusters.append((m_start, m_end))
+
+        seg_parts: list[str] = []
+        pos = 0
+        for c_start, c_end in clusters:
             stripped_any = True
-            before = seg[pos : match.start()]
-            # Trim horizontal space at the deleted citation site ONLY when followed by whitespace,
+            before = seg[pos:c_start]
+            # Trim horizontal space at the deleted citation cluster ONLY when followed by whitespace,
             # punctuation, or EOF (never gluing adjacent tokens like "Use [99]`code`" or "A [99]B"),
-            # and swallow space immediately after the citation if it precedes punctuation ("Code [99] :").
-            after_seg_idx = match.end()
+            # and swallow space immediately after the cluster if it precedes punctuation ("Code [99] :").
+            after_seg_idx = c_end
             ws_end = after_seg_idx
             while ws_end < len(seg) and seg[ws_end] in " \t":
                 ws_end += 1
@@ -304,7 +324,11 @@ def _compute_unstreamed_suffix(
             tail = canonical[len(norm_trimmed) :]
             if not tail or not tail[0].isalnum():
                 return tail
-    if streamed.endswith("\n") or (not post_tool_turn and not norm_streamed):
+    if streamed.endswith("\n") or (
+        not post_tool_turn
+        and not norm_streamed
+        and not _starts_with_opening_fence(canonical)
+    ):
         return canonical
     return f"\n\n{canonical}"
 
@@ -510,16 +534,20 @@ async def chat_completions(
                             canonical,
                             post_tool_turn=False,
                         )
-                    elif (
-                        last_rotated_turn
-                        and _compute_unstreamed_suffix(
+                    elif last_rotated_turn and (
+                        canonical.startswith(last_rotated_turn)
+                        or _compute_unstreamed_suffix(
                             last_rotated_turn,
                             canonical,
                             post_tool_turn=True,
                         )
                         == ""
                     ):
-                        suffix = ""
+                        suffix = _compute_unstreamed_suffix(
+                            last_rotated_turn,
+                            canonical,
+                            post_tool_turn=True,
+                        )
                     else:
                         suffix = _compute_unstreamed_suffix(
                             all_streamed,
