@@ -104,6 +104,7 @@ async def _load_indexed_units(
             allowed_partitions=principal.allowed_partition_ids,
             reference_time=now_utc,
             organization_id=principal.organization_id or None,
+            exclude_in_flight_control_jobs=True,
         )
         exclude_unit_superseded = task in ("DRAFT_GENERATION", "SOURCE_PROPOSAL")
         version_superseded_expr = DocumentVersion.valid_to <= now_utc

@@ -1279,3 +1279,269 @@ async def test_strict_input_validation_extra_forbid_malformed_json_nan_enums_and
             f"{base}/res-any/reopen?debug=1", headers=headers, json={}
         )
     ).status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# 8. Triad Round 2 Hardening Regressions (Fixes 1, 2, 12b)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_include_inactive_enforces_live_partition_acl_confirmed_spm_and_non_empty_meta(
+    conflicts_env,
+) -> None:
+    """Fix 1: GET /conflicts?include_inactive=true MUST enforce live partition ACL,
+    CONFIRMED SourceProjectMapping, and non-empty live partition metadata on both sides,
+    while still surfacing caller-authorized revoked rows."""
+    async with conflicts_env.session_factory() as s:
+        pub_base = await _seed_doc_unit(
+            s,
+            tag="inc-pub-base",
+            text="Public baseline security guideline.",
+            partition_id=PART_PUBLIC,
+        )
+        # 1. Live-drifted executive doc (stored conflict claims PART_PUBLIC, live version moved to PART_EXEC)
+        drifted_exec = await _seed_doc_unit(
+            s,
+            tag="inc-drift-exec",
+            text="SECRET EXECUTIVE COMPENSATION BOARD MINUTES.",
+            partition_id=PART_EXEC,
+        )
+        # 2. Revoked SourceProjectMapping doc
+        revoked_spm_doc = await _seed_doc_unit(
+            s,
+            tag="inc-rev-spm",
+            text="Unmapped source confidential memo.",
+            partition_id=PART_PUBLIC,
+        )
+        spm_rev = await s.get(SourceProjectMapping, f"spm-{revoked_spm_doc['source'].id}")
+        assert spm_rev is not None
+        spm_rev.state = "REVOKED"
+        spm_rev.revoked_at = T_JUN
+        spm_rev.revoked_by = "admin"
+        spm_rev.revocation_ref = "rev-spm-1"
+        # 3. Missing live security_partition_id metadata
+        empty_meta_doc = await _seed_doc_unit(
+            s,
+            tag="inc-empty-meta",
+            text="Version missing security partition metadata.",
+            partition_id=PART_PUBLIC,
+        )
+        empty_meta_doc["ver"].metadata_json = {}
+        # 4. Legitimate caller-authorized revoked document (CONFIRMED SPM + PART_PUBLIC)
+        auth_revoked_doc = await _seed_doc_unit(
+            s,
+            tag="inc-auth-rev",
+            text="Caller-authorized revoked public policy.",
+            partition_id=PART_PUBLIC,
+            ver_status="REVOKED",
+            search_status="REVOKED",
+        )
+
+        drifted_row = await _seed_conflict_row(
+            s,
+            resolution_id="res-inc-live-drifted",
+            side_a=pub_base,
+            side_b=drifted_exec,
+            status=ConflictResolutionStatus.PENDING_REVIEW,
+        )
+        drifted_row.winner_security_partition_id = PART_PUBLIC
+
+        await _seed_conflict_row(
+            s,
+            resolution_id="res-inc-revoked-spm",
+            side_a=pub_base,
+            side_b=revoked_spm_doc,
+            status=ConflictResolutionStatus.PENDING_REVIEW,
+        )
+        await _seed_conflict_row(
+            s,
+            resolution_id="res-inc-empty-meta",
+            side_a=pub_base,
+            side_b=empty_meta_doc,
+            status=ConflictResolutionStatus.PENDING_REVIEW,
+        )
+        await _seed_conflict_row(
+            s,
+            resolution_id="res-inc-auth-revoked",
+            side_a=pub_base,
+            side_b=auth_revoked_doc,
+            status=ConflictResolutionStatus.REVOKED_WINNER,
+        )
+        await s.commit()
+
+    base = f"/api/v1/projects/{PROJECT_ID}/conflicts"
+    public_principal = _make_principal(
+        subject="user_pub_inc",
+        allowed_partition_ids=frozenset({PART_PUBLIC}),
+    )
+    conflicts_env.app.dependency_overrides[require_conflicts_bff_principal] = (
+        lambda: public_principal
+    )
+    try:
+        r_inc = await conflicts_env.client.get(f"{base}?include_inactive=true")
+        assert r_inc.status_code == 200, r_inc.text
+        body = r_inc.json()
+        assert body["total"] == 1
+        assert [item["id"] for item in body["items"]] == ["res-inc-auth-revoked"]
+        assert "SECRET EXECUTIVE" not in r_inc.text
+    finally:
+        conflicts_env.app.dependency_overrides.pop(require_conflicts_bff_principal, None)
+
+
+@pytest.mark.asyncio
+async def test_resolve_and_reopen_fail_closed_404_on_missing_live_partition_and_revoked_spm(
+    conflicts_env,
+) -> None:
+    """Fix 2: POST /resolve & POST /reopen MUST fail closed (HTTP 404, zero oracle;
+    service raises ForbiddenError) on missing live partition metadata or revoked SPM."""
+    from sag_api.core.errors import ForbiddenError
+    from sag_api.services.knowledge_conflict_service import reopen_conflict, resolve_conflict
+
+    async with conflicts_env.session_factory() as s:
+        pub_a = await _seed_doc_unit(
+            s, tag="fc-pub-a", text="Public rule A baseline.", partition_id=PART_PUBLIC
+        )
+        no_part_doc = await _seed_doc_unit(
+            s, tag="fc-no-part", text="Doc with stripped partition metadata.", partition_id=PART_PUBLIC
+        )
+        no_part_doc["ver"].metadata_json = {}
+        rev_spm_doc = await _seed_doc_unit(
+            s, tag="fc-rev-spm", text="Doc whose source mapping was revoked.", partition_id=PART_PUBLIC
+        )
+        spm = await s.get(SourceProjectMapping, f"spm-{rev_spm_doc['source'].id}")
+        assert spm is not None
+        spm.state = "REVOKED"
+        spm.revoked_at = T_JUN
+        spm.revoked_by = "admin"
+        spm.revocation_ref = "rev-fc-1"
+
+        await _seed_conflict_row(
+            s,
+            resolution_id="res-fc-no-part",
+            side_a=pub_a,
+            side_b=no_part_doc,
+            status=ConflictResolutionStatus.PENDING_REVIEW,
+        )
+        await _seed_conflict_row(
+            s,
+            resolution_id="res-fc-rev-spm",
+            side_a=pub_a,
+            side_b=rev_spm_doc,
+            status=ConflictResolutionStatus.PENDING_REVIEW,
+        )
+        await s.commit()
+
+    base = f"/api/v1/projects/{PROJECT_ID}/conflicts"
+    headers = _bff_headers(user_id="reviewer_fc")
+
+    for res_id in ("res-fc-no-part", "res-fc-rev-spm"):
+        r_res = await conflicts_env.client.post(
+            f"{base}/{res_id}/resolve",
+            headers=headers,
+            json={"action": "WINNER_B", "reason": "attempt bypass"},
+        )
+        assert r_res.status_code == 404
+        assert r_res.json()["error"]["message"] == f"Conflict resolution '{res_id}' not found"
+
+        r_reopen = await conflicts_env.client.post(
+            f"{base}/{res_id}/reopen",
+            headers=headers,
+            json={"reason": "attempt reopen bypass"},
+        )
+        assert r_reopen.status_code == 404
+        assert r_reopen.json()["error"]["message"] == f"Conflict resolution '{res_id}' not found"
+
+    # Service-layer ForbiddenError check
+    async with conflicts_env.session_factory() as s:
+        for res_id in ("res-fc-no-part", "res-fc-rev-spm"):
+            with pytest.raises(ForbiddenError):
+                await resolve_conflict(
+                    s,
+                    tenant_id=TENANT_ID,
+                    project_id=PROJECT_ID,
+                    allowed_partition_ids={PART_PUBLIC},
+                    resolution_id=res_id,
+                    action="WINNER_B",
+                    reason="probe",
+                    actor="reviewer_fc",
+                )
+            with pytest.raises(ForbiddenError):
+                await reopen_conflict(
+                    s,
+                    tenant_id=TENANT_ID,
+                    project_id=PROJECT_ID,
+                    allowed_partition_ids={PART_PUBLIC},
+                    resolution_id=res_id,
+                    reason="probe",
+                    actor="reviewer_fc",
+                )
+
+
+@pytest.mark.asyncio
+async def test_resolve_winner_a_swaps_evidence_json_winner_loser_fields(conflicts_env) -> None:
+    """Fix 12b: POST /resolve with action='WINNER_A' swaps winner/loser fields in evidence_json."""
+    async with conflicts_env.session_factory() as s:
+        doc_a = await _seed_doc_unit(
+            s,
+            tag="swap-ev-a",
+            text="Baseline approval threshold is 5M VND.",
+            authority_tier=3,
+            effective_from=T_JAN,
+            section_path="Finance > Baseline",
+        )
+        doc_b = await _seed_doc_unit(
+            s,
+            tag="swap-ev-b",
+            text="Updated approval threshold is 10M VND.",
+            authority_tier=1,
+            effective_from=T_JUN,
+            section_path="Executive > Thresholds",
+        )
+        row = await _seed_conflict_row(
+            s,
+            resolution_id="res-swap-ev",
+            side_a=doc_a,
+            side_b=doc_b,
+            status=ConflictResolutionStatus.PENDING_REVIEW,
+        )
+        row.evidence_json = {
+            "winner_version_id": doc_b["version_id"],
+            "winner_authority_tier": 1,
+            "winner_effective_from": T_JUN.isoformat(),
+            "winner_valid_from": T_JUN.isoformat(),
+            "winner_scope_tags": ["global"],
+            "winner_section_path": "Executive > Thresholds",
+            "loser_version_id": doc_a["version_id"],
+            "loser_authority_tier": 3,
+            "loser_effective_from": T_JAN.isoformat(),
+            "loser_valid_from": T_JAN.isoformat(),
+            "loser_scope_tags": ["vn-local"],
+            "loser_section_path": "Finance > Baseline",
+        }
+        await s.commit()
+
+    base = f"/api/v1/projects/{PROJECT_ID}/conflicts"
+    resp = await conflicts_env.client.post(
+        f"{base}/res-swap-ev/resolve",
+        headers=_bff_headers(user_id="reviewer_swap"),
+        json={"action": "WINNER_A", "reason": "Keep baseline threshold"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    async with conflicts_env.session_factory() as s:
+        updated = await s.get(KnowledgeConflictResolution, "res-swap-ev")
+        assert updated is not None
+        ev = updated.evidence_json
+        assert ev["winner_version_id"] == doc_a["version_id"]
+        assert ev["loser_version_id"] == doc_b["version_id"]
+        assert ev["winner_authority_tier"] == 3
+        assert ev["loser_authority_tier"] == 1
+        assert ev["winner_effective_from"] == T_JAN.isoformat()
+        assert ev["loser_effective_from"] == T_JUN.isoformat()
+        assert ev["winner_valid_from"] == T_JAN.isoformat()
+        assert ev["loser_valid_from"] == T_JUN.isoformat()
+        assert ev["winner_scope_tags"] == ["vn-local"]
+        assert ev["loser_scope_tags"] == ["global"]
+        assert ev["winner_section_path"] == "Finance > Baseline"
+        assert ev["loser_section_path"] == "Executive > Thresholds"

@@ -1194,3 +1194,234 @@ async def test_handover_single_execute_fake_session_and_dual_dialect_sql(task: s
             assert "NOT (EXISTS" in sql.upper() or "NOT EXISTS" in sql.upper()
         else:
             assert "NOT (EXISTS" not in sql.upper() and "NOT EXISTS" not in sql.upper()
+
+
+# ===========================================================================
+# PART C: Triad Round 2 Hardening Regressions (Fixes 6 & 7)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("job_type", [JobType.REPROCESS_DOCUMENT, JobType.DELETE_DOCUMENT])
+async def test_handover_revives_loser_immediately_during_inflight_reprocess_or_delete_job(
+    p2c_env,
+    job_type: JobType,
+) -> None:
+    """Fix 6: HandoverAssist revives Doc 1 across DRAFT_GENERATION, SOURCE_PROPOSAL, and
+    QUESTION_ANSWER immediately while winner Doc 2 has an in-flight REPROCESS_DOCUMENT or
+    DELETE_DOCUMENT job (matching Retrieval/MindMap with zero ghost suppression)."""
+    pid = p2c_env.project_id
+    logical_loser = f"continuum-ho-inflight-loser-{job_type.value}"
+    logical_winner = f"continuum-ho-inflight-winner-{job_type.value}"
+
+    async with p2c_env.session_factory() as s:
+        ver_w, units_w = await _seed_doc_with_units(
+            s,
+            source_id=f"src_inf_{job_type.value}",
+            doc_id=f"doc_inf_w_{job_type.value}",
+            ver_id=f"ver_inf_w_{job_type.value}",
+            logical_source_id=logical_winner,
+            filename="winner.md",
+            sections=[("Rule", "WINNER_INFLIGHT: new rule.", 1)],
+        )
+        ver_l, units_l = await _seed_doc_with_units(
+            s,
+            source_id=f"src_inf_{job_type.value}",
+            doc_id=f"doc_inf_l_{job_type.value}",
+            ver_id=f"ver_inf_l_{job_type.value}",
+            logical_source_id=logical_loser,
+            filename="loser.md",
+            sections=[
+                ("Rule 1", "LOSER_UNIT_SUP: old rule.", 1),
+                ("Rule 2", "LOSER_UNIT_KEEP: untouched rule.", 2),
+            ],
+        )
+        await _seed_conflict(
+            s,
+            res_id=f"res-inf-{job_type.value}",
+            winner_doc_id=f"doc_inf_w_{job_type.value}",
+            winner_ver_id=ver_w.id,
+            winner_unit_id=units_w[0].id,
+            loser_doc_id=f"doc_inf_l_{job_type.value}",
+            loser_ver_id=ver_l.id,
+            loser_unit_id=units_l[0].id,
+            status=ConflictResolutionStatus.ACTIVE.value,
+        )
+        await s.commit()
+
+        src_input = [
+            HandoverAssistSourceInput(
+                kind="PROJECT_DOCUMENT",
+                id="851a2b3c4d5e6f7a8b9c0d41",
+                version=1,
+                title="Loser Guide",
+                logicalSourceId=logical_loser,
+            )
+        ]
+
+        # Before in-flight control job: loser unit 0 is suppressed
+        for task in ("DRAFT_GENERATION", "SOURCE_PROPOSAL"):
+            loaded_before = await handover_assist_service._load_indexed_units(
+                s, principal=_principal(), project_id=pid, sources=src_input, task=task
+            )
+            assert [r[1] for r in loaded_before[(logical_loser, 1)]] == [units_l[1].id]
+
+        qa_sup_before: set[tuple[str, int, str, str]] = set()
+        await handover_assist_service._load_indexed_units(
+            s,
+            principal=_principal(),
+            project_id=pid,
+            sources=src_input,
+            task="QUESTION_ANSWER",
+            superseded_unit_keys=qa_sup_before,
+        )
+        assert qa_sup_before == {(logical_loser, 1, "CHUNK", units_l[0].id)}
+
+        # Enqueue in-flight control job on winner doc (REPROCESS sets Document.status=PENDING)
+        winner_doc = await s.get(Document, f"doc_inf_w_{job_type.value}")
+        assert winner_doc is not None
+        if job_type == JobType.REPROCESS_DOCUMENT:
+            winner_doc.status = DocumentStatus.PENDING
+        s.add(
+            Job(
+                id=f"job-inf-{job_type.value}",
+                source_id=f"src_inf_{job_type.value}",
+                document_id=winner_doc.id,
+                type=job_type,
+                status=JobStatus.QUEUED if job_type == JobType.REPROCESS_DOCUMENT else JobStatus.RUNNING,
+            )
+        )
+        await s.commit()
+
+        # Immediately revived in DRAFT_GENERATION, SOURCE_PROPOSAL, AND QUESTION_ANSWER!
+        for task in ("DRAFT_GENERATION", "SOURCE_PROPOSAL"):
+            loaded_after = await handover_assist_service._load_indexed_units(
+                s, principal=_principal(), project_id=pid, sources=src_input, task=task
+            )
+            assert [r[1] for r in loaded_after[(logical_loser, 1)]] == [units_l[0].id, units_l[1].id]
+
+        qa_sup_after: set[tuple[str, int, str, str]] = set()
+        qa_loaded_after = await handover_assist_service._load_indexed_units(
+            s,
+            principal=_principal(),
+            project_id=pid,
+            sources=src_input,
+            task="QUESTION_ANSWER",
+            superseded_unit_keys=qa_sup_after,
+        )
+        assert [r[1] for r in qa_loaded_after[(logical_loser, 1)]] == [units_l[0].id, units_l[1].id]
+        assert qa_sup_after == set()
+
+
+@pytest.mark.asyncio
+async def test_mind_map_three_doc_transitive_supersession_chain_excludes_doc1_superseded_unit(
+    p2c_env,
+) -> None:
+    """Fix 7: Under a 3-document chain across distinct confirmed sources (Doc 3 -> Doc 2 -> Doc 1),
+    dropping fully-superseded Doc 2 from ready_docs MUST NOT drop Doc 2's source from
+    _select_evidence_catalog's supersession filter and leak Doc 1's superseded unit."""
+    pid = p2c_env.project_id
+    async with p2c_env.session_factory() as s:
+        ver_1, units_1 = await _seed_doc_with_units(
+            s,
+            source_id="src_chain_1",
+            doc_id="doc_chain_1",
+            ver_id="ver_chain_1",
+            filename="chain-doc1.md",
+            sections=[
+                ("Clause A", "CHAIN_DOC1_SUPERSEDED: legacy 2023 rule.", 1),
+                ("Clause B", "CHAIN_DOC1_ACTIVE: evergreen rule.", 2),
+            ],
+        )
+        ver_2, units_2 = await _seed_doc_with_units(
+            s,
+            source_id="src_chain_2",
+            doc_id="doc_chain_2",
+            ver_id="ver_chain_2",
+            filename="chain-doc2.md",
+            sections=[("Clause A v2", "CHAIN_DOC2_MIDDLE: intermediate 2024 rule.", 1)],
+        )
+        ver_3, units_3 = await _seed_doc_with_units(
+            s,
+            source_id="src_chain_3",
+            doc_id="doc_chain_3",
+            ver_id="ver_chain_3",
+            filename="chain-doc3.md",
+            sections=[("Clause A v3", "CHAIN_DOC3_LATEST: final 2026 rule.", 1)],
+        )
+        # Doc 2 supersedes Doc 1's Clause A; Doc 3 supersedes Doc 2's sole unit
+        await _seed_conflict(
+            s,
+            res_id="res-chain-2-over-1",
+            winner_doc_id="doc_chain_2",
+            winner_ver_id=ver_2.id,
+            winner_unit_id=units_2[0].id,
+            loser_doc_id="doc_chain_1",
+            loser_ver_id=ver_1.id,
+            loser_unit_id=units_1[0].id,
+            status=ConflictResolutionStatus.ACTIVE.value,
+        )
+        await _seed_conflict(
+            s,
+            res_id="res-chain-3-over-2",
+            winner_doc_id="doc_chain_3",
+            winner_ver_id=ver_3.id,
+            winner_unit_id=units_3[0].id,
+            loser_doc_id="doc_chain_2",
+            loser_ver_id=ver_2.id,
+            loser_unit_id=units_2[0].id,
+            status=ConflictResolutionStatus.ACTIVE.value,
+        )
+        await s.commit()
+
+        ready_docs, _, _ = await mind_map_service._load_project_scope_snapshot(
+            s, principal=_principal(), project_id=pid
+        )
+        by_doc = {d.sag_document_id: d for d in ready_docs}
+        assert set(by_doc.keys()) == {"doc_chain_1", "doc_chain_3"}
+        assert "doc_chain_2" not in by_doc
+        assert by_doc["doc_chain_1"].total_unit_count == 1
+
+        catalog, coverage, _ = await mind_map_service._select_evidence_catalog(
+            s,
+            principal=_principal(),
+            ready_docs=ready_docs,
+            pending_count=0,
+            topic=None,
+            project_id=pid,
+        )
+        cat_unit_ids = {ev.unit.unit_id for ev in catalog}
+        assert units_1[0].id not in cat_unit_ids  # Doc 1's superseded unit MUST stay excluded!
+        assert cat_unit_ids == {units_1[1].id, units_3[0].id}
+        assert coverage.evidenceUnitCount == 2
+
+        # If Doc 2 enters DELETE_DOCUMENT in-flight, Doc 1's Clause A revives consistently
+        s.add(
+            Job(
+                id="job-del-chain-2",
+                source_id="src_chain_2",
+                document_id="doc_chain_2",
+                type=JobType.DELETE_DOCUMENT,
+                status=JobStatus.RUNNING,
+            )
+        )
+        await s.commit()
+
+        ready_docs_del, _, _ = await mind_map_service._load_project_scope_snapshot(
+            s, principal=_principal(), project_id=pid
+        )
+        by_doc_del = {d.sag_document_id: d for d in ready_docs_del}
+        assert by_doc_del["doc_chain_1"].total_unit_count == 2
+        catalog_del, _, _ = await mind_map_service._select_evidence_catalog(
+            s,
+            principal=_principal(),
+            ready_docs=ready_docs_del,
+            pending_count=0,
+            topic=None,
+            project_id=pid,
+        )
+        assert {ev.unit.unit_id for ev in catalog_del} == {
+            units_1[0].id,
+            units_1[1].id,
+            units_3[0].id,
+        }

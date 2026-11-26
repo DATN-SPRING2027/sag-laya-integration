@@ -655,7 +655,28 @@ async def _select_evidence_catalog(
                 .scalar_subquery()
             )
             unit_order = ((heading_score + func.coalesce(span_score, 0.0)).desc(), *unit_order)
-        hidden_ids = await _hidden_control_document_ids(session, confirmed_source_ids)
+        confirmed_spm_source_ids = (
+            list(
+                (
+                    await session.scalars(
+                        select(SourceProjectMapping.source_id)
+                        .where(
+                            SourceProjectMapping.organization_id == principal.organization_id,
+                            SourceProjectMapping.project_id.in_(scoped_project_ids),
+                            SourceProjectMapping.state == "CONFIRMED",
+                        )
+                        .distinct()
+                    )
+                ).all()
+            )
+            if scoped_project_ids and principal.organization_id
+            else []
+        )
+        all_confirmed_source_ids = sorted(
+            {str(sid) for sid in confirmed_spm_source_ids if sid}
+            | set(confirmed_source_ids)
+        )
+        hidden_ids = await _hidden_control_document_ids(session, all_confirmed_source_ids)
         active_superseded_exists = build_active_superseded_unit_exists(
             SearchUnit.id,
             tenant_id=tenant_id,
@@ -663,7 +684,7 @@ async def _select_evidence_catalog(
             allowed_partitions=allowed_partitions,
             reference_time=now_utc,
             organization_id=principal.organization_id,
-            allowed_source_ids=confirmed_source_ids or None,
+            allowed_source_ids=all_confirmed_source_ids or None,
             hidden_document_ids=hidden_ids,
         )
         ranked_units = (

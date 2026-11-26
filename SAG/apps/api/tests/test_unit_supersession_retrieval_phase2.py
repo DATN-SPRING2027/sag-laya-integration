@@ -2103,3 +2103,121 @@ async def test_multi_hop_expansion_filters_superseded_unit_in_past_point_after_a
     assert sec_a.is_superseded is False
     assert sec_a.conflict_status is None
     assert sec_a.valid_to == VALID_TO_INF
+
+
+# ---------------------------------------------------------------------------
+# Group 7: Triad Round 2 Hardening Regression (Fix 10)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_scope_knowledge_index_cache_key_isolated_from_other_partition_kg_edges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fix 10: Inserting P_exec-only KnowledgeGraphEdge rows MUST NOT change or bust
+    {P_public}'s _SCOPE_KNOWLEDGE_INDEX_CACHE key (zero cross-partition side-channel)."""
+    from sag_api.db.models import KnowledgeGraphEdge
+
+    db_engine, factory = await _make_db(monkeypatch)
+    surs._SCOPE_KNOWLEDGE_INDEX_CACHE.clear()
+    try:
+        async with factory() as session:
+            src_pub = await _seed_source(session, source_id="src-ck-pub", name="Public")
+            src_exec = await _seed_source(session, source_id="src-ck-exec", name="Exec")
+            await _seed_doc_version(
+                session,
+                source_id=src_pub.id,
+                doc_id="doc-ck-pub",
+                version_id="ver-ck-pub",
+                filename="pub.md",
+                partition_id=P_PUBLIC,
+                units=[("unit-ck-pub-1", "Public Sec", "Public SLA response is 24 hours.")],
+            )
+            await _seed_doc_version(
+                session,
+                source_id=src_exec.id,
+                doc_id="doc-ck-exec-1",
+                version_id="ver-ck-exec-1",
+                filename="exec1.md",
+                partition_id=P_EXEC,
+                units=[("unit-ck-exec-1", "Exec Sec 1", "Executive policy A.")],
+            )
+            await _seed_doc_version(
+                session,
+                source_id=src_exec.id,
+                doc_id="doc-ck-exec-2",
+                version_id="ver-ck-exec-2",
+                filename="exec2.md",
+                partition_id=P_EXEC,
+                units=[("unit-ck-exec-2", "Exec Sec 2", "Executive policy B.")],
+            )
+            await session.commit()
+
+            pub_versions = {
+                "ver-ck-pub": surs._ReadyVersion(
+                    document_version_id="ver-ck-pub",
+                    document_id="doc-ck-pub",
+                    source_id=src_pub.id,
+                    project_id=PROJECT_ID,
+                    tenant_id=TENANT_ID,
+                    partition_id=P_PUBLIC,
+                    source=src_pub,
+                    valid_to=VALID_TO_INF,
+                    is_superseded=False,
+                )
+            }
+
+            k1 = await surs._get_or_build_scope_knowledge_index(
+                session,
+                pub_versions,
+                allowed_partitions={P_PUBLIC},
+                reference_time=datetime(2025, 8, 1, tzinfo=UTC),
+                organization_id=ORG_ID,
+            )
+            keys_before = len(surs._SCOPE_KNOWLEDGE_INDEX_CACHE)
+            assert keys_before == 1
+
+            # Insert P_exec-only CONTRADICTS and SUPERSEDES edges + a cross-partition edge
+            session.add_all(
+                [
+                    KnowledgeGraphEdge(
+                        id="edge-ck-exec-con",
+                        project_id=PROJECT_ID,
+                        source_unit_id="unit-ck-exec-1",
+                        target_unit_id="unit-ck-exec-2",
+                        edge_type="CONTRADICTS",
+                        metadata_json={"is_candidate": True},
+                    ),
+                    KnowledgeGraphEdge(
+                        id="edge-ck-exec-sup",
+                        project_id=PROJECT_ID,
+                        source_unit_id="unit-ck-exec-2",
+                        target_unit_id="unit-ck-exec-1",
+                        edge_type="SUPERSEDES",
+                        metadata_json={"is_candidate": False},
+                    ),
+                    KnowledgeGraphEdge(
+                        id="edge-ck-cross-con",
+                        project_id=PROJECT_ID,
+                        source_unit_id="unit-ck-exec-1",
+                        target_unit_id="unit-ck-pub-1",
+                        edge_type="CONTRADICTS",
+                        metadata_json={"is_candidate": True},
+                    ),
+                ]
+            )
+            await session.commit()
+
+            k2 = await surs._get_or_build_scope_knowledge_index(
+                session,
+                pub_versions,
+                allowed_partitions={P_PUBLIC},
+                reference_time=datetime(2025, 8, 1, tzinfo=UTC),
+                organization_id=ORG_ID,
+            )
+            keys_after = len(surs._SCOPE_KNOWLEDGE_INDEX_CACHE)
+            assert k1 is k2
+            assert keys_after == keys_before == 1
+    finally:
+        surs._SCOPE_KNOWLEDGE_INDEX_CACHE.clear()
+        await db_engine.dispose()

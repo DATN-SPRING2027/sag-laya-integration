@@ -1370,17 +1370,28 @@ async def _get_or_build_scope_knowledge_index(
                 candidates.append((build_id in active_graphs, len(relevant), build_id))
         if candidates:
             graph_ids.append(max(candidates)[2])
-    kg_edge_ids = sorted(
-        str(eid)
-        for (eid,) in (
-            await session.execute(
-                select(KnowledgeGraphEdge.id).where(
-                    KnowledgeGraphEdge.project_id.in_(projects),
-                    KnowledgeGraphEdge.edge_type.in_(("CONTRADICTS", "SUPERSEDES")),
+    kg_edge_ids: list[str] = []
+    if projects and norm_partitions and version_ids:
+        edge_src_su = aliased(SearchUnit)
+        edge_tgt_su = aliased(SearchUnit)
+        kg_edge_ids = sorted(
+            str(eid)
+            for (eid,) in (
+                await session.execute(
+                    select(KnowledgeGraphEdge.id)
+                    .join(edge_src_su, edge_src_su.id == KnowledgeGraphEdge.source_unit_id)
+                    .join(edge_tgt_su, edge_tgt_su.id == KnowledgeGraphEdge.target_unit_id)
+                    .where(
+                        KnowledgeGraphEdge.project_id.in_(projects),
+                        KnowledgeGraphEdge.edge_type.in_(("CONTRADICTS", "SUPERSEDES")),
+                        edge_src_su.document_version_id.in_(version_ids),
+                        edge_tgt_su.document_version_id.in_(version_ids),
+                        edge_src_su.security_partition_id.in_(norm_partitions),
+                        edge_tgt_su.security_partition_id.in_(norm_partitions),
+                    )
                 )
-            )
-        ).all()
-    )
+            ).all()
+        )
     digest = hashlib.sha256(repr((
         _scope_knowledge_digest(current_versions),
         norm_partitions,

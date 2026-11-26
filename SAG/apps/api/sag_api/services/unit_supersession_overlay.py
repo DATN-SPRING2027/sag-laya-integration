@@ -26,11 +26,12 @@ from sag_api.core.logging import get_logger
 from sag_api.db.models import (
     Document,
     DocumentVersion,
+    Job,
     KnowledgeConflictResolution,
     SearchUnit,
     SourceProjectMapping,
 )
-from sag_api.enums import ConflictResolutionStatus, DocumentStatus
+from sag_api.enums import ConflictResolutionStatus, DocumentStatus, JobStatus, JobType
 
 log = get_logger("unit_supersession_overlay")
 
@@ -94,6 +95,7 @@ def _build_live_side_predicates(
     organization_id: str | None,
     allowed_source_ids: list[str] | None,
     hidden_document_ids: list[str],
+    exclude_in_flight_control_jobs: bool = False,
 ) -> list[ColumnElement[bool]]:
     """Build live ACL, temporal, mapping, partition, and SearchUnit gates for one side."""
     partition_expr = ver_alias.metadata_json["security_partition_id"].as_string()
@@ -128,6 +130,14 @@ def _build_live_side_predicates(
     ]
     if hidden_document_ids:
         predicates.append(doc_alias.id.notin_(hidden_document_ids))
+    if exclude_in_flight_control_jobs:
+        job_alias = aliased(Job)
+        in_flight_control_doc_ids = select(job_alias.document_id).where(
+            job_alias.document_id.is_not(None),
+            job_alias.type.in_((JobType.DELETE_DOCUMENT, JobType.REPROCESS_DOCUMENT)),
+            job_alias.status.in_((JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.PAUSED)),
+        )
+        predicates.append(doc_alias.id.notin_(in_flight_control_doc_ids))
     if allowed_source_ids is not None:
         predicates.append(doc_alias.source_id.in_(allowed_source_ids))
     if organization_id is not None:
@@ -355,6 +365,7 @@ def build_active_superseded_unit_exists(
     organization_id: str | None = None,
     allowed_source_ids: IdCollection | None = None,
     hidden_document_ids: IdCollection = (),
+    exclude_in_flight_control_jobs: bool = False,
 ) -> ColumnElement[bool]:
     """Build a correlated SQL EXISTS clause verifying an ACL-visible ACTIVE supersession."""
     norm_tenants = _normalize_id_list(tenant_id)
@@ -404,6 +415,7 @@ def build_active_superseded_unit_exists(
                 organization_id=organization_id,
                 allowed_source_ids=norm_sources,
                 hidden_document_ids=norm_hidden,
+                exclude_in_flight_control_jobs=exclude_in_flight_control_jobs,
             ),
         )
         .exists()

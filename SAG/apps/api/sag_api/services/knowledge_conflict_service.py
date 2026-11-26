@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import threading
 import uuid
 from collections import defaultdict
@@ -72,6 +73,9 @@ _READY_SEARCH_STATUSES: tuple[str, ...] = ("SEARCH_READY", "READY")
 _BLOCKED_DOCUMENT_STATUSES: tuple[DocumentStatus, ...] = (
     DocumentStatus.DELETING,
     DocumentStatus.DELETE_FAILED,
+    DocumentStatus.PAUSING,
+    DocumentStatus.PAUSED,
+    DocumentStatus.FAILED,
 )
 _BLOCKED_VERSION_STATUSES: tuple[str, ...] = ("REVOKED", "FAILED")
 _POINTS_FETCH_BATCH_SIZE = 128
@@ -394,6 +398,17 @@ def _version_partition(ver: DocumentVersion | None) -> str:
         return ""
     raw = ver.metadata_json.get("security_partition_id")
     return raw.strip() if isinstance(raw, str) else ""
+
+
+def _is_human_hitl_locked(row: KnowledgeConflictResolution) -> bool:
+    """Return True iff the resolution holds a human HITL lock (MANUAL_HITL or human KEEP_BOTH_SCOPED)."""
+    if row.resolution_mode == ConflictResolutionMode.MANUAL_HITL.value:
+        return True
+    return (
+        row.resolution_mode == ConflictResolutionMode.KEEP_BOTH_SCOPED.value
+        and bool((row.resolved_by or "").strip())
+        and not str(row.resolved_by).startswith("system:")
+    )
 
 
 def _append_audit(
@@ -893,7 +908,7 @@ async def discover_conflict_candidates(
         _score, _n_uid, _e_uid, pk, new_unit, ex_unit, ex_ver, _ex_doc = entry
         prev_res = existing_res_by_key.get(pk)
         if prev_res is not None:
-            if prev_res.resolution_mode == ConflictResolutionMode.MANUAL_HITL.value:
+            if _is_human_hitl_locked(prev_res):
                 continue
             hashes_match = {prev_res.winner_content_hash, prev_res.loser_content_hash} == {
                 new_unit.content_hash,
@@ -1508,6 +1523,30 @@ async def persist_conflict_decisions(
         subtype = decision.conflict_subtype
         cand = decision.candidate
 
+        raw_conf = decision.confidence
+        if (
+            isinstance(raw_conf, bool)
+            or not isinstance(raw_conf, (int, float))
+            or not math.isfinite(float(raw_conf))
+        ):
+            safe_confidence = 0.0
+            conf_invalid = True
+        else:
+            safe_confidence = max(0.0, min(1.0, float(raw_conf)))
+            conf_invalid = False
+
+        raw_cos = cand.cosine_similarity
+        safe_cosine = (
+            float(raw_cos)
+            if (
+                raw_cos is not None
+                and not isinstance(raw_cos, bool)
+                and isinstance(raw_cos, (int, float))
+                and math.isfinite(float(raw_cos))
+            )
+            else None
+        )
+
         if subtype in (
             ConflictSubtype.SUPPORTS_OR_EQUIVALENT,
             ConflictSubtype.DIFFERENT_PERSPECTIVE,
@@ -1516,7 +1555,7 @@ async def persist_conflict_decisions(
             continue
 
         if subtype == ConflictSubtype.SCOPED_EXCEPTION:
-            if cand.cosine_similarity < _SCOPED_EXCEPTION_AUDIT_MIN_COSINE:
+            if safe_cosine is None or safe_cosine < _SCOPED_EXCEPTION_AUDIT_MIN_COSINE:
                 ignored_non_conflicts += 1
                 continue
 
@@ -1562,10 +1601,7 @@ async def persist_conflict_decisions(
                 KnowledgeConflictResolution.pair_key == pair_key,
             )
         )
-        if (
-            existing_row is not None
-            and existing_row.resolution_mode == ConflictResolutionMode.MANUAL_HITL.value
-        ):
+        if existing_row is not None and _is_human_hitl_locked(existing_row):
             skipped_manual_hitl += 1
             continue
 
@@ -1573,6 +1609,7 @@ async def persist_conflict_decisions(
         target_status: ConflictResolutionStatus
         target_mode: ConflictResolutionMode
         effective_valid_to: datetime | None = None
+        effective_degraded = bool(decision.degraded_fallback or conf_invalid)
 
         if subtype == ConflictSubtype.SCOPED_EXCEPTION:
             target_status = ConflictResolutionStatus.DISMISSED_SCOPED
@@ -1581,9 +1618,9 @@ async def persist_conflict_decisions(
         elif subtype == ConflictSubtype.DIRECT_SUPERSEDES:
             # Auto-supersede IFF ALL 5 gates pass; fail-closed otherwise!
             can_auto_supersede = (
-                (not decision.degraded_fallback)
+                (not effective_degraded)
                 and decision.winner in {"NEW", "EXISTING"}
-                and decision.confidence >= min_auto_conf
+                and safe_confidence >= min_auto_conf
                 and w_part == l_part == security_partition_id
                 and _has_strict_precedence(w_ver, l_ver)
             )
@@ -1602,7 +1639,7 @@ async def persist_conflict_decisions(
             effective_valid_to = None
 
         # Hard invariant defense-in-depth: degraded fallback NEVER produces ACTIVE/AUTO_POLICY.
-        if decision.degraded_fallback:
+        if effective_degraded:
             target_status = ConflictResolutionStatus.PENDING_REVIEW
             target_mode = ConflictResolutionMode.UNRESOLVED
             effective_valid_to = None
@@ -1634,12 +1671,12 @@ async def persist_conflict_decisions(
                 conflict_subtype=subtype.value,
                 status=target_status.value,
                 resolution_mode=target_mode.value,
-                confidence=decision.confidence,
-                cosine_similarity=cand.cosine_similarity,
+                confidence=safe_confidence,
+                cosine_similarity=safe_cosine,
                 effective_valid_to=effective_valid_to,
                 scope_difference_summary=decision.scope_difference_summary,
                 reason=decision.reason,
-                degraded_fallback=decision.degraded_fallback,
+                degraded_fallback=effective_degraded,
                 evidence_json=evidence_snapshot,
                 audit_history_json=[],
                 resolved_by="system:auto_policy"
@@ -1658,8 +1695,8 @@ async def persist_conflict_decisions(
                 extra={
                     "conflict_subtype": subtype.value,
                     "resolution_mode": target_mode.value,
-                    "confidence": decision.confidence,
-                    "degraded_fallback": decision.degraded_fallback,
+                    "confidence": safe_confidence,
+                    "degraded_fallback": effective_degraded,
                 },
             )
             session.add(row)
@@ -1680,12 +1717,12 @@ async def persist_conflict_decisions(
             row.conflict_subtype = subtype.value
             row.status = target_status.value
             row.resolution_mode = target_mode.value
-            row.confidence = decision.confidence
-            row.cosine_similarity = cand.cosine_similarity
+            row.confidence = safe_confidence
+            row.cosine_similarity = safe_cosine
             row.effective_valid_to = effective_valid_to
             row.scope_difference_summary = decision.scope_difference_summary
             row.reason = decision.reason
-            row.degraded_fallback = decision.degraded_fallback
+            row.degraded_fallback = effective_degraded
             row.evidence_json = evidence_snapshot
             row.updated_at = now
             if target_mode == ConflictResolutionMode.AUTO_POLICY:
@@ -1705,8 +1742,8 @@ async def persist_conflict_decisions(
                 extra={
                     "conflict_subtype": subtype.value,
                     "resolution_mode": target_mode.value,
-                    "confidence": decision.confidence,
-                    "degraded_fallback": decision.degraded_fallback,
+                    "confidence": safe_confidence,
+                    "degraded_fallback": effective_degraded,
                 },
             )
             session.add(row)
@@ -1727,12 +1764,12 @@ async def persist_conflict_decisions(
             sup_edge = await _upsert_supersedes_edge(
                 session,
                 row=row,
-                weight=max(0.1, float(decision.confidence)),
+                weight=max(0.1, safe_confidence),
                 metadata={
                     "is_candidate": False,
                     "conflict_subtype": subtype.value,
                     "resolution_id": row.id,
-                    "confidence": decision.confidence,
+                    "confidence": safe_confidence,
                 },
             )
             if sup_edge is not None and linked_con is None:
@@ -1743,13 +1780,13 @@ async def persist_conflict_decisions(
             _edge, cap_hit = await _upsert_contradicts_edge_guarded(
                 session,
                 row=row,
-                weight=max(0.1, float(decision.confidence)),
+                weight=max(0.1, safe_confidence),
                 metadata={
                     "is_candidate": True,
                     "conflict_subtype": subtype.value,
                     "resolution_id": row.id,
-                    "confidence": decision.confidence,
-                    "degraded_fallback": decision.degraded_fallback,
+                    "confidence": safe_confidence,
+                    "degraded_fallback": effective_degraded,
                 },
                 partition_edge_count_cache=edge_count_cache,
             )
@@ -2022,7 +2059,7 @@ async def resolve_document_conflicts_service(
                 decisions=verified_decisions,
                 now_utc=write_now,
             )
-            return ResolveDocumentConflictsResult(
+            result = ResolveDocumentConflictsResult(
                 candidates_discovered=len(candidates),
                 pairs_evaluated=len(cls_result.decisions),
                 auto_superseded=summary.auto_superseded,
@@ -2034,6 +2071,21 @@ async def resolve_document_conflicts_service(
                 degraded_reason=cls_result.degraded_reason,
                 token_usage=cls_result.token_usage,
             )
+            if fresh_job is not None:
+                fresh_job.progress = 1.0
+                fresh_job.payload = {
+                    **dict(fresh_job.payload or {}),
+                    **result.to_payload_dict(),
+                }
+                session.add(fresh_job)
+            await session.commit()
+            if (
+                summary.auto_superseded
+                or summary.pending_review
+                or summary.dismissed_scoped
+            ):
+                _clear_project_caches_safely(project_id)
+            return result
     except ConflictError as lease_err:
         raise JobDeferred(delay_seconds=2.0) from lease_err
 
@@ -2107,6 +2159,36 @@ def _pick_best_matching_unit(
     return units[0]
 
 
+async def _cleanup_superseded_resolution_edges(
+    session: AsyncSession,
+    target_row: KnowledgeConflictResolution,
+    *,
+    delete_owned_contradicts: bool,
+) -> None:
+    """Remove SUPERSEDES edges and clear/delete linked CONTRADICTS edges on remap or collision."""
+    await _delete_supersedes_edges_for_resolution(session, target_row)
+    linked_con = await _find_linked_contradicts_edge(session, target_row)
+    if linked_con is not None:
+        meta = dict(linked_con.metadata_json or {})
+        if delete_owned_contradicts and meta.get("resolution_id") == target_row.id:
+            if target_row.graph_edge_id == linked_con.id:
+                target_row.graph_edge_id = None
+                session.add(target_row)
+                await session.flush()
+            await session.delete(linked_con)
+            await session.flush()
+        else:
+            linked_con.metadata_json = {
+                **meta,
+                "is_candidate": False,
+                "resolution_status": ConflictResolutionStatus.SUPERSEDED_BY_UPDATE.value,
+            }
+            session.add(linked_con)
+            if target_row.graph_edge_id == linked_con.id:
+                target_row.graph_edge_id = None
+                session.add(target_row)
+
+
 async def _handle_pair_key_collision(
     session: AsyncSession,
     *,
@@ -2131,15 +2213,19 @@ async def _handle_pair_key_collision(
     if collision is None:
         return True
 
-    row_is_hitl = row.resolution_mode == ConflictResolutionMode.MANUAL_HITL.value
-    col_is_hitl = collision.resolution_mode == ConflictResolutionMode.MANUAL_HITL.value
+    row_is_hitl = _is_human_hitl_locked(row)
+    col_is_hitl = _is_human_hitl_locked(collision)
     if row_is_hitl and not col_is_hitl:
-        await _delete_supersedes_edges_for_resolution(session, collision)
+        await _cleanup_superseded_resolution_edges(
+            session, collision, delete_owned_contradicts=True
+        )
         await session.delete(collision)
         await session.flush()
         return True
     if col_is_hitl and not row_is_hitl:
-        await _delete_supersedes_edges_for_resolution(session, row)
+        await _cleanup_superseded_resolution_edges(
+            session, row, delete_owned_contradicts=False
+        )
         prev = row.status
         row.status = ConflictResolutionStatus.SUPERSEDED_BY_UPDATE.value
         _append_audit(
@@ -2158,12 +2244,16 @@ async def _handle_pair_key_collision(
     row_ts = _as_utc(row.updated_at) or now_utc
     col_ts = _as_utc(collision.updated_at) or now_utc
     if row_ts >= col_ts:
-        await _delete_supersedes_edges_for_resolution(session, collision)
+        await _cleanup_superseded_resolution_edges(
+            session, collision, delete_owned_contradicts=True
+        )
         await session.delete(collision)
         await session.flush()
         return True
 
-    await _delete_supersedes_edges_for_resolution(session, row)
+    await _cleanup_superseded_resolution_edges(
+        session, row, delete_owned_contradicts=False
+    )
     prev = row.status
     row.status = ConflictResolutionStatus.SUPERSEDED_BY_UPDATE.value
     _append_audit(
@@ -2270,6 +2360,18 @@ async def reconcile_resolutions_after_version_ready(
                 continue
             old_ver_id = res.winner_version_id
             old_unit_id = res.winner_unit_id
+            if old_unit_id != chosen.id:
+                await _delete_supersedes_edges_for_resolution(session, res)
+                stale_con = await _find_linked_contradicts_edge(session, res)
+                if stale_con is not None:
+                    stale_con.metadata_json = {
+                        **(stale_con.metadata_json or {}),
+                        "is_candidate": False,
+                        "resolution_status": ConflictResolutionStatus.SUPERSEDED_BY_UPDATE.value,
+                    }
+                    session.add(stale_con)
+                    if res.graph_edge_id == stale_con.id:
+                        res.graph_edge_id = None
             res.winner_version_id = new_version.id
             res.winner_unit_id = chosen.id
             res.pair_key = new_pk
@@ -2347,6 +2449,18 @@ async def reconcile_resolutions_after_version_ready(
                 session, row=res, new_pair_key=new_pk, now_utc=now
             ):
                 continue
+            old_unit_id = res.winner_unit_id
+            if old_unit_id != chosen.id:
+                stale_con = await _find_linked_contradicts_edge(session, res)
+                if stale_con is not None:
+                    stale_con.metadata_json = {
+                        **(stale_con.metadata_json or {}),
+                        "is_candidate": False,
+                        "resolution_status": ConflictResolutionStatus.SUPERSEDED_BY_UPDATE.value,
+                    }
+                    session.add(stale_con)
+                    if res.graph_edge_id == stale_con.id:
+                        res.graph_edge_id = None
             res.winner_unit_id = chosen.id
             res.pair_key = new_pk
             res.updated_at = now
@@ -2416,6 +2530,18 @@ async def reconcile_resolutions_after_version_ready(
             ):
                 continue
             old_unit_id = res.loser_unit_id
+            if old_unit_id != chosen.id:
+                await _delete_supersedes_edges_for_resolution(session, res)
+                stale_con = await _find_linked_contradicts_edge(session, res)
+                if stale_con is not None:
+                    stale_con.metadata_json = {
+                        **(stale_con.metadata_json or {}),
+                        "is_candidate": False,
+                        "resolution_status": ConflictResolutionStatus.SUPERSEDED_BY_UPDATE.value,
+                    }
+                    session.add(stale_con)
+                    if res.graph_edge_id == stale_con.id:
+                        res.graph_edge_id = None
             res.loser_unit_id = chosen.id
             res.pair_key = new_pk
             res.updated_at = now
@@ -2645,8 +2771,11 @@ async def reevaluate_resolutions_after_metadata_update(
                 session.add(row)
                 effective_updated += 1
 
-        if row.resolution_mode != ConflictResolutionMode.AUTO_POLICY.value:
-            # MANUAL_HITL rows are immune to automatic precedence invalidation.
+        if (
+            _is_human_hitl_locked(row)
+            or row.resolution_mode != ConflictResolutionMode.AUTO_POLICY.value
+        ):
+            # Human HITL rows (MANUAL_HITL / KEEP_BOTH_SCOPED) are immune to auto invalidation.
             continue
 
         if partner is None:
@@ -2688,8 +2817,13 @@ def _clear_project_caches_safely(project_id: str) -> None:
         from sag_api.api.v1.universe import clear_universe_caches
 
         clear_universe_caches(project_id)
-    except Exception:  # noqa: BLE001 - optional cache clear
-        pass
+    except Exception as exc:  # noqa: BLE001 - isolated post-commit cache invalidation
+        log.warning(
+            "Failed to clear project universe caches project=%s error_type=%s error=%s degraded=True",
+            project_id,
+            type(exc).__name__,
+            str(exc)[:200],
+        )
 
 
 async def list_project_conflicts(
@@ -2739,10 +2873,45 @@ async def list_project_conflicts(
 
     doc_filter = (document_id or "").strip()
 
+    winner_ver = aliased(DocumentVersion)
+    loser_ver = aliased(DocumentVersion)
+    winner_spm = aliased(SourceProjectMapping)
+    loser_spm = aliased(SourceProjectMapping)
+    w_part_expr = winner_ver.metadata_json["security_partition_id"].as_string()
+    l_part_expr = loser_ver.metadata_json["security_partition_id"].as_string()
+
     base = (
         select(kcr)
         .join(winner_doc, winner_doc.id == kcr.winner_document_id)
         .join(loser_doc, loser_doc.id == kcr.loser_document_id)
+        .join(winner_ver, winner_ver.id == kcr.winner_version_id)
+        .join(loser_ver, loser_ver.id == kcr.loser_version_id)
+        .join(
+            winner_spm,
+            and_(
+                winner_spm.source_id == winner_doc.source_id,
+                winner_spm.organization_id == tenant_id,
+                winner_spm.project_id == project_id,
+                winner_spm.state == "CONFIRMED",
+            ),
+        )
+        .join(
+            loser_spm,
+            and_(
+                loser_spm.source_id == loser_doc.source_id,
+                loser_spm.organization_id == tenant_id,
+                loser_spm.project_id == project_id,
+                loser_spm.state == "CONFIRMED",
+            ),
+        )
+    )
+
+    # Always enforce live dual-partition ACL and CONFIRMED source mappings regardless of include_inactive.
+    predicates.extend(
+        [
+            w_part_expr.in_(norm_partitions),
+            l_part_expr.in_(norm_partitions),
+        ]
     )
 
     if doc_filter:
@@ -2756,44 +2925,14 @@ async def list_project_conflicts(
         )
 
     if not include_inactive:
-        winner_ver = aliased(DocumentVersion)
-        loser_ver = aliased(DocumentVersion)
-        winner_spm = aliased(SourceProjectMapping)
-        loser_spm = aliased(SourceProjectMapping)
-        w_part_expr = winner_ver.metadata_json["security_partition_id"].as_string()
-        l_part_expr = loser_ver.metadata_json["security_partition_id"].as_string()
-        base = (
-            base.join(winner_ver, winner_ver.id == kcr.winner_version_id)
-            .join(loser_ver, loser_ver.id == kcr.loser_version_id)
-            .join(
-                winner_spm,
-                and_(
-                    winner_spm.source_id == winner_doc.source_id,
-                    winner_spm.organization_id == tenant_id,
-                    winner_spm.project_id == project_id,
-                    winner_spm.state == "CONFIRMED",
-                ),
-            )
-            .join(
-                loser_spm,
-                and_(
-                    loser_spm.source_id == loser_doc.source_id,
-                    loser_spm.organization_id == tenant_id,
-                    loser_spm.project_id == project_id,
-                    loser_spm.state == "CONFIRMED",
-                ),
-            )
-        )
         predicates.extend(
             [
                 winner_doc.is_active.is_(True),
                 winner_doc.status.not_in(_BLOCKED_DOCUMENT_STATUSES),
                 winner_ver.status != "REVOKED",
-                w_part_expr.in_(norm_partitions),
                 loser_doc.is_active.is_(True),
                 loser_doc.status.not_in(_BLOCKED_DOCUMENT_STATUSES),
                 loser_ver.status != "REVOKED",
-                l_part_expr.in_(norm_partitions),
             ]
         )
 
@@ -2966,10 +3105,30 @@ async def _load_and_authorize_resolution_for_update(
 
     for live_ver in (winner_ver, loser_ver):
         live_part = _version_partition(live_ver)
-        if live_part and live_part not in norm_partitions:
+        if not live_part or live_part not in norm_partitions:
             raise ForbiddenError(
                 "Principal is not authorized to access the live security partition of this conflict"
             )
+
+    if winner_doc is None or loser_doc is None:
+        raise ForbiddenError("Conflict source is no longer mapped to this project")
+    required_source_ids = {winner_doc.source_id, loser_doc.source_id}
+    if any(not sid for sid in required_source_ids):
+        raise ForbiddenError("Conflict source is no longer mapped to this project")
+    confirmed_source_ids = set(
+        (
+            await session.scalars(
+                select(SourceProjectMapping.source_id).where(
+                    SourceProjectMapping.source_id.in_(sorted(required_source_ids)),
+                    SourceProjectMapping.organization_id == tenant_id,
+                    SourceProjectMapping.project_id == project_id,
+                    SourceProjectMapping.state == "CONFIRMED",
+                )
+            )
+        ).all()
+    )
+    if not required_source_ids.issubset(confirmed_source_ids):
+        raise ForbiddenError("Conflict source is no longer mapped to this project")
 
     return row, winner_doc, winner_ver, loser_doc, loser_ver
 
@@ -3043,6 +3202,28 @@ async def resolve_conflict(
                 row.winner_content_hash,
                 row.winner_security_partition_id,
             )
+            if isinstance(row.evidence_json, dict):
+                orig_ev = row.evidence_json
+                swapped_ev = dict(orig_ev)
+                for w_key, l_key in (
+                    ("winner_version_id", "loser_version_id"),
+                    ("winner_authority_tier", "loser_authority_tier"),
+                    ("winner_effective_from", "loser_effective_from"),
+                    ("winner_valid_from", "loser_valid_from"),
+                    ("winner_source_published_at", "loser_source_published_at"),
+                    ("winner_scope_tags", "loser_scope_tags"),
+                    ("winner_section_path", "loser_section_path"),
+                ):
+                    if w_key in orig_ev or l_key in orig_ev:
+                        if l_key in orig_ev:
+                            swapped_ev[w_key] = orig_ev[l_key]
+                        else:
+                            swapped_ev.pop(w_key, None)
+                        if w_key in orig_ev:
+                            swapped_ev[l_key] = orig_ev[w_key]
+                        else:
+                            swapped_ev.pop(l_key, None)
+                row.evidence_json = swapped_ev
 
         row.status = ConflictResolutionStatus.ACTIVE.value
         row.resolution_mode = ConflictResolutionMode.MANUAL_HITL.value

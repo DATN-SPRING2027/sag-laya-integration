@@ -547,6 +547,7 @@ async def test_handover_assist_filters_indexed_units_by_exact_version_in_sql_bef
         CanonicalBlock,
         Document,
         DocumentVersion,
+        Job,
         KnowledgeConflictResolution,
         SearchUnit,
         SourceProjectMapping,
@@ -564,6 +565,7 @@ async def test_handover_assist_filters_indexed_units_by_exact_version_in_sql_bef
                 CanonicalBlock.__table__,
                 SearchUnit.__table__,
                 SourceProjectMapping.__table__,
+                Job.__table__,
                 KnowledgeConflictResolution.__table__,
             ],
         )

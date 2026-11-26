@@ -2548,3 +2548,968 @@ async def test_lifecycle_doc2_v2_carry_forward_retraction_out_of_order_and_metad
         ).all()
         assert len(cjobs) == 1
         fake_queue.enqueue.assert_awaited_once_with(cjobs[0].id)
+
+
+# ---------------------------------------------------------------------------
+# 13. Triad Round 2 Hardening Regressions (Fixes 3, 4, 5, 8, 9, 11, 12a)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_document_conflicts_commits_inside_source_processing_lease(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    """Fix 3: Phase D conflict writes MUST commit BEFORE acquire_source_processing_lease releases."""
+    from sag_api.db.models import OctxOperationLease
+
+    # Use a file-backed SQLite DB so concurrent sessions (worker, lease, spy) use distinct
+    # connections rather than StaticPool's single shared :memory: connection.
+    db_file = tmp_path / "lease_commit_order.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db_file.as_posix()}")
+    _enable_sqlite_fk(engine)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(tasks, "SessionLocal", factory)
+    try:
+        async with factory() as session:
+            d_old = await _seed_doc_unit(
+                session,
+                tag="lease-c-old",
+                text="Backup retention window is 14 days for all staging clusters.",
+                authority_tier=2,
+                effective_from=T_JAN,
+            )
+            d_new = await _seed_doc_unit(
+                session,
+                tag="lease-c-new",
+                text="Backup retention window is 30 days for all staging clusters.",
+                authority_tier=1,
+                effective_from=T_JUN,
+            )
+            cjob = Job(
+                id="job-lease-commit-order",
+                type=JobType.CONFLICT_RESOLUTION,
+                source_id=str(d_new["source_id"]),
+                document_id=str(d_new["document_id"]),
+                status=JobStatus.RUNNING,
+                payload={
+                    "tenant_id": TENANT_ID,
+                    "project_id": PROJECT_ID,
+                    "document_id": str(d_new["document_id"]),
+                    "document_version_id": str(d_new["version_id"]),
+                    "security_partition_id": PART_A,
+                },
+            )
+            session.add(cjob)
+            await session.commit()
+
+            collection = f"search_units_{PROJECT_ID}"
+            new_pid = generate_search_unit_point_id(collection, str(d_new["unit_id"]))
+            old_hash = str(d_old["unit"].content_hash)
+
+            def _q_handler(request: httpx.Request) -> httpx.Response:
+                if request.url.path.endswith("/points"):
+                    return httpx.Response(
+                        200,
+                        json={
+                            "result": [
+                                {
+                                    "id": new_pid,
+                                    "payload": {"search_unit_id": d_new["unit_id"]},
+                                    "vector": {"content_vector": [0.7, 0.7, 0.0]},
+                                }
+                            ]
+                        },
+                    )
+                if request.url.path.endswith("/points/query/batch"):
+                    return httpx.Response(
+                        200,
+                        json={
+                            "result": [
+                                {
+                                    "points": [
+                                        {
+                                            "id": "p-lease-old",
+                                            "score": 0.91,
+                                            "payload": {
+                                                "search_unit_id": d_old["unit_id"],
+                                                "document_version_id": d_old["version_id"],
+                                                "document_id": d_old["document_id"],
+                                                "security_partition_id": PART_A,
+                                                "content_hash": old_hash,
+                                            },
+                                        }
+                                    ]
+                                }
+                            ]
+                        },
+                    )
+                return httpx.Response(404)
+
+            def _llm_reply(messages, _rf):
+                user_txt = messages[-1]["content"]
+                parsed_in = json.loads(
+                    user_txt.split("PAIRS_JSON:\n", 1)[1].split("\nEND_PAIRS_JSON", 1)[0]
+                )
+                return json.dumps(
+                    {
+                        "items": [
+                            {
+                                "pair_id": parsed_in[0]["pair_id"],
+                                "classification": "DIRECT_SUPERSEDES",
+                                "confidence": 0.96,
+                                "winner": "NEW",
+                                "scope_difference_summary": None,
+                                "reason": "Higher authority supersedes older backup retention rule",
+                            }
+                        ]
+                    }
+                )
+
+            expected_lease_key = f"source:{d_new['source_id']}:processor:{cjob.id}"
+            lease_active_at_commit: list[bool] = []
+            orig_commit = session.commit
+
+            async def _spied_commit():
+                async with factory() as check_s:
+                    lease_row = await check_s.scalar(
+                        select(OctxOperationLease).where(
+                            OctxOperationLease.resource_key == expected_lease_key
+                        )
+                    )
+                    lease_active_at_commit.append(lease_row is not None)
+                await orig_commit()
+
+            session.commit = _spied_commit  # type: ignore[method-assign]
+            try:
+                async with httpx.AsyncClient(
+                    transport=httpx.MockTransport(_q_handler), base_url="http://qdrant.test"
+                ) as qdrant:
+                    result = await resolve_document_conflicts_service(
+                        session,
+                        job=cjob,
+                        qdrant_client=qdrant,
+                        llm=_FakeLLM(_llm_reply),
+                        lease_session_factory=factory,
+                        now_utc=T_NOW,
+                    )
+            finally:
+                session.commit = orig_commit  # type: ignore[method-assign]
+
+            assert result.auto_superseded == 1
+            # Commit MUST have executed WHILE the processing lease was active!
+            assert lease_active_at_commit == [True]
+
+        # After return, lease is cleanly released AND conflict row + job progress are ALREADY committed!
+        async with factory() as verify_s:
+            remaining_lease = await verify_s.scalar(
+                select(OctxOperationLease).where(
+                    OctxOperationLease.resource_key == expected_lease_key
+                )
+            )
+            assert remaining_lease is None
+            persisted_rows = (await verify_s.scalars(select(KnowledgeConflictResolution))).all()
+            assert len(persisted_rows) == 1
+            assert persisted_rows[0].status == ConflictResolutionStatus.ACTIVE.value
+            persisted_job = await verify_s.get(Job, cjob.id)
+            assert persisted_job is not None
+            assert persisted_job.progress == 1.0
+            assert (persisted_job.payload or {}).get("auto_superseded") == 1
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_carry_forward_v1_v2_v3_and_pending_winner_b_leave_zero_orphaned_supersedes_edges(
+    p2a_db,
+):
+    """Fix 4: Carry-forward v1 -> v2 -> v3 -> retract AND PENDING_REVIEW -> WINNER_B -> v2 -> reopen
+    MUST clean up prior SUPERSEDES edges and keep graph_edge_id bound to the live edge."""
+    async with p2a_db() as session:
+        # Scenario A: v1 -> v2 -> v3 -> retract
+        doc1 = await _seed_doc_unit(
+            session, tag="edge-d1", text="Legacy quota is 10 GB.", authority_tier=2, effective_from=T_JAN
+        )
+        doc2_v1 = await _seed_doc_unit(
+            session,
+            tag="edge-d2-v1",
+            document_id="doc-edge-2",
+            version_no=1,
+            text="Updated quota is 50 GB.",
+            authority_tier=1,
+            effective_from=T_MAR,
+            valid_from=T_MAR,
+            valid_to=T_JUN,
+        )
+        e1 = KnowledgeGraphEdge(
+            id="edge-sup-v1-init",
+            project_id=PROJECT_ID,
+            source_unit_id=str(doc2_v1["unit_id"]),
+            target_unit_id=str(doc1["unit_id"]),
+            edge_type="SUPERSEDES",
+            metadata_json={"is_candidate": False, "resolution_id": "res-edge-cf"},
+        )
+        session.add(e1)
+        await session.flush()
+
+        res = KnowledgeConflictResolution(
+            id="res-edge-cf",
+            tenant_id=TENANT_ID,
+            project_id=PROJECT_ID,
+            security_partition_id=PART_A,
+            winner_security_partition_id=PART_A,
+            pair_key=compute_conflict_pair_key(
+                str(doc2_v1["version_id"]),
+                str(doc2_v1["unit_id"]),
+                str(doc1["version_id"]),
+                str(doc1["unit_id"]),
+            ),
+            winner_document_id="doc-edge-2",
+            winner_version_id=str(doc2_v1["version_id"]),
+            winner_unit_id=str(doc2_v1["unit_id"]),
+            winner_content_hash=doc2_v1["unit"].content_hash,
+            loser_document_id=str(doc1["document_id"]),
+            loser_version_id=str(doc1["version_id"]),
+            loser_unit_id=str(doc1["unit_id"]),
+            loser_content_hash=doc1["unit"].content_hash,
+            conflict_subtype=ConflictSubtype.DIRECT_SUPERSEDES.value,
+            status=ConflictResolutionStatus.ACTIVE.value,
+            resolution_mode=ConflictResolutionMode.MANUAL_HITL.value,
+            confidence=1.0,
+            effective_valid_to=T_MAR,
+            graph_edge_id=e1.id,
+        )
+        session.add(res)
+        await session.commit()
+
+        # v1 -> v2 carry-forward
+        doc2_v2 = await _seed_doc_unit(
+            session,
+            tag="edge-d2-v2",
+            source_id=str(doc2_v1["source_id"]),
+            document_id="doc-edge-2",
+            version_no=2,
+            text="Updated quota is 50 GB.",
+            authority_tier=1,
+            effective_from=T_JUN,
+            valid_from=T_JUN,
+            valid_to=VALID_TO_FOREVER,
+            supersedes_id=str(doc2_v1["version_id"]),
+        )
+        await reconcile_resolutions_after_version_ready(
+            session, new_version=doc2_v2["ver"], now_utc=T_NOW
+        )
+        await session.commit()
+        await session.refresh(res)
+        sup_v2 = (
+            await session.scalars(
+                select(KnowledgeGraphEdge).where(KnowledgeGraphEdge.edge_type == "SUPERSEDES")
+            )
+        ).all()
+        assert len(sup_v2) == 1
+        assert sup_v2[0].source_unit_id == str(doc2_v2["unit_id"])
+        assert sup_v2[0].target_unit_id == str(doc1["unit_id"])
+        assert res.graph_edge_id == sup_v2[0].id
+        assert await session.get(KnowledgeGraphEdge, "edge-sup-v1-init") is None
+
+        # v2 -> v3 carry-forward
+        doc2_v2["ver"].valid_to = T_SEP
+        doc2_v3 = await _seed_doc_unit(
+            session,
+            tag="edge-d2-v3",
+            source_id=str(doc2_v1["source_id"]),
+            document_id="doc-edge-2",
+            version_no=3,
+            text="Updated quota is 50 GB.",
+            authority_tier=1,
+            effective_from=T_SEP,
+            valid_from=T_SEP,
+            valid_to=VALID_TO_FOREVER,
+            supersedes_id=str(doc2_v2["version_id"]),
+        )
+        await reconcile_resolutions_after_version_ready(
+            session, new_version=doc2_v3["ver"], now_utc=T_NOW
+        )
+        await session.commit()
+        await session.refresh(res)
+        sup_v3 = (
+            await session.scalars(
+                select(KnowledgeGraphEdge).where(KnowledgeGraphEdge.edge_type == "SUPERSEDES")
+            )
+        ).all()
+        assert len(sup_v3) == 1
+        assert sup_v3[0].source_unit_id == str(doc2_v3["unit_id"])
+        assert res.graph_edge_id == sup_v3[0].id
+
+        # v3 -> v4 retraction -> 0 SUPERSEDES edges remain!
+        doc2_v3["ver"].valid_to = T_NOW
+        doc2_v4 = await _seed_doc_unit(
+            session,
+            tag="edge-d2-v4",
+            source_id=str(doc2_v1["source_id"]),
+            document_id="doc-edge-2",
+            version_no=4,
+            text="Quota clause completely retracted.",
+            authority_tier=1,
+            effective_from=T_NOW,
+            valid_from=T_NOW,
+            valid_to=VALID_TO_FOREVER,
+            supersedes_id=str(doc2_v3["version_id"]),
+        )
+        await reconcile_resolutions_after_version_ready(
+            session, new_version=doc2_v4["ver"], now_utc=T_NOW
+        )
+        await session.commit()
+        await session.refresh(res)
+        assert res.status == ConflictResolutionStatus.NEEDS_REVALIDATION.value
+        assert res.graph_edge_id is None
+        sup_retracted = (
+            await session.scalars(
+                select(KnowledgeGraphEdge).where(KnowledgeGraphEdge.edge_type == "SUPERSEDES")
+            )
+        ).all()
+        assert sup_retracted == []
+
+        # Scenario B: PENDING_REVIEW (with CONTRADICTS C1) -> WINNER_B -> v2 carry-forward -> reopen
+        doc_b1 = await _seed_doc_unit(
+            session, tag="edge-b1", text="Default TTL is 1h.", authority_tier=2, effective_from=T_JAN
+        )
+        doc_b2_v1 = await _seed_doc_unit(
+            session,
+            tag="edge-b2-v1",
+            document_id="doc-edge-b2",
+            version_no=1,
+            text="Default TTL is 4h.",
+            authority_tier=2,
+            effective_from=T_MAR,
+            valid_from=T_MAR,
+            valid_to=T_JUN,
+        )
+        c1 = KnowledgeGraphEdge(
+            id="edge-con-b1",
+            project_id=PROJECT_ID,
+            source_unit_id=str(doc_b2_v1["unit_id"]),
+            target_unit_id=str(doc_b1["unit_id"]),
+            edge_type="CONTRADICTS",
+            metadata_json={"is_candidate": True, "resolution_id": "res-edge-b"},
+        )
+        session.add(c1)
+        await session.flush()
+        res_b = KnowledgeConflictResolution(
+            id="res-edge-b",
+            tenant_id=TENANT_ID,
+            project_id=PROJECT_ID,
+            security_partition_id=PART_A,
+            winner_security_partition_id=PART_A,
+            pair_key=compute_conflict_pair_key(
+                str(doc_b2_v1["version_id"]),
+                str(doc_b2_v1["unit_id"]),
+                str(doc_b1["version_id"]),
+                str(doc_b1["unit_id"]),
+            ),
+            winner_document_id="doc-edge-b2",
+            winner_version_id=str(doc_b2_v1["version_id"]),
+            winner_unit_id=str(doc_b2_v1["unit_id"]),
+            winner_content_hash=doc_b2_v1["unit"].content_hash,
+            loser_document_id=str(doc_b1["document_id"]),
+            loser_version_id=str(doc_b1["version_id"]),
+            loser_unit_id=str(doc_b1["unit_id"]),
+            loser_content_hash=doc_b1["unit"].content_hash,
+            conflict_subtype=ConflictSubtype.HARD_CONTRADICTION.value,
+            status=ConflictResolutionStatus.PENDING_REVIEW.value,
+            resolution_mode=ConflictResolutionMode.UNRESOLVED.value,
+            confidence=0.88,
+            graph_edge_id=c1.id,
+        )
+        session.add(res_b)
+        await session.commit()
+
+        await resolve_conflict(
+            session,
+            tenant_id=TENANT_ID,
+            project_id=PROJECT_ID,
+            allowed_partition_ids={PART_A},
+            resolution_id="res-edge-b",
+            action="WINNER_B",
+            reason="Confirm 4h TTL",
+            actor="reviewer-b",
+        )
+        doc_b2_v2 = await _seed_doc_unit(
+            session,
+            tag="edge-b2-v2",
+            source_id=str(doc_b2_v1["source_id"]),
+            document_id="doc-edge-b2",
+            version_no=2,
+            text="Default TTL is 4h.",
+            authority_tier=2,
+            effective_from=T_JUN,
+            valid_from=T_JUN,
+            valid_to=VALID_TO_FOREVER,
+            supersedes_id=str(doc_b2_v1["version_id"]),
+        )
+        await reconcile_resolutions_after_version_ready(
+            session, new_version=doc_b2_v2["ver"], now_utc=T_NOW
+        )
+        await session.commit()
+        await session.refresh(res_b)
+        sup_b_v2 = (
+            await session.scalars(
+                select(KnowledgeGraphEdge).where(KnowledgeGraphEdge.edge_type == "SUPERSEDES")
+            )
+        ).all()
+        assert len(sup_b_v2) == 1
+        assert sup_b_v2[0].source_unit_id == str(doc_b2_v2["unit_id"])
+        assert res_b.graph_edge_id == sup_b_v2[0].id
+
+        await reopen_conflict(
+            session,
+            tenant_id=TENANT_ID,
+            project_id=PROJECT_ID,
+            allowed_partition_ids={PART_A},
+            resolution_id="res-edge-b",
+            reason="Re-evaluate",
+            actor="reviewer-b",
+        )
+        sup_b_reopen = (
+            await session.scalars(
+                select(KnowledgeGraphEdge).where(KnowledgeGraphEdge.edge_type == "SUPERSEDES")
+            )
+        ).all()
+        assert sup_b_reopen == []
+
+
+@pytest.mark.asyncio
+async def test_human_hitl_keep_both_scoped_protected_from_automated_overwrite(p2a_db):
+    """Fix 5: Human-resolved KEEP_BOTH_SCOPED decisions MUST be locked identically to
+    MANUAL_HITL across discovery, persist_conflict_decisions, and pair-key collision."""
+    from sag_api.services.knowledge_conflict_service import (
+        ClassifiedConflictDecision,
+        _handle_pair_key_collision,
+    )
+
+    async with p2a_db() as session:
+        doc_a = await _seed_doc_unit(
+            session,
+            tag="kbs-a",
+            text="EMEA travel stipend is 100 EUR per day for all team members.",
+            authority_tier=2,
+            effective_from=T_JAN,
+        )
+        doc_b = await _seed_doc_unit(
+            session,
+            tag="kbs-b",
+            text="APAC travel stipend is 120 USD per day for all team members.",
+            authority_tier=1,
+            effective_from=T_JUN,
+        )
+        pk = compute_conflict_pair_key(
+            str(doc_b["version_id"]),
+            str(doc_b["unit_id"]),
+            str(doc_a["version_id"]),
+            str(doc_a["unit_id"]),
+        )
+        row = KnowledgeConflictResolution(
+            id="res-kbs-human",
+            tenant_id=TENANT_ID,
+            project_id=PROJECT_ID,
+            security_partition_id=PART_A,
+            winner_security_partition_id=PART_A,
+            pair_key=pk,
+            winner_document_id=str(doc_b["document_id"]),
+            winner_version_id=str(doc_b["version_id"]),
+            winner_unit_id=str(doc_b["unit_id"]),
+            winner_content_hash=doc_b["unit"].content_hash,
+            loser_document_id=str(doc_a["document_id"]),
+            loser_version_id=str(doc_a["version_id"]),
+            loser_unit_id=str(doc_a["unit_id"]),
+            loser_content_hash=doc_a["unit"].content_hash,
+            conflict_subtype=ConflictSubtype.HARD_CONTRADICTION.value,
+            status=ConflictResolutionStatus.PENDING_REVIEW.value,
+            resolution_mode=ConflictResolutionMode.UNRESOLVED.value,
+            confidence=0.89,
+            evidence_json={"winner_authority_tier": 2, "loser_authority_tier": 2},
+        )
+        session.add(row)
+        await session.commit()
+
+        resolved = await resolve_conflict(
+            session,
+            tenant_id=TENANT_ID,
+            project_id=PROJECT_ID,
+            allowed_partition_ids={PART_A},
+            resolution_id="res-kbs-human",
+            action="KEEP_BOTH_SCOPED",
+            reason="Distinct regions EMEA vs APAC",
+            actor="human-reviewer-42",
+        )
+        assert resolved.status == ConflictResolutionStatus.DISMISSED_SCOPED.value
+        assert resolved.resolution_mode == ConflictResolutionMode.KEEP_BOTH_SCOPED.value
+        assert resolved.resolved_by == "human-reviewer-42"
+
+        # 1. Stage 2A discovery skips the pair even after metadata snapshot drift!
+        doc_b["ver"].authority_tier = 1
+        await session.commit()
+        collection = f"search_units_{PROJECT_ID}"
+        new_pid = generate_search_unit_point_id(collection, str(doc_b["unit_id"]))
+        old_hash = str(doc_a["unit"].content_hash)
+
+        def _q_handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/points"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "result": [
+                            {
+                                "id": new_pid,
+                                "payload": {"search_unit_id": doc_b["unit_id"]},
+                                "vector": {"content_vector": [1.0, 0.0]},
+                            }
+                        ]
+                    },
+                )
+            if request.url.path.endswith("/points/query/batch"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "result": [
+                            {
+                                "points": [
+                                    {
+                                        "id": "p-kbs-a",
+                                        "score": 0.92,
+                                        "payload": {
+                                            "search_unit_id": doc_a["unit_id"],
+                                            "document_version_id": doc_a["version_id"],
+                                            "document_id": doc_a["document_id"],
+                                            "security_partition_id": PART_A,
+                                            "content_hash": old_hash,
+                                        },
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                )
+            return httpx.Response(404)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_q_handler), base_url="http://qdrant.test"
+        ) as qdrant:
+            cands = await discover_conflict_candidates(
+                session,
+                qdrant_client=qdrant,
+                tenant_id=TENANT_ID,
+                project_id=PROJECT_ID,
+                security_partition_id=PART_A,
+                new_document=doc_b["doc"],
+                new_version=doc_b["ver"],
+                now_utc=T_NOW,
+            )
+        assert cands == []
+
+        # 2. persist_conflict_decisions MUST NOT overwrite human KEEP_BOTH_SCOPED!
+        cand = ConflictCandidate(
+            pair_id="kbs-overwrite-attempt",
+            pair_key=pk,
+            cosine_similarity=0.93,
+            new_document_id=str(doc_b["document_id"]),
+            new_document_name="kbs-b.md",
+            new_version_id=str(doc_b["version_id"]),
+            new_version=doc_b["ver"],
+            new_unit_id=str(doc_b["unit_id"]),
+            new_content_hash=doc_b["unit"].content_hash,
+            new_section_path="Travel",
+            new_text=doc_b["unit"].text_snapshot or "",
+            new_security_partition_id=PART_A,
+            existing_document_id=str(doc_a["document_id"]),
+            existing_document_name="kbs-a.md",
+            existing_version_id=str(doc_a["version_id"]),
+            existing_version=doc_a["ver"],
+            existing_unit_id=str(doc_a["unit_id"]),
+            existing_content_hash=doc_a["unit"].content_hash,
+            existing_section_path="Travel",
+            existing_text=doc_a["unit"].text_snapshot or "",
+            existing_security_partition_id=PART_A,
+        )
+        decision = ClassifiedConflictDecision(
+            candidate=cand,
+            conflict_subtype=ConflictSubtype.DIRECT_SUPERSEDES,
+            confidence=0.99,
+            winner="NEW",
+            scope_difference_summary=None,
+            reason="Automated overwrite attempt",
+        )
+        persist_res = await persist_conflict_decisions(
+            session,
+            tenant_id=TENANT_ID,
+            project_id=PROJECT_ID,
+            security_partition_id=PART_A,
+            decisions=[decision],
+            now_utc=T_NOW,
+        )
+        await session.commit()
+        await session.refresh(resolved)
+        assert persist_res.skipped_manual_hitl == 1
+        assert resolved.status == ConflictResolutionStatus.DISMISSED_SCOPED.value
+        assert resolved.resolution_mode == ConflictResolutionMode.KEEP_BOTH_SCOPED.value
+        assert resolved.resolved_by == "human-reviewer-42"
+
+        # 3. _handle_pair_key_collision protects human KEEP_BOTH_SCOPED against AUTO_POLICY remap
+        doc_c = await _seed_doc_unit(
+            session, tag="kbs-c", text="Other policy text for collision test.", authority_tier=1, effective_from=T_JUN
+        )
+        auto_row = KnowledgeConflictResolution(
+            id="res-kbs-auto-incoming",
+            tenant_id=TENANT_ID,
+            project_id=PROJECT_ID,
+            security_partition_id=PART_A,
+            winner_security_partition_id=PART_A,
+            pair_key=compute_conflict_pair_key(
+                str(doc_c["version_id"]), str(doc_c["unit_id"]), str(doc_a["version_id"]), str(doc_a["unit_id"])
+            ),
+            winner_document_id=str(doc_c["document_id"]),
+            winner_version_id=str(doc_c["version_id"]),
+            winner_unit_id=str(doc_c["unit_id"]),
+            winner_content_hash=doc_c["unit"].content_hash,
+            loser_document_id=str(doc_a["document_id"]),
+            loser_version_id=str(doc_a["version_id"]),
+            loser_unit_id=str(doc_a["unit_id"]),
+            loser_content_hash=doc_a["unit"].content_hash,
+            conflict_subtype=ConflictSubtype.DIRECT_SUPERSEDES.value,
+            status=ConflictResolutionStatus.ACTIVE.value,
+            resolution_mode=ConflictResolutionMode.AUTO_POLICY.value,
+            confidence=0.95,
+            resolved_by="system:auto_policy",
+        )
+        session.add(auto_row)
+        await session.flush()
+
+        can_update = await _handle_pair_key_collision(
+            session, row=auto_row, new_pair_key=pk, now_utc=T_NOW
+        )
+        assert can_update is False
+        assert auto_row.status == ConflictResolutionStatus.SUPERSEDED_BY_UPDATE.value
+        assert await session.get(KnowledgeConflictResolution, "res-kbs-human") is not None
+
+
+@pytest.mark.asyncio
+async def test_blocked_document_statuses_reject_paused_and_failed_documents(p2a_db):
+    """Fix 8: _BLOCKED_DOCUMENT_STATUSES in knowledge_conflict_service blocks PAUSED/FAILED docs."""
+    from sag_api.services.knowledge_conflict_service import has_active_cross_document_peer
+
+    async with p2a_db() as session:
+        doc_ready = await _seed_doc_unit(
+            session,
+            tag="blk-ready",
+            text="Ready active document rule for status checks.",
+            doc_status=DocumentStatus.READY,
+        )
+        doc_paused = await _seed_doc_unit(
+            session,
+            tag="blk-paused",
+            text="Paused document rule that must be ignored.",
+            doc_status=DocumentStatus.PAUSED,
+        )
+        doc_failed = await _seed_doc_unit(
+            session,
+            tag="blk-failed",
+            text="Failed document rule that must be ignored.",
+            doc_status=DocumentStatus.FAILED,
+        )
+        await session.commit()
+
+        # Peer check ignores PAUSED and FAILED docs
+        has_peer = await has_active_cross_document_peer(
+            session,
+            tenant_id=TENANT_ID,
+            project_id=PROJECT_ID,
+            security_partition_id=PART_A,
+            exclude_document_id=str(doc_ready["document_id"]),
+            now_utc=T_NOW,
+        )
+        assert has_peer is False
+
+        # Conflict involving PAUSED or FAILED doc is hidden from default list and blocked on resolve/reopen
+        for tag, bad_doc in (("paused", doc_paused), ("failed", doc_failed)):
+            row = KnowledgeConflictResolution(
+                id=f"res-blk-{tag}",
+                tenant_id=TENANT_ID,
+                project_id=PROJECT_ID,
+                security_partition_id=PART_A,
+                winner_security_partition_id=PART_A,
+                pair_key=compute_conflict_pair_key(
+                    str(bad_doc["version_id"]),
+                    str(bad_doc["unit_id"]),
+                    str(doc_ready["version_id"]),
+                    str(doc_ready["unit_id"]),
+                ),
+                winner_document_id=str(bad_doc["document_id"]),
+                winner_version_id=str(bad_doc["version_id"]),
+                winner_unit_id=str(bad_doc["unit_id"]),
+                winner_content_hash=bad_doc["unit"].content_hash,
+                loser_document_id=str(doc_ready["document_id"]),
+                loser_version_id=str(doc_ready["version_id"]),
+                loser_unit_id=str(doc_ready["unit_id"]),
+                loser_content_hash=doc_ready["unit"].content_hash,
+                conflict_subtype=ConflictSubtype.HARD_CONTRADICTION.value,
+                status=ConflictResolutionStatus.PENDING_REVIEW.value,
+                resolution_mode=ConflictResolutionMode.UNRESOLVED.value,
+                confidence=0.85,
+            )
+            session.add(row)
+        await session.commit()
+
+        items, total = await list_project_conflicts(
+            session,
+            tenant_id=TENANT_ID,
+            project_id=PROJECT_ID,
+            allowed_partition_ids={PART_A},
+            include_inactive=False,
+        )
+        assert items == []
+        assert total == 0
+
+        for res_id in ("res-blk-paused", "res-blk-failed"):
+            with pytest.raises(ConflictError):
+                await resolve_conflict(
+                    session,
+                    tenant_id=TENANT_ID,
+                    project_id=PROJECT_ID,
+                    allowed_partition_ids={PART_A},
+                    resolution_id=res_id,
+                    action="WINNER_B",
+                    reason="cannot win with paused/failed doc",
+                    actor="reviewer-blk",
+                )
+            with pytest.raises(ConflictError):
+                await reopen_conflict(
+                    session,
+                    tenant_id=TENANT_ID,
+                    project_id=PROJECT_ID,
+                    allowed_partition_ids={PART_A},
+                    resolution_id=res_id,
+                    reason="cannot reopen paused/failed doc",
+                    actor="reviewer-blk",
+                )
+
+
+@pytest.mark.asyncio
+async def test_pair_key_collision_deletes_owned_contradicts_edge_and_cleans_quality(p2a_db):
+    """Fix 9: Deleting a colliding row in _handle_pair_key_collision removes its owned
+    CONTRADICTS edge so neither KnowledgeQuality nor the 5,000 edge cap is polluted."""
+    async with p2a_db() as session:
+        doc1 = await _seed_doc_unit(
+            session, tag="col-d1", text="Original expense cap is 2M VND.", authority_tier=2, effective_from=T_JAN
+        )
+        doc2_v1 = await _seed_doc_unit(
+            session,
+            tag="col-d2-v1",
+            document_id="doc-col-2",
+            version_no=1,
+            text="Expense cap is 5M VND.",
+            authority_tier=1,
+            effective_from=T_MAR,
+            valid_from=T_MAR,
+            valid_to=T_JUN,
+        )
+        doc2_v2 = await _seed_doc_unit(
+            session,
+            tag="col-d2-v2",
+            source_id=str(doc2_v1["source_id"]),
+            document_id="doc-col-2",
+            version_no=2,
+            text="Expense cap is 5M VND.",
+            authority_tier=1,
+            effective_from=T_JUN,
+            valid_from=T_JUN,
+            valid_to=VALID_TO_FOREVER,
+            supersedes_id=str(doc2_v1["version_id"]),
+        )
+        # Seed MANUAL_HITL resolution on v1
+        res_hitl = KnowledgeConflictResolution(
+            id="res-col-hitl",
+            tenant_id=TENANT_ID,
+            project_id=PROJECT_ID,
+            security_partition_id=PART_A,
+            winner_security_partition_id=PART_A,
+            pair_key=compute_conflict_pair_key(
+                str(doc2_v1["version_id"]),
+                str(doc2_v1["unit_id"]),
+                str(doc1["version_id"]),
+                str(doc1["unit_id"]),
+            ),
+            winner_document_id="doc-col-2",
+            winner_version_id=str(doc2_v1["version_id"]),
+            winner_unit_id=str(doc2_v1["unit_id"]),
+            winner_content_hash=doc2_v1["unit"].content_hash,
+            loser_document_id=str(doc1["document_id"]),
+            loser_version_id=str(doc1["version_id"]),
+            loser_unit_id=str(doc1["unit_id"]),
+            loser_content_hash=doc1["unit"].content_hash,
+            conflict_subtype=ConflictSubtype.DIRECT_SUPERSEDES.value,
+            status=ConflictResolutionStatus.ACTIVE.value,
+            resolution_mode=ConflictResolutionMode.MANUAL_HITL.value,
+            confidence=1.0,
+            effective_valid_to=T_MAR,
+        )
+        # Seed colliding automated PENDING_REVIEW row on v2 with owned CONTRADICTS edge
+        col_con_edge = KnowledgeGraphEdge(
+            id="edge-col-con-owned",
+            project_id=PROJECT_ID,
+            source_unit_id=str(doc2_v2["unit_id"]),
+            target_unit_id=str(doc1["unit_id"]),
+            edge_type="CONTRADICTS",
+            metadata_json={"is_candidate": True, "resolution_id": "res-col-auto"},
+        )
+        session.add(col_con_edge)
+        await session.flush()
+
+        res_auto_col = KnowledgeConflictResolution(
+            id="res-col-auto",
+            tenant_id=TENANT_ID,
+            project_id=PROJECT_ID,
+            security_partition_id=PART_A,
+            winner_security_partition_id=PART_A,
+            pair_key=compute_conflict_pair_key(
+                str(doc2_v2["version_id"]),
+                str(doc2_v2["unit_id"]),
+                str(doc1["version_id"]),
+                str(doc1["unit_id"]),
+            ),
+            winner_document_id="doc-col-2",
+            winner_version_id=str(doc2_v2["version_id"]),
+            winner_unit_id=str(doc2_v2["unit_id"]),
+            winner_content_hash=doc2_v2["unit"].content_hash,
+            loser_document_id=str(doc1["document_id"]),
+            loser_version_id=str(doc1["version_id"]),
+            loser_unit_id=str(doc1["unit_id"]),
+            loser_content_hash=doc1["unit"].content_hash,
+            conflict_subtype=ConflictSubtype.HARD_CONTRADICTION.value,
+            status=ConflictResolutionStatus.PENDING_REVIEW.value,
+            resolution_mode=ConflictResolutionMode.UNRESOLVED.value,
+            confidence=0.80,
+            graph_edge_id=col_con_edge.id,
+        )
+        session.add_all([res_hitl, res_auto_col])
+        await session.commit()
+
+        rec = await reconcile_resolutions_after_version_ready(
+            session, new_version=doc2_v2["ver"], now_utc=T_NOW
+        )
+        await session.commit()
+        assert rec.carried_forward_count == 1
+        assert await session.get(KnowledgeConflictResolution, "res-col-auto") is None
+        # Owned CONTRADICTS edge was deleted cleanly -> 0 orphaned candidate edges!
+        assert await session.get(KnowledgeGraphEdge, "edge-col-con-owned") is None
+        remaining_con = (
+            await session.scalars(
+                select(KnowledgeGraphEdge).where(KnowledgeGraphEdge.edge_type == "CONTRADICTS")
+            )
+        ).all()
+        assert remaining_con == []
+
+
+@pytest.mark.asyncio
+async def test_persist_conflict_decisions_sanitizes_nan_and_inf_confidence_fail_closed(p2a_db):
+    """Fix 11: Non-finite / NaN confidence passed directly to persist_conflict_decisions
+    clamps to 0.0 and fails closed to PENDING_REVIEW without IntegrityError or JSON NaN."""
+    from sag_api.services.knowledge_conflict_service import ClassifiedConflictDecision
+
+    async with p2a_db() as session:
+        d1 = await _seed_doc_unit(
+            session, tag="nan-1", text="Legacy timeout is 10 seconds.", authority_tier=2, effective_from=T_JAN
+        )
+        d2 = await _seed_doc_unit(
+            session, tag="nan-2", text="New timeout is 20 seconds.", authority_tier=1, effective_from=T_JUN
+        )
+        d3 = await _seed_doc_unit(
+            session, tag="nan-3", text="Alternate timeout is 30 seconds.", authority_tier=1, effective_from=T_SEP
+        )
+        await session.commit()
+
+        decisions = []
+        for idx, (doc_new, bad_conf) in enumerate(((d2, float("nan")), (d3, float("inf")))):
+            cand = ConflictCandidate(
+                pair_id=f"nan-pair-{idx}",
+                pair_key=compute_conflict_pair_key(
+                    str(doc_new["version_id"]),
+                    str(doc_new["unit_id"]),
+                    str(d1["version_id"]),
+                    str(d1["unit_id"]),
+                ),
+                cosine_similarity=0.91,
+                new_document_id=str(doc_new["document_id"]),
+                new_document_name=f"nan-{idx}.md",
+                new_version_id=str(doc_new["version_id"]),
+                new_version=doc_new["ver"],
+                new_unit_id=str(doc_new["unit_id"]),
+                new_content_hash=doc_new["unit"].content_hash,
+                new_section_path="Timeout",
+                new_text=doc_new["unit"].text_snapshot or "",
+                new_security_partition_id=PART_A,
+                existing_document_id=str(d1["document_id"]),
+                existing_document_name="nan-1.md",
+                existing_version_id=str(d1["version_id"]),
+                existing_version=d1["ver"],
+                existing_unit_id=str(d1["unit_id"]),
+                existing_content_hash=d1["unit"].content_hash,
+                existing_section_path="Timeout",
+                existing_text=d1["unit"].text_snapshot or "",
+                existing_security_partition_id=PART_A,
+            )
+            decisions.append(
+                ClassifiedConflictDecision(
+                    candidate=cand,
+                    conflict_subtype=ConflictSubtype.DIRECT_SUPERSEDES,
+                    confidence=bad_conf,
+                    winner="NEW",
+                    scope_difference_summary=None,
+                    reason="Synthetic non-finite confidence probe",
+                )
+            )
+
+        summary = await persist_conflict_decisions(
+            session,
+            tenant_id=TENANT_ID,
+            project_id=PROJECT_ID,
+            security_partition_id=PART_A,
+            decisions=decisions,
+            now_utc=T_NOW,
+        )
+        await session.commit()
+
+        assert summary.auto_superseded == 0
+        assert summary.pending_review == 2
+        rows = (await session.scalars(select(KnowledgeConflictResolution))).all()
+        assert len(rows) == 2
+        for row in rows:
+            assert row.confidence == 0.0
+            assert row.status == ConflictResolutionStatus.PENDING_REVIEW.value
+            assert row.resolution_mode == ConflictResolutionMode.UNRESOLVED.value
+            assert row.degraded_fallback is True
+            # Strict JSON serialization MUST succeed (zero NaN/Infinity tokens)
+            serialized = json.dumps(row.audit_history_json, allow_nan=False)
+            assert "NaN" not in serialized and "Infinity" not in serialized
+
+
+def test_clear_project_caches_safely_logs_degraded_warning_on_failure(monkeypatch, caplog):
+    """Fix 12a: _clear_project_caches_safely MUST log warning with degraded=True on exception."""
+    from sag_api.api.v1 import universe as universe_api
+    from sag_api.services.knowledge_conflict_service import _clear_project_caches_safely
+
+    def _boom(_project_id: str) -> None:
+        raise RuntimeError("cache eviction backend down")
+
+    monkeypatch.setattr(universe_api, "clear_universe_caches", _boom)
+    with caplog.at_level(logging.WARNING):
+        _clear_project_caches_safely(PROJECT_ID)
+
+    matching = [
+        rec.getMessage()
+        for rec in caplog.records
+        if "degraded=True" in rec.getMessage()
+        and "RuntimeError" in rec.getMessage()
+        and PROJECT_ID in rec.getMessage()
+    ]
+    assert len(matching) == 1

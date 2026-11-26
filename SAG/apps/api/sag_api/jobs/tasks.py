@@ -1976,9 +1976,12 @@ async def resolve_document_conflicts(
             await resolved_qdrant.aclose()
 
     refreshed_job = await session.get(Job, job_id, populate_existing=True) or job
-    refreshed_job.progress = 1.0
-    refreshed_job.payload = {**payload, **result.to_payload_dict()}
-    await session.commit()
+    expected_payload = {**dict(refreshed_job.payload or payload), **result.to_payload_dict()}
+    if refreshed_job.progress != 1.0 or refreshed_job.payload != expected_payload:
+        refreshed_job.progress = 1.0
+        refreshed_job.payload = expected_payload
+        session.add(refreshed_job)
+        await session.commit()
 
 
 TASK_HANDLERS: dict[JobType, TaskHandler] = {
