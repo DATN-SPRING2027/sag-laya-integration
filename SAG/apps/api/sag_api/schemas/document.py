@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, computed_field, field_validator
 
-from sag_api.enums import DocumentStatus
+from sag_api.enums import DocumentStatus, normalize_authority_tier, normalize_scope_tags
+
+_SENTINEL_EFFECTIVE_CUTOFF = datetime(9999, 1, 1, 0, 0, 0, tzinfo=UTC)
 
 
 class MessageItem(BaseModel):
@@ -23,6 +25,57 @@ class IngestRequest(BaseModel):
     text: str | None = None
     title: str | None = None
     messages: list[MessageItem] | None = Field(default=None)
+    source_published_at: datetime | None = None
+    authority_tier: int | None = Field(default=None, ge=1, le=4)
+    effective_from: datetime | None = None
+    scope_tags: list[str] | None = Field(default=None, max_length=16)
+
+    @field_validator("authority_tier", mode="before")
+    @classmethod
+    def _validate_authority_tier(cls, value: object) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError("authority_tier cannot be a boolean")
+        if isinstance(value, (int, str)):
+            return normalize_authority_tier(value)
+        raise ValueError("authority_tier must be an integer between 1 and 4")
+
+    @field_validator("effective_from", "source_published_at", mode="before")
+    @classmethod
+    def _reject_bool_timestamps(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("timestamp field cannot be a boolean")
+        return value
+
+    @field_validator("effective_from", mode="after")
+    @classmethod
+    def _normalize_effective_from(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        dt = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+        if dt >= _SENTINEL_EFFECTIVE_CUTOFF:
+            raise ValueError("effective_from must be earlier than 9999-01-01T00:00:00Z")
+        return dt
+
+    @field_validator("source_published_at", mode="after")
+    @classmethod
+    def _normalize_source_published_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+    @field_validator("scope_tags", mode="before")
+    @classmethod
+    def _validate_scope_tags(cls, value: object) -> list[str] | None:
+        if value is None:
+            return None
+        if not isinstance(value, list):
+            raise ValueError("scope_tags must be a list of strings")
+        if len(value) > 16:
+            raise ValueError("scope_tags cannot exceed 16 tags")
+        normalized = normalize_scope_tags(value)
+        return normalized or None
 
 
 class DocumentOut(BaseModel):

@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
-from sag_api.core.config import FIXED_SEARCH_TOP_K, settings
+from sag_api.core.config import settings
 from sag_api.core.db import get_session
 from sag_api.core.deps import (
     get_current_user,
@@ -101,6 +101,7 @@ async def _build_query_route(
     requested_retrieval_mode: str | None = None,
     *,
     requested_top_k: int | None = None,
+    as_of: datetime | None = None,
     trace_strategy_plan: bool = False,
     llm: LLMClient | None = None,
 ) -> _QueryRoutePlan:
@@ -154,6 +155,7 @@ async def _build_query_route(
         features=analysis.features,
         requested_top_k=requested_top_k,
         route_decision=decision,
+        as_of=as_of,
     )
 
     confidence = decision.get("confidence", 0.0)
@@ -377,6 +379,7 @@ async def _prepare_global_search(
             body.strategy,
             body.retrieval_mode,
             requested_top_k=body.top_k,
+            as_of=body.as_of if isinstance(body.as_of, datetime) else None,
             trace_strategy_plan=True,
             llm=llm,
         )
@@ -590,6 +593,7 @@ async def search(
             [source_id],
             body.strategy,
             requested_top_k=body.top_k,
+            as_of=body.as_of if isinstance(body.as_of, datetime) else None,
             llm=llm,
         )
         if route_plan.need_retrieval:
@@ -665,7 +669,11 @@ async def search(
         return SearchResponse(
             query=query,
             sections=[
-                SectionOut(**{**s.model_dump(), "source_id": source.id}, source_name=source.name) for s in outcome.sections
+                SectionOut(
+                    **{**s.model_dump(), "source_id": source.id},
+                    source_name=source.name,
+                )
+                for s in outcome.sections
             ],
             **graph_fields,
             source_hits=_source_hits(graph_fields["events"]),

@@ -5,10 +5,14 @@ Complies with Section 9.1 and 9.2 of phase-0-contracts-and-foundations.md.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from sag_api.enums import normalize_authority_tier, normalize_scope_tags
+
+_SENTINEL_EFFECTIVE_CUTOFF = datetime(9999, 1, 1, 0, 0, 0, tzinfo=UTC)
 
 
 class DocumentUploadResponse(BaseModel):
@@ -117,3 +121,86 @@ class DocumentRevokeRequest(BaseModel):
 class DocumentRevokeResponse(BaseModel):
     status: Literal["REVOKED", "ALREADY_REVOKED", "NOT_FOUND"]
     document_id: str | None = None
+
+
+class DocumentMetadataPatchRequest(BaseModel):
+    """Strict tri-state partial update payload for DocumentVersion authority/temporal metadata."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version_no: int | None = Field(default=None, ge=1)
+    authority_tier: int | None = Field(default=None, ge=1, le=4)
+    effective_from: datetime | None = None
+    scope_tags: list[str] | None = Field(default=None, max_length=16)
+
+    @field_validator("version_no", mode="before")
+    @classmethod
+    def _reject_bool_version_no(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("version_no cannot be a boolean")
+        return value
+
+    @field_validator("authority_tier", mode="before")
+    @classmethod
+    def _validate_authority_tier(cls, value: object) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError("authority_tier cannot be a boolean")
+        if isinstance(value, (int, str)):
+            return normalize_authority_tier(value)
+        raise ValueError("authority_tier must be an integer between 1 and 4")
+
+    @field_validator("effective_from", mode="before")
+    @classmethod
+    def _reject_bool_effective_from(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("effective_from cannot be a boolean")
+        return value
+
+    @field_validator("effective_from", mode="after")
+    @classmethod
+    def _normalize_effective_from(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        dt = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+        if dt >= _SENTINEL_EFFECTIVE_CUTOFF:
+            raise ValueError("effective_from must be earlier than 9999-01-01T00:00:00Z")
+        return dt
+
+    @field_validator("scope_tags", mode="before")
+    @classmethod
+    def _validate_scope_tags(cls, value: object) -> list[str] | None:
+        if value is None:
+            return None
+        if not isinstance(value, list):
+            raise ValueError("scope_tags must be a list of strings")
+        if len(value) > 16:
+            raise ValueError("scope_tags cannot exceed 16 tags")
+        normalized = normalize_scope_tags(value)
+        return normalized or None
+
+    @model_validator(mode="after")
+    def _require_metadata_field(self) -> DocumentMetadataPatchRequest:
+        if not (self.model_fields_set - {"version_no"}):
+            raise ValueError(
+                "At least one metadata field (authority_tier, effective_from, scope_tags) must be provided"
+            )
+        return self
+
+
+class DocumentMetadataPatchResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    document_id: str
+    version_id: str
+    version_no: int
+    authority_tier: int | None = None
+    effective_from: datetime | None = None
+    scope_tags: list[str] | None = None
+    valid_from: datetime
+    valid_to: datetime
+    temporal_recomputed: bool = False
+    qdrant_payload_synced: bool = False
+    degraded: bool = False
+    degraded_reason: str | None = None
