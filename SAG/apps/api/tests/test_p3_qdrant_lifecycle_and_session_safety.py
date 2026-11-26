@@ -558,6 +558,7 @@ async def test_reconcile_search_index_job_enqueued_durably_after_commit(
     now = datetime.now(UTC)
 
     points: list[dict] = []
+    deleted_old_ver: list[dict] = []
 
     def qdrant_handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode("utf-8")) if request.content else {}
@@ -594,8 +595,19 @@ async def test_reconcile_search_index_job_enqueued_durably_after_commit(
             return httpx.Response(200, json={"result": {"points": points}})
         if request.url.path.endswith("/points/delete"):
             must = (body.get("filter") or {}).get("must") or []
-            if must and must[0].get("match", {}).get("any") == ["old-ver-rec"]:
-                return httpx.Response(503, text="qdrant prune error")
+            for cond in must:
+                match = cond.get("match") or {}
+                if match.get("value") == "old-ver-rec" or "old-ver-rec" in (match.get("any") or []):
+                    deleted_old_ver.append(cond)
+            return httpx.Response(200, json={"result": {"status": "completed"}})
+        if request.url.path.endswith("/points/payload"):
+            must = (body.get("filter") or {}).get("must") or []
+            target_vid = next(
+                (c.get("match", {}).get("value") for c in must if c.get("key") == "document_version_id"),
+                None,
+            )
+            if target_vid == "old-ver-rec":
+                return httpx.Response(503, text="qdrant payload sync error")
             return httpx.Response(200, json={"result": {"status": "completed"}})
         return httpx.Response(200, json={"result": {}})
 
@@ -715,7 +727,10 @@ async def test_reconcile_search_index_job_enqueued_durably_after_commit(
             reconcile_job = await session.scalar(
                 select(Job).where(Job.type == JobType.RECONCILE_SEARCH_INDEX)
             )
+            assert deleted_old_ver == []
             assert reconcile_job is not None
+            assert (reconcile_job.payload or {}).get("reason") == "temporal_payload_sync_failed"
+            assert (reconcile_job.payload or {}).get("sync_version_ids") == ["old-ver-rec"]
             assert enqueued_after_commit == [(reconcile_job.id, True)]
             job_queue.enqueue_durably.assert_awaited_once_with(reconcile_job.id)
     finally:

@@ -658,6 +658,15 @@ async def _process_document_unlocked(
                             "DEDUP_TEMPORAL" if current_pipeline_stage == "DEDUP" else "INGEST"
                         )
                     )
+                    failed_created_at = datetime.now(UTC)
+                    if ing_run.started_at is not None:
+                        run_started = (
+                            ing_run.started_at.replace(tzinfo=UTC)
+                            if ing_run.started_at.tzinfo is None
+                            else ing_run.started_at.astimezone(UTC)
+                        )
+                        if failed_created_at < run_started:
+                            failed_created_at = run_started
                     failed_stage_run = StageRun(
                         id=str(uuid.uuid4()),
                         run_id=run_id,
@@ -666,6 +675,7 @@ async def _process_document_unlocked(
                         error_message=pipe_err_str,
                         duration_ms=0.0,
                         metrics_json={"error": pipe_err_str},
+                        created_at=failed_created_at,
                     )
                     session.add(failed_stage_run)
 
@@ -1662,10 +1672,14 @@ async def reconcile_search_index(
     job_queue=None,
 ) -> None:
     """Reconcile orphan Qdrant points against PostgreSQL SearchUnit/DocumentVersion truth."""
-    from sag_api.services.search_index_service import reconcile_orphan_search_units
+    from sag_api.services.search_index_service import (
+        reconcile_orphan_search_units,
+        reconcile_version_temporal_payloads,
+    )
 
     payload = dict(job.payload or {})
     reconcile_timeout = _reconcile_qdrant_timeout()
+    reconcile_timeout_sec = max(30.0, float(getattr(settings, "search_source_timeout", 30.0) or 30.0))
 
     qdrant_client: Any = None
     should_close = False
@@ -1690,6 +1704,7 @@ async def reconcile_search_index(
 
     total_scanned = 0
     total_deleted = 0
+    total_temporal_synced = 0
     per_project: dict[str, dict[str, int]] = {}
     try:
         requested_pid = payload.get("project_id")
@@ -1744,7 +1759,38 @@ async def reconcile_search_index(
         )
         is_superseded_prune_failure = payload.get("reason") == "superseded_prune_failed"
         explicit_prune_superseded = payload.get("prune_superseded") is True
+
+        raw_sync_vids = payload.get("sync_version_ids")
+        targeted_sync_vids = (
+            [str(vid).strip() for vid in raw_sync_vids if isinstance(vid, str) and vid.strip()]
+            if isinstance(raw_sync_vids, (list, tuple))
+            else []
+        )
+        is_temporal_sync_failure = payload.get("reason") == "temporal_payload_sync_failed"
+        explicit_sync_payloads = payload.get("sync_temporal_payloads") is True
+
         for idx, pid in enumerate(project_ids):
+            if (is_temporal_sync_failure or targeted_sync_vids) and not (
+                explicit_prune_superseded or is_superseded_prune_failure
+            ):
+                sync_stats = await reconcile_version_temporal_payloads(
+                    session,
+                    qdrant_client,
+                    project_id=pid,
+                    version_ids=targeted_sync_vids or None,
+                    request_timeout=reconcile_timeout_sec,
+                )
+                synced_count = int(sync_stats.get("synced_versions", 0))
+                total_temporal_synced += synced_count
+                per_project[pid] = {
+                    "scanned": 0,
+                    "orphans_deleted": 0,
+                    "temporal_payloads_synced": synced_count,
+                    "temporal_payloads_requested": int(sync_stats.get("requested_versions", 0)),
+                }
+                job.progress = (idx + 1) / len(project_ids)
+                continue
+
             if targeted_superseded_vids and (is_superseded_prune_failure or explicit_prune_superseded):
                 stats = await reconcile_orphan_search_units(
                     session,
@@ -1762,6 +1808,20 @@ async def reconcile_search_index(
                 )
             else:
                 stats = await reconcile_orphan_search_units(session, qdrant_client, project_id=pid)
+
+            if explicit_sync_payloads or not is_superseded_prune_failure:
+                sweep_stats = await reconcile_version_temporal_payloads(
+                    session,
+                    qdrant_client,
+                    project_id=pid,
+                    version_ids=targeted_sync_vids or None,
+                    request_timeout=reconcile_timeout_sec,
+                )
+                synced_count = int(sweep_stats.get("synced_versions", 0))
+                if synced_count > 0 or explicit_sync_payloads:
+                    total_temporal_synced += synced_count
+                    stats = {**stats, "temporal_payloads_synced": synced_count}
+
             per_project[pid] = stats
             total_scanned += int(stats.get("scanned", 0))
             total_deleted += int(stats.get("orphans_deleted", 0))
@@ -1771,12 +1831,20 @@ async def reconcile_search_index(
             await qdrant_client.aclose()
 
     job.progress = 1.0
-    job.payload = {
+    next_job_payload: dict[str, Any] = {
         **payload,
         "scanned": total_scanned,
         "orphans_deleted": total_deleted,
         "projects": per_project,
     }
+    if (
+        is_temporal_sync_failure
+        or targeted_sync_vids
+        or explicit_sync_payloads
+        or total_temporal_synced > 0
+    ):
+        next_job_payload["temporal_payloads_synced"] = total_temporal_synced
+    job.payload = next_job_payload
     await session.commit()
 
 

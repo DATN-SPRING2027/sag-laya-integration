@@ -18,6 +18,7 @@ import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from sqlalchemy import func, or_, select
@@ -43,8 +44,23 @@ from sag_api.db.models.routing_rag import (
     SearchUnit,
     StageRun,
 )
+from sag_api.enums import normalize_scope_tags
 
 log = get_logger("sag.search_index")
+
+_MAX_VALID_TO = datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC)
+
+
+def _as_utc(dt: datetime | str | None) -> datetime | None:
+    if dt is None:
+        return None
+    if isinstance(dt, str):
+        parsed = datetime.fromisoformat(dt)
+    else:
+        parsed = dt
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 # Bounded LRU cache mapping sha256(model_signature + NUL + text) -> dense vector
 _SHARED_TEXT_EMBEDDING_CACHE: dict[str, list[float]] = {}
@@ -272,6 +288,9 @@ PAYLOAD_INDEX_FIELDS = [
     ("tree_version_b", "keyword"),
     ("secondary_node_ids_a", "keyword"),
     ("secondary_node_ids_b", "keyword"),
+    ("authority_tier", "integer"),
+    ("effective_from_ts", "integer"),
+    ("scope_tags", "keyword"),
 ]
 
 _VERIFIED_CLIENT_COLLECTIONS: WeakKeyDictionary[Any, set[tuple[str, int, str]]] = WeakKeyDictionary()
@@ -951,8 +970,17 @@ def build_qdrant_payload(
     embedding_model_signature: str | None = None,
 ) -> dict[str, Any]:
     """Build Qdrant point payload including pre-provisioned tree routing fields and retrieval locators."""
-    valid_from_ts = int(version.valid_from.timestamp()) if version.valid_from else None
-    valid_to_ts = int(version.valid_to.timestamp()) if version.valid_to else None
+    valid_from_utc = _as_utc(version.valid_from)
+    valid_to_utc = _as_utc(version.valid_to)
+    effective_from_utc = _as_utc(getattr(version, "effective_from", None))
+    valid_from_iso = valid_from_utc.isoformat() if valid_from_utc else None
+    valid_to_iso = valid_to_utc.isoformat() if valid_to_utc else None
+    valid_from_ts = int(valid_from_utc.timestamp()) if valid_from_utc else None
+    valid_to_ts = int(valid_to_utc.timestamp()) if valid_to_utc else None
+    effective_from_iso = effective_from_utc.isoformat() if effective_from_utc else None
+    effective_from_ts = int(effective_from_utc.timestamp()) if effective_from_utc else None
+    authority_tier = getattr(version, "authority_tier", None)
+    scope_tags = normalize_scope_tags(getattr(version, "scope_tags_json", None))
 
     return {
         "_sag_id": unit.id,
@@ -967,12 +995,16 @@ def build_qdrant_payload(
         "block_from_id": block_from_id or getattr(unit, "block_from_id", None),
         "block_to_id": block_to_id or getattr(unit, "block_to_id", None),
         "source_anchor": source_anchor,
-        "valid_from": version.valid_from.isoformat() if version.valid_from else None,
-        "valid_to": version.valid_to.isoformat() if version.valid_to else None,
+        "valid_from": valid_from_iso,
+        "valid_to": valid_to_iso,
         "valid_from_ts": valid_from_ts,
         "valid_to_ts": valid_to_ts,
-        "valid_from_iso": version.valid_from.isoformat() if version.valid_from else None,
-        "valid_to_iso": version.valid_to.isoformat() if version.valid_to else None,
+        "valid_from_iso": valid_from_iso,
+        "valid_to_iso": valid_to_iso,
+        "authority_tier": authority_tier,
+        "effective_from": effective_from_iso,
+        "effective_from_ts": effective_from_ts,
+        "scope_tags": scope_tags,
         "token_count": unit.token_count,
         "section_path": unit.section_path,
         "page_from": unit.page_from,
@@ -1392,6 +1424,280 @@ async def delete_document_points_from_qdrant(
     return len(document_version_ids)
 
 
+class TemporalPayloadSyncError(RuntimeError):
+    """Structured error raised when one or more Qdrant set_payload temporal sync calls fail."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failed_version_ids: Sequence[str],
+        synced_version_ids: Sequence[str] = (),
+        errors_by_version: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.failed_version_ids: list[str] = [str(v) for v in failed_version_ids]
+        self.synced_version_ids: list[str] = [str(v) for v in synced_version_ids]
+        self.errors_by_version: dict[str, str] = dict(errors_by_version or {})
+
+
+def build_mutated_version_entries(
+    versions: Sequence[DocumentVersion],
+) -> list[dict[str, Any]]:
+    """Build canonical mutated-version payload sync entries from ORM DocumentVersion rows."""
+    entries: list[dict[str, Any]] = []
+    for v in versions:
+        cur_from = _as_utc(v.valid_from)
+        cur_to = _as_utc(v.valid_to)
+        eff_from = _as_utc(getattr(v, "effective_from", None))
+        entries.append(
+            {
+                "version_id": str(v.id),
+                "valid_from": cur_from,
+                "valid_to": cur_to,
+                "is_superseded": bool(cur_to is not None and cur_to < _MAX_VALID_TO),
+                "authority_tier": getattr(v, "authority_tier", None),
+                "effective_from": eff_from,
+                "scope_tags": normalize_scope_tags(getattr(v, "scope_tags_json", None)),
+            }
+        )
+    return entries
+
+
+def _build_temporal_payload_patch(entry: dict[str, Any]) -> dict[str, Any]:
+    """Build the 10-key Qdrant set_payload patch for temporal validity & authority metadata."""
+    valid_from_utc = _as_utc(entry.get("valid_from"))
+    valid_to_utc = _as_utc(entry.get("valid_to"))
+    effective_from_utc = _as_utc(entry.get("effective_from"))
+
+    valid_from_iso = valid_from_utc.isoformat() if valid_from_utc else None
+    valid_to_iso = valid_to_utc.isoformat() if valid_to_utc else None
+    valid_from_ts = int(valid_from_utc.timestamp()) if valid_from_utc else None
+    valid_to_ts = int(valid_to_utc.timestamp()) if valid_to_utc else None
+    effective_from_iso = effective_from_utc.isoformat() if effective_from_utc else None
+    effective_from_ts = int(effective_from_utc.timestamp()) if effective_from_utc else None
+
+    return {
+        "valid_from": valid_from_iso,
+        "valid_to": valid_to_iso,
+        "valid_from_ts": valid_from_ts,
+        "valid_to_ts": valid_to_ts,
+        "valid_from_iso": valid_from_iso,
+        "valid_to_iso": valid_to_iso,
+        "authority_tier": entry.get("authority_tier"),
+        "effective_from": effective_from_iso,
+        "effective_from_ts": effective_from_ts,
+        "scope_tags": normalize_scope_tags(entry.get("scope_tags")),
+    }
+
+
+async def sync_version_temporal_payloads_to_qdrant(
+    qdrant_client: httpx.AsyncClient,
+    *,
+    project_id: str,
+    mutated_versions: Sequence[dict[str, Any]],
+    request_timeout: float | None = None,
+    allow_missing_collection: bool = False,
+) -> list[str]:
+    """Sync temporal & authority payload fields in Qdrant via POST /points/payload?wait=true."""
+    deduped: dict[str, dict[str, Any]] = {}
+    for entry in mutated_versions:
+        vid = str(entry.get("version_id") or "").strip()
+        if not vid:
+            continue
+        deduped[vid] = entry
+
+    if not deduped:
+        return []
+
+    encoded_col = quote(f"search_units_{project_id}", safe="")
+    payload_url = f"/collections/{encoded_col}/points/payload?wait=true"
+    index_url = f"/collections/{encoded_col}/index?wait=true"
+
+    req_kwargs: dict[str, Any] = {}
+    if isinstance(request_timeout, httpx.Timeout):
+        req_kwargs["timeout"] = request_timeout
+    elif request_timeout is not None:
+        timeout_sec = max(1.0, float(request_timeout))
+        req_kwargs["timeout"] = httpx.Timeout(timeout_sec, connect=min(10.0, timeout_sec))
+
+    synced_ids: list[str] = []
+    failed_ids: list[str] = []
+    errors_by_version: dict[str, str] = {}
+
+    for vid, entry in deduped.items():
+        patch = _build_temporal_payload_patch(entry)
+        body = {
+            "payload": patch,
+            "filter": {
+                "must": [
+                    {"key": "project_id", "match": {"value": str(project_id)}},
+                    {"key": "document_version_id", "match": {"value": vid}},
+                ]
+            },
+        }
+        try:
+            res = await qdrant_client.post(payload_url, json=body, **req_kwargs)
+            if res.status_code == 400 and "index required but not found" in res.text.lower():
+                lower_text = res.text.lower()
+                missing_fields = [
+                    field_name
+                    for field_name in ("project_id", "document_version_id")
+                    if field_name in lower_text
+                ]
+                if not missing_fields:
+                    missing_fields = ["project_id", "document_version_id"]
+                for field_name in missing_fields:
+                    idx_res = await qdrant_client.put(
+                        index_url,
+                        json={"field_name": field_name, "field_schema": "keyword"},
+                        **req_kwargs,
+                    )
+                    if (
+                        idx_res.status_code >= 400
+                        and idx_res.status_code != 409
+                        and "already exists" not in idx_res.text.lower()
+                    ):
+                        idx_res.raise_for_status()
+                res = await qdrant_client.post(payload_url, json=body, **req_kwargs)
+
+            if res.status_code == 404 and allow_missing_collection:
+                synced_ids.append(vid)
+                continue
+            if res.status_code >= 400:
+                failed_ids.append(vid)
+                errors_by_version[vid] = sanitize_error_message(
+                    f"HTTP {res.status_code} - {res.text}"
+                )
+                continue
+            synced_ids.append(vid)
+        except Exception as exc:
+            failed_ids.append(vid)
+            errors_by_version[vid] = sanitize_error_message(exc)
+
+    if failed_ids:
+        raise TemporalPayloadSyncError(
+            f"Failed to sync temporal payloads in Qdrant for versions {failed_ids}",
+            failed_version_ids=failed_ids,
+            synced_version_ids=synced_ids,
+            errors_by_version=errors_by_version,
+        )
+    return synced_ids
+
+
+async def reconcile_version_temporal_payloads(
+    session: AsyncSession,
+    qdrant_client: httpx.AsyncClient,
+    *,
+    project_id: str,
+    version_ids: Sequence[str] | None = None,
+    request_timeout: float = 30.0,
+) -> dict[str, int]:
+    """Repair Qdrant temporal & authority payloads from PostgreSQL truth and clear degraded flags."""
+    from sag_api.db.models.document import Document
+
+    if version_ids is None:
+        proj_versions = (
+            await session.execute(
+                select(DocumentVersion)
+                .join(Document, Document.id == DocumentVersion.document_id)
+                .where(Document.project_id == project_id)
+            )
+        ).scalars().all()
+        discovered_ids: list[str] = []
+        for ver in proj_versions:
+            meta = ver.metadata_json or {}
+            if meta.get("qdrant_temporal_sync_degraded") is not True:
+                continue
+            raw_failed = meta.get("qdrant_temporal_sync_failed_version_ids")
+            failed_list = (
+                [str(x).strip() for x in raw_failed if str(x).strip()]
+                if isinstance(raw_failed, list)
+                else []
+            )
+            if failed_list:
+                discovered_ids.extend(failed_list)
+            else:
+                discovered_ids.append(str(ver.id))
+        unique_ids = list(dict.fromkeys(discovered_ids))
+    else:
+        unique_ids = list(dict.fromkeys(str(v).strip() for v in version_ids if str(v).strip()))
+
+    if not unique_ids:
+        return {"synced_versions": 0, "requested_versions": 0}
+
+    versions = (
+        await session.execute(
+            select(DocumentVersion)
+            .join(Document, Document.id == DocumentVersion.document_id)
+            .where(
+                Document.project_id == project_id,
+                Document.is_active.is_(True),
+                DocumentVersion.id.in_(unique_ids),
+                DocumentVersion.status.notin_(("FAILED", "REVOKED")),
+                DocumentVersion.search_status.in_(("SEARCH_READY", "READY")),
+            )
+        )
+    ).scalars().all()
+
+    if not versions:
+        return {"synced_versions": 0, "requested_versions": len(unique_ids)}
+
+    entries = build_mutated_version_entries(versions)
+    synced_ids = await sync_version_temporal_payloads_to_qdrant(
+        qdrant_client,
+        project_id=project_id,
+        mutated_versions=entries,
+        request_timeout=request_timeout,
+        allow_missing_collection=True,
+    )
+
+    if synced_ids:
+        synced_set = set(synced_ids)
+        proj_versions_all = (
+            await session.execute(
+                select(DocumentVersion)
+                .join(Document, Document.id == DocumentVersion.document_id)
+                .where(Document.project_id == project_id)
+            )
+        ).scalars().all()
+        for ver in proj_versions_all:
+            meta = dict(ver.metadata_json or {})
+            has_degraded_marker = (
+                meta.get("qdrant_temporal_sync_degraded") is True
+                or "qdrant_temporal_sync_failed_version_ids" in meta
+                or "qdrant_temporal_sync_degraded_reason" in meta
+                or "qdrant_temporal_sync_error" in meta
+            )
+            if not has_degraded_marker:
+                continue
+            raw_failed = meta.get("qdrant_temporal_sync_failed_version_ids")
+            failed_list = (
+                [str(x).strip() for x in raw_failed if str(x).strip()]
+                if isinstance(raw_failed, list)
+                else []
+            )
+            if str(ver.id) not in synced_set and not synced_set.intersection(failed_list):
+                continue
+            remaining_failed = [fid for fid in failed_list if fid not in synced_set]
+            if not remaining_failed:
+                meta["qdrant_temporal_sync_degraded"] = False
+                meta.pop("qdrant_temporal_sync_degraded_reason", None)
+                meta.pop("qdrant_temporal_sync_error", None)
+                meta.pop("qdrant_temporal_sync_failed_version_ids", None)
+            else:
+                meta["qdrant_temporal_sync_degraded"] = True
+                meta["qdrant_temporal_sync_failed_version_ids"] = remaining_failed
+                meta["qdrant_temporal_sync_degraded_reason"] = (
+                    f"temporal_payload_sync_failed:{','.join(remaining_failed)}"
+                )
+            ver.metadata_json = meta
+            session.add(ver)
+        await session.flush()
+
+    return {"synced_versions": len(synced_ids), "requested_versions": len(unique_ids)}
+
+
 async def reconcile_orphan_search_units(
     session: AsyncSession,
     qdrant_client: httpx.AsyncClient,
@@ -1566,14 +1872,14 @@ async def run_search_indexing_stage(
     # Resolve authoritative tenant_id and doc from Document or IngestionRun
     from sag_api.db.models.document import Document
     from sag_api.db.models.routing_rag import IngestionRun
+
     doc = await session.get(Document, document_version.document_id)
+    ing_run = await session.get(IngestionRun, run_id) if run_id else None
     if not tenant_id:
         if doc and doc.tenant_id:
             tenant_id = doc.tenant_id
-        elif run_id:
-            ing_run = await session.get(IngestionRun, run_id)
-            if ing_run and ing_run.tenant_id:
-                tenant_id = ing_run.tenant_id
+        elif ing_run and ing_run.tenant_id:
+            tenant_id = ing_run.tenant_id
     if not tenant_id:
         tenant_id = "tenant_default"
 
@@ -1806,8 +2112,8 @@ async def run_search_indexing_stage(
         # Strict fail-closed manifest verification: checksum must match
         manifest_verified = (qdrant_checksum == manifest_checksum)
 
-    prune_degraded = False
-    prune_degraded_reason: str | None = None
+    sync_degraded = False
+    sync_degraded_reason: str | None = None
     if manifest_verified and units:
         from sag_api.services.dedup_and_temporal_service import resolve_temporal_supersedes
 
@@ -1820,33 +2126,67 @@ async def run_search_indexing_stage(
             current_version=document_version,
             document_id=document_version.document_id,
         )
-        superseded_version_id = temporal_info.get("supersedes_id") if isinstance(temporal_info, dict) else None
-        if (
-            qdrant_client is not None
-            and isinstance(temporal_info, dict)
-            and temporal_info.get("action") == "SUPERSEDED"
-            and superseded_version_id
-        ):
+        versions_to_sync: list[dict[str, Any]] = []
+        if isinstance(temporal_info, dict) and temporal_info.get("mutated_versions"):
+            versions_to_sync = list(temporal_info["mutated_versions"])
+        else:
+            versions_to_sync = build_mutated_version_entries([document_version])
+            superseded_version_id = (
+                temporal_info.get("supersedes_id") if isinstance(temporal_info, dict) else None
+            )
+            if (
+                isinstance(temporal_info, dict)
+                and temporal_info.get("action") == "SUPERSEDED"
+                and superseded_version_id
+            ):
+                superseded_ver = await session.get(DocumentVersion, str(superseded_version_id))
+                if superseded_ver is not None:
+                    versions_to_sync.extend(build_mutated_version_entries([superseded_ver]))
+                else:
+                    versions_to_sync.append(
+                        {
+                            "version_id": str(superseded_version_id),
+                            "valid_from": None,
+                            "valid_to": _as_utc(document_version.valid_from),
+                            "is_superseded": True,
+                            "authority_tier": None,
+                            "effective_from": None,
+                            "scope_tags": [],
+                        }
+                    )
+
+        if qdrant_client is not None and versions_to_sync:
             try:
-                await delete_document_points_from_qdrant(
+                await sync_version_temporal_payloads_to_qdrant(
                     qdrant_client,
                     project_id=project_id,
-                    document_version_ids=[str(superseded_version_id)],
+                    mutated_versions=versions_to_sync,
                 )
             except Exception as exc:
-                prune_degraded = True
-                prune_degraded_reason = f"superseded_version_prune_failed:{superseded_version_id}"
+                failed_ids = (
+                    list(exc.failed_version_ids)
+                    if isinstance(exc, TemporalPayloadSyncError)
+                    else [
+                        str(entry["version_id"])
+                        for entry in versions_to_sync
+                        if entry.get("version_id")
+                    ]
+                )
+                sync_degraded = True
+                sync_degraded_reason = f"temporal_payload_sync_failed:{','.join(failed_ids)}"
                 err_safe = sanitize_error_message(exc)
                 log.warning(
-                    "Failed to prune superseded version %s from Qdrant (marking degraded & scheduling reconcile): %s",
-                    superseded_version_id,
+                    "Failed to sync temporal payloads in Qdrant for versions %s "
+                    "(marking degraded & scheduling reconcile): %s",
+                    failed_ids,
                     err_safe,
                 )
                 document_version.metadata_json = {
                     **(document_version.metadata_json or {}),
-                    "qdrant_prune_degraded": True,
-                    "qdrant_prune_degraded_reason": prune_degraded_reason,
-                    "qdrant_prune_error": err_safe,
+                    "qdrant_temporal_sync_degraded": True,
+                    "qdrant_temporal_sync_degraded_reason": sync_degraded_reason,
+                    "qdrant_temporal_sync_error": err_safe,
+                    "qdrant_temporal_sync_failed_version_ids": failed_ids,
                 }
                 from sag_api.db.models import Job
                 from sag_api.enums import JobStatus, JobType
@@ -1859,9 +2199,8 @@ async def run_search_indexing_stage(
                     document_id=document_version.document_id,
                     payload={
                         "project_id": project_id,
-                        "reason": "superseded_prune_failed",
-                        "superseded_version_id": str(superseded_version_id),
-                        "prune_superseded": True,
+                        "reason": "temporal_payload_sync_failed",
+                        "sync_version_ids": failed_ids,
                     },
                 )
                 session.add(reconcile_job)
@@ -1902,6 +2241,33 @@ async def run_search_indexing_stage(
                 else "Qdrant client missing or manifest count/checksum mismatch"
             )
 
+        stage_created_at = datetime.now(UTC)
+        if ing_run is not None and ing_run.started_at is not None:
+            run_started = _as_utc(ing_run.started_at)
+            if run_started is not None and stage_created_at < run_started:
+                stage_created_at = run_started
+
+        stage_metrics: dict[str, Any] = {
+            "search_unit_count": len(units),
+            "pg_count": pg_count,
+            "qdrant_count": qdrant_count,
+            "qdrant_indexed_count": indexed_count,
+            "manifest_checksum": manifest_checksum,
+            "qdrant_checksum": qdrant_checksum,
+            "manifest_verified": manifest_verified,
+            "degraded": sync_degraded,
+            "degraded_reason": sync_degraded_reason,
+            "collection_name": collection_name,
+            "token_usage": _idx_token_usage,
+            "error": (
+                sanitize_error_message(indexing_error)
+                if indexing_error
+                else (err_text if not is_success else None)
+            ),
+        }
+        if ing_run is not None and getattr(ing_run, "attempt_count", None) is not None:
+            stage_metrics["attempt_count"] = ing_run.attempt_count
+
         stage_run = StageRun(
             id=str(uuid.uuid4()),
             run_id=run_id,
@@ -1909,24 +2275,8 @@ async def run_search_indexing_stage(
             status="SUCCESS" if is_success else "FAILED",
             error_message=err_text,
             duration_ms=duration_ms,
-            metrics_json={
-                "search_unit_count": len(units),
-                "pg_count": pg_count,
-                "qdrant_count": qdrant_count,
-                "qdrant_indexed_count": indexed_count,
-                "manifest_checksum": manifest_checksum,
-                "qdrant_checksum": qdrant_checksum,
-                "manifest_verified": manifest_verified,
-                "degraded": prune_degraded,
-                "degraded_reason": prune_degraded_reason,
-                "collection_name": collection_name,
-                "token_usage": _idx_token_usage,
-                "error": (
-                    sanitize_error_message(indexing_error)
-                    if indexing_error
-                    else (err_text if not is_success else None)
-                ),
-            },
+            metrics_json=stage_metrics,
+            created_at=stage_created_at,
         )
         session.add(stage_run)
 

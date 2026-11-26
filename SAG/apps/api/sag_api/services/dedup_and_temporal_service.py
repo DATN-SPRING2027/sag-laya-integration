@@ -33,6 +33,7 @@ from sag_api.db.models.routing_rag import (
     DocumentVersion,
     StageRun,
 )
+from sag_api.enums import normalize_scope_tags
 
 log = get_logger("services.dedup_temporal")
 
@@ -714,6 +715,47 @@ def _as_utc(dt: datetime | None) -> datetime | None:
     return dt.astimezone(UTC)
 
 
+def _resolve_version_start(
+    version: DocumentVersion,
+    *,
+    include_valid_from: bool = True,
+    include_created_at: bool = True,
+    fallback: datetime | None = None,
+) -> datetime | None:
+    """Resolve canonical effective start timestamp.
+
+    Precedence: effective_from > source_published_at > observed_at [> valid_from] [> created_at] > fallback.
+    """
+    raw = (
+        getattr(version, "effective_from", None)
+        or getattr(version, "source_published_at", None)
+        or getattr(version, "observed_at", None)
+        or (getattr(version, "valid_from", None) if include_valid_from else None)
+        or (getattr(version, "created_at", None) if include_created_at else None)
+        or fallback
+    )
+    return _as_utc(raw)
+
+
+def _build_mutated_version_entry(
+    v: DocumentVersion,
+    *,
+    max_valid_to: datetime,
+) -> dict[str, Any]:
+    cur_from = _as_utc(v.valid_from)
+    cur_to = _as_utc(v.valid_to)
+    eff_from = _as_utc(getattr(v, "effective_from", None))
+    return {
+        "version_id": str(v.id),
+        "valid_from": cur_from,
+        "valid_to": cur_to,
+        "is_superseded": bool(cur_to is not None and cur_to < max_valid_to),
+        "authority_tier": getattr(v, "authority_tier", None),
+        "effective_from": eff_from,
+        "scope_tags": normalize_scope_tags(getattr(v, "scope_tags_json", None)),
+    }
+
+
 async def resolve_temporal_supersedes(
     session: AsyncSession,
     *,
@@ -736,9 +778,18 @@ async def resolve_temporal_supersedes(
     )
     res = await session.execute(stmt)
     all_prev = list(res.scalars().all())
+    initial_intervals: dict[str, tuple[datetime | None, datetime | None]] = {
+        str(v.id): (_as_utc(v.valid_from), _as_utc(v.valid_to))
+        for v in [current_version, *all_prev]
+    }
 
     now_utc = datetime.now(UTC)
-    cur_start = _as_utc(current_version.source_published_at or current_version.observed_at or now_utc)
+    cur_start = _resolve_version_start(
+        current_version,
+        include_valid_from=False,
+        include_created_at=False,
+        fallback=now_utc,
+    )
     assert cur_start is not None
 
     max_valid_to = datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC)
@@ -748,19 +799,21 @@ async def resolve_temporal_supersedes(
         current_version.valid_to = max_valid_to
         current_version.supersedes_id = None
         current_version.knowledge_status = "NOT_STARTED"
-        return {"action": "INITIAL", "active_version_id": current_version.id}
+        return {
+            "action": "INITIAL",
+            "active_version_id": current_version.id,
+            "current_version_id": current_version.id,
+            "supersedes_id": None,
+            "mutated_versions": [
+                _build_mutated_version_entry(current_version, max_valid_to=max_valid_to)
+            ],
+        }
 
     # Find the version active at cur_start: valid_from <= cur_start < valid_to
     active_at_start = None
     active_v_from: datetime | None = None
     for v in all_prev:
-        raw_from = (
-            getattr(v, "source_published_at", None)
-            or getattr(v, "observed_at", None)
-            or getattr(v, "valid_from", None)
-            or getattr(v, "created_at", None)
-        )
-        v_from = _as_utc(raw_from)
+        v_from = _resolve_version_start(v, include_valid_from=True, include_created_at=True)
         v_to = _as_utc(v.valid_to or max_valid_to)
         if v_from and v_to and v_from <= cur_start < v_to:
             active_at_start = v
@@ -782,12 +835,11 @@ async def resolve_temporal_supersedes(
         # (e.g. v1 -> v2, inserting v_mid between their dates leaves v2 pointing to v_mid, maintaining continuous chain)
         for v in all_prev:
             if v.id != current_version.id and v.supersedes_id == active_at_start.id:
-                raw_v = (
-                    getattr(v, "source_published_at", None)
-                    or getattr(v, "observed_at", None)
-                    or getattr(v, "valid_from", None)
+                v_start = _resolve_version_start(
+                    v,
+                    include_valid_from=True,
+                    include_created_at=False,
                 )
-                v_start = _as_utc(raw_v)
                 if v_start and v_start >= cur_start:
                     v.supersedes_id = current_version.id
                     session.add(v)
@@ -807,13 +859,7 @@ async def resolve_temporal_supersedes(
         future_vers = []
         past_vers = []
         for v in all_prev:
-            raw_from = (
-                getattr(v, "source_published_at", None)
-                or getattr(v, "observed_at", None)
-                or getattr(v, "valid_from", None)
-                or getattr(v, "created_at", None)
-            )
-            vf = _as_utc(raw_from)
+            vf = _resolve_version_start(v, include_valid_from=True, include_created_at=True)
             vt = _as_utc(v.valid_to or max_valid_to)
             if vf and vf > cur_start:
                 future_vers.append((v, vf))
@@ -877,11 +923,21 @@ async def resolve_temporal_supersedes(
         ):
             version.knowledge_status = "NOT_STARTED"
 
+    mutated_versions: list[dict[str, Any]] = [
+        _build_mutated_version_entry(current_version, max_valid_to=max_valid_to)
+    ]
+    for v in all_prev:
+        if (_as_utc(v.valid_from), _as_utc(v.valid_to)) != initial_intervals[str(v.id)]:
+            mutated_versions.append(
+                _build_mutated_version_entry(v, max_valid_to=max_valid_to)
+            )
+
     return {
         "action": action,
         "active_version_id": active_id,
         "current_version_id": current_version.id,
         "supersedes_id": current_version.supersedes_id,
+        "mutated_versions": mutated_versions,
     }
 
 

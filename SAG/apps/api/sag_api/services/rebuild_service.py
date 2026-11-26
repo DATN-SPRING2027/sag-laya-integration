@@ -7,17 +7,15 @@ Guarantees disaster recovery, migration readiness, and idempotent re-indexing.
 from __future__ import annotations
 
 from typing import Any
+
 import httpx
-from sqlalchemy import or_, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.logging import get_logger
 from sag_api.db.models.document import Document
 from sag_api.db.models.routing_rag import DocumentVersion, IngestionRun, SearchUnit
-from sag_api.services.search_index_service import (
-    ensure_qdrant_collection_and_indexes,
-    run_search_indexing_stage,
-)
+from sag_api.services.search_index_service import run_search_indexing_stage
 
 log = get_logger("sag.rebuild_service")
 
@@ -73,13 +71,32 @@ async def rebuild_search_index_for_project(
     """
     collection_name = f"search_units_{project_id}"
 
-    # Strictly scope query to DocumentVersions belonging to requested project_id via Document
+    # Strictly scope query to DocumentVersions belonging to requested project_id via Document,
+    # ordered chronologically using an EXISTS semi-join (PG16-safe with COALESCE ORDER BY).
+    has_units = (
+        select(SearchUnit.id)
+        .where(SearchUnit.document_version_id == DocumentVersion.id)
+        .exists()
+    )
+    effective_order = func.coalesce(
+        DocumentVersion.effective_from,
+        DocumentVersion.source_published_at,
+        DocumentVersion.valid_from,
+        DocumentVersion.observed_at,
+    )
     stmt = (
         select(DocumentVersion)
-        .join(SearchUnit, SearchUnit.document_version_id == DocumentVersion.id)
         .join(Document, Document.id == DocumentVersion.document_id)
-        .where(Document.project_id == project_id)
-        .distinct()
+        .where(
+            Document.project_id == project_id,
+            has_units,
+        )
+        .order_by(
+            DocumentVersion.document_id.asc(),
+            effective_order.asc(),
+            DocumentVersion.version_no.asc(),
+            DocumentVersion.id.asc(),
+        )
     )
     versions = (await session.execute(stmt)).scalars().all()
 

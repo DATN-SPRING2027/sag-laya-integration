@@ -240,18 +240,25 @@ async def test_canonical_embedding_reuses_sdk_client_without_starting_event_stor
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("prune_fails", [False, True])
+@pytest.mark.parametrize("sync_fails", [False, True])
 @pytest.mark.parametrize("missing_index", [False, True])
-async def test_verified_new_version_publishes_even_when_old_point_cleanup_fails(ingestion_db, monkeypatch, prune_fails, missing_index):
+async def test_verified_new_version_publishes_even_when_old_point_cleanup_fails(
+    ingestion_db, monkeypatch, sync_fails, missing_index
+):
     import json
+    from datetime import UTC, datetime, timedelta
 
     import httpx
 
     from sag_api.services import dedup_and_temporal_service as temporal
 
     points = []
-    deleted = []
+    deleted_superseded = []
+    synced_payloads: dict[str, dict] = {}
     created_indexes = []
+    now = datetime.now(UTC)
+    t_old = now - timedelta(days=5)
+    max_valid_to = datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC)
 
     async def index(_client, *, units, **kwargs):
         points.extend(
@@ -272,13 +279,22 @@ async def test_verified_new_version_publishes_even_when_old_point_cleanup_fails(
             return httpx.Response(200, json={"result": {"count": len(points)}})
         if request.url.path.endswith("/points/scroll"):
             return httpx.Response(200, json={"result": {"points": points}})
+        if request.url.path.endswith("/points/payload"):
+            must = (body.get("filter") or {}).get("must") or []
+            vid = next(
+                (c["match"]["value"] for c in must if c.get("key") == "document_version_id"),
+                None,
+            )
+            if vid is not None:
+                synced_payloads[vid] = dict(body.get("payload") or {})
+            if vid == "old-version" and sync_fails:
+                return httpx.Response(503, text="unavailable")
+            return httpx.Response(200, json={"result": {}})
         match = body["filter"]["must"][0]["match"]
         if missing_index and match.get("value") == "version" and not created_indexes:
             return httpx.Response(400, text='Index required but not found for "document_version_id"')
-        if match.get("any") == ["old-version"]:
-            deleted.append(match["any"])
-            if prune_fails:
-                return httpx.Response(503, text="unavailable")
+        if match.get("any") == ["old-version"] or match.get("value") == "old-version":
+            deleted_superseded.append(match)
         return httpx.Response(200, json={"result": {}})
 
     monkeypatch.setattr(search_index_service, "index_search_units_to_qdrant", index)
@@ -288,7 +304,29 @@ async def test_verified_new_version_publishes_even_when_old_point_cleanup_fails(
         AsyncMock(
             return_value={
                 "action": "SUPERSEDED",
+                "active_version_id": "version",
+                "current_version_id": "version",
                 "supersedes_id": "old-version",
+                "mutated_versions": [
+                    {
+                        "version_id": "version",
+                        "valid_from": now,
+                        "valid_to": max_valid_to,
+                        "is_superseded": False,
+                        "authority_tier": None,
+                        "effective_from": None,
+                        "scope_tags": [],
+                    },
+                    {
+                        "version_id": "old-version",
+                        "valid_from": t_old,
+                        "valid_to": now,
+                        "is_superseded": True,
+                        "authority_tier": None,
+                        "effective_from": None,
+                        "scope_tags": [],
+                    },
+                ],
             }
         ),
     )
@@ -322,15 +360,20 @@ async def test_verified_new_version_publishes_even_when_old_point_cleanup_fails(
             )
         assert units
         assert version.search_status == "SEARCH_READY"
-        assert deleted == [["old-version"]]
+        assert deleted_superseded == []
+        assert {"version", "old-version"} <= set(synced_payloads.keys())
+        assert synced_payloads["old-version"]["valid_to_ts"] == int(now.timestamp())
+        assert synced_payloads["old-version"]["valid_to_iso"] == now.isoformat()
         assert created_indexes == (["document_version_id"] if missing_index else [])
-        if prune_fails:
-            assert (version.metadata_json or {}).get("qdrant_prune_degraded") is True
+        if sync_fails:
+            assert (version.metadata_json or {}).get("qdrant_temporal_sync_degraded") is True
+            assert (version.metadata_json or {}).get("qdrant_temporal_sync_failed_version_ids") == ["old-version"]
             reconcile_job = await session.scalar(
                 select(Job).where(Job.type == JobType.RECONCILE_SEARCH_INDEX)
             )
             assert reconcile_job is not None
-            assert (reconcile_job.payload or {}).get("superseded_version_id") == "old-version"
+            assert (reconcile_job.payload or {}).get("reason") == "temporal_payload_sync_failed"
+            assert (reconcile_job.payload or {}).get("sync_version_ids") == ["old-version"]
 
 
 @pytest.mark.asyncio

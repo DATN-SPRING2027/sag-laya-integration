@@ -537,7 +537,8 @@ async def test_p6_rework_06_superseded_prune_failed_reconcile_prunes_failed_vers
 
     now = datetime.now(UTC)
     qdrant_store: dict[str, dict] = {}
-    fail_v1_delete = True
+    fail_v1_payload_sync = True
+    v1_delete_calls: list[dict] = []
 
     def q_handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode("utf-8")) if request.content else {}
@@ -577,12 +578,31 @@ async def test_p6_rework_06_superseded_prune_failed_reconcile_prunes_failed_vers
                 vid = must[0].get("match", {}).get("value")
                 pts = [pt for pt in pts if pt.get("payload", {}).get("document_version_id") == vid]
             return httpx.Response(200, json={"result": {"points": pts, "next_page_offset": None}})
+        if path.endswith("/points/payload"):
+            must = (body.get("filter") or {}).get("must") or []
+            target_vid = next(
+                (c.get("match", {}).get("value") for c in must if c.get("key") == "document_version_id"),
+                None,
+            )
+            if fail_v1_payload_sync and target_vid == "v1":
+                return httpx.Response(503, text="qdrant temporary 503")
+            patch = body.get("payload") or {}
+            for pt in qdrant_store.values():
+                if pt.get("payload", {}).get("document_version_id") == target_vid:
+                    pt.setdefault("payload", {}).update(patch)
+            return httpx.Response(200, json={"result": {"status": "completed"}})
         if path.endswith("/points/delete"):
             if "filter" in body:
                 must = (body.get("filter") or {}).get("must") or []
-                target_vids = must[0].get("match", {}).get("any", []) if must else []
-                if fail_v1_delete and "v1" in target_vids:
-                    return httpx.Response(503, text="qdrant temporary 503")
+                target_vids: list[str] = []
+                for cond in must:
+                    match = cond.get("match") or {}
+                    if "any" in match:
+                        target_vids.extend(match["any"])
+                    if "value" in match:
+                        target_vids.append(match["value"])
+                if "v1" in target_vids:
+                    v1_delete_calls.append(body)
                 for pid in list(qdrant_store.keys()):
                     if qdrant_store[pid].get("payload", {}).get("document_version_id") in target_vids:
                         del qdrant_store[pid]
@@ -722,21 +742,22 @@ async def test_p6_rework_06_superseded_prune_failed_reconcile_prunes_failed_vers
             )
             await session.commit()
 
-            # Verify queued reconcile job has prune_superseded=True & superseded_version_id="v1"
+            # Verify POST /points/delete was NOT called for v1 and queued reconcile job targets payload sync
+            assert v1_delete_calls == []
             reconcile_job = await session.get(Job, v2._last_reconcile_job_id)
             assert reconcile_job is not None
             assert reconcile_job.type == JobType.RECONCILE_SEARCH_INDEX
-            assert reconcile_job.payload["reason"] == "superseded_prune_failed"
-            assert reconcile_job.payload["superseded_version_id"] == "v1"
-            assert reconcile_job.payload.get("prune_superseded") is True
+            assert reconcile_job.payload["reason"] == "temporal_payload_sync_failed"
+            assert reconcile_job.payload["sync_version_ids"] == ["v1"]
             assert "pt-v1" in qdrant_store
 
-            # Now Qdrant recovers -> run reconcile_search_index
-            fail_v1_delete = False
+            # Now Qdrant recovers -> run reconcile_search_index (retains v1 and repairs its valid_to payload)
+            fail_v1_payload_sync = False
             mgr = SimpleNamespace(get_search_unit_qdrant_client=AsyncMock(return_value=q_client))
             await tasks.reconcile_search_index(session, reconcile_job, engine_manager=mgr)
 
-            assert "pt-v1" not in qdrant_store, "Failed superseded v1 MUST be deleted by reconcile_search_index"
+            assert "pt-v1" in qdrant_store, "Superseded v1 MUST be retained in Qdrant after payload sync"
+            assert qdrant_store["pt-v1"]["payload"]["valid_to_ts"] == int(v1.valid_to.timestamp())
             assert "pt-v-other-hist" in qdrant_store, "Unrelated historical superseded version should be preserved"
             assert any(
                 pt.get("payload", {}).get("document_version_id") == "v2" for pt in qdrant_store.values()
