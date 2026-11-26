@@ -607,6 +607,60 @@ async def _process_document_unlocked(
                     from sag_api.services.document_service import _enqueue_persisted_job
 
                     await _enqueue_persisted_job(job_queue, str(reconcile_job_id))
+
+                # Phase 2 Post-SEARCH_READY Hook: carry-forward/revalidation + async conflict job.
+                # Strictly isolated: errors here MUST NEVER fail Document.status or search_status.
+                if doc_ver.search_status == "SEARCH_READY":
+                    try:
+                        from sag_api.services.knowledge_conflict_service import (
+                            enqueue_conflict_resolution_job,
+                            has_active_cross_document_peer,
+                            reconcile_resolutions_after_version_ready,
+                        )
+
+                        reconcile_summary = await reconcile_resolutions_after_version_ready(
+                            session,
+                            new_version=doc_ver,
+                        )
+                        conflict_job_id: str | None = None
+                        if settings.conflict_resolution_job_enabled and (
+                            reconcile_summary.needs_revalidation_count > 0
+                            or await has_active_cross_document_peer(
+                                session,
+                                tenant_id=ing_run.tenant_id,
+                                project_id=ing_run.project_id,
+                                security_partition_id=sec_partition,
+                                exclude_document_id=document.id,
+                            )
+                        ):
+                            conflict_job = await enqueue_conflict_resolution_job(
+                                session,
+                                tenant_id=ing_run.tenant_id,
+                                project_id=ing_run.project_id,
+                                source_id=source.id,
+                                document_id=document.id,
+                                document_version_id=doc_ver.id,
+                                security_partition_id=sec_partition,
+                                reason=(
+                                    "version_revalidation"
+                                    if reconcile_summary.needs_revalidation_count > 0
+                                    else "document_search_ready"
+                                ),
+                            )
+                            conflict_job_id = conflict_job.id if conflict_job is not None else None
+                        await session.commit()
+                        if conflict_job_id and job_queue is not None:
+                            from sag_api.services.document_service import _enqueue_persisted_job
+
+                            await _enqueue_persisted_job(job_queue, conflict_job_id)
+                    except Exception as conflict_hook_err:  # noqa: BLE001 - non-blocking post-SEARCH_READY hook
+                        await session.rollback()
+                        log.warning(
+                            "Post-SEARCH_READY conflict hook degraded doc=%s version=%s degraded=True: %s",
+                            document.id,
+                            doc_ver.id,
+                            sanitize_error_message(conflict_hook_err),
+                        )
             except ParsePaused:
                 await _pause_or_yield()
             except (JobPaused, JobYielded):
@@ -1111,6 +1165,18 @@ async def _delete_document_task_unlocked(
     job.payload = {**(job.payload or {}), "target_document_id": document.id}
     job.document_id = None
     await session.flush()
+    from sqlalchemy import or_ as sa_or
+
+    from sag_api.db.models.conflict_resolution import KnowledgeConflictResolution
+
+    await session.execute(
+        delete(KnowledgeConflictResolution).where(
+            sa_or(
+                KnowledgeConflictResolution.winner_document_id == document.id,
+                KnowledgeConflictResolution.loser_document_id == document.id,
+            )
+        )
+    )
     await session.delete(document)
     await session.flush()
     remaining_path_refs = 0
@@ -1248,6 +1314,21 @@ async def _reprocess_document_task_unlocked(
         {value.strip() for value in payload.get("derived_source_ids", []) if isinstance(value, str) and value.strip()}
     )
     if not payload.get("cleanup_completed"):
+        stale_conflict_jobs = list(
+            (
+                await session.scalars(
+                    select(Job).where(
+                        Job.document_id == document.id,
+                        Job.type == JobType.CONFLICT_RESOLUTION,
+                        Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]),
+                    )
+                )
+            ).all()
+        )
+        for stale_cjob in stale_conflict_jobs:
+            stale_cjob.payload = {**(stale_cjob.payload or {}), "pause_requested": True}
+            if stale_cjob.status == JobStatus.QUEUED:
+                stale_cjob.status = JobStatus.PAUSED
         await _cleanup_legacy_engine_document_data(
             engine_manager,
             source,
@@ -1848,6 +1929,58 @@ async def reconcile_search_index(
     await session.commit()
 
 
+async def resolve_document_conflicts(
+    session: AsyncSession,
+    job: Job,
+    *,
+    engine_manager: EngineManager | None = None,
+    job_queue=None,
+    qdrant_client: Any | None = None,
+    llm_client: Any | None = None,
+) -> None:
+    """Async Stage 2A/2B cross-document conflict detection worker (isolated from ingestion readiness)."""
+    from sag_api.generation.llm import LLMClient
+    from sag_api.services.knowledge_conflict_service import resolve_document_conflicts_service
+
+    job_id = str(job.id)
+    payload = dict(job.payload or {})
+    timeout = _reconcile_qdrant_timeout()
+    resolved_qdrant: Any = qdrant_client
+    should_close_qdrant = False
+    if resolved_qdrant is None:
+        if engine_manager is not None and hasattr(engine_manager, "get_search_unit_qdrant_client"):
+            base_client = await engine_manager.get_search_unit_qdrant_client()
+            if base_client is not None:
+                resolved_qdrant = _TimeoutBoundQdrantClient(base_client, timeout)
+        elif settings.sag_vector_provider == "qdrant":
+            q_headers = {"api-key": settings.sag_qdrant_api_key} if settings.sag_qdrant_api_key else {}
+            resolved_qdrant = httpx.AsyncClient(
+                base_url=settings.sag_qdrant_url.rstrip("/"),
+                headers=q_headers,
+                timeout=timeout,
+            )
+            should_close_qdrant = True
+
+    resolved_llm = llm_client if llm_client is not None else LLMClient(settings)
+
+    try:
+        result = await resolve_document_conflicts_service(
+            session,
+            job=job,
+            qdrant_client=resolved_qdrant,
+            llm=resolved_llm,
+            lease_session_factory=SessionLocal,
+        )
+    finally:
+        if should_close_qdrant and resolved_qdrant is not None:
+            await resolved_qdrant.aclose()
+
+    refreshed_job = await session.get(Job, job_id, populate_existing=True) or job
+    refreshed_job.progress = 1.0
+    refreshed_job.payload = {**payload, **result.to_payload_dict()}
+    await session.commit()
+
+
 TASK_HANDLERS: dict[JobType, TaskHandler] = {
     JobType.PROCESS_DOCUMENT: process_document,
     JobType.REPROCESS_DOCUMENT: reprocess_document_task,
@@ -1856,6 +1989,7 @@ TASK_HANDLERS: dict[JobType, TaskHandler] = {
     JobType.INDEX_UNIVERSE: index_universe,
     JobType.REBUILD_UNIVERSE_TREE: rebuild_universe_tree,
     JobType.RECONCILE_SEARCH_INDEX: reconcile_search_index,
+    JobType.CONFLICT_RESOLUTION: resolve_document_conflicts,
     JobType.OCTX_PREFLIGHT: preflight_octx,
     JobType.OCTX_IMPORT: import_octx,
     JobType.OCTX_EXPORT: export_octx,

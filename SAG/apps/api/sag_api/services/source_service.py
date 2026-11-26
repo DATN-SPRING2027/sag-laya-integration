@@ -487,6 +487,7 @@ async def delete_source(
     doc_rows = (
         await session.execute(
             select(
+                Document.id,
                 Document.project_id,
                 DocumentVersion.id,
                 Document.sag_source_id,
@@ -496,6 +497,8 @@ async def delete_source(
         )
     ).all()
 
+    doc_ids: list[str] = []
+    seen_docs: set[str] = set()
     version_ids: list[str] = []
     seen_versions: set[str] = set()
     project_ids: list[str] = []
@@ -509,7 +512,10 @@ async def delete_source(
                 seen_projects.add(clean)
                 project_ids.append(clean)
 
-    for doc_pid, ver_id, doc_sag_id in doc_rows:
+    for doc_id, doc_pid, ver_id, doc_sag_id in doc_rows:
+        if isinstance(doc_id, str) and doc_id and doc_id not in seen_docs:
+            seen_docs.add(doc_id)
+            doc_ids.append(doc_id)
         _add_project(doc_pid)
         if isinstance(ver_id, str) and ver_id and ver_id not in seen_versions:
             seen_versions.add(ver_id)
@@ -584,6 +590,17 @@ async def delete_source(
             AgentBinding.target_id == source.id,
         )
     )
+    if doc_ids:
+        from sag_api.db.models.conflict_resolution import KnowledgeConflictResolution
+
+        await session.execute(
+            delete(KnowledgeConflictResolution).where(
+                or_(
+                    KnowledgeConflictResolution.winner_document_id.in_(doc_ids),
+                    KnowledgeConflictResolution.loser_document_id.in_(doc_ids),
+                )
+            )
+        )
     await session.delete(source)
     tree_jobs = []
     if job_queue is not None:

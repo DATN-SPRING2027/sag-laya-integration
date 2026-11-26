@@ -1051,6 +1051,17 @@ async def delete_document(
             )
         ).all()
     )
+    active_conflict_jobs = list(
+        (
+            await session.scalars(
+                select(Job).where(
+                    Job.document_id == document.id,
+                    Job.type == JobType.CONFLICT_RESOLUTION,
+                    Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]),
+                )
+            )
+        ).all()
+    )
 
     # A document whose processor has never started cannot have written any
     # engine-side records. Delete it inside this request so it is never held up
@@ -1157,6 +1168,23 @@ async def delete_document(
             finished_at=completed_at,
         )
         session.add(completed)
+        for cjob in active_conflict_jobs:
+            cjob.payload = {**(cjob.payload or {}), "pause_requested": True}
+            if cjob.status == JobStatus.QUEUED:
+                cjob.status = JobStatus.PAUSED
+        from sqlalchemy import delete as sa_delete
+        from sqlalchemy import or_ as sa_or
+
+        from sag_api.db.models.conflict_resolution import KnowledgeConflictResolution
+
+        await session.execute(
+            sa_delete(KnowledgeConflictResolution).where(
+                sa_or(
+                    KnowledgeConflictResolution.winner_document_id == target_document_id,
+                    KnowledgeConflictResolution.loser_document_id == target_document_id,
+                )
+            )
+        )
         await session.delete(document)
         await session.flush()
         remaining_path_refs = 0
@@ -1219,7 +1247,7 @@ async def delete_document(
             return existing
         await session.refresh(document)
 
-    for job in active_jobs:
+    for job in [*active_jobs, *active_conflict_jobs]:
         job.payload = {**(job.payload or {}), "pause_requested": True}
         if job.status == JobStatus.QUEUED:
             job.status = JobStatus.PAUSED
@@ -1525,6 +1553,7 @@ async def handle_document_upload(
     duplicate_sync_doc: Document | None = None
     duplicate_sync_ver: DocumentVersion | None = None
     duplicate_versions_to_sync: list[dict[str, Any]] = []
+    duplicate_conflict_job_id: str | None = None
     for attempt in range(max_retries):
         try:
             async with session.begin_nested():
@@ -1654,6 +1683,40 @@ async def handle_document_upload(
 
                             if doc.source_id:
                                 await touch_source_revision(session, doc.source_id)
+                            if is_ready:
+                                from sag_api.services.knowledge_conflict_service import (
+                                    enqueue_conflict_resolution_job,
+                                    has_active_cross_document_peer,
+                                    reevaluate_resolutions_after_metadata_update,
+                                )
+
+                                dup_reeval = await reevaluate_resolutions_after_metadata_update(
+                                    session,
+                                    updated_version=latest_ver,
+                                    temporal_changed=(eff_changed or pub_changed),
+                                    authority_changed=tier_changed,
+                                )
+                                if settings.conflict_resolution_job_enabled and (
+                                    dup_reeval["needs_revalidation"] > 0
+                                    or await has_active_cross_document_peer(
+                                        session,
+                                        tenant_id=tenant_id,
+                                        project_id=project_id,
+                                        security_partition_id=security_partition_id,
+                                        exclude_document_id=doc.id,
+                                    )
+                                ):
+                                    dup_cjob = await enqueue_conflict_resolution_job(
+                                        session,
+                                        tenant_id=tenant_id,
+                                        project_id=project_id,
+                                        source_id=doc.source_id,
+                                        document_id=doc.id,
+                                        document_version_id=latest_ver.id,
+                                        security_partition_id=security_partition_id,
+                                        reason="metadata_updated",
+                                    )
+                                    duplicate_conflict_job_id = dup_cjob.id if dup_cjob is not None else None
                             duplicate_metadata_updated = True
                             duplicate_sync_doc = doc
                             duplicate_sync_ver = latest_ver
@@ -1897,6 +1960,15 @@ async def handle_document_upload(
                     engine_manager=engine_manager,
                     job_queue=job_queue,
                 )
+            if duplicate_conflict_job_id and job_queue is not None:
+                try:
+                    await _enqueue_persisted_job(job_queue, duplicate_conflict_job_id)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "Failed to enqueue conflict job %s after duplicate upload metadata update: %s",
+                        duplicate_conflict_job_id,
+                        sanitize_error_message(exc),
+                    )
         return duplicate_response
 
     # Durable enqueue after transaction commit
@@ -2660,7 +2732,13 @@ async def revoke_project_document(
             await session.scalars(
                 select(Job).where(
                     Job.document_id == doc.id,
-                    Job.type.in_([JobType.PROCESS_DOCUMENT, JobType.REPROCESS_DOCUMENT]),
+                    Job.type.in_(
+                        [
+                            JobType.PROCESS_DOCUMENT,
+                            JobType.REPROCESS_DOCUMENT,
+                            JobType.CONFLICT_RESOLUTION,
+                        ]
+                    ),
                     Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]),
                 )
             )
@@ -2692,6 +2770,14 @@ async def revoke_project_document(
             meta["revoke_reason"] = reason
         ver.metadata_json = meta
 
+    from sag_api.services.knowledge_conflict_service import handle_document_revoked_conflicts
+
+    await handle_document_revoked_conflicts(
+        session,
+        document_id=doc.id,
+        reason=reason,
+    )
+
     if doc.source_id:
         source = await session.get(Source, doc.source_id)
         if source is not None:
@@ -2714,6 +2800,7 @@ class PreparedMetadataPatchSync:
     target_ver: DocumentVersion
     versions_to_sync: list[dict[str, Any]]
     temporal_recomputed: bool
+    conflict_job_id: str | None = None
 
 
 async def commit_document_version_metadata_patch(
@@ -2829,6 +2916,10 @@ async def commit_document_version_metadata_patch(
     if not doc.is_active:
         raise NotFoundError(f"Document '{document_id}' not found in project '{project_id}'")
 
+    old_authority_tier = target_ver.authority_tier
+    old_scope_tags = (
+        list(target_ver.scope_tags_json) if target_ver.scope_tags_json is not None else None
+    )
     old_effective_from = _as_utc_dt(target_ver.effective_from)
     old_valid_from = _as_utc_dt(target_ver.valid_from)
     old_valid_to = _as_utc_dt(target_ver.valid_to)
@@ -2843,10 +2934,17 @@ async def commit_document_version_metadata_patch(
     session.add(target_ver)
 
     is_search_ready = target_ver.search_status in ("SEARCH_READY", "READY")
+    authority_changed = (
+        "authority_tier" in fields_to_update and target_ver.authority_tier != old_authority_tier
+    )
     effective_from_changed = (
         "effective_from" in fields_to_update
         and _as_utc_dt(target_ver.effective_from) != old_effective_from
     )
+    new_scope_tags = (
+        list(target_ver.scope_tags_json) if target_ver.scope_tags_json is not None else None
+    )
+    scope_tags_changed = "scope_tags" in fields_to_update and new_scope_tags != old_scope_tags
 
     temporal_recomputed = False
     versions_to_sync: list[dict[str, Any]] = []
@@ -2865,6 +2963,42 @@ async def commit_document_version_metadata_patch(
 
         versions_to_sync = build_mutated_version_entries([target_ver])
 
+    conflict_job_id: str | None = None
+    if is_search_ready and (authority_changed or effective_from_changed or scope_tags_changed):
+        from sag_api.services.knowledge_conflict_service import (
+            enqueue_conflict_resolution_job,
+            has_active_cross_document_peer,
+            reevaluate_resolutions_after_metadata_update,
+        )
+
+        reeval = await reevaluate_resolutions_after_metadata_update(
+            session,
+            updated_version=target_ver,
+            temporal_changed=effective_from_changed,
+            authority_changed=authority_changed,
+        )
+        if settings.conflict_resolution_job_enabled and (
+            reeval["needs_revalidation"] > 0
+            or await has_active_cross_document_peer(
+                session,
+                tenant_id=tenant_id,
+                project_id=project_id,
+                security_partition_id=sec_partition,
+                exclude_document_id=doc.id,
+            )
+        ):
+            conflict_job = await enqueue_conflict_resolution_job(
+                session,
+                tenant_id=tenant_id,
+                project_id=project_id,
+                source_id=doc.source_id,
+                document_id=doc.id,
+                document_version_id=target_ver.id,
+                security_partition_id=sec_partition,
+                reason="metadata_updated",
+            )
+            conflict_job_id = conflict_job.id if conflict_job is not None else None
+
     if doc.source_id:
         await touch_source_revision(session, doc.source_id)
 
@@ -2878,6 +3012,7 @@ async def commit_document_version_metadata_patch(
         target_ver=target_ver,
         versions_to_sync=versions_to_sync,
         temporal_recomputed=temporal_recomputed,
+        conflict_job_id=conflict_job_id,
     )
 
 
@@ -2904,6 +3039,15 @@ async def finalize_document_version_metadata_sync(
             job_queue=job_queue,
         )
     )
+    if prepared.conflict_job_id and job_queue is not None:
+        try:
+            await _enqueue_persisted_job(job_queue, prepared.conflict_job_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "Failed to enqueue conflict resolution job %s after metadata patch: %s",
+                prepared.conflict_job_id,
+                sanitize_error_message(exc),
+            )
 
     return DocumentMetadataPatchResponse(
         document_id=doc.id,
