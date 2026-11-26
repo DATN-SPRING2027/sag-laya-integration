@@ -73,6 +73,7 @@ _COMPLETE_CITATION_BRACKET_RE = re.compile(
     r"\[(\s*+[sS]?\d++(?:\s*+[,;、]\s*+[sS]?\d++)*+\s*+)\](?!\(\s*+(?:https?:|mailto:)|:\s*+(?:https?:|mailto:))"
 )
 _SPACE_BEFORE_PUNCT_RE = re.compile(r"(?<![ \t])[ \t]++([，。！？；：,.!?;:])")
+_COLLAPSE_INLINE_SPACE_RE = re.compile(r"[ \t]{2,}+")
 
 
 def _is_zero_math_bracket(inner: str) -> bool:
@@ -214,6 +215,62 @@ def _split_unbuffered_citation_tail(text: str) -> tuple[str, str]:
     return flushed, pending
 
 
+def _resolve_turn_eof_pending(
+    pending: str,
+    *,
+    at_line_start: bool,
+    code_fence: str | None,
+) -> str:
+    """Resolve a held tail at turn EOF without leaking unverified prose citations or dropping code."""
+    if not pending:
+        return ""
+    segments, _, _ = _prose_segments(
+        pending,
+        at_line_start=at_line_start,
+        code_fence=code_fence,
+        hold_incomplete=False,
+    )
+    if not segments:
+        return pending
+    out: list[str] = []
+    cursor = 0
+    stripped_any = False
+
+    def _strip_unverified(match: re.Match[str]) -> str:
+        nonlocal stripped_any
+        if _is_zero_math_bracket(match.group(1)):
+            return match.group(0)
+        stripped_any = True
+        return ""
+
+    for seg_start, seg_end in segments:
+        if seg_start > cursor:
+            out.append(pending[cursor:seg_start])
+        seg_stripped = False
+
+        def _strip_seg(match: re.Match[str]) -> str:
+            nonlocal seg_stripped
+            res = _strip_unverified(match)
+            if res == "":
+                seg_stripped = True
+            return res
+
+        cleaned = _COMPLETE_CITATION_BRACKET_RE.sub(_strip_seg, pending[seg_start:seg_end])
+        if seg_stripped:
+            cleaned = _COLLAPSE_INLINE_SPACE_RE.sub(" ", cleaned)
+            cleaned = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", cleaned)
+        out.append(cleaned)
+        cursor = seg_end
+    if cursor < len(pending):
+        out.append(pending[cursor:])
+    resolved = "".join(out)
+    if stripped_any:
+        resolved = resolved.rstrip(" \t")
+        if not resolved.strip():
+            return ""
+    return resolved
+
+
 def _compute_unstreamed_suffix(
     streamed: str,
     canonical: str,
@@ -231,7 +288,7 @@ def _compute_unstreamed_suffix(
     if norm_streamed and canonical.startswith(norm_streamed):
         return canonical[len(norm_streamed) :]
     if not post_tool_turn:
-        norm_trimmed = norm_streamed.rstrip(" \t\r\n")
+        norm_trimmed = norm_streamed.rstrip()
         if norm_trimmed and canonical.startswith(norm_trimmed):
             tail = canonical[len(norm_trimmed) :]
             if not tail or not tail[0].isalnum():
@@ -331,12 +388,25 @@ async def chat_completions(
             def _rotate_streamed_turn() -> str | None:
                 nonlocal pending_bracket, streamed_before_tool, need_turn_separator
                 nonlocal stream_at_line_start, stream_code_fence
-                flushed_ws: str | None = None
+                flushed_eof: str | None = None
                 if not should_buffer:
-                    if pending_bracket and pending_bracket.isspace() and streamed_parts:
-                        streamed_parts.append(pending_bracket)
-                        flushed_ws = pending_bracket
+                    if pending_bracket:
+                        if pending_bracket.isspace():
+                            eof_tail = pending_bracket if streamed_parts else ""
+                        else:
+                            eof_tail = _resolve_turn_eof_pending(
+                                pending_bracket,
+                                at_line_start=stream_at_line_start,
+                                code_fence=stream_code_fence,
+                            )
                         pending_bracket = ""
+                        if eof_tail:
+                            streamed_parts.append(eof_tail)
+                            if need_turn_separator:
+                                need_turn_separator = False
+                                flushed_eof = eof_tail if eof_tail[0].isspace() else f"\n\n{eof_tail}"
+                            else:
+                                flushed_eof = eof_tail
                     if streamed_parts:
                         streamed_before_tool = True
                         need_turn_separator = not streamed_parts[-1][-1].isspace()
@@ -344,7 +414,7 @@ async def chat_completions(
                         streamed_parts.clear()
                     stream_at_line_start = True
                     stream_code_fence = None
-                return flushed_ws
+                return flushed_eof
 
             def chunk(delta: dict, finish: str | None = None, *, sag_meta: dict | None = None) -> str:
                 payload: dict = {
@@ -371,28 +441,20 @@ async def chat_completions(
                             buffered_parts.append(pending_bracket)
                             pending_bracket = ""
                 elif event.type == EventType.TURN_STARTED.value:
-                    if not should_buffer and streamed_parts:
-                        flushed_ws = _rotate_streamed_turn()
-                        if flushed_ws:
-                            yield chunk({"content": flushed_ws})
-                        pending_bracket = ""
+                    if not should_buffer and (streamed_parts or pending_bracket):
+                        flushed_eof = _rotate_streamed_turn()
+                        if flushed_eof:
+                            yield chunk({"content": flushed_eof})
                 elif event.type == EventType.TOOL_STARTED.value:
-                    flushed_ws = _rotate_streamed_turn()
-                    if flushed_ws:
-                        yield chunk({"content": flushed_ws})
+                    flushed_eof = _rotate_streamed_turn()
+                    if flushed_eof:
+                        yield chunk({"content": flushed_eof})
                     if payload.get("name") in {"search_context", "get_entity"}:
                         should_buffer = True
-                        if pending_bracket:
-                            buffered_parts.append(pending_bracket)
-                            pending_bracket = ""
-                    else:
-                        pending_bracket = ""
                 elif event.type == EventType.TOOL_FAILED.value:
-                    flushed_ws = _rotate_streamed_turn()
-                    if flushed_ws:
-                        yield chunk({"content": flushed_ws})
-                    if not should_buffer:
-                        pending_bracket = ""
+                    flushed_eof = _rotate_streamed_turn()
+                    if flushed_eof:
+                        yield chunk({"content": flushed_eof})
                 elif event.type == EventType.MESSAGE_DELTA.value:
                     delta = str(payload.get("delta") or "")
                     if not delta:

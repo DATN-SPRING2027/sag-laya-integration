@@ -1979,6 +1979,156 @@ async def test_p6_rework_19_single_pass_sse_state_closing_bt_eof_and_unterminate
         assert await _run_deltas(list(raw_r4), canon_r4) == canon_r4
 
 
+# ---------------------------------------------------------------------------
+# Item 20 (CHAL-R8-1 & CHAL-R8-2): Flush held inline code / closing fence at
+# turn rotation without leaking citations, and handle trailing Unicode whitespace
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_p6_rework_20_turn_rotation_eof_code_flush_and_unicode_whitespace(monkeypatch) -> None:
+    agent = SimpleNamespace(id="agent-r8", name="R8Bot", persona={"web_enabled": True})
+    monkeypatch.setattr(openai_api.svc, "get_agent", AsyncMock(return_value=agent))
+    monkeypatch.setattr(openai_api.svc, "resolve_sources", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        openai_api.svc,
+        "build_ask_context",
+        lambda **kw: SimpleNamespace(
+            source_ids=[],
+            citations=[],
+            session_citations=[],
+            route_decision={"coarse_intent": "CHAT", "degraded": False},
+        ),
+    )
+
+    async def _run_events(events: list[SimpleNamespace]) -> str:
+        async def fake_stream(*args, **kwargs):
+            for ev in events:
+                yield ev
+
+        monkeypatch.setattr(openai_api.agent_service, "generate_stream", fake_stream)
+        body = openai_api.ChatCompletionRequest(
+            messages=[openai_api.ChatMessage(role="user", content="check")],
+            stream=True,
+        )
+        resp = await openai_api.chat_completions(
+            agent_id="agent-r8",
+            body=body,
+            _user=SimpleNamespace(id="u-1", name="Tester"),
+            owner_key="owner-1",
+            principal=SimpleNamespace(tenant_id="t-1", organization_id="o-1", user_id="u-1"),
+            session=SimpleNamespace(),
+            engine_manager=SimpleNamespace(),
+            llm=SimpleNamespace(configured=True),
+            tool_registry=SimpleNamespace(),
+            agent_runtime=SimpleNamespace(),
+        )
+        out_chunks: list[str] = []
+        async for raw in resp.body_iterator:
+            text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+            for line in text.splitlines():
+                if not line.startswith("data: ") or line == "data: [DONE]":
+                    continue
+                payload = json.loads(line[len("data: ") :])
+                delta = (payload.get("choices") or [{}])[0].get("delta") or {}
+                if delta.get("content"):
+                    out_chunks.append(delta["content"])
+        return "".join(out_chunks)
+
+    # CHAL-R8-1A: Turn 1 ending in inline code before non-knowledge tool (web_search)
+    out_ws = await _run_events(
+        [
+            SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}}),
+            SimpleNamespace(
+                type=EventType.MESSAGE_DELTA.value,
+                data={"payload": {"delta": "Let me inspect `config.yaml`"}},
+            ),
+            SimpleNamespace(type=EventType.TOOL_STARTED.value, data={"payload": {"name": "web_search"}}),
+            SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": "Done."}}),
+            SimpleNamespace(
+                type=EventType.RUN_COMPLETED.value,
+                data={"payload": {"output": "Done.", "citations": [], "degraded": False}},
+            ),
+        ]
+    )
+    assert out_ws == "Let me inspect `config.yaml`\n\nDone."
+
+    # CHAL-R8-1B: Turn 1 ending in inline code before knowledge tool (search_context)
+    out_sc = await _run_events(
+        [
+            SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}}),
+            SimpleNamespace(
+                type=EventType.MESSAGE_DELTA.value,
+                data={"payload": {"delta": "Let me inspect `config.yaml`"}},
+            ),
+            SimpleNamespace(type=EventType.TOOL_STARTED.value, data={"payload": {"name": "search_context"}}),
+            SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": "Found setting X."}}),
+            SimpleNamespace(
+                type=EventType.RUN_COMPLETED.value,
+                data={"payload": {"output": "Found setting X.", "citations": [], "degraded": False}},
+            ),
+        ]
+    )
+    assert out_sc == "Let me inspect `config.yaml`\n\nFound setting X."
+
+    # CHAL-R8-1C: Turn 1 with ONLY inline code (streamed_parts empty) + Turn 1 held [99] before tool
+    out_only_code = await _run_events(
+        [
+            SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}}),
+            SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": "`config.yaml`"}}),
+            SimpleNamespace(type=EventType.TURN_STARTED.value, data={"payload": {}}),
+            SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": "Done."}}),
+            SimpleNamespace(
+                type=EventType.RUN_COMPLETED.value,
+                data={"payload": {"output": "Done.", "citations": [], "degraded": False}},
+            ),
+        ]
+    )
+    assert out_only_code == "`config.yaml`\n\nDone."
+
+    out_cit_before_tool = await _run_events(
+        [
+            SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}}),
+            SimpleNamespace(
+                type=EventType.MESSAGE_DELTA.value,
+                data={"payload": {"delta": "Checking [99] and `config.yaml`"}},
+            ),
+            SimpleNamespace(type=EventType.TOOL_STARTED.value, data={"payload": {"name": "web_search"}}),
+            SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": "Done."}}),
+            SimpleNamespace(
+                type=EventType.RUN_COMPLETED.value,
+                data={"payload": {"output": "Done.", "citations": [], "degraded": False}},
+            ),
+        ]
+    )
+    assert "[99]" not in out_cit_before_tool
+    assert out_cit_before_tool == "Checking and `config.yaml`\n\nDone."
+
+    # CHAL-R8-2: Trailing Unicode whitespace (\u3000, \u00a0, \u2003) must NOT duplicate response 2x
+    for raw_u, expected_u in [
+        ("根据文档，系统支持双因素认证。\u3000", "根据文档，系统支持双因素认证。\u3000"),
+        ("The system supports MFA.\u00a0", "The system supports MFA.\u00a0"),
+        ("The system supports MFA.\u2003", "The system supports MFA.\u2003"),
+        ("The system supports MFA\u00a0[99]", "The system supports MFA\u00a0"),
+    ]:
+        canon_u, _ = agent_service._finalize_answer_citations(raw_u, [])
+        out_u = await _run_events(
+            [
+                SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}}),
+                *[
+                    SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": ch}})
+                    for ch in raw_u
+                ],
+                SimpleNamespace(
+                    type=EventType.RUN_COMPLETED.value,
+                    data={"payload": {"output": canon_u, "citations": [], "degraded": False}},
+                ),
+            ]
+        )
+        assert out_u == expected_u
+        assert out_u.count(canon_u) == 1
+
+
 
 
 
