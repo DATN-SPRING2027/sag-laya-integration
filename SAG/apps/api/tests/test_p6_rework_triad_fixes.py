@@ -2602,6 +2602,173 @@ async def test_p6_rework_23_ws_prefix_opening_fence_citation_clusters_and_2turn_
     assert out_2t_case_c == "Step 1.\n\nLet me check. Final."
 
 
+# ---------------------------------------------------------------------------
+# Item 24 (CHAL-R12-1 & CHAL-R12-2): Preserve inter-citation separating space
+# inside merged clusters when surrounded by non-ws tokens, and match normalized
+# 2-turn/3-turn Case C prefixes via _match_post_tool_turn_suffix
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_p6_rework_24_cluster_inner_ws_preservation_and_normalized_multiturn_case_c(
+    monkeypatch,
+) -> None:
+    agent = SimpleNamespace(id="agent-r12", name="R12Bot", persona={"web_enabled": True})
+    monkeypatch.setattr(openai_api.svc, "get_agent", AsyncMock(return_value=agent))
+    monkeypatch.setattr(openai_api.svc, "resolve_sources", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        openai_api.svc,
+        "build_ask_context",
+        lambda **kw: SimpleNamespace(
+            source_ids=[],
+            citations=[],
+            session_citations=[],
+            route_decision={"coarse_intent": "CHAT", "degraded": False},
+        ),
+    )
+
+    async def _run_events(events: list[SimpleNamespace]) -> str:
+        async def fake_stream(*args, **kwargs):
+            for ev in events:
+                yield ev
+
+        monkeypatch.setattr(openai_api.agent_service, "generate_stream", fake_stream)
+        body = openai_api.ChatCompletionRequest(
+            messages=[openai_api.ChatMessage(role="user", content="check")],
+            stream=True,
+        )
+        resp = await openai_api.chat_completions(
+            agent_id="agent-r12",
+            body=body,
+            _user=SimpleNamespace(id="u-1", name="Tester"),
+            owner_key="owner-1",
+            principal=SimpleNamespace(tenant_id="t-1", organization_id="o-1", user_id="u-1"),
+            session=SimpleNamespace(),
+            engine_manager=SimpleNamespace(),
+            llm=SimpleNamespace(configured=True),
+            tool_registry=SimpleNamespace(),
+            agent_runtime=SimpleNamespace(),
+        )
+        out_chunks: list[str] = []
+        async for raw in resp.body_iterator:
+            text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+            for line in text.splitlines():
+                if not line.startswith("data: ") or line == "data: [DONE]":
+                    continue
+                payload = json.loads(line[len("data: ") :])
+                delta = (payload.get("choices") or [{}])[0].get("delta") or {}
+                if delta.get("content"):
+                    out_chunks.append(delta["content"])
+        return "".join(out_chunks)
+
+    # CHAL-R12-1A: Cluster with inter-citation space between non-ws tokens keeps separating space
+    for raw_c, expected_c in [
+        ("First sentence.[99] [88]Second sentence.", "First sentence. Second sentence."),
+        ("Use[99] [88]`config.yaml`", "Use `config.yaml`"),
+        ("Range[99] [88][0, 1]", "Range [0, 1]"),
+        ("See[99] [88][1](https://example.com).", "See [1](https://example.com)."),
+        ("A[99] [88]B", "A B"),
+        ("A[99]\t[88]B", "A\tB"),
+        ("A[99] [S99]B", "A B"),
+        ("A[99] [88][77]B", "A B"),
+    ]:
+        for chunks in ([raw_c], list(raw_c)):
+            out_c = await _run_events(
+                [
+                    SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}}),
+                    *[
+                        SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": c}})
+                        for c in chunks
+                    ],
+                    SimpleNamespace(type=EventType.TOOL_STARTED.value, data={"payload": {"name": "web_search"}}),
+                    SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": "Done."}}),
+                    SimpleNamespace(
+                        type=EventType.RUN_COMPLETED.value,
+                        data={"payload": {"output": "Done.", "citations": [], "degraded": False}},
+                    ),
+                ]
+            )
+            assert out_c == f"{expected_c}\n\nDone."
+
+    # CHAL-R12-1B: 1-turn & 2-turn TOOL_FAILED must NOT duplicate answer after inner_ws cluster
+    out_tf1 = await _run_events(
+        [
+            SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}}),
+            SimpleNamespace(
+                type=EventType.MESSAGE_DELTA.value,
+                data={"payload": {"delta": "First sentence.[99] [88]Second sentence."}},
+            ),
+            SimpleNamespace(type=EventType.TOOL_FAILED.value, data={"payload": {"name": "web_search"}}),
+            SimpleNamespace(
+                type=EventType.RUN_COMPLETED.value,
+                data={"payload": {"output": "First sentence. Second sentence.", "citations": [], "degraded": False}},
+            ),
+        ]
+    )
+    assert out_tf1 == "First sentence. Second sentence."
+
+    out_tf2 = await _run_events(
+        [
+            SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}}),
+            SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": "Step 1."}}),
+            SimpleNamespace(type=EventType.TOOL_STARTED.value, data={"payload": {"name": "web_search"}}),
+            SimpleNamespace(
+                type=EventType.MESSAGE_DELTA.value,
+                data={"payload": {"delta": "Use[99] [88]`config.yaml`"}},
+            ),
+            SimpleNamespace(type=EventType.TOOL_FAILED.value, data={"payload": {"name": "get_time"}}),
+            SimpleNamespace(
+                type=EventType.RUN_COMPLETED.value,
+                data={"payload": {"output": "Use `config.yaml`", "citations": [], "degraded": False}},
+            ),
+        ]
+    )
+    assert out_tf2 == "Step 1.\n\nUse `config.yaml`"
+
+    # CHAL-R12-2: Normalized 2-turn / 3-turn Case C prefix extensions must NOT duplicate Turn 2
+    for t2_delta, canonical_out, expected_full in [
+        (" Let me check. ", "Let me check. Final.", "Step 1.\n\n Let me check. Final."),
+        ("\nLet me check. ", "Let me check. Final.", "Step 1.\nLet me check. Final."),
+        ("\u3000Let me check. ", "Let me check. Final.", "Step 1.\n\n\u3000Let me check. Final."),
+        ("\u00a0Let me check. ", "Let me check. Final.", "Step 1.\n\n\u00a0Let me check. Final."),
+        ("Let me check . ", "Let me check. Final.", "Step 1.\n\nLet me check . Final."),
+        ("Checking : ", "Checking: Final.", "Step 1.\n\nChecking : Final."),
+        ("正在查询 。", "正在查询。完成。", "Step 1.\n\n正在查询 。完成。"),
+    ]:
+        out_nc = await _run_events(
+            [
+                SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}}),
+                SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": "Step 1."}}),
+                SimpleNamespace(type=EventType.TOOL_STARTED.value, data={"payload": {"name": "web_search"}}),
+                SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": t2_delta}}),
+                SimpleNamespace(type=EventType.TOOL_STARTED.value, data={"payload": {"name": "search_context"}}),
+                SimpleNamespace(
+                    type=EventType.RUN_COMPLETED.value,
+                    data={"payload": {"output": canonical_out, "citations": [], "degraded": False}},
+                ),
+            ]
+        )
+        assert out_nc == expected_full
+
+    # Fenced code extension after ws + stripped citation
+    out_fence_ext = await _run_events(
+        [
+            SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}}),
+            SimpleNamespace(
+                type=EventType.MESSAGE_DELTA.value,
+                data={"payload": {"delta": "\u3000[99]\n```py\nreturn xs[88]\n```"}},
+            ),
+            SimpleNamespace(type=EventType.TOOL_STARTED.value, data={"payload": {"name": "search_context"}}),
+            SimpleNamespace(
+                type=EventType.RUN_COMPLETED.value,
+                data={"payload": {"output": "```py\nreturn xs[88]\n```\nDone.", "citations": [], "degraded": False}},
+            ),
+        ]
+    )
+    assert out_fence_ext.count("return xs[88]") == 1
+    assert out_fence_ext.endswith("\nDone.")
+
+
 
 
 

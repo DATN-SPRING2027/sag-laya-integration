@@ -234,6 +234,7 @@ def _resolve_turn_eof_pending(
     at_line_start: bool,
     code_fence: str | None,
     has_prior_turn_text: bool = True,
+    prior_ends_non_ws: bool = False,
 ) -> str:
     """Resolve a held tail at turn EOF without leaking unverified prose citations or dropping code."""
     if not pending:
@@ -254,19 +255,22 @@ def _resolve_turn_eof_pending(
         if seg_start > cursor:
             out.append(pending[cursor:seg_start])
         seg = pending[seg_start:seg_end]
-        clusters: list[tuple[int, int]] = []
+        # Each cluster is (cluster_start, cluster_end, first_nonempty_inner_ws)
+        clusters: list[tuple[int, int, str]] = []
         for match in _COMPLETE_CITATION_BRACKET_RE.finditer(seg):
             if _is_zero_math_bracket(match.group(1)):
                 continue
             m_start, m_end = match.start(), match.end()
-            if clusters and not seg[clusters[-1][1] : m_start].strip(" \t"):
-                clusters[-1] = (clusters[-1][0], m_end)
-            else:
-                clusters.append((m_start, m_end))
+            if clusters:
+                gap = seg[clusters[-1][1] : m_start]
+                if not gap.strip(" \t"):
+                    clusters[-1] = (clusters[-1][0], m_end, clusters[-1][2] or gap)
+                    continue
+            clusters.append((m_start, m_end, ""))
 
         seg_parts: list[str] = []
         pos = 0
-        for c_start, c_end in clusters:
+        for c_start, c_end, inner_ws in clusters:
             stripped_any = True
             before = seg[pos:c_start]
             # Trim horizontal space at the deleted citation cluster ONLY when followed by whitespace,
@@ -283,7 +287,16 @@ def _resolve_turn_eof_pending(
             if not next_ch or next_ch in " \t\r\n" or next_ch in _PUNCT_CHARS:
                 seg_parts.append(before.rstrip(" \t"))
             else:
-                seg_parts.append(before)
+                has_preceding_non_ws = (
+                    (bool(before) and not before[-1].isspace())
+                    or (not before and pos > 0 and not seg[pos - 1].isspace())
+                    or (not before and pos == 0 and seg_start > 0 and not pending[seg_start - 1].isspace())
+                    or (not before and pos == 0 and seg_start == 0 and prior_ends_non_ws)
+                )
+                if inner_ws and has_preceding_non_ws:
+                    seg_parts.append(before + inner_ws)
+                else:
+                    seg_parts.append(before)
             pos = after_seg_idx
         seg_parts.append(seg[pos:])
         out.append("".join(seg_parts))
@@ -300,6 +313,20 @@ def _resolve_turn_eof_pending(
     return resolved
 
 
+def _match_post_tool_turn_suffix(streamed: str, canonical: str) -> str | None:
+    """Return unstreamed suffix if ``canonical`` extends or equals ``streamed``, else ``None``."""
+    if not streamed or not canonical:
+        return None
+    if canonical.startswith(streamed):
+        return canonical[len(streamed) :]
+    norm_streamed = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", streamed.lstrip())
+    if norm_streamed and canonical.startswith(norm_streamed):
+        return canonical[len(norm_streamed) :]
+    if norm_streamed.rstrip() == canonical:
+        return ""
+    return None
+
+
 def _compute_unstreamed_suffix(
     streamed: str,
     canonical: str,
@@ -311,15 +338,12 @@ def _compute_unstreamed_suffix(
         return ""
     if not streamed:
         return canonical
-    if canonical.startswith(streamed):
-        return canonical[len(streamed) :]
+    matched = _match_post_tool_turn_suffix(streamed, canonical)
+    if matched is not None:
+        return matched
     norm_streamed = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", streamed.lstrip())
-    if norm_streamed and canonical.startswith(norm_streamed):
-        return canonical[len(norm_streamed) :]
-    norm_trimmed = norm_streamed.rstrip()
-    if norm_trimmed == canonical:
-        return ""
     if not post_tool_turn:
+        norm_trimmed = norm_streamed.rstrip()
         if norm_trimmed and canonical.startswith(norm_trimmed):
             tail = canonical[len(norm_trimmed) :]
             if not tail or not tail[0].isalnum():
@@ -435,6 +459,7 @@ async def chat_completions(
                                 at_line_start=stream_at_line_start,
                                 code_fence=stream_code_fence,
                                 has_prior_turn_text=bool(streamed_parts),
+                                prior_ends_non_ws=bool(streamed_parts) and not streamed_parts[-1][-1].isspace(),
                             )
                         pending_bracket = ""
                         if eof_tail:
@@ -534,20 +559,11 @@ async def chat_completions(
                             canonical,
                             post_tool_turn=False,
                         )
-                    elif last_rotated_turn and (
-                        canonical.startswith(last_rotated_turn)
-                        or _compute_unstreamed_suffix(
-                            last_rotated_turn,
-                            canonical,
-                            post_tool_turn=True,
-                        )
-                        == ""
+                    elif (
+                        last_rotated_turn
+                        and (matched_last := _match_post_tool_turn_suffix(last_rotated_turn, canonical)) is not None
                     ):
-                        suffix = _compute_unstreamed_suffix(
-                            last_rotated_turn,
-                            canonical,
-                            post_tool_turn=True,
-                        )
+                        suffix = matched_last
                     else:
                         suffix = _compute_unstreamed_suffix(
                             all_streamed,
