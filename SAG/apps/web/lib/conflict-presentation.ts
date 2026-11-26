@@ -1,5 +1,6 @@
 import { parseUtcDate } from "@/lib/format";
 import type {
+  ConflictAuditEntry,
   ConflictResolutionStatus,
   ConflictSide,
   ConflictSubtype,
@@ -217,4 +218,16 @@ export function compareAuthorityPrecedence(
   if (tierB.tier < tierA.tier) return "b_higher";
   if (tierA.tier < tierB.tier) return "a_higher";
   return "equal";
+}
+
+export function auditEntryTimestamp(
+  entry: Pick<ConflictAuditEntry, "at" | "timestamp">,
+): string | null {
+  for (const candidate of [entry.at, entry.timestamp]) {
+    if (typeof candidate === "string") {
+      const trimmed = candidate.trim();
+      if (trimmed) return trimmed;
+    }
+  }
+  return null;
 }

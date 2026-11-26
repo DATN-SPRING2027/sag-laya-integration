@@ -137,10 +137,16 @@ export function KnowledgeWorkspace({
   const [view, setView] = React.useState<View>("grid");
   const [creating, setCreating] = React.useState(false);
   const [pendingConflicts, setPendingConflicts] = React.useState(0);
+  const [conflictRefreshNonce, setConflictRefreshNonce] = React.useState(0);
   const [selectedSource, setSelectedSource] = React.useState<{
     id: string;
     initialScreen: "documents" | "add";
   } | null>(null);
+
+  const handleWorkspaceRefresh = React.useCallback(async () => {
+    setConflictRefreshNonce((n) => n + 1);
+    await refresh();
+  }, [refresh]);
 
   const importFileRef = React.useRef<HTMLInputElement | null>(null);
   const octxImport = useOctxImports();
@@ -169,24 +175,24 @@ export function KnowledgeWorkspace({
 
   React.useEffect(() => {
     if (!active) return;
-    let cancelled = false;
+    const controller = new AbortController();
     void api
       .listConflicts(
         { status: ["PENDING_REVIEW", "NEEDS_REVALIDATION"], limit: 1 },
-        { redirectOnUnauthorized: false },
+        { redirectOnUnauthorized: false, signal: controller.signal },
       )
       .then((res) => {
-        if (!cancelled) {
+        if (!controller.signal.aborted) {
           setPendingConflicts(Number.isFinite(res.total) ? Math.max(0, res.total) : 0);
         }
       })
       .catch(() => {
-        if (!cancelled) setPendingConflicts(0);
+        if (!controller.signal.aborted) setPendingConflicts(0);
       });
     return () => {
-      cancelled = true;
+      controller.abort();
     };
-  }, [active]);
+  }, [active, conflictRefreshNonce]);
 
   React.useEffect(() => {
     if (variant !== "normal") return;
@@ -213,7 +219,7 @@ export function KnowledgeWorkspace({
           initialScreen={selectedSource.initialScreen}
           active={active}
           onBack={() => setSelectedSource(null)}
-          onSourceChanged={refresh}
+          onSourceChanged={handleWorkspaceRefresh}
         />
       );
     }
@@ -268,7 +274,7 @@ export function KnowledgeWorkspace({
                 variant="ghost"
                 size="icon"
                 className="size-7"
-                onClick={() => void refresh()}
+                onClick={() => void handleWorkspaceRefresh()}
                 aria-label={t("refresh")}
                 title={t("refresh")}
               >
@@ -322,7 +328,7 @@ export function KnowledgeWorkspace({
               {error && (
                 <div className="mb-2 flex items-center justify-between gap-2 rounded-md bg-destructive/8 px-3 py-2 text-xs text-destructive">
                   <span className="truncate">{error}</span>
-                  <button type="button" onClick={() => void refresh()} className="font-medium">
+                  <button type="button" onClick={() => void handleWorkspaceRefresh()} className="font-medium">
                     {t("retry")}
                   </button>
                 </div>
@@ -452,7 +458,7 @@ export function KnowledgeWorkspace({
         {error && (
           <div className="mb-4 flex items-center justify-between gap-3 rounded-lg border border-destructive/20 bg-destructive/8 px-4 py-3 text-sm text-destructive">
             <span>{error}</span>
-            <Button variant="outline" size="sm" onClick={() => void refresh()}>
+            <Button variant="outline" size="sm" onClick={() => void handleWorkspaceRefresh()}>
               {t("retry")}
             </Button>
           </div>
@@ -473,7 +479,7 @@ export function KnowledgeWorkspace({
         ) : view === "grid" ? (
           <div className={cn(styles.sourceGrid, "animate-fade-in")}>
             {sources.map((source) => (
-              <SourceCard key={source.id} source={source} onChanged={refresh} />
+              <SourceCard key={source.id} source={source} onChanged={handleWorkspaceRefresh} />
             ))}
           </div>
         ) : (

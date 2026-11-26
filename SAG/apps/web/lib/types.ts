@@ -1141,7 +1141,7 @@ export interface ConflictSide {
   document_id: string;
   document_name: string;
   version_id: string;
-  version_no: number;
+  version_no: number | null;
   unit_id: string;
   section_path: string;
   page_from: number | null;
@@ -1155,10 +1155,11 @@ export interface ConflictSide {
 export interface ConflictAuditEntry {
   action: string;
   actor: string;
-  reason: string;
-  from_status: string | null;
+  reason?: string | null;
+  from_status?: string | null;
   to_status: string;
-  at: string;
+  at?: string | null;
+  timestamp?: string | null;
 }
 
 export interface ConflictItem {
@@ -1172,7 +1173,7 @@ export interface ConflictItem {
   status: ConflictResolutionStatus;
   resolution_mode: ConflictResolutionMode;
   confidence: number;
-  cosine_similarity: number;
+  cosine_similarity: number | null;
   effective_valid_to: string | null;
   scope_difference_summary: string | null;
   reason: string;

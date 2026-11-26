@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any, TypeVar
 
@@ -89,6 +90,27 @@ def _as_utc(value: datetime | None) -> datetime | None:
     if value is None:
         return None
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def _normalize_audit_history(entries: Sequence[Any] | None) -> list[dict[str, Any]]:
+    if not entries:
+        return []
+    normalized: list[dict[str, Any]] = []
+    for raw in entries:
+        if not isinstance(raw, dict):
+            continue
+        entry = dict(raw)
+        raw_at = entry.get("at")
+        if isinstance(raw_at, datetime):
+            entry["at"] = (_as_utc(raw_at) or raw_at).isoformat()
+        elif not (isinstance(raw_at, str) and raw_at.strip()):
+            raw_ts = entry.get("timestamp")
+            if isinstance(raw_ts, datetime):
+                entry["at"] = (_as_utc(raw_ts) or raw_ts).isoformat()
+            elif isinstance(raw_ts, str) and raw_ts.strip():
+                entry["at"] = raw_ts.strip()
+        normalized.append(entry)
+    return normalized
 
 
 def _verify_project_and_tenant_scope(
@@ -180,7 +202,7 @@ def _to_item_out(item: ConflictListItem) -> ConflictItemOut:
         resolved_at=_as_utc(item.resolved_at),
         created_at=_as_utc(item.created_at) or datetime.now(UTC),
         updated_at=_as_utc(item.updated_at) or datetime.now(UTC),
-        audit_history=list(item.audit_history),
+        audit_history=_normalize_audit_history(item.audit_history),
         side_a=_to_side_out(item.side_a),
         side_b=_to_side_out(item.side_b),
     )
@@ -211,7 +233,7 @@ def _to_action_response(row: KnowledgeConflictResolution) -> ConflictActionRespo
         resolved_at=_as_utc(row.resolved_at),
         created_at=_as_utc(row.created_at) or datetime.now(UTC),
         updated_at=_as_utc(row.updated_at) or datetime.now(UTC),
-        audit_history=list(row.audit_history_json or []),
+        audit_history=_normalize_audit_history(row.audit_history_json),
     )
 
 

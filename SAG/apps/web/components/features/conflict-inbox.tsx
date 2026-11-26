@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import Link from "next/link";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useLocale, useTranslations } from "next-intl";
 import {
   Archive,
@@ -28,6 +29,7 @@ import { toast } from "sonner";
 import { api, ApiError } from "@/lib/api";
 import {
   CONFLICT_SUBTYPES,
+  auditEntryTimestamp,
   authorityTierMeta,
   canReopenConflict,
   canResolveConflict,
@@ -70,6 +72,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 const PAGE_LIMIT = 20;
 const MAX_REASON_LENGTH = 2000;
+const MAX_DOCUMENT_ID_LENGTH = 256;
 
 type PendingMutation = ConflictResolveAction | "REOPEN";
 
@@ -181,12 +184,14 @@ function ConflictSidePanel({
       </div>
 
       <div className="mt-2.5 flex flex-wrap items-baseline gap-2">
-        <h3 className="min-w-0 break-words text-sm font-medium leading-snug text-foreground">
+        <h2 className="min-w-0 break-words text-sm font-medium leading-snug text-foreground">
           {side.document_name}
-        </h3>
-        <span className="shrink-0 rounded border border-border bg-background px-1.5 py-0.5 font-mono text-[11px] tabular-nums text-muted-foreground">
-          {t("sides.version", { version: side.version_no })}
-        </span>
+        </h2>
+        {side.version_no != null && (
+          <span className="shrink-0 rounded border border-border bg-background px-1.5 py-0.5 font-mono text-[11px] tabular-nums text-muted-foreground">
+            {t("sides.version", { version: side.version_no })}
+          </span>
+        )}
       </div>
 
       <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
@@ -249,6 +254,8 @@ function ConflictCard({
 }: ConflictCardProps) {
   const t = useTranslations("ConflictInbox");
   const [auditOpen, setAuditOpen] = React.useState(false);
+  const auditToggleId = React.useId();
+  const auditPanelId = React.useId();
 
   const isMutating = pendingAction !== undefined;
   const resolvable = canResolveConflict(item.status);
@@ -320,11 +327,14 @@ function ConflictCard({
               value: formatConfidencePct(item.confidence),
             })}
           </span>
-          <span className="rounded border border-border/70 bg-background px-1.5 py-0.5 font-mono text-[11px] tabular-nums">
-            {t("metrics.cosine", {
-              value: formatConfidencePct(item.cosine_similarity),
-            })}
-          </span>
+          {item.cosine_similarity != null &&
+            Number.isFinite(item.cosine_similarity) && (
+              <span className="rounded border border-border/70 bg-background px-1.5 py-0.5 font-mono text-[11px] tabular-nums">
+                {t("metrics.cosine", {
+                  value: formatConfidencePct(item.cosine_similarity),
+                })}
+              </span>
+            )}
           {updatedRelative && (
             <time
               dateTime={item.updated_at}
@@ -498,10 +508,12 @@ function ConflictCard({
       {/* Collapsible Audit Trail */}
       <div className="border-t bg-muted/10 px-4 py-2">
         <button
+          id={auditToggleId}
           type="button"
           aria-expanded={auditOpen}
+          aria-controls={auditPanelId}
           onClick={() => setAuditOpen((open) => !open)}
-          className="inline-flex items-center gap-1.5 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
+          className="inline-flex items-center gap-1.5 rounded text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           <History className="size-3.5" />
           <span className="tabular-nums">
@@ -515,46 +527,62 @@ function ConflictCard({
         </button>
 
         {auditOpen && (
-          <div className="mt-2.5 pb-1">
+          <div
+            id={auditPanelId}
+            aria-labelledby={auditToggleId}
+            className="mt-2.5 pb-1"
+          >
             {item.audit_history.length === 0 ? (
               <p className="text-xs text-muted-foreground">{t("audit.empty")}</p>
             ) : (
               <ol className="space-y-2.5 border-l border-border pl-4">
-                {item.audit_history.map((entry, idx) => (
-                  <li
-                    key={`${entry.at}-${entry.action}-${idx}`}
-                    className="relative text-xs"
-                  >
-                    <span className="absolute -left-[21px] top-1.5 size-2 rounded-full border border-border bg-background" />
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="rounded border border-border bg-background px-1.5 py-0.5 font-mono text-[11px] font-medium text-foreground">
-                        {entry.action}
-                      </span>
-                      <span className="text-muted-foreground">
-                        {entry.from_status
-                          ? t("audit.transition", {
-                              from: formatAuditStatus(entry.from_status),
-                              to: formatAuditStatus(entry.to_status),
-                            })
-                          : formatAuditStatus(entry.to_status)}
-                      </span>
-                      <span className="font-mono text-[11px] text-muted-foreground">
-                        {t("audit.actor", { actor: entry.actor })}
-                      </span>
-                      <time
-                        dateTime={entry.at}
-                        className="font-mono text-[11px] tabular-nums text-muted-foreground"
-                      >
-                        {formatDateTime(entry.at, timezone, locale)}
-                      </time>
-                    </div>
-                    {entry.reason && (
-                      <p className="mt-1 whitespace-pre-wrap break-words text-foreground/85">
-                        {entry.reason}
-                      </p>
-                    )}
-                  </li>
-                ))}
+                {item.audit_history.map((entry, idx) => {
+                  const ts = auditEntryTimestamp(entry);
+                  const formattedTs = ts
+                    ? formatDateTime(ts, timezone, locale)
+                    : "";
+                  return (
+                    <li
+                      key={`${ts ?? "no-ts"}-${entry.action}-${idx}`}
+                      className="relative text-xs"
+                    >
+                      <span className="absolute -left-[21px] top-1.5 size-2 rounded-full border border-border bg-background" />
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="rounded border border-border bg-background px-1.5 py-0.5 font-mono text-[11px] font-medium text-foreground">
+                          {entry.action}
+                        </span>
+                        <span className="text-muted-foreground">
+                          {entry.from_status
+                            ? t("audit.transition", {
+                                from: formatAuditStatus(entry.from_status),
+                                to: formatAuditStatus(entry.to_status),
+                              })
+                            : formatAuditStatus(entry.to_status)}
+                        </span>
+                        <span className="font-mono text-[11px] text-muted-foreground">
+                          {t("audit.actor", { actor: entry.actor })}
+                        </span>
+                        {ts && formattedTs ? (
+                          <time
+                            dateTime={ts}
+                            className="font-mono text-[11px] tabular-nums text-muted-foreground"
+                          >
+                            {formattedTs}
+                          </time>
+                        ) : (
+                          <span className="font-mono text-[11px] tabular-nums text-muted-foreground">
+                            —
+                          </span>
+                        )}
+                      </div>
+                      {entry.reason && (
+                        <p className="mt-1 whitespace-pre-wrap break-words text-foreground/85">
+                          {entry.reason}
+                        </p>
+                      )}
+                    </li>
+                  );
+                })}
               </ol>
             )}
           </div>
@@ -578,6 +606,9 @@ export function ConflictInbox({
   const t = useTranslations("ConflictInbox");
   const tKnowledge = useTranslations("Knowledge");
   const locale = useLocale();
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
 
   const [tab, setTab] = React.useState<ConflictFilterTab>("pending");
   const [subtypeFilter, setSubtypeFilter] = React.useState<
@@ -594,6 +625,7 @@ export function ConflictInbox({
   );
   const [includeInactive, setIncludeInactive] = React.useState(false);
   const [offset, setOffset] = React.useState(0);
+  const [reloadNonce, setReloadNonce] = React.useState(0);
 
   const [items, setItems] = React.useState<ConflictItem[] | null>(null);
   const [total, setTotal] = React.useState(0);
@@ -608,6 +640,26 @@ export function ConflictInbox({
   >({});
 
   const requestSeqRef = React.useRef(0);
+  const pendingIdsRef = React.useRef<Set<string>>(new Set());
+
+  const removeUrlQueryParams = React.useCallback(
+    (keys: readonly ("source" | "document")[]) => {
+      const rawQuery = searchParams?.toString() ?? "";
+      const nextParams = new URLSearchParams(rawQuery);
+      let mutated = false;
+      for (const key of keys) {
+        if (nextParams.has(key)) {
+          nextParams.delete(key);
+          mutated = true;
+        }
+      }
+      if (!mutated) return;
+      const basePath = pathname || "/knowledge/conflicts";
+      const qs = nextParams.toString();
+      router.replace(qs ? `${basePath}?${qs}` : basePath, { scroll: false });
+    },
+    [pathname, router, searchParams],
+  );
 
   React.useEffect(() => {
     setSourceId(initialSourceId?.trim() || null);
@@ -627,39 +679,61 @@ export function ConflictInbox({
     const handle = window.setTimeout(() => {
       setAppliedDocumentId(trimmed);
       setOffset(0);
+      if (!trimmed) {
+        removeUrlQueryParams(["document"]);
+      }
     }, 300);
     return () => window.clearTimeout(handle);
-  }, [appliedDocumentId, docInput]);
+  }, [appliedDocumentId, docInput, removeUrlQueryParams]);
 
-  const fetchConflicts = React.useCallback(
-    async (overrideOffset?: number) => {
-      const targetOffset = overrideOffset ?? offset;
-      const seq = ++requestSeqRef.current;
-      setLoading(true);
-      setError(null);
+  React.useEffect(() => {
+    const controller = new AbortController();
+    const seq = ++requestSeqRef.current;
+    const statuses = tabToStatuses(tab);
+    const currentOffset = offset;
 
-      const statuses = tabToStatuses(tab);
+    setLoading(true);
+    setError(null);
+
+    void (async () => {
+      let clamped = false;
       try {
-        const res = await api.listConflicts({
-          source_id: sourceId ?? undefined,
-          status: statuses,
-          conflict_subtype:
-            subtypeFilter === "ALL" ? undefined : [subtypeFilter],
-          document_id: appliedDocumentId || undefined,
-          include_inactive: includeInactive || undefined,
-          limit: PAGE_LIMIT,
-          offset: targetOffset,
-        });
-        if (seq !== requestSeqRef.current) return;
-        if (targetOffset > 0 && res.items.length === 0 && res.total > 0) {
-          const prevOffset = Math.max(0, targetOffset - PAGE_LIMIT);
-          setOffset(prevOffset);
-          return;
+        const res = await api.listConflicts(
+          {
+            source_id: sourceId ?? undefined,
+            status: statuses,
+            conflict_subtype:
+              subtypeFilter === "ALL" ? undefined : [subtypeFilter],
+            document_id: appliedDocumentId || undefined,
+            include_inactive: includeInactive || undefined,
+            limit: PAGE_LIMIT,
+            offset: currentOffset,
+          },
+          { signal: controller.signal },
+        );
+        if (controller.signal.aborted || seq !== requestSeqRef.current) return;
+
+        if (currentOffset > 0 && res.items.length === 0) {
+          if (res.total === 0) {
+            clamped = true;
+            setOffset(0);
+            return;
+          }
+          if (currentOffset >= res.total) {
+            const clampedOffset =
+              Math.floor((res.total - 1) / PAGE_LIMIT) * PAGE_LIMIT;
+            if (clampedOffset !== currentOffset) {
+              clamped = true;
+              setOffset(clampedOffset);
+              return;
+            }
+          }
         }
+
         setItems(res.items);
         setTotal(res.total);
       } catch (err) {
-        if (seq !== requestSeqRef.current) return;
+        if (controller.signal.aborted || seq !== requestSeqRef.current) return;
         if (err instanceof ApiError && err.code === "aborted") return;
         const message =
           err instanceof ApiError
@@ -668,19 +742,32 @@ export function ConflictInbox({
               ? err.message
               : t("errors.loadFailed");
         setError(message);
-        setItems((current) => current ?? []);
+        setItems([]);
+        setTotal(0);
       } finally {
-        if (seq === requestSeqRef.current) {
+        if (
+          !clamped &&
+          !controller.signal.aborted &&
+          seq === requestSeqRef.current
+        ) {
           setLoading(false);
         }
       }
-    },
-    [appliedDocumentId, includeInactive, offset, sourceId, subtypeFilter, t, tab],
-  );
+    })();
 
-  React.useEffect(() => {
-    void fetchConflicts();
-  }, [fetchConflicts]);
+    return () => {
+      controller.abort();
+    };
+  }, [
+    appliedDocumentId,
+    includeInactive,
+    offset,
+    reloadNonce,
+    sourceId,
+    subtypeFilter,
+    t,
+    tab,
+  ]);
 
   const handleTabChange = (value: string) => {
     if (
@@ -708,17 +795,22 @@ export function ConflictInbox({
     const trimmed = docInput.trim();
     setAppliedDocumentId(trimmed);
     setOffset(0);
+    if (!trimmed) {
+      removeUrlQueryParams(["document"]);
+    }
   };
 
   const clearDocumentFilter = () => {
     setDocInput("");
     setAppliedDocumentId("");
     setOffset(0);
+    removeUrlQueryParams(["document"]);
   };
 
   const clearSourceFilter = () => {
     setSourceId(null);
     setOffset(0);
+    removeUrlQueryParams(["source"]);
   };
 
   const resetAllFilters = () => {
@@ -729,6 +821,7 @@ export function ConflictInbox({
     setAppliedDocumentId("");
     setIncludeInactive(false);
     setOffset(0);
+    removeUrlQueryParams(["source", "document"]);
   };
 
   const handleReasonChange = React.useCallback((id: string, value: string) => {
@@ -736,69 +829,73 @@ export function ConflictInbox({
   }, []);
 
   const handleResolve = React.useCallback(
-    async (id: string, action: ConflictResolveAction) => {
-      if (pendingActions[id]) return;
-      const trimmedReason = (reasonDrafts[id] ?? "").trim();
-      setPendingActions((prev) => ({ ...prev, [id]: action }));
+    async (conflictId: string, action: ConflictResolveAction) => {
+      if (pendingIdsRef.current.has(conflictId)) return;
+      pendingIdsRef.current.add(conflictId);
+      const trimmedReason = (reasonDrafts[conflictId] ?? "").trim();
+      setPendingActions((prev) => ({ ...prev, [conflictId]: action }));
       try {
         await api.resolveConflict(
-          id,
+          conflictId,
           trimmedReason ? { action, reason: trimmedReason } : { action },
         );
         setReasonDrafts((prev) => {
           const next = { ...prev };
-          delete next[id];
+          delete next[conflictId];
           return next;
         });
         if (action === "WINNER_B") toast.success(t("toasts.resolvedWinnerB"));
         else if (action === "WINNER_A") toast.success(t("toasts.resolvedWinnerA"));
         else toast.success(t("toasts.resolvedKeepBoth"));
-        await fetchConflicts();
+        setReloadNonce((n) => n + 1);
       } catch (err) {
         toast.error(
           err instanceof ApiError ? err.message : t("toasts.actionError"),
         );
       } finally {
+        pendingIdsRef.current.delete(conflictId);
         setPendingActions((prev) => {
           const next = { ...prev };
-          delete next[id];
+          delete next[conflictId];
           return next;
         });
       }
     },
-    [fetchConflicts, pendingActions, reasonDrafts, t],
+    [reasonDrafts, t],
   );
 
   const handleReopen = React.useCallback(
-    async (id: string) => {
-      if (pendingActions[id]) return;
-      const trimmedReason = (reasonDrafts[id] ?? "").trim();
-      setPendingActions((prev) => ({ ...prev, [id]: "REOPEN" }));
+    async (conflictId: string) => {
+      if (pendingIdsRef.current.has(conflictId)) return;
+      pendingIdsRef.current.add(conflictId);
+      const trimmedReason = (reasonDrafts[conflictId] ?? "").trim();
+      setPendingActions((prev) => ({ ...prev, [conflictId]: "REOPEN" }));
       try {
         await api.reopenConflict(
-          id,
+          conflictId,
           trimmedReason ? { reason: trimmedReason } : undefined,
         );
         setReasonDrafts((prev) => {
           const next = { ...prev };
-          delete next[id];
+          delete next[conflictId];
           return next;
         });
         toast.success(t("toasts.reopened"));
-        await fetchConflicts();
+        setReloadNonce((n) => n + 1);
       } catch (err) {
         toast.error(
           err instanceof ApiError ? err.message : t("toasts.actionError"),
         );
       } finally {
+        pendingIdsRef.current.delete(conflictId);
         setPendingActions((prev) => {
           const next = { ...prev };
-          delete next[id];
+          delete next[conflictId];
           return next;
         });
       }
     },
-    [fetchConflicts, pendingActions, reasonDrafts, t],
+    [reasonDrafts, t],
   );
 
   const hasFilters =
@@ -808,13 +905,14 @@ export function ConflictInbox({
     tab !== "all";
 
   const currentItems = items ?? [];
-  const startIndex = total === 0 || currentItems.length === 0 ? 0 : offset + 1;
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_LIMIT));
+  const currentPage = Math.min(totalPages, Math.floor(offset / PAGE_LIMIT) + 1);
+  const startIndex =
+    total === 0 || currentItems.length === 0 ? 0 : Math.min(total, offset + 1);
   const endIndex =
     total === 0 || currentItems.length === 0
       ? 0
       : Math.min(total, offset + currentItems.length);
-  const currentPage = Math.floor(offset / PAGE_LIMIT) + 1;
-  const totalPages = Math.max(1, Math.ceil(total / PAGE_LIMIT));
   const hasPrev = offset > 0;
   const hasNext = offset + currentItems.length < total;
 
@@ -838,7 +936,7 @@ export function ConflictInbox({
               variant="outline"
               size="sm"
               disabled={loading}
-              onClick={() => void fetchConflicts()}
+              onClick={() => setReloadNonce((n) => n + 1)}
             >
               <RotateCw className={cn("size-3.5", loading && "animate-spin")} />
               {t("refresh")}
@@ -903,6 +1001,7 @@ export function ConflictInbox({
             <Input
               value={docInput}
               onChange={(event) => setDocInput(event.target.value)}
+              maxLength={MAX_DOCUMENT_ID_LENGTH}
               placeholder={t("filters.documentPlaceholder")}
               aria-label={t("filters.documentAria")}
               className="h-9 pl-8 pr-8 text-xs"
@@ -969,7 +1068,7 @@ export function ConflictInbox({
             type="button"
             variant="outline"
             size="sm"
-            onClick={() => void fetchConflicts()}
+            onClick={() => setReloadNonce((n) => n + 1)}
             className="shrink-0"
           >
             {t("retry")}
@@ -1033,7 +1132,7 @@ export function ConflictInbox({
       )}
 
       {/* Pagination Bar */}
-      {(total > PAGE_LIMIT || offset > 0) && (
+      {total > PAGE_LIMIT && (
         <div className="flex items-center justify-between gap-3 border-t pt-4">
           <span className="font-mono text-xs tabular-nums text-muted-foreground">
             {t("summary.page", { page: currentPage, totalPages })}

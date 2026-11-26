@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   CONFLICT_SUBTYPES,
+  auditEntryTimestamp,
   authorityTierMeta,
   canReopenConflict,
   canResolveConflict,
@@ -161,5 +162,28 @@ describe("conflict presentation helpers", () => {
     expect(
       compareAuthorityPrecedence({ authority_tier: 1 }, { authority_tier: 99 }),
     ).toBe("incomplete");
+  });
+
+  it("extracts audit entry timestamp preferring at over timestamp and returning null when absent", () => {
+    expect(
+      auditEntryTimestamp({
+        at: "2026-11-26T10:05:00+00:00",
+        timestamp: "2026-11-26T10:00:00+00:00",
+      }),
+    ).toBe("2026-11-26T10:05:00+00:00");
+    expect(
+      auditEntryTimestamp({
+        timestamp: "  2026-11-26T10:00:00+00:00  ",
+      }),
+    ).toBe("2026-11-26T10:00:00+00:00");
+    expect(
+      auditEntryTimestamp({
+        at: "   ",
+        timestamp: "2026-11-26T10:00:00+00:00",
+      }),
+    ).toBe("2026-11-26T10:00:00+00:00");
+    expect(auditEntryTimestamp({ at: null, timestamp: null })).toBeNull();
+    expect(auditEntryTimestamp({ at: "", timestamp: "   " })).toBeNull();
+    expect(auditEntryTimestamp({})).toBeNull();
   });
 });

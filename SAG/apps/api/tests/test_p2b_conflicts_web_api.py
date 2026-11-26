@@ -681,7 +681,7 @@ async def test_web_single_project_list_filters_source_document_pagination_and_va
     assert body["offset"] == 0
     assert [i["id"] for i in body["items"]] == ["res-sp-3", "res-sp-2", "res-sp-1"]
 
-    # Hydrated side_a & side_b verification
+    # Hydrated side_a & side_b verification + audit_history wire normalization (`at` + `timestamp`)
     item1 = body["items"][2]
     assert item1["project_id"] == PROJ_A
     assert item1["side_a"]["document_id"] == doc_a["document_id"]
@@ -690,6 +690,12 @@ async def test_web_single_project_list_filters_source_document_pagination_and_va
     assert item1["side_b"]["document_id"] == doc_b["document_id"]
     assert item1["side_b"]["document_name"] == "policy-2025.md"
     assert "18 days" in item1["side_b"]["text_snapshot"]
+    assert len(item1["audit_history"]) >= 1
+    for audit_entry in item1["audit_history"]:
+        assert isinstance(audit_entry.get("at"), str) and audit_entry["at"].strip()
+        assert isinstance(audit_entry.get("timestamp"), str) and audit_entry["timestamp"].strip()
+        assert audit_entry["at"] == audit_entry["timestamp"]
+        assert datetime.fromisoformat(audit_entry["at"]).tzinfo is not None
 
     # Repeatable status filter (matches FE badge query!)
     r_badge = await client.get(
@@ -1228,6 +1234,11 @@ async def test_web_full_hitl_lifecycle_resolve_swap_keep_both_reopen_and_409(
     assert wb["resolved_by"] == USER_ACTIVE_ID
     assert wb["audit_history"][-1]["action"] == "WINNER_B"
     assert wb["audit_history"][-1]["actor"] == USER_ACTIVE_ID
+    for entry in wb["audit_history"]:
+        assert isinstance(entry.get("at"), str) and entry["at"].strip()
+        assert isinstance(entry.get("timestamp"), str) and entry["timestamp"].strip()
+        assert entry["at"] == entry["timestamp"]
+        assert datetime.fromisoformat(entry["at"]).tzinfo is not None
 
     # 2. WINNER_A -> symmetric swap + evidence_json swap + invariant pair_key
     r_wa = await client.post(
@@ -1298,6 +1309,23 @@ async def test_web_full_hitl_lifecycle_resolve_swap_keep_both_reopen_and_409(
     assert ro["resolved_by"] == USER_SECOND_ID
     assert ro["audit_history"][-1]["action"] == "REOPEN"
     assert ro["audit_history"][-1]["actor"] == USER_SECOND_ID
+    for entry in ro["audit_history"]:
+        assert isinstance(entry.get("at"), str) and entry["at"].strip()
+        assert isinstance(entry.get("timestamp"), str) and entry["timestamp"].strip()
+        assert entry["at"] == entry["timestamp"]
+        assert datetime.fromisoformat(entry["at"]).tzinfo is not None
+
+    # Verify GET /api/v1/conflicts also returns normalized audit_history (`at` + `timestamp`) after lifecycle mutations
+    r_after = await client.get(f"{base}?document_id={doc_a['document_id']}", headers=h1)
+    assert r_after.status_code == 200, r_after.text
+    life_items = [i for i in r_after.json()["items"] if i["id"] == "res-life-1"]
+    assert len(life_items) == 1
+    assert len(life_items[0]["audit_history"]) == len(ro["audit_history"])
+    for entry in life_items[0]["audit_history"]:
+        assert isinstance(entry.get("at"), str) and entry["at"].strip()
+        assert isinstance(entry.get("timestamp"), str) and entry["timestamp"].strip()
+        assert entry["at"] == entry["timestamp"]
+        assert datetime.fromisoformat(entry["at"]).tzinfo is not None
 
     async with web_conflicts_env.session_factory() as s:
         con_edge = await s.get(KnowledgeGraphEdge, "edge-con-res-life-1")
