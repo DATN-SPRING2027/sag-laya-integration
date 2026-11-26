@@ -1,6 +1,6 @@
 # Báo cáo Khắc phục Toàn diện Hệ thống RAG SAG (Pha P0 → P5)
 
-**Tài liệu gốc đối chiếu:** `audit/SAG-5-stage-hallucination-audit.md`  
+**Tài liệu gốc đối chiếu:** `SAG/docs/SAG-5-stage-hallucination-audit.md`  
 **Kho mã nguồn:** `d:\DoAnTotnghiep\sag-laya-integration` (`SAG/apps/api/sag_api`, `SAG/apps/api/sag_agent`, `SAG/apps/api/tests`, `SAG/apps/api/migrations`)  
 **Phạm vi Git:** Nhánh gốc `2aca825` (`feat/thanhtai040805-retrieval-routing-and-stage2b-upgrade-be-api`) → nhánh cuối **`fix/sag-p5-flags-config-docs-tests` @ `8a79ef1`** (52 commit tuyến tính, giữ nguyên cục bộ, không push/rebase/force)  
 **Trạng thái kiểm thử cuối cùng (offline):** **`545 passed, 5 skipped`** (tăng từ `345 passed, 1 skipped` ở nhánh gốc; 5 test bị skip đều là integration/smoke opt-in cần hạ tầng live)  
@@ -11,7 +11,7 @@
 ## 1. Tóm tắt điều hành (Executive Summary)
 
 ### 1.1. Bối cảnh & 2 Quyết định kiến trúc đã chốt
-Kiểm toán tĩnh 5 giai đoạn (`audit/SAG-5-stage-hallucination-audit.md`) phát hiện hàng loạt nguyên nhân gây hallucination hệ thống, sai lệch tiếng Việt (NFC/NFD, tokenization, BM25), rò rỉ ACL/vector và hiện tượng *developer-hallucination* (tài liệu/cờ/test khẳng định sai kiến trúc vận hành thực tế). Trước khi triển khai khắc phục 6 pha (P0 → P5), dự án đã chốt **2 quyết định kiến trúc** và **4 nguyên tắc bất biến**:
+Kiểm toán tĩnh 5 giai đoạn (`SAG/docs/SAG-5-stage-hallucination-audit.md`) phát hiện hàng loạt nguyên nhân gây hallucination hệ thống, sai lệch tiếng Việt (NFC/NFD, tokenization, BM25), rò rỉ ACL/vector và hiện tượng *developer-hallucination* (tài liệu/cờ/test khẳng định sai kiến trúc vận hành thực tế). Trước khi triển khai khắc phục 6 pha (P0 → P5), dự án đã chốt **2 quyết định kiến trúc** và **4 nguyên tắc bất biến**:
 
 1. **Bỏ hẳn Laya Router — sử dụng provider ngoài cấu hình được:** Việc thiếu `laya_router.py` / `api/v1/laya.py` là chủ đích thiết kế, không khôi phục. Định tuyến chạy qua provider ngoài cấu hình được trong `Settings` (`services/decision_router.py`, mặc định tương thích SiliconFlow `Kev-4b`). Toàn bộ tàn dư Laya (`SAG_ENABLE_LAYA`, `SAG_LAYA_*`, `SAG_OPENROUTER_API_KEY`, key trùng `SAG_DECISION_MODEL`, các biến E2 đã gỡ trong `compose.yaml`) được dọn sạch, đồng thời sửa triệt để lỗ hổng fallback regex & ép `"project"` khi provider lỗi.
 2. **Bỏ hẳn đường R2/S3 Object-Ingest & post-index Disk GC:** Đường R2 là code chết nhưng vẫn mở endpoint (`POST .../documents/ingest-object`) và nhánh Disk GC có nguy cơ xóa file gốc trên đĩa sau khi index. Toàn bộ đường R2 và Disk GC được gỡ bỏ hoàn toàn khỏi runtime, giữ nguyên luồng upload file thông thường (`handle_document_upload` → `prepare_document` → `READY`) và MinerU Mode 2 (batch presigned upload).
