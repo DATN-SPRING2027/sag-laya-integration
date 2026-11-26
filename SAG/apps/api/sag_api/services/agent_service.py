@@ -47,6 +47,7 @@ from sag_api.services.agent_domain import (
 )
 from sag_api.services.decision_router import CHAT_HIGH_CONFIDENCE, IntentFlags, route_query_async
 from sag_api.services.evidence_service import no_answer_text
+from sag_api.services.temporal_metadata_format import format_evidence_metadata_suffix
 from sag_api.tools import ToolContext as HostToolContext
 from sag_api.tools import ToolRegistry
 from sag_api.tools.builtin import WebSearchTool
@@ -729,6 +730,34 @@ def _parse_entailment_verdict(raw_text: str) -> tuple[str | None, bool | None]:
     return None, None
 
 
+def _extract_verifier_metadata(source: Any) -> dict[str, Any] | None:
+    """Extract temporal/authority/conflict fields for internal verifier-only side maps."""
+    if source is None:
+        return None
+    if isinstance(source, Mapping):
+        nested = source.get("_verifier_meta")
+        if isinstance(nested, Mapping):
+            source = nested
+        meta = {
+            "authority_tier": source.get("authority_tier"),
+            "effective_from": source.get("effective_from"),
+            "valid_to": source.get("valid_to"),
+            "is_superseded": bool(source.get("is_superseded", False)),
+            "conflict_status": source.get("conflict_status"),
+        }
+    else:
+        meta = {
+            "authority_tier": getattr(source, "authority_tier", None),
+            "effective_from": getattr(source, "effective_from", None),
+            "valid_to": getattr(source, "valid_to", None),
+            "is_superseded": bool(getattr(source, "is_superseded", False)),
+            "conflict_status": getattr(source, "conflict_status", None),
+        }
+    if any(v is not None and v is not False for v in meta.values()):
+        return meta
+    return None
+
+
 async def _verify_grounded_entailment(
     llm: Any | None,
     *,
@@ -737,6 +766,7 @@ async def _verify_grounded_entailment(
     internal_citations: list[dict[str, Any]],
     session_citations: list[dict[str, Any]],
     verifier_content_by_n: Mapping[int, str] | None = None,
+    verifier_meta_by_n: Mapping[int, Mapping[str, Any]] | None = None,
 ) -> tuple[str, str | None]:
     """Verify cited answer is neither an abstention nor an unsupported/fabricated claim (S5-05)."""
     claim_internal = [cit for cit in internal_citations if cit.get("claim_level") == "claim"]
@@ -770,12 +800,32 @@ async def _verify_grounded_entailment(
             continue
         if len(full_text) > per_item_limit:
             full_text = full_text[:per_item_limit].rstrip() + "…"
-        line = f"[{n}] {label}: {full_text}" if label else f"[{n}] {full_text}"
+        meta_source = (
+            verifier_meta_by_n.get(n)
+            if (
+                verifier_meta_by_n
+                and isinstance(n, int)
+                and not isinstance(n, bool)
+                and n in verifier_meta_by_n
+            )
+            else (
+                cit.get("_verifier_meta")
+                if isinstance(cit.get("_verifier_meta"), Mapping)
+                else cit
+            )
+        )
+        meta_suffix = format_evidence_metadata_suffix(meta_source)
+        label_with_meta = f"{label} {meta_suffix}".strip() if meta_suffix else label
+        line = (
+            f"[{n}] {label_with_meta}: {full_text}"
+            if label_with_meta
+            else f"[{n}] {full_text}"
+        )
         remaining_chars = _VERIFIER_MAX_TOTAL_EVIDENCE_CHARS - used_chars
         if remaining_chars <= 0:
             break
         if len(line) > remaining_chars:
-            prefix = f"[{n}] {label}: " if label else f"[{n}] "
+            prefix = f"[{n}] {label_with_meta}: " if label_with_meta else f"[{n}] "
             if remaining_chars > len(prefix) + 16:
                 line = line[:remaining_chars].rstrip() + "…"
             elif remaining_chars >= len(prefix):
@@ -819,7 +869,9 @@ async def _verify_grounded_entailment(
                 'Set answerability to "insufficient_evidence" and supported to false if the candidate answer is a refusal '
                 "or says the evidence lacks the requested information (even if it cites [1]/[S1]). "
                 "Set supported to false if the candidate answer states factual claims (numbers, dates, names, rules) "
-                "that contradict or are not entailed by the cited evidence excerpts."
+                "that contradict or are not entailed by the cited evidence excerpts. "
+                "Treat authority tier, effective date, superseded, or conflict status shown in an excerpt's "
+                "header metadata (e.g., (Chính thức · Hiệu lực YYYY-MM-DD)) as verified evidence attributes."
             ),
         },
         {
@@ -1198,6 +1250,7 @@ def _adapt_tool(
     host_context: HostToolContext,
     citations: list[dict],
     verifier_content_by_n: dict[int, str] | None = None,
+    verifier_meta_by_n: dict[int, dict[str, Any]] | None = None,
 ) -> AgentTool:
     async def execute(
         arguments: Mapping[str, Any],
@@ -1230,18 +1283,25 @@ def _adapt_tool(
             }
             if call_id and call_citations:
                 host_context.citation_numbers_by_call_id[call_id] = call_citations
-        if verifier_content_by_n is not None and result.citations:
+        if (verifier_content_by_n is not None or verifier_meta_by_n is not None) and result.citations:
             raw_sections = result.data.get("sections")
             section_list = raw_sections if isinstance(raw_sections, list) else []
             for idx_cit, cit in enumerate(result.citations):
                 cit_n = cit.get("n")
                 if not isinstance(cit_n, int) or isinstance(cit_n, bool):
                     continue
-                full_text = str(cit.get("_verifier_content") or cit.get("content") or "").strip()
-                if not full_text and idx_cit < len(section_list):
-                    full_text = str(getattr(section_list[idx_cit], "content", "") or "").strip()
-                if full_text:
-                    verifier_content_by_n[cit_n] = full_text
+                if verifier_content_by_n is not None:
+                    full_text = str(cit.get("_verifier_content") or cit.get("content") or "").strip()
+                    if not full_text and idx_cit < len(section_list):
+                        full_text = str(getattr(section_list[idx_cit], "content", "") or "").strip()
+                    if full_text:
+                        verifier_content_by_n[cit_n] = full_text
+                if verifier_meta_by_n is not None:
+                    meta = _extract_verifier_metadata(cit)
+                    if meta is None and idx_cit < len(section_list):
+                        meta = _extract_verifier_metadata(section_list[idx_cit])
+                    if meta is not None:
+                        verifier_meta_by_n[cit_n] = meta
         public_tool_citations = [_strip_internal_citation_fields(c) for c in result.citations]
         citations.extend(public_tool_citations)
         host_context.citation_offset = max(
@@ -1467,6 +1527,7 @@ async def generate_stream(
     ]
 
     verifier_content_by_n: dict[int, str] = {}
+    verifier_meta_by_n: dict[int, dict[str, Any]] = {}
     citations: list[dict[str, Any]] = []
     for raw_cit in plan.citations:
         cit_n = raw_cit.get("n")
@@ -1474,6 +1535,9 @@ async def generate_stream(
             full_text = str(raw_cit.get("_verifier_content") or raw_cit.get("content") or "").strip()
             if full_text:
                 verifier_content_by_n[cit_n] = full_text
+            meta = _extract_verifier_metadata(raw_cit)
+            if meta is not None:
+                verifier_meta_by_n[cit_n] = meta
         citations.append(_strip_internal_citation_fields(raw_cit))
     local_evidence_required = knowledge_only or bool(plan.source_ids)
     external_references: list[dict[str, Any]] = []
@@ -1578,7 +1642,13 @@ async def generate_stream(
                 names = []
                 host_tools = []
             tools = tuple(
-                _adapt_tool(tool, host_context, citations, verifier_content_by_n)
+                _adapt_tool(
+                    tool,
+                    host_context,
+                    citations,
+                    verifier_content_by_n,
+                    verifier_meta_by_n,
+                )
                 for tool in host_tools
             )
             scene_notes: list[str] = []
@@ -1592,7 +1662,11 @@ async def generate_stream(
                         "TUYỆT ĐỐI KHÔNG gắn [n] vào câu từ chối khi thiếu dữ kiện; "
                         "cấm lấy dữ kiện từ lượt trước rồi gắn [n] không chứa dữ kiện đó; "
                         "nếu người dùng yêu cầu đọc đích danh tệp cụ thể nhưng tệp đó không có trong Locator file=... "
-                        "của phạm vi hiện tại thì phải từ chối thay vì trả lời bằng tệp khác."
+                        "của phạm vi hiện tại thì phải từ chối thay vì trả lời bằng tệp khác. "
+                        "Khi bằng chứng có nhãn thẩm quyền/hiệu lực hoặc xung đột "
+                        "(Chính thức, Quy chuẩn, Hướng dẫn, Nháp, Hiệu lực, Bản cũ, Xung đột), "
+                        "phải ưu tiên nguồn bậc cao hơn và hiệu lực mới hơn, không nêu Bản cũ là quy định hiện hành, "
+                        "và nếu xung đột ngang bậc chưa phân giải thì trình bày rõ cả hai nguồn kèm nhãn [n]."
                     )
                 if mcp_bundle.warnings:
                     unavailable = "、".join(warning.get("server", "MCP") for warning in mcp_bundle.warnings)
@@ -1968,6 +2042,7 @@ async def generate_stream(
                             internal_citations=internal_citations,
                             session_citations=used_session_citations,
                             verifier_content_by_n=verifier_content_by_n,
+                            verifier_meta_by_n=verifier_meta_by_n,
                         )
                         if verified_status == "no_answer":
                             canonical_answer = empty_response or no_answer_text(query=plan.query)

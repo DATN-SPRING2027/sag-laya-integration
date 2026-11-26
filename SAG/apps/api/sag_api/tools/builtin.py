@@ -26,6 +26,7 @@ from sag_api.services.evidence_service import (
     build_tool_evidence_pack,
     has_traceable_locator,
 )
+from sag_api.services.temporal_metadata_format import format_evidence_metadata_suffix
 from sag_api.tools.base import Tool, ToolContext, ToolMeta, ToolResult
 
 log = get_logger("tools.web_search")
@@ -64,6 +65,8 @@ def _format_sections(
     event_refs = _events_by_section(events)
     blocks = []
     for i, s in enumerate(sections, start=1 + offset):
+        suffix = format_evidence_metadata_suffix(s)
+        suffix_str = f" {suffix}" if suffix else ""
         locator = (
             f"Locator: file={getattr(s, 'document_name', '')}; "
             f"document={getattr(s, 'document_id', '')}; "
@@ -83,7 +86,7 @@ def _format_sections(
             event = related_events[0]
             title = " ".join(str(getattr(event, "title", "") or "").split())
             summary = " ".join(str(getattr(event, "summary", "") or "").split())
-            lines = [f"[{i}] Sự kiện: {title or 'Sự kiện chưa có tên'}", locator]
+            lines = [f"[{i}] Sự kiện: {title or 'Sự kiện chưa có tên'}{suffix_str}", locator]
             if summary:
                 lines.append(f"Tóm tắt: {summary}")
             content = getattr(s, "content", "")
@@ -101,7 +104,7 @@ def _format_sections(
         body_text = str(getattr(s, "content", "") or "")
         if catalog_inventory and len(body_text) > 420:
             body_text = body_text[:420].rstrip() + "…"
-        blocks.append(f"[{i}] {heading}\n{locator}\n{catalog_line}{body_text}")
+        blocks.append(f"[{i}] {heading}{suffix_str}\n{locator}\n{catalog_line}{body_text}")
     return "\n\n".join(blocks)
 
 
@@ -244,7 +247,11 @@ class SearchContextTool(Tool):
         rendered_content = packed.content
         if unfiltered_catalog:
             unique_ids = {s.document_id for s in sections if s.document_id}
-            ready_total = int(outcome.stats.get("ready_versions") or len(unique_ids))
+            ready_total = int(
+                outcome.stats.get("ready_documents")
+                or outcome.stats.get("ready_versions")
+                or len(unique_ids)
+            )
             unique_packed_docs = len({s.document_id or s.document_name for s in sections})
             manifest_lines: list[str] = []
             seen_docs: set[str] = set()
@@ -265,12 +272,38 @@ class SearchContextTool(Tool):
                 f"{rendered_content}"
             )
         else:
+            has_conflict_or_authority_signal = (
+                any(
+                    str(getattr(s, "conflict_status", "") or "").strip().upper()
+                    in {"ACTIVE_CONFLICT", "SUPERSEDED_BY_UNIT"}
+                    or bool(getattr(s, "is_superseded", False))
+                    for s in sections
+                )
+                or len(
+                    {
+                        s.authority_tier
+                        for s in sections
+                        if isinstance(getattr(s, "authority_tier", None), int)
+                        and not isinstance(getattr(s, "authority_tier", None), bool)
+                    }
+                )
+                >= 2
+            )
+            conflict_guardrail = (
+                " Lưu ý thẩm quyền & xung đột: ưu tiên nguồn bậc cao hơn "
+                "(Chính thức > Quy chuẩn > Hướng dẫn > Nháp) và ngày Hiệu lực mới hơn; "
+                "không nêu (Bản cũ) là quy định đang áp dụng trừ khi hỏi về lịch sử thay đổi; "
+                "nếu còn (Xung đột) ngang bậc chưa phân giải, phải nêu rõ cả hai nguồn kèm ngày và nhãn [n]."
+                if has_conflict_or_authority_signal
+                else ""
+            )
             rendered_content = (
                 "(Bằng chứng tra cứu hợp lệ bên dưới: khi trả lời dựa trên các đoạn này, BẮT BUỘC gắn nhãn trích dẫn "
                 "[n] trong ngoặc vuông ngay sau mỗi mệnh đề, con số hoặc dòng bảng được đoạn đó hỗ trợ trực tiếp — "
                 "kể cả khi người dùng không yêu cầu trích dẫn, vì câu trả lời thiếu [n] sẽ bị cổng kiểm chứng từ chối. "
                 "Ngược lại, nếu các đoạn bên dưới KHÔNG chứa thông tin được hỏi hoặc thiếu tệp người dùng nêu đích danh, "
-                "hãy từ chối ngắn gọn và TUYỆT ĐỐI KHÔNG gắn bất kỳ nhãn [n] nào vào câu từ chối.)\n\n"
+                "hãy từ chối ngắn gọn và TUYỆT ĐỐI KHÔNG gắn bất kỳ nhãn [n] nào vào câu từ chối."
+                f"{conflict_guardrail})\n\n"
                 f"{rendered_content}"
             )
         return ToolResult(
@@ -346,7 +379,11 @@ class GetEntityTool(Tool):
                 name,
                 principal=ctx.principal,
                 top_k=6,
-                query_strategy_plan=plan_query(name, requested_top_k=6),
+                query_strategy_plan=plan_query(
+                    name,
+                    requested_top_k=6,
+                    route_decision=ctx.route_decision,
+                ),
             )
             sections = [
                 section
