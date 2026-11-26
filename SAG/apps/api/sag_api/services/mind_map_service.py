@@ -92,6 +92,8 @@ class _ReadyDocumentScope:
     total_unit_count: int
     updated_sort_key: float
     project_id: str = ""
+    authority_tier: int | None = None
+    effective_from_iso: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,6 +424,7 @@ async def _load_project_scope_snapshot(
             if chosen_ready is not None:
                 vid_str = str(chosen_ready.id)
                 updated_dt = _as_utc(getattr(doc, "updated_at", None) or getattr(doc, "created_at", None))
+                eff_dt = _as_utc(chosen_ready.effective_from)
                 ready_docs.append(
                     _ReadyDocumentScope(
                         sag_document_id=doc_id_str,
@@ -437,6 +440,12 @@ async def _load_project_scope_snapshot(
                         total_unit_count=unit_counts[vid_str],
                         updated_sort_key=updated_dt.timestamp() if updated_dt else 0.0,
                         project_id=str(doc.project_id or ""),
+                        authority_tier=(
+                            int(chosen_ready.authority_tier)
+                            if chosen_ready.authority_tier is not None
+                            else None
+                        ),
+                        effective_from_iso=eff_dt.isoformat() if eff_dt is not None else "",
                     )
                 )
             elif (usable or not all_vers) and (
@@ -451,10 +460,17 @@ async def _load_project_scope_snapshot(
             ).hexdigest()
             return [], pending_count, fp
 
-        fp_payload = "|".join(
-            f"{d.sag_document_id}:{d.document_version_id}:{d.version_no}:{d.manifest_fingerprint}"
-            for d in sorted(ready_docs, key=lambda item: (item.sag_document_id, item.document_version_id))
-        )
+        fp_parts: list[str] = []
+        for d in sorted(ready_docs, key=lambda item: (item.sag_document_id, item.document_version_id)):
+            meta_suffix = (
+                f":at={d.authority_tier}:ef={d.effective_from_iso}"
+                if (d.authority_tier is not None or d.effective_from_iso)
+                else ""
+            )
+            fp_parts.append(
+                f"{d.sag_document_id}:{d.document_version_id}:{d.version_no}:{d.manifest_fingerprint}{meta_suffix}"
+            )
+        fp_payload = "|".join(fp_parts)
         scope_fp = hashlib.sha256(
             f"ready:{tenant_id}:{project_id}:{fp_payload}".encode()
         ).hexdigest()
@@ -472,7 +488,8 @@ def _stratify_documents_across_projects(
     ordered_docs: list[_ReadyDocumentScope],
     limit: int,
 ) -> list[_ReadyDocumentScope]:
-    """Select up to `limit` documents in round-robin across project buckets so multi-project ('all') scopes stay balanced."""
+    """Select up to `limit` documents in round-robin across project buckets
+    so multi-project ('all') scopes stay balanced."""
     if len(ordered_docs) <= limit:
         return list(ordered_docs)
     project_buckets: dict[str, list[_ReadyDocumentScope]] = {}
