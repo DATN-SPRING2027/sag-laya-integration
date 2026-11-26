@@ -45,6 +45,7 @@ for _module in (
     api_router.include_router(_module.router)
 api_router.include_router(documents.project_router)
 api_router.include_router(conflicts.router)
+api_router.include_router(conflicts.web_router)
 api_router.include_router(handover.router)
 api_router.include_router(mind_map.router)
 api_router.include_router(answer_actions.project_share_router)

@@ -13,14 +13,15 @@ from pydantic import BaseModel
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sag_api.core.deps import get_session
+from sag_api.core.deps import get_current_user, get_session
 from sag_api.core.errors import BadRequestError, ForbiddenError, NotFoundError, ValidationError
 from sag_api.core.principal_assertion import (
     VerifiedPrincipal,
     require_bff_service_token,
     require_project_bff_principal,
+    require_project_read_principal,
 )
-from sag_api.db.models import KnowledgeConflictResolution
+from sag_api.db.models import KnowledgeConflictResolution, User
 from sag_api.enums import (
     ConflictResolutionMode,
     ConflictResolutionStatus,
@@ -44,6 +45,7 @@ from sag_api.services.knowledge_conflict_service import (
 )
 
 router = APIRouter(prefix="/projects/{project_id}/conflicts", tags=["conflicts"])
+web_router = APIRouter(prefix="/conflicts", tags=["conflicts"])
 
 _SAFE_PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}\Z")
 _SAFE_RESOLUTION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}\Z")
@@ -53,6 +55,26 @@ _ALLOWED_LIST_QUERY_PARAMS = frozenset(
     {"status", "conflict_subtype", "document_id", "include_inactive", "limit", "offset"}
 )
 _SINGLE_VALUE_LIST_QUERY_PARAMS = ("document_id", "include_inactive", "limit", "offset")
+_WEB_ALLOWED_LIST_QUERY_PARAMS = frozenset(
+    {
+        "project_id",
+        "source_id",
+        "status",
+        "conflict_subtype",
+        "document_id",
+        "include_inactive",
+        "limit",
+        "offset",
+    }
+)
+_WEB_SINGLE_VALUE_LIST_QUERY_PARAMS = (
+    "project_id",
+    "source_id",
+    "document_id",
+    "include_inactive",
+    "limit",
+    "offset",
+)
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 
@@ -337,6 +359,184 @@ async def reopen_conflict_endpoint(
         )
     except ForbiddenError as exc:
         # Collapse out-of-partition denials into 404 to prevent partition existence oracles.
+        raise NotFoundError(f"Conflict resolution '{resolution_id}' not found") from exc
+
+    out = _to_action_response(row)
+    return JSONResponse(
+        status_code=200,
+        content=out.model_dump(mode="json"),
+        headers=_NO_STORE_HEADERS,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Interactive Web Session Router (`/api/v1/conflicts`)
+# ---------------------------------------------------------------------------
+
+
+def _verify_web_principal_scope(principal: VerifiedPrincipal) -> None:
+    if (
+        not (principal.tenant_id or "").strip()
+        or not principal.allowed_project_ids
+        or not principal.allowed_partition_ids
+    ):
+        raise ForbiddenError(
+            f"Principal '{principal.subject}' does not have an active tenant/project/partition scope"
+        )
+
+
+@web_router.get(
+    "",
+    response_model=ConflictListResponse,
+    summary="List ACL-filtered cross-document conflicts for the active web session",
+)
+async def list_web_conflicts_endpoint(
+    request: Request,
+    project_id: str | None = Query(default=None),
+    source_id: str | None = Query(default=None, min_length=1, max_length=128),
+    status: list[ConflictResolutionStatus] | None = Query(default=None),
+    conflict_subtype: list[ConflictSubtype] | None = Query(default=None),
+    document_id: str | None = Query(default=None, min_length=1, max_length=256),
+    include_inactive: bool = Query(default=False),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    _user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
+    session: AsyncSession = Depends(get_session),
+) -> JSONResponse:
+    _verify_web_principal_scope(principal)
+
+    unknown_keys = sorted(set(request.query_params.keys()) - _WEB_ALLOWED_LIST_QUERY_PARAMS)
+    if unknown_keys:
+        raise BadRequestError(f"Unsupported query parameters: {', '.join(unknown_keys)}")
+    for single_key in _WEB_SINGLE_VALUE_LIST_QUERY_PARAMS:
+        if len(request.query_params.getlist(single_key)) > 1:
+            raise BadRequestError(f"Duplicate {single_key} query parameter is not allowed")
+
+    if project_id is not None:
+        if not _SAFE_PROJECT_ID_RE.fullmatch(project_id):
+            raise BadRequestError("Invalid project_id format")
+        if project_id.lower() == "all":
+            raise BadRequestError("Single-project filter is required; 'all' is not allowed")
+        if project_id not in principal.allowed_project_ids:
+            raise ForbiddenError(
+                f"Principal '{principal.subject}' is not authorized to access project '{project_id}'"
+            )
+        scoped_project_ids = [project_id]
+    else:
+        scoped_project_ids = sorted(principal.allowed_project_ids)
+
+    cleaned_source_id: str | None = None
+    if source_id is not None:
+        cleaned_source_id = source_id.strip()
+        if not cleaned_source_id:
+            raise BadRequestError("source_id must not be blank")
+
+    cleaned_document_id: str | None = None
+    if document_id is not None:
+        cleaned_document_id = document_id.strip()
+        if not cleaned_document_id:
+            raise BadRequestError("document_id must not be blank")
+
+    items, total = await list_project_conflicts(
+        session,
+        tenant_id=principal.tenant_id,
+        project_ids=scoped_project_ids,
+        allowed_partition_ids=principal.allowed_partition_ids,
+        status_filter=[member.value for member in status] if status else None,
+        conflict_subtype=[member.value for member in conflict_subtype] if conflict_subtype else None,
+        source_id=cleaned_source_id,
+        document_id=cleaned_document_id,
+        include_inactive=include_inactive,
+        limit=limit,
+        offset=offset,
+    )
+    out = ConflictListResponse(
+        items=[_to_item_out(item) for item in items],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+    return JSONResponse(
+        status_code=200,
+        content=out.model_dump(mode="json"),
+        headers=_NO_STORE_HEADERS,
+    )
+
+
+@web_router.post(
+    "/{resolution_id}/resolve",
+    response_model=ConflictActionResponse,
+    summary="Apply a Human-in-the-Loop resolution decision via the active web session",
+)
+async def resolve_web_conflict_endpoint(
+    resolution_id: str,
+    request: Request,
+    _user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
+    session: AsyncSession = Depends(get_session),
+) -> JSONResponse:
+    _verify_web_principal_scope(principal)
+    _validate_resolution_id(resolution_id)
+    if request.query_params:
+        unknown = ", ".join(sorted(set(request.query_params.keys())))
+        raise BadRequestError(f"Unsupported query parameters: {unknown}")
+
+    payload = await _parse_json_body(request, ConflictResolveRequest)
+    try:
+        row = await resolve_conflict(
+            session,
+            tenant_id=principal.tenant_id,
+            allowed_project_ids=principal.allowed_project_ids,
+            allowed_partition_ids=principal.allowed_partition_ids,
+            resolution_id=resolution_id,
+            action=payload.action,
+            reason=payload.reason,
+            actor=principal.subject,
+        )
+    except ForbiddenError as exc:
+        # Collapse out-of-partition/unmapped denials into 404 to prevent existence oracles.
+        raise NotFoundError(f"Conflict resolution '{resolution_id}' not found") from exc
+
+    out = _to_action_response(row)
+    return JSONResponse(
+        status_code=200,
+        content=out.model_dump(mode="json"),
+        headers=_NO_STORE_HEADERS,
+    )
+
+
+@web_router.post(
+    "/{resolution_id}/reopen",
+    response_model=ConflictActionResponse,
+    summary="Reversibly reopen a resolved conflict via the active web session",
+)
+async def reopen_web_conflict_endpoint(
+    resolution_id: str,
+    request: Request,
+    _user: User = Depends(get_current_user),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
+    session: AsyncSession = Depends(get_session),
+) -> JSONResponse:
+    _verify_web_principal_scope(principal)
+    _validate_resolution_id(resolution_id)
+    if request.query_params:
+        unknown = ", ".join(sorted(set(request.query_params.keys())))
+        raise BadRequestError(f"Unsupported query parameters: {unknown}")
+
+    payload = await _parse_json_body(request, ConflictReopenRequest)
+    try:
+        row = await reopen_conflict(
+            session,
+            tenant_id=principal.tenant_id,
+            allowed_project_ids=principal.allowed_project_ids,
+            allowed_partition_ids=principal.allowed_partition_ids,
+            resolution_id=resolution_id,
+            reason=payload.reason,
+            actor=principal.subject,
+        )
+    except ForbiddenError as exc:
+        # Collapse out-of-partition/unmapped denials into 404 to prevent existence oracles.
         raise NotFoundError(f"Conflict resolution '{resolution_id}' not found") from exc
 
     out = _to_action_response(row)

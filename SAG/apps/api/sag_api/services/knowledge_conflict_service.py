@@ -2830,10 +2830,12 @@ async def list_project_conflicts(
     session: AsyncSession,
     *,
     tenant_id: str,
-    project_id: str,
+    project_id: str | None = None,
+    project_ids: Sequence[str] | set[str] | frozenset[str] | None = None,
     allowed_partition_ids: Sequence[str] | set[str] | frozenset[str],
     status_filter: str | Sequence[str] | None = None,
     conflict_subtype: str | Sequence[str] | None = None,
+    source_id: str | None = None,
     document_id: str | None = None,
     include_inactive: bool = False,
     limit: int = 50,
@@ -2841,7 +2843,13 @@ async def list_project_conflicts(
 ) -> tuple[list[ConflictListItem], int]:
     """List ACL-verified conflicts hydrated with both sides' full document/version/unit context."""
     norm_partitions = _normalize_id_set(allowed_partition_ids)
-    if not norm_partitions:
+    if project_ids is not None:
+        scoped_project_ids = _normalize_id_set(project_ids)
+    elif isinstance(project_id, str) and project_id.strip():
+        scoped_project_ids = [project_id.strip()]
+    else:
+        scoped_project_ids = []
+    if not tenant_id or not norm_partitions or not scoped_project_ids:
         return [], 0
 
     safe_limit = max(1, min(200, int(limit)))
@@ -2853,7 +2861,7 @@ async def list_project_conflicts(
 
     predicates: list[Any] = [
         kcr.tenant_id == tenant_id,
-        kcr.project_id == project_id,
+        kcr.project_id.in_(scoped_project_ids),
         # Dual-partition ACL enforcement — zero side-channel!
         kcr.security_partition_id.in_(norm_partitions),
         kcr.winner_security_partition_id.in_(norm_partitions),
@@ -2871,6 +2879,7 @@ async def list_project_conflicts(
         if subtypes:
             predicates.append(kcr.conflict_subtype.in_(subtypes))
 
+    src_filter = (source_id or "").strip()
     doc_filter = (document_id or "").strip()
 
     winner_ver = aliased(DocumentVersion)
@@ -2891,7 +2900,7 @@ async def list_project_conflicts(
             and_(
                 winner_spm.source_id == winner_doc.source_id,
                 winner_spm.organization_id == tenant_id,
-                winner_spm.project_id == project_id,
+                winner_spm.project_id == kcr.project_id,
                 winner_spm.state == "CONFIRMED",
             ),
         )
@@ -2900,7 +2909,7 @@ async def list_project_conflicts(
             and_(
                 loser_spm.source_id == loser_doc.source_id,
                 loser_spm.organization_id == tenant_id,
-                loser_spm.project_id == project_id,
+                loser_spm.project_id == kcr.project_id,
                 loser_spm.state == "CONFIRMED",
             ),
         )
@@ -2913,6 +2922,14 @@ async def list_project_conflicts(
             l_part_expr.in_(norm_partitions),
         ]
     )
+
+    if src_filter:
+        predicates.append(
+            or_(
+                winner_doc.source_id == src_filter,
+                loser_doc.source_id == src_filter,
+            )
+        )
 
     if doc_filter:
         predicates.append(
@@ -3071,7 +3088,8 @@ async def _load_and_authorize_resolution_for_update(
     session: AsyncSession,
     *,
     tenant_id: str,
-    project_id: str,
+    project_id: str | None = None,
+    allowed_project_ids: Sequence[str] | set[str] | frozenset[str] | None = None,
     allowed_partition_ids: Sequence[str] | set[str] | frozenset[str],
     resolution_id: str,
 ) -> tuple[
@@ -3081,17 +3099,29 @@ async def _load_and_authorize_resolution_for_update(
     Document | None,
     DocumentVersion | None,
 ]:
+    if allowed_project_ids is not None:
+        scoped_projects = set(_normalize_id_set(allowed_project_ids))
+    elif isinstance(project_id, str) and project_id.strip():
+        scoped_projects = {project_id.strip()}
+    else:
+        scoped_projects = set()
+
+    if not tenant_id or not scoped_projects:
+        raise NotFoundError(f"Conflict resolution '{resolution_id}' not found")
+
     row = await session.scalar(
         select(KnowledgeConflictResolution)
         .where(KnowledgeConflictResolution.id == resolution_id)
         .with_for_update()
     )
-    if row is None or row.tenant_id != tenant_id or row.project_id != project_id:
+    if row is None or row.tenant_id != tenant_id or row.project_id not in scoped_projects:
         raise NotFoundError(f"Conflict resolution '{resolution_id}' not found")
 
     norm_partitions = set(_normalize_id_set(allowed_partition_ids))
     if (
-        row.security_partition_id not in norm_partitions
+        not row.security_partition_id
+        or not row.winner_security_partition_id
+        or row.security_partition_id not in norm_partitions
         or row.winner_security_partition_id not in norm_partitions
     ):
         raise ForbiddenError(
@@ -3121,7 +3151,7 @@ async def _load_and_authorize_resolution_for_update(
                 select(SourceProjectMapping.source_id).where(
                     SourceProjectMapping.source_id.in_(sorted(required_source_ids)),
                     SourceProjectMapping.organization_id == tenant_id,
-                    SourceProjectMapping.project_id == project_id,
+                    SourceProjectMapping.project_id == row.project_id,
                     SourceProjectMapping.state == "CONFIRMED",
                 )
             )
@@ -3137,7 +3167,8 @@ async def resolve_conflict(
     session: AsyncSession,
     *,
     tenant_id: str,
-    project_id: str,
+    project_id: str | None = None,
+    allowed_project_ids: Sequence[str] | set[str] | frozenset[str] | None = None,
     allowed_partition_ids: Sequence[str] | set[str] | frozenset[str],
     resolution_id: str,
     action: Literal["WINNER_B", "WINNER_A", "KEEP_BOTH_SCOPED"],
@@ -3153,6 +3184,7 @@ async def resolve_conflict(
             session,
             tenant_id=tenant_id,
             project_id=project_id,
+            allowed_project_ids=allowed_project_ids,
             allowed_partition_ids=allowed_partition_ids,
             resolution_id=resolution_id,
         )
@@ -3305,7 +3337,7 @@ async def resolve_conflict(
 
     await session.commit()
     await session.refresh(row)
-    _clear_project_caches_safely(project_id)
+    _clear_project_caches_safely(row.project_id)
     return row
 
 
@@ -3313,7 +3345,8 @@ async def reopen_conflict(
     session: AsyncSession,
     *,
     tenant_id: str,
-    project_id: str,
+    project_id: str | None = None,
+    allowed_project_ids: Sequence[str] | set[str] | frozenset[str] | None = None,
     allowed_partition_ids: Sequence[str] | set[str] | frozenset[str],
     resolution_id: str,
     reason: str,
@@ -3325,6 +3358,7 @@ async def reopen_conflict(
             session,
             tenant_id=tenant_id,
             project_id=project_id,
+            allowed_project_ids=allowed_project_ids,
             allowed_partition_ids=allowed_partition_ids,
             resolution_id=resolution_id,
         )
@@ -3378,7 +3412,7 @@ async def reopen_conflict(
 
     await session.commit()
     await session.refresh(row)
-    _clear_project_caches_safely(project_id)
+    _clear_project_caches_safely(row.project_id)
     return row
 
 
