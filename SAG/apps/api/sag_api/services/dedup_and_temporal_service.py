@@ -772,7 +772,8 @@ async def resolve_temporal_supersedes(
         .where(
             DocumentVersion.document_id == document_id,
             DocumentVersion.id != current_version.id,
-            DocumentVersion.search_status == "SEARCH_READY",
+            DocumentVersion.search_status.in_(("SEARCH_READY", "READY")),
+            DocumentVersion.status.notin_(("REVOKED", "FAILED")),
         )
         .order_by(DocumentVersion.valid_from.asc())
     )

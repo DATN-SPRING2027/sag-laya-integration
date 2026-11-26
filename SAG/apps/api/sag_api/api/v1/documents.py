@@ -63,8 +63,10 @@ from sag_api.schemas.routing_rag import (
     ProjectDocumentReadinessBatchResponse,
 )
 from sag_api.services.document_service import (
+    commit_document_version_metadata_patch,
     compact_logical_source_id,
     delete_document,
+    finalize_document_version_metadata_sync,
     get_document_version_chunks,
     get_document_version_status,
     get_or_create_project_source,
@@ -78,7 +80,6 @@ from sag_api.services.document_service import (
     resolve_project_document,
     resume_document,
     revoke_project_document,
-    update_document_version_metadata,
 )
 from sag_api.services.source_operation_service import source_document_mutation
 from sag_api.services.source_service import (
@@ -589,7 +590,7 @@ async def patch_source_document_metadata(
             f"Principal '{principal.subject}' is not authorized to access project '{project_id}'"
         )
     async with source_document_mutation(SessionLocal, source.id, "document-metadata-patch"):
-        return await update_document_version_metadata(
+        prepared = await commit_document_version_metadata_patch(
             session,
             tenant_id=principal.tenant_id,
             project_id=project_id,
@@ -597,9 +598,13 @@ async def patch_source_document_metadata(
             allowed_partition_ids=principal.allowed_partition_ids,
             version_no=payload.version_no,
             **_patch_metadata_kwargs(payload),
-            engine_manager=engine_manager,
-            job_queue=job_queue,
         )
+    return await finalize_document_version_metadata_sync(
+        session,
+        prepared,
+        engine_manager=engine_manager,
+        job_queue=job_queue,
+    )
 
 
 @router.get("/{document_id}", response_model=DocumentOut)
@@ -1170,7 +1175,7 @@ async def patch_project_document_metadata(
         document_id=document_id,
     )
     async with source_document_mutation(SessionLocal, source.id, "document-metadata-patch"):
-        return await update_document_version_metadata(
+        prepared = await commit_document_version_metadata_patch(
             session,
             tenant_id=principal.tenant_id,
             project_id=project_id,
@@ -1178,6 +1183,10 @@ async def patch_project_document_metadata(
             allowed_partition_ids=principal.allowed_partition_ids,
             version_no=payload.version_no,
             **_patch_metadata_kwargs(payload),
-            engine_manager=engine_manager,
-            job_queue=job_queue,
         )
+    return await finalize_document_version_metadata_sync(
+        session,
+        prepared,
+        engine_manager=engine_manager,
+        job_queue=job_queue,
+    )

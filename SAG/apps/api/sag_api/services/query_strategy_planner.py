@@ -196,6 +196,8 @@ def plan_query(
         resolved_as_of = _coerce_utc_datetime(as_of)
         if resolved_as_of is not None:
             reasons.append("EXPLICIT_AS_OF")
+            if clean_temporal != "change_lineage":
+                clean_temporal = "past_point"
     elif clean_temporal == "past_point":
         route_as_of = _coerce_utc_datetime(_route_field(route_decision, "as_of"))
         if route_as_of is not None:
@@ -233,7 +235,7 @@ def plan_query(
         multi_hop=multi_hop_eligible,
         exact_lookup=exact_lookup,
         constraints=constraints,
-        temporal_mode=str(temporal_mode) if temporal_mode else None,
+        temporal_mode=clean_temporal,
         entities=tuple(str(e).strip() for e in entities if str(e).strip()),
         as_of=resolved_as_of,
     )

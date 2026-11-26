@@ -238,11 +238,22 @@ def test_plan_query_as_of_gating_and_route_decision_query_fallback() -> None:
         assert p_other.retrieval_plan.as_trace()["temporal_mode"] == mode
         assert p_other.retrieval_plan.as_trace()["as_of"] is None
 
-    # 5. Explicit as_of overrides and normalizes naive datetime to UTC
+    # 5. Explicit as_of overrides, normalizes naive datetime to UTC, and promotes past_point
     explicit_dt = datetime(2025, 3, 1, 12, 0, 0)
     p_explicit = plan_query("Chính sách nghỉ phép", temporal_mode="atemporal", as_of=explicit_dt)
     assert p_explicit.retrieval_plan.as_of == datetime(2025, 3, 1, 12, 0, 0, tzinfo=UTC)
+    assert p_explicit.retrieval_plan.temporal_mode == "past_point"
     assert "EXPLICIT_AS_OF" in p_explicit.reason_codes
+
+    # 5b. Explicit as_of preserves change_lineage when router requested lineage comparison
+    p_lineage_as_of = plan_query(
+        "Chính sách nghỉ phép thay đổi thế nào?",
+        temporal_mode="change_lineage",
+        as_of=explicit_dt,
+    )
+    assert p_lineage_as_of.retrieval_plan.temporal_mode == "change_lineage"
+    assert p_lineage_as_of.retrieval_plan.as_of == datetime(2025, 3, 1, 12, 0, 0, tzinfo=UTC)
+    assert "EXPLICIT_AS_OF" in p_lineage_as_of.reason_codes
 
     # 6. rebuild_retrieval_plan_with_top_k preserves temporal_mode & as_of
     base = build_retrieval_plan(
@@ -253,3 +264,66 @@ def test_plan_query_as_of_gating_and_route_decision_query_fallback() -> None:
     rebuilt = rebuild_retrieval_plan_with_top_k(base, 12)
     assert rebuilt.temporal_mode == "past_point"
     assert rebuilt.as_of == datetime(2025, 6, 15, 23, 59, 59, 999999, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "hôm qua",
+        "tuần trước",
+        "tháng trước",
+        "quý trước",
+        "năm ngoái",
+        "yesterday",
+        "last week",
+        "last month",
+        "last quarter",
+        "last year",
+    ],
+)
+@pytest.mark.parametrize(
+    "ref",
+    [
+        datetime(1970, 1, 1, 0, 0, 0, tzinfo=UTC),
+        datetime(1969, 6, 1, 0, 0, 0, tzinfo=UTC),
+        datetime(2101, 6, 1, 0, 0, 0, tzinfo=UTC),
+    ],
+)
+def test_tier5_relative_out_of_range_reference_time_returns_none(
+    query: str, ref: datetime
+) -> None:
+    assert extract_as_of_datetime(query, reference_time=ref) is None
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "ngày 32 tháng 1 năm 2025",
+        "ngày 00 tháng 1 năm 2025",
+        "ngay 0 thang 1 nam 2025",
+        "ngày 15 tháng 13 năm 2025",
+        "ngày 15 tháng 00 năm 2025",
+    ],
+)
+def test_invalid_verbose_vn_dates_do_not_fall_through_to_month_or_year(query: str) -> None:
+    assert extract_as_of_datetime(query) is None
+
+
+def test_repeated_invalid_dates_400_tokens_under_5ms() -> None:
+    payloads = [
+        ("31/2/2025 " * 409)[:4090],
+        ("30 Feb 2025 " * 330)[:3960],
+        ("ngày 32 tháng 1 năm 2025 " * 170)[:4080],
+    ]
+    # Warm up regex/unicode caches once before timing
+    extract_as_of_datetime("31/2/2025")
+    for payload in payloads:
+        samples: list[float] = []
+        for _ in range(3):
+            t0 = time.perf_counter()
+            res = extract_as_of_datetime(payload)
+            samples.append((time.perf_counter() - t0) * 1000.0)
+            assert res is None
+        best_ms = min(samples)
+        assert best_ms < 5.0, f"Parser exceeded 5ms ({best_ms:.2f}ms) on repeated invalid dates"
+

@@ -962,3 +962,243 @@ async def test_rebuild_query_uses_pg16_safe_exists_without_select_distinct(sync_
         assert "COALESCE(" in rebuild_sql
         assert "ORDER BY" in rebuild_sql
         assert "SELECT DISTINCT" not in rebuild_sql
+
+
+@pytest.mark.asyncio
+async def test_reconcile_clears_stale_degraded_flag_when_failed_predecessor_revoked_or_deleted(
+    sync_db,
+):
+    """MINOR-1: If a failed predecessor version was revoked or its document deleted before
+    reconcile runs, reconcile_version_temporal_payloads must merge-clear stale degraded markers
+    on the surviving active version while preserving security_partition_id and unrelated keys,
+    without prematurely clearing still-active unsynced failed IDs."""
+    t1 = datetime(2024, 1, 1, tzinfo=UTC)
+    t2 = datetime(2025, 1, 1, tzinfo=UTC)
+    _store, _del, payload_calls, _idx, _state, handler = _make_qdrant_harness(
+        project_id="proj-stale",
+    )
+
+    async with sync_db() as session:
+        session.add(Source(id="src-stale", name="Stale", sag_source_config_id="cfg-stale"))
+        session.add_all(
+            [
+                Document(
+                    id="doc-active",
+                    source_id="src-stale",
+                    tenant_id="t-s",
+                    project_id="proj-stale",
+                    filename="active.md",
+                    storage_path="active.md",
+                    status=DocumentStatus.READY,
+                    is_active=True,
+                ),
+                Document(
+                    id="doc-deleted",
+                    source_id="src-stale",
+                    tenant_id="t-s",
+                    project_id="proj-stale",
+                    filename="deleted.md",
+                    storage_path="deleted.md",
+                    status=DocumentStatus.READY,
+                    is_active=False,
+                ),
+            ]
+        )
+        await session.flush()
+
+        # Predecessor 1: revoked on same doc; Predecessor 2: on soft-deleted doc
+        v1_revoked = DocumentVersion(
+            id="v1-revoked",
+            document_id="doc-active",
+            version_no=1,
+            file_hash="fh-s1",
+            valid_from=t1,
+            valid_to=t2,
+            status="REVOKED",
+            search_status="SEARCH_READY",
+            metadata_json={"security_partition_id": "part-s"},
+        )
+        v1_deleted = DocumentVersion(
+            id="v1-deleted",
+            document_id="doc-deleted",
+            version_no=1,
+            file_hash="fh-s-del",
+            valid_from=t1,
+            valid_to=MAX_VALID_TO,
+            status="READY",
+            search_status="SEARCH_READY",
+            metadata_json={"security_partition_id": "part-s"},
+        )
+        # Surviving v2 pointing only to now-dead predecessors
+        v2_stale = DocumentVersion(
+            id="v2-stale",
+            document_id="doc-active",
+            version_no=2,
+            file_hash="fh-s2",
+            valid_from=t2,
+            valid_to=MAX_VALID_TO,
+            status="READY",
+            search_status="SEARCH_READY",
+            metadata_json={
+                "security_partition_id": "part-s",
+                "custom_keep": "yes",
+                "qdrant_temporal_sync_degraded": True,
+                "qdrant_temporal_sync_degraded_reason": "temporal_payload_sync_failed",
+                "qdrant_temporal_sync_error": "HTTP 503",
+                "qdrant_temporal_sync_failed_version_ids": ["v1-revoked", "v1-deleted"],
+            },
+        )
+        # Another active version still legitimately unsynced
+        v3_live_unsynced = DocumentVersion(
+            id="v3-live",
+            document_id="doc-active",
+            version_no=3,
+            file_hash="fh-s3",
+            valid_from=t2 + timedelta(days=1),
+            valid_to=MAX_VALID_TO,
+            status="READY",
+            search_status="SEARCH_READY",
+            metadata_json={"security_partition_id": "part-s"},
+        )
+        # Partial version referencing one dead predecessor + one still-active version
+        v4_partial = DocumentVersion(
+            id="v4-partial",
+            document_id="doc-active",
+            version_no=4,
+            file_hash="fh-s4",
+            valid_from=t2 + timedelta(days=2),
+            valid_to=MAX_VALID_TO,
+            status="READY",
+            search_status="SEARCH_READY",
+            metadata_json={
+                "security_partition_id": "part-s",
+                "qdrant_temporal_sync_degraded": True,
+                "qdrant_temporal_sync_degraded_reason": "temporal_payload_sync_failed",
+                "qdrant_temporal_sync_error": "HTTP 503",
+                "qdrant_temporal_sync_failed_version_ids": ["v1-revoked", "v3-live"],
+            },
+        )
+        session.add_all([v1_revoked, v1_deleted, v2_stale, v3_live_unsynced, v4_partial])
+        await session.commit()
+
+        async with httpx.AsyncClient(
+            base_url="http://qdrant.local", transport=httpx.MockTransport(handler)
+        ) as q_client:
+            # Explicit reconcile targeting ONLY the now-dead versions
+            res = await search_index_service.reconcile_version_temporal_payloads(
+                session,
+                q_client,
+                project_id="proj-stale",
+                version_ids=["v1-revoked", "v1-deleted"],
+            )
+            await session.commit()
+
+            assert res["synced_versions"] == 0
+            assert payload_calls == []
+
+            await session.refresh(v2_stale)
+            assert v2_stale.metadata_json["qdrant_temporal_sync_degraded"] is False
+            assert "qdrant_temporal_sync_degraded_reason" not in v2_stale.metadata_json
+            assert "qdrant_temporal_sync_error" not in v2_stale.metadata_json
+            assert "qdrant_temporal_sync_failed_version_ids" not in v2_stale.metadata_json
+            assert v2_stale.metadata_json["security_partition_id"] == "part-s"
+            assert v2_stale.metadata_json["custom_keep"] == "yes"
+
+            # v4_partial pruned dead v1-revoked, but keeps degraded=True for still-active v3-live
+            await session.refresh(v4_partial)
+            assert v4_partial.metadata_json["qdrant_temporal_sync_degraded"] is True
+            assert v4_partial.metadata_json["qdrant_temporal_sync_failed_version_ids"] == ["v3-live"]
+            assert v4_partial.metadata_json["security_partition_id"] == "part-s"
+
+            # Now full discovery sweep (version_ids=None) syncs v3-live and clears v4_partial
+            res2 = await search_index_service.reconcile_version_temporal_payloads(
+                session,
+                q_client,
+                project_id="proj-stale",
+                version_ids=None,
+            )
+            await session.commit()
+            assert res2["synced_versions"] == 1
+            await session.refresh(v4_partial)
+            assert v4_partial.metadata_json["qdrant_temporal_sync_degraded"] is False
+            assert "qdrant_temporal_sync_failed_version_ids" not in v4_partial.metadata_json
+            assert v4_partial.metadata_json["security_partition_id"] == "part-s"
+
+
+@pytest.mark.asyncio
+async def test_resolve_temporal_supersedes_matches_legacy_ready_and_excludes_revoked_failed(sync_db):
+    """MINOR-2: resolve_temporal_supersedes accepts legacy search_status='READY' predecessors
+    and excludes status in ('REVOKED', 'FAILED') matching document_service."""
+    t1 = datetime(2024, 1, 1, tzinfo=UTC)
+    t2 = datetime(2025, 1, 1, tzinfo=UTC)
+
+    async with sync_db() as session:
+        session.add(Source(id="src-leg", name="Leg", sag_source_config_id="cfg-leg"))
+        session.add(
+            Document(
+                id="doc-leg",
+                source_id="src-leg",
+                tenant_id="t-leg",
+                project_id="p-leg",
+                filename="legacy.md",
+                storage_path="legacy.md",
+                status=DocumentStatus.READY,
+                is_active=True,
+            )
+        )
+        await session.flush()
+
+        v_legacy = DocumentVersion(
+            id="v-legacy",
+            document_id="doc-leg",
+            version_no=1,
+            file_hash="fh-l1",
+            effective_from=t1,
+            valid_from=t1,
+            valid_to=MAX_VALID_TO,
+            status="READY",
+            search_status="READY",
+        )
+        v_revoked = DocumentVersion(
+            id="v-revoked",
+            document_id="doc-leg",
+            version_no=2,
+            file_hash="fh-l2",
+            effective_from=t1 + timedelta(days=30),
+            valid_from=t1 + timedelta(days=30),
+            valid_to=MAX_VALID_TO,
+            status="REVOKED",
+            search_status="SEARCH_READY",
+        )
+        v_failed = DocumentVersion(
+            id="v-failed",
+            document_id="doc-leg",
+            version_no=3,
+            file_hash="fh-l3",
+            effective_from=t1 + timedelta(days=60),
+            valid_from=t1 + timedelta(days=60),
+            valid_to=MAX_VALID_TO,
+            status="FAILED",
+            search_status="SEARCH_READY",
+        )
+        v_new = DocumentVersion(
+            id="v-new",
+            document_id="doc-leg",
+            version_no=4,
+            file_hash="fh-l4",
+            effective_from=t2,
+            status="RECEIVED",
+            search_status="PENDING",
+        )
+        session.add_all([v_legacy, v_revoked, v_failed, v_new])
+        await session.flush()
+
+        res = await temporal_service.resolve_temporal_supersedes(
+            session, current_version=v_new, document_id="doc-leg"
+        )
+        assert res["action"] == "SUPERSEDED"
+        assert v_new.supersedes_id == "v-legacy"
+        assert v_legacy.valid_to == t2
+        assert v_revoked.valid_to == MAX_VALID_TO
+        assert v_failed.valid_to == MAX_VALID_TO
+

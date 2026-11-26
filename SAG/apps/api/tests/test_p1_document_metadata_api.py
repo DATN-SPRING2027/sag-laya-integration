@@ -896,6 +896,147 @@ async def test_reprocess_document_ignores_non_lifecycle_jobs(p1d_db, non_lifecyc
         fake_queue.enqueue.assert_awaited_once_with(new_job.id)
 
 
+@pytest.mark.asyncio
+async def test_reprocess_document_same_second_active_job_returns_existing_regardless_of_uuid(
+    p1d_db,
+):
+    """Same-second SUCCEEDED PROCESS_DOCUMENT with larger UUID ('ffffffff-...') must NEVER shadow
+    an active QUEUED REPROCESS_DOCUMENT with smaller UUID ('00000000-...')."""
+    fake_queue = SimpleNamespace(
+        enqueue=AsyncMock(),
+        begin_source_maintenance=lambda *_args, **_kwargs: None,
+    )
+    same_ts = datetime(2026, 11, 26, 9, 31, 40, tzinfo=UTC)
+    async with p1d_db() as session:
+        src = await _seed_source(session)
+        doc = Document(
+            id="doc-reproc-same-sec",
+            source_id=src.id,
+            tenant_id="tenant-p1d",
+            project_id="proj-p1d",
+            filename="policy.md",
+            storage_path="policy.md",
+            status=DocumentStatus.PENDING,
+            is_active=True,
+        )
+        session.add(doc)
+        await session.flush()
+
+        succeeded_job = Job(
+            id="ffffffff-ffff-ffff-ffff-ffffffffffff",
+            type=JobType.PROCESS_DOCUMENT,
+            source_id=src.id,
+            document_id=doc.id,
+            status=JobStatus.SUCCEEDED,
+            payload={"run_id": "run-old"},
+            created_at=same_ts,
+        )
+        queued_reproc = Job(
+            id="00000000-0000-0000-0000-000000000001",
+            type=JobType.REPROCESS_DOCUMENT,
+            source_id=src.id,
+            document_id=doc.id,
+            status=JobStatus.QUEUED,
+            payload={"target_document_id": doc.id},
+            created_at=same_ts,
+        )
+        session.add_all([succeeded_job, queued_reproc])
+        await session.commit()
+
+        returned_job = await reprocess_document(session, src, doc.id, job_queue=fake_queue)
+        assert returned_job.id == queued_reproc.id
+        assert returned_job.status == JobStatus.QUEUED
+        fake_queue.enqueue.assert_not_awaited()
+
+        all_jobs = list(
+            (await session.scalars(select(Job).where(Job.document_id == doc.id))).all()
+        )
+        assert len(all_jobs) == 2
+
+
+@pytest.mark.asyncio
+async def test_patch_metadata_releases_source_mutation_lease_before_qdrant_http_sync(
+    p1d_db, monkeypatch: pytest.MonkeyPatch
+):
+    """source_document_mutation lease protects PG write & commit, then releases BEFORE the
+    post-commit Qdrant HTTP set_payload network call on both project and source routes."""
+    from contextlib import asynccontextmanager
+
+    lease_state = {"active": False, "entries": 0}
+    qdrant_saw_lease_active: list[bool] = []
+    real_mutation = documents_api.source_document_mutation
+
+    @asynccontextmanager
+    async def tracked_mutation(*args, **kwargs):
+        async with real_mutation(*args, **kwargs):
+            lease_state["entries"] += 1
+            lease_state["active"] = True
+            try:
+                yield
+            finally:
+                lease_state["active"] = False
+
+    monkeypatch.setattr(documents_api, "source_document_mutation", tracked_mutation)
+
+    def qdrant_handler(request: httpx.Request) -> httpx.Response:
+        qdrant_saw_lease_active.append(lease_state["active"])
+        return httpx.Response(200, json={"result": {"status": "completed"}, "status": "ok"})
+
+    qdrant = httpx.AsyncClient(
+        transport=httpx.MockTransport(qdrant_handler),
+        base_url="http://qdrant.test",
+    )
+    principal = _make_principal()
+
+    try:
+        async with p1d_db() as session:
+            src = await _seed_source(session)
+            up = await handle_document_upload(
+                session,
+                tenant_id="tenant-p1d",
+                project_id="proj-p1d",
+                owner_id="user-p1d",
+                security_partition_id="part-a",
+                client_token="lease-tok-1",
+                file_bytes=b"# Lease\n\nContent.\n",
+                original_filename="lease.md",
+                content_type="text/markdown",
+                logical_source_id="lease-doc",
+                source_id=src.id,
+            )
+            ver = await session.get(DocumentVersion, up.version_id)
+            doc = await session.get(Document, up.document_id)
+            assert ver is not None and doc is not None
+            ver.status = "READY"
+            ver.search_status = "SEARCH_READY"
+            doc.status = DocumentStatus.READY
+            await session.commit()
+
+            app = _build_documents_app(session, principal=principal, qdrant_client=qdrant)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                r1 = await client.patch(
+                    f"/projects/proj-p1d/documents/{doc.id}/metadata",
+                    json={"authority_tier": 1},
+                )
+                assert r1.status_code == 200, r1.text
+                assert r1.json()["qdrant_payload_synced"] is True
+
+                r2 = await client.patch(
+                    f"/sources/{src.id}/documents/{doc.id}/metadata",
+                    json={"authority_tier": 2},
+                )
+                assert r2.status_code == 200, r2.text
+                assert r2.json()["qdrant_payload_synced"] is True
+
+            assert lease_state["entries"] == 2
+            assert lease_state["active"] is False
+            assert qdrant_saw_lease_active == [False, False]
+    finally:
+        await qdrant.aclose()
+
+
 # ---------------------------------------------------------------------------
 # 5. SearchRequest & GlobalSearchRequest Explicit as_of Normalization & Forwarding
 # ---------------------------------------------------------------------------
@@ -1036,6 +1177,7 @@ async def test_search_routes_forward_explicit_as_of_to_plan_query_and_preserve_s
             )
             assert r_src.status_code == 200, r_src.text
             assert captured_plans[-1].retrieval_plan.as_of == expected_as_of
+            assert captured_plans[-1].retrieval_plan.temporal_mode == "past_point"
             # Frozen SectionOut must NOT leak internal metadata fields
             sec_json = r_src.json()["sections"][0]
             assert "authority_tier" not in sec_json
@@ -1050,6 +1192,7 @@ async def test_search_routes_forward_explicit_as_of_to_plan_query_and_preserve_s
             )
             assert r_glob.status_code == 200, r_glob.text
             assert captured_plans[-1].retrieval_plan.as_of == expected_as_of
+            assert captured_plans[-1].retrieval_plan.temporal_mode == "past_point"
 
             # 5c. Streaming POST /search/stream preserves strict frozen SSE event set
             r_stream = await client.post(
@@ -1058,6 +1201,7 @@ async def test_search_routes_forward_explicit_as_of_to_plan_query_and_preserve_s
             )
             assert r_stream.status_code == 200, r_stream.text
             assert captured_plans[-1].retrieval_plan.as_of == expected_as_of
+            assert captured_plans[-1].retrieval_plan.temporal_mode == "past_point"
             sse_events = [
                 line.split(":", 1)[1].strip()
                 for line in r_stream.text.splitlines()

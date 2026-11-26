@@ -1640,59 +1640,77 @@ async def reconcile_version_temporal_payloads(
         )
     ).scalars().all()
 
-    if not versions:
-        return {"synced_versions": 0, "requested_versions": len(unique_ids)}
+    synced_ids: list[str] = []
+    if versions:
+        entries = build_mutated_version_entries(versions)
+        synced_ids = await sync_version_temporal_payloads_to_qdrant(
+            qdrant_client,
+            project_id=project_id,
+            mutated_versions=entries,
+            request_timeout=request_timeout,
+            allow_missing_collection=True,
+        )
 
-    entries = build_mutated_version_entries(versions)
-    synced_ids = await sync_version_temporal_payloads_to_qdrant(
-        qdrant_client,
-        project_id=project_id,
-        mutated_versions=entries,
-        request_timeout=request_timeout,
-        allow_missing_collection=True,
-    )
+    synced_set = set(synced_ids)
+    proj_rows = (
+        await session.execute(
+            select(DocumentVersion, Document.is_active)
+            .join(Document, Document.id == DocumentVersion.document_id)
+            .where(Document.project_id == project_id)
+        )
+    ).all()
+    active_ready_ids = {
+        str(ver.id)
+        for ver, doc_is_active in proj_rows
+        if bool(doc_is_active)
+        and ver.status not in ("FAILED", "REVOKED")
+        and ver.search_status in ("SEARCH_READY", "READY")
+    }
 
-    if synced_ids:
-        synced_set = set(synced_ids)
-        proj_versions_all = (
-            await session.execute(
-                select(DocumentVersion)
-                .join(Document, Document.id == DocumentVersion.document_id)
-                .where(Document.project_id == project_id)
-            )
-        ).scalars().all()
-        for ver in proj_versions_all:
-            meta = dict(ver.metadata_json or {})
-            has_degraded_marker = (
-                meta.get("qdrant_temporal_sync_degraded") is True
-                or "qdrant_temporal_sync_failed_version_ids" in meta
-                or "qdrant_temporal_sync_degraded_reason" in meta
-                or "qdrant_temporal_sync_error" in meta
-            )
-            if not has_degraded_marker:
+    mutated_any = False
+    for ver, _doc_is_active in proj_rows:
+        meta = dict(ver.metadata_json or {})
+        has_degraded_marker = (
+            meta.get("qdrant_temporal_sync_degraded") is True
+            or "qdrant_temporal_sync_failed_version_ids" in meta
+            or "qdrant_temporal_sync_degraded_reason" in meta
+            or "qdrant_temporal_sync_error" in meta
+        )
+        if not has_degraded_marker:
+            continue
+        raw_failed = meta.get("qdrant_temporal_sync_failed_version_ids")
+        failed_list = (
+            [str(x).strip() for x in raw_failed if str(x).strip()]
+            if isinstance(raw_failed, list)
+            else []
+        )
+        ver_id = str(ver.id)
+        if failed_list:
+            resolved_ids = {
+                fid for fid in failed_list if fid in synced_set or fid not in active_ready_ids
+            }
+            if not resolved_ids and ver_id not in synced_set:
                 continue
-            raw_failed = meta.get("qdrant_temporal_sync_failed_version_ids")
-            failed_list = (
-                [str(x).strip() for x in raw_failed if str(x).strip()]
-                if isinstance(raw_failed, list)
-                else []
-            )
-            if str(ver.id) not in synced_set and not synced_set.intersection(failed_list):
+            remaining_failed = [fid for fid in failed_list if fid not in resolved_ids]
+        else:
+            if ver_id not in synced_set and ver_id in active_ready_ids:
                 continue
-            remaining_failed = [fid for fid in failed_list if fid not in synced_set]
-            if not remaining_failed:
-                meta["qdrant_temporal_sync_degraded"] = False
-                meta.pop("qdrant_temporal_sync_degraded_reason", None)
-                meta.pop("qdrant_temporal_sync_error", None)
-                meta.pop("qdrant_temporal_sync_failed_version_ids", None)
-            else:
-                meta["qdrant_temporal_sync_degraded"] = True
-                meta["qdrant_temporal_sync_failed_version_ids"] = remaining_failed
-                meta["qdrant_temporal_sync_degraded_reason"] = (
-                    f"temporal_payload_sync_failed:{','.join(remaining_failed)}"
-                )
-            ver.metadata_json = meta
-            session.add(ver)
+            remaining_failed = []
+        if not remaining_failed:
+            meta["qdrant_temporal_sync_degraded"] = False
+            meta.pop("qdrant_temporal_sync_degraded_reason", None)
+            meta.pop("qdrant_temporal_sync_error", None)
+            meta.pop("qdrant_temporal_sync_failed_version_ids", None)
+        else:
+            meta["qdrant_temporal_sync_degraded"] = True
+            meta["qdrant_temporal_sync_failed_version_ids"] = remaining_failed
+            meta["qdrant_temporal_sync_degraded_reason"] = (
+                f"temporal_payload_sync_failed:{','.join(remaining_failed)}"
+            )
+        ver.metadata_json = meta
+        session.add(ver)
+        mutated_any = True
+    if mutated_any:
         await session.flush()
 
     return {"synced_versions": len(synced_ids), "requested_versions": len(unique_ids)}

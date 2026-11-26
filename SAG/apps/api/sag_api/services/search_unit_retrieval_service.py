@@ -2146,16 +2146,21 @@ async def _retrieve_search_unit_sections(
     strategy_plan = query_strategy_plan or plan_query(query, requested_top_k=top_k)
     temporal_mode = strategy_plan.retrieval_plan.temporal_mode
     as_of = strategy_plan.retrieval_plan.as_of
+    effective_temporal_mode = (
+        "past_point"
+        if as_of is not None and temporal_mode != "change_lineage"
+        else temporal_mode
+    )
     pinned_now = datetime.now(UTC)
-    if temporal_mode == "past_point" and as_of is not None:
+    if as_of is not None and temporal_mode != "change_lineage":
         reference_time = _as_utc(as_of) or pinned_now
         load_include_superseded = False
         allows_superseded = True
-    elif temporal_mode == "past_point":
+    elif effective_temporal_mode == "past_point":
         reference_time = pinned_now
         load_include_superseded = True
         allows_superseded = True
-    elif temporal_mode == "change_lineage":
+    elif effective_temporal_mode == "change_lineage":
         reference_time = pinned_now
         load_include_superseded = True
         allows_superseded = True
@@ -2909,7 +2914,7 @@ async def _retrieve_search_unit_sections(
             selected = group_sections_by_document(
                 fallback_pool,
                 limit=selection_limit,
-                temporal_mode=temporal_mode,
+                temporal_mode=effective_temporal_mode,
             )
         else:
             selected = fallback_pool[:selection_limit]
@@ -2944,7 +2949,7 @@ async def _retrieve_search_unit_sections(
             limit=None,
             subqueries=strategy_plan.retrieval_plan.decomposition.subqueries,
             entities=strategy_plan.retrieval_plan.entities,
-            temporal_mode=temporal_mode,
+            temporal_mode=effective_temporal_mode,
             reference_time=reference_time,
         )
         t_fusion_ms = round((time.perf_counter() - t_fusion_start) * 1000, 2)
@@ -2980,7 +2985,7 @@ async def _retrieve_search_unit_sections(
                 per_document_limit=per_doc_limit,
                 multi_hop=is_multi_hop_query,
                 entities=strategy_plan.retrieval_plan.entities,
-                temporal_mode=temporal_mode,
+                temporal_mode=effective_temporal_mode,
             )
         except TimeoutError:
             selection_fallback_reason = "diversity_budget_exhausted"
@@ -2990,7 +2995,7 @@ async def _retrieve_search_unit_sections(
                 selected = group_sections_by_document(
                     fused.sections,
                     limit=selection_limit,
-                    temporal_mode=temporal_mode,
+                    temporal_mode=effective_temporal_mode,
                 )
             else:
                 selected = fused.sections[:selection_limit]
@@ -3051,7 +3056,7 @@ async def _retrieve_search_unit_sections(
             has_required_anchors = int((diversity_stats or {}).get("required_anchor_count", 0) or 0) > 0
             allow_contradiction = bool(
                 has_required_anchors
-                or temporal_mode == "change_lineage"
+                or effective_temporal_mode == "change_lineage"
                 or effective_plan.retrieval_plan.answer_shape == AnswerShape.MULTI_FACET_COMPARE
                 or effective_plan.primary_strategy.value in {"ENTITY_RELATIONAL", "MULTI_HOP"}
             )
@@ -3126,7 +3131,7 @@ async def _retrieve_search_unit_sections(
                         per_document_limit=per_doc_limit,
                         multi_hop=is_multi_hop_mode,
                         entities=effective_plan.retrieval_plan.entities,
-                        temporal_mode=temporal_mode,
+                        temporal_mode=effective_temporal_mode,
                     )
                 except TimeoutError:
                     diversity_stats = {**diversity_stats, "reason": "diversity_budget_exhausted"}

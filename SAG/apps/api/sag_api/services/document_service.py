@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -538,26 +539,32 @@ async def reprocess_document(
     document = await get_document(session, source, document_id)
     if document.status in {DocumentStatus.DELETING, DocumentStatus.DELETE_FAILED}:
         raise ConflictError("Document is deleting or deletion failed, cannot reprocess")
+    lifecycle_types = [
+        JobType.PROCESS_DOCUMENT,
+        JobType.REPROCESS_DOCUMENT,
+        JobType.DELETE_DOCUMENT,
+    ]
+    active_job = await session.scalar(
+        select(Job)
+        .where(
+            Job.document_id == document.id,
+            Job.type.in_(lifecycle_types),
+            Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.PAUSED]),
+        )
+        .order_by(Job.created_at.desc(), Job.id.desc())
+        .limit(1)
+    )
+    if active_job is not None:
+        return active_job
     latest = await session.scalar(
         select(Job)
         .where(
             Job.document_id == document.id,
-            Job.type.in_(
-                [
-                    JobType.PROCESS_DOCUMENT,
-                    JobType.REPROCESS_DOCUMENT,
-                    JobType.DELETE_DOCUMENT,
-                ]
-            ),
+            Job.type.in_(lifecycle_types),
         )
         .order_by(Job.created_at.desc(), Job.id.desc())
+        .limit(1)
     )
-    if latest is not None and latest.status in {
-        JobStatus.QUEUED,
-        JobStatus.RUNNING,
-        JobStatus.PAUSED,
-    }:
-        return latest
     restart_from_scratch = document.status == DocumentStatus.READY
     retrying_cleanup = bool(
         latest is not None and latest.type == JobType.REPROCESS_DOCUMENT and latest.status == JobStatus.FAILED
@@ -2698,7 +2705,18 @@ async def revoke_project_document(
     return DocumentRevokeResponse(status="REVOKED", document_id=doc.id)
 
 
-async def update_document_version_metadata(
+@dataclass(slots=True)
+class PreparedMetadataPatchSync:
+    """Committed PostgreSQL metadata patch state awaiting post-lease Qdrant payload sync."""
+
+    project_id: str
+    doc: Document
+    target_ver: DocumentVersion
+    versions_to_sync: list[dict[str, Any]]
+    temporal_recomputed: bool
+
+
+async def commit_document_version_metadata_patch(
     session: AsyncSession,
     *,
     tenant_id: str,
@@ -2709,11 +2727,8 @@ async def update_document_version_metadata(
     authority_tier: int | str | None = _UNSET,
     effective_from: datetime | None = _UNSET,
     scope_tags: list[str] | None = _UNSET,
-    qdrant_client: Any | None = None,
-    engine_manager: Any | None = None,
-    job_queue: JobQueue | None = None,
-) -> DocumentMetadataPatchResponse:
-    """Apply a tri-state metadata PATCH to a DocumentVersion with fail-closed partition ACL."""
+) -> PreparedMetadataPatchSync:
+    """Apply and commit a tri-state metadata PATCH in PostgreSQL with fail-closed partition ACL."""
     fields_to_update = {
         field_name
         for field_name, field_value in (
@@ -2857,14 +2872,33 @@ async def update_document_version_metadata(
     from sag_api.api.v1.universe import clear_universe_caches
 
     clear_universe_caches(project_id)
+    return PreparedMetadataPatchSync(
+        project_id=project_id,
+        doc=doc,
+        target_ver=target_ver,
+        versions_to_sync=versions_to_sync,
+        temporal_recomputed=temporal_recomputed,
+    )
 
+
+async def finalize_document_version_metadata_sync(
+    session: AsyncSession,
+    prepared: PreparedMetadataPatchSync,
+    *,
+    qdrant_client: Any | None = None,
+    engine_manager: Any | None = None,
+    job_queue: JobQueue | None = None,
+) -> DocumentMetadataPatchResponse:
+    """Sync committed metadata changes to Qdrant outside mutation leases and format response."""
+    doc = prepared.doc
+    target_ver = prepared.target_ver
     qdrant_payload_synced, degraded, degraded_reason = (
         await _sync_temporal_payloads_with_reconcile(
             session,
-            project_id=project_id,
+            project_id=prepared.project_id,
             doc=doc,
             target_ver=target_ver,
-            versions_to_sync=versions_to_sync,
+            versions_to_sync=prepared.versions_to_sync,
             qdrant_client=qdrant_client,
             engine_manager=engine_manager,
             job_queue=job_queue,
@@ -2884,8 +2918,44 @@ async def update_document_version_metadata(
         ),
         valid_from=_as_utc_dt(target_ver.valid_from) or datetime.now(UTC),
         valid_to=_as_utc_dt(target_ver.valid_to) or _MAX_VALID_TO,
-        temporal_recomputed=temporal_recomputed,
+        temporal_recomputed=prepared.temporal_recomputed,
         qdrant_payload_synced=qdrant_payload_synced,
         degraded=degraded,
         degraded_reason=degraded_reason,
+    )
+
+
+async def update_document_version_metadata(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    project_id: str,
+    document_id: str,
+    allowed_partition_ids: frozenset[str] | set[str],
+    version_no: int | None = None,
+    authority_tier: int | str | None = _UNSET,
+    effective_from: datetime | None = _UNSET,
+    scope_tags: list[str] | None = _UNSET,
+    qdrant_client: Any | None = None,
+    engine_manager: Any | None = None,
+    job_queue: JobQueue | None = None,
+) -> DocumentMetadataPatchResponse:
+    """Apply a tri-state metadata PATCH to a DocumentVersion with fail-closed partition ACL."""
+    prepared = await commit_document_version_metadata_patch(
+        session,
+        tenant_id=tenant_id,
+        project_id=project_id,
+        document_id=document_id,
+        allowed_partition_ids=allowed_partition_ids,
+        version_no=version_no,
+        authority_tier=authority_tier,
+        effective_from=effective_from,
+        scope_tags=scope_tags,
+    )
+    return await finalize_document_version_metadata_sync(
+        session,
+        prepared,
+        qdrant_client=qdrant_client,
+        engine_manager=engine_manager,
+        job_queue=job_queue,
     )

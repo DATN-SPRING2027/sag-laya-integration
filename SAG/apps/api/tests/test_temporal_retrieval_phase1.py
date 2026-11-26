@@ -1030,3 +1030,151 @@ def test_post_ood_rerank_tilt_invariants(monkeypatch: pytest.MonkeyPatch) -> Non
     )
     assert res_sat.sections[0].chunk_id == "z-sat-t1"
     assert res_sat.sections[1].chunk_id == "a-sat-t4"
+
+
+@pytest.mark.asyncio
+async def test_explicit_as_of_override_promotes_past_point_and_retrieves_historical_v1_end_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """E2E regression for MAJOR-1: explicit API `as_of` on a plain query where decision_router
+    returns `temporal_mode='atemporal'` MUST promote `past_point` and return ONLY v1 (not v2),
+    and defense-in-depth in `_retrieve_search_unit_sections` MUST honor `as_of` even if a caller
+    passes a RetrievalPlan whose `temporal_mode` was not promoted."""
+    from dataclasses import replace
+
+    from sag_api.api.v1 import search as search_api
+    from sag_api.services.retrieval_plan import build_retrieval_plan
+
+    v1_from = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+    v2_from = datetime(2025, 6, 15, 0, 0, 0, tzinfo=UTC)
+    v_inf = datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC)
+    as_of_2024 = datetime(2024, 6, 1, 23, 59, 59, 999999, tzinfo=UTC)
+
+    c1 = "Hạn mức công tác phí tiêu chuẩn áp dụng cho nhân viên là 100 triệu đồng mỗi năm."
+    c2 = "Hạn mức công tác phí tiêu chuẩn áp dụng cho nhân viên là 200 triệu đồng mỗi năm."
+    plain_query = "Hạn mức công tác phí tiêu chuẩn áp dụng cho nhân viên là bao nhiêu?"
+
+    db_engine, _factory, src = await _seed_versioned_db(
+        monkeypatch,
+        [
+            {
+                "document_id": "doc-travel",
+                "version_id": "v1",
+                "version_no": 1,
+                "valid_from": v1_from,
+                "valid_to": v2_from,
+                "authority_tier": 2,
+                "effective_from": v1_from,
+                "scope_tags_json": ["finance", "vn"],
+                "units": [("u-v1", "Công tác phí V1", c1)],
+            },
+            {
+                "document_id": "doc-travel",
+                "version_id": "v2",
+                "version_no": 2,
+                "valid_from": v2_from,
+                "valid_to": v_inf,
+                "authority_tier": 1,
+                "effective_from": v2_from,
+                "scope_tags_json": ["finance", "vn"],
+                "units": [("u-v2", "Công tác phí V2", c2)],
+            },
+        ],
+    )
+
+    class _AtemporalRouteDecision:
+        def to_dict(self) -> dict:
+            return {
+                "coarse_intent": "KNOWLEDGE",
+                "question_scope": "scoped",
+                "is_chitchat": False,
+                "need_retrieval": True,
+                "suggested_strategy": "hybrid",
+                "answer_shape": "fact_answer",
+                "intent_flags": {"needs_retrieval": True},
+                "confidence": 0.95,
+                "model": "mock-router",
+                "degraded": False,
+                "degraded_reason": None,
+                "fallback_used": False,
+                "fallback_reason": None,
+                "reason_codes": [],
+                "order_mode": "relevance",
+                "explicit_count": None,
+                "target_unit": "passage",
+                "is_catalog_query": False,
+                "retrieval_mode_hint": "auto",
+                "temporal_mode": "atemporal",
+                "subqueries": [],
+                "entities": [],
+                "query": plain_query,
+            }
+
+    monkeypatch.setattr(
+        search_api,
+        "route_query_async",
+        AsyncMock(return_value=_AtemporalRouteDecision()),
+    )
+    routing_spy = AsyncMock(
+        side_effect=AssertionError("Tree routing MUST be bypassed when explicit as_of is active")
+    )
+    monkeypatch.setattr(surs, "capture_routing_decisions", routing_spy)
+    monkeypatch.setattr(surs, "_query_vector", AsyncMock(return_value=[1.0, 0.0]))
+
+    qdrant_points = {
+        "v1": [_qdrant_point("v1", "u-v1", c1, 0.89)],
+        "v2": [_qdrant_point("v2", "u-v2", c2, 0.95)],
+    }
+
+    try:
+        # 1. Real _build_query_route -> real retrieve_search_unit_sections (NOT mocked!)
+        route_plan = await search_api._build_query_route(
+            plain_query,
+            [_SOURCE_ID],
+            None,
+            as_of=as_of_2024,
+        )
+        assert route_plan.strategy_plan.retrieval_plan.temporal_mode == "past_point"
+        assert route_plan.strategy_plan.retrieval_plan.as_of == as_of_2024
+        assert "EXPLICIT_AS_OF" in route_plan.strategy_plan.reason_codes
+
+        async with _make_mock_qdrant_client(qdrant_points) as client:
+            engine = SimpleNamespace(get_search_unit_qdrant_client=AsyncMock(return_value=client))
+            outcome = await surs.retrieve_search_unit_sections(
+                engine,
+                [src],
+                plain_query,
+                principal=_principal(),
+                top_k=5,
+                query_strategy_plan=route_plan.strategy_plan,
+            )
+            assert [s.document_version_id for s in outcome.sections] == ["v1"]
+            assert outcome.sections[0].content == c1
+            assert outcome.sections[0].is_superseded is True
+
+            # 2. Defense-in-depth: manually crafted plan with temporal_mode='atemporal' + as_of
+            # MUST still pin reference_time=as_of, bypass tree routing, and return ONLY v1!
+            unpromoted_rp = build_retrieval_plan(
+                plain_query,
+                temporal_mode="atemporal",
+                as_of=as_of_2024,
+            )
+            unpromoted_plan = replace(route_plan.strategy_plan, retrieval_plan=unpromoted_rp)
+            assert unpromoted_plan.retrieval_plan.temporal_mode == "atemporal"
+
+            outcome_did = await surs.retrieve_search_unit_sections(
+                engine,
+                [src],
+                plain_query,
+                principal=_principal(),
+                top_k=5,
+                query_strategy_plan=unpromoted_plan,
+            )
+            assert [s.document_version_id for s in outcome_did.sections] == ["v1"]
+            assert outcome_did.sections[0].content == c1
+            assert outcome_did.sections[0].is_superseded is True
+
+        routing_spy.assert_not_called()
+    finally:
+        await db_engine.dispose()
+
