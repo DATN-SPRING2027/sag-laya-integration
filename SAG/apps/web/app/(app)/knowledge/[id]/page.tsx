@@ -14,6 +14,7 @@ import {
   Orbit,
   Plus,
   RefreshCw,
+  Scale,
   Search,
   TriangleAlert,
 } from "lucide-react";
@@ -198,6 +199,28 @@ export default function SourceDetailPage() {
               </Button>
             </TooltipTrigger>
             <TooltipContent side="bottom">{tCard("export")}</TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                asChild
+                variant="outline"
+                size="icon"
+                aria-label={t("sourceConflicts")}
+                title={t("sourceConflicts")}
+              >
+                <Link
+                  href={
+                    source
+                      ? `/knowledge/conflicts?source=${encodeURIComponent(source.id)}`
+                      : "/knowledge/conflicts"
+                  }
+                >
+                  <Scale className="size-4" />
+                </Link>
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">{t("sourceConflicts")}</TooltipContent>
           </Tooltip>
           <Tooltip>
             <TooltipTrigger asChild>

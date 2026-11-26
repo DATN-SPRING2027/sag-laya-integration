@@ -589,7 +589,10 @@
       "cancelled": "Import cancelled",
       "expired": "Import expired"
     },
-    "exportOctx": "Export as .octx"
+    "exportOctx": "Export as .octx",
+    "conflicts": "Xung đột",
+    "conflictsPendingAria": "{count, number} xung đột đang chờ duyệt",
+    "sourceConflicts": "Xung đột của nguồn này"
   },
   "SearchStrategies": {
     "vectorLabel": "Fast (vector)",
@@ -1920,6 +1923,131 @@
       "supersessionChainTitle": "Chuỗi kế thừa quyết định #{index, number}",
       "decisionStateTitle": "Trạng thái quyết định #{index, number}",
       "supersededTransition": "Đề xuất cũ được thay thế bởi quyết định mới hơn"
+    }
+  },
+  "ConflictInbox": {
+    "title": "Hộp thư xử lý xung đột tri thức",
+    "description": "Đối chiếu và phân xử các đoạn nội dung mâu thuẫn giữa các phiên bản và cấp thẩm quyền. Quyết định được áp dụng ngay vào thứ tự ưu tiên truy xuất và nhật ký kiểm toán.",
+    "refresh": "Làm mới",
+    "retry": "Thử lại",
+    "tabs": {
+      "aria": "Lọc xung đột theo trạng thái",
+      "pending": "Chờ duyệt",
+      "active": "Đang hiệu lực",
+      "scoped": "Song song theo phạm vi",
+      "all": "Tất cả"
+    },
+    "filters": {
+      "subtypeAria": "Lọc theo phân loại xung đột",
+      "allSubtypes": "Tất cả phân loại",
+      "documentPlaceholder": "Lọc theo mã tài liệu hoặc nguồn logic…",
+      "documentAria": "Lọc theo mã tài liệu",
+      "clearDocument": "Xóa bộ lọc tài liệu",
+      "includeInactive": "Hiển thị mục đã lưu trữ",
+      "sourceChip": "Nguồn: {sourceId}",
+      "clearSource": "Bỏ lọc theo nguồn",
+      "resetAll": "Đặt lại bộ lọc"
+    },
+    "summary": {
+      "showing": "Đang hiển thị {start, number}–{end, number} trên tổng số {total, number} xung đột",
+      "zero": "Không có xung đột nào khớp bộ lọc hiện tại",
+      "page": "Trang {page, number} / {totalPages, number}"
+    },
+    "statuses": {
+      "PENDING_REVIEW": "Chờ duyệt",
+      "NEEDS_REVALIDATION": "Cần thẩm định lại",
+      "ACTIVE": "Đang hiệu lực",
+      "DISMISSED_SCOPED": "Giữ cả hai theo phạm vi",
+      "REVOKED_WINNER": "Bản thắng đã thu hồi",
+      "SUPERSEDED_BY_UPDATE": "Đã thay thế bởi cập nhật mới"
+    },
+    "subtypes": {
+      "DIRECT_SUPERSEDES": "Thay thế trực tiếp",
+      "HARD_CONTRADICTION": "Mâu thuẫn trực tiếp",
+      "SCOPED_EXCEPTION": "Ngoại lệ theo phạm vi",
+      "DIFFERENT_PERSPECTIVE": "Khác góc nhìn",
+      "SUPPORTS_OR_EQUIVALENT": "Bổ trợ hoặc tương đương"
+    },
+    "modes": {
+      "AUTO_POLICY": "Chính sách tự động",
+      "MANUAL_HITL": "Phân xử thủ công",
+      "UNRESOLVED": "Chưa xử lý",
+      "KEEP_BOTH_SCOPED": "Giữ song song theo phạm vi"
+    },
+    "tiers": {
+      "tier1": "Chính thức",
+      "tier2": "Quy định",
+      "tier3": "Tham khảo",
+      "tier4": "Nháp",
+      "badge": "{code} · {label}"
+    },
+    "precedence": {
+      "bHigher": "Bên B cao hơn ({codeB} > {codeA})",
+      "aHigher": "Bên A cao hơn ({codeA} > {codeB})",
+      "equal": "Đồng cấp ({codeA} = {codeB})"
+    },
+    "metrics": {
+      "confidence": "Tin cậy {value}",
+      "cosine": "Cosine {value}"
+    },
+    "degraded": {
+      "title": "Đang dùng chế độ dự phòng heuristic",
+      "description": "Bộ phân loại LLM tự động đã chuyển sang tín hiệu dự phòng cho cặp này. Vui lòng đọc kỹ cả hai trích đoạn trước khi chốt quyết định."
+    },
+    "sides": {
+      "baselineA": "Bên A · Bản gốc",
+      "proposedB": "Bên B · Bản đề xuất",
+      "activeWinner": "Bên B · Bản đang hiệu lực",
+      "superseded": "Bên A · Đã bị thay thế",
+      "scopedA": "Bên A · Theo phạm vi",
+      "scopedB": "Bên B · Theo phạm vi",
+      "sideA": "Bên A · Lưu trữ",
+      "sideB": "Bên B · Lưu trữ",
+      "version": "v{version, number}",
+      "effectiveFrom": "Hiệu lực {date}",
+      "partition": "Phân vùng {id}",
+      "noExcerpt": "Không có trích đoạn văn bản được lưu cho đơn vị này."
+    },
+    "details": {
+      "reason": "Lý do đánh giá",
+      "scopeDifference": "Khác biệt phạm vi",
+      "effectiveValidTo": "Bản cũ có hiệu lực đến {date}",
+      "resolvedBy": "Người xử lý: {actor}",
+      "resolvedAt": "Xử lý lúc {at}"
+    },
+    "actions": {
+      "reasonLabel": "Lý do quyết định (tùy chọn)",
+      "reasonPlaceholder": "Nhập lý do lưu vào nhật ký kiểm toán (tối đa 2.000 ký tự)…",
+      "keepSideB": "Giữ Bên B",
+      "keepSideA": "Giữ Bên A",
+      "keepBothScoped": "Giữ cả hai (Phân phạm vi)",
+      "reopen": "Mở lại để duyệt",
+      "archivedNotice": "Bản ghi xung đột này đã được lưu trữ ở chế độ chỉ đọc do phiên bản liên quan đã bị thu hồi hoặc thay thế."
+    },
+    "audit": {
+      "toggle": "Nhật ký kiểm toán ({count, number})",
+      "empty": "Chưa có bản ghi lịch sử nào.",
+      "actor": "Thực hiện bởi: {actor}",
+      "transition": "{from} → {to}"
+    },
+    "pagination": {
+      "previous": "Trang trước",
+      "next": "Trang sau"
+    },
+    "empty": {
+      "title": "Không có xung đột nào",
+      "description": "Hiện không có xung đột tri thức nào cần xử lý trong hàng đợi này.",
+      "filteredDescription": "Không có bản ghi xung đột nào khớp với trạng thái, phân loại hoặc nguồn đang chọn."
+    },
+    "errors": {
+      "loadFailed": "Không thể tải danh sách xung đột"
+    },
+    "toasts": {
+      "resolvedWinnerB": "Đã lưu quyết định: chọn Bên B làm bản có hiệu lực.",
+      "resolvedWinnerA": "Đã lưu quyết định: giữ Bên A làm bản có hiệu lực.",
+      "resolvedKeepBoth": "Đã lưu quyết định: giữ song song cả hai bên theo phạm vi.",
+      "reopened": "Đã mở lại xung đột và chuyển về hàng đợi chờ duyệt.",
+      "actionError": "Không thể cập nhật quyết định xung đột."
     }
   }
 }

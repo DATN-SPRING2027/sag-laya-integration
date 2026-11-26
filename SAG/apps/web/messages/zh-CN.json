@@ -589,7 +589,10 @@
       "cancelled": "导入已取消",
       "expired": "导入任务已过期"
     },
-    "exportOctx": "导出为 .octx"
+    "exportOctx": "导出为 .octx",
+    "conflicts": "冲突裁决",
+    "conflictsPendingAria": "{count, number} 条待审冲突",
+    "sourceConflicts": "查看此信源冲突"
   },
   "SearchStrategies": {
     "vectorLabel": "快速(vector)",
@@ -1920,6 +1923,131 @@
       "supersessionChainTitle": "决策替代链路 #{index, number}",
       "decisionStateTitle": "决策状态记录 #{index, number}",
       "supersededTransition": "旧方案已被更新确认的决策替代"
+    }
+  },
+  "ConflictInbox": {
+    "title": "知识冲突裁决收件箱",
+    "description": "并排比对跨版本与跨权威级别的矛盾条款。人工裁决将即时更新检索生效优先级并写入审计日志。",
+    "refresh": "刷新",
+    "retry": "重试",
+    "tabs": {
+      "aria": "按状态筛选冲突",
+      "pending": "待人工复核",
+      "active": "已生效",
+      "scoped": "分范围共存",
+      "all": "全部"
+    },
+    "filters": {
+      "subtypeAria": "按冲突类型筛选",
+      "allSubtypes": "全部类型",
+      "documentPlaceholder": "按文档 ID 或逻辑信源筛选…",
+      "documentAria": "按文档 ID 筛选",
+      "clearDocument": "清除文档筛选",
+      "includeInactive": "包含已归档记录",
+      "sourceChip": "信源：{sourceId}",
+      "clearSource": "清除信源筛选",
+      "resetAll": "重置筛选"
+    },
+    "summary": {
+      "showing": "当前显示第 {start, number}–{end, number} 条，共 {total, number} 条冲突",
+      "zero": "当前筛选条件下无冲突记录",
+      "page": "第 {page, number} / {totalPages, number} 页"
+    },
+    "statuses": {
+      "PENDING_REVIEW": "待人工复核",
+      "NEEDS_REVALIDATION": "需重新复核",
+      "ACTIVE": "已生效",
+      "DISMISSED_SCOPED": "分范围共存",
+      "REVOKED_WINNER": "生效方已撤销",
+      "SUPERSEDED_BY_UPDATE": "已被新版本替代"
+    },
+    "subtypes": {
+      "DIRECT_SUPERSEDES": "直接替代",
+      "HARD_CONTRADICTION": "硬性矛盾",
+      "SCOPED_EXCEPTION": "范围例外",
+      "DIFFERENT_PERSPECTIVE": "视角差异",
+      "SUPPORTS_OR_EQUIVALENT": "相互印证或等价"
+    },
+    "modes": {
+      "AUTO_POLICY": "策略自动裁决",
+      "MANUAL_HITL": "人工裁决",
+      "UNRESOLVED": "未裁决",
+      "KEEP_BOTH_SCOPED": "分范围保留"
+    },
+    "tiers": {
+      "tier1": "官方正式",
+      "tier2": "政策制度",
+      "tier3": "参考指南",
+      "tier4": "草稿",
+      "badge": "{code} · {label}"
+    },
+    "precedence": {
+      "bHigher": "B 方级别更高（{codeB} > {codeA}）",
+      "aHigher": "A 方级别更高（{codeA} > {codeB}）",
+      "equal": "权威级别相同（{codeA} = {codeB}）"
+    },
+    "metrics": {
+      "confidence": "置信度 {value}",
+      "cosine": "余弦 {value}"
+    },
+    "degraded": {
+      "title": "已降级至启发式判定",
+      "description": "该冲突对的自动 LLM 分类已回退为启发式信号，请务必人工核对双方原文后再做裁决。"
+    },
+    "sides": {
+      "baselineA": "A 方 · 基线版本",
+      "proposedB": "B 方 · 候选版本",
+      "activeWinner": "B 方 · 当前生效",
+      "superseded": "A 方 · 已被替代",
+      "scopedA": "A 方 · 分范围保留",
+      "scopedB": "B 方 · 分范围保留",
+      "sideA": "A 方 · 已归档",
+      "sideB": "B 方 · 已归档",
+      "version": "v{version, number}",
+      "effectiveFrom": "生效于 {date}",
+      "partition": "分区 {id}",
+      "noExcerpt": "该知识单元未记录文本快照。"
+    },
+    "details": {
+      "reason": "判定说明",
+      "scopeDifference": "适用范围差异",
+      "effectiveValidTo": "旧版有效至 {date}",
+      "resolvedBy": "裁决人：{actor}",
+      "resolvedAt": "裁决时间：{at}"
+    },
+    "actions": {
+      "reasonLabel": "裁决说明（可选）",
+      "reasonPlaceholder": "可选填写写入审计日志的裁决依据（最多 2,000 字）…",
+      "keepSideB": "采纳 B 方",
+      "keepSideA": "保留 A 方",
+      "keepBothScoped": "分范围双保留",
+      "reopen": "重新打开复核",
+      "archivedNotice": "该冲突记录因涉及版本已撤销或被后续更新替代，现已归档为只读状态。"
+    },
+    "audit": {
+      "toggle": "审计轨迹（{count, number}）",
+      "empty": "暂无审计记录。",
+      "actor": "操作者：{actor}",
+      "transition": "{from} → {to}"
+    },
+    "pagination": {
+      "previous": "上一页",
+      "next": "下一页"
+    },
+    "empty": {
+      "title": "暂无冲突记录",
+      "description": "当前队列中没有待处理或已记录的知识冲突。",
+      "filteredDescription": "没有符合当前状态、类型或信源筛选条件的冲突记录。"
+    },
+    "errors": {
+      "loadFailed": "加载冲突列表失败"
+    },
+    "toasts": {
+      "resolvedWinnerB": "裁决已保存：已将 B 方设为当前生效版本。",
+      "resolvedWinnerA": "裁决已保存：已保留 A 方作为生效版本。",
+      "resolvedKeepBoth": "裁决已保存：已将双方设为分范围共存。",
+      "reopened": "已重新打开冲突并退回待复核队列。",
+      "actionError": "更新冲突裁决失败。"
     }
   }
 }

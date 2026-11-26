@@ -11,10 +11,12 @@ import {
   List,
   Plus,
   RotateCw,
+  Scale,
   Upload,
 } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 
+import { api } from "@/lib/api";
 import { relativeTime } from "@/lib/format";
 import type { Source } from "@/lib/types";
 import { dispatchUniverseSourceFocus } from "@/lib/universe-events";
@@ -29,6 +31,7 @@ import { PageHeader } from "@/components/features/page-header";
 import { SourceCard } from "@/components/features/source-card";
 import { SourceIdCopy } from "@/components/features/source-id-copy";
 import { SourceCreateForm } from "@/components/features/source-create-form";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
@@ -133,6 +136,7 @@ export function KnowledgeWorkspace({
   const { sources, error, ensureLoaded, refresh, addSource } = useKnowledgeWorkspace();
   const [view, setView] = React.useState<View>("grid");
   const [creating, setCreating] = React.useState(false);
+  const [pendingConflicts, setPendingConflicts] = React.useState(0);
   const [selectedSource, setSelectedSource] = React.useState<{
     id: string;
     initialScreen: "documents" | "add";
@@ -164,6 +168,27 @@ export function KnowledgeWorkspace({
   }, [active, ensureLoaded, refresh, variant]);
 
   React.useEffect(() => {
+    if (!active) return;
+    let cancelled = false;
+    void api
+      .listConflicts(
+        { status: ["PENDING_REVIEW", "NEEDS_REVALIDATION"], limit: 1 },
+        { redirectOnUnauthorized: false },
+      )
+      .then((res) => {
+        if (!cancelled) {
+          setPendingConflicts(Number.isFinite(res.total) ? Math.max(0, res.total) : 0);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setPendingConflicts(0);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [active]);
+
+  React.useEffect(() => {
     if (variant !== "normal") return;
     const saved = window.localStorage.getItem("sag:knowledge-view");
     if (saved === "list") setView("list");
@@ -173,6 +198,11 @@ export function KnowledgeWorkspace({
     setView(next);
     window.localStorage.setItem("sag:knowledge-view", next);
   };
+
+  const conflictsAria =
+    pendingConflicts > 0
+      ? t("conflictsPendingAria", { count: pendingConflicts })
+      : t("conflicts");
 
   if (variant === "compact") {
     if (selectedSource) {
@@ -213,6 +243,26 @@ export function KnowledgeWorkspace({
                   {sources === null ? t("syncing") : t("sourcesCount", { count: sources.length })}
                 </p>
               </div>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    asChild
+                    variant="ghost"
+                    size="icon"
+                    className="relative size-7"
+                    aria-label={conflictsAria}
+                    title={conflictsAria}
+                  >
+                    <Link href="/knowledge/conflicts">
+                      <Scale className="size-3.5" />
+                      {pendingConflicts > 0 && (
+                        <span className="absolute right-1 top-1 size-1.5 rounded-full bg-destructive" />
+                      )}
+                    </Link>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">{conflictsAria}</TooltipContent>
+              </Tooltip>
               <Button
                 type="button"
                 variant="ghost"
@@ -347,6 +397,25 @@ export function KnowledgeWorkspace({
                 <List />
               </ToggleGroupItem>
             </ToggleGroup>
+            <Button
+              asChild
+              variant="outline"
+              size="sm"
+              aria-label={conflictsAria}
+            >
+              <Link href="/knowledge/conflicts">
+                <Scale className="size-3.5" />
+                <span>{t("conflicts")}</span>
+                {pendingConflicts > 0 && (
+                  <Badge
+                    variant="destructive"
+                    className="ml-0.5 h-4 min-w-4 justify-center px-1 text-[10px] tabular-nums leading-none"
+                  >
+                    {pendingConflicts > 99 ? "99+" : pendingConflicts}
+                  </Badge>
+                )}
+              </Link>
+            </Button>
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button
