@@ -1831,6 +1831,154 @@ async def test_p6_rework_18_challenger_r6_crlf_long_fence_mid_para_fence_and_bla
     assert await _run_deltas(list(raw_inline60), canon_inline60) == canon_inline60
 
 
+# ---------------------------------------------------------------------------
+# Item 19 (REV-R7-1..3 / CHAL-R7-1..4): Single-pass state derivation (no false
+# fence open/close on truncated flushed prefixes), closing backtick EOF hold,
+# and unterminated backtick fence lookahead during streaming
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_p6_rework_19_single_pass_sse_state_closing_bt_eof_and_unterminated_bt_fence(
+    monkeypatch,
+) -> None:
+    agent = SimpleNamespace(id="agent-r7", name="R7Bot", persona={"web_enabled": True})
+    monkeypatch.setattr(openai_api.svc, "get_agent", AsyncMock(return_value=agent))
+    monkeypatch.setattr(openai_api.svc, "resolve_sources", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        openai_api.svc,
+        "build_ask_context",
+        lambda **kw: SimpleNamespace(
+            source_ids=[],
+            citations=[],
+            session_citations=[],
+            route_decision={"coarse_intent": "CHAT", "degraded": False},
+        ),
+    )
+
+    async def _run_deltas(deltas: list[str], canonical: str) -> str:
+        async def fake_stream(*args, **kwargs):
+            yield SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}})
+            for d in deltas:
+                yield SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": d}})
+            yield SimpleNamespace(
+                type=EventType.RUN_COMPLETED.value,
+                data={"payload": {"output": canonical, "citations": [], "degraded": False}},
+            )
+
+        monkeypatch.setattr(openai_api.agent_service, "generate_stream", fake_stream)
+        body = openai_api.ChatCompletionRequest(
+            messages=[openai_api.ChatMessage(role="user", content="code")],
+            stream=True,
+        )
+        resp = await openai_api.chat_completions(
+            agent_id="agent-r7",
+            body=body,
+            _user=SimpleNamespace(id="u-1", name="Tester"),
+            owner_key="owner-1",
+            principal=SimpleNamespace(tenant_id="t-1", organization_id="o-1", user_id="u-1"),
+            session=SimpleNamespace(),
+            engine_manager=SimpleNamespace(),
+            llm=SimpleNamespace(configured=True),
+            tool_registry=SimpleNamespace(),
+            agent_runtime=SimpleNamespace(),
+        )
+        out_chunks: list[str] = []
+        async for raw in resp.body_iterator:
+            text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+            for line in text.splitlines():
+                if not line.startswith("data: ") or line == "data: [DONE]":
+                    continue
+                payload = json.loads(line[len("data: ") :])
+                delta = (payload.get("choices") or [{}])[0].get("delta") or {}
+                if delta.get("content"):
+                    out_chunks.append(delta["content"])
+        return "".join(out_chunks)
+
+    # 1) REV-R7-1 / CHAL-R7-2: Truncated non-fence ``` prefix must NEVER falsely open code_fence
+    flushed_c, _, _, next_fence_c = openai_api._split_unbuffered_citation_tail_stateful("``` [99] `code`\n\n")
+    assert flushed_c == "```"
+    assert next_fence_c is None
+
+    for raw_r1, splits in [
+        ("```" + "a" * 80 + "``` done [99].", [list("```" + "a" * 80 + "``` done [99].")]),
+        ("```" + "a" * 70 + "``` done [99].", [["```" + "a" * 70 + "`", "`` done [99]."]]),
+        ("``` [99] `code`\n\nprose [88]", [list("``` [99] `code`\n\nprose [88]")]),
+        ("``` [99] `\n\nNext [88]", [["``` [99] `\n\nNext ", "[88]"]]),
+        (
+            "``` " + "a" * 65 + " `x` [99]\nNext [88]",
+            [["``` " + "a" * 65 + " `x", "` [99]\nNext [88]"]],
+        ),
+    ]:
+        canon_r1, _ = agent_service._finalize_answer_citations(raw_r1, [])
+        assert "[99]" not in canon_r1 and "[88]" not in canon_r1
+        for chunks in splits:
+            assert await _run_deltas(chunks, canon_r1) == canon_r1
+
+    # 2) CHAL-R7-3: Non-closing "```\r " / "~~~\r\t" inside open fence must NOT falsely close code_fence
+    flushed_cr, pending_cr, _, next_fence_cr = openai_api._split_unbuffered_citation_tail_stateful(
+        "```\r ",
+        at_line_start=True,
+        code_fence="```",
+    )
+    assert flushed_cr == "```\r"
+    assert pending_cr == " "
+    assert next_fence_cr == "```"
+
+    for raw_r3 in [
+        "```py\ncode [99]\n```\r \nstill\n```\nprose [88]",
+        "~~~py\ncode [99]\n~~~\r\t\nstill\n~~~\nprose [88]",
+        "```py\ncode [99]\n   ```\r \nstill\n```\nprose [88]",
+    ]:
+        canon_r3, _ = agent_service._finalize_answer_citations(raw_r3, [])
+        assert "code [99]" in canon_r3 and "[88]" not in canon_r3
+        assert await _run_deltas(list(raw_r3), canon_r3) == canon_r3
+
+    # 3) REV-R7-2 / CHAL-R7-1: Closing backtick run at chunk EOF must hold until next char confirms length
+    segs_eof, unclosed_eof, _ = agent_service._scan_markdown_prose_segments("Stray ` [99] `", hold_incomplete=True)
+    assert segs_eof == [(0, 6)]
+    assert unclosed_eof == 6
+
+    for raw_r2, custom_chunks in [
+        ("Stray ` [99] ``code``", [["Stray ` [99] `", "`code``"]]),
+        ("See ``a```x [99] `b` end", [["See ``a``", "`x [99] `b` end"]]),
+        (
+            "Here is a stray ` [99]\n```python\nx = 1\n```\nReal prose [88]",
+            [["Here is a stray ` [99]\n`", "``python\nx = 1\n```\nReal prose [88]"]],
+        ),
+        (
+            "Stray `` [99]\n```python\nx = 1\n```\nProse [88]",
+            [["Stray `` [99]\n``", "`python\nx = 1\n```\nProse [88]"]],
+        ),
+        (
+            "Here is a stray ` backtick\n```python\n# " + "x" * 70 + "\na = 1\n```\nReal prose [99]",
+            [
+                ["Here is a stray ` backtick\n`", "``python\n# " + "x" * 70 + "\na = 1\n```\nReal prose [99]"],
+            ],
+        ),
+    ]:
+        canon_r2, _ = agent_service._finalize_answer_citations(raw_r2, [])
+        assert "[99]" not in canon_r2 and "[88]" not in canon_r2
+        assert await _run_deltas(list(raw_r2), canon_r2) == canon_r2
+        for chunks in custom_chunks:
+            assert await _run_deltas(chunks, canon_r2) == canon_r2
+
+    # 4) REV-R7-3 / CHAL-R7-4: Unterminated backtick fence line during streaming must NOT prematurely split paragraph
+    segs_u, unclosed_u, _ = agent_service._scan_markdown_prose_segments("Check `a\n```", hold_incomplete=True)
+    assert segs_u == [(0, 6)]
+    assert unclosed_u == 6
+
+    for raw_r4, chunks_r4 in [
+        ("Check `a\n```b` [99] c`\n\nEnd", ["Check `a\n```", "b` [99] c`\n\nEnd"]),
+        ("Use `a\n   ```b` [99] c`\n\nEnd", ["Use `a\n   ```", "b` [99] c`\n\nEnd"]),
+        ("Check ```a\n```b\ncode [99]\n```\nprose [88]", ["Check ```a\n```b", "\ncode [99]\n```\nprose [88]"]),
+        ("Check ```a\n```b` [99]\n\nEnd", ["Check ```a\n```b", "` [99]\n\nEnd"]),
+    ]:
+        canon_r4, _ = agent_service._finalize_answer_citations(raw_r4, [])
+        assert await _run_deltas(chunks_r4, canon_r4) == canon_r4
+        assert await _run_deltas(list(raw_r4), canon_r4) == canon_r4
+
+
 
 
 

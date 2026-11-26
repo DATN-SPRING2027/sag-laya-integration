@@ -264,11 +264,19 @@ def _is_incomplete_closing_fence_prefix(
     return _is_closing_fence_tail(text, pos, content_end)
 
 
-def _find_inline_paragraph_limit(text: str, start: int) -> int:
+def _find_inline_paragraph_limit(
+    text: str,
+    start: int,
+    *,
+    allow_unterminated_backtick_fence: bool = True,
+) -> int:
     """Return the exclusive end offset of the current CommonMark paragraph from ``start``.
 
     Stops before any complete blank line (``\\n[ \\t]*\\r?\\n``) or any valid opening code fence
     line on a subsequent line because CommonMark block structure takes precedence over inline code.
+    When ``allow_unterminated_backtick_fence=False`` (streaming), an unterminated trailing backtick
+    fence line is not yet treated as a hard paragraph boundary because a later backtick before LF
+    can still disqualify it under CommonMark §4.5.
     """
     length = len(text)
     nl_idx = text.find("\n", start)
@@ -284,12 +292,40 @@ def _find_inline_paragraph_limit(text: str, start: int) -> int:
         fence_match = _FENCE_OPEN_RE.match(text, line_pos)
         if fence_match:
             marker = fence_match.group(2)
-            if marker[0] != "`" or text.find("`", fence_match.end(), content_end) == -1:
+            if marker[0] != "`":
+                return line_pos
+            if (
+                (next_nl != -1 or allow_unterminated_backtick_fence)
+                and text.find("`", fence_match.end(), content_end) == -1
+            ):
                 return line_pos
         if next_nl == -1:
             return length
         line_pos = next_nl + 1
     return length
+
+
+def _is_potential_unterminated_bt_fence_at(
+    text: str,
+    closing: int,
+    span_end: int,
+    run_len: int,
+) -> bool:
+    """Return True if ``closing`` starts a short unterminated line that could still become a backtick fence."""
+    if run_len < 3 or (len(text) - span_end) > _MAX_PENDING_FENCE_HEADER_CHARS:
+        return False
+    lookback = max(0, closing - 4)
+    prev_nl = text.rfind("\n", lookback, closing)
+    if prev_nl == -1:
+        if lookback > 0:
+            return False
+        line_start = 0
+    else:
+        line_start = prev_nl + 1
+    lead = closing - line_start
+    if lead > 3 or text[line_start:closing] != " " * lead:
+        return False
+    return text.find("\n", span_end) == -1 and text.find("`", span_end) == -1
 
 
 def _index_paragraph_backtick_runs(text: str, start: int, limit: int) -> dict[int, list[int]]:
@@ -436,14 +472,27 @@ def _scan_markdown_prose_segments(
                 run_len += 1
             after_start = index + run_len
             if index >= para_limit:
-                para_limit = _find_inline_paragraph_limit(text, after_start)
+                para_limit = _find_inline_paragraph_limit(
+                    text,
+                    after_start,
+                    allow_unterminated_backtick_fence=not hold_incomplete,
+                )
                 para_bt_runs = _index_paragraph_backtick_runs(text, after_start, para_limit)
                 para_bt_cursors = {}
             closing = _next_closing_backticks(para_bt_runs, para_bt_cursors, after_start, run_len)
             if closing != -1:
+                span_end = closing + run_len
+                if hold_incomplete and (
+                    span_end == length
+                    or _is_potential_unterminated_bt_fence_at(text, closing, span_end, run_len)
+                ):
+                    if index > prose_start:
+                        segments.append((prose_start, index))
+                    unclosed_code_start = index
+                    prose_start = length
+                    break
                 if index > prose_start:
                     segments.append((prose_start, index))
-                span_end = closing + run_len
                 prose_start = span_end
                 index = span_end
                 continue

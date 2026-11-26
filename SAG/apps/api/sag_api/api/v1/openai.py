@@ -149,24 +149,6 @@ def _prose_segments(
     )
 
 
-def _advance_markdown_state(
-    flushed: str,
-    *,
-    at_line_start: bool,
-    code_fence: str | None,
-) -> tuple[bool, str | None]:
-    """Advance cross-chunk markdown line-start and fenced-code state using the unified scanner."""
-    if not flushed:
-        return at_line_start, code_fence
-    _, _, next_fence = _prose_segments(
-        flushed,
-        at_line_start=at_line_start,
-        code_fence=code_fence,
-        hold_incomplete=False,
-    )
-    return flushed.endswith("\n"), next_fence
-
-
 def _split_unbuffered_citation_tail_stateful(
     text: str,
     *,
@@ -183,6 +165,7 @@ def _split_unbuffered_citation_tail_stateful(
         code_fence=code_fence,
     )
     split_pos: int | None = None
+    split_in_prose = False
     for seg_start, seg_end in segments:
         segment = text[seg_start:seg_end]
         for match in _COMPLETE_CITATION_BRACKET_RE.finditer(segment):
@@ -192,6 +175,7 @@ def _split_unbuffered_citation_tail_stateful(
             while abs_start > seg_start and text[abs_start - 1] in " \t":
                 abs_start -= 1
             split_pos = abs_start
+            split_in_prose = True
             break
         if split_pos is not None:
             break
@@ -204,6 +188,7 @@ def _split_unbuffered_citation_tail_stateful(
         incomplete_rel = _find_incomplete_citation_tail_start(text[seg_start:seg_end])
         if incomplete_rel is not None:
             split_pos = seg_start + incomplete_rel
+            split_in_prose = True
 
     if split_pos is None:
         stripped = text.rstrip(" \t")
@@ -214,14 +199,12 @@ def _split_unbuffered_citation_tail_stateful(
 
     flushed = text[:split_pos]
     pending = text[split_pos:]
-    if split_pos == len(text):
-        next_line_start, next_fence = flushed.endswith("\n"), end_fence
+    if not flushed:
+        next_line_start, next_fence = at_line_start, code_fence
+    elif split_in_prose:
+        next_line_start, next_fence = flushed.endswith("\n"), None
     else:
-        next_line_start, next_fence = _advance_markdown_state(
-            flushed,
-            at_line_start=at_line_start,
-            code_fence=code_fence,
-        )
+        next_line_start, next_fence = flushed.endswith("\n"), end_fence
     return flushed, pending, next_line_start, next_fence
 
 
