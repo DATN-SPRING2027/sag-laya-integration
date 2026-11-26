@@ -70,10 +70,10 @@ def _split_query(messages: list[ChatMessage]) -> tuple[str, list[dict[str, str]]
 
 
 _COMPLETE_CITATION_BRACKET_RE = re.compile(
-    r"\[(\s*+[sS]?\d++(?:\s*+[,;、]\s*+[sS]?\d++)*+\s*+)\](?!\(\s*+(?:https?:|mailto:)|:\s*+(?:https?:|mailto:))"
+    r"\[(\s*+[sS]?\d++(?:\s*+[,;、]\s*+[sS]?\d++)*+\s*+)\](?!\(\s*+(?:https?:|mailto:)|:\s*+(?:https?:|mailto:))",
+    re.IGNORECASE,
 )
 _SPACE_BEFORE_PUNCT_RE = re.compile(r"(?<![ \t])[ \t]++([，。！？；：,.!?;:])")
-_COLLAPSE_INLINE_SPACE_RE = re.compile(r"[ \t]{2,}+")
 
 
 def _is_zero_math_bracket(inner: str) -> bool:
@@ -220,6 +220,7 @@ def _resolve_turn_eof_pending(
     *,
     at_line_start: bool,
     code_fence: str | None,
+    has_prior_turn_text: bool = True,
 ) -> str:
     """Resolve a held tail at turn EOF without leaking unverified prose citations or dropping code."""
     if not pending:
@@ -236,36 +237,31 @@ def _resolve_turn_eof_pending(
     cursor = 0
     stripped_any = False
 
-    def _strip_unverified(match: re.Match[str]) -> str:
-        nonlocal stripped_any
-        if _is_zero_math_bracket(match.group(1)):
-            return match.group(0)
-        stripped_any = True
-        return ""
-
     for seg_start, seg_end in segments:
         if seg_start > cursor:
             out.append(pending[cursor:seg_start])
-        seg_stripped = False
-
-        def _strip_seg(match: re.Match[str]) -> str:
-            nonlocal seg_stripped
-            res = _strip_unverified(match)
-            if res == "":
-                seg_stripped = True
-            return res
-
-        cleaned = _COMPLETE_CITATION_BRACKET_RE.sub(_strip_seg, pending[seg_start:seg_end])
-        if seg_stripped:
-            cleaned = _COLLAPSE_INLINE_SPACE_RE.sub(" ", cleaned)
-            cleaned = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", cleaned)
-        out.append(cleaned)
+        seg = pending[seg_start:seg_end]
+        seg_parts: list[str] = []
+        pos = 0
+        for match in _COMPLETE_CITATION_BRACKET_RE.finditer(seg):
+            if _is_zero_math_bracket(match.group(1)):
+                continue
+            stripped_any = True
+            before = seg[pos : match.start()]
+            # Trim only horizontal space immediately before the deleted citation site so Markdown
+            # indentation, nested lists, aligned tables, and 2-space hard line breaks stay intact.
+            seg_parts.append(before.rstrip(" \t"))
+            pos = match.end()
+        seg_parts.append(seg[pos:])
+        out.append("".join(seg_parts))
         cursor = seg_end
     if cursor < len(pending):
         out.append(pending[cursor:])
     resolved = "".join(out)
     if stripped_any:
         resolved = resolved.rstrip(" \t")
+        if not has_prior_turn_text:
+            resolved = resolved.lstrip(" \t")
         if not resolved.strip():
             return ""
     return resolved
@@ -287,13 +283,15 @@ def _compute_unstreamed_suffix(
     norm_streamed = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", streamed.lstrip())
     if norm_streamed and canonical.startswith(norm_streamed):
         return canonical[len(norm_streamed) :]
+    norm_trimmed = norm_streamed.rstrip()
+    if norm_trimmed == canonical:
+        return ""
     if not post_tool_turn:
-        norm_trimmed = norm_streamed.rstrip()
         if norm_trimmed and canonical.startswith(norm_trimmed):
             tail = canonical[len(norm_trimmed) :]
             if not tail or not tail[0].isalnum():
                 return tail
-    if streamed[-1].isspace():
+    if streamed.endswith("\n"):
         return canonical
     return f"\n\n{canonical}"
 
@@ -398,18 +396,19 @@ async def chat_completions(
                                 pending_bracket,
                                 at_line_start=stream_at_line_start,
                                 code_fence=stream_code_fence,
+                                has_prior_turn_text=bool(streamed_parts),
                             )
                         pending_bracket = ""
                         if eof_tail:
                             streamed_parts.append(eof_tail)
                             if need_turn_separator:
                                 need_turn_separator = False
-                                flushed_eof = eof_tail if eof_tail[0].isspace() else f"\n\n{eof_tail}"
+                                flushed_eof = eof_tail if eof_tail.startswith("\n") else f"\n\n{eof_tail}"
                             else:
                                 flushed_eof = eof_tail
                     if streamed_parts:
                         streamed_before_tool = True
-                        need_turn_separator = not streamed_parts[-1][-1].isspace()
+                        need_turn_separator = not streamed_parts[-1].endswith("\n")
                         prior_streamed_parts.extend(streamed_parts)
                         streamed_parts.clear()
                     stream_at_line_start = True
@@ -476,7 +475,7 @@ async def chat_completions(
                             streamed_parts.append(flush_text)
                             if need_turn_separator:
                                 need_turn_separator = False
-                                out_text = flush_text if flush_text[0].isspace() else f"\n\n{flush_text}"
+                                out_text = flush_text if flush_text.startswith("\n") else f"\n\n{flush_text}"
                             else:
                                 out_text = flush_text
                             yield chunk({"content": out_text})

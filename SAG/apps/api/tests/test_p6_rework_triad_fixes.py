@@ -2129,6 +2129,195 @@ async def test_p6_rework_20_turn_rotation_eof_code_flush_and_unicode_whitespace(
         assert out_u.count(canon_u) == 1
 
 
+# ---------------------------------------------------------------------------
+# Item 21 (CHAL-R9-1..5): Newline-based turn separators, site-only citation
+# whitespace cleanup, leading citation lstrip, IGNORECASE links, and post-tool
+# exact-match Unicode whitespace dedup
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_p6_rework_21_turn_separators_markdown_indent_links_and_post_tool_unicode_ws(
+    monkeypatch,
+) -> None:
+    agent = SimpleNamespace(id="agent-r9", name="R9Bot", persona={"web_enabled": True})
+    monkeypatch.setattr(openai_api.svc, "get_agent", AsyncMock(return_value=agent))
+    monkeypatch.setattr(openai_api.svc, "resolve_sources", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        openai_api.svc,
+        "build_ask_context",
+        lambda **kw: SimpleNamespace(
+            source_ids=[],
+            citations=[],
+            session_citations=[],
+            route_decision={"coarse_intent": "CHAT", "degraded": False},
+        ),
+    )
+
+    async def _run_events(events: list[SimpleNamespace]) -> str:
+        async def fake_stream(*args, **kwargs):
+            for ev in events:
+                yield ev
+
+        monkeypatch.setattr(openai_api.agent_service, "generate_stream", fake_stream)
+        body = openai_api.ChatCompletionRequest(
+            messages=[openai_api.ChatMessage(role="user", content="check")],
+            stream=True,
+        )
+        resp = await openai_api.chat_completions(
+            agent_id="agent-r9",
+            body=body,
+            _user=SimpleNamespace(id="u-1", name="Tester"),
+            owner_key="owner-1",
+            principal=SimpleNamespace(tenant_id="t-1", organization_id="o-1", user_id="u-1"),
+            session=SimpleNamespace(),
+            engine_manager=SimpleNamespace(),
+            llm=SimpleNamespace(configured=True),
+            tool_registry=SimpleNamespace(),
+            agent_runtime=SimpleNamespace(),
+        )
+        out_chunks: list[str] = []
+        async for raw in resp.body_iterator:
+            text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+            for line in text.splitlines():
+                if not line.startswith("data: ") or line == "data: [DONE]":
+                    continue
+                payload = json.loads(line[len("data: ") :])
+                delta = (payload.get("choices") or [{}])[0].get("delta") or {}
+                if delta.get("content"):
+                    out_chunks.append(delta["content"])
+        return "".join(out_chunks)
+
+    # CHAL-R9-1A: Closing code fence with trailing horizontal space must still get \n\n before Turn 2
+    for tool_name in ("web_search", "search_context"):
+        out_fence_ws = await _run_events(
+            [
+                SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}}),
+                SimpleNamespace(
+                    type=EventType.MESSAGE_DELTA.value,
+                    data={"payload": {"delta": "```py\nx = 1\n``` "}},
+                ),
+                SimpleNamespace(type=EventType.TOOL_STARTED.value, data={"payload": {"name": tool_name}}),
+                SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": "Done."}}),
+                SimpleNamespace(
+                    type=EventType.RUN_COMPLETED.value,
+                    data={"payload": {"output": "Done.", "citations": [], "degraded": False}},
+                ),
+            ]
+        )
+        assert out_fence_ws == "```py\nx = 1\n``` \n\nDone."
+        segs_check, _, fence_check = agent_service._scan_markdown_prose_segments(
+            out_fence_ws, hold_incomplete=False
+        )
+        assert fence_check is None
+        assert segs_check and "Done." in out_fence_ws[segs_check[-1][0] : segs_check[-1][1]]
+
+    # CHAL-R9-1B: Turn 1 ending in horizontal space (\u3000 / ' ') before Turn 2 opening fence
+    out_fence_t2 = await _run_events(
+        [
+            SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}}),
+            SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": "Hello\u3000"}}),
+            SimpleNamespace(type=EventType.TOOL_STARTED.value, data={"payload": {"name": "web_search"}}),
+            SimpleNamespace(
+                type=EventType.MESSAGE_DELTA.value,
+                data={"payload": {"delta": "```py\nreturn [99]\n```"}},
+            ),
+            SimpleNamespace(
+                type=EventType.RUN_COMPLETED.value,
+                data={"payload": {"output": "```py\nreturn [99]\n```", "citations": [], "degraded": False}},
+            ),
+        ]
+    )
+    assert out_fence_t2 == "Hello\u3000\n\n```py\nreturn [99]\n```"
+
+    # CHAL-R9-2: Site-only whitespace cleanup preserves 4-space code, nested lists, 2-space breaks, tables
+    for raw_t1, expected_t1 in [
+        ("Code [99]:\n\n    x = 1\n    y = 2", "Code:\n\n    x = 1\n    y = 2"),
+        ("Steps [99]:\n- Item 1\n    - Nested 1a", "Steps:\n- Item 1\n    - Nested 1a"),
+        ("Line 1 [99]\nLine 2  \nLine 3", "Line 1\nLine 2  \nLine 3"),
+        ("Summary [99]:\n| A   | B   |\n| --- | --- |", "Summary:\n| A   | B   |\n| --- | --- |"),
+    ]:
+        out_md = await _run_events(
+            [
+                SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}}),
+                SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": raw_t1}}),
+                SimpleNamespace(type=EventType.TOOL_STARTED.value, data={"payload": {"name": "web_search"}}),
+                SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": "Done."}}),
+                SimpleNamespace(
+                    type=EventType.RUN_COMPLETED.value,
+                    data={"payload": {"output": "Done.", "citations": [], "degraded": False}},
+                ),
+            ]
+        )
+        assert out_md == f"{expected_t1}\n\nDone."
+
+    # CHAL-R9-3: Leading unverified citation in Turn 0 or mid-chain Turn 1 does not leave dangling space
+    out_3turn = await _run_events(
+        [
+            SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}}),
+            SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": "Step 0."}}),
+            SimpleNamespace(type=EventType.TOOL_STARTED.value, data={"payload": {"name": "web_search"}}),
+            SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": "[99] `config.yaml`"}}),
+            SimpleNamespace(type=EventType.TOOL_STARTED.value, data={"payload": {"name": "get_time"}}),
+            SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": "Done."}}),
+            SimpleNamespace(
+                type=EventType.RUN_COMPLETED.value,
+                data={"payload": {"output": "Done.", "citations": [], "degraded": False}},
+            ),
+        ]
+    )
+    assert out_3turn == "Step 0.\n\n`config.yaml`\n\nDone."
+
+    out_t0_lead = await _run_events(
+        [
+            SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}}),
+            SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": "[99] `config.yaml`"}}),
+            SimpleNamespace(type=EventType.TOOL_STARTED.value, data={"payload": {"name": "web_search"}}),
+            SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": "Done."}}),
+            SimpleNamespace(
+                type=EventType.RUN_COMPLETED.value,
+                data={"payload": {"output": "Done.", "citations": [], "degraded": False}},
+            ),
+        ]
+    )
+    assert out_t0_lead == "`config.yaml`\n\nDone."
+
+    # CHAL-R9-4: Case-insensitive Markdown links (HTTPS://, MAILTO:) preserved on turn rotation
+    for link_t1 in (
+        "See [99](HTTPS://example.com)",
+        "Email [1](MAILTO:ops@example.com)",
+        "Ref [2]: HTTPS://example.com",
+    ):
+        out_link = await _run_events(
+            [
+                SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}}),
+                SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": link_t1}}),
+                SimpleNamespace(type=EventType.TOOL_STARTED.value, data={"payload": {"name": "web_search"}}),
+                SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": "Done."}}),
+                SimpleNamespace(
+                    type=EventType.RUN_COMPLETED.value,
+                    data={"payload": {"output": "Done.", "citations": [], "degraded": False}},
+                ),
+            ]
+        )
+        assert out_link == f"{link_t1}\n\nDone."
+
+    # CHAL-R9-5: Post-tool exact-match trailing Unicode whitespace must NOT duplicate 2x
+    for ws_ch in ("\u3000", "\u00a0", "\u2003"):
+        out_pt = await _run_events(
+            [
+                SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}}),
+                SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": f"Done.{ws_ch}"}}),
+                SimpleNamespace(type=EventType.TOOL_FAILED.value, data={"payload": {"name": "web_search"}}),
+                SimpleNamespace(
+                    type=EventType.RUN_COMPLETED.value,
+                    data={"payload": {"output": "Done.", "citations": [], "degraded": False}},
+                ),
+            ]
+        )
+        assert out_pt == f"Done.{ws_ch}"
+
+
 
 
 
