@@ -608,6 +608,63 @@ def test_routing_tree_leiden_preserves_cluster_purity_above_256_nodes():
     assert pure_buckets >= 6
 
 
+def test_routing_tree_agglomeration_prevents_connected_graph_snowball_overflow():
+    """Connected multi-community graphs (N=960, 24 linked communities) must not snowball into
+    a single giant cluster exceeding max_cluster_size at max_depth."""
+    n_comms = 24
+    per_comm = 40
+    comm_nodes: dict[int, list[str]] = {c: [] for c in range(n_comms)}
+    comm_of: dict[str, int] = {}
+    for c in range(n_comms):
+        for i in range(per_comm):
+            uid = hashlib.sha256(f"dense-comm-{c}-u-{i}".encode()).hexdigest()[:16]
+            comm_nodes[c].append(uid)
+            comm_of[uid] = c
+
+    edges: list[KnowledgeEdgeInput] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _add_edge(u: str, v: str, w: float) -> None:
+        a, b = (u, v) if u < v else (v, u)
+        if a != b and (a, b) not in seen:
+            seen.add((a, b))
+            edges.append(KnowledgeEdgeInput(a, b, w))
+
+    for c, members in comm_nodes.items():
+        # Strong intra-community edges
+        for idx, u in enumerate(members):
+            for step in range(1, 7):
+                _add_edge(u, members[(idx + step) % len(members)], 0.92)
+        # Cross-community semantic bridges (what real dense kNN graphs produce)
+        next_members = comm_nodes[(c + 1) % n_comms]
+        skip_members = comm_nodes[(c + 2) % n_comms]
+        for idx in range(0, len(members), 4):
+            _add_edge(members[idx], next_members[idx], 0.45)
+            _add_edge(members[idx], skip_members[idx], 0.25)
+
+    units = [
+        KnowledgeUnitInput(
+            unit_id=uid,
+            tenant_id="t-dense",
+            project_id="p-dense",
+            security_partition_id="public",
+            dense=tuple(float(comm_of[uid] % 4 == d) for d in range(4)),
+            sparse=((f"topic{comm_of[uid]}", 1.0),),
+        )
+        for uid in sorted(comm_of.keys())
+    ]
+    cfg = TreeBuildConfig(min_cluster_size=1, min_partition_units=1)
+    snap = build_routing_snapshot(units, edges, config=cfg)
+
+    assert snap.publishable is True, f"Quality gates failed: {dict(snap.quality_gates)}"
+    assert snap.quality_gates["cluster_constraints"] is True
+    assert snap.quality_gates["tree_integrity"] is True
+    assert float(snap.metrics["giant_ratio"] or 0.0) <= 0.45, (
+        f"Snowball giant cluster detected: giant_ratio={snap.metrics['giant_ratio']}"
+    )
+    assert float(snap.metrics["cohesion"] or 0.0) >= 0.50
+
+
 def test_routing_policy_entropy_broadening_reachable_and_margin_ordered():
     rp = RoutingPolicy()
     assert rp.broad_margin_threshold > rp.decisive_margin, (

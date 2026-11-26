@@ -233,8 +233,15 @@ def _agglomerate_communities(
     groups: list[tuple[str, ...]],
     edge_weights: dict[tuple[str, str], float],
     target_count: int,
+    *,
+    max_group_size: int | None = None,
 ) -> list[tuple[str, ...]]:
-    """Agglomeratively merge Leiden communities down to target_count preserving graph structure."""
+    """Agglomeratively merge Leiden communities down to target_count preserving graph structure.
+
+    Uses average-linkage inter-community density (`weight / (|A| * |B|)`) with an optional
+    size ceiling (`max_group_size`) so large communities do not snowball into a single giant
+    cluster on densely connected semantic graphs.
+    """
     if len(groups) <= target_count:
         return groups
 
@@ -254,11 +261,21 @@ def _agglomerate_communities(
         pair_weights[key] += weight
 
     while len(active) > target_count:
-        if pair_weights:
+        eligible_pairs = (
+            [
+                item
+                for item in pair_weights.items()
+                if max_group_size is None
+                or len(active[item[0][0]]) + len(active[item[0][1]]) <= max_group_size
+            ]
+            if pair_weights
+            else []
+        )
+        if eligible_pairs:
             (left, right), _best_w = min(
-                pair_weights.items(),
+                eligible_pairs,
                 key=lambda item: (
-                    -item[1],
+                    -(item[1] / (len(active[item[0][0]]) * len(active[item[0][1]]))),
                     len(active[item[0][0]]) + len(active[item[0][1]]),
                     active[item[0][0]][0],
                     active[item[0][1]][0],
@@ -300,6 +317,8 @@ def _partition(
     unit_ids: tuple[str, ...],
     edge_weights: dict[tuple[str, str], float],
     config: TreeBuildConfig,
+    *,
+    remaining_levels: int | None = None,
 ) -> list[tuple[str, ...]]:
     """Constrained Leiden partition with hierarchical community ceiling and agglomerative merge."""
     if len(unit_ids) <= config.target_cluster_size:
@@ -310,10 +329,24 @@ def _partition(
     except ImportError as exc:
         raise RuntimeError("Phase 6 requires the igraph and leidenalg dependencies") from exc
 
+    subtree_cap = (
+        config.max_cluster_size * (config.max_children ** remaining_levels)
+        if remaining_levels is not None
+        else None
+    )
     effective_max_size = max(
         config.max_cluster_size,
         math.ceil(len(unit_ids) / config.max_children),
     )
+    if subtree_cap is not None and subtree_cap >= config.min_cluster_size:
+        effective_max_size = min(effective_max_size, subtree_cap)
+    merge_cap = max(
+        effective_max_size,
+        math.ceil(2.0 * len(unit_ids) / config.max_children),
+    )
+    if subtree_cap is not None and subtree_cap >= config.min_cluster_size:
+        merge_cap = min(merge_cap, subtree_cap)
+
     indices = {unit_id: index for index, unit_id in enumerate(unit_ids)}
     graph_pairs = sorted(edge_weights.items())
     graph_edges = [(indices[left], indices[right]) for (left, right), _ in graph_pairs]
@@ -341,12 +374,19 @@ def _partition(
             balanced.append(tuple(members))
 
     if len(balanced) > config.max_children:
-        balanced = _agglomerate_communities(balanced, edge_weights, config.max_children)
+        balanced = _agglomerate_communities(
+            balanced,
+            edge_weights,
+            config.max_children,
+            max_group_size=merge_cap,
+        )
     elif len(balanced) <= 1 and len(unit_ids) > config.target_cluster_size:
         sub_max_size = max(
             config.target_cluster_size,
             math.ceil(len(unit_ids) / config.max_children),
         )
+        if subtree_cap is not None and subtree_cap >= config.min_cluster_size:
+            sub_max_size = min(sub_max_size, subtree_cap)
         if sub_max_size < len(unit_ids):
             sub_partition = leidenalg.find_partition(
                 graph,
@@ -364,7 +404,12 @@ def _partition(
             ]
             if len(sub_groups) > 1:
                 balanced = (
-                    _agglomerate_communities(sub_groups, edge_weights, config.max_children)
+                    _agglomerate_communities(
+                        sub_groups,
+                        edge_weights,
+                        config.max_children,
+                        max_group_size=merge_cap,
+                    )
                     if len(sub_groups) > config.max_children
                     else sorted(sub_groups, key=lambda group: group[0])
                 )
@@ -398,7 +443,7 @@ def _partition(
         options = [
             (math.fsum(weights_by_group[index]), -len(group), index)
             for index, group in enumerate(balanced)
-            if index != small_index and len(group) + len(small) <= effective_max_size
+            if index != small_index and len(group) + len(small) <= merge_cap
         ]
         if not options:
             options = [
@@ -409,6 +454,18 @@ def _partition(
         _, _, target_index = max(options, key=lambda triple: (triple[0], triple[1], -triple[2]))
         balanced[target_index] = tuple(sorted(balanced[target_index] + small))
         balanced.pop(small_index)
+
+    # Guarantee child subtree capacity at depth (e.g., depth == max_depth - 1 -> leaves <= max_cluster_size)
+    # while keeping Leiden community members contiguous when a boundary rebalance is required.
+    if (
+        subtree_cap is not None
+        and any(len(group) > subtree_cap for group in balanced)
+        and len(unit_ids) <= config.max_children * subtree_cap
+    ):
+        ordered = [uid for group in balanced for uid in group]
+        count = min(config.max_children, max(2, math.ceil(len(unit_ids) / subtree_cap)))
+        balanced = [tuple(sorted(part)) for part in _balanced_chunks(ordered, count)]
+
     return sorted(balanced, key=lambda group: group[0])
 
 
@@ -576,7 +633,12 @@ def build_routing_snapshot(
                     for target_id, weight in edge_adjacency.get(source_id, ())
                     if source_id < target_id and target_id in member_set
                 }
-                clusters = _partition(member_ids, scoped_edges, config)
+                clusters = _partition(
+                    member_ids,
+                    scoped_edges,
+                    config,
+                    remaining_levels=max(0, config.max_depth - depth - 1),
+                )
                 if len(clusters) > config.max_children:
                     raise RuntimeError("partitioner exceeded max_children after balanced fallback")
                 if len(clusters) > 1:
