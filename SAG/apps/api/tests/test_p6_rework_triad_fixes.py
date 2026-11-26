@@ -1571,13 +1571,14 @@ async def test_p6_rework_16_four_char_fence_indented_backtick_and_multiline_inli
     )
     assert out_ind_1ch == canon_ind
 
-    # 4) Multi-line inline code containing \n~~~ and \n```py must NOT desync fence state
-    canon_ml1 = "Example: `line1\n~~~\nline2`. End."
-    out_ml1 = await _run_deltas(["Example: `line1\n~~~\nline2`.", " End [99]."], canon_ml1)
+    # 4) CommonMark-valid multi-line inline code (non-fence interior lines such as 4-space indented
+    #    markers or plain lines) must NOT desync fence state or leak citations
+    canon_ml1 = "Example: `line1\n    ~~~\nline2 [99]`. End."
+    out_ml1 = await _run_deltas(["Example: `line1\n    ~~~\nline2 [99]`.", " End [99]."], canon_ml1)
     assert out_ml1 == canon_ml1
 
-    canon_ml2 = "Use `foo\n```py\nbar`\nSee."
-    out_ml2 = await _run_deltas(["Use `foo\n```py\nbar`\n", "See [99]."], canon_ml2)
+    canon_ml2 = "Use `foo\n    ```py\nbar`\nSee."
+    out_ml2 = await _run_deltas(["Use `foo\n    ```py\nbar`\n", "See [99]."], canon_ml2)
     assert out_ml2 == canon_ml2
 
     # 5) Long (>64 chars) line-start split triple-backtick inline code must NOT stick fence open
@@ -1637,14 +1638,198 @@ def test_p6_rework_17_strict_linear_backtick_index_and_unterminated_closing_fenc
         assert _best_ms(openai_api._split_unbuffered_citation_tail_stateful, s_32k) < 50.0
         assert _best_ms(agent_service._finalize_answer_citations, s_32k, []) < 50.0
 
-    # Unterminated closing fence line > 64 chars with no newline must NOT prematurely clear code_fence
-    _, _, next_ls, next_fence = openai_api._split_unbuffered_citation_tail_stateful(
+    # Unterminated closing fence line > 64 chars is HELD cleanly without closing or stranding fence
+    flushed, pending, next_ls, next_fence = openai_api._split_unbuffered_citation_tail_stateful(
         "```" + " " * 70,
         at_line_start=True,
         code_fence="```",
     )
-    assert next_ls is False
+    assert flushed == ""
+    assert pending == "```" + " " * 70
+    assert next_ls is True
     assert next_fence == "```"
+
+    # Follow-up "\nprose [99]" closes the fence and holds "[99]"
+    flushed2, pending2, next_ls2, next_fence2 = openai_api._split_unbuffered_citation_tail_stateful(
+        pending + "\nprose [99]",
+        at_line_start=next_ls,
+        code_fence=next_fence,
+    )
+    assert flushed2 == "```" + " " * 70 + "\nprose"
+    assert pending2 == " [99]"
+    assert next_ls2 is False
+    assert next_fence2 is None
+
+    # Alternative follow-up "foo\n" keeps fence open (non-whitespace suffix is not a closing fence)
+    flushed3, pending3, next_ls3, next_fence3 = openai_api._split_unbuffered_citation_tail_stateful(
+        pending + "foo\n",
+        at_line_start=next_ls,
+        code_fence=next_fence,
+    )
+    assert flushed3 == "```" + " " * 70 + "foo\n"
+    assert pending3 == ""
+    assert next_ls3 is True
+    assert next_fence3 == "```"
+
+
+# ---------------------------------------------------------------------------
+# Item 18 (CHAL-R6 F1-F5): CRLF & >64-char closing fences, mid-paragraph
+# fenced blocks, CommonMark blank lines, EOF parity, and long header/inline spans
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_p6_rework_18_challenger_r6_crlf_long_fence_mid_para_fence_and_blank_lines(monkeypatch) -> None:
+    agent = SimpleNamespace(id="agent-r6", name="R6Bot", persona={"web_enabled": True})
+    monkeypatch.setattr(openai_api.svc, "get_agent", AsyncMock(return_value=agent))
+    monkeypatch.setattr(openai_api.svc, "resolve_sources", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        openai_api.svc,
+        "build_ask_context",
+        lambda **kw: SimpleNamespace(
+            source_ids=[],
+            citations=[],
+            session_citations=[],
+            route_decision={"coarse_intent": "CHAT", "degraded": False},
+        ),
+    )
+
+    async def _run_deltas(deltas: list[str], canonical: str) -> str:
+        async def fake_stream(*args, **kwargs):
+            yield SimpleNamespace(type=EventType.RUN_STARTED.value, data={"payload": {"grounding_required": False}})
+            for d in deltas:
+                yield SimpleNamespace(type=EventType.MESSAGE_DELTA.value, data={"payload": {"delta": d}})
+            yield SimpleNamespace(
+                type=EventType.RUN_COMPLETED.value,
+                data={"payload": {"output": canonical, "citations": [], "degraded": False}},
+            )
+
+        monkeypatch.setattr(openai_api.agent_service, "generate_stream", fake_stream)
+        body = openai_api.ChatCompletionRequest(
+            messages=[openai_api.ChatMessage(role="user", content="code")],
+            stream=True,
+        )
+        resp = await openai_api.chat_completions(
+            agent_id="agent-r6",
+            body=body,
+            _user=SimpleNamespace(id="u-1", name="Tester"),
+            owner_key="owner-1",
+            principal=SimpleNamespace(tenant_id="t-1", organization_id="o-1", user_id="u-1"),
+            session=SimpleNamespace(),
+            engine_manager=SimpleNamespace(),
+            llm=SimpleNamespace(configured=True),
+            tool_registry=SimpleNamespace(),
+            agent_runtime=SimpleNamespace(),
+        )
+        out_chunks: list[str] = []
+        async for raw in resp.body_iterator:
+            text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+            for line in text.splitlines():
+                if not line.startswith("data: ") or line == "data: [DONE]":
+                    continue
+                payload = json.loads(line[len("data: ") :])
+                delta = (payload.get("choices") or [{}])[0].get("delta") or {}
+                if delta.get("content"):
+                    out_chunks.append(delta["content"])
+        return "".join(out_chunks)
+
+    # F1A: CRLF closing fences (backtick, tilde, indented) split at \r|\n and 1-char streamed
+    for raw_text, chunks in [
+        (
+            "```py\r\ncode [99]\r\n```\r\nprose [99]",
+            ["```py\r\ncode [99]\r\n", "```\r", "\nprose [99]"],
+        ),
+        (
+            "~~~py\r\ncode [99]\r\n~~~\r\nprose [99]",
+            ["~~~py\r\ncode [99]\r\n", "~~~\r", "\nprose [99]"],
+        ),
+        (
+            "```py\r\ncode [99]\r\n   ```\r\nprose [99]",
+            ["```py\r\ncode [99]\r\n", "   ```\r", "\nprose [99]"],
+        ),
+    ]:
+        canon, _ = agent_service._finalize_answer_citations(raw_text, [])
+        assert canon.endswith("\r\nprose")
+        assert "code [99]" in canon
+        assert await _run_deltas(chunks, canon) == canon
+        assert await _run_deltas(list(raw_text), canon) == canon
+
+    # Non-CommonMark trailing whitespace (NBSP) must NOT close a code fence
+    nbsp_text = "```py\ncode [99]\n```\u00a0\nstill_code [99]"
+    nbsp_canon, _ = agent_service._finalize_answer_citations(nbsp_text, [])
+    assert nbsp_canon == nbsp_text
+    assert await _run_deltas(["```py\ncode [99]\n", "```\u00a0", "\nstill_code [99]"], nbsp_canon) == nbsp_canon
+
+    # F1B: Closing fence > 64 chars (spaces, 65 backticks, tilde) streamed 1-char & split before \n
+    for closer in ("```" + " " * 70, "```" + " " * 62, "`" * 65):
+        raw_long = f"```py\ncode [99]\n{closer}\nprose [99]"
+        canon_long, _ = agent_service._finalize_answer_citations(raw_long, [])
+        assert canon_long == f"```py\ncode [99]\n{closer}\nprose"
+        assert await _run_deltas(["```py\ncode [99]\n", closer, "\nprose [99]"], canon_long) == canon_long
+        assert await _run_deltas(list(raw_long), canon_long) == canon_long
+
+    raw_tilde_long = "~~~py\ncode [99]\n" + "~~~" + " " * 70 + "\nprose [99]"
+    canon_tilde_long, _ = agent_service._finalize_answer_citations(raw_tilde_long, [])
+    assert canon_tilde_long == "~~~py\ncode [99]\n" + "~~~" + " " * 70 + "\nprose"
+    assert await _run_deltas(list(raw_tilde_long), canon_tilde_long) == canon_tilde_long
+
+    # F2A/B/C: Mid-paragraph fenced code blocks interrupt paragraphs (CommonMark §3 / §4.5)
+    for raw_f2, expected_f2 in [
+        (
+            "Use ``` in markdown:\n```python\narr[99] = 1\n```\nReal prose [99]",
+            "Use ``` in markdown:\n```python\narr[99] = 1\n```\nReal prose",
+        ),
+        (
+            "Here is a stray ` backtick\n```python\nx = `hello` [99]\n```\nReal prose [99]",
+            "Here is a stray ` backtick\n```python\nx = `hello` [99]\n```\nReal prose",
+        ),
+        (
+            "Here is a stray ` backtick\n~~~python\nx = `hello` [99]\n~~~\nReal prose [99]",
+            "Here is a stray ` backtick\n~~~python\nx = `hello` [99]\n~~~\nReal prose",
+        ),
+        (
+            "Here is ` stray\n```python\ncode = 1\n```\nSee `x [99]` and prose [99]",
+            "Here is ` stray\n```python\ncode = 1\n```\nSee `x [99]` and prose",
+        ),
+    ]:
+        canon_f2, _ = agent_service._finalize_answer_citations(raw_f2, [])
+        assert canon_f2 == expected_f2
+        assert await _run_deltas(list(raw_f2), expected_f2) == expected_f2
+
+    # F3: Non-LF CommonMark blank lines (\r\n\r\n, \n \n, \n\t\n) terminate inline backtick spans
+    for sep in ("\r\n\r\n", "\n \n", "\n\t\n", "\n \t \r\n"):
+        raw_f3 = f"Para 1 has stray ` and [99].{sep}Para 2 has stray ` end"
+        expected_f3 = f"Para 1 has stray ` and.{sep}Para 2 has stray ` end"
+        canon_f3, _ = agent_service._finalize_answer_citations(raw_f3, [])
+        assert canon_f3 == expected_f3
+        assert await _run_deltas([raw_f3], expected_f3) == expected_f3
+        assert await _run_deltas(list(raw_f3), expected_f3) == expected_f3
+
+    # F4: Exact EOF parity between openai._prose_segments(hold_incomplete=False) and agent_service
+    segs_open, _, fence_open = openai_api._prose_segments("```py [99]", hold_incomplete=False)
+    assert segs_open == []
+    assert fence_open == "```"
+    assert agent_service._finalize_answer_citations("```py [99]", [])[0] == "```py [99]"
+
+    segs_close, _, fence_close = openai_api._prose_segments(
+        "```py\ncode [99]\n```",
+        hold_incomplete=False,
+    )
+    assert segs_close == []
+    assert fence_close is None
+
+    # F5A: >256-char opening fence header split before \n must NOT invert fence state
+    raw_f5a = "```" + "a" * 260 + "\ncode [99]\n```\nprose [99]"
+    canon_f5a, _ = agent_service._finalize_answer_citations(raw_f5a, [])
+    assert canon_f5a == "```" + "a" * 260 + "\ncode [99]\n```\nprose"
+    assert await _run_deltas(["```" + "a" * 260, "\ncode [99]\n```\nprose [99]"], canon_f5a) == canon_f5a
+
+    # Bounded inline code span (<=64 chars) streamed 1-char preserves parity & holds prose [99]
+    raw_inline60 = "`" + "a" * 60 + "` prose [99] `ok`"
+    canon_inline60, _ = agent_service._finalize_answer_citations(raw_inline60, [])
+    assert canon_inline60 == "`" + "a" * 60 + "` prose  `ok`"
+    assert await _run_deltas(list(raw_inline60), canon_inline60) == canon_inline60
+
 
 
 

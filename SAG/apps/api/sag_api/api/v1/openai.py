@@ -72,10 +72,7 @@ def _split_query(messages: list[ChatMessage]) -> tuple[str, list[dict[str, str]]
 _COMPLETE_CITATION_BRACKET_RE = re.compile(
     r"\[(\s*+[sS]?\d++(?:\s*+[,;、]\s*+[sS]?\d++)*+\s*+)\](?!\(\s*+(?:https?:|mailto:)|:\s*+(?:https?:|mailto:))"
 )
-_FENCE_OPEN_RE = re.compile(r"( {0,3})(`{3,}|~{3,})")
 _SPACE_BEFORE_PUNCT_RE = re.compile(r"(?<![ \t])[ \t]++([，。！？；：,.!?;:])")
-_MAX_PENDING_INLINE_CODE_CHARS = 64
-_MAX_PENDING_FENCE_HEADER_CHARS = 256
 
 
 def _is_zero_math_bracket(inner: str) -> bool:
@@ -132,43 +129,6 @@ def _find_incomplete_citation_tail_start(segment: str) -> int | None:
     return start
 
 
-def _index_paragraph_backtick_runs(text: str, start: int, limit: int) -> dict[int, list[int]]:
-    """Build a single-pass O(L) map of backtick run length -> sorted start offsets within [start, limit)."""
-    runs: dict[int, list[int]] = {}
-    pos = start
-    while pos < limit:
-        idx = text.find("`", pos, limit)
-        if idx == -1:
-            break
-        end = idx + 1
-        while end < limit and text[end] == "`":
-            end += 1
-        runs.setdefault(end - idx, []).append(idx)
-        pos = end
-    return runs
-
-
-def _next_closing_backticks(
-    runs: dict[int, list[int]],
-    cursors: dict[int, int],
-    start: int,
-    run_len: int,
-) -> int:
-    """Return earliest matching backtick run offset >= start in amortized O(1) time, or -1."""
-    positions = runs.get(run_len)
-    if not positions:
-        return -1
-    cur = cursors.get(run_len, 0)
-    n_pos = len(positions)
-    while cur < n_pos and positions[cur] < start:
-        cur += 1
-    if cur < n_pos:
-        cursors[run_len] = cur + 1
-        return positions[cur]
-    cursors[run_len] = cur
-    return -1
-
-
 def _prose_segments(
     text: str,
     *,
@@ -178,145 +138,15 @@ def _prose_segments(
 ) -> tuple[list[tuple[int, int]], int | None, str | None]:
     """Return ``(prose_segments, unclosed_code_start, end_code_fence)``.
 
-    Single source of truth for both unbuffered SSE citation scanning and cross-chunk
-    markdown state advancement (with ``hold_incomplete=False`` on an already-chosen prefix).
+    Delegates directly to ``agent_service._scan_markdown_prose_segments`` so SSE streaming,
+    cross-chunk state advancement, and final citation rewriting share one single CommonMark scanner.
     """
-    segments: list[tuple[int, int]] = []
-    prose_start = 0
-    index = 0
-    length = len(text)
-    unclosed_code_start: int | None = None
-    para_limit = -1
-    para_bt_runs: dict[int, list[int]] = {}
-    para_bt_cursors: dict[int, int] = {}
-
-    while index < length:
-        line_start = (index == 0 and at_line_start) or (index > 0 and text[index - 1] == "\n")
-        if line_start:
-            nl_idx = text.find("\n", index)
-            line_end = length if nl_idx == -1 else nl_idx + 1
-
-            # Hold any unterminated potential closing-fence prefix (0..3 spaces + 0..N chars of
-            # code_fence[0] + trailing spaces/tabs) BEFORE len(marker) >= len(code_fence),
-            # so 4+-char closing fences split at 1..3 chars stay intact.
-            if (
-                hold_incomplete
-                and code_fence is not None
-                and nl_idx == -1
-                and (length - index) <= _MAX_PENDING_INLINE_CODE_CHARS
-            ):
-                rem = text[index:]
-                stripped_lead = rem.lstrip(" ")
-                lead_spaces = len(rem) - len(stripped_lead)
-                if lead_spaces <= 3:
-                    core = stripped_lead.rstrip(" \t")
-                    if not core or all(ch == code_fence[0] for ch in core):
-                        unclosed_code_start = index
-                        prose_start = length
-                        break
-
-            fence_match = _FENCE_OPEN_RE.match(text, index)
-            if fence_match:
-                marker = fence_match.group(2)
-                suffix = text[fence_match.end() : line_end].strip()
-                if code_fence is None:
-                    # CommonMark §4.5: backtick fence info strings cannot contain backticks.
-                    if marker[0] != "`" or "`" not in suffix:
-                        if nl_idx == -1:
-                            # Never commit an opening fence before seeing its terminating newline.
-                            if hold_incomplete and (length - index) <= _MAX_PENDING_FENCE_HEADER_CHARS:
-                                if index > prose_start:
-                                    segments.append((prose_start, index))
-                                unclosed_code_start = index
-                                prose_start = length
-                                break
-                            index = line_end
-                            continue
-                        if index > prose_start:
-                            segments.append((prose_start, index))
-                        code_fence = marker
-                        prose_start = line_end
-                        index = line_end
-                        continue
-                elif (
-                    code_fence[0] == marker[0]
-                    and len(marker) >= len(code_fence)
-                    and suffix == ""
-                ):
-                    if nl_idx == -1:
-                        index = line_end
-                        continue
-                    code_fence = None
-                    prose_start = line_end
-                    index = line_end
-                    continue
-            elif (
-                hold_incomplete
-                and code_fence is None
-                and nl_idx == -1
-                and (length - index) <= _MAX_PENDING_INLINE_CODE_CHARS
-            ):
-                # Hold 0..3 leading spaces + 1..2 backticks or tildes at line start so indented
-                # opening fences split after 1..2 marker chars preserve at_line_start=True.
-                rem = text[index:]
-                stripped_lead = rem.lstrip(" ")
-                lead_spaces = len(rem) - len(stripped_lead)
-                if (
-                    lead_spaces <= 3
-                    and stripped_lead
-                    and (
-                        all(ch == "`" for ch in stripped_lead)
-                        or all(ch == "~" for ch in stripped_lead)
-                    )
-                ):
-                    if index > prose_start:
-                        segments.append((prose_start, index))
-                    unclosed_code_start = index
-                    prose_start = length
-                    break
-
-        if code_fence is not None:
-            nl_idx = text.find("\n", index)
-            index = length if nl_idx == -1 else nl_idx + 1
-            continue
-
-        if text[index] == "`":
-            run_len = 1
-            while index + run_len < length and text[index + run_len] == "`":
-                run_len += 1
-            after_start = index + run_len
-            if index >= para_limit:
-                next_para = text.find("\n\n", after_start)
-                para_limit = length if next_para == -1 else next_para
-                para_bt_runs = _index_paragraph_backtick_runs(text, after_start, para_limit)
-                para_bt_cursors = {}
-            closing = _next_closing_backticks(para_bt_runs, para_bt_cursors, after_start, run_len)
-            if closing != -1:
-                if index > prose_start:
-                    segments.append((prose_start, index))
-                span_end = closing + run_len
-                prose_start = span_end
-                index = span_end
-                continue
-            if (
-                hold_incomplete
-                and unclosed_code_start is None
-                and (length - after_start) <= _MAX_PENDING_INLINE_CODE_CHARS
-                and text.find("\n\n", after_start) == -1
-            ):
-                if index > prose_start:
-                    segments.append((prose_start, index))
-                unclosed_code_start = index
-                prose_start = length
-                break
-            index = after_start
-            continue
-
-        index += 1
-
-    if code_fence is None and prose_start < length:
-        segments.append((prose_start, length))
-    return segments, unclosed_code_start, code_fence
+    return agent_service._scan_markdown_prose_segments(
+        text,
+        at_line_start=at_line_start,
+        code_fence=code_fence,
+        hold_incomplete=hold_incomplete,
+    )
 
 
 def _advance_markdown_state(
