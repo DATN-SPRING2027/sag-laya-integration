@@ -211,11 +211,11 @@ class Settings(BaseSettings):
     sag_pg_database: str = "sag"
     sag_qdrant_url: str = Field(
         default="http://localhost:6333",
-        validation_alias=AliasChoices("SAG_QDRANT_URL", "SAG_SAG_QDRANT_URL"),
+        validation_alias=AliasChoices("sag_qdrant_url", "SAG_QDRANT_URL", "SAG_SAG_QDRANT_URL"),
     )
     sag_qdrant_api_key: str | None = Field(
         default=None,
-        validation_alias=AliasChoices("SAG_QDRANT_API_KEY", "SAG_SAG_QDRANT_API_KEY"),
+        validation_alias=AliasChoices("sag_qdrant_api_key", "SAG_QDRANT_API_KEY", "SAG_SAG_QDRANT_API_KEY"),
     )
 
     # ── LLM（答案生成 + 抽取）─────────────────────────────────────────
