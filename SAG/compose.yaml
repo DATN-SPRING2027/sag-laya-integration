@@ -171,6 +171,8 @@ services:
         NEXT_PUBLIC_CONTINUUM_SSO_URL: ${NEXT_PUBLIC_CONTINUUM_SSO_URL:-http://localhost:3000/api/backend/ai-engine/auth/sag-login}
         # 桌面客户端构建可设为 false，Web 默认保留页内窗口缩放。
         NEXT_PUBLIC_ENABLE_WINDOW_SCALING: ${NEXT_PUBLIC_ENABLE_WINDOW_SCALING:-true}
+    environment:
+      SAG_API_INTERNAL_URL: http://api:8000
     depends_on:
       api:
         condition: service_healthy

@@ -23,7 +23,7 @@ describe("SAG Web HttpOnly session route (SAG-SEC-005 / SEC-BE-001)", () => {
 
     const req = new NextRequest("https://sag.local/api/auth/session", {
       method: "POST",
-      headers: { "Content-Type": "application/json", host: "sag.local" },
+      headers: { "Content-Type": "application/json", host: "sag.local", origin: "https://sag.local" },
       body: JSON.stringify({ code: "one-time-code-123", state: "state-abc" }),
     });
     const res = await POST(req);
@@ -43,7 +43,7 @@ describe("SAG Web HttpOnly session route (SAG-SEC-005 / SEC-BE-001)", () => {
   it("clears the HttpOnly cookie on DELETE and never exposes token via getToken()", async () => {
     const req = new NextRequest("http://localhost:3002/api/auth/session", {
       method: "DELETE",
-      headers: { host: "localhost:3002" },
+      headers: { host: "localhost:3002", origin: "http://localhost:3002" },
     });
     const res = await DELETE(req);
     expect(res.status).toBe(200);

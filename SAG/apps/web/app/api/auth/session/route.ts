@@ -56,12 +56,26 @@ export async function GET(req: NextRequest) {
   );
 }
 
+function isSameOrigin(req: NextRequest): boolean {
+  return req.headers.get("origin") === req.nextUrl.origin;
+}
+
 export async function POST(req: NextRequest) {
+  if (!isSameOrigin(req)) {
+    return NextResponse.json({ error: "Invalid request origin" }, { status: 403 });
+  }
+  if (req.headers.get("content-type")?.split(";")[0].trim().toLowerCase() !== "application/json") {
+    return NextResponse.json({ error: "Expected JSON" }, { status: 415 });
+  }
   let body: { code?: unknown; state?: unknown; token?: unknown; maxAgeSeconds?: unknown };
   try {
     body = (await req.json()) as typeof body;
   } catch {
     return NextResponse.json({ error: "Invalid JSON payload" }, { status: 400 });
+  }
+
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
   }
 
   let resolvedToken: string | null = null;
@@ -123,6 +137,9 @@ export async function POST(req: NextRequest) {
 }
 
 export async function DELETE(req: NextRequest) {
+  if (!isSameOrigin(req)) {
+    return NextResponse.json({ error: "Invalid request origin" }, { status: 403 });
+  }
   const cookieName = tokenCookieName(req.headers.get("host") ?? "");
   const response = NextResponse.json(
     { ok: true },

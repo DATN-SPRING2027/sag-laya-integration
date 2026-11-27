@@ -369,7 +369,7 @@ class Settings(BaseSettings):
     # Post-generation entailment verifier timeout (defaults to derived from llm_timeout_ms when None).
     entailment_verifier_timeout_seconds: float | None = Field(default=None, ge=1.0, le=300.0)
     # Stream assistant tokens progressively instead of buffering until post-gen verification finishes.
-    streaming_progressive_enabled: bool = True
+    streaming_progressive_enabled: bool = False
 
     @field_validator("decision_base_url")
     @classmethod

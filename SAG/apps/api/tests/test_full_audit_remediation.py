@@ -32,7 +32,7 @@ from sag_agent import EventType
 from sag_api.api.v1 import conflicts as conflicts_api
 from sag_api.api.v1 import system as system_api
 from sag_api.core import deps
-from sag_api.core.config import Settings
+from sag_api.core.config import Settings, settings
 from sag_api.core.errors import ForbiddenError, ValidationError
 from sag_api.core.logging import sanitize_request_id
 from sag_api.core.principal_assertion import VerifiedPrincipal
@@ -286,7 +286,7 @@ def test_perf_defaults_and_multiturn_router_cache_keys() -> None:
     s = Settings(_env_file=None)
     assert s.decision_provider == "disabled"
     assert s.search_route_decision_cache_enabled is True
-    assert s.streaming_progressive_enabled is True
+    assert s.streaming_progressive_enabled is False
 
     k1 = decision_router._cache_key(
         provider="siliconflow",
@@ -319,6 +319,7 @@ def test_perf_defaults_and_multiturn_router_cache_keys() -> None:
 async def test_progressive_streaming_yields_tokens_before_run_completed_without_duplication(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(settings, "streaming_progressive_enabled", True)
     source = SimpleNamespace(id="src-1", name="Docs", sag_source_config_id="cfg-1")
     monkeypatch.setattr(agent_service, "resolve_sources", AsyncMock(return_value=[source]))
     monkeypatch.setattr(agent_service, "resolve_mcp_specs", AsyncMock(return_value=[]))

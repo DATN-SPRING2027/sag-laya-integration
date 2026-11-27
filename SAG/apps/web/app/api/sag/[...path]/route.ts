@@ -31,11 +31,6 @@ async function proxyToSag(
     "accept-language",
     "content-type",
     "x-request-id",
-    "x-sag-bff-service-token",
-    "x-continuum-role",
-    "x-continuum-roles",
-    "x-continuum-capabilities",
-    "x-continuum-permissions",
     "last-event-id",
   ];
   for (const name of forwardHeaderNames) {
@@ -78,6 +73,19 @@ async function proxyToSag(
     if (value) responseHeaders.set(name, value);
   }
   responseHeaders.set("x-content-type-options", "nosniff");
+  const contentType = responseHeaders.get("content-type")?.split(";")[0].trim().toLowerCase();
+  const activeContent = contentType && new Set([
+    "text/html", "application/xhtml+xml", "image/svg+xml", "application/xml", "text/xml",
+  ]).has(contentType);
+  if (upstream.ok && (path.at(-1) === "file" || activeContent)) {
+    responseHeaders.set("content-type", "application/octet-stream");
+    const disposition = responseHeaders.get("content-disposition");
+    responseHeaders.set(
+      "content-disposition",
+      disposition ? disposition.replace(/^[^;]+/, "attachment") : "attachment",
+    );
+    responseHeaders.set("content-security-policy", "sandbox; default-src 'none'");
+  }
 
   return new Response(upstream.body, {
     status: upstream.status,

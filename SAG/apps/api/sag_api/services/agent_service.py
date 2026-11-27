@@ -2050,7 +2050,7 @@ async def generate_stream(
                     if isinstance(delta, str):
                         partial_answer.append(delta)
                     if local_grounding_required or session_grounded_scope or host_context.search_context_called:
-                        if not getattr(settings, "streaming_progressive_enabled", True):
+                        if not getattr(settings, "streaming_progressive_enabled", False):
                             # Legacy buffered mode: keep unvalidated deltas private until RUN_COMPLETED.
                             continue
                         streamed_grounded_deltas = True

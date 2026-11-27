@@ -49,3 +49,13 @@
   - **Full isolated `pytest` (Python 3.12.13):** **917 passed, 0 failed, 5 skipped** (`0` `math.sumprod` crashes; includes 21 new regression tests in `tests/test_full_audit_remediation.py` + `tests/test_parsing_json_text.py`; final handover fix verified with `56 passed in 25.83s` after the 916/917 full run).
   - **`SAG/apps/web` checks:** `tsc --noEmit` (`0` errors), `eslint . --max-warnings=0` (`0` errors, `0` warnings), `vitest run` (`10/10` test files, `63/63` tests passed including new `HttpOnly` SSO code-exchange test `app/api/auth/session/route.test.ts`).
 - **Evidence Report:** `C:\Users\KAYT\.gemini\antigravity\brain\239821f2-3439-4e7c-8f68-23ae7b8ec3e0\scratch\fix-sag.md`.
+
+## PR #76 review follow-up
+
+The HttpOnly flow uses the cookie-backed identity API. The callback shares its
+one-time exchange across effect re-runs and session mutations require a
+same-origin request. The web proxy drops privileged headers supplied by callers
+and serves original downloads as attachments. Compose configures the internal API
+origin. Grounded streaming defaults to buffered until verification. No database
+migration is included. The Conflict reviewer write path still needs a separate
+Continuum BFF integration. Verify the web checks, Compose, and Python suite.
