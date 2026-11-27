@@ -59,3 +59,9 @@ and serves original downloads as attachments. Compose configures the internal AP
 origin. Grounded streaming defaults to buffered until verification. No database
 migration is included. The Conflict reviewer write path still needs a separate
 Continuum BFF integration. Verify the web checks, Compose, and Python suite.
+
+A second follow-up makes revocation cleanup retryable. PostgreSQL keeps the
+revoked state when Qdrant is unavailable. The retry removes only the original
+version IDs, so a later ingestion is kept. Source aggregate recomputation takes
+a row lock for concurrent promotions. The canonical ingestion suite passed 21
+tests. No database migration or live cleanup was applied.

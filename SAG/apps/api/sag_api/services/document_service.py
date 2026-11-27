@@ -19,7 +19,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.config import settings
 from sag_api.core.error_taxonomy import ErrorLayer, ErrorStage
-from sag_api.core.errors import ConflictError, ForbiddenError, NotFoundError, ValidationError
+from sag_api.core.errors import (
+    ConflictError,
+    ForbiddenError,
+    NotFoundError,
+    ServiceUnavailableError,
+    ValidationError,
+)
 from sag_api.core.identity import (
     VerifiedPrincipal,
     compute_payload_hash,
@@ -2743,6 +2749,32 @@ async def resolve_project_document(
     return doc
 
 
+async def _purge_revoked_project_versions(
+    *,
+    project_id: str,
+    versions: list[DocumentVersion],
+    engine_manager: Any,
+    qdrant_client: Any,
+) -> None:
+    if not versions:
+        return
+
+    from sag_api.services.search_index_service import delete_document_points_from_qdrant
+
+    try:
+        if qdrant_client is None and engine_manager is not None:
+            qdrant_client = await engine_manager.get_search_unit_qdrant_client()
+        if qdrant_client is not None:
+            # A retry can overlap later ingestion. Purge only the revoked versions.
+            await delete_document_points_from_qdrant(
+                qdrant_client,
+                project_id=project_id,
+                document_version_ids=[str(version.id) for version in versions],
+            )
+    except (httpx.HTTPError, RuntimeError, AttributeError, ServiceUnavailableError) as exc:
+        raise ServiceUnavailableError("Revoked vectors could not be removed. Retry the revocation.") from exc
+
+
 async def revoke_project_document(
     session: AsyncSession,
     *,
@@ -2807,6 +2839,10 @@ async def revoke_project_document(
         from sag_api.api.v1.universe import clear_universe_caches
 
         clear_universe_caches(project_id)
+        await _purge_revoked_project_versions(
+            project_id=project_id, versions=versions,
+            engine_manager=engine_manager, qdrant_client=qdrant_client,
+        )
         return DocumentRevokeResponse(status="ALREADY_REVOKED", document_id=doc.id)
 
     now_utc = datetime.now(UTC)
@@ -2876,36 +2912,10 @@ async def revoke_project_document(
     clear_universe_caches(project_id)
     bump_project_session_revocation_epoch(project_id)
 
-    # SAG-DB-001: Purge revoked document vectors from Qdrant across ALL revocation reasons
-    # (not only DOCUMENT_DELETED) and enqueue routing tree refresh.
-    resolved_qdrant = qdrant_client
-    if resolved_qdrant is None and engine_manager is not None and hasattr(engine_manager, "get_search_unit_qdrant_client"):
-        try:
-            resolved_qdrant = await engine_manager.get_search_unit_qdrant_client()
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "Could not acquire Qdrant client for document revocation purge doc=%s (%s)",
-                doc.id,
-                type(exc).__name__,
-            )
-            resolved_qdrant = None
-    if resolved_qdrant is not None:
-        from sag_api.services.search_index_service import delete_document_points_from_qdrant
-
-        try:
-            await delete_document_points_from_qdrant(
-                resolved_qdrant,
-                project_id=project_id,
-                document_version_ids=[str(ver.id) for ver in versions],
-                document_id=str(doc.id),
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "Qdrant point purge failed during document revocation doc=%s project=%s (%s)",
-                doc.id,
-                project_id,
-                type(exc).__name__,
-            )
+    await _purge_revoked_project_versions(
+        project_id=project_id, versions=versions,
+        engine_manager=engine_manager, qdrant_client=qdrant_client,
+    )
 
     if job_queue is not None:
         from sag_api.services.universe_tree_service import enqueue_project_tree_rebuild

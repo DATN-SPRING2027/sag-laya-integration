@@ -964,7 +964,8 @@ async def _process_document_unlocked(
     )
     if completed.rowcount != 1:
         await _yield_after_document_transition_lost(session, document)
-    # Recompute exact active totals for Source instead of monotonic += across version replacements.
+    # Serialize totals for concurrent document promotions in the same source.
+    await session.execute(select(Source.id).where(Source.id == source.id).with_for_update())
     totals_row = (
         await session.execute(
             select(
