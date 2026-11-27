@@ -13,6 +13,7 @@ from sag_api.core.config import settings
 from sag_api.core.db import SessionLocal, get_session
 from sag_api.core.deps import (
     get_current_user,
+    require_authenticated_or_service_token,
     require_model_config_operator,
     require_operator_or_service_token,
 )
@@ -365,7 +366,7 @@ async def metrics(
 
 @router.get("/capabilities")
 async def capabilities(
-    _operator: User | None = Depends(require_operator_or_service_token),
+    _caller: User | None = Depends(require_authenticated_or_service_token),
 ) -> dict:
     """能力探测：供前端判断是否已配置 LLM、当前引擎后端等。"""
     return _capabilities()

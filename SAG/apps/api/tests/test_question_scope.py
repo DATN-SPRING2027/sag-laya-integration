@@ -313,11 +313,11 @@ class QuestionScopeStreamIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Internet access is disabled in this turn.", system_prompt)
         self.assertIn("current external information cannot be verified", system_prompt)
 
-    async def test_standalone_general_question_answers_directly_without_tools_or_evidence_gate(self) -> None:
+    async def test_standalone_general_question_answers_directly_when_web_mode_enabled(self) -> None:
         events, runtime, router_mock, _ = await self._run_stream(
             query="Giải thích REST API là gì?",
             scope_response='{"scope":"general"}',
-            knowledge_only=True,
+            knowledge_only=False,
             output="REST API là kiến trúc giao diện lập trình ứng dụng dựa trên HTTP.",
         )
         router_mock.assert_awaited_once()
@@ -327,6 +327,25 @@ class QuestionScopeStreamIntegrationTests(unittest.IsolatedAsyncioTestCase):
         completed = [e for e in events if e.type == EventType.RUN_COMPLETED.value]
         self.assertEqual(completed[0].data["payload"]["answer_status"], "answered")
         self.assertIn("REST API", completed[0].data["payload"]["output"])
+
+    async def test_knowledge_only_mode_never_bypasses_search_or_evidence_gate_on_general_scope(self) -> None:
+        events, runtime, _, _ = await self._run_stream(
+            query="kĩ thuật nào dùng làm fe cho ai chat",
+            scope_response='{"scope":"general"}',
+            knowledge_only=True,
+            output="Để xây dựng FE cho AI Chat, các kỹ thuật phổ biến là React, Next.js và Redux Toolkit.",
+        )
+        tool_names = [t.spec.name for t in runtime.definition.tools]
+        self.assertIn("search_context", tool_names)
+        self.assertEqual(
+            runtime.definition.initial_tool_choice,
+            {"type": "function", "function": {"name": "search_context"}},
+        )
+        system_prompt = runtime.history[0]["content"]
+        self.assertNotIn("You may explain general public knowledge directly without citations", system_prompt)
+        completed = [e for e in events if e.type == EventType.RUN_COMPLETED.value]
+        self.assertEqual(completed[0].data["payload"]["answer_status"], "no_answer")
+        self.assertEqual(completed[0].data["payload"]["no_answer_reason"], "weak_evidence")
 
     async def test_application_scope_disables_tools_and_reflects_internet_state(self) -> None:
         _, runtime, _, resolve_mcp = await self._run_stream(

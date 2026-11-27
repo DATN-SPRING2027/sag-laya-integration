@@ -1641,10 +1641,34 @@ async def generate_stream(
             and route_mem_scope in {"session_history", "full_session_audit"}
             and not bool(plan.source_ids)
         )
+        flags = _extract_intent_flags(plan_route_decision)
+        coarse_intent = str(plan_route_decision.get("coarse_intent") or "AMBIGUOUS").upper()
+        try:
+            route_confidence = float(plan_route_decision.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            route_confidence = 0.0
+        is_chitchat_turn = (
+            (coarse_intent == "CHAT" and route_confidence >= CHAT_HIGH_CONFIDENCE)
+            or (bool(plan_route_decision.get("is_chitchat")) and route_confidence >= CHAT_HIGH_CONFIDENCE)
+        )
+        is_pure_time_or_web_only = (
+            (flags.needs_web or flags.needs_time) and not flags.needs_retrieval
+        )
         raw_scope = str(plan_route_decision.get("question_scope") or "").strip().lower()
         if bool(plan.source_ids):
             question_scope = "project"
         elif session_grounded_scope and raw_scope in {"", "unknown"}:
+            question_scope = "project"
+        elif (
+            knowledge_only
+            and raw_scope == "general"
+            and not is_chitchat_turn
+            and not flags.is_pure_math_or_transform
+            and not is_pure_time_or_web_only
+        ):
+            # In strict knowledge-only mode (e.g. Continuum Project AI Chat),
+            # never let a "general" router label bypass search_context or allow
+            # uncited parametric answers for knowledge/technical questions.
             question_scope = "project"
         elif raw_scope in {"general", "project", "application", "unknown"}:
             question_scope = raw_scope
@@ -1657,8 +1681,6 @@ async def generate_stream(
             else await resolve_mcp_specs(session, agent)
         )
 
-    flags = _extract_intent_flags(plan_route_decision)
-    coarse_intent = str(plan_route_decision.get("coarse_intent") or "AMBIGUOUS")
     route_degraded = bool(plan_route_decision.get("degraded", False))
     route_degraded_reason = plan_route_decision.get("degraded_reason")
     extraction_degraded = bool(
@@ -1790,15 +1812,25 @@ async def generate_stream(
                         + general_tail
                     )
                 else:
-                    offline_tail = (
-                        "If answering requires real-time or external facts, clearly state that Internet access "
-                        "is disabled so current external information cannot be verified."
-                        if (needs_external_lookup and "get_time" not in names)
-                        else "This is a standalone general knowledge question, not a project document lookup."
-                    )
+                    if needs_external_lookup and "get_time" not in names:
+                        offline_tail = (
+                            "If answering requires real-time or external facts, clearly state that Internet access "
+                            "is disabled so current external information cannot be verified."
+                        )
+                    elif is_chitchat_turn:
+                        offline_tail = (
+                            "This is a conversational greeting or assistant-identity turn; reply briefly and naturally."
+                        )
+                    elif flags.is_pure_math_or_transform:
+                        offline_tail = (
+                            "This is a pure math or text-transformation request; answer directly from the provided input."
+                        )
+                    else:
+                        offline_tail = (
+                            "Do not answer factual or project questions from unverified model memory without evidence."
+                        )
                     scene_notes.append(
                         "Answer in the user's language. Internet access is disabled in this turn. "
-                        "You may explain general public knowledge directly without citations. "
                         "Never invent current external facts, private project facts, live records, "
                         "browsing history or tool results. "
                         + offline_tail

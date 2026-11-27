@@ -138,6 +138,33 @@ async def require_operator_or_service_token(
     return await require_model_config_operator(user=user)
 
 
+async def require_authenticated_or_service_token(
+    request: Request,
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
+    session: AsyncSession = Depends(get_session),
+) -> User | None:
+    """Allow trusted BFF/service credentials or any authenticated user for read-only UI capabilities."""
+    bff_tokens = request.headers.getlist("X-SAG-BFF-Service-Token")
+    if bff_tokens:
+        if (
+            len(bff_tokens) == 1
+            and settings.bff_service_token
+            and secrets.compare_digest(bff_tokens[0], settings.bff_service_token)
+        ):
+            request.state.auth_kind = "bff_service"
+            return None
+        raise ForbiddenError("Invalid Continuum service credential")
+
+    if creds is not None and creds.credentials and settings.service_api_key:
+        if secrets.compare_digest(creds.credentials, settings.service_api_key):
+            request.state.auth_kind = "service_api_key"
+            return None
+
+    if creds is None or not creds.credentials:
+        raise AuthError("Thiếu token xác thực")
+    return await get_current_user(request, token=creds.credentials, session=session)
+
+
 async def get_current_user_or_connector(
     request: Request,
     token: str = Depends(_get_bearer_token),

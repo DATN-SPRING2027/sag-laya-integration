@@ -242,3 +242,43 @@ def test_env_examples_have_no_unknown_sag_keys_and_load_cleanly() -> None:
     loaded = ApiExampleSettings()
     assert loaded.search_strategy == "multi"
     assert loaded.sag_language == "en"
+
+
+def test_require_authenticated_or_service_token_allows_regular_user_and_rejects_anonymous(monkeypatch) -> None:
+    """Read-only /system/capabilities allows any authenticated SAG Web user while rejecting anonymous requests."""
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from fastapi.security import HTTPAuthorizationCredentials
+    from starlette.datastructures import Headers
+
+    from sag_api.core import deps
+    from sag_api.core.errors import AuthError
+
+    fake_user = SimpleNamespace(id="regular-member-1", is_active=True)
+    monkeypatch.setattr(deps, "get_current_user", AsyncMock(return_value=fake_user))
+    fake_request = SimpleNamespace(
+        url=SimpleNamespace(path="/api/v1/system/capabilities"),
+        method="GET",
+        headers=Headers({}),
+        state=SimpleNamespace(),
+    )
+
+    resolved = asyncio.run(
+        deps.require_authenticated_or_service_token(
+            fake_request,
+            creds=HTTPAuthorizationCredentials(scheme="Bearer", credentials="user-jwt"),
+            session=None,  # type: ignore[arg-type]
+        )
+    )
+    assert resolved is fake_user
+
+    with pytest.raises(AuthError):
+        asyncio.run(
+            deps.require_authenticated_or_service_token(
+                fake_request,
+                creds=None,
+                session=None,  # type: ignore[arg-type]
+            )
+        )
