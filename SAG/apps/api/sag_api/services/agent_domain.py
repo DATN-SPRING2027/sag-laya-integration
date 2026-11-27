@@ -928,8 +928,18 @@ def _message_source_ids(message: Message) -> set[str] | None:
         if not has_knowledge_scope:
             return None
         sources = details.get("sources")
-        if not isinstance(sources, list) or not sources:
+        if not isinstance(sources, list):
             return None
+        if not sources:
+            matches = details.get("matches")
+            raw_count = details.get("count")
+            has_unattributed_matches = (
+                (isinstance(matches, list) and len(matches) > 0)
+                or (isinstance(raw_count, int) and not isinstance(raw_count, bool) and raw_count > 0)
+            )
+            if has_unattributed_matches:
+                return None
+            continue
         step_source_ids = {
             str(source["id"])
             for source in sources

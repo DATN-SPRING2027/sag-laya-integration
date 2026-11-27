@@ -761,3 +761,87 @@ def test_request_id_sanitization_prevents_log_injection() -> None:
         cleaned = sanitize_request_id(malicious)
         assert "\n" not in cleaned and "\r" not in cleaned and "\x1b" not in cleaned
         assert cleaned != malicious
+
+
+@pytest.mark.asyncio
+async def test_documents_file_and_preview_neutralize_active_html_and_svg(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sag_api.api.v1 import documents as documents_api
+
+    html_file = tmp_path / "report.html"
+    html_file.write_text("<script>alert(1)</script>", encoding="utf-8")
+    svg_file = tmp_path / "diagram.svg"
+    svg_file.write_text("<svg onload='alert(1)'></svg>", encoding="utf-8")
+
+    fake_source = SimpleNamespace(id="src-1", project_id="proj-1")
+    monkeypatch.setattr(documents_api, "get_source", AsyncMock(return_value=fake_source))
+
+    html_doc = SimpleNamespace(
+        id="doc-html",
+        filename="report.html",
+        content_type="text/html",
+        storage_path=str(html_file),
+        octx_installation_id=None,
+    )
+    monkeypatch.setattr(documents_api, "get_public_document", AsyncMock(return_value=html_doc))
+    file_resp = await documents_api.get_file(
+        "src-1", "doc-html", _user=SimpleNamespace(), principal=SimpleNamespace(), session=None  # type: ignore[arg-type]
+    )
+    assert file_resp.media_type == "application/octet-stream"
+    assert "attachment" in file_resp.headers.get("content-disposition", "").lower()
+    assert file_resp.headers.get("x-content-type-options") == "nosniff"
+    assert "sandbox" in file_resp.headers.get("content-security-policy", "")
+
+    svg_doc = SimpleNamespace(
+        id="doc-svg",
+        filename="diagram.svg",
+        content_type="image/svg+xml",
+        storage_path=str(svg_file),
+        octx_installation_id=None,
+    )
+    monkeypatch.setattr(documents_api, "get_public_document", AsyncMock(return_value=svg_doc))
+    monkeypatch.setattr(documents_api, "is_text_preview", lambda *_a, **_k: False)
+    preview_resp = await documents_api.get_preview(
+        "src-1", "doc-svg", _user=SimpleNamespace(), principal=SimpleNamespace(), session=None  # type: ignore[arg-type]
+    )
+    assert preview_resp.media_type == "application/octet-stream"
+    assert "attachment" in preview_resp.headers.get("content-disposition", "").lower()
+    assert preview_resp.headers.get("x-content-type-options") == "nosniff"
+    assert "sandbox" in preview_resp.headers.get("content-security-policy", "")
+
+
+def test_empty_knowledge_abstention_step_preserves_message_provenance_while_unattributed_matches_fail_closed() -> None:
+    from sag_api.services.agent_domain import _message_source_ids
+
+    abstention_msg = SimpleNamespace(
+        citations=[],
+        steps=[
+            {
+                "kind": "tool",
+                "name": "search_context",
+                "count": 0,
+                "details": {"count": 0, "scope": "knowledge", "sources": []},
+            }
+        ],
+    )
+    assert _message_source_ids(abstention_msg) == set()
+
+    unattributed_match_msg = SimpleNamespace(
+        citations=[],
+        steps=[
+            {
+                "kind": "tool",
+                "name": "search_context",
+                "count": 1,
+                "details": {
+                    "count": 1,
+                    "scope": "knowledge",
+                    "sources": [],
+                    "matches": [{"chunk_id": "c-1"}],
+                },
+            }
+        ],
+    )
+    assert _message_source_ids(unattributed_match_msg) is None

@@ -621,6 +621,28 @@ async def get_(
     )
 
 
+_ACTIVE_CONTENT_TYPES = frozenset(
+    {
+        "text/html",
+        "application/xhtml+xml",
+        "image/svg+xml",
+        "application/xml",
+        "text/xml",
+    }
+)
+_SAFE_DOWNLOAD_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": "sandbox; default-src 'none'",
+}
+
+
+def _safe_media_type(content_type: str | None) -> tuple[str, bool]:
+    raw = (content_type or "application/octet-stream").split(";")[0].strip().lower()
+    if not raw or raw in _ACTIVE_CONTENT_TYPES:
+        return "application/octet-stream", True
+    return raw, False
+
+
 @router.get("/{document_id}/file")
 async def get_file(
     source_id: str,
@@ -629,7 +651,7 @@ async def get_file(
     principal: VerifiedPrincipal = Depends(require_project_read_principal),
     session: AsyncSession = Depends(get_session),
 ):
-    """Original file (preview/download). Returns 404 when file has been cleaned up."""
+    """Original file download. Always forces attachment + safe MIME for active content."""
     import os
 
     from fastapi.responses import FileResponse
@@ -642,11 +664,13 @@ async def get_file(
         raise NotFoundError("OCTX bundle does not contain the original file; inspect parsed content instead")
     if not document.storage_path or not os.path.isfile(document.storage_path):
         raise NotFoundError("Original file does not exist or has been cleaned up")
+    media_type, _ = _safe_media_type(document.content_type)
     return FileResponse(
         document.storage_path,
-        media_type=document.content_type or "application/octet-stream",
+        media_type=media_type,
         filename=document.filename,
-        content_disposition_type="inline",
+        content_disposition_type="attachment",
+        headers=dict(_SAFE_DOWNLOAD_HEADERS),
     )
 
 
@@ -658,7 +682,7 @@ async def get_preview(
     principal: VerifiedPrincipal = Depends(require_project_read_principal),
     session: AsyncSession = Depends(get_session),
 ):
-    """Return preview directly consumable by browser; text is normalized to UTF-8 while download preserves raw bytes."""
+    """Return preview directly consumable by browser; text is normalized to UTF-8 while active content is forced to safe attachment."""
     import os
 
     from fastapi.responses import FileResponse, Response
@@ -677,13 +701,18 @@ async def get_preview(
         return Response(
             content=decoded.text,
             media_type="text/plain; charset=utf-8",
-            headers={"X-Muse-Source-Encoding": decoded.encoding},
+            headers={
+                "X-Muse-Source-Encoding": decoded.encoding,
+                "X-Content-Type-Options": "nosniff",
+            },
         )
+    media_type, is_active = _safe_media_type(document.content_type)
     return FileResponse(
         document.storage_path,
-        media_type=document.content_type or "application/octet-stream",
+        media_type=media_type,
         filename=document.filename,
-        content_disposition_type="inline",
+        content_disposition_type="attachment" if is_active else "inline",
+        headers=dict(_SAFE_DOWNLOAD_HEADERS) if is_active else {"X-Content-Type-Options": "nosniff"},
     )
 
 
