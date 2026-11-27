@@ -27,7 +27,7 @@ jobs:
           enable-cache: true
           python-version: "3.12"
       - name: Install API dependencies
-        run: uv sync --frozen --extra postgres
+        run: uv sync --frozen --extra dev --extra postgres
       - name: Ruff lint
         run: uv run ruff check sag_api tests
       - name: AST syntax verification

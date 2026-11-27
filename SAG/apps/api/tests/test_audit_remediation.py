@@ -34,7 +34,6 @@ from sag_api.services.knowledge_service import (
     graph_payload,
 )
 
-
 METRIC_PARTITION_UNIVERSE_BLOCKS = [
     (
         "Northwind Labs Knowledge Governance Playbook",
@@ -450,6 +449,7 @@ async def test_task5_paused_and_failed_documents_excluded_from_retrieval_scope(r
 async def test_search_unit_qdrant_store_batch_query_single_roundtrip() -> None:
     """Verify Qdrant points/query/batch executes multiple channels in 1 HTTP round-trip."""
     import httpx
+
     from sag_api.sag.search_unit_store import SearchUnitQdrantStore
 
     requests_seen: list[tuple[str, str, dict]] = []
@@ -574,6 +574,7 @@ def test_incremental_processor_disables_event_entity_edge_vectors_by_default() -
 def test_bilingual_vietnamese_english_stopwords_and_diacritics() -> None:
     """Verify Vietnamese + English stopwords and Unicode diacritics in lexical/sparse/query analysis."""
     from pathlib import Path
+
     import sag_api.sag as sag_pkg
     from sag_api.sag.search_unit_store import _SPARSE_QUERY_STOPWORDS, build_sparse_query_vector
     from sag_api.services.query_analysis import analyze_query

@@ -13,12 +13,15 @@ Follows Ponytail minimalism:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import json
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import quote
+from weakref import WeakKeyDictionary
 
 import httpx
 from sqlalchemy import func, or_, select
@@ -269,9 +272,6 @@ def compute_sparse_bm25_vector(
         "values": [sparse_map[idx] for idx in sorted_indices],
     }
 
-
-import asyncio
-from weakref import WeakKeyDictionary
 
 PAYLOAD_INDEX_FIELDS = [
     ("tenant_id", "keyword"),

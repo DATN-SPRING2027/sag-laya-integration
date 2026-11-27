@@ -40,6 +40,7 @@ from sag_api.services.query_analysis import (
     extract_salient_query_terms,
     normalize_lexical_text,
 )
+from sag_api.services.search_index_service import COMMON_STOPWORDS
 
 log = get_logger("retrieval")
 
@@ -211,8 +212,6 @@ def _section_key(section: RetrievedSection) -> tuple[str, str]:
     fingerprint = normalize_lexical_text(f"{section.heading}\n{section.content}")[:240]
     return source, fingerprint
 
-
-from sag_api.services.search_index_service import COMMON_STOPWORDS
 
 _LEXICAL_STOPWORDS = COMMON_STOPWORDS
 _CONTINUOUS_SCRIPT_TERM_RE = re.compile(

@@ -259,6 +259,7 @@ class IncrementalDocumentProcessor:
             return False
 
         from sqlalchemy import select
+
         from sag_api.db.models.routing_rag import CanonicalBlock, SearchUnit
 
         session_factory = relational.session_factory()
@@ -349,7 +350,7 @@ class IncrementalDocumentProcessor:
             "\n".join(u.content_hash for u in units).encode("utf-8")
         ).hexdigest()[:32]
         chunk_version = sha256(
-            f"canonical-search-units:{self._document_version_id}:{len(chunk_items)}".encode("utf-8")
+            f"canonical-search-units:{self._document_version_id}:{len(chunk_items)}".encode()
         ).hexdigest()[:32]
 
         chunk_set_input = ChunkSet(
@@ -386,6 +387,7 @@ class IncrementalDocumentProcessor:
         if current.source_id:
             try:
                 from sqlalchemy import update
+
                 from sag_api.db.models import Document
 
                 async with session_factory() as session:
@@ -469,6 +471,7 @@ class IncrementalDocumentProcessor:
         if current.source_id and self._document_version_id:
             try:
                 from sqlalchemy import update
+
                 from sag_api.core.db import SessionLocal
                 from sag_api.db.models import Document, DocumentVersion
 

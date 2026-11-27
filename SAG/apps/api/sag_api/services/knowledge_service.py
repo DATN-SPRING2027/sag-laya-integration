@@ -30,7 +30,6 @@ from sag_api.db.models import (
     IngestionRun,
     KnowledgeEvidence,
     KnowledgeGraphBuild,
-    KnowledgeJob,
     KnowledgeQueueControl,
     KnowledgeUnit,
     KnowledgeUnitEdge,

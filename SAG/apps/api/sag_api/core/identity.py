@@ -5,9 +5,9 @@ Defined according to Section 4.3 of phase-0-contracts-and-foundations.md.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import uuid
+from dataclasses import dataclass
 
 NAMESPACE_SAG = uuid.NAMESPACE_URL
 

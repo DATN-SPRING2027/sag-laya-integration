@@ -474,7 +474,7 @@ async def _process_document_unlocked(
                         raise RuntimeError(f"Prepared markdown path missing for document {document.id}")
 
                     def _read_prepared_text(p: str) -> str:
-                        with open(p, "r", encoding="utf-8", errors="replace") as f:
+                        with open(p, encoding="utf-8", errors="replace") as f:
                             return f.read()
 
                     doc_content = await asyncio.to_thread(_read_prepared_text, prepared.path)
@@ -1217,6 +1217,7 @@ async def _delete_document_task_unlocked(
     remaining_path_refs = 0
     if path:
         from sqlalchemy import func as sa_func
+
         from sag_api.db.models.routing_rag import SourceSnapshot
 
         doc_refs = int(
@@ -1678,9 +1679,9 @@ async def rebuild_universe_tree(
 
     results = []
     for index, project_id in enumerate(project_ids):
-        from sqlalchemy import and_, or_, select
+        from sqlalchemy import select
 
-        from sag_api.db.models import KnowledgeJob, KnowledgeUnit
+        from sag_api.db.models import KnowledgeJob
 
         ingesting = await session.scalar(select(Job.id).join(Document, Document.id == Job.document_id).where(
             Document.project_id == project_id, Document.tenant_id == tenant_id,

@@ -6,7 +6,7 @@ import json
 import re
 from collections.abc import Sequence
 from datetime import UTC, datetime
-from typing import Any, TypeVar
+from typing import Any
 
 from fastapi import APIRouter, Depends, Header, Query, Request
 from fastapi.responses import JSONResponse
@@ -76,9 +76,6 @@ _WEB_SINGLE_VALUE_LIST_QUERY_PARAMS = (
     "limit",
     "offset",
 )
-
-_ModelT = TypeVar("_ModelT", bound=BaseModel)
-
 
 _ALLOWED_CONFLICT_WRITE_CAPABILITIES = frozenset(
     {"knowledge.verify", "conflict.resolve", "conflicts.resolve", "conflicts.write"}
@@ -192,10 +189,10 @@ def _validate_resolution_id(resolution_id: str) -> None:
         raise BadRequestError("Invalid resolution_id format")
 
 
-async def _parse_json_body(
+async def _parse_json_body[ModelT: BaseModel](
     request: Request,
-    model_cls: type[_ModelT],
-) -> _ModelT:
+    model_cls: type[ModelT],
+) -> ModelT:
     raw_bytes = await request.body()
     if len(raw_bytes) > _MAX_BODY_BYTES:
         raise BadRequestError("Request body exceeds the maximum allowed size")

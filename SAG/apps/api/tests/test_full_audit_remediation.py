@@ -18,7 +18,6 @@ Covers:
 
 from __future__ import annotations
 
-import io
 import sys
 import zipfile
 from contextlib import asynccontextmanager

@@ -22,7 +22,7 @@ from sag_api.core.deps import (
     require_operator_or_service_token,
 )
 from sag_api.core.error_taxonomy import ErrorCode
-from sag_api.core.errors import BadRequestError, ConfigurationError, ConflictError, ForbiddenError, NotFoundError
+from sag_api.core.errors import BadRequestError, ConfigurationError, ConflictError, NotFoundError
 from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import (
     VerifiedPrincipal,

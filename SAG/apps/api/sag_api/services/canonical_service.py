@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.error_taxonomy import ErrorLayer, ErrorStage

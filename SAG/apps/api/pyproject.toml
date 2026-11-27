@@ -74,4 +74,4 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
-ignore = ["B008"]  # FastAPI Depends() in defaults
+ignore = ["B008", "E501"]  # FastAPI Depends() in defaults; pre-existing long lines in legacy modules
