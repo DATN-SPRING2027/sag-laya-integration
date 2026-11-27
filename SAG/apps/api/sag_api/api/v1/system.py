@@ -11,7 +11,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.config import settings
 from sag_api.core.db import SessionLocal, get_session
-from sag_api.core.deps import get_current_user, get_current_user_or_connector, require_model_config_operator
+from sag_api.core.deps import (
+    get_current_user,
+    require_model_config_operator,
+    require_operator_or_service_token,
+)
 from sag_api.core.errors import ApiError, ConflictError, ForbiddenError
 from sag_api.core.logging import get_logger
 from sag_api.core.model_providers import model_provider_catalog
@@ -102,14 +106,15 @@ def _discovery_binding_is_loopback() -> bool:
 
 
 def _request_can_discover_dsh(request: Request) -> bool:
-    """Allow direct loopback peers or explicit local-container discovery."""
+    """Allow local DSH discovery ONLY when explicitly enabled in standalone non-Continuum mode."""
+    if not settings.dsh_local_discovery or settings.auth_mode == "continuum":
+        return False
     if _request_is_loopback(request):
         return True
     if request.client is None:
         return False
     return (
-        settings.dsh_local_discovery
-        and _discovery_binding_is_loopback()
+        _discovery_binding_is_loopback()
         and request.client.host == _docker_gateway_address()
         and _request_targets_loopback(request)
     )
@@ -223,7 +228,11 @@ async def ready(request: Request) -> JSONResponse:
 
 
 @router.get("/metrics")
-async def metrics(request: Request, format: str = "prometheus") -> Response:
+async def metrics(
+    request: Request,
+    format: str = "prometheus",
+    _operator: User | None = Depends(require_operator_or_service_token),
+) -> Response:
     """Hệ thống giám sát chỉ số (Metrics endpoint) phục vụ chẩn đoán tải & sức khỏe."""
     db_ready = False
     try:
@@ -355,14 +364,16 @@ async def metrics(request: Request, format: str = "prometheus") -> Response:
 
 
 @router.get("/capabilities")
-async def capabilities() -> dict:
+async def capabilities(
+    _operator: User | None = Depends(require_operator_or_service_token),
+) -> dict:
     """能力探测：供前端判断是否已配置 LLM、当前引擎后端等。"""
     return _capabilities()
 
 
 @router.get("/dsh", response_model=DshCapabilityDescriptor)
 async def dsh_capabilities(
-    _user: User = Depends(get_current_user_or_connector),
+    _user: User = Depends(require_model_config_operator),
     session: AsyncSession = Depends(get_session),
 ) -> DshCapabilityDescriptor:
     """Return connector capabilities without exposing its credential."""
@@ -373,11 +384,12 @@ async def dsh_capabilities(
 @router.get("/dsh-connection", response_model=DshConnectionDescriptor)
 async def discover_dsh_connection(
     request: Request,
+    _user: User = Depends(require_model_config_operator),
     session: AsyncSession = Depends(get_session),
 ) -> DshConnectionDescriptor:
-    """Return the local connector credential only to a loopback peer."""
+    """Return the local connector credential only to an explicitly enabled loopback operator."""
     if not _request_can_discover_dsh(request):
-        raise ForbiddenError("仅允许本机访问 DSH 连接配置")
+        raise ForbiddenError("DSH local discovery is disabled")
     state = await dsh_integration_service.get_or_create_state(session)
     return _dsh_connection_descriptor(request, state)
 
@@ -385,10 +397,12 @@ async def discover_dsh_connection(
 @router.get("/dsh/export")
 async def export_dsh_connection(
     request: Request,
-    _user: User = Depends(get_current_user),
+    _user: User = Depends(require_model_config_operator),
     session: AsyncSession = Depends(get_session),
 ) -> Response:
-    """Download the connector descriptor after normal SAG authentication."""
+    """Download the connector descriptor after operator authentication."""
+    if settings.auth_mode == "continuum":
+        raise ForbiddenError("DSH connector token export is disabled in Continuum multi-tenant mode")
     state = await dsh_integration_service.get_or_create_state(session)
     descriptor = _dsh_connection_descriptor(request, state)
     return Response(
@@ -401,7 +415,7 @@ async def export_dsh_connection(
 @router.put("/dsh/settings", response_model=DshCapabilityDescriptor)
 async def update_dsh_settings(
     body: DshIntegrationUpdate,
-    _user: User = Depends(get_current_user),
+    _user: User = Depends(require_model_config_operator),
     session: AsyncSession = Depends(get_session),
 ) -> DshCapabilityDescriptor:
     """Select the source used by DSH when a request omits one."""
@@ -414,7 +428,7 @@ async def update_dsh_settings(
 
 @router.post("/dsh/regenerate", response_model=DshCapabilityDescriptor)
 async def regenerate_dsh_connection_token(
-    _user: User = Depends(get_current_user),
+    _user: User = Depends(require_model_config_operator),
     session: AsyncSession = Depends(get_session),
 ) -> DshCapabilityDescriptor:
     """Rotate the connector credential without returning the new secret."""
@@ -440,7 +454,7 @@ async def get_model_providers(
 
 @router.get("/preferences")
 async def get_system_preferences(
-    _user: User = Depends(get_current_user),
+    _user: User = Depends(require_model_config_operator),
 ) -> dict[str, str]:
     """Presentation preferences shared by this local-first installation."""
     return settings_service.effective_system_preferences()
@@ -449,7 +463,7 @@ async def get_system_preferences(
 @router.put("/preferences")
 async def update_system_preferences(
     body: SystemPreferencesUpdate,
-    _user: User = Depends(get_current_user),
+    _user: User = Depends(require_model_config_operator),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, str]:
     return await settings_service.save_system_preferences(

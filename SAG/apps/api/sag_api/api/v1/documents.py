@@ -977,6 +977,7 @@ async def revoke_project_document_endpoint(
     principal: VerifiedPrincipal = Depends(require_project_bff_principal),
     session: AsyncSession = Depends(get_session),
     job_queue: JobQueue | None = Depends(get_job_queue),
+    engine_manager: EngineManager | None = Depends(get_engine_manager),
 ) -> DocumentRevokeResponse:
     if project_id not in principal.allowed_project_ids or not principal.tenant_id:
         raise ForbiddenError(
@@ -989,6 +990,8 @@ async def revoke_project_document_endpoint(
         logical_source_id=payload.logical_source_id,
         document_id=payload.document_id,
         reason=payload.reason,
+        engine_manager=engine_manager,
+        job_queue=job_queue,
     )
     if (
         (payload.reason or "").strip().upper() == "DOCUMENT_DELETED"

@@ -304,16 +304,25 @@ class QdrantVectorStore:
                     "payload": payload,
                 }
             )
-        try:
-            await self._request(
-                "PUT",
-                self._path(collection, "/points?wait=true"),
-                json={"points": points},
-            )
-        except Exception as exc:  # noqa: BLE001 - normalize per-item contract
-            detail = str(exc)
-            return BulkResult(failed_items=tuple(FailedItem(record.id, detail) for record in records))
-        return BulkResult(succeeded_ids=tuple(record.id for record in records))
+        from sag_api.services.search_index_service import iter_qdrant_point_batches
+
+        succeeded_ids: list[str] = []
+        failed_items: list[FailedItem] = []
+        offset = 0
+        for batch in iter_qdrant_point_batches(points):
+            batch_records = records[offset : offset + len(batch)]
+            offset += len(batch)
+            try:
+                await self._request(
+                    "PUT",
+                    self._path(collection, "/points?wait=true"),
+                    json={"points": batch},
+                )
+                succeeded_ids.extend(record.id for record in batch_records)
+            except Exception as exc:  # noqa: BLE001 - normalize per-item contract
+                detail = str(exc)
+                failed_items.extend(FailedItem(record.id, detail) for record in batch_records)
+        return BulkResult(succeeded_ids=tuple(succeeded_ids), failed_items=tuple(failed_items))
 
     async def get_many(self, collection: str, ids: list[str]) -> list[VectorRecord]:
         if not ids:

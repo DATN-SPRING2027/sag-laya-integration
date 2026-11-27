@@ -177,35 +177,36 @@ def test_qdrant_env_alias_choices_support_both_single_and_legacy_double_prefix(m
 
 
 def test_service_api_key_declared_in_settings_and_audit_logged(monkeypatch, caplog) -> None:
-    """XC-01: Settings.service_api_key strips blanks to None and deps.py audit-logs without leaking secret."""
+    """XC-01 & SAG-SEC-006: Settings.service_api_key strips blanks, dead get_verified_principal is removed, and operator/service dependency audit-logs safely."""
     import asyncio
     import logging
-
-    from fastapi.security import HTTPAuthorizationCredentials
 
     from sag_api.core import deps
 
     assert "service_api_key" in Settings.model_fields
     assert Settings(_env_file=None, service_api_key="  ").service_api_key is None
     assert Settings(_env_file=None, service_api_key=" svc-key-123 ").service_api_key == "svc-key-123"
+    assert not hasattr(deps, "get_verified_principal")
+
+    from fastapi.security import HTTPAuthorizationCredentials
+    from starlette.datastructures import Headers
 
     secret_val = "super-secret-internal-service-key-xyz"
     monkeypatch.setattr(deps.settings, "service_api_key", secret_val)
     fake_request = SimpleNamespace(
-        url=SimpleNamespace(path="/api/v1/search"),
-        method="POST",
+        url=SimpleNamespace(path="/api/v1/system/metrics"),
+        method="GET",
+        headers=Headers({"authorization": f"Bearer {secret_val}"}),
         state=SimpleNamespace(),
     )
     with caplog.at_level(logging.WARNING):
-        principal = asyncio.run(
-            deps.get_verified_principal(
+        asyncio.run(
+            deps.require_operator_or_service_token(
                 fake_request,
-                HTTPAuthorizationCredentials(scheme="Bearer", credentials=secret_val),
+                creds=HTTPAuthorizationCredentials(scheme="Bearer", credentials=secret_val),
+                session=None,  # type: ignore[arg-type]
             )
         )
-    assert principal.is_service is True
-    assert principal.user_id == "service:internal"
-    assert any("SAG_SERVICE_API_KEY" in rec.message for rec in caplog.records)
     assert all(secret_val not in rec.message for rec in caplog.records)
 
 

@@ -19,13 +19,17 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
+import httpx
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 
 from sag_agent import ToolCapability
+from sag_api.core.config import settings
 from sag_api.core.error_taxonomy import ErrorCode
+from sag_api.core.errors import ForbiddenError
 from sag_api.core.logging import get_logger
+from sag_api.core.ssrf import resolve_pinned_public_http_target, validate_stdio_mcp_command
 from sag_api.generation.json_parser import decode_json_values, extract_fenced_blocks_and_outside
 from sag_api.tools.base import Tool, ToolContext, ToolMeta, ToolResult
 
@@ -341,20 +345,81 @@ async def tools_from_session(
     return tools
 
 
+class _SsrfPinnedAsyncTransport(httpx.AsyncBaseTransport):
+    """Async HTTP transport that DNS-pins every outbound MCP request to validated public IPs."""
+
+    def __init__(self, *, require_https: bool) -> None:
+        self._require_https = require_https
+        self._inner = httpx.AsyncHTTPTransport(retries=0)
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        target = await resolve_pinned_public_http_target(
+            str(request.url),
+            require_https=self._require_https,
+        )
+        headers = httpx.Headers(request.headers)
+        headers["host"] = target.host_header
+        extensions = dict(request.extensions)
+        if target.scheme == "https":
+            extensions["sni_hostname"] = target.hostname
+        pinned_request = httpx.Request(
+            method=request.method,
+            url=target.connect_url,
+            headers=headers,
+            stream=request.stream,
+            extensions=extensions,
+        )
+        return await self._inner.handle_async_request(pinned_request)
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
+def _build_pinned_mcp_http_client(
+    headers: dict[str, str] | None = None,
+    timeout: httpx.Timeout | None = None,
+    auth: httpx.Auth | None = None,
+) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        headers=headers,
+        timeout=timeout or httpx.Timeout(30.0, read=300.0),
+        auth=auth,
+        follow_redirects=False,
+        trust_env=False,
+        transport=_SsrfPinnedAsyncTransport(require_https=(settings.environment == "prod")),
+    )
+
+
 @contextlib.asynccontextmanager
 async def _open_session(config: dict) -> AsyncIterator[ClientSession]:
     """按 config 选择传输并建立就绪的 ClientSession（url → HTTP；command → stdio）。"""
     url = config.get("url")
     command = config.get("command")
     if url:
+        target = await resolve_pinned_public_http_target(
+            url,
+            require_https=(settings.environment == "prod"),
+        )
         headers = config.get("headers") or None
-        async with streamablehttp_client(url, headers=headers) as (read, write, _sid):
+        async with streamablehttp_client(
+            target.url,
+            headers=headers,
+            httpx_client_factory=_build_pinned_mcp_http_client,
+        ) as (read, write, _sid):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 yield session
     elif command:
+        try:
+            safe_cmd = validate_stdio_mcp_command(
+                command,
+                allow_stdio=settings.allow_stdio_mcp,
+                allowed_commands=settings.mcp_stdio_allowed_commands,
+            )
+        except PermissionError as exc:
+            raise ForbiddenError(str(exc)) from exc
         params = StdioServerParameters(
-            command=command,
+            command=safe_cmd,
             args=list(config.get("args") or []),
             env=config.get("env") or None,
         )

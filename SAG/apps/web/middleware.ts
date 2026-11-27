@@ -3,7 +3,7 @@ import type { NextRequest } from "next/server";
 
 import { tokenCookieName } from "@/lib/auth-cookie";
 
-const PUBLIC_PATHS = ["/login", "/sso"];
+const PUBLIC_PATHS = ["/login", "/sso", "/auth/continuum-callback", "/api/"];
 
 type TokenClaims = {
   auth_mode?: unknown;
@@ -52,7 +52,7 @@ export function middleware(req: NextRequest) {
     url.pathname = "/login";
     return NextResponse.redirect(url);
   }
-  if (authenticated && isPublic && pathname !== "/sso") {
+  if (authenticated && isPublic && pathname !== "/sso" && pathname !== "/auth/continuum-callback" && !pathname.startsWith("/api/")) {
     const url = req.nextUrl.clone();
     url.pathname = "/chat";
     return NextResponse.redirect(url);

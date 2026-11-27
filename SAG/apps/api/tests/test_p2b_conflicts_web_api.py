@@ -116,6 +116,15 @@ def _web_jwt_headers(
     return {"Authorization": f"Bearer {token}"}
 
 
+def _web_write_headers(**kwargs: Any) -> dict[str, str]:
+    """Authorized HITL conflict write headers: Continuum JWT + BFF service token + reviewer role (SAG-SEC-002)."""
+    return {
+        **_web_jwt_headers(**kwargs),
+        "X-SAG-BFF-Service-Token": "test-bff-p2b-secret",
+        "X-Continuum-Role": "ADMIN",
+    }
+
+
 def _bff_headers(
     *,
     token: str = "test-bff-p2b-secret",
@@ -526,8 +535,17 @@ async def test_web_conflicts_fail_closed_auth_and_missing_scope(
     assert (await client.get(base, headers=pwd_headers)).status_code == 403
     monkeypatch.setattr(settings, "auth_mode", "continuum")
 
-    # Empty tenant / projects / partitions on VerifiedPrincipal -> 403 fail-closed on all 3 endpoints
+    # SAG-SEC-002: Direct read-only project JWT without BFF service token + reviewer capability -> 403 on write endpoints
     valid_user_headers = _web_jwt_headers()
+    assert (
+        await client.post(f"{base}/res-1/resolve", headers=valid_user_headers, json={"action": "WINNER_B"})
+    ).status_code == 403
+    assert (
+        await client.post(f"{base}/res-1/reopen", headers=valid_user_headers, json={})
+    ).status_code == 403
+
+    # Empty tenant / projects / partitions on VerifiedPrincipal -> 403 fail-closed on all 3 endpoints
+    write_user_headers = _web_write_headers()
     for bad_principal in (
         _make_principal(tenant_id=""),
         _make_principal(allowed_project_ids=frozenset()),
@@ -541,12 +559,12 @@ async def test_web_conflicts_fail_closed_auth_and_missing_scope(
             assert (
                 await client.post(
                     f"{base}/res-1/resolve",
-                    headers=valid_user_headers,
+                    headers=write_user_headers,
                     json={"action": "WINNER_B"},
                 )
             ).status_code == 403
             assert (
-                await client.post(f"{base}/res-1/reopen", headers=valid_user_headers, json={})
+                await client.post(f"{base}/res-1/reopen", headers=write_user_headers, json={})
             ).status_code == 403
         finally:
             web_conflicts_env.app.dependency_overrides.pop(require_project_read_principal, None)
@@ -772,26 +790,27 @@ async def test_web_single_project_list_filters_source_document_pagination_and_va
     assert (await client.get(f"{base}?source_id={'s' * 129}", headers=headers)).status_code == 422
 
     # POST strict validation: resolution_id, query params, malformed JSON, NaN, oversized body, extra="forbid"
+    write_headers = _web_write_headers(project_id=PROJ_A)
     assert (
-        await client.post(f"{base}/bad!id/resolve", headers=headers, json={"action": "WINNER_B"})
+        await client.post(f"{base}/bad!id/resolve", headers=write_headers, json={"action": "WINNER_B"})
     ).status_code == 400
     assert (
-        await client.post(f"{base}/res-sp-1/resolve?debug=1", headers=headers, json={"action": "WINNER_B"})
+        await client.post(f"{base}/res-sp-1/resolve?debug=1", headers=write_headers, json={"action": "WINNER_B"})
     ).status_code == 400
     assert (
-        await client.post(f"{base}/res-sp-1/reopen?debug=1", headers=headers, json={})
+        await client.post(f"{base}/res-sp-1/reopen?debug=1", headers=write_headers, json={})
     ).status_code == 400
     assert (
         await client.post(
             f"{base}/res-sp-1/resolve",
-            headers={**headers, "Content-Type": "application/json"},
+            headers={**write_headers, "Content-Type": "application/json"},
             content=b"{broken",
         )
     ).status_code == 400
     assert (
         await client.post(
             f"{base}/res-sp-1/resolve",
-            headers={**headers, "Content-Type": "application/json"},
+            headers={**write_headers, "Content-Type": "application/json"},
             content=b'{"action":"WINNER_B","reason":NaN}',
         )
     ).status_code == 400
@@ -799,21 +818,21 @@ async def test_web_single_project_list_filters_source_document_pagination_and_va
     assert (
         await client.post(
             f"{base}/res-sp-1/resolve",
-            headers={**headers, "Content-Type": "application/json"},
+            headers={**write_headers, "Content-Type": "application/json"},
             content=oversized,
         )
     ).status_code == 400
     assert (
         await client.post(
             f"{base}/res-sp-1/resolve",
-            headers=headers,
+            headers=write_headers,
             json={"action": "WINNER_B", "spoof": True},
         )
     ).status_code == 422
     assert (
         await client.post(
             f"{base}/res-sp-1/reopen",
-            headers=headers,
+            headers=write_headers,
             json={"reason": "ok", "extra": 1},
         )
     ).status_code == 422
@@ -934,9 +953,15 @@ async def test_web_multi_project_all_scope_narrowing_and_isolation(
     assert (await client.get(f"{base}?project_id=all", headers=multi_headers)).status_code == 400
 
     # Mutate conflict in PROJ_B under multi-project scope and verify cache clear uses row.project_id (PROJ_B)
+    multi_write_headers = _web_write_headers(
+        project_id="all",
+        partition_id="all",
+        allowed_project_ids=[PROJ_A, PROJ_B],
+        allowed_partition_ids=[PROJ_A, PROJ_B],
+    )
     r_res_b = await client.post(
         f"{base}/res-mp-b/resolve",
-        headers=multi_headers,
+        headers=multi_write_headers,
         json={"action": "WINNER_B", "reason": "Resolve proj-b conflict"},
     )
     assert r_res_b.status_code == 200, r_res_b.text
@@ -945,7 +970,7 @@ async def test_web_multi_project_all_scope_narrowing_and_isolation(
 
     r_reopen_b = await client.post(
         f"{base}/res-mp-b/reopen",
-        headers=multi_headers,
+        headers=multi_write_headers,
         json={"reason": "Reopen proj-b conflict"},
     )
     assert r_reopen_b.status_code == 200, r_reopen_b.text
@@ -954,7 +979,7 @@ async def test_web_multi_project_all_scope_narrowing_and_isolation(
     # Mutating conflict with REVOKED mapping in PROJ_B (even though CONFIRMED in PROJ_A) -> 404 anti-oracle!
     r_unmapped = await client.post(
         f"{base}/res-mp-b-unmapped/resolve",
-        headers=multi_headers,
+        headers=multi_write_headers,
         json={"action": "WINNER_B"},
     )
     assert r_unmapped.status_code == 404
@@ -1012,7 +1037,7 @@ async def test_web_anti_oracle_404_equivalence_resolve_and_reopen(web_conflicts_
         await s.commit()
 
     client: httpx.AsyncClient = web_conflicts_env.client
-    headers = _web_jwt_headers(project_id=PROJ_A)
+    headers = _web_write_headers(project_id=PROJ_A)
     base = "/api/v1/conflicts"
     missing_uuid = "00000000-0000-4000-8000-000000000000"
 
@@ -1214,8 +1239,8 @@ async def test_web_full_hitl_lifecycle_resolve_swap_keep_both_reopen_and_409(
 
     client: httpx.AsyncClient = web_conflicts_env.client
     base = "/api/v1/conflicts"
-    h1 = _web_jwt_headers(user_id=USER_ACTIVE_ID, project_id=PROJ_A)
-    h2 = _web_jwt_headers(user_id=USER_SECOND_ID, project_id=PROJ_A)
+    h1 = _web_write_headers(user_id=USER_ACTIVE_ID, project_id=PROJ_A)
+    h2 = _web_write_headers(user_id=USER_SECOND_ID, project_id=PROJ_A)
 
     # 1. WINNER_B
     r_wb = await client.post(

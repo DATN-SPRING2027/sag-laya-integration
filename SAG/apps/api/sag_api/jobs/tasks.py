@@ -6,6 +6,7 @@ Bên trong bộ xử lý chịu trách nhiệm cập nhật trạng thái giai �
 
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
@@ -14,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from zleap.sag.exceptions import SagError
@@ -286,11 +287,12 @@ async def _process_document_unlocked(
         await session.refresh(document)
         if document.status in _CONTROL_TRANSITION_STATES:
             return
-        document.status = DocumentStatus.LOADING
-        document.progress = max(document.progress, 25)
-        for field, value in _parser_state_values(state).items():
-            setattr(document, field, value)
-        job.progress = document.progress / 100
+        if document.status != DocumentStatus.READY:
+            document.status = DocumentStatus.LOADING
+            document.progress = max(document.progress, 25)
+            for field, value in _parser_state_values(state).items():
+                setattr(document, field, value)
+            job.progress = document.progress / 100
         job.payload = {**(await refresh_payload()), "document_parser": state}
         await session.commit()
 
@@ -302,14 +304,17 @@ async def _process_document_unlocked(
         await session.refresh(document)
         if document.status in _CONTROL_TRANSITION_STATES:
             return
-        if doc_status is not None and document.status in (
-            DocumentStatus.PENDING,
-            DocumentStatus.LOADING,
-            DocumentStatus.EXTRACTING,
-        ):
-            document.status = doc_status
-        document.progress = max(int(document.progress or 0), min_progress)
-        job.progress = document.progress / 100
+        if document.status != DocumentStatus.READY:
+            if doc_status is not None and document.status in (
+                DocumentStatus.PENDING,
+                DocumentStatus.LOADING,
+                DocumentStatus.EXTRACTING,
+            ):
+                document.status = doc_status
+            document.progress = max(int(document.progress or 0), min_progress)
+            job.progress = document.progress / 100
+        else:
+            job.progress = max(float(job.progress or 0.0), min_progress / 100)
         if run_id:
             ing_run_row = await session.get(IngestionRun, run_id)
             if ing_run_row is not None:
@@ -468,8 +473,11 @@ async def _process_document_unlocked(
                     if prepared is None or not prepared.path or not os.path.exists(prepared.path):
                         raise RuntimeError(f"Prepared markdown path missing for document {document.id}")
 
-                    with open(prepared.path, "r", encoding="utf-8", errors="replace") as f:
-                        doc_content = f.read()
+                    def _read_prepared_text(p: str) -> str:
+                        with open(p, "r", encoding="utf-8", errors="replace") as f:
+                            return f.read()
+
+                    doc_content = await asyncio.to_thread(_read_prepared_text, prepared.path)
 
                     r_count, r_ratio = inspect_replacement_chars(doc_content)
                     if r_count > 0:
@@ -916,6 +924,28 @@ async def _process_document_unlocked(
         synced_usage = await sync_document_token_usage(session, doc_ver.id)
         effective_token_usage = max(effective_token_usage, int(synced_usage["totals"]["total_tokens"]))
 
+    promote_values: dict[str, Any] = {
+        "status": DocumentStatus.READY,
+        "chunk_count": outcome.chunk_count,
+        "event_count": outcome.event_count,
+        "sag_source_id": outcome.source_id,
+        "progress": 100,
+        "token_usage": effective_token_usage,
+        "error": None,
+        "error_layer": None,
+        "error_stage": None,
+    }
+    if run_id and "doc_ver" in locals() and doc_ver is not None:
+        staged = (doc_ver.metadata_json or {}).get("staged_document")
+        if isinstance(staged, dict):
+            if staged.get("storage_path"):
+                promote_values["storage_path"] = str(staged["storage_path"])
+            if staged.get("filename"):
+                promote_values["filename"] = str(staged["filename"])
+            if "content_type" in staged:
+                promote_values["content_type"] = staged["content_type"]
+            if isinstance(staged.get("size_bytes"), int):
+                promote_values["size_bytes"] = staged["size_bytes"]
     completed = await session.execute(
         update(Document)
         .where(
@@ -925,31 +955,36 @@ async def _process_document_unlocked(
                     DocumentStatus.PENDING,
                     DocumentStatus.LOADING,
                     DocumentStatus.EXTRACTING,
+                    DocumentStatus.READY,
                 ]
             ),
         )
-        .values(
-            status=DocumentStatus.READY,
-            chunk_count=outcome.chunk_count,
-            event_count=outcome.event_count,
-            sag_source_id=outcome.source_id,
-            progress=100,
-            token_usage=effective_token_usage,
-            error=None,
-            error_layer=None,
-            error_stage=None,
-        )
+        .values(**promote_values)
         .execution_options(synchronize_session=False)
     )
     if completed.rowcount != 1:
         await _yield_after_document_transition_lost(session, document)
-    # Bộ đếm tổng hợp của nguồn dữ liệu được cập nhật bằng SQL nguyên tử để tránh mất mát do đọc-ghi đồng thời
+    # Recompute exact active totals for Source instead of monotonic += across version replacements.
+    totals_row = (
+        await session.execute(
+            select(
+                func.coalesce(func.sum(Document.chunk_count), 0),
+                func.coalesce(func.sum(Document.event_count), 0),
+            ).where(
+                Document.source_id == source.id,
+                Document.is_active.is_(True),
+                Document.status.notin_(
+                    [DocumentStatus.DELETING, DocumentStatus.DELETE_FAILED]
+                ),
+            )
+        )
+    ).one()
     await session.execute(
         update(Source)
         .where(Source.id == source.id)
         .values(
-            chunk_count=Source.chunk_count + outcome.chunk_count,
-            event_count=Source.event_count + outcome.event_count,
+            chunk_count=int(totals_row[0] or 0),
+            event_count=int(totals_row[1] or 0),
         )
     )
     if outcome.source_id:
@@ -1535,8 +1570,11 @@ async def _sync_source_unlocked(session: AsyncSession, job: Job, *, job_queue=No
             log.warning("Đồng bộ thu thập thất bại %s: %s", d.external_id, getattr(e, "message", None) or e)
             continue
         try:
-            with open(local.path, "rb") as f:
-                data = f.read()
+            def _read_sync_bytes(p: str) -> bytes:
+                with open(p, "rb") as f:
+                    return f.read()
+
+            data = await asyncio.to_thread(_read_sync_bytes, local.path)
             logical_id = compact_logical_source_id(f"source:{source.id}:{d.external_id}")
             security_partition_id = explicit_partition
             if not security_partition_id:

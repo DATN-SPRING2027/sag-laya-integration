@@ -233,6 +233,7 @@ def _extract_pdf_streaming(path: str) -> str:
                 page_no = idx + 1
                 parts: list[str] = []
                 table_mds: list[str] = []
+                table_bboxes: list[tuple[float, float, float, float]] = []
                 if hasattr(page, "find_tables"):
                     try:
                         found = page.find_tables()
@@ -245,9 +246,50 @@ def _extract_pdf_streaming(path: str) -> str:
                             ]
                             if clean_rows:
                                 table_mds.append(_format_markdown_table(clean_rows))
+                                raw_bbox = getattr(tbl, "bbox", None)
+                                if raw_bbox is not None and len(raw_bbox) == 4:
+                                    table_bboxes.append(
+                                        (
+                                            float(raw_bbox[0]),
+                                            float(raw_bbox[1]),
+                                            float(raw_bbox[2]),
+                                            float(raw_bbox[3]),
+                                        )
+                                    )
                     except Exception:  # noqa: BLE001
                         table_mds = []
-                text = (page.get_text("text") or "").strip()
+                        table_bboxes = []
+                if table_bboxes:
+                    # Mask out text spans whose center falls inside detected table bounding boxes
+                    # so table text is never duplicated alongside structured Markdown tables.
+                    prose_lines: list[str] = []
+                    page_dict = page.get_text("dict") or {}
+                    for block in page_dict.get("blocks") or []:
+                        if block.get("type", 0) != 0:
+                            continue
+                        for line in block.get("lines") or []:
+                            line_spans: list[str] = []
+                            for span in line.get("spans") or []:
+                                span_text = str(span.get("text") or "")
+                                if not span_text.strip():
+                                    continue
+                                sbbox = span.get("bbox")
+                                inside_table = False
+                                if sbbox is not None and len(sbbox) == 4:
+                                    cx = (float(sbbox[0]) + float(sbbox[2])) / 2.0
+                                    cy = (float(sbbox[1]) + float(sbbox[3])) / 2.0
+                                    for bx0, by0, bx1, by1 in table_bboxes:
+                                        if bx0 <= cx <= bx1 and by0 <= cy <= by1:
+                                            inside_table = True
+                                            break
+                                if not inside_table:
+                                    line_spans.append(span_text)
+                            joined = "".join(line_spans).strip()
+                            if joined:
+                                prose_lines.append(joined)
+                    text = "\n".join(prose_lines).strip()
+                else:
+                    text = (page.get_text("text") or "").strip()
                 if text:
                     parts.append(text)
                 parts.extend(table_mds)
@@ -355,12 +397,60 @@ def _extract_docx_streaming(path: str) -> str:
                 pass
 
 
+_MAX_OOXML_ENTRY_UNCOMPRESSED_BYTES = 50 * 1024 * 1024  # 50 MiB per archive entry
+_MAX_OOXML_TOTAL_UNCOMPRESSED_BYTES = 200 * 1024 * 1024  # 200 MiB cumulative per archive
+_MAX_OOXML_COMPRESSION_RATIO = 100.0
+
+
+def _assert_safe_zip_archive(archive: zipfile.ZipFile) -> None:
+    """Reject OOXML zip bombs before reading or streaming archive entries."""
+    total_uncompressed = 0
+    for info in archive.infolist():
+        if info.is_dir():
+            continue
+        uncompressed = int(info.file_size or 0)
+        compressed = max(1, int(info.compress_size or 0))
+        if uncompressed > _MAX_OOXML_ENTRY_UNCOMPRESSED_BYTES:
+            raise _LocalParseValidationError(
+                f"OOXML archive entry '{info.filename}' exceeds safe uncompressed size limit"
+            )
+        if uncompressed > 1024 * 1024 and (uncompressed / compressed) > _MAX_OOXML_COMPRESSION_RATIO:
+            raise _LocalParseValidationError(
+                f"OOXML archive entry '{info.filename}' exceeds safe compression ratio limit"
+            )
+        total_uncompressed += uncompressed
+        if total_uncompressed > _MAX_OOXML_TOTAL_UNCOMPRESSED_BYTES:
+            raise _LocalParseValidationError("OOXML archive exceeds safe total uncompressed size limit")
+
+
+def _read_zip_entry_bounded(
+    archive: zipfile.ZipFile,
+    entry_or_name: zipfile.ZipInfo | str,
+    *,
+    max_bytes: int = _MAX_OOXML_ENTRY_UNCOMPRESSED_BYTES,
+) -> bytes:
+    """Stream-read one zip entry with a hard byte ceiling regardless of spoofed ZIP headers."""
+    chunks: list[bytes] = []
+    total = 0
+    with archive.open(entry_or_name, "r") as stream:
+        while True:
+            chunk = stream.read(64 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise _LocalParseValidationError("OOXML archive entry exceeded streaming byte limit")
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _sanitize_docx_to_temp_file(path: str) -> str:
     """Stream DOCX entries to a temporary file on disk, omitting word/media/* binaries
     and cleaning dangling image relationships so MarkItDown uses ~90% less RAM.
     """
     try:
         with zipfile.ZipFile(path, "r") as source:
+            _assert_safe_zip_archive(source)
             entries = source.infolist()
             kept_entries = [
                 entry
@@ -376,7 +466,7 @@ def _sanitize_docx_to_temp_file(path: str) -> str:
                     and entry.filename.endswith(".rels")
                 ):
                     continue
-                relationships = source.read(entry)
+                relationships = _read_zip_entry_bounded(source, entry)
                 sanitized, removed_ids = _without_dangling_image_relationships(
                     relationships=relationships,
                     relationships_entry=entry.filename,
@@ -389,7 +479,7 @@ def _sanitize_docx_to_temp_file(path: str) -> str:
                 source_part = entry.filename.replace("/_rels/", "/", 1)[: -len(".rels")]
                 if source_part not in kept_names:
                     continue
-                source_xml = replacements.get(source_part) or source.read(source_part)
+                source_xml = replacements.get(source_part) or _read_zip_entry_bounded(source, source_part)
                 sanitized_source = _without_image_relationship_references(
                     content=source_xml,
                     relationship_ids=removed_ids,
@@ -403,6 +493,7 @@ def _sanitize_docx_to_temp_file(path: str) -> str:
             fd, temp_path = tempfile.mkstemp(prefix=".sanitized-", suffix=".docx")
             os.close(fd)
             try:
+                copied_total = 0
                 with zipfile.ZipFile(temp_path, "w", compression=zipfile.ZIP_DEFLATED) as dest:
                     dest.comment = source.comment
                     for entry in kept_entries:
@@ -414,7 +505,21 @@ def _sanitize_docx_to_temp_file(path: str) -> str:
                             with source.open(entry, "r") as src_stream, dest.open(
                                 entry.filename, "w"
                             ) as dst_stream:
-                                shutil.copyfileobj(src_stream, dst_stream, length=64 * 1024)
+                                entry_bytes = 0
+                                while True:
+                                    buf = src_stream.read(64 * 1024)
+                                    if not buf:
+                                        break
+                                    entry_bytes += len(buf)
+                                    copied_total += len(buf)
+                                    if (
+                                        entry_bytes > _MAX_OOXML_ENTRY_UNCOMPRESSED_BYTES
+                                        or copied_total > _MAX_OOXML_TOTAL_UNCOMPRESSED_BYTES
+                                    ):
+                                        raise _LocalParseValidationError(
+                                            "OOXML archive exceeded safe streaming decompression limit"
+                                        )
+                                    dst_stream.write(buf)
                 return temp_path
             except Exception:
                 try:
@@ -559,6 +664,7 @@ def _extract_pptx_streaming(path: str) -> str:
     slides_markdown: list[str] = []
     try:
         with zipfile.ZipFile(path, "r") as archive:
+            _assert_safe_zip_archive(archive)
             names = set(archive.namelist())
             slide_entries: list[tuple[int, str]] = []
             for name in names:
@@ -568,12 +674,12 @@ def _extract_pptx_streaming(path: str) -> str:
             slide_entries.sort(key=lambda item: item[0])
 
             for slide_no, slide_entry in slide_entries:
-                slide_xml = archive.read(slide_entry)
+                slide_xml = _read_zip_entry_bounded(archive, slide_entry)
                 slide_parts = _parse_pptx_slide_xml(slide_xml, slide_no)
 
                 notes_entry = _resolve_pptx_notes_entry(archive, names, slide_no, slide_entry)
                 if notes_entry is not None:
-                    notes_text = _parse_pptx_notes_xml(archive.read(notes_entry))
+                    notes_text = _parse_pptx_notes_xml(_read_zip_entry_bounded(archive, notes_entry))
                     if notes_text:
                         slide_parts.append(f"**Speaker Notes:**\n{notes_text}")
 
@@ -712,22 +818,37 @@ def _extract_xlsx_streaming(
     except ImportError:
         return _convert_via_markitdown(path)
 
+    with zipfile.ZipFile(path, "r") as archive:
+        _assert_safe_zip_archive(archive)
+
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    wb_formulas = openpyxl.load_workbook(path, read_only=True, data_only=False)
     sheets_out: list[str] = []
     try:
         for sheet_idx, sheet_name in enumerate(wb.sheetnames, start=1):
             ws = wb[sheet_name]
+            ws_f = wb_formulas[sheet_name] if sheet_name in wb_formulas.sheetnames else None
             collected_rows: list[list[str]] = []
             max_used_col = 0
             truncated_rows = False
             truncated_cols = False
 
+            formula_iter = ws_f.iter_rows(values_only=True) if ws_f is not None else iter(())
             for raw_row in ws.iter_rows(values_only=True):
+                formula_row = next(formula_iter, None) if ws_f is not None else None
                 if raw_row is None:
                     continue
-                if len(raw_row) > max_cols and any(_format_excel_cell(val) for val in raw_row[max_cols:]):
+                merged_row = list(raw_row)
+                if formula_row is not None:
+                    max_len = max(len(merged_row), len(formula_row))
+                    if len(merged_row) < max_len:
+                        merged_row.extend([None] * (max_len - len(merged_row)))
+                    for idx_c in range(min(len(formula_row), max_len)):
+                        if merged_row[idx_c] is None and formula_row[idx_c] is not None:
+                            merged_row[idx_c] = formula_row[idx_c]
+                if len(merged_row) > max_cols and any(_format_excel_cell(val) for val in merged_row[max_cols:]):
                     truncated_cols = True
-                sliced = list(raw_row[:max_cols])
+                sliced = merged_row[:max_cols]
                 cells = [_format_excel_cell(val) for val in sliced]
                 # Trim trailing empty cells on this row
                 last_non_empty = 0
@@ -765,6 +886,7 @@ def _extract_xlsx_streaming(
             sheets_out.append("\n\n".join(sheet_parts))
     finally:
         wb.close()
+        wb_formulas.close()
 
     combined = "\n\n".join(sheets_out).strip()
     if not _is_meaningful_markdown(combined):

@@ -550,3 +550,167 @@ def group_sections_by_document(
         else:
             selected.append(sec)
     return selected
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    except ValueError:
+        return None
+
+
+def _section_timestamp(section: Any) -> datetime | None:
+    for attr in ("effective_from", "updated_at", "valid_to"):
+        ts = _parse_iso_datetime(getattr(section, attr, None))
+        if ts is not None:
+            return ts
+    return None
+
+
+def _matches_predicate(section: Any, predicate: FieldPredicate) -> bool:
+    field = predicate.field
+    op = predicate.op
+    val = predicate.value
+    if field == "document_name":
+        doc_name = unicodedata.normalize("NFC", str(getattr(section, "document_name", "") or "")).casefold()
+        if not doc_name:
+            return False
+        if op == "eq":
+            return doc_name == unicodedata.normalize("NFC", str(val or "")).casefold()
+        if op == "contains":
+            return unicodedata.normalize("NFC", str(val or "")).casefold() in doc_name
+        if op == "in" and isinstance(val, (list, tuple, set, frozenset)):
+            targets = {unicodedata.normalize("NFC", str(v or "")).casefold() for v in val}
+            return doc_name in targets
+        return True
+    if field == "source_id":
+        src_id = str(getattr(section, "source_id", "") or "")
+        if op == "eq":
+            return src_id == str(val or "")
+        if op == "in" and isinstance(val, (list, tuple, set, frozenset)):
+            return src_id in {str(v) for v in val}
+        return True
+    if field == "content_type":
+        doc_name = str(getattr(section, "document_name", "") or "").lower()
+        ext = doc_name.rsplit(".", 1)[-1] if "." in doc_name else ""
+        candidates = {ext, str(getattr(section, "content_type", "") or "").lower()} - {""}
+        if op == "eq":
+            target = str(val or "").lower().lstrip(".")
+            return bool(target) and (target in candidates or any(target in c for c in candidates))
+        if op == "in" and isinstance(val, (list, tuple, set, frozenset)):
+            targets = {str(v or "").lower().lstrip(".") for v in val}
+            return bool(candidates & targets)
+        return True
+    if field == "time_range":
+        sec_ts = _section_timestamp(section)
+        if sec_ts is None:
+            return False
+        if op == "gte":
+            bound = _parse_iso_datetime(val)
+            return bound is None or sec_ts >= bound
+        if op == "lte":
+            bound = _parse_iso_datetime(val)
+            return bound is None or sec_ts <= bound
+        if op == "between" and isinstance(val, (list, tuple)) and len(val) == 2:
+            lo = _parse_iso_datetime(val[0])
+            hi = _parse_iso_datetime(val[1])
+            if lo is not None and sec_ts < lo:
+                return False
+            if hi is not None and sec_ts > hi:
+                return False
+            return True
+        return True
+    if field == "node_id":
+        node_vals = {
+            str(getattr(section, attr, "") or "")
+            for attr in ("node_id", "section_path", "anchor")
+        } - {""}
+        if op == "eq":
+            return str(val or "") in node_vals
+        if op == "in" and isinstance(val, (list, tuple, set, frozenset)):
+            return bool(node_vals & {str(v) for v in val})
+        return True
+    # temporal_mode is handled upstream by version/supersession resolution
+    return True
+
+
+def apply_plan_constraints_and_order(
+    sections: list[Any],
+    plan: RetrievalPlan | None,
+) -> tuple[list[Any], dict[str, Any]]:
+    """Execute RetrievalPlan.constraints (FieldPredicate) and RetrievalPlan.order deterministically (SAG-RET-001)."""
+    if not sections or plan is None:
+        return list(sections), {
+            "constraints_applied": False,
+            "constraints_fallback": False,
+            "filtered_out": 0,
+            "order_applied": plan.order.value if plan is not None else OrderMode.RELEVANCE.value,
+        }
+
+    result = list(sections)
+    active_constraints = [
+        pred for pred in plan.constraints if pred.is_supported() and pred.field != "temporal_mode"
+    ]
+    constraints_applied = bool(active_constraints)
+    constraints_fallback = False
+    filtered_out = 0
+
+    if active_constraints:
+        matched = [
+            sec for sec in result if all(_matches_predicate(sec, pred) for pred in active_constraints)
+        ]
+        if matched:
+            filtered_out = len(result) - len(matched)
+            result = matched
+        else:
+            # Safe fallback when over-constrained: preserve recall and record fallback in stats.
+            constraints_fallback = True
+
+    order_mode = plan.order
+    if order_mode == OrderMode.TIME_DESC:
+        min_dt = datetime(1900, 1, 1, tzinfo=UTC)
+        result.sort(
+            key=lambda sec: (
+                _section_timestamp(sec) is not None,
+                _section_timestamp(sec) or min_dt,
+                float(getattr(sec, "score", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+    elif order_mode == OrderMode.TIME_ASC:
+        max_dt = datetime(9999, 12, 31, tzinfo=UTC)
+        result.sort(
+            key=lambda sec: (
+                _section_timestamp(sec) is None,
+                _section_timestamp(sec) or max_dt,
+                -float(getattr(sec, "score", 0.0) or 0.0),
+            ),
+        )
+    elif order_mode == OrderMode.FIELD:
+        result.sort(
+            key=lambda sec: (
+                str(getattr(sec, "document_name", "") or "").casefold(),
+                int(getattr(sec, "page_from", 0) or 0),
+                -float(getattr(sec, "score", 0.0) or 0.0),
+            ),
+        )
+
+    reranked: list[Any] = []
+    for idx, sec in enumerate(result):
+        if hasattr(sec, "model_copy"):
+            reranked.append(sec.model_copy(update={"rank": idx}))
+        else:
+            reranked.append(sec)
+
+    return reranked, {
+        "constraints_applied": constraints_applied,
+        "constraints_fallback": constraints_fallback,
+        "filtered_out": filtered_out,
+        "order_applied": order_mode.value,
+    }

@@ -339,13 +339,15 @@ def build_agent_messages(
         content: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
         for att in attachments:
             path, media_type = att.get("path"), att.get("media_type", "image/png")
-            if not path:
-                continue
-            try:
-                with open(path, "rb") as f:
-                    b64 = base64.b64encode(f.read()).decode()
-            except OSError:
-                continue
+            b64 = att.get("b64_data")
+            if not b64:
+                if not path:
+                    continue
+                try:
+                    with open(path, "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode()
+                except OSError:
+                    continue
             content.append({"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{b64}"}})
         messages.append({"role": "user", "content": content})
     else:
@@ -428,6 +430,16 @@ def build_citations(
                     **(
                         {"public_document_id": s.public_document_id}
                         if s.public_document_id
+                        else {}
+                    ),
+                    **(
+                        {"public_source_id": s.public_source_id}
+                        if s.public_source_id
+                        else {}
+                    ),
+                    **(
+                        {"source_kind": s.source_kind}
+                        if s.source_kind
                         else {}
                     ),
                     **(

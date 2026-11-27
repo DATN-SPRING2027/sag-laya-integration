@@ -140,10 +140,17 @@ async def upload(
     data = await file.read(max_upload_bytes + 1)
     if len(data) > max_upload_bytes:
         raise ValidationError(f"图片过大（上限 {_MAX_MB}MB）")
-    _verify_image_attachment(ext, data)
+    import asyncio
+
+    await asyncio.to_thread(_verify_image_attachment, ext, data)
     attachment_id = f"{uuid.uuid4().hex}{ext}"
-    with open(os.path.join(_dir(owner_key), attachment_id), "wb") as f:
-        f.write(data)
+
+    def _write_attachment(dest: str, payload: bytes) -> None:
+        with open(dest, "wb") as f:
+            f.write(payload)
+
+    target_dir = await asyncio.to_thread(_dir, owner_key)
+    await asyncio.to_thread(_write_attachment, os.path.join(target_dir, attachment_id), data)
     return {"id": attachment_id, "name": file.filename or attachment_id, "media_type": media_type}
 
 

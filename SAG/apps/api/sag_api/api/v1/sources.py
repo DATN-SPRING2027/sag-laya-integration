@@ -253,13 +253,13 @@ async def sync(
     )
     project_id = (
         mapping.project_id
-        if mapping and principal.has_project_access(mapping.project_id)
+        if mapping and mapping.project_id in principal.allowed_project_ids
         else (sorted(principal.allowed_project_ids)[0] if len(principal.allowed_project_ids) == 1 else None)
     )
     partition_id = (
         project_id
-        if project_id and project_id in principal.allowed_partitions
-        else (sorted(principal.allowed_partitions)[0] if principal.allowed_partitions else None)
+        if project_id and project_id in principal.allowed_partition_ids
+        else (sorted(principal.allowed_partition_ids)[0] if principal.allowed_partition_ids else None)
     )
     job = await sync_source(
         session,

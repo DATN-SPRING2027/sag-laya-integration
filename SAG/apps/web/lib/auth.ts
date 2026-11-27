@@ -1,23 +1,51 @@
-// 轻量令牌存储：cookie（供中间件路由守卫）+ 本地读取（供 API 客户端加 Bearer 头）。
-// MVP 方案；生产可升级为 httpOnly cookie + route handler 代理。
+// Server-managed HttpOnly session cookie helpers (SAG-SEC-005 / SEC-BE-001).
+// Tokens are never persisted in JS-readable document.cookie or localStorage;
+// authenticated API requests are proxied server-side via /api/sag/[...path].
 import { tokenCookieName } from "@/lib/auth-cookie";
 
 function tokenKey(): string {
   return tokenCookieName(window.location.host);
 }
 
-export function setToken(token: string, maxAgeSeconds = 60 * 60 * 24 * 7) {
-  if (typeof document === "undefined") return;
-  document.cookie = `${tokenKey()}=${token}; path=/; max-age=${maxAgeSeconds}; SameSite=Lax`;
+export async function setToken(token: string, maxAgeSeconds = 60 * 60 * 24 * 7): Promise<void> {
+  if (typeof window === "undefined") return;
+  const response = await fetch("/api/auth/session", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token, maxAgeSeconds }),
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to establish session (${response.status})`);
+  }
+}
+
+export async function exchangeContinuumCode(code: string, state: string): Promise<void> {
+  if (typeof window === "undefined") return;
+  const response = await fetch("/api/auth/session", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code, state }),
+  });
+  if (!response.ok) {
+    throw new Error(`Continuum SSO code exchange failed (${response.status})`);
+  }
 }
 
 export function getToken(): string | null {
-  if (typeof document === "undefined") return null;
-  const m = document.cookie.match(new RegExp(`(?:^|; )${tokenKey()}=([^;]*)`));
-  return m ? decodeURIComponent(m[1]) : null;
+  // HttpOnly session cookie is intentionally unreadable from client JavaScript.
+  return null;
 }
 
-export function clearToken() {
-  if (typeof document === "undefined") return;
-  document.cookie = `${tokenKey()}=; path=/; max-age=0`;
+export function clearToken(): void {
+  if (typeof window === "undefined") return;
+  // Expire any legacy non-HttpOnly cookie left over from earlier builds.
+  if (typeof document !== "undefined") {
+    document.cookie = `${tokenKey()}=; path=/; max-age=0; SameSite=Lax`;
+  }
+  void fetch("/api/auth/session", {
+    method: "DELETE",
+    credentials: "same-origin",
+  }).catch(() => {});
 }

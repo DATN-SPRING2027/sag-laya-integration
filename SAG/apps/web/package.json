@@ -4,7 +4,7 @@
   "version": "1.8.7",
   "packageManager": "npm@10.9.2",
   "engines": {
-    "node": ">=20"
+    "node": ">=20.9.0"
   },
   "scripts": {
     "preinstall": "node ./scripts/require-npm.cjs",

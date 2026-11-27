@@ -98,27 +98,30 @@ def test_estimate_tokens_tiktoken_disallowed_special_and_offline_fallback(caplog
         text_utils.reset_tiktoken_fallback_state()
 
 
-def test_system_metrics_exposes_tiktoken_fallback_status() -> None:
+def test_system_metrics_exposes_tiktoken_fallback_status(monkeypatch) -> None:
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
     from sag_api.api.v1 import system as system_api
+    from sag_api.core import config as config_mod
     from sag_api.core import text_utils
 
     text_utils.reset_tiktoken_fallback_state()
+    monkeypatch.setattr(config_mod.settings, "bff_service_token", "test-metrics-bff-token")
     app = FastAPI()
     app.include_router(system_api.router, prefix="/api/v1")
     app.state.knowledge_runtime = type("RT", (), {"ready": True})()
+    auth_headers = {"X-SAG-BFF-Service-Token": "test-metrics-bff-token"}
     try:
         with patch("tiktoken.get_encoding", side_effect=RuntimeError("offline")):
             text_utils.estimate_tokens("Kiểm tra cảnh báo tiktoken fallback")
         with TestClient(app) as client:
-            json_res = client.get("/api/v1/system/metrics?format=json")
+            json_res = client.get("/api/v1/system/metrics?format=json", headers=auth_headers)
             assert json_res.status_code == 200
             tf = json_res.json()["tiktoken_fallback"]
             assert tf == {"degraded": True, "fallback_count": 1, "reason": "load:RuntimeError"}
 
-            prom_res = client.get("/api/v1/system/metrics")
+            prom_res = client.get("/api/v1/system/metrics", headers=auth_headers)
             assert prom_res.status_code == 200
             assert "sag_tiktoken_degraded 1" in prom_res.text
             assert "sag_tiktoken_fallback_total 1" in prom_res.text

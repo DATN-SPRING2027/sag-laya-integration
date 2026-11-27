@@ -64,6 +64,13 @@ _MANIFEST_NODE_FEATURES_CACHE: OrderedDict[
 _MANIFEST_NODE_FEATURES_CACHE_MAX = 64
 
 
+def _sumprod(left: Sequence[float], right: Sequence[float]) -> float:
+    fn = getattr(math, "sumprod", None)
+    if fn is not None:
+        return fn(left, right)
+    return math.fsum(a * b for a, b in zip(left, right, strict=False))
+
+
 def _normalize_unit_vector(values: Sequence[float] | None) -> tuple[float, ...] | None:
     if not values:
         return None
@@ -77,7 +84,7 @@ def _normalize_unit_vector(values: Sequence[float] | None) -> tuple[float, ...] 
     if scale <= 0.0:
         return None
     scaled = [v / scale for v in floats]
-    norm = math.sqrt(math.sumprod(scaled, scaled))
+    norm = math.sqrt(_sumprod(scaled, scaled))
     if norm <= 0.0 or not math.isfinite(norm):
         return None
     return tuple(v / norm for v in scaled)
@@ -417,7 +424,7 @@ def _build_query_node_profiles(
             and norm_medoid is not None
             and len(query_unit_vector) == len(norm_medoid)
         ):
-            cos_val = math.sumprod(query_unit_vector, norm_medoid)
+            cos_val = _sumprod(query_unit_vector, norm_medoid)
             if math.isfinite(cos_val):
                 raw_cos_by_node[node_id] = cos_val
 

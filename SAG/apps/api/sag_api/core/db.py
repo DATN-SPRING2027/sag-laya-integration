@@ -31,6 +31,11 @@ _ensure_sqlite_dir(settings.database_url)
 
 _engine_url = make_url(settings.database_url)
 _connect_args: dict[str, object] = {}
+_engine_kwargs: dict[str, object] = {
+    "echo": False,
+    "future": True,
+    "pool_pre_ping": True,
+}
 if _engine_url.drivername == "postgresql+asyncpg":
     _query = dict(_engine_url.query)
     _search_path = _query.pop("search_path", None)
@@ -39,13 +44,19 @@ if _engine_url.drivername == "postgresql+asyncpg":
             raise ValueError("PostgreSQL search_path must be a non-empty string.")
         _engine_url = _engine_url.set(query=_query)
         _connect_args["server_settings"] = {"search_path": _search_path}
+    _connect_args["command_timeout"] = float(settings.db_command_timeout_seconds)
+    _engine_kwargs.update(
+        {
+            "pool_size": int(settings.db_pool_size),
+            "max_overflow": int(settings.db_max_overflow),
+            "pool_recycle": int(settings.db_pool_recycle_seconds),
+        }
+    )
 
 engine: AsyncEngine = create_async_engine(
     _engine_url,
-    echo=False,
-    future=True,
-    pool_pre_ping=True,
     connect_args=_connect_args,
+    **_engine_kwargs,
 )
 
 # Session-level PostgreSQL advisory locks span Qdrant network I/O. Keep these

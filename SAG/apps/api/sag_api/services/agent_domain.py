@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -546,15 +547,46 @@ async def add_binding(
     target_type: BindingTargetType,
     target_id: str,
     config: dict | None = None,
+    principal: VerifiedPrincipal | None = None,
 ) -> AgentBinding:
+    from sag_api.core.errors import ForbiddenError
+    from sag_api.core.ssrf import resolve_pinned_public_http_target, validate_stdio_mcp_command
+
     config = config or {}
     if target_type == BindingTargetType.SOURCE:
-        if await session.get(Source, target_id) is None:
+        if principal is not None:
+            from sag_api.services.source_service import get_authorized_source
+
+            source = await get_authorized_source(session, principal=principal, source_id=target_id)
+        else:
+            source = await session.get(Source, target_id)
+        if source is None:
             raise NotFoundError("Source not found")
     elif target_type == BindingTargetType.MCP_SERVER:
-        if not (config.get("url") or config.get("command")):
+        raw_url = config.get("url")
+        raw_command = config.get("command")
+        if not (raw_url or raw_command):
             raise ValidationError("MCP server requires url or command")
-        target_id = target_id or (config.get("name") or config.get("url") or "mcp")
+        if raw_command:
+            try:
+                validate_stdio_mcp_command(
+                    raw_command,
+                    allow_stdio=settings.allow_stdio_mcp,
+                    allowed_commands=settings.mcp_stdio_allowed_commands,
+                )
+            except PermissionError as exc:
+                raise ForbiddenError(str(exc)) from exc
+            except ValueError as exc:
+                raise ValidationError(str(exc)) from exc
+        if raw_url:
+            try:
+                await resolve_pinned_public_http_target(
+                    raw_url,
+                    require_https=(settings.environment == "prod"),
+                )
+            except ValueError as exc:
+                raise ValidationError(str(exc)) from exc
+        target_id = target_id or (config.get("name") or raw_url or "mcp")
     exists = await session.scalar(
         select(AgentBinding).where(
             AgentBinding.agent_id == agent.id,
@@ -909,6 +941,31 @@ def _message_source_ids(message: Message) -> set[str] | None:
     return source_ids
 
 
+def _message_has_verifiable_evidence(message: Message) -> bool:
+    citations = message.citations if isinstance(message.citations, list) else []
+    for citation in citations:
+        if not isinstance(citation, dict):
+            return True
+        if (
+            citation.get("document_id")
+            or citation.get("document_version_id")
+            or citation.get("chunk_id")
+            or citation.get("source_id")
+        ):
+            return True
+    steps = getattr(message, "steps", None)
+    if isinstance(steps, list):
+        for step in steps:
+            if not isinstance(step, dict):
+                return True
+            if step.get("kind") == "session_context" or "session_citations" in step:
+                return True
+            details = step.get("details")
+            if isinstance(details, dict) and isinstance(details.get("matches"), list) and details["matches"]:
+                return True
+    return False
+
+
 async def filter_messages_for_scope(
     session: AsyncSession,
     messages: list[Message],
@@ -916,6 +973,9 @@ async def filter_messages_for_scope(
     principal: VerifiedPrincipal,
     requested_source_ids: list[str] | None = None,
 ) -> list[Message]:
+    from sag_api.db.models import Document
+    from sag_api.services.answer_actions_service import _verify_evidence_document_provenance
+
     provenance = [
         (message, _message_source_ids(message) if message.role == MessageRole.ASSISTANT else None)
         for message in messages
@@ -928,12 +988,40 @@ async def filter_messages_for_scope(
     ) if source_ids else set()
     if requested_source_ids is not None:
         authorized.intersection_update(requested_source_ids)
+    # Identify sources that have real Document rows in DB so single-document revocation is always enforced
+    # while synthetic source-only unit tests (without Document fixtures) stay compatible.
+    sources_with_docs: set[str] = set()
+    if authorized:
+        sources_with_docs = set(
+            (
+                await session.scalars(
+                    select(Document.source_id).where(Document.source_id.in_(sorted(authorized))).distinct()
+                )
+            ).all()
+        )
+    verified_message_ids: set[str] = set()
     visible: list[Message] = []
     for message, cited_source_ids in provenance:
         if message.role != MessageRole.ASSISTANT:
             visible.append(message)
             continue
         can_read = cited_source_ids is not None and cited_source_ids.issubset(authorized)
+        if can_read and _message_has_verifiable_evidence(message):
+            has_version_or_step_ref = any(
+                isinstance(c, dict) and (c.get("document_version_id") or c.get("chunk_id"))
+                for c in (message.citations if isinstance(message.citations, list) else [])
+            ) or any(
+                isinstance(s, dict) and (s.get("kind") == "session_context" or "session_citations" in s)
+                for s in (getattr(message, "steps", None) if isinstance(getattr(message, "steps", None), list) else [])
+            )
+            if has_version_or_step_ref or bool(cited_source_ids & sources_with_docs):
+                can_read = await _verify_evidence_document_provenance(
+                    session,
+                    message=message,
+                    principal=principal,
+                    authorized_source_ids=authorized,
+                    _verified=verified_message_ids,
+                )
         # Preserve conversation roles without changing the persisted ORM row.
         # Frozen prompts can embed earlier revoked answers, even for a currently
         # authorized answer; omit those snapshots from every assistant history read.
@@ -1244,7 +1332,19 @@ async def prepare_ask(
             "webp": "image/webp",
             "gif": "image/gif",
         }.get(ext, "image/png")
-        resolved.append({"id": aid, "media_type": media_type, "path": path})
+        b64_data: str | None = None
+        try:
+            def _encode_attachment(file_path=path) -> str:
+                with open(file_path, "rb") as fh:
+                    return base64.b64encode(fh.read()).decode()
+
+            b64_data = await asyncio.to_thread(_encode_attachment)
+        except OSError:
+            b64_data = None
+        entry: dict[str, Any] = {"id": aid, "media_type": media_type, "path": path}
+        if b64_data is not None:
+            entry["b64_data"] = b64_data
+        resolved.append(entry)
 
     ts = _next_monotonic_utc_now()
     user_msg = Message(

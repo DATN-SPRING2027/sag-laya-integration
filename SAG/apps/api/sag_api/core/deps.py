@@ -13,9 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sag_agent import AgentRuntime
 from sag_api.core.config import settings
 from sag_api.core.db import get_session
-from sag_api.core.error_taxonomy import ErrorCode
 from sag_api.core.errors import AuthError, ForbiddenError
-from sag_api.core.identity import VerifiedPrincipal
 from sag_api.core.logging import get_logger
 from sag_api.core.principal_assertion import (
     VerifiedPrincipal as AssertionVerifiedPrincipal,
@@ -107,6 +105,39 @@ async def require_model_config_operator(
     return user
 
 
+async def require_operator_or_service_token(
+    request: Request,
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
+    session: AsyncSession = Depends(get_session),
+) -> User | None:
+    """Allow trusted BFF/service credentials or explicit model-config operators."""
+    bff_tokens = request.headers.getlist("X-SAG-BFF-Service-Token")
+    if bff_tokens:
+        if (
+            len(bff_tokens) == 1
+            and settings.bff_service_token
+            and secrets.compare_digest(bff_tokens[0], settings.bff_service_token)
+        ):
+            request.state.auth_kind = "bff_service"
+            return None
+        raise ForbiddenError("Invalid Continuum service credential")
+
+    if creds is not None and creds.credentials and settings.service_api_key:
+        if secrets.compare_digest(creds.credentials, settings.service_api_key):
+            log.warning(
+                "Authenticated internal service via SAG_SERVICE_API_KEY method=%s path=%s",
+                request.method,
+                request.url.path,
+            )
+            request.state.auth_kind = "service_api_key"
+            return None
+
+    if creds is None or not creds.credentials:
+        raise AuthError("Thiếu token xác thực")
+    user = await get_current_user(request, token=creds.credentials, session=session)
+    return await require_model_config_operator(user=user)
+
+
 async def get_current_user_or_connector(
     request: Request,
     token: str = Depends(_get_bearer_token),
@@ -143,95 +174,6 @@ def get_tool_registry():
     from sag_api.tools import registry
 
     return registry
-
-
-async def get_verified_principal(
-    request: Request,
-    creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
-) -> VerifiedPrincipal:
-    """Verify principal identity and authorized project/security partition scopes at API boundary."""
-    if creds is None or not creds.credentials:
-        raise AuthError("Missing authentication token", code=ErrorCode.UNAUTHORIZED)
-
-    token = creds.credentials
-    # Hỗ trợ credential riêng biệt (service_api_key) cho internal service nếu được cấu hình.
-    # Tuyệt đối không chấp nhận settings.secret_key (khóa ký HMAC) làm bearer token.
-    service_api_key = settings.service_api_key
-    if service_api_key and secrets.compare_digest(token, service_api_key):
-        log.warning(
-            "Authenticated internal service principal via SAG_SERVICE_API_KEY method=%s path=%s",
-            request.method,
-            request.url.path,
-        )
-        principal = VerifiedPrincipal(
-            user_id="service:internal",
-            tenant_id="tenant_continuum_default",
-            allowed_projects=frozenset({"*"}),
-            allowed_partitions=frozenset({"*"}),
-            is_service=True,
-            roles=("service", "admin"),
-        )
-        request.state.principal = principal
-        return principal
-
-    try:
-        payload = decode_token(token)
-    except jwt.PyJWTError as err:
-        raise AuthError("Token is invalid or expired", code=ErrorCode.UNAUTHORIZED) from err
-
-    user_id = payload.get("sub")
-    if not user_id:
-        raise AuthError("Token is missing subject claim", code=ErrorCode.UNAUTHORIZED)
-
-    tenant_id = (
-        payload.get("tenant_id")
-        or payload.get("orgId")
-        or payload.get("org_id")
-        or "tenant_continuum_default"
-    )
-
-    roles_list = payload.get("roles", [])
-    roles = tuple(roles_list) if isinstance(roles_list, (list, tuple)) else ()
-
-    is_service = bool(
-        str(user_id).startswith("service:")
-        or payload.get("role") == "service"
-        or "service" in roles
-        or payload.get("iss") == "continuum-backend"
-    )
-
-    allowed_projects_set: set[str] = set()
-    if payload.get("activeProjectId"):
-        allowed_projects_set.add(str(payload["activeProjectId"]))
-    if payload.get("project_id"):
-        allowed_projects_set.add(str(payload["project_id"]))
-    for key in ("projects", "allowed_projects"):
-        val = payload.get(key)
-        if isinstance(val, (list, set, tuple)):
-            allowed_projects_set.update(str(p) for p in val)
-        elif isinstance(val, str) and val.strip():
-            allowed_projects_set.add(val.strip())
-    if is_service and not allowed_projects_set:
-        allowed_projects_set.add("*")
-
-    allowed_partitions_set: set[str] = set()
-    for key in ("security_partition", "security_partitions", "allowed_partitions"):
-        val = payload.get(key)
-        if isinstance(val, (list, set, tuple)):
-            allowed_partitions_set.update(str(p) for p in val)
-        elif isinstance(val, str) and val.strip():
-            allowed_partitions_set.add(val.strip())
-
-    principal = VerifiedPrincipal(
-        user_id=str(user_id),
-        tenant_id=str(tenant_id),
-        allowed_projects=frozenset(allowed_projects_set),
-        allowed_partitions=frozenset(allowed_partitions_set),
-        is_service=is_service,
-        roles=roles,
-    )
-    request.state.principal = principal
-    return principal
 
 
 async def _resolve_path_source_access(

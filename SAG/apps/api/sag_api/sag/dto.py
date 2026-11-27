@@ -30,6 +30,8 @@ class RetrievedSection(BaseModel):
     project_id: str | None = None
     document_id: str | None = None
     public_document_id: str | None = None
+    public_source_id: str | None = None
+    source_kind: str | None = None
     document_version_id: str | None = None
     document_name: str | None = None
     version_no: int | None = None

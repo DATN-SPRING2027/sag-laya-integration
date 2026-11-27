@@ -49,10 +49,13 @@ import type {
   ConflictResolveAction,
 } from "./types";
 
-/** 浏览器通过局域网 IP 打开前端时，自动将 API 指向同主机 8000 端口。 */
+/** 浏览器默认通过同源 Next.js BFF 代理 (/api/sag) 注入 HttpOnly 会话凭证 (SAG-SEC-005)。 */
 function resolveApiBase(): string {
   const configured = process.env.NEXT_PUBLIC_API_BASE;
   if (typeof window !== "undefined") {
+    if (process.env.NEXT_PUBLIC_DIRECT_API_BASE !== "true") {
+      return "/api/sag";
+    }
     const { protocol, hostname } = window.location;
     const isLocalHost = hostname === "localhost" || hostname === "127.0.0.1";
     if (!isLocalHost) {

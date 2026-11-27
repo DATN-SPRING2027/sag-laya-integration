@@ -932,6 +932,13 @@ async def rebuild_knowledge_version(
     return units
 
 
+def _sumprod(left, right) -> float:
+    fn = getattr(math, "sumprod", None)
+    if fn is not None:
+        return fn(left, right)
+    return math.fsum(a * b for a, b in zip(left, right, strict=False))
+
+
 def _cosine(left: list, right: list) -> float | None:
     if not left or not right:
         return None
@@ -941,8 +948,8 @@ def _cosine(left: list, right: list) -> float | None:
     if not scale_a or not scale_b:
         return None
     a, b = [v / scale_a for v in left], [v / scale_b for v in right]
-    value = math.sumprod(a, b) / math.sqrt(
-        math.sumprod(a, a) * math.sumprod(b, b)
+    value = _sumprod(a, b) / math.sqrt(
+        _sumprod(a, a) * _sumprod(b, b)
     )
     return (max(-1.0, min(1.0, value)) + 1) / 2
 
@@ -956,7 +963,7 @@ def _prepare_dense(vector):
     if not scale:
         return (vector, 0.0)
     normalized = [value / scale for value in vector]
-    return normalized, math.sumprod(normalized, normalized)
+    return normalized, _sumprod(normalized, normalized)
 
 
 def _prepared_cosine(left, right):
@@ -968,7 +975,7 @@ def _prepared_cosine(left, right):
         raise ValueError("Knowledge dense features must share a dimension")
     if not norm_a or not norm_b:
         return None
-    value = math.sumprod(a, b) / math.sqrt(norm_a * norm_b)
+    value = _sumprod(a, b) / math.sqrt(norm_a * norm_b)
     return (max(-1.0, min(1.0, value)) + 1) / 2
 
 
@@ -1034,7 +1041,7 @@ def graph_payload(units: list[KnowledgeUnit], config: KnowledgeConfig = Knowledg
                 # ponytail: fixed LSH buckets; replace with partition-filtered ANN when dense recall needs it.
                 signs = _lsh_signs(len(dense))
                 bits = tuple(
-                    math.sumprod(dense, signs[p]) >= 0
+                    _sumprod(dense, signs[p]) >= 0
                     for p in range(8)
                 )
                 keys += [("dense", band, bits[band : band + 4]) for band in (0, 4)]

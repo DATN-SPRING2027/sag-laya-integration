@@ -286,15 +286,19 @@ async def test_token_usage_cost_known_flag_for_unpriced_and_override_models(monk
     assert summary["totals"]["cost_known"] is False
     assert summary["by_model"]["qwen3.6-flash"]["cost_known"] is False
 
+    from sag_api.core import config as config_mod
+
+    monkeypatch.setattr(config_mod.settings, "bff_service_token", "test-metrics-bff-token")
     app = FastAPI()
     app.include_router(system_api.router, prefix="/api/v1")
     app.state.knowledge_runtime = SimpleNamespace(ready=True)
+    auth_headers = {"X-SAG-BFF-Service-Token": "test-metrics-bff-token"}
     with TestClient(app) as client:
-        prom_res = client.get("/api/v1/system/metrics")
+        prom_res = client.get("/api/v1/system/metrics", headers=auth_headers)
         assert prom_res.status_code == 200
         assert "sag_token_cost_known 0" in prom_res.text
 
-        json_res = client.get("/api/v1/system/metrics?format=json")
+        json_res = client.get("/api/v1/system/metrics?format=json", headers=auth_headers)
         assert json_res.status_code == 200
         assert json_res.json()["token_usage"]["cost_known"] is False
 

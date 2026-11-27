@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { useTranslations } from "next-intl";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
-import { setToken } from "@/lib/auth";
+import { exchangeContinuumCode, setToken } from "@/lib/auth";
 
 type ProjectOption = { id: string; name: string };
 
@@ -17,16 +17,33 @@ export default function ContinuumSsoPage() {
   const [selectionFailed, setSelectionFailed] = useState(false);
 
   useEffect(() => {
-    const state = new URLSearchParams(window.location.search).get("state");
+    let active = true;
+    const search = new URLSearchParams(window.location.search);
+    const state = search.get("state");
+    const code = search.get("code");
     const result = new URLSearchParams(window.location.hash.slice(1));
     const token = result.get("token");
     const expectedState = window.sessionStorage.getItem("sag-continuum-sso-state");
-    window.history.replaceState(null, "", "/sso");
+    window.history.replaceState(null, "", window.location.pathname || "/sso");
 
     if (!state || state !== expectedState) {
       window.sessionStorage.removeItem("sag-continuum-sso-state");
       router.replace("/login?sso=failed");
       return;
+    }
+
+    if (code) {
+      window.sessionStorage.removeItem("sag-continuum-sso-state");
+      void exchangeContinuumCode(code, state)
+        .then(() => {
+          if (active) router.replace("/chat");
+        })
+        .catch(() => {
+          if (active) router.replace("/login?sso=failed");
+        });
+      return () => {
+        active = false;
+      };
     }
 
     if (token) {
@@ -36,9 +53,16 @@ export default function ContinuumSsoPage() {
         return;
       }
       window.sessionStorage.removeItem("sag-continuum-sso-state");
-      setToken(token, 15 * 60);
-      router.replace("/chat");
-      return;
+      void setToken(token, 15 * 60)
+        .then(() => {
+          if (active) router.replace("/chat");
+        })
+        .catch(() => {
+          if (active) router.replace("/login?sso=failed");
+        });
+      return () => {
+        active = false;
+      };
     }
 
     const encodedProjects = result.get("projects");
@@ -61,6 +85,9 @@ export default function ContinuumSsoPage() {
       window.sessionStorage.removeItem("sag-continuum-sso-state");
       router.replace("/login?sso=failed");
     }
+    return () => {
+      active = false;
+    };
   }, [router]);
 
   function selectProject(projectId: string) {

@@ -1384,44 +1384,113 @@ async def index_search_units_to_qdrant(
             },
         })
 
-    # 3. Upsert points with wait=true for strong consistency
-    res = await qdrant_client.put(
-        f"/collections/{collection_name}/points?wait=true",
-        json={"points": points},
-    )
-    res.raise_for_status()
+    # 3. Upsert points in bounded batches (<= 128 points / <= 8 MiB) with cleanup on partial failure
+    batches = iter_qdrant_point_batches(points)
+    written_any = False
+    try:
+        for batch_idx, batch in enumerate(batches):
+            wait_flag = "true" if batch_idx == len(batches) - 1 else "false"
+            res = await qdrant_client.put(
+                f"/collections/{collection_name}/points?wait={wait_flag}",
+                json={"points": batch},
+            )
+            res.raise_for_status()
+            written_any = True
+    except Exception:
+        if written_any:
+            try:
+                await delete_document_points_from_qdrant(
+                    qdrant_client,
+                    project_id=project_id,
+                    document_version_ids=[str(version.id)],
+                )
+            except Exception as cleanup_exc:  # noqa: BLE001
+                log.warning(
+                    "Partial Qdrant upsert rollback failed version=%s (%s)",
+                    version.id,
+                    type(cleanup_exc).__name__,
+                )
+        raise
     return len(points)
+
+
+_QDRANT_UPSERT_MAX_POINTS = 128
+_QDRANT_UPSERT_MAX_BYTES = 8 * 1024 * 1024  # 8 MiB per HTTP PUT request
+
+
+def _estimate_point_json_bytes(point: dict[str, Any]) -> int:
+    try:
+        return len(json.dumps(point, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return 16 * 1024
+
+
+def iter_qdrant_point_batches(
+    points: Sequence[dict[str, Any]],
+    *,
+    max_points: int = _QDRANT_UPSERT_MAX_POINTS,
+    max_bytes: int = _QDRANT_UPSERT_MAX_BYTES,
+) -> list[list[dict[str, Any]]]:
+    """Chunk Qdrant points into bounded batches respecting both point count and byte ceilings."""
+    if not points:
+        return []
+    batches: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    current_bytes = 32
+    for point in points:
+        pt_bytes = _estimate_point_json_bytes(point)
+        if current and (len(current) >= max_points or current_bytes + pt_bytes > max_bytes):
+            batches.append(current)
+            current = []
+            current_bytes = 32
+        current.append(point)
+        current_bytes += pt_bytes
+    if current:
+        batches.append(current)
+    return batches
 
 
 async def delete_document_points_from_qdrant(
     qdrant_client: httpx.AsyncClient,
     *,
     project_id: str,
-    document_version_ids: Sequence[str],
+    document_version_ids: Sequence[str] = (),
+    document_id: str | None = None,
 ) -> int:
-    """Delete all Qdrant points belonging to the given document version IDs."""
-    if not document_version_ids:
+    """Delete all Qdrant points belonging to the given document or document version IDs."""
+    clean_versions = [str(v_id) for v_id in document_version_ids if str(v_id).strip()]
+    clean_doc_id = (document_id or "").strip()
+    if not clean_versions and not clean_doc_id:
         return 0
     collection_name = f"search_units_{project_id}"
+    should_clauses: list[dict[str, Any]] = []
+    if clean_versions:
+        should_clauses.append(
+            {
+                "key": "document_version_id",
+                "match": {"any": clean_versions},
+            }
+        )
+    if clean_doc_id:
+        should_clauses.append(
+            {
+                "key": "document_id",
+                "match": {"value": clean_doc_id},
+            }
+        )
+    qdrant_filter = (
+        {"must": should_clauses} if len(should_clauses) == 1 else {"should": should_clauses}
+    )
     del_res = await qdrant_client.post(
         f"/collections/{collection_name}/points/delete?wait=true",
-        json={
-            "filter": {
-                "must": [
-                    {
-                        "key": "document_version_id",
-                        "match": {"any": [str(v_id) for v_id in document_version_ids]},
-                    }
-                ]
-            }
-        },
+        json={"filter": qdrant_filter},
     )
     if del_res.status_code >= 400 and del_res.status_code != 404:
         raise RuntimeError(
-            f"Failed to delete Qdrant points for versions {document_version_ids}: "
+            f"Failed to delete Qdrant points for doc={clean_doc_id!r} versions={clean_versions}: "
             f"HTTP {del_res.status_code} - {del_res.text}"
         )
-    return len(document_version_ids)
+    return len(clean_versions) or (1 if clean_doc_id else 0)
 
 
 class TemporalPayloadSyncError(RuntimeError):
@@ -1726,14 +1795,40 @@ async def reconcile_orphan_search_units(
     inflight_grace_minutes: int = 15,
     request_timeout: float = 30.0,
 ) -> dict[str, int]:
-    """Identify and delete orphan Qdrant points while protecting in-flight indexing and active history."""
+    """Stream-reconcile and delete orphan Qdrant points page-by-page (bounded memory)."""
     from sag_api.db.models.document import Document
 
     collection_name = f"search_units_{project_id}"
     timeout_sec = max(30.0, float(request_timeout))
     reconcile_timeout = httpx.Timeout(timeout_sec, connect=min(10.0, timeout_sec))
 
-    all_points: list[dict[str, Any]] = []
+    now = datetime.now(UTC)
+    grace_cutoff = now - timedelta(minutes=max(0, int(inflight_grace_minutes)))
+    targeted_prune_ids = {
+        str(vid).strip() for vid in (prune_version_ids or ()) if str(vid).strip()
+    }
+    if preserve_superseded:
+        if targeted_prune_ids:
+            ready_condition = DocumentVersion.search_status.in_(("SEARCH_READY", "READY")) & (
+                DocumentVersion.id.notin_(targeted_prune_ids) | (DocumentVersion.valid_to > now)
+            )
+        else:
+            ready_condition = DocumentVersion.search_status.in_(("SEARCH_READY", "READY"))
+    else:
+        ready_condition = DocumentVersion.search_status.in_(("SEARCH_READY", "READY")) & (
+            DocumentVersion.valid_to > now
+        )
+    inflight_or_grace = or_(
+        DocumentVersion.search_status.in_(("INDEXING", "PENDING")),
+        ready_condition,
+        (
+            DocumentVersion.search_status.notin_(("INDEX_FAILED", "SEARCH_READY", "READY"))
+            & (DocumentVersion.created_at >= grace_cutoff)
+        ),
+    )
+
+    total_scanned = 0
+    total_orphans_deleted = 0
     next_offset = None
     while True:
         payload: dict[str, Any] = {
@@ -1749,123 +1844,91 @@ async def reconcile_orphan_search_units(
             timeout=reconcile_timeout,
         )
         if not res.is_success:
-            if res.status_code == 404 and next_offset is None and not all_points:
+            if res.status_code == 404 and next_offset is None and total_scanned == 0:
                 return {"scanned": 0, "orphans_deleted": 0}
             raise RuntimeError(
                 f"Failed to scroll Qdrant collection {collection_name}: HTTP {res.status_code} - {res.text}"
             )
         data = res.json().get("result", {})
         points = data.get("points", [])
-        all_points.extend(points)
+        total_scanned += len(points)
+
+        point_entries: list[tuple[Any, Any, Any]] = []
+        for p in points:
+            pid = p.get("id")
+            if not pid:
+                continue
+            pt_payload = p.get("payload") or {}
+            if pt_payload.get("_collection_meta") is True:
+                continue
+            point_entries.append(
+                (pid, pt_payload.get("search_unit_id"), pt_payload.get("document_version_id"))
+            )
+
+        if point_entries:
+            valid_unit_ids: set[str] = set()
+            unit_ids = sorted({str(uid) for _pid, uid, _vid in point_entries if uid})
+            if unit_ids:
+                rows = (
+                    await session.execute(
+                        select(SearchUnit.id)
+                        .join(DocumentVersion, DocumentVersion.id == SearchUnit.document_version_id)
+                        .join(Document, Document.id == DocumentVersion.document_id)
+                        .where(
+                            SearchUnit.id.in_(unit_ids),
+                            Document.is_active.is_(True),
+                            DocumentVersion.status.notin_(("FAILED", "REVOKED")),
+                            inflight_or_grace,
+                        )
+                    )
+                ).scalars().all()
+                valid_unit_ids.update(str(row) for row in rows)
+
+            inflight_version_ids: set[str] = set()
+            candidate_vids = sorted(
+                {
+                    str(vid)
+                    for _pid, uid, vid in point_entries
+                    if vid and (not uid or str(uid) not in valid_unit_ids)
+                }
+            )
+            if candidate_vids:
+                v_rows = (
+                    await session.execute(
+                        select(DocumentVersion.id)
+                        .join(Document, Document.id == DocumentVersion.document_id)
+                        .where(
+                            DocumentVersion.id.in_(candidate_vids),
+                            Document.is_active.is_(True),
+                            DocumentVersion.status.notin_(("FAILED", "REVOKED")),
+                            DocumentVersion.search_status.in_(("INDEXING", "PENDING")),
+                        )
+                    )
+                ).scalars().all()
+                inflight_version_ids.update(str(row) for row in v_rows)
+
+            orphan_point_ids = [
+                pid
+                for pid, uid, vid in point_entries
+                if not uid
+                or (str(uid) not in valid_unit_ids and (not vid or str(vid) not in inflight_version_ids))
+            ]
+            if orphan_point_ids:
+                del_res = await qdrant_client.post(
+                    f"/collections/{collection_name}/points/delete?wait=true",
+                    json={"points": orphan_point_ids},
+                    timeout=reconcile_timeout,
+                )
+                if del_res.status_code >= 400 and del_res.status_code != 404:
+                    raise RuntimeError(f"Failed to delete orphan points: {del_res.text}")
+                total_orphans_deleted += len(orphan_point_ids)
+
         prev_offset = next_offset
         next_offset = data.get("next_page_offset")
         if next_offset is None or not points or next_offset == prev_offset:
             break
 
-    if not all_points:
-        return {"scanned": 0, "orphans_deleted": 0}
-
-    point_entries: list[tuple[Any, Any, Any]] = []
-    for p in all_points:
-        pid = p.get("id")
-        if not pid:
-            continue
-        pt_payload = p.get("payload") or {}
-        if pt_payload.get("_collection_meta") is True:
-            continue
-        point_entries.append(
-            (pid, pt_payload.get("search_unit_id"), pt_payload.get("document_version_id"))
-        )
-
-    now = datetime.now(UTC)
-    grace_cutoff = now - timedelta(minutes=max(0, int(inflight_grace_minutes)))
-
-    targeted_prune_ids = {
-        str(vid).strip() for vid in (prune_version_ids or ()) if str(vid).strip()
-    }
-    valid_unit_ids: set[str] = set()
-    unit_ids = sorted({str(uid) for _pid, uid, _vid in point_entries if uid})
-    if unit_ids:
-        if preserve_superseded:
-            if targeted_prune_ids:
-                ready_condition = DocumentVersion.search_status.in_(("SEARCH_READY", "READY")) & (
-                    DocumentVersion.id.notin_(targeted_prune_ids) | (DocumentVersion.valid_to > now)
-                )
-            else:
-                ready_condition = DocumentVersion.search_status.in_(("SEARCH_READY", "READY"))
-        else:
-            ready_condition = DocumentVersion.search_status.in_(("SEARCH_READY", "READY")) & (
-                DocumentVersion.valid_to > now
-            )
-        inflight_or_grace = or_(
-            DocumentVersion.search_status.in_(("INDEXING", "PENDING")),
-            ready_condition,
-            (
-                DocumentVersion.search_status.notin_(("INDEX_FAILED", "SEARCH_READY", "READY"))
-                & (DocumentVersion.created_at >= grace_cutoff)
-            ),
-        )
-        for i in range(0, len(unit_ids), 500):
-            batch = unit_ids[i : i + 500]
-            rows = (
-                await session.execute(
-                    select(SearchUnit.id)
-                    .join(DocumentVersion, DocumentVersion.id == SearchUnit.document_version_id)
-                    .join(Document, Document.id == DocumentVersion.document_id)
-                    .where(
-                        SearchUnit.id.in_(batch),
-                        Document.is_active.is_(True),
-                        DocumentVersion.status.notin_(("FAILED", "REVOKED")),
-                        inflight_or_grace,
-                    )
-                )
-            ).scalars().all()
-            valid_unit_ids.update(str(row) for row in rows)
-
-    # Also protect uncommitted SearchUnit points whose DocumentVersion is actively INDEXING/PENDING
-    inflight_version_ids: set[str] = set()
-    candidate_vids = sorted(
-        {
-            str(vid)
-            for _pid, uid, vid in point_entries
-            if vid and (not uid or str(uid) not in valid_unit_ids)
-        }
-    )
-    if candidate_vids:
-        for i in range(0, len(candidate_vids), 500):
-            v_batch = candidate_vids[i : i + 500]
-            v_rows = (
-                await session.execute(
-                    select(DocumentVersion.id)
-                    .join(Document, Document.id == DocumentVersion.document_id)
-                    .where(
-                        DocumentVersion.id.in_(v_batch),
-                        Document.is_active.is_(True),
-                        DocumentVersion.status.notin_(("FAILED", "REVOKED")),
-                        DocumentVersion.search_status.in_(("INDEXING", "PENDING")),
-                    )
-                )
-            ).scalars().all()
-            inflight_version_ids.update(str(row) for row in v_rows)
-
-    orphan_point_ids = [
-        pid
-        for pid, uid, vid in point_entries
-        if not uid
-        or (str(uid) not in valid_unit_ids and (not vid or str(vid) not in inflight_version_ids))
-    ]
-    if orphan_point_ids:
-        for i in range(0, len(orphan_point_ids), 500):
-            batch_ids = orphan_point_ids[i : i + 500]
-            del_res = await qdrant_client.post(
-                f"/collections/{collection_name}/points/delete?wait=true",
-                json={"points": batch_ids},
-                timeout=reconcile_timeout,
-            )
-            if del_res.status_code >= 400 and del_res.status_code != 404:
-                raise RuntimeError(f"Failed to delete orphan points: {del_res.text}")
-
-    return {"scanned": len(all_points), "orphans_deleted": len(orphan_point_ids)}
+    return {"scanned": total_scanned, "orphans_deleted": total_orphans_deleted}
 
 
 async def run_search_indexing_stage(

@@ -1,0 +1,92 @@
+name: SAG CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sag-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  api-test:
+    name: API Lint & Pytest (Python 3.12)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: SAG/apps/api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - name: Install API dependencies
+        run: uv sync --frozen --extra postgres
+      - name: Ruff lint
+        run: uv run ruff check sag_api tests
+      - name: AST syntax verification
+        run: |
+          uv run python -c "
+          import ast, pathlib
+          for p in sorted(pathlib.Path('sag_api').rglob('*.py')):
+              ast.parse(p.read_text(encoding='utf-8'), filename=str(p))
+          print('AST OK')
+          "
+      - name: Run pytest
+        env:
+          LITELLM_LOCAL_MODEL_COST_MAP: "True"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: uv run pytest -q
+      - name: Verify OpenAPI snapshot freshness
+        run: |
+          uv run python -c "
+          import json, pathlib
+          from sag_api.main import app
+          snap = pathlib.Path('../../docs/openapi/sag-api.openapi.json')
+          assert snap.is_file(), 'Missing OpenAPI snapshot'
+          live = app.openapi()
+          assert live['paths'], 'Empty OpenAPI paths'
+          "
+
+  web-test:
+    name: Web Lint, Typecheck, Unit & Build (Node 22)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: SAG/apps/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: SAG/apps/web/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: ESLint
+        run: npm run lint
+      - name: TypeScript typecheck
+        run: npm run typecheck
+      - name: Unit tests
+        run: npm run test:unit
+      - name: Production build
+        run: npm run build
+
+  compose-validate:
+    name: Validate Docker Compose Configs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate compose.yaml
+        run: docker compose -f SAG/compose.yaml config --quiet
+      - name: Validate compose.postgres.yaml
+        env:
+          POSTGRES_PASSWORD: ci-dummy-password
+          SAG_SECRET_KEY: ci-dummy-secret-key-at-least-32-chars-long
+        run: docker compose -f SAG/compose.yaml -f SAG/compose.postgres.yaml config --quiet

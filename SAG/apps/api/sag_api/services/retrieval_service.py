@@ -1693,7 +1693,8 @@ async def retrieve_relevant_sections(
         if retrieval_plan.target == TargetUnit.DOCUMENT
         else requested_limit
     )
-    reranked = rerank_sections(
+    reranked = await asyncio.to_thread(
+        rerank_sections,
         query,
         semantic_sections,
         lexical=lexical_sections,
@@ -1713,6 +1714,11 @@ async def retrieve_relevant_sections(
         if retrieval_plan.target == TargetUnit.DOCUMENT
         else reranked.sections[:requested_limit]
     )
+    from sag_api.services.retrieval_plan import apply_plan_constraints_and_order
+
+    final_sections, plan_execution = apply_plan_constraints_and_order(
+        final_sections, retrieval_plan
+    )
     rerank_latency_ms = round((time.perf_counter() - rerank_start) * 1000, 2)
     total_latency_ms = round((time.perf_counter() - total_start) * 1000, 2)
     stats = {
@@ -1721,6 +1727,7 @@ async def retrieve_relevant_sections(
         "automatic_top_k": top_k is None and retrieval_plan.cardinality.count_source.value != "DEFAULT",
         "effective_top_k": len(final_sections),
         "retrieval_plan": retrieval_plan.as_trace(),
+        "plan_execution": plan_execution,
         "budget_exhausted": (
             len(final_sections) >= settings.search_unit_candidate_limit
             or len(outcome.sections) >= settings.search_unit_candidate_limit

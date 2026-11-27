@@ -38,10 +38,11 @@ export function AuthImage({
       return;
     }
     let alive = true;
+    const token = getToken();
     fetch(api.attachmentUrl(id), {
       credentials: "include",
       headers: {
-        Authorization: `Bearer ${getToken() ?? ""}`,
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
         "Accept-Language": locale,
       },
     })

@@ -68,6 +68,7 @@ class Settings(BaseSettings):
     debug: bool = True
     secret_key: str = "dev-insecure-secret-change-me-in-production-0123456789"
     access_token_expire_minutes: int = 60 * 24 * 7  # 7 天
+    continuum_session_expire_minutes: int = Field(default=5, ge=1, le=15)
     # continuum delegates interactive sign-in to Continuum; local/password are standalone modes.
     auth_mode: Literal["local", "password", "continuum"] = "local"
     # Comma-separated SAG user IDs permitted to change deployment-wide model settings.
@@ -98,6 +99,11 @@ class Settings(BaseSettings):
     token_pricing_json: str | None = None
     # Optional stdio MCP source ID (legacy; stdio transport remains disabled).
     mcp_source_id: str | None = None
+    # Operator opt-in for stdio MCP server bindings (default disabled for multi-tenant safety).
+    allow_stdio_mcp: bool = False
+    mcp_stdio_allowed_commands: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # Logging format: auto selects JSON in prod and human-readable text in dev.
+    log_format: Literal["auto", "text", "json"] = "auto"
     # Desktop sidecar bind host/port.
     desktop_host: str = "127.0.0.1"
     desktop_port: int = Field(default=8000, ge=1, le=65535)
@@ -111,6 +117,10 @@ class Settings(BaseSettings):
 
     # ── sag 元数据库 ───────────────────────────────────────────────────
     database_url: str = "postgresql+asyncpg://sag:sag@localhost:5432/sag"
+    db_pool_size: int = Field(default=15, ge=1, le=100)
+    db_max_overflow: int = Field(default=15, ge=0, le=100)
+    db_pool_recycle_seconds: int = Field(default=1800, ge=60, le=86400)
+    db_command_timeout_seconds: float = Field(default=30.0, ge=1.0, le=300.0)
 
     # ── 存储 ────────────────────────────────────────────────────────────
     data_dir: str = "./.data/engine"  # OCTX、上传文件和运行时状态
@@ -281,9 +291,10 @@ class Settings(BaseSettings):
     # Keep part of the routed query's deadline available to its ACL-scoped global escape.
     search_tree_escape_reserve_seconds: float = Field(default=1.5, ge=0.1, le=10.0)
     search_tree_snapshot_timeout: float = Field(default=3.0, ge=0.05, le=10.0)
-    # Exact, profile-content-addressed route decisions only. Semantic matching
-    # and answer/evidence caching have no enablement path in this release.
-    search_route_decision_cache_enabled: bool = False
+    # Exact, profile-content-addressed route decisions only.
+    search_route_decision_cache_enabled: bool = True
+    # Reject Qdrant points missing embedding_model_signature when enabled (mismatched signatures are always rejected).
+    search_strict_embedding_signature: bool = False
     # Diversity knobs are retrieval quality parameters, not answerability/confidence thresholds.
     search_mmr_diversity_weight: float = Field(default=0.5, ge=0.0, le=1.0)
     search_near_duplicate_similarity: float = Field(default=0.98, ge=0.9, le=1.0)
@@ -347,13 +358,18 @@ class Settings(BaseSettings):
     session_context_qdrant_sync_enabled: bool = True
     session_context_max_messages: int = Field(default=5000, ge=50, le=50000)
     session_context_full_audit_max_batches: int = Field(default=6, ge=1, le=20)
-    decision_provider: Literal["siliconflow", "openai_compatible", "llm", "disabled"] = "siliconflow"
+    # Default disabled: A/B benchmarks prove Kev-4b adds +53.1% retrieval p50 and +31.4% tokens with 0% recall gain.
+    decision_provider: Literal["siliconflow", "openai_compatible", "llm", "disabled"] = "disabled"
     decision_base_url: str | None = None
     decision_api_key: str | None = None
     decision_model: str = Field(default="Kev-4b", min_length=1, max_length=200)
     decision_timeout_ms: int = Field(default=10_000, ge=500, le=60_000)
     siliconflow_base_url: str = "https://api.siliconflow.com/v1"
     siliconflow_api_key: str | None = None
+    # Post-generation entailment verifier timeout (defaults to derived from llm_timeout_ms when None).
+    entailment_verifier_timeout_seconds: float | None = Field(default=None, ge=1.0, le=300.0)
+    # Stream assistant tokens progressively instead of buffering until post-gen verification finishes.
+    streaming_progressive_enabled: bool = True
 
     @field_validator("decision_base_url")
     @classmethod
@@ -408,16 +424,18 @@ class Settings(BaseSettings):
         data = dict(value)
         provider = data.get("decision_provider")
         normalized_provider = provider.strip().lower() if isinstance(provider, str) else provider
-        if normalized_provider is None or normalized_provider == "" or normalized_provider in ("laya", "openrouter"):
+        if normalized_provider in ("laya", "openrouter"):
             data["decision_provider"] = "siliconflow"
+        elif normalized_provider == "":
+            data["decision_provider"] = "disabled"
         if normalized_provider in ("laya", "openrouter") or data.get("decision_model") == "typesafe/jev-1.14":
             data["decision_model"] = "Kev-4b"
         return data
 
-    @field_validator("cors_origins", mode="before")
+    @field_validator("cors_origins", "mcp_stdio_allowed_commands", mode="before")
     @classmethod
     def _split_origins(cls, v: object) -> object:
-        """允许用逗号分隔的字符串配置 CORS 源。"""
+        """允许用逗号分隔的字符串配置列表项。"""
         if isinstance(v, str):
             v = v.strip()
             if not v:
