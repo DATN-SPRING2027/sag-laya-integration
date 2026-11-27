@@ -115,6 +115,25 @@ def test_build_messages_empty_sections_has_abstain_rule_and_respects_language():
     assert "never respond in chinese" not in msgs_zh[0]["content"].lower()
 
 
+def test_prompts_enforce_enterprise_editorial_style_no_decorative_emojis_and_clean_citations():
+    """Enterprise editorial rules ban decorative heading emojis and normalize citation punctuation."""
+    for lang in ("en", "vi"):
+        direct_msgs = build_messages("Which frontend technologies are used?", [], language=lang)
+        agent_msgs = build_agent_messages(
+            "Continuum SAG",
+            {},
+            "Which frontend technologies are used?",
+            language=lang,
+        )
+        for system_text in (direct_msgs[0]["content"], agent_msgs[0]["content"]):
+            lowered = system_text.lower()
+            assert "[formatting and tone]" in lowered
+            assert "never use decorative emojis" in lowered
+            assert "markdown table" in lowered
+            assert "no space after the closing bracket" in lowered
+            assert "never '[4] .'" in lowered
+
+
 @pytest.mark.asyncio
 async def test_llm_client_strict_structured_output_mode_does_not_strip_response_format(monkeypatch):
     """S5-13: Strict llm_structured_output_mode must re-raise 400/422 instead of stripping response_format."""
