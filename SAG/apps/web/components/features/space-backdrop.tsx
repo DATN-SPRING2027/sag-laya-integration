@@ -57,7 +57,10 @@ export function SpaceBackdrop({
   pauseAmbientMotion?: boolean;
   variant?: "shell" | "universe";
 }) {
-  const reducedMotion = useReducedMotion();
+  const prefersReducedMotion = useReducedMotion();
+  const [mounted, setMounted] = React.useState(false);
+  React.useEffect(() => setMounted(true), []);
+  const reducedMotion = mounted && Boolean(prefersReducedMotion);
   const ambientMotionPaused = Boolean(reducedMotion) || pauseAmbientMotion;
   const backdropRef = React.useRef<HTMLDivElement>(null);
   const cursorMeteorRef = React.useRef<HTMLSpanElement>(null);

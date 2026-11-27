@@ -270,11 +270,13 @@ async def gc_expired_transfers(
         .scalars()
         .all()
     )
+    import asyncio
+
     removed = 0
     for transfer in transfers:
         directory = storage.staging_dir(transfer.id)
         if directory.exists():
-            shutil.rmtree(directory)
+            await asyncio.to_thread(shutil.rmtree, directory)
             removed += 1
         transfer.staging_key = None
         transfer.input_signature = None

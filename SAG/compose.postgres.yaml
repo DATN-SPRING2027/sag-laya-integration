@@ -26,6 +26,12 @@ services:
       - qdrantdata:/qdrant/storage
     ports:
       - "${BIND_ADDRESS:-127.0.0.1}:${QDRANT_PORT:-6333}:6333"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333 && printf \"GET /readyz HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" >&3 && head -n 1 <&3 | grep -q 200'"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
     restart: unless-stopped
 
   api:
@@ -35,6 +41,11 @@ services:
     environment:
       SAG_ENVIRONMENT: prod
       SAG_DEBUG: "false"
+      SAG_LOG_FORMAT: json
+      SAG_DSH_LOCAL_DISCOVERY: ${SAG_DSH_LOCAL_DISCOVERY:-false}
+      SAG_LOCK_LLM_CONFIG: ${SAG_LOCK_LLM_CONFIG:-true}
+      SAG_DECISION_PROVIDER: ${SAG_DECISION_PROVIDER:-disabled}
+      SAG_ALLOW_STDIO_MCP: ${SAG_ALLOW_STDIO_MCP:-false}
       SAG_SECRET_KEY: ${SAG_SECRET_KEY:?请先在 .env 中设置 SAG_SECRET_KEY}
       SAG_MODEL_CONFIG_OPERATOR_IDS: ${SAG_MODEL_CONFIG_OPERATOR_IDS:-}
       SAG_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-sag}:${POSTGRES_PASSWORD:?请先在 .env 中设置 POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-sag}

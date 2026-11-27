@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.error_taxonomy import ErrorLayer, ErrorStage
@@ -126,7 +126,10 @@ async def parse_and_persist_document_content(
                     stem = Path(doc.filename).stem.replace("_", " ").strip()
                     if stem:
                         resolved_title = stem
-        blocks = extract_canonical_blocks(
+        import asyncio
+
+        blocks = await asyncio.to_thread(
+            extract_canonical_blocks,
             content,
             version_id=document_version_id,
             page_from=page_from,

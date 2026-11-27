@@ -6,7 +6,7 @@ import json
 import re
 from collections.abc import Sequence
 from datetime import UTC, datetime
-from typing import Any, TypeVar
+from typing import Any
 
 from fastapi import APIRouter, Depends, Header, Query, Request
 from fastapi.responses import JSONResponse
@@ -77,13 +77,66 @@ _WEB_SINGLE_VALUE_LIST_QUERY_PARAMS = (
     "offset",
 )
 
-_ModelT = TypeVar("_ModelT", bound=BaseModel)
+_ALLOWED_CONFLICT_WRITE_CAPABILITIES = frozenset(
+    {"knowledge.verify", "conflict.resolve", "conflicts.resolve", "conflicts.write"}
+)
+_ALLOWED_CONFLICT_WRITE_ROLES = frozenset(
+    {"ADMIN", "MANAGER", "OWNER", "TEAM_LEADER", "LEADER", "SME", "REVIEWER", "PLATFORM_OPERATOR"}
+)
+
+
+def _extract_csv_tokens(request: Request, *header_names: str) -> set[str]:
+    tokens: set[str] = set()
+    for name in header_names:
+        for raw in request.headers.getlist(name):
+            for part in raw.split(","):
+                cleaned = part.strip()
+                if cleaned:
+                    tokens.add(cleaned)
+    return tokens
+
+
+def _assert_conflict_reviewer_capability(request: Request) -> None:
+    """Require IAM-asserted write capability or authoritative reviewer role for conflict HITL writes."""
+    caps = {
+        tok.lower()
+        for tok in _extract_csv_tokens(
+            request,
+            "X-Continuum-Capabilities",
+            "X-Continuum-Permissions",
+        )
+    }
+    roles = {
+        tok.upper()
+        for tok in _extract_csv_tokens(
+            request,
+            "X-Continuum-Role",
+            "X-Continuum-Roles",
+        )
+    }
+    if caps & _ALLOWED_CONFLICT_WRITE_CAPABILITIES:
+        return
+    if roles & _ALLOWED_CONFLICT_WRITE_ROLES:
+        return
+    raise ForbiddenError(
+        "Authoritative reviewer role or knowledge.verify / conflict.resolve capability is required"
+    )
 
 
 async def require_conflicts_bff_principal(request: Request) -> VerifiedPrincipal:
     """Enforce Continuum BFF service authentication unconditionally (no direct user-JWT bypass)."""
     await require_bff_service_token(request)
     return await require_project_bff_principal(request)
+
+
+async def require_web_conflict_write_principal(
+    request: Request,
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
+) -> VerifiedPrincipal:
+    """Enforce JWT auth + BFF service authentication + IAM reviewer capability on /api/v1/conflicts HITL mutations."""
+    await require_bff_service_token(request)
+    _assert_conflict_reviewer_capability(request)
+    return principal
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
@@ -136,10 +189,10 @@ def _validate_resolution_id(resolution_id: str) -> None:
         raise BadRequestError("Invalid resolution_id format")
 
 
-async def _parse_json_body(
+async def _parse_json_body[ModelT: BaseModel](
     request: Request,
-    model_cls: type[_ModelT],
-) -> _ModelT:
+    model_cls: type[ModelT],
+) -> ModelT:
     raw_bytes = await request.body()
     if len(raw_bytes) > _MAX_BODY_BYTES:
         raise BadRequestError("Request body exceeds the maximum allowed size")
@@ -489,13 +542,13 @@ async def list_web_conflicts_endpoint(
 @web_router.post(
     "/{resolution_id}/resolve",
     response_model=ConflictActionResponse,
-    summary="Apply a Human-in-the-Loop resolution decision via the active web session",
+    summary="Apply a Human-in-the-Loop resolution decision via BFF-verified reviewer session",
 )
 async def resolve_web_conflict_endpoint(
     resolution_id: str,
     request: Request,
     _user: User = Depends(get_current_user),
-    principal: VerifiedPrincipal = Depends(require_project_read_principal),
+    principal: VerifiedPrincipal = Depends(require_web_conflict_write_principal),
     session: AsyncSession = Depends(get_session),
 ) -> JSONResponse:
     _verify_web_principal_scope(principal)
@@ -531,13 +584,13 @@ async def resolve_web_conflict_endpoint(
 @web_router.post(
     "/{resolution_id}/reopen",
     response_model=ConflictActionResponse,
-    summary="Reversibly reopen a resolved conflict via the active web session",
+    summary="Reversibly reopen a resolved conflict via BFF-verified reviewer session",
 )
 async def reopen_web_conflict_endpoint(
     resolution_id: str,
     request: Request,
     _user: User = Depends(get_current_user),
-    principal: VerifiedPrincipal = Depends(require_project_read_principal),
+    principal: VerifiedPrincipal = Depends(require_web_conflict_write_principal),
     session: AsyncSession = Depends(get_session),
 ) -> JSONResponse:
     _verify_web_principal_scope(principal)

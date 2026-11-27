@@ -137,8 +137,11 @@ _SYSTEM_PROMPT = (
     "Return ONLY a valid JSON object matching the required schema:\n"
     "- coarse_intent: CHAT (greeting/small talk/identity/thanks), KNOWLEDGE (factual/doc/session lookup), "
     "COMMAND (explicit action/transform), or AMBIGUOUS.\n"
-    "- question_scope: general (pure public concepts/world/coding), project (uploaded documents, policies, "
-    "project-specific facts, follow-ups about prior turns), application (live app records like my tasks/projects), "
+    "- question_scope: general (pure public concepts/world/weather/time with no project context), "
+    "project (uploaded documents, architecture, tech stack, frontend/backend technologies, features, APIs, "
+    "policies, project-specific facts, follow-ups about prior turns — when has_sources is true and web_enabled "
+    "is false, classify technical/stack/implementation questions such as 'kĩ thuật nào dùng làm fe cho ai chat' "
+    "as project with needs_retrieval=true), application (live app records like my tasks/projects), "
     "or unknown (uncertain or potentially private).\n"
     "- memory_scope: none (chat only), session_history (earlier chat decisions/owners/tasks), "
     "project_documents (uploaded knowledge base), hybrid_both (needs both or uncertain), or full_session_audit.\n"
@@ -506,13 +509,23 @@ def _cache_key(
     scoped: bool,
     has_thread_history: bool,
     context: Mapping[str, Any] | None,
+    prior_turns: Sequence[Mapping[str, Any]] | None = None,
 ) -> tuple[str, str, str, str, str]:
+    prior_sig = [
+        (
+            str(turn.get("role") or ""),
+            _extract_turn_text(turn.get("content"))[:200],
+        )
+        for turn in (prior_turns or ())[-4:]
+        if isinstance(turn, Mapping)
+    ]
     ctx_blob = json.dumps(
         {
             "has_sources": has_sources,
             "web_enabled": web_enabled,
             "scoped": scoped,
             "has_thread_history": has_thread_history,
+            "prior_turns": prior_sig,
             "context": dict(context) if context else {},
         },
         sort_keys=True,
@@ -606,21 +619,28 @@ async def _call_openai_compatible_router(
     if rf is not None:
         body["response_format"] = rf
 
-    client_kwargs: dict[str, Any] = {
-        "timeout": httpx.Timeout(timeout_seconds, connect=min(3.0, timeout_seconds)),
-    }
-    if http_transport is not None:
-        client_kwargs["transport"] = http_transport
+    req_timeout = httpx.Timeout(timeout_seconds, connect=min(3.0, timeout_seconds))
 
-    async with httpx.AsyncClient(**client_kwargs) as client:
-        response = await client.post(endpoint, headers=headers, json=body)
+    async def _post_with(client: httpx.AsyncClient) -> Any:
+        response = await client.post(endpoint, headers=headers, json=body, timeout=req_timeout)
         if response.status_code in {400, 422} and rf is not None and rf.get("type") == "json_schema":
             if _should_downgrade_http_json_schema(response.status_code, response.text):
                 downgraded_body = dict(body)
                 downgraded_body["response_format"] = {"type": "json_object"}
-                response = await client.post(endpoint, headers=headers, json=downgraded_body)
+                response = await client.post(
+                    endpoint, headers=headers, json=downgraded_body, timeout=req_timeout
+                )
         response.raise_for_status()
-        payload = response.json()
+        return response.json()
+
+    if http_transport is not None:
+        async with httpx.AsyncClient(timeout=req_timeout, transport=http_transport) as client:
+            payload = await _post_with(client)
+    else:
+        from sag_api.core.http_client import get_pooled_http_client
+
+        client = get_pooled_http_client("decision_router", timeout=req_timeout)
+        payload = await _post_with(client)
 
     if not isinstance(payload, dict):
         raise ValueError("router response root is not an object")
@@ -697,7 +717,7 @@ async def route_query_async(
         llm_model = str(getattr(client_settings, "llm_model", None) or settings.llm_model)
         llm_base = str(getattr(client_settings, "llm_base_url", None) or settings.llm_base_url or "")
         start_time = time.perf_counter()
-        llm_cache_eligible = use_cache and not prior_turns
+        llm_cache_eligible = use_cache
         llm_key = _cache_key(
             provider=provider,
             base_url=llm_base,
@@ -708,6 +728,7 @@ async def route_query_async(
             scoped=scoped,
             has_thread_history=has_thread_history,
             context=context,
+            prior_turns=prior_turns,
         )
         if llm_cache_eligible:
             cached = _get_cached_decision_payload(llm_key)
@@ -761,7 +782,7 @@ async def route_query_async(
 
     model = settings.decision_model
     start_time = time.perf_counter()
-    cache_eligible = use_cache and http_transport is None and not prior_turns
+    cache_eligible = use_cache and http_transport is None
     key = _cache_key(
         provider=provider,
         base_url=base_url,
@@ -772,6 +793,7 @@ async def route_query_async(
         scoped=scoped,
         has_thread_history=has_thread_history,
         context=context,
+        prior_turns=prior_turns,
     )
     if cache_eligible:
         cached = _get_cached_decision_payload(key)

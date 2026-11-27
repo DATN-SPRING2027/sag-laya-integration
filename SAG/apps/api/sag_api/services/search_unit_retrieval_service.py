@@ -10,7 +10,7 @@ import re
 import threading
 import time
 import unicodedata
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -126,16 +126,23 @@ async def _select_diverse_sections(
 
 
 _CONTINUUM_PUBLIC_DOC_ID_RE = re.compile(
-    r"^(?:continuum:project_document:|project-document:)?([0-9a-fA-F]{24})\Z"
+    r"^(?:continuum:(project_document|work_report|work_note):|(project-document):)?([0-9a-fA-F]{24})\Z"
 )
 
 
-def _resolve_public_document_id(logical_source_id: object) -> str | None:
+def _resolve_public_source_ref(logical_source_id: object) -> tuple[str | None, str | None]:
+    """Extract (source_kind, public_source_id) for Continuum documents, work reports, and task notes (E2E-INT-011)."""
     if isinstance(logical_source_id, str) and logical_source_id.strip():
         matched = _CONTINUUM_PUBLIC_DOC_ID_RE.fullmatch(logical_source_id.strip())
         if matched:
-            return matched.group(1).lower()
-    return None
+            raw_kind = matched.group(1) or ("project_document" if matched.group(2) else None)
+            return raw_kind, matched.group(3).lower()
+    return None, None
+
+
+def _resolve_public_document_id(logical_source_id: object) -> str | None:
+    _kind, public_id = _resolve_public_source_ref(logical_source_id)
+    return public_id
 
 
 def _verify_selection_scope(
@@ -805,6 +812,7 @@ async def _query_group(
     query_vector: list[float],
     route: RouteDecision | None = None,
     sub_sparse_queries: tuple[dict[str, list[int] | list[float]], ...] = (),
+    sub_dense_queries: tuple[list[float], ...] = (),
 ) -> tuple[_SearchGroup, list[SearchUnitHit], list[SearchUnitHit]]:
     collection = f"search_units_{group.project_id}"
     use_tree_route = bool(
@@ -843,6 +851,18 @@ async def _query_group(
                     "limit": limit,
                 },
             ]
+            sub_dense_count = 0
+            for sub_vec in sub_dense_queries:
+                if sub_vec and all(math.isfinite(v) for v in sub_vec):
+                    searches.append(
+                        {
+                            "vector_name": "content_vector",
+                            "query": [float(v) for v in sub_vec],
+                            "search_filter": search_filter,
+                            "limit": sub_limit,
+                        }
+                    )
+                    sub_dense_count += 1
             for sub_sparse in sub_sparse_queries:
                 searches.append(
                     {
@@ -853,8 +873,10 @@ async def _query_group(
                     }
                 )
             batch_res = await store.search_batch(collection, searches=searches)
-            semantic = batch_res[0]
-            lexical = _interleave_hit_lists([batch_res[1], *batch_res[2:]], limit=limit)
+            dense_lists = [batch_res[0], *batch_res[2 : 2 + sub_dense_count]]
+            sparse_lists = [batch_res[1], *batch_res[2 + sub_dense_count :]]
+            semantic = _interleave_hit_lists(dense_lists, limit=limit) if sub_dense_count else batch_res[0]
+            lexical = _interleave_hit_lists(sparse_lists, limit=limit) if sub_sparse_queries else batch_res[1]
         else:
             semantic_task = asyncio.create_task(
                 store.search(
@@ -901,6 +923,7 @@ async def _query_routed_group_batch(
     route: RouteDecision,
     escape_limit: int | None = None,
     sub_sparse_queries: tuple[dict[str, list[int] | list[float]], ...] = (),
+    sub_dense_queries: tuple[list[float], ...] = (),
 ) -> tuple[list[SearchUnitHit], list[SearchUnitHit], list[SearchUnitHit], list[SearchUnitHit]]:
     """Execute branch_local + global_escape hybrid queries in 1 Qdrant batch round-trip."""
     collection = f"search_units_{group.project_id}"
@@ -930,35 +953,139 @@ async def _query_routed_group_batch(
         {"vector_name": "content_vector", "query": vector, "search_filter": escape_filter, "limit": eff_escape_limit},
         {"vector_name": "bm25_sparse", "query": sparse_query, "search_filter": escape_filter, "limit": eff_escape_limit},
     ]
-    local_sub_cnt = 0
+    valid_sub_dense = [
+        [float(v) for v in sub_vec]
+        for sub_vec in sub_dense_queries
+        if sub_vec and all(math.isfinite(v) for v in sub_vec)
+    ]
+    sub_local_lim = max(8, limit // 2)
+    sub_esc_lim = max(8, eff_escape_limit // 2)
+    local_dense_cnt = 0
+    esc_dense_cnt = 0
+    for sub_vec in valid_sub_dense:
+        searches.append(
+            {"vector_name": "content_vector", "query": sub_vec, "search_filter": local_filter, "limit": sub_local_lim}
+        )
+        local_dense_cnt += 1
+    for sub_vec in valid_sub_dense:
+        searches.append(
+            {"vector_name": "content_vector", "query": sub_vec, "search_filter": escape_filter, "limit": sub_esc_lim}
+        )
+        esc_dense_cnt += 1
+    local_sparse_cnt = 0
     if sub_sparse_queries:
-        sub_local_lim = max(8, limit // 2)
-        sub_esc_lim = max(8, eff_escape_limit // 2)
         for sub_sparse in sub_sparse_queries:
             searches.append(
                 {"vector_name": "bm25_sparse", "query": sub_sparse, "search_filter": local_filter, "limit": sub_local_lim}
             )
-            local_sub_cnt += 1
+            local_sparse_cnt += 1
         for sub_sparse in sub_sparse_queries:
             searches.append(
                 {"vector_name": "bm25_sparse", "query": sub_sparse, "search_filter": escape_filter, "limit": sub_esc_lim}
             )
     batch = await store.search_batch(collection, searches=searches)
-    if not sub_sparse_queries:
+    if not valid_sub_dense and not sub_sparse_queries:
         return batch[0], batch[1], batch[2], batch[3]
-    local_sub_hits = batch[4 : 4 + local_sub_cnt]
-    esc_sub_hits = batch[4 + local_sub_cnt :]
+    cursor = 4
+    local_sub_dense = batch[cursor : cursor + local_dense_cnt]
+    cursor += local_dense_cnt
+    esc_sub_dense = batch[cursor : cursor + esc_dense_cnt]
+    cursor += esc_dense_cnt
+    local_sub_sparse = batch[cursor : cursor + local_sparse_cnt]
+    cursor += local_sparse_cnt
+    esc_sub_sparse = batch[cursor:]
     return (
-        batch[0],
-        _interleave_hit_lists([batch[1], *local_sub_hits], limit=limit),
-        batch[2],
-        _interleave_hit_lists([batch[3], *esc_sub_hits], limit=eff_escape_limit),
+        _interleave_hit_lists([batch[0], *local_sub_dense], limit=limit) if local_sub_dense else batch[0],
+        _interleave_hit_lists([batch[1], *local_sub_sparse], limit=limit) if local_sub_sparse else batch[1],
+        _interleave_hit_lists([batch[2], *esc_sub_dense], limit=eff_escape_limit) if esc_sub_dense else batch[2],
+        _interleave_hit_lists([batch[3], *esc_sub_sparse], limit=eff_escape_limit) if esc_sub_sparse else batch[3],
     )
 
 
 _QWEN3_QUERY_INSTRUCT = (
     "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
 )
+
+
+async def _batch_subquery_vectors(
+    engine_manager: Any,
+    group: _SearchGroup,
+    subqueries: tuple[str, ...],
+) -> tuple[list[float], ...]:
+    """Batch-embed decomposed sub-queries in a single embedding request so multi-hop runs dense+sparse hybrid (SAG-RET-003)."""
+    if not subqueries:
+        return ()
+    from sag_api.core.token_usage import (
+        extract_embedding_usage,
+        record_embedding_cache_hit,
+        record_embedding_usage,
+        token_usage_scope,
+    )
+    from sag_api.services.search_index_service import (
+        build_embedding_model_signature,
+        get_cached_text_embedding,
+        put_cached_text_embedding,
+    )
+
+    settings_obj = getattr(engine_manager, "_settings", None) or settings
+    try:
+        embedding = await engine_manager.get_sag_embedding(group.source.sag_source_config_id, group.source)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - best-effort dense sub-query enrichment; primary query still runs
+        return ()
+
+    emb_model = getattr(embedding, "model", None) or getattr(settings_obj, "embedding_model", "") or ""
+    model_name = str(emb_model).lower()
+    prepared = [
+        f"{_QWEN3_QUERY_INSTRUCT}{sq}" if ("qwen3-embedding" in model_name and not sq.startswith("Instruct:")) else sq
+        for sq in subqueries
+    ]
+    emb_sig = build_embedding_model_signature(embedding, settings_obj=settings_obj)
+    vectors_by_idx: dict[int, list[float]] = {}
+    missing_indices: list[int] = []
+    missing_texts: list[str] = []
+    for idx, text in enumerate(prepared):
+        cached = get_cached_text_embedding(text, model_signature=emb_sig)
+        if cached is not None:
+            vectors_by_idx[idx] = cached
+        else:
+            missing_indices.append(idx)
+            missing_texts.append(text)
+    if vectors_by_idx:
+        record_embedding_cache_hit(
+            model=emb_model or None,
+            count=len(vectors_by_idx),
+            component="query_embedding",
+            project_id=group.project_id,
+        )
+    if missing_texts:
+        try:
+            with token_usage_scope(
+                component="query_embedding",
+                project_id=group.project_id,
+                tenant_id=group.tenant_id,
+            ):
+                if hasattr(embedding, "batch_generate"):
+                    raw_vecs = await embedding.batch_generate(missing_texts)
+                else:
+                    raw_vecs = [await embedding.generate(text) for text in missing_texts]
+                if not getattr(embedding, "_sag_token_metered_cache_wrapped", False):
+                    for text in missing_texts:
+                        record_embedding_usage(
+                            model=emb_model or None,
+                            usage=extract_embedding_usage(None, text),
+                        )
+            for idx, text, raw_vec in zip(missing_indices, missing_texts, raw_vecs, strict=False):
+                vec = [float(v) for v in raw_vec]
+                if vec and all(math.isfinite(v) for v in vec):
+                    put_cached_text_embedding(text, vec, model_signature=emb_sig)
+                    vectors_by_idx[idx] = vec
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - degrade cleanly to sparse sub-queries
+            log.debug("sub-query dense batch embedding skipped (%s)", type(exc).__name__)
+    return tuple(vectors_by_idx[i] for i in range(len(prepared)) if i in vectors_by_idx)
 
 
 async def _query_vector(engine_manager: Any, group: _SearchGroup, query: str) -> list[float]:
@@ -1284,6 +1411,8 @@ class _ScopeKnowledgeIndex:
 
 _SCOPE_KNOWLEDGE_INDEX_CACHE: dict[str, _ScopeKnowledgeIndex] = {}
 _SCOPE_KNOWLEDGE_INDEX_CACHE_MAX = 16
+_SCOPE_KNOWLEDGE_EPOCH_CACHE: OrderedDict[tuple[Any, ...], _ScopeKnowledgeIndex] = OrderedDict()
+_SCOPE_KNOWLEDGE_EPOCH_CACHE_MAX = 32
 
 
 def _scope_knowledge_digest(current_versions: dict[str, _ReadyVersion]) -> str:
@@ -1337,6 +1466,101 @@ async def _get_or_build_scope_knowledge_index(
             allowed_source_ids=scoped_sources or None,
             hidden_document_ids=hidden_doc_ids,
         )
+    projects = sorted({v.project_id for v in current_versions.values() if v.project_id})
+    scope_versions_digest = _scope_knowledge_digest(current_versions)
+    # SAG-PERF-003: collapse 4-6 cache-key PG scans into 1 lightweight metadata fingerprint query on warm hits.
+    fast_cache_key: tuple[Any, ...] | None = None
+    if version_ids and norm_partitions and projects:
+        edge_src_fp = aliased(SearchUnit)
+        edge_tgt_fp = aliased(SearchUnit)
+        ku_count_sq = (
+            select(func.count(KnowledgeUnit.id))
+            .where(
+                KnowledgeUnit.document_version_id.in_(version_ids),
+                KnowledgeUnit.is_current.is_(True),
+                KnowledgeUnit.security_partition_id.in_(norm_partitions),
+            )
+            .scalar_subquery()
+        )
+        ku_max_sq = (
+            select(func.max(KnowledgeUnit.checksum))
+            .where(
+                KnowledgeUnit.document_version_id.in_(version_ids),
+                KnowledgeUnit.is_current.is_(True),
+                KnowledgeUnit.security_partition_id.in_(norm_partitions),
+            )
+            .scalar_subquery()
+        )
+        gb_count_sq = (
+            select(func.count(KnowledgeGraphBuild.id))
+            .where(KnowledgeGraphBuild.project_id.in_(projects))
+            .scalar_subquery()
+        )
+        gb_max_sq = (
+            select(func.max(KnowledgeGraphBuild.id))
+            .where(KnowledgeGraphBuild.project_id.in_(projects))
+            .scalar_subquery()
+        )
+        edge_count_sq = (
+            select(func.count(KnowledgeGraphEdge.id))
+            .select_from(KnowledgeGraphEdge)
+            .join(edge_src_fp, edge_src_fp.id == KnowledgeGraphEdge.source_unit_id)
+            .join(edge_tgt_fp, edge_tgt_fp.id == KnowledgeGraphEdge.target_unit_id)
+            .where(
+                KnowledgeGraphEdge.project_id.in_(projects),
+                KnowledgeGraphEdge.edge_type.in_(("CONTRADICTS", "SUPERSEDES")),
+                edge_src_fp.document_version_id.in_(version_ids),
+                edge_tgt_fp.document_version_id.in_(version_ids),
+                edge_src_fp.security_partition_id.in_(norm_partitions),
+                edge_tgt_fp.security_partition_id.in_(norm_partitions),
+            )
+            .scalar_subquery()
+        )
+        edge_max_sq = (
+            select(func.max(KnowledgeGraphEdge.id))
+            .select_from(KnowledgeGraphEdge)
+            .join(edge_src_fp, edge_src_fp.id == KnowledgeGraphEdge.source_unit_id)
+            .join(edge_tgt_fp, edge_tgt_fp.id == KnowledgeGraphEdge.target_unit_id)
+            .where(
+                KnowledgeGraphEdge.project_id.in_(projects),
+                KnowledgeGraphEdge.edge_type.in_(("CONTRADICTS", "SUPERSEDES")),
+                edge_src_fp.document_version_id.in_(version_ids),
+                edge_tgt_fp.document_version_id.in_(version_ids),
+                edge_src_fp.security_partition_id.in_(norm_partitions),
+                edge_tgt_fp.security_partition_id.in_(norm_partitions),
+            )
+            .scalar_subquery()
+        )
+        fp_rows = (
+            await session.execute(
+                select(
+                    ProjectSearchState.project_id,
+                    ProjectSearchState.active_search_epoch,
+                    ProjectSearchState.active_tree_version,
+                    ku_count_sq,
+                    ku_max_sq,
+                    gb_count_sq,
+                    gb_max_sq,
+                    edge_count_sq,
+                    edge_max_sq,
+                ).where(ProjectSearchState.project_id.in_(projects))
+            )
+        ).all()
+        if fp_rows:
+            state_sig = tuple(sorted((str(r[0]), int(r[1] or 0), str(r[2] or "")) for r in fp_rows))
+            agg_sig = (fp_rows[0][3], fp_rows[0][4], fp_rows[0][5], fp_rows[0][6], fp_rows[0][7], fp_rows[0][8])
+            fast_cache_key = (
+                scope_versions_digest,
+                tuple(norm_partitions),
+                state_sig,
+                agg_sig,
+                effective_overlay_fp,
+            )
+            epoch_hit = _SCOPE_KNOWLEDGE_EPOCH_CACHE.get(fast_cache_key)
+            if epoch_hit is not None:
+                _SCOPE_KNOWLEDGE_EPOCH_CACHE.move_to_end(fast_cache_key)
+                return epoch_hit
+
     checksum_rows = (await session.execute(
         select(KnowledgeUnit.id, KnowledgeUnit.checksum, KnowledgeUnit.project_id).where(
             KnowledgeUnit.document_version_id.in_(version_ids), KnowledgeUnit.is_current.is_(True),
@@ -1344,19 +1568,19 @@ async def _get_or_build_scope_knowledge_index(
         )
     )).all()
     checksums = {uid: value for uid, value, _project in checksum_rows}
-    projects = {v.project_id for v in current_versions.values()}
+    projects_set = set(projects)
     active_rows = (await session.execute(select(
         TreeManifest.project_id, TreeManifest.manifest_json["knowledge_graph_build_id"].as_string(),
     ).join(ProjectSearchState, ProjectSearchState.active_tree_version == TreeManifest.tree_version)
-        .where(TreeManifest.project_id.in_(projects), TreeManifest.status == "ACTIVE"))).all()
+        .where(TreeManifest.project_id.in_(projects_set), TreeManifest.status == "ACTIVE"))).all()
     pinned = {project: build for project, build in active_rows if build}
     active_graphs = set(pinned.values())
     graph_rows = (await session.execute(select(
         KnowledgeGraphBuild.id, KnowledgeGraphBuild.project_id, KnowledgeGraphBuild.manifest_json["units"],
-    ).where(KnowledgeGraphBuild.project_id.in_(projects),
+    ).where(KnowledgeGraphBuild.project_id.in_(projects_set),
             (KnowledgeGraphBuild.id.in_(active_graphs)) | KnowledgeGraphBuild.input_fingerprint.is_(None)))).all()
     graph_ids = []
-    for project in projects:
+    for project in projects_set:
         wanted = {uid: value for uid, value, scope_project in checksum_rows if scope_project == project}
         candidates = []
         for build_id, build_project, pairs in graph_rows:
@@ -1371,7 +1595,7 @@ async def _get_or_build_scope_knowledge_index(
         if candidates:
             graph_ids.append(max(candidates)[2])
     kg_edge_ids: list[str] = []
-    if projects and norm_partitions and version_ids:
+    if projects_set and norm_partitions and version_ids:
         edge_src_su = aliased(SearchUnit)
         edge_tgt_su = aliased(SearchUnit)
         kg_edge_ids = sorted(
@@ -1382,7 +1606,7 @@ async def _get_or_build_scope_knowledge_index(
                     .join(edge_src_su, edge_src_su.id == KnowledgeGraphEdge.source_unit_id)
                     .join(edge_tgt_su, edge_tgt_su.id == KnowledgeGraphEdge.target_unit_id)
                     .where(
-                        KnowledgeGraphEdge.project_id.in_(projects),
+                        KnowledgeGraphEdge.project_id.in_(projects_set),
                         KnowledgeGraphEdge.edge_type.in_(("CONTRADICTS", "SUPERSEDES")),
                         edge_src_su.document_version_id.in_(version_ids),
                         edge_tgt_su.document_version_id.in_(version_ids),
@@ -1393,7 +1617,7 @@ async def _get_or_build_scope_knowledge_index(
             ).all()
         )
     digest = hashlib.sha256(repr((
-        _scope_knowledge_digest(current_versions),
+        scope_versions_digest,
         norm_partitions,
         sorted(checksums.items()),
         sorted(graph_ids),
@@ -1402,6 +1626,11 @@ async def _get_or_build_scope_knowledge_index(
     )).encode()).hexdigest()
     cached = _SCOPE_KNOWLEDGE_INDEX_CACHE.get(digest)
     if cached is not None:
+        if fast_cache_key is not None:
+            _SCOPE_KNOWLEDGE_EPOCH_CACHE[fast_cache_key] = cached
+            _SCOPE_KNOWLEDGE_EPOCH_CACHE.move_to_end(fast_cache_key)
+            while len(_SCOPE_KNOWLEDGE_EPOCH_CACHE) > _SCOPE_KNOWLEDGE_EPOCH_CACHE_MAX:
+                _SCOPE_KNOWLEDGE_EPOCH_CACHE.popitem(last=False)
         return cached
 
     ku_rows = (
@@ -1680,6 +1909,11 @@ async def _get_or_build_scope_knowledge_index(
     if len(_SCOPE_KNOWLEDGE_INDEX_CACHE) >= _SCOPE_KNOWLEDGE_INDEX_CACHE_MAX:
         _SCOPE_KNOWLEDGE_INDEX_CACHE.pop(next(iter(_SCOPE_KNOWLEDGE_INDEX_CACHE)))
     _SCOPE_KNOWLEDGE_INDEX_CACHE[digest] = index
+    if fast_cache_key is not None:
+        _SCOPE_KNOWLEDGE_EPOCH_CACHE[fast_cache_key] = index
+        _SCOPE_KNOWLEDGE_EPOCH_CACHE.move_to_end(fast_cache_key)
+        while len(_SCOPE_KNOWLEDGE_EPOCH_CACHE) > _SCOPE_KNOWLEDGE_EPOCH_CACHE_MAX:
+            _SCOPE_KNOWLEDGE_EPOCH_CACHE.popitem(last=False)
     return index
 
 
@@ -1775,6 +2009,7 @@ async def _ensure_versions_hydrated(
             or hashlib.sha256(combined_text.encode("utf-8")).hexdigest() != unit.content_hash
         ):
             continue
+        source_kind, public_source_id = _resolve_public_source_ref(logical_source_id)
         sec_template = RetrievedSection(
             chunk_id=unit.id,
             search_unit_id=unit.id,
@@ -1791,7 +2026,9 @@ async def _ensure_versions_hydrated(
             canonical_evidence_verified=True,
             project_id=ver.project_id,
             document_id=str(doc_id),
-            public_document_id=_resolve_public_document_id(logical_source_id),
+            public_document_id=public_source_id,
+            public_source_id=public_source_id,
+            source_kind=source_kind,
             document_version_id=v_id_str,
             document_name=str(filename or ""),
             version_no=int(version_no),
@@ -2060,6 +2297,69 @@ async def _expand_multi_hop_sections(
                     if tgt_ku is None or tgt_ku.document_version_id in seed_version_ids:
                         continue
                     neighbor_scores[tgt_id] = max(neighbor_scores.get(tgt_id, 0.0), s_score * w)
+
+                # HippoRAG 2 damped Personalized PageRank over ACL-scoped KnowledgeUnitEdge graph (SAG-RET-003)
+                if k_index.edges_by_ku:
+                    try:
+                        import igraph as ig
+
+                        ppr_nodes: list[str] = []
+                        ppr_idx: dict[str, int] = {}
+                        ppr_edges: list[tuple[int, int]] = []
+                        ppr_weights: list[float] = []
+                        seen_pairs: set[tuple[int, int]] = set()
+                        for src_id, adj in k_index.edges_by_ku.items():
+                            if src_id not in k_index.ku_by_id:
+                                continue
+                            u_idx = ppr_idx.get(src_id)
+                            if u_idx is None:
+                                u_idx = len(ppr_nodes)
+                                ppr_idx[src_id] = u_idx
+                                ppr_nodes.append(src_id)
+                            for tgt_id, weight in adj:
+                                if tgt_id not in k_index.ku_by_id or weight <= 0.0:
+                                    continue
+                                v_idx = ppr_idx.get(tgt_id)
+                                if v_idx is None:
+                                    v_idx = len(ppr_nodes)
+                                    ppr_idx[tgt_id] = v_idx
+                                    ppr_nodes.append(tgt_id)
+                                pair = (u_idx, v_idx) if u_idx <= v_idx else (v_idx, u_idx)
+                                if pair not in seen_pairs:
+                                    seen_pairs.add(pair)
+                                    ppr_edges.append(pair)
+                                    ppr_weights.append(float(weight))
+                        if ppr_edges and any(sid in ppr_idx for sid in seed_ku_scores):
+                            reset = [float(seed_ku_scores.get(nid, 0.0)) for nid in ppr_nodes]
+                            reset_total = sum(reset)
+                            if reset_total > 0.0:
+                                reset = [val / reset_total for val in reset]
+                                graph = ig.Graph(n=len(ppr_nodes), edges=ppr_edges, directed=False)
+                                scores_ppr = graph.personalized_pagerank(
+                                    damping=0.85,
+                                    reset=reset,
+                                    weights=ppr_weights,
+                                    directed=False,
+                                )
+                                non_seed_ppr = sorted(
+                                    (
+                                        (ppr_nodes[i], float(scores_ppr[i]))
+                                        for i in range(len(ppr_nodes))
+                                        if ppr_nodes[i] not in seed_ku_scores and scores_ppr[i] > 0.0
+                                    ),
+                                    key=lambda item: -item[1],
+                                )[: max(limit, 8)]
+                                if non_seed_ppr:
+                                    max_ppr = max(val for _nid, val in non_seed_ppr)
+                                    if max_ppr > 0.0:
+                                        for nid, ppr_val in non_seed_ppr:
+                                            tgt_ku = k_index.ku_by_id.get(nid)
+                                            if tgt_ku is None or tgt_ku.document_version_id in seed_version_ids:
+                                                continue
+                                            scaled_ppr = top_anchor_score * 0.85 * (ppr_val / max_ppr)
+                                            neighbor_scores[nid] = max(neighbor_scores.get(nid, 0.0), scaled_ppr)
+                    except Exception:  # noqa: BLE001 - fall back cleanly to 1-hop + bridge entities
+                        pass
 
                 # HippoRAG 2 Bridge Entity Activation using pre-indexed scope knowledge units
                 if top_seed_entities:
@@ -2508,15 +2808,28 @@ async def _retrieve_search_unit_sections(
                     config_key
                 ]
             raw_subqueries = strategy_plan.retrieval_plan.decomposition.subqueries
-            sub_sparse_queries: tuple[dict[str, list[int] | list[float]], ...] = (
+            cleaned_subqueries: tuple[str, ...] = (
                 tuple(
-                    sq_vec
+                    sq.strip()
                     for sq in raw_subqueries[:3]
-                    if sq.strip() and sq.strip() != query.strip() and (sq_vec := build_sparse_query_vector(sq))["indices"]
+                    if sq.strip() and sq.strip() != query.strip()
                 )
                 if len(raw_subqueries) >= 2
                 else ()
             )
+            sub_sparse_queries: tuple[dict[str, list[int] | list[float]], ...] = tuple(
+                sq_vec
+                for sq in cleaned_subqueries
+                if (sq_vec := build_sparse_query_vector(sq))["indices"]
+            )
+            sub_dense_tasks: dict[str, asyncio.Task[tuple[list[float], ...]]] = {}
+            if cleaned_subqueries:
+                for group in groups:
+                    config_key = group.source.sag_source_config_id or group.source.id
+                    if config_key not in sub_dense_tasks:
+                        sub_dense_tasks[config_key] = asyncio.create_task(
+                            _batch_subquery_vectors(engine_manager, group, cleaned_subqueries)
+                        )
             if allows_superseded:
                 decisions = {}
                 t_route_ms = 0.0
@@ -2551,7 +2864,13 @@ async def _retrieve_search_unit_sections(
                         )
                     config_key = group.source.sag_source_config_id or group.source.id
                     vector = await vector_tasks[config_key]
+                    sub_dense_queries = (
+                        await sub_dense_tasks[config_key]
+                        if config_key in sub_dense_tasks
+                        else ()
+                    )
                     if route is None or not route.routed:
+                        extra_sub = {"sub_dense_queries": sub_dense_queries} if sub_dense_queries else {}
                         result = await _query_group(
                             group,
                             query=query,
@@ -2559,6 +2878,7 @@ async def _retrieve_search_unit_sections(
                             store=store,
                             query_vector=vector,
                             sub_sparse_queries=sub_sparse_queries,
+                            **extra_sub,
                         )
                         return [(group, route, "global_only", result[1], result[2])], None, None
 
@@ -2584,6 +2904,7 @@ async def _retrieve_search_unit_sections(
                     eff_escape_limit = max(8, candidate_limit // 2) if confident_local else candidate_limit
 
                     if hasattr(store, "search_batch"):
+                        extra_sub = {"sub_dense_queries": sub_dense_queries} if sub_dense_queries else {}
                         try:
                             async with asyncio.timeout_at(local_deadline):
                                 local_sem, local_lex, esc_sem, esc_lex = await _query_routed_group_batch(
@@ -2595,6 +2916,7 @@ async def _retrieve_search_unit_sections(
                                     route=route,
                                     escape_limit=eff_escape_limit,
                                     sub_sparse_queries=sub_sparse_queries,
+                                    **extra_sub,
                                 )
                             return (
                                 [
@@ -2616,6 +2938,7 @@ async def _retrieve_search_unit_sections(
                                     store=store,
                                     query_vector=vector,
                                     sub_sparse_queries=sub_sparse_queries,
+                                    **extra_sub,
                                 )
                             return [(group, route, "global_escape", esc_res[1], esc_res[2])], local_failure, None
 
@@ -2774,11 +3097,15 @@ async def _retrieve_search_unit_sections(
                 max_sparse_raw_score = max(max_sparse_raw_score, max_score)
             for rank, hit in enumerate(channel_hits):
                 hit_emb_sig = hit.payload.get("embedding_model_signature")
-                if (
-                    isinstance(hit_emb_sig, str)
-                    and hit_emb_sig.strip()
-                    and hit_emb_sig.strip() != active_emb_sig
-                ):
+                if not isinstance(hit_emb_sig, str) or not hit_emb_sig.strip():
+                    if getattr(active_settings, "search_strict_embedding_signature", True):
+                        log.warning(
+                            "Skipping Qdrant hit missing embedding_model_signature (unit=%r active=%r)",
+                            hit.payload.get("search_unit_id"),
+                            active_emb_sig,
+                        )
+                        continue
+                elif hit_emb_sig.strip() != active_emb_sig:
                     log.warning(
                         "Qdrant hit embedding_model_signature mismatch: index=%r active=%r",
                         hit_emb_sig,
@@ -2996,11 +3323,14 @@ async def _retrieve_search_unit_sections(
             else ("ACTIVE_CONFLICT" if unit_id_str in active_conflict_unit_ids else None)
         )
         unit_ordinals[unit_id_str] = (int(start_ordinal), int(end_ordinal))
+        ref_source_kind, ref_public_id = _resolve_public_source_ref(logical_source_id)
         unit_by_id[unit_id_str] = (
             unit,
             {
                 "document_id": str(document_id),
-                "public_document_id": _resolve_public_document_id(logical_source_id),
+                "public_document_id": ref_public_id,
+                "public_source_id": ref_public_id,
+                "source_kind": ref_source_kind,
                 "document_version_id": str(unit.document_version_id),
                 "document_name": str(filename or ""),
                 "version_no": int(version_no),
@@ -3224,7 +3554,8 @@ async def _retrieve_search_unit_sections(
         t_diversity_ms = round((time.perf_counter() - t_rerank_start) * 1000, 2)
     else:
         t_fusion_start = time.perf_counter()
-        fused = rerank_sections(
+        fused = await asyncio.to_thread(
+            rerank_sections,
             query,
             semantic,
             lexical=lexical,
@@ -3559,6 +3890,11 @@ async def _retrieve_search_unit_sections(
                             selected.append(chosen_section)
             except (TimeoutError, SQLAlchemyError, SearchIndexUnavailable):
                 pass
+    from sag_api.services.retrieval_plan import apply_plan_constraints_and_order
+
+    selected, plan_execution = apply_plan_constraints_and_order(
+        selected, effective_plan.retrieval_plan
+    )
     selected_version_ids = {str(section.document_version_id or "") for section in selected}
     selected_unit_ids = {
         str(section.search_unit_id or section.chunk_id or "")
@@ -3622,6 +3958,7 @@ async def _retrieve_search_unit_sections(
             "cross_scope_merge": "rank_interleave",
             "coverage": coverage,
             "routing": routing,
+            "plan_execution": plan_execution,
             "selection_fallback_reason": selection_fallback_reason,
             "degraded": bool(selection_fallback_reason),
             "degraded_reason": selection_fallback_reason,

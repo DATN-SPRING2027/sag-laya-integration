@@ -559,9 +559,14 @@ def build_source_mcp(
             else:
                 return "(Tài liệu nhị phân chưa có nội dung Markdown đã phân tích.)"
         else:
+            import asyncio
+
+            def _read_lines_sync(path: str) -> list[str]:
+                with open(path, encoding="utf-8", errors="replace") as file:
+                    return file.readlines()
+
             try:
-                with open(storage_path, encoding="utf-8", errors="replace") as file:
-                    lines = file.readlines()
+                lines = await asyncio.to_thread(_read_lines_sync, storage_path)
             except OSError:
                 return "(Đọc tệp thất bại.)"
 

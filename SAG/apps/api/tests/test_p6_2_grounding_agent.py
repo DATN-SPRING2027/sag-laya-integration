@@ -356,11 +356,25 @@ async def test_entailment_verifier_sees_full_chunk_and_doc_name_caps_size_and_lo
         '{"answerability": "unsupported", "supported": true}'
     )[0] is None
 
-    # Timeout/exception must log warning + return explicit entailment_verifier_failed + propagate degraded=True
+    # SAG-CHAT-001: Timeout on lexically supported cited answer preserves answer with degraded reason;
+    # non-timeout verifier error still fails closed with entailment_verifier_failed + degraded=True.
     caplog.set_level(logging.WARNING)
-    failing_llm = SimpleNamespace(
+    timeout_llm = SimpleNamespace(
         configured=True,
         complete=AsyncMock(side_effect=TimeoutError("verifier timed out")),
+    )
+    timeout_status, timeout_reason = await agent_service._verify_grounded_entailment(
+        timeout_llm,
+        query="Hạn mức?",
+        answer="750 triệu VND [1].",
+        internal_citations=[{**built[0], "claim_level": "claim"}],
+        session_citations=[],
+    )
+    assert (timeout_status, timeout_reason) == ("answered", "entailment_verifier_timeout")
+
+    failing_llm = SimpleNamespace(
+        configured=True,
+        complete=AsyncMock(side_effect=RuntimeError("verifier upstream 500")),
     )
     err_status, err_reason = await agent_service._verify_grounded_entailment(
         failing_llm,

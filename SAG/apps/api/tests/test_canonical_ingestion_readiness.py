@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from sag_api.core.config import Settings
-from sag_api.core.errors import ValidationError
+from sag_api.core.errors import ServiceUnavailableError, ValidationError
 from sag_api.db.base import Base
 from sag_api.db.models import (
     CanonicalBlock,
@@ -442,13 +442,32 @@ async def test_project_upload_revoke_and_status_lifecycle(ingestion_db, tmp_path
         assert revoke_res.status == "REVOKED"
         assert revoke_res.document_id == upload_res.document_id
 
+        qdrant_client = object()
+        purge = AsyncMock(side_effect=[RuntimeError("Qdrant unavailable"), None])
+        monkeypatch.setattr(search_index_service, "delete_document_points_from_qdrant", purge)
+        with pytest.raises(ServiceUnavailableError):
+            await revoke_project_document(
+                session,
+                tenant_id="tenant-2",
+                project_id="project-2",
+                logical_source_id="be-doc-123",
+                qdrant_client=qdrant_client,
+            )
+
         revoke_again = await revoke_project_document(
             session,
             tenant_id="tenant-2",
             project_id="project-2",
             logical_source_id="be-doc-123",
+            qdrant_client=qdrant_client,
         )
         assert revoke_again.status == "ALREADY_REVOKED"
+        assert purge.await_count == 2
+        purge.assert_awaited_with(
+            qdrant_client,
+            project_id="project-2",
+            document_version_ids=[upload_res.version_id],
+        )
 
         not_found = await revoke_project_document(
             session,

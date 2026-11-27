@@ -95,10 +95,13 @@ async def lifespan(app: FastAPI):
                     warm_task.cancel()
                 await _drain_warm_manifest_task(warm_task)
     finally:
+        from sag_api.core.http_client import close_pooled_http_clients
+
         failures: list[BaseException] = []
         for cleanup in (
             knowledge_worker.stop,
             runtime.stop,
+            close_pooled_http_clients,
             dispose_db,
         ):
             try:

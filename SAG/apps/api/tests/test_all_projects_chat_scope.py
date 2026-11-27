@@ -27,16 +27,9 @@ from sag_api.core.errors import ApiError, ForbiddenError
 from sag_api.core.principal_assertion import VerifiedPrincipal
 from sag_api.db.base import Base
 from sag_api.db.models import (
-    Agent,
-    Document,
-    DocumentVersion,
     Message,
-    SearchUnit,
-    Source,
-    SourceProjectMapping,
-    Thread,
 )
-from sag_api.enums import DocumentStatus, MessageRole, MessageStatus
+from sag_api.enums import MessageRole, MessageStatus
 from sag_api.services import answer_actions_service as actions_svc
 from sag_api.tools import ToolRegistry
 

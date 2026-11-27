@@ -1,18 +1,23 @@
-"""进程内 asyncio 任务队列 —— 随 API 进程起停。
+"""In-process asyncio job queue + PostgreSQL SKIP LOCKED durable lease scaffold (SAG-ING-005).
 
-- N 个 worker 协程从队列取 job_id，加载 Job，维护状态机并分发处理器。
-- 启动时「恢复」上次残留的 QUEUED/RUNNING 任务（RUNNING 重置为 QUEUED 重跑）。
+MVP Deployment Constraint:
+- `InProcessAsyncQueue` is designed for single-worker API deployments (`uvicorn --workers 1`)
+  because in-memory scheduling locks and process-local caches (`SESSION_INDEX_CACHE`,
+  `_SCOPE_KNOWLEDGE_INDEX_CACHE`) are not shared across multiple API processes.
+- For multi-worker / dedicated-worker horizontal scale-out, workers must claim jobs via
+  `claim_next_queued_job_for_worker()` (`SELECT ... FOR UPDATE SKIP LOCKED` on PostgreSQL)
+  with bounded lease expiration so concurrent workers never double-execute the same job.
 """
 
 from __future__ import annotations
 
 import asyncio
 import itertools
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sag_api.core.config import settings
 from sag_api.core.errors import is_retryable_error
@@ -48,6 +53,44 @@ _MAINTENANCE_JOB_TYPES = {
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+async def claim_next_queued_job_for_worker(
+    session: AsyncSession,
+    *,
+    worker_id: str,
+    lease_seconds: int = 300,
+    job_types: tuple[JobType, ...] | None = None,
+) -> str | None:
+    """Atomically claim one QUEUED (or lease-expired RUNNING) Job using FOR UPDATE SKIP LOCKED.
+
+    Safe across multiple PostgreSQL worker processes; falls back to transactional row update on SQLite.
+    """
+    from sag_api.db.models import Job
+
+    now = _now()
+    lease_until = now + timedelta(seconds=max(30, int(lease_seconds)))
+    stmt = select(Job).where(Job.status == JobStatus.QUEUED)
+    if job_types:
+        stmt = stmt.where(Job.type.in_(list(job_types)))
+    stmt = stmt.order_by(Job.created_at.asc(), Job.id.asc()).limit(1)
+    dialect = getattr(getattr(session.get_bind(), "dialect", None), "name", "")
+    if dialect == "postgresql":
+        stmt = stmt.with_for_update(skip_locked=True)
+    job = await session.scalar(stmt)
+    if job is None:
+        return None
+    payload = dict(job.payload or {})
+    payload["worker_lease"] = {
+        "worker_id": worker_id,
+        "claimed_at": now.isoformat(),
+        "lease_expires_at": lease_until.isoformat(),
+    }
+    job.status = JobStatus.RUNNING
+    job.started_at = now
+    job.payload = payload
+    await session.flush()
+    return str(job.id)
 
 
 def _is_retryable(exc: Exception) -> bool:

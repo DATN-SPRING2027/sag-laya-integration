@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import re
 from collections.abc import AsyncIterator
 from typing import Any, Protocol, runtime_checkable
 
@@ -80,6 +81,25 @@ def _attr(value: Any, name: str, default: Any = None) -> Any:
     return getattr(value, name, default)
 
 
+_SECRET_REDACTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 [REDACTED]"),
+    (re.compile(r"(?i)\b(sk|pk|rk|api|token)[_-][A-Za-z0-9_-]{12,}\b"), "[REDACTED_KEY]"),
+    (re.compile(r"(?i)(api[_-]?key|authorization|token|password|secret)\s*[=:]\s*['\"]?[^\s,'\";}]+"), r"\1=[REDACTED]"),
+    (re.compile(r"(https?://)([^:@/\s]+):([^@/\s]+)@"), r"\1[REDACTED]:[REDACTED]@"),
+)
+
+
+def sanitize_llm_error_message(error: object, *, max_length: int = 320) -> str:
+    """Redact credentials, internal URLs/passwords, and control chars from upstream LLM errors (SAG-CHAT-003)."""
+    text = str(error or "").replace("\r", " ").replace("\n", " ")
+    text = " ".join(text.split())
+    for pattern, repl in _SECRET_REDACTION_PATTERNS:
+        text = pattern.sub(repl, text)
+    if len(text) > max_length:
+        text = text[: max_length - 1].rstrip() + "…"
+    return text
+
+
 def _classify_llm_error(e: Exception, *, stage: ErrorStage) -> ApiError:
     """把 LiteLLM 的裸异常拆分为带 layer/stage 的领域异常。
 
@@ -89,7 +109,8 @@ def _classify_llm_error(e: Exception, *, stage: ErrorStage) -> ApiError:
     """
     name = type(e).__name__
     status = getattr(e, "status_code", None)
-    detail = f"{name}: {e}"
+    safe_text = sanitize_llm_error_message(e)
+    detail = f"{name}: {safe_text}" if safe_text else name
     # 超时 / 限流 / 服务暂不可用 —— 可安全重试
     _retryable_names = {
         "Timeout",
@@ -100,7 +121,7 @@ def _classify_llm_error(e: Exception, *, stage: ErrorStage) -> ApiError:
     }
     if name in _retryable_names or status in {408, 429, 503}:
         return ServiceUnavailableError(
-            f"模型调用暂时失败（{name}），请稍后重试：{e}",
+            f"模型调用暂时失败（{name}），请稍后重试：{safe_text}",
             code=ErrorCode.LLM_UNAVAILABLE,
             layer=ErrorLayer.LLM,
             stage=stage,
@@ -108,7 +129,7 @@ def _classify_llm_error(e: Exception, *, stage: ErrorStage) -> ApiError:
     # 鉴权失败 —— API key / 权限问题，需改配置
     if name in {"AuthenticationError", "PermissionDeniedError"} or status in {401, 403}:
         return ConfigurationError(
-            f"模型鉴权失败（{name}），请检查 API Key 配置：{e}",
+            f"模型鉴权失败（{name}），请检查 API Key 配置",
             code=ErrorCode.LLM_AUTH_ERROR,
             layer=ErrorLayer.LLM,
             stage=ErrorStage.CONFIG,
@@ -116,7 +137,7 @@ def _classify_llm_error(e: Exception, *, stage: ErrorStage) -> ApiError:
     # 请求非法 / 上下文超限 —— 请求本身的问题
     if name in {"BadRequestError", "ContextWindowExceededError", "UnprocessableEntityError"} or status in {400, 422}:
         return UpstreamError(
-            f"模型拒绝请求（{name}）：{e}",
+            f"模型拒绝请求（{name}）：{safe_text}",
             code=ErrorCode.LLM_BAD_REQUEST,
             layer=ErrorLayer.LLM,
             stage=stage,
@@ -176,6 +197,9 @@ class LLMClient:
                 request["tool_choice"] = tool_choice
         if response_format is not None:
             request["response_format"] = response_format
+            # SAG-CHAT-003: avoid multiplicative retries across structured-output fallback tiers
+            if self._settings.llm_structured_output_mode == "auto":
+                request["num_retries"] = 0
         if self._settings.llm_base_url:
             request["api_base"] = self._settings.llm_base_url
         normalized = apply_litellm_completion_policy(self._settings, request)
@@ -186,12 +210,14 @@ class LLMClient:
                 if stream and "stream_options" in normalized and "stream_options" in str(err).casefold():
                     fallback_request = dict(request)
                     fallback_request["stream_options"] = None
+                    fallback_request["num_retries"] = 0
                     with omit_stream_options_scope(True):
                         return await _litellm_completion(
                             **apply_litellm_completion_policy(self._settings, fallback_request)
                         )
                 if not stream and should_downgrade_json_schema(err, normalized, self._settings):
                     json_obj_req = _with_json_object(normalized)
+                    json_obj_req["num_retries"] = 0
                     try:
                         return await _litellm_completion(**json_obj_req)
                     except Exception as inner_err:
@@ -203,6 +229,7 @@ class LLMClient:
                         ):
                             plain_req = dict(json_obj_req)
                             plain_req.pop("response_format", None)
+                            plain_req["num_retries"] = 0
                             return await _litellm_completion(**plain_req)
                         raise
                 if (
@@ -214,6 +241,7 @@ class LLMClient:
                 ):
                     plain_req = dict(normalized)
                     plain_req.pop("response_format", None)
+                    plain_req["num_retries"] = 0
                     return await _litellm_completion(**plain_req)
                 raise
 
@@ -339,7 +367,7 @@ class LLMClient:
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
-            log.warning("LLM 轮次流式调用失败：%s", e)
+            log.warning("LLM 轮次流式调用失败：%s: %s", type(e).__name__, sanitize_llm_error_message(e))
             raise _classify_llm_error(e, stage=ErrorStage.GENERATE) from e
         finally:
             if not usage_recorded and (latest_raw_usage is not None or collected_parts or tool_parts):

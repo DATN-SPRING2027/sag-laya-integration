@@ -81,7 +81,15 @@ async def _load_indexed_units(
         return {}
 
     try:
-        from sag_api.db.models import CanonicalBlock, Document, DocumentVersion, SearchUnit
+        from sag_api.db.models import (
+            CanonicalBlock,
+            Document,
+            DocumentVersion,
+            SearchUnit,
+            SourceProjectMapping,
+        )
+        from sag_api.enums import DocumentStatus
+        from sag_api.services.mind_map_service import _is_version_revoked, _version_partition_allowed
         from sag_api.services.search_index_service import resolve_search_unit_text
         from sag_api.services.unit_supersession_overlay import (
             build_active_superseded_unit_exists,
@@ -113,12 +121,44 @@ async def _load_indexed_units(
             if exclude_unit_superseded
             else or_(version_superseded_expr, unit_superseded_expr)
         )
+        effective_org_id = principal.organization_id or principal.tenant_id
+        confirmed_mapping_count = (
+            select(func.count(SourceProjectMapping.id))
+            .where(
+                SourceProjectMapping.source_id == Document.source_id,
+                SourceProjectMapping.organization_id == effective_org_id,
+                SourceProjectMapping.project_id == project_id,
+                SourceProjectMapping.state == "CONFIRMED",
+            )
+            .correlate(Document)
+            .scalar_subquery()
+        )
+        total_mapping_count = (
+            select(func.count(SourceProjectMapping.id))
+            .where(
+                SourceProjectMapping.source_id == Document.source_id,
+            )
+            .correlate(Document)
+            .scalar_subquery()
+        )
         where_clauses = [
+            or_(confirmed_mapping_count > 0, total_mapping_count == 0),
             Document.tenant_id == principal.tenant_id,
             Document.project_id == project_id,
             Document.is_active.is_(True),
+            Document.status.notin_(
+                [
+                    DocumentStatus.DELETING,
+                    DocumentStatus.DELETE_FAILED,
+                    DocumentStatus.PAUSING,
+                    DocumentStatus.PAUSED,
+                    DocumentStatus.FAILED,
+                ]
+            ),
             or_(*pair_filters),
+            or_(DocumentVersion.status.is_(None), DocumentVersion.status != "REVOKED"),
             DocumentVersion.search_status.in_(("READY", "SEARCH_READY")),
+            or_(DocumentVersion.knowledge_status.is_(None), DocumentVersion.knowledge_status != "REVOKED"),
             SearchUnit.security_partition_id.in_(principal.allowed_partition_ids),
             start_block.document_version_id == DocumentVersion.id,
             end_block.document_version_id == DocumentVersion.id,
@@ -195,6 +235,25 @@ async def _load_indexed_units(
         )
         result = await session.execute(stmt)
         rows = result.all()
+        if not rows:
+            return {}
+        ver_ids = sorted({str(r.document_version_id) for r in rows})
+        ver_objs = {
+            str(v.id): v
+            for v in (
+                await session.scalars(select(DocumentVersion).where(DocumentVersion.id.in_(ver_ids)))
+            ).all()
+        }
+        allowed_ver_ids = {
+            vid
+            for vid, ver in ver_objs.items()
+            if not _is_version_revoked(ver)
+            and (
+                not (isinstance(ver.metadata_json, dict) and ver.metadata_json.get("security_partition_id"))
+                or _version_partition_allowed(ver, principal.allowed_partition_ids)
+            )
+        }
+        rows = [r for r in rows if str(r.document_version_id) in allowed_ver_ids]
         if not rows:
             return {}
 

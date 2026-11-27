@@ -44,6 +44,18 @@ HIDDEN_SCOPE_PLACEHOLDER = "[Answer hidden because its evidence is unavailable i
 KEYSET_BATCH_SIZE = 500
 
 
+_PROJECT_REVOCATION_EPOCH: dict[str, int] = {}
+
+
+def bump_project_session_revocation_epoch(project_id: str) -> int:
+    """Increment project revocation epoch and evict cached ECCE session substrates."""
+    key = (project_id or "").strip()
+    next_epoch = _PROJECT_REVOCATION_EPOCH.get(key, 0) + 1
+    _PROJECT_REVOCATION_EPOCH[key] = next_epoch
+    SESSION_INDEX_CACHE.clear()
+    return next_epoch
+
+
 class _ConfiguredHttpEmbedder:
     """Lightweight OpenAI/SiliconFlow-compatible HTTP embedder (0 local models)."""
 
@@ -56,6 +68,8 @@ class _ConfiguredHttpEmbedder:
     async def batch_generate(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
+        from sag_api.core.http_client import get_pooled_http_client
+
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
@@ -64,10 +78,10 @@ class _ConfiguredHttpEmbedder:
             "model": self._model,
             "input": texts,
         }
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.post(self._endpoint, headers=headers, json=payload)
-            resp.raise_for_status()
-            body = resp.json()
+        client = get_pooled_http_client("session_embedder", timeout=self._timeout)
+        resp = await client.post(self._endpoint, headers=headers, json=payload, timeout=self._timeout)
+        resp.raise_for_status()
+        body = resp.json()
         data = sorted(body.get("data") or [], key=lambda item: int(item.get("index", 0)))
         return [[float(v) for v in (row.get("embedding") or [])] for row in data]
 
@@ -123,9 +137,11 @@ def _compute_scope_signature(
 ) -> str:
     tenant_id = str(getattr(principal, "tenant_id", "") or "")
     org_id = str(getattr(principal, "organization_id", "") or "")
-    projects = ",".join(sorted(getattr(principal, "allowed_project_ids", ()) or ()))
+    project_list = sorted(getattr(principal, "allowed_project_ids", ()) or ())
+    projects = ",".join(project_list)
     partitions = ",".join(sorted(getattr(principal, "allowed_partition_ids", ()) or ()))
-    raw = f"{tenant_id}|{org_id}|{projects}|{partitions}|{owner_key}|*PROJECT*"
+    rev_epochs = ",".join(f"{pid}:{_PROJECT_REVOCATION_EPOCH.get(pid, 0)}" for pid in project_list)
+    raw = f"{tenant_id}|{org_id}|{projects}|{partitions}|{rev_epochs}|{owner_key}|*PROJECT*"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
@@ -247,6 +263,8 @@ async def _cached_sources_still_authorized(
     *,
     cached_source_ids: set[str],
     principal: VerifiedPrincipal,
+    thread_id: str | None = None,
+    exclude_id: str | None = None,
 ) -> bool:
     if not cached_source_ids:
         return True
@@ -257,7 +275,27 @@ async def _cached_sources_still_authorized(
         principal=principal,
         requested_source_ids=sorted(cached_source_ids),
     )
-    return cached_source_ids.issubset(authorized)
+    if not cached_source_ids.issubset(authorized):
+        return False
+    if thread_id:
+        from sag_api.services.agent_domain import filter_messages_for_scope
+
+        raw_msgs = await load_full_thread_messages_keyset(
+            session,
+            thread_id=thread_id,
+            exclude_id=exclude_id,
+        )
+        assistant_msgs = [m for m in raw_msgs if m.role == MessageRole.ASSISTANT]
+        if assistant_msgs:
+            scoped = await filter_messages_for_scope(
+                session,
+                assistant_msgs,
+                principal=principal,
+                requested_source_ids=None,
+            )
+            if any(m.content == HIDDEN_SCOPE_PLACEHOLDER for m in scoped):
+                return False
+    return True
 
 
 async def _invoke_sync_storage(*args: Any, **kwargs: Any) -> PersistenceSyncStats:
@@ -454,6 +492,8 @@ async def prepare_session_context_for_ask(
             session,
             cached_source_ids=index.cached_cited_source_ids,
             principal=principal,
+            thread_id=thread_id,
+            exclude_id=exclude_message_id,
         )
         persisted_state = await _inspect_thread_persisted_state(
             session,

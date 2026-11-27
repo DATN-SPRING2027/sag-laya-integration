@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
 from sag_agent import AgentRuntime, EventType, RunHandle
+from sag_api.core.config import settings
 from sag_api.core.conversation_ownership import get_conversation_owner
 from sag_api.core.db import SessionLocal, get_session
 from sag_api.core.deps import (
@@ -18,6 +19,7 @@ from sag_api.core.deps import (
     get_engine_manager,
     get_llm,
     get_tool_registry,
+    require_operator_or_service_token,
 )
 from sag_api.core.error_taxonomy import ErrorCode
 from sag_api.core.errors import BadRequestError, ConfigurationError, ConflictError, NotFoundError
@@ -190,16 +192,42 @@ async def list_bindings(
     return [BindingOut.model_validate(b) for b in await svc.list_bindings(session, agent)]
 
 
+async def _require_mcp_binding_operator(request: Request, session: AsyncSession) -> None:
+    """Restrict MCP_SERVER binding mutations to explicit operators/BFF in multi-tenant modes."""
+    if settings.auth_mode == "local":
+        return
+    from fastapi.security import HTTPAuthorizationCredentials
+
+    auth_header = request.headers.get("authorization")
+    creds: HTTPAuthorizationCredentials | None = None
+    if auth_header:
+        parts = auth_header.split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            creds = HTTPAuthorizationCredentials(scheme=parts[0], credentials=parts[1])
+    await require_operator_or_service_token(request, creds=creds, session=session)
+
+
 @router.post("/{agent_id}/bindings", response_model=BindingOut, status_code=201)
 async def add_binding(
     agent_id: str,
     body: BindingCreate,
+    request: Request,
     owner_key: str = Depends(get_conversation_owner),
+    principal: VerifiedPrincipal = Depends(require_project_read_principal),
     session: AsyncSession = Depends(get_session),
 ):
+    from sag_api.enums import BindingTargetType
+
+    if body.target_type == BindingTargetType.MCP_SERVER:
+        await _require_mcp_binding_operator(request, session)
     agent = await svc.get_agent(session, agent_id, owner_key=owner_key, write=True)
     b = await svc.add_binding(
-        session, agent, target_type=body.target_type, target_id=body.target_id, config=body.config
+        session,
+        agent,
+        target_type=body.target_type,
+        target_id=body.target_id,
+        config=body.config,
+        principal=principal,
     )
     return BindingOut.model_validate(b)
 
@@ -208,10 +236,17 @@ async def add_binding(
 async def remove_binding(
     agent_id: str,
     binding_id: str,
+    request: Request,
     owner_key: str = Depends(get_conversation_owner),
     session: AsyncSession = Depends(get_session),
 ):
+    from sag_api.db.models import AgentBinding
+    from sag_api.enums import BindingTargetType
+
     agent = await svc.get_agent(session, agent_id, owner_key=owner_key, write=True)
+    binding = await session.get(AgentBinding, binding_id)
+    if binding is not None and binding.agent_id == agent.id and binding.target_type == BindingTargetType.MCP_SERVER:
+        await _require_mcp_binding_operator(request, session)
     await svc.remove_binding(session, agent, binding_id)
     return Ok(detail="已解绑")
 

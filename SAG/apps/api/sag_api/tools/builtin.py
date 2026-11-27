@@ -6,10 +6,7 @@ sau đó mô hình gọi khi cần. Vòng lặp Agent dùng cùng một hợp đ
 
 from __future__ import annotations
 
-import asyncio
-import socket
 from datetime import UTC, datetime
-from ipaddress import ip_address
 from typing import Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -551,31 +548,17 @@ def _safe_web_url(value: Any) -> str | None:
 
 
 async def _validated_public_web_url(value: Any) -> str:
-    url = _safe_web_url(value)
-    if url is None:
-        raise RuntimeError("Chỉ có thể mở địa chỉ trang web công khai")
-    parsed = urlsplit(url)
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    if port not in _WEB_PAGE_PORTS:
-        raise RuntimeError("Chỉ có thể mở địa chỉ trang web công khai")
+    from sag_api.core.ssrf import resolve_pinned_public_http_target
 
-    host = parsed.hostname or ""
     try:
-        addresses = {ip_address(host)}
-    except ValueError:
-        try:
-            records = await asyncio.to_thread(
-                socket.getaddrinfo,
-                host,
-                port,
-                type=socket.SOCK_STREAM,
-            )
-        except OSError as error:
-            raise RuntimeError("Không phân giải được địa chỉ trang web công khai") from error
-        addresses = {ip_address(record[4][0].split("%", 1)[0]) for record in records}
-    if not addresses or any(not address.is_global for address in addresses):
-        raise RuntimeError("Chỉ có thể mở địa chỉ trang web công khai")
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", parsed.query, ""))
+        target = await resolve_pinned_public_http_target(
+            value,
+            require_https=False,
+            allowed_ports=_WEB_PAGE_PORTS,
+        )
+    except ValueError as error:
+        raise RuntimeError("Chỉ có thể mở địa chỉ trang web công khai") from error
+    return target.url
 
 
 async def _download_public_web_page(
@@ -583,7 +566,16 @@ async def _download_public_web_page(
     *,
     max_bytes: int = _WEB_PAGE_MAX_BYTES,
 ) -> tuple[str, str]:
-    current_url = await _validated_public_web_url(url)
+    from sag_api.core.ssrf import resolve_pinned_public_http_target
+
+    try:
+        target = await resolve_pinned_public_http_target(
+            url,
+            require_https=False,
+            allowed_ports=_WEB_PAGE_PORTS,
+        )
+    except ValueError as error:
+        raise RuntimeError("Chỉ có thể mở địa chỉ trang web công khai") from error
     timeout_seconds = min(max(settings.llm_timeout_ms / 1000, 5), 30)
     try:
         async with httpx.AsyncClient(
@@ -593,12 +585,28 @@ async def _download_public_web_page(
             headers={"User-Agent": "sag-bot/0.1 (+https://github.com/Zleap-AI/SAG)"},
         ) as client:
             for _ in range(_WEB_PAGE_MAX_REDIRECTS + 1):
-                async with client.stream("GET", current_url) as response:
+                req_headers = {"Host": target.host_header}
+                req_extensions = (
+                    {"sni_hostname": target.hostname} if target.scheme == "https" else {}
+                )
+                async with client.stream(
+                    "GET",
+                    target.connect_url,
+                    headers=req_headers,
+                    extensions=req_extensions,
+                ) as response:
                     if response.status_code in {301, 302, 303, 307, 308}:
                         location = response.headers.get("location")
                         if not location:
                             raise RuntimeError("Địa chỉ chuyển hướng trang web không hợp lệ")
-                        current_url = await _validated_public_web_url(urljoin(current_url, location))
+                        try:
+                            target = await resolve_pinned_public_http_target(
+                                urljoin(target.url, location),
+                                require_https=False,
+                                allowed_ports=_WEB_PAGE_PORTS,
+                            )
+                        except ValueError as error:
+                            raise RuntimeError("Chỉ có thể mở địa chỉ trang web công khai") from error
                         continue
                     response.raise_for_status()
                     content_type = response.headers.get("content-type", "").lower()
@@ -614,7 +622,7 @@ async def _download_public_web_page(
                         chunks.append(chunk[:remaining])
                         size += min(len(chunk), remaining)
                     encoding = response.charset_encoding or "utf-8"
-                    return current_url, b"".join(chunks).decode(encoding, errors="replace")
+                    return target.url, b"".join(chunks).decode(encoding, errors="replace")
     except httpx.HTTPError as error:
         log.warning("Đọc trang web công khai thất bại: %s", error.__class__.__name__)
         raise RuntimeError("Hiện chưa thể đọc trang web công khai") from error

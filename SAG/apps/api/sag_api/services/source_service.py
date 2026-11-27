@@ -619,7 +619,9 @@ async def delete_source(
 
     # 引擎槽关闭 + 上传目录清理（尽力而为，不阻断删除）
     await engine_manager.release(sag_id)
-    shutil.rmtree(os.path.join(upload_dir, source_id), ignore_errors=True)
+    import asyncio
+
+    await asyncio.to_thread(shutil.rmtree, os.path.join(upload_dir, source_id), True)
     from sag_api.services.universe_service import schedule_universe_refresh
 
     await schedule_universe_refresh(

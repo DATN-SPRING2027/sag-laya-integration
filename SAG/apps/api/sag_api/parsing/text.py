@@ -18,6 +18,7 @@ _PLAIN_TEXT_SUFFIXES = {
     ".txt",
     ".text",
     ".log",
+    ".json",
     ".yaml",
     ".yml",
     ".sql",

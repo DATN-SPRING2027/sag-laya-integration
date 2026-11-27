@@ -59,6 +59,8 @@ class MindMapCitationOut(BaseModel):
     sourceName: str | None = Field(default=None, max_length=240)
     projectId: str | None = Field(default=None, max_length=128)
     documentId: str = Field(min_length=1, max_length=128)
+    publicSourceId: str | None = Field(default=None, max_length=128)
+    sourceKind: str | None = Field(default=None, max_length=64)
     documentName: str | None = Field(default=None, max_length=240)
     chunkId: str | None = Field(default=None, max_length=128)
     versionNo: int | None = Field(default=None, ge=1)

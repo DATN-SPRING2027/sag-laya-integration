@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -17,7 +19,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sag_api.core.config import settings
 from sag_api.core.error_taxonomy import ErrorLayer, ErrorStage
-from sag_api.core.errors import ConflictError, ForbiddenError, NotFoundError, ValidationError
+from sag_api.core.errors import (
+    ConflictError,
+    ForbiddenError,
+    NotFoundError,
+    ServiceUnavailableError,
+    ValidationError,
+)
 from sag_api.core.identity import (
     VerifiedPrincipal,
     compute_payload_hash,
@@ -427,10 +435,14 @@ async def create_document_from_upload(
     safe_name = os.path.basename(filename) or "upload"
 
     dest_dir = os.path.join(upload_dir, source.id)
-    os.makedirs(dest_dir, exist_ok=True)
     storage_path = os.path.join(dest_dir, f"{doc_id}_{safe_name}")
-    with open(storage_path, "wb") as f:
-        f.write(data)
+
+    def _write_upload_file(directory: str, path: str, payload: bytes) -> None:
+        os.makedirs(directory, exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(payload)
+
+    await asyncio.to_thread(_write_upload_file, dest_dir, storage_path, data)
 
     document = Document(
         id=doc_id,
@@ -1291,16 +1303,60 @@ async def delete_document(
 # ============================================================================
 
 
+_ZIP_OOXML_EXTS = frozenset({".docx", ".pptx", ".xlsx", ".odt", ".ods", ".odp", ".epub"})
+
+
+def _validate_upload_magic_bytes(ext: str, file_bytes: bytes) -> None:
+    """Verify binary file signatures match declared extensions to reject spoofed payloads."""
+    head = file_bytes[:32]
+    if ext == ".pdf":
+        stripped = head.lstrip(b"\xef\xbb\xbf \t\r\n")
+        if not stripped.startswith(b"%PDF-"):
+            raise ValidationError(
+                "Uploaded PDF file header does not match %PDF- signature",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            )
+    elif ext in _ZIP_OOXML_EXTS:
+        if not (head.startswith(b"PK\x03\x04") or head.startswith(b"PK\x05\x06")):
+            raise ValidationError(
+                f"Uploaded {ext} archive header does not match ZIP/OOXML signature",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            )
+    elif ext == ".png":
+        if not head.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValidationError(
+                "Uploaded PNG file header is invalid",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            )
+    elif ext in {".jpg", ".jpeg"}:
+        if not head.startswith(b"\xff\xd8\xff"):
+            raise ValidationError(
+                "Uploaded JPEG file header is invalid",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            )
+    elif ext == ".webp":
+        if len(head) < 12 or not (head.startswith(b"RIFF") and head[8:12] == b"WEBP"):
+            raise ValidationError(
+                "Uploaded WebP file header is invalid",
+                layer=ErrorLayer.CLIENT,
+                stage=ErrorStage.UPLOAD,
+            )
+
+
 def _check_upload_file(filename: str, file_bytes: bytes) -> None:
-    """Validate file content, size, and allowed extensions."""
+    """Validate file content, size, allowed extensions, and magic-byte signatures."""
     if not file_bytes:
         raise ValidationError("Uploaded file cannot be empty")
     max_size = getattr(settings, "max_upload_size_bytes", 50 * 1024 * 1024)
     if len(file_bytes) > max_size:
         raise ValidationError(f"File size exceeds maximum allowed ({max_size} bytes)")
+    ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     allowed = settings.allowed_upload_exts
     if allowed:
-        ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
         if ext not in allowed:
             pretty = ", ".join(sorted(e.lstrip(".") for e in allowed))
             raise ValidationError(
@@ -1308,16 +1364,28 @@ def _check_upload_file(filename: str, file_bytes: bytes) -> None:
                 layer=ErrorLayer.CLIENT,
                 stage=ErrorStage.UPLOAD,
             )
+    if ext:
+        _validate_upload_magic_bytes(ext, file_bytes)
+
+
+def _safe_snapshot_extension(original_filename: str) -> str:
+    base = os.path.basename(original_filename or "")
+    _, ext = os.path.splitext(base)
+    cleaned = ext.lower()
+    if cleaned and re.fullmatch(r"\.[a-z0-9]{1,16}", cleaned):
+        return cleaned
+    return ".bin"
 
 
 def _save_snapshot_file(payload_hash: str, original_filename: str, file_bytes: bytes) -> str:
     """Persist raw file bytes to immutable, content-addressed snapshot storage.
 
-    Storage path format: snapshots/{hash[:2]}/{hash}/{safe_name}
-    Guarantees that different payloads never share paths and cannot overwrite each other,
-    preserving immutability under concurrent version allocation races.
+    Storage path format: snapshots/{hash[:2]}/{hash}/{hash[:16]}{ext}
+    Uses deterministic hash-derived filenames on disk (never untrusted client basenames)
+    to prevent Windows reserved-name/character/path-length failures while preserving immutability.
     """
-    safe_name = os.path.basename(original_filename) or "source.bin"
+    safe_ext = _safe_snapshot_extension(original_filename)
+    safe_name = f"{payload_hash[:16]}{safe_ext}"
     base_dir = Path(settings.effective_data_dir) / "snapshots" / payload_hash[:2] / payload_hash
     base_dir.mkdir(parents=True, exist_ok=True)
     target_path = base_dir / safe_name
@@ -1772,17 +1840,27 @@ async def handle_document_upload(
                     else:
                         version_no = 1
                         supersedes_id = None
-                    storage_path = _save_snapshot_file(payload_hash, original_filename, file_bytes)
-                    doc.storage_path = storage_path
-                    doc.is_active = True
-                    doc.status = DocumentStatus.PENDING
-                    doc.progress = 0
-                    doc.filename = original_filename
-                    doc.content_type = content_type
-                    doc.size_bytes = len(file_bytes)
-                    doc.error = None
-                    doc.error_layer = None
-                    doc.error_stage = None
+                    storage_path = await asyncio.to_thread(
+                        _save_snapshot_file, payload_hash, original_filename, file_bytes
+                    )
+                    is_live_replacement = (
+                        latest_ver is not None
+                        and doc.status == DocumentStatus.READY
+                        and doc.is_active is True
+                    )
+                    if not is_live_replacement:
+                        # Only initialize live Document metadata when no READY predecessor is serving traffic.
+                        # For v2+ replacements over READY v1, keep Document pointing at v1 until INDEX_SEARCH commits.
+                        doc.storage_path = storage_path
+                        doc.is_active = True
+                        doc.status = DocumentStatus.PENDING
+                        doc.progress = 0
+                        doc.filename = original_filename
+                        doc.content_type = content_type
+                        doc.size_bytes = len(file_bytes)
+                        doc.error = None
+                        doc.error_layer = None
+                        doc.error_stage = None
                     if source_id and not doc.source_id:
                         doc.source_id = source_id
 
@@ -1790,6 +1868,15 @@ async def handle_document_upload(
 
                 existing_ver = await session.get(DocumentVersion, version_id)
                 if not existing_ver:
+                    version_meta: dict[str, Any] = {
+                        "security_partition_id": security_partition_id,
+                        "staged_document": {
+                            "storage_path": storage_path,
+                            "filename": original_filename,
+                            "content_type": content_type,
+                            "size_bytes": len(file_bytes),
+                        },
+                    }
                     doc_version = DocumentVersion(
                         id=version_id,
                         document_id=doc.id,
@@ -1805,7 +1892,7 @@ async def handle_document_upload(
                         authority_tier=norm_authority_tier,
                         effective_from=norm_effective_from,
                         scope_tags_json=norm_scope_tags,
-                        metadata_json={"security_partition_id": security_partition_id},
+                        metadata_json=version_meta,
                     )
                     session.add(doc_version)
                     await session.flush()
@@ -2271,18 +2358,24 @@ async def resolve_document_parsed_markdown(
         if has_any_version is not None:
             return None
 
+    def _read_text_if_file(path: str) -> str | None:
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+            return text if text.strip() else None
+        except OSError:
+            return None
+
     # Step 1: Resolve on-disk markdown or parsed sidecar
     storage_path = document.storage_path or ""
     if storage_path:
         suffix = os.path.splitext(storage_path)[1].lower()
-        if suffix in {".md", ".markdown"} and os.path.isfile(storage_path):
-            try:
-                with open(storage_path, encoding="utf-8", errors="replace") as f:
-                    text = f.read()
-                if text.strip():
-                    return text
-            except OSError:
-                pass
+        if suffix in {".md", ".markdown"}:
+            text = await asyncio.to_thread(_read_text_if_file, storage_path)
+            if text:
+                return text
 
         candidate_paths: list[str] = []
         if document.parser_provider in {"mineru", "markitdown"}:
@@ -2298,14 +2391,9 @@ async def resolve_document_parsed_markdown(
                 candidate_paths.append(p)
 
         for candidate in candidate_paths:
-            if os.path.isfile(candidate):
-                try:
-                    with open(candidate, encoding="utf-8", errors="replace") as f:
-                        text = f.read()
-                    if text.strip():
-                        return text
-                except OSError:
-                    continue
+            text = await asyncio.to_thread(_read_text_if_file, candidate)
+            if text:
+                return text
 
     # Step 2: Reconstruct from latest active, partition-authorized DocumentVersion + CanonicalBlocks
     if authorized_version_id:
@@ -2661,6 +2749,32 @@ async def resolve_project_document(
     return doc
 
 
+async def _purge_revoked_project_versions(
+    *,
+    project_id: str,
+    versions: list[DocumentVersion],
+    engine_manager: Any,
+    qdrant_client: Any,
+) -> None:
+    if not versions:
+        return
+
+    from sag_api.services.search_index_service import delete_document_points_from_qdrant
+
+    try:
+        if qdrant_client is None and engine_manager is not None:
+            qdrant_client = await engine_manager.get_search_unit_qdrant_client()
+        if qdrant_client is not None:
+            # A retry can overlap later ingestion. Purge only the revoked versions.
+            await delete_document_points_from_qdrant(
+                qdrant_client,
+                project_id=project_id,
+                document_version_ids=[str(version.id) for version in versions],
+            )
+    except (httpx.HTTPError, RuntimeError, AttributeError, ServiceUnavailableError) as exc:
+        raise ServiceUnavailableError("Revoked vectors could not be removed. Retry the revocation.") from exc
+
+
 async def revoke_project_document(
     session: AsyncSession,
     *,
@@ -2669,6 +2783,9 @@ async def revoke_project_document(
     logical_source_id: str | None = None,
     document_id: str | None = None,
     reason: str | None = None,
+    engine_manager: Any = None,
+    job_queue: Any = None,
+    qdrant_client: Any = None,
 ) -> DocumentRevokeResponse:
     """Revoke a project document from retrieval and knowledge indexing."""
     logical_id = (logical_source_id or "").strip()
@@ -2722,6 +2839,10 @@ async def revoke_project_document(
         from sag_api.api.v1.universe import clear_universe_caches
 
         clear_universe_caches(project_id)
+        await _purge_revoked_project_versions(
+            project_id=project_id, versions=versions,
+            engine_manager=engine_manager, qdrant_client=qdrant_client,
+        )
         return DocumentRevokeResponse(status="ALREADY_REVOKED", document_id=doc.id)
 
     now_utc = datetime.now(UTC)
@@ -2786,8 +2907,35 @@ async def revoke_project_document(
 
     await session.commit()
     from sag_api.api.v1.universe import clear_universe_caches
+    from sag_api.services.session_context.runtime import bump_project_session_revocation_epoch
 
     clear_universe_caches(project_id)
+    bump_project_session_revocation_epoch(project_id)
+
+    await _purge_revoked_project_versions(
+        project_id=project_id, versions=versions,
+        engine_manager=engine_manager, qdrant_client=qdrant_client,
+    )
+
+    if job_queue is not None:
+        from sag_api.services.universe_tree_service import enqueue_project_tree_rebuild
+
+        try:
+            await enqueue_project_tree_rebuild(
+                session,
+                job_queue,
+                tenant_id=tenant_id,
+                project_ids=[project_id],
+                reason=f"document_revoked:{(reason or 'revoked').strip().lower()}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "Failed to enqueue REBUILD_UNIVERSE_TREE after document revocation doc=%s project=%s (%s)",
+                doc.id,
+                project_id,
+                type(exc).__name__,
+            )
+
     return DocumentRevokeResponse(status="REVOKED", document_id=doc.id)
 
 

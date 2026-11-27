@@ -3,7 +3,7 @@ name = "sag-api"
 version = "0.1.0"
 description = "sag — 开源知识库平台后端（FastAPI + zleap-sag）"
 readme = { text = "SAG API — FastAPI backend for the SAG knowledge platform.", content-type = "text/markdown" }
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = { text = "MIT" }
 dependencies = [
     "fastapi>=0.115",
@@ -62,6 +62,7 @@ packages = ["sag_api", "sag_agent"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 markers = [
     "ai_smoke: opt-in live requests to configured AI services",
     "integration: opt-in live integration tests against PostgreSQL, Qdrant, MinerU, and configured LLM/router",
@@ -69,8 +70,8 @@ markers = [
 
 [tool.ruff]
 line-length = 120
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
-ignore = ["B008"]  # FastAPI Depends() in defaults
+ignore = ["B008", "E501"]  # FastAPI Depends() in defaults; pre-existing long lines in legacy modules

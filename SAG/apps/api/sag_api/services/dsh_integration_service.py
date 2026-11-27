@@ -118,7 +118,11 @@ async def get_or_create_state(session: AsyncSession) -> DshIntegrationState:
 
 
 async def authenticate_connector(session: AsyncSession, token: str) -> User | None:
-    """Return the first active user when the supplied connector token matches."""
+    """Return the first active user when the supplied connector token matches (disabled in continuum mode)."""
+    from sag_api.core.config import settings
+
+    if settings.auth_mode == "continuum":
+        return None
     state = await get_or_create_state(session)
     if not secrets.compare_digest(state.token, token):
         return None
@@ -130,13 +134,31 @@ async def authenticate_connector(session: AsyncSession, token: str) -> User | No
     )
 
 
+async def _validate_dsh_source_access(
+    session: AsyncSession,
+    source_id: str,
+    *,
+    principal=None,
+) -> None:
+    if principal is not None:
+        from sag_api.services.source_service import get_authorized_source
+
+        source = await get_authorized_source(session, principal=principal, source_id=source_id)
+    else:
+        source = await session.get(Source, source_id)
+    if source is None:
+        raise NotFoundError("Source not found")
+
+
 async def update_default_source(
     session: AsyncSession,
     source_id: str | None,
+    *,
+    principal=None,
 ) -> DshIntegrationState:
-    """Persist a selected source after confirming that it exists, or clear it."""
-    if source_id is not None and await session.get(Source, source_id) is None:
-        raise NotFoundError("Source not found")
+    """Persist a selected source after confirming authorized ownership, or clear it."""
+    if source_id is not None:
+        await _validate_dsh_source_access(session, source_id, principal=principal)
 
     async with _state_write_lock():
         row = await _get_or_create_row(session)
@@ -236,10 +258,12 @@ async def _commit_and_publish_state(
 async def update_default_source_and_publish(
     session: AsyncSession,
     source_id: str | None,
+    *,
+    principal=None,
 ) -> DshIntegrationState:
     """Publish a source selection, restoring the previous state if publication fails."""
-    if source_id is not None and await session.get(Source, source_id) is None:
-        raise NotFoundError("信源不存在")
+    if source_id is not None:
+        await _validate_dsh_source_access(session, source_id, principal=principal)
 
     async with _state_write_lock():
         row = await _get_or_create_row(session)

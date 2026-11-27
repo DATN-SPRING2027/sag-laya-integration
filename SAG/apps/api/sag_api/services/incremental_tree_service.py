@@ -154,6 +154,104 @@ def _unit_to_manifest(unit: KnowledgeUnitInput) -> dict[str, Any]:
     }
 
 
+def reconstruct_snapshot_from_manifest(
+    raw_manifest: dict[str, Any] | str,
+    *,
+    tenant_id: str,
+    project_id: str,
+) -> TreeRoutingSnapshot:
+    """Reconstruct a TreeRoutingSnapshot from a persisted TreeManifest.manifest_json (SAG-RET-002)."""
+    manifest = json.loads(raw_manifest) if isinstance(raw_manifest, str) else dict(raw_manifest)
+    if "snapshot" in manifest and isinstance(manifest["snapshot"], dict):
+        manifest = dict(manifest["snapshot"])
+    units_raw = manifest.get("units")
+    lineage_raw = manifest.get("lineage")
+    if not isinstance(units_raw, list) or not units_raw or not isinstance(lineage_raw, list) or not lineage_raw:
+        raise ValueError("Manifest lacks units or lineage needed for incremental reconstruction")
+    config_dict = manifest.get("config") or {}
+    config = TreeBuildConfig(**config_dict)
+    units = [_unit_from_manifest(item, tenant_id, project_id) for item in units_raw]
+    unit_map = {u.unit_id: u for u in units}
+
+    # Rebuild node unit memberships from routing_profiles / roots / partitions
+    node_units_map: dict[str, tuple[str, ...]] = {}
+    node_partition_map: dict[str, str] = {}
+    for prof in manifest.get("routing_profiles") or ():
+        if isinstance(prof, dict) and prof.get("node_id"):
+            nid = str(prof["node_id"])
+            node_units_map[nid] = tuple(str(uid) for uid in (prof.get("unit_ids") or ()) if str(uid) in unit_map)
+            if prof.get("partition_id"):
+                node_partition_map[nid] = str(prof["partition_id"])
+
+    def _collect_from_roots(nodes: list[Any]) -> None:
+        for item in nodes:
+            if not isinstance(item, dict) or not item.get("node_id"):
+                continue
+            nid = str(item["node_id"])
+            if nid not in node_units_map:
+                node_units_map[nid] = tuple(str(uid) for uid in (item.get("unit_ids") or ()) if str(uid) in unit_map)
+            if nid not in node_partition_map and item.get("security_partition_id"):
+                node_partition_map[nid] = str(item["security_partition_id"])
+            if isinstance(item.get("children"), list):
+                _collect_from_roots(item["children"])
+
+    if isinstance(manifest.get("roots"), list):
+        _collect_from_roots(manifest["roots"])
+
+    children_by_parent: dict[str | None, list[str]] = defaultdict(list)
+    parent_by_node: dict[str, str | None] = {}
+    for pair in lineage_raw:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            continue
+        nid = str(pair[0])
+        pid = str(pair[1]) if pair[1] is not None else None
+        parent_by_node[nid] = pid
+        children_by_parent[pid].append(nid)
+
+    if not node_units_map:
+        raise ValueError("Manifest lacks per-node unit memberships for incremental reconstruction")
+
+    def _build_node(nid: str, depth: int) -> RoutingNode:
+        child_nodes = tuple(_build_node(cid, depth + 1) for cid in sorted(children_by_parent.get(nid, ())))
+        own_ids = node_units_map.get(nid, ())
+        if child_nodes:
+            combined_ids = tuple(sorted({uid for c in child_nodes for uid in c.unit_ids} | set(own_ids)))
+        else:
+            combined_ids = tuple(sorted(set(own_ids)))
+        members = [unit_map[uid] for uid in combined_ids if uid in unit_map]
+        part = node_partition_map.get(nid) or (members[0].security_partition_id if members else "default")
+        return RoutingNode(
+            node_id=nid,
+            parent_id=parent_by_node.get(nid),
+            depth=depth,
+            security_partition_id=part,
+            unit_ids=combined_ids,
+            profile=_profile(members, config.profile_sparse_terms),
+            children=child_nodes,
+        )
+
+    roots = tuple(_build_node(root_id, 0) for root_id in sorted(children_by_parent.get(None, ())))
+    if not roots:
+        raise ValueError("Manifest contains no root nodes")
+    lineage = tuple(sorted((nid, pid) for nid, pid in parent_by_node.items()))
+    quality_gates = dict(manifest.get("quality_gates") or {})
+    metrics = dict(manifest.get("quality_metrics") or {})
+    return TreeRoutingSnapshot(
+        contract_version=str(manifest.get("contract_version") or "routing-tree.v1"),
+        tree_version=str(manifest.get("tree_version") or ""),
+        tenant_id=tenant_id,
+        project_id=project_id,
+        config_version=str(manifest.get("config_version") or config.version),
+        roots=roots,
+        metrics=metrics,
+        quality_gates=quality_gates,
+        publishable=bool(quality_gates) and all(quality_gates.values()),
+        manifest_json=json.dumps(manifest, sort_keys=True, separators=(",", ":")),
+        lineage=lineage,
+        partition_algorithm=str(manifest.get("partition_algorithm") or "constrained-hierarchical-leiden-cpm-v1"),
+    )
+
+
 def _refresh_incremental_snapshot(
     base_snapshot: TreeRoutingSnapshot,
     roots: tuple[RoutingNode, ...],

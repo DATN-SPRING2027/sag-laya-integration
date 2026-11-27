@@ -160,6 +160,13 @@ def _stable_id(*parts: str) -> str:
     return hashlib.sha256(value).hexdigest()[:32]
 
 
+def _sumprod(left, right) -> float:
+    fn = getattr(math, "sumprod", None)
+    if fn is not None:
+        return fn(left, right)
+    return math.fsum(a * b for a, b in zip(left, right, strict=False))
+
+
 def _cosine(left: tuple[float, ...], right: tuple[float, ...]) -> float:
     if not left or len(left) != len(right):
         return 0.0
@@ -169,10 +176,10 @@ def _cosine(left: tuple[float, ...], right: tuple[float, ...]) -> float:
         return 0.0
     scaled_left = tuple(value / left_scale for value in left)
     scaled_right = tuple(value / right_scale for value in right)
-    dot = math.sumprod(scaled_left, scaled_right)
+    dot = _sumprod(scaled_left, scaled_right)
     norm = math.sqrt(
-        math.sumprod(scaled_left, scaled_left)
-        * math.sumprod(scaled_right, scaled_right)
+        _sumprod(scaled_left, scaled_left)
+        * _sumprod(scaled_right, scaled_right)
     )
     return max(0.0, dot / norm) if norm else 0.0
 
@@ -193,14 +200,14 @@ def _profile(
             for uid, vector in vectors:
                 scale = max(map(abs, vector))
                 normalized = tuple(value / scale for value in vector) if scale else vector
-                prepared[uid] = (normalized, math.sumprod(normalized, normalized))
+                prepared[uid] = (normalized, _sumprod(normalized, normalized))
 
         def cosine(left, right):
             a, norm_a = prepared[left]
             b, norm_b = prepared[right]
             if len(a) != len(b) or not norm_a or not norm_b:
                 return 0.0
-            return max(0.0, math.sumprod(a, b) / math.sqrt(norm_a * norm_b))
+            return max(0.0, _sumprod(a, b) / math.sqrt(norm_a * norm_b))
 
         candidates = sorted(vectors, key=lambda item: hashlib.sha256(item[0].encode()).digest())[:64]
         medoid = min(
@@ -609,7 +616,7 @@ def build_routing_snapshot(
             if unit.dense:
                 scale = max(map(abs, unit.dense))
                 normalized = tuple(value / scale for value in unit.dense) if scale else unit.dense
-                prepared_dense_by_uid[unit.unit_id] = (normalized, math.sumprod(normalized, normalized))
+                prepared_dense_by_uid[unit.unit_id] = (normalized, _sumprod(normalized, normalized))
 
         roots = []
         lineage = []

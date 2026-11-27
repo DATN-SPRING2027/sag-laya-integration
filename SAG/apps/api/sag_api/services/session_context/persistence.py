@@ -194,7 +194,14 @@ def _open_qdrant_client_context(
     headers: dict[str, str] = {}
     if settings.sag_qdrant_api_key:
         headers["api-key"] = settings.sag_qdrant_api_key
-    return httpx.AsyncClient(base_url=qdrant_url, headers=headers, timeout=4.0), True
+    from sag_api.core.http_client import get_pooled_http_client
+
+    return get_pooled_http_client(
+        "session_qdrant",
+        base_url=qdrant_url,
+        headers=headers,
+        timeout=4.0,
+    ), False
 
 
 async def _lookup_confirmed_source_projects(
@@ -620,22 +627,27 @@ async def upsert_session_units_to_qdrant(
                 },
             }
         )
-    res = await qdrant_client.put(
-        f"/collections/{collection_name}/points?wait=true",
-        json={"points": points},
-    )
-    if res.status_code in {400, 404}:
-        await ensure_session_qdrant_collection(
-            qdrant_client,
-            project_id=project_id,
-            vector_dim=vector_dim,
-            force_verify=True,
-        )
+    from sag_api.services.search_index_service import iter_qdrant_point_batches
+
+    batches = iter_qdrant_point_batches(points)
+    for batch_idx, batch in enumerate(batches):
+        wait_flag = "true" if batch_idx == len(batches) - 1 else "false"
         res = await qdrant_client.put(
-            f"/collections/{collection_name}/points?wait=true",
-            json={"points": points},
+            f"/collections/{collection_name}/points?wait={wait_flag}",
+            json={"points": batch},
         )
-    res.raise_for_status()
+        if res.status_code in {400, 404}:
+            await ensure_session_qdrant_collection(
+                qdrant_client,
+                project_id=project_id,
+                vector_dim=vector_dim,
+                force_verify=True,
+            )
+            res = await qdrant_client.put(
+                f"/collections/{collection_name}/points?wait={wait_flag}",
+                json={"points": batch},
+            )
+        res.raise_for_status()
     return len(points)
 
 

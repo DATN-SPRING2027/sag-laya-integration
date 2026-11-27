@@ -1,25 +1,46 @@
-FROM python:3.12-slim
+# ── builder ──────────────────────────────────────────────────────────────────
+FROM python:3.12-slim AS builder
 
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy
+
+COPY --from=ghcr.io/astral-sh/uv:0.6.14 /uv /uvx /usr/local/bin/
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends build-essential curl \
+ && apt-get install -y --no-install-recommends build-essential \
  && rm -rf /var/lib/apt/lists/*
 
-# Install dependency layers separately from application code.
-# Keep the LiteLLM/MCP SDK pair aligned with uv.lock; newer LiteLLM needs MCP v2.
 COPY pyproject.toml uv.lock ./
-RUN pip install --upgrade pip hatchling \
- && python -c 'import re, tomllib; p=tomllib.load(open("pyproject.toml", "rb")); locked={pkg["name"]:pkg["version"] for pkg in tomllib.load(open("uv.lock", "rb"))["package"]}; deps=list(p["project"]["dependencies"])+p["project"]["optional-dependencies"]["postgres"]; deps=[name+"=="+locked[name] if (name:=re.match(r"[A-Za-z0-9_.-]+", dep).group()) in {"litellm", "mcp"} else dep for dep in deps]; print("\n".join(deps))' > /tmp/requirements.txt \
- && pip install -r /tmp/requirements.txt
+RUN uv sync --frozen --no-dev --extra postgres --no-install-project
 
-# 再安装本项目本身（无依赖解析，保持快速重建）。
 COPY sag_api ./sag_api
 COPY sag_agent ./sag_agent
-RUN pip install --no-deps --no-build-isolation .
+RUN uv sync --frozen --no-dev --extra postgres
+
+# ── runtime (non-root, no build toolchain) ───────────────────────────────────
+FROM python:3.12-slim AS runtime
+
+WORKDIR /app
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/app/.venv/bin:$PATH"
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid 1001 appgroup \
+ && useradd --system --uid 1001 --gid appgroup --create-home appuser \
+ && mkdir -p /data/engine /data/uploads \
+ && chown -R appuser:appgroup /app /data
+
+COPY --from=builder --chown=appuser:appgroup /app/.venv /app/.venv
+COPY --from=builder --chown=appuser:appgroup /app/sag_api /app/sag_api
+COPY --from=builder --chown=appuser:appgroup /app/sag_agent /app/sag_agent
+
+USER appuser
 
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \

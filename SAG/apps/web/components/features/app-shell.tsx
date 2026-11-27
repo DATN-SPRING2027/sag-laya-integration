@@ -12,7 +12,7 @@ import { motion } from "motion/react";
 import { toast } from "sonner";
 
 import { api, ApiError } from "@/lib/api";
-import { clearToken, getToken } from "@/lib/auth";
+import { clearToken } from "@/lib/auth";
 import {
   APP_INITIALIZATION_DEFAULTS,
   dismissQuickModelSetup,
@@ -619,21 +619,20 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   React.useEffect(() => {
     let alive = true;
     (async () => {
-      if (!getToken()) {
-        router.replace("/login");
-        return;
-      }
       try {
         const [u, c, a, setup] = await Promise.all([
           api.me(),
-          api.capabilities(),
+          api.capabilities().catch((error) => {
+            if (error instanceof ApiError && error.status === 403) return null;
+            throw error;
+          }),
           api.getDefaultAgent(),
           api.modelSetupStatus().catch(() => null),
         ]);
         if (!alive) return;
         setUser(u);
         setCapabilities(c);
-        setTimezone(c.timezone || DEFAULT_TIME_ZONE);
+        setTimezone(c?.timezone || DEFAULT_TIME_ZONE);
         setAgent(a);
         setQuickSetupOpen(
           shouldShowQuickModelSetup(Boolean(setup?.required), window.localStorage),
@@ -641,18 +640,18 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         recordDiag("app.init", {
           user_id: u.id,
           agent_id: a.id,
-          language: c.language ?? "zh",
-          timezone: c.timezone || DEFAULT_TIME_ZONE,
+          language: c?.language ?? "zh",
+          timezone: c?.timezone || DEFAULT_TIME_ZONE,
           platform: typeof window !== "undefined" && window.sagDesktop?.isDesktop ? "desktop" : "web",
           capabilities: {
-            llm_configured: c.llm_configured,
-            llm_provider: c.llm_provider,
-            llm_model: c.llm_model,
-            embedding_model: c.embedding_model,
-            document_parser: c.document_parser,
-            effective_document_parser: c.effective_document_parser,
-            search_strategy: c.search_strategy,
-            max_upload_mb: c.max_upload_mb,
+            llm_configured: c?.llm_configured,
+            llm_provider: c?.llm_provider,
+            llm_model: c?.llm_model,
+            embedding_model: c?.embedding_model,
+            document_parser: c?.document_parser,
+            effective_document_parser: c?.effective_document_parser,
+            search_strategy: c?.search_strategy,
+            max_upload_mb: c?.max_upload_mb,
           },
         });
         threadLimitRef.current = SIDEBAR_THREADS_PAGE_SIZE;

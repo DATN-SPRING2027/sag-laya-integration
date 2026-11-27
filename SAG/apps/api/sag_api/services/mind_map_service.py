@@ -58,7 +58,7 @@ from sag_api.services.unit_supersession_overlay import (
 log = get_logger("services.mind_map")
 
 _CONTINUUM_DOC_ID_RE = re.compile(
-    r"^(?:continuum:project_document:|project-document:)?([0-9a-fA-F]{24})\Z"
+    r"^(?:continuum:(project_document|work_report|work_note):|(project-document):)?([0-9a-fA-F]{24})\Z"
 )
 _SECTION_SPLIT_RE = re.compile(r"\s*(?:>|→|\|)\s*")
 _WORD_TOKEN_RE = re.compile(r"[\w]{2,}", re.UNICODE)
@@ -98,6 +98,8 @@ class _ReadyDocumentScope:
     project_id: str = ""
     authority_tier: int | None = None
     effective_from_iso: str = ""
+    public_source_id: str | None = None
+    source_kind: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,12 +136,19 @@ def _as_utc(value: datetime | None) -> datetime | None:
     return value.astimezone(UTC)
 
 
-def _resolve_public_document_id(logical_source_id: str | None, sag_doc_id: str) -> str:
+def _resolve_public_source_ref(logical_source_id: str | None, sag_doc_id: str) -> tuple[str | None, str]:
+    """Resolve (source_kind, public_source_id) for Continuum documents, work reports, and task notes (E2E-INT-011)."""
     if isinstance(logical_source_id, str) and logical_source_id.strip():
         matched = _CONTINUUM_DOC_ID_RE.fullmatch(logical_source_id.strip())
         if matched:
-            return matched.group(1).lower()
-    return sag_doc_id
+            raw_kind = matched.group(1) or ("project_document" if matched.group(2) else None)
+            return raw_kind, matched.group(3).lower()
+    return None, sag_doc_id
+
+
+def _resolve_public_document_id(logical_source_id: str | None, sag_doc_id: str) -> str:
+    _kind, public_id = _resolve_public_source_ref(logical_source_id, sag_doc_id)
+    return public_id
 
 
 def _clean_text(raw: Any, max_len: int) -> str:
@@ -440,12 +449,11 @@ async def _load_project_scope_snapshot(
                 vid_str = str(chosen_ready.id)
                 updated_dt = _as_utc(getattr(doc, "updated_at", None) or getattr(doc, "created_at", None))
                 eff_dt = _as_utc(chosen_ready.effective_from)
+                source_kind, public_id = _resolve_public_source_ref(doc.logical_source_id, doc_id_str)
                 ready_docs.append(
                     _ReadyDocumentScope(
                         sag_document_id=doc_id_str,
-                        public_document_id=_resolve_public_document_id(
-                            doc.logical_source_id, doc_id_str
-                        ),
+                        public_document_id=public_id,
                         document_name=str(doc.filename or doc_id_str),
                         source_id=str(doc.source_id or ""),
                         source_name=src_name,
@@ -461,6 +469,8 @@ async def _load_project_scope_snapshot(
                             else None
                         ),
                         effective_from_iso=eff_dt.isoformat() if eff_dt is not None else "",
+                        public_source_id=public_id if source_kind is not None else None,
+                        source_kind=source_kind,
                     )
                 )
             elif (usable or not all_vers) and (
@@ -1040,6 +1050,8 @@ def _build_citation_dto(number: int, ev: _CatalogEvidence) -> MindMapCitationOut
         sourceName=src_name,
         projectId=proj_id,
         documentId=u.doc.public_document_id,
+        publicSourceId=u.doc.public_source_id,
+        sourceKind=u.doc.source_kind,
         documentName=doc_name,
         chunkId=u.unit_id,
         versionNo=u.doc.version_no,

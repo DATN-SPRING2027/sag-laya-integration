@@ -36,7 +36,7 @@ def verify_password(password: str, password_hash: str) -> bool:
 def create_access_token(subject: str, extra: dict[str, Any] | None = None) -> str:
     now = datetime.now(UTC)
     lifetime_minutes = (
-        min(settings.access_token_expire_minutes, 15)
+        min(settings.access_token_expire_minutes, settings.continuum_session_expire_minutes, 15)
         if settings.auth_mode == "continuum"
         else settings.access_token_expire_minutes
     )

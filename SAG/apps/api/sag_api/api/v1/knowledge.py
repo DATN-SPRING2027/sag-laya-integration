@@ -185,11 +185,17 @@ async def read(
     """按行分页读取原始文件。"""
     source = await get_source(session, source_id)
     document = await get_public_document(session, source, document_id, principal=principal)
-    if not document.storage_path or not os.path.isfile(document.storage_path):
+    import asyncio
+
+    if not document.storage_path or not await asyncio.to_thread(os.path.isfile, document.storage_path):
         raise NotFoundError("原始文件不存在或已清理")
+
+    def _read_lines(path: str) -> list[str]:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.readlines()
+
     try:
-        with open(document.storage_path, encoding="utf-8", errors="replace") as f:
-            all_lines = f.readlines()
+        all_lines = await asyncio.to_thread(_read_lines, document.storage_path)
     except OSError as exc:
         raise NotFoundError("文件读取失败") from exc
     total = len(all_lines)

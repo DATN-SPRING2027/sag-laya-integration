@@ -1,4 +1,9 @@
-> **SUPERSEDED (2026-11-25):** Đặc tả kiến trúc v1.1 (2026-09-23). Các phần mô tả **Laya Local** (`§13.6`, `§14.1`, `laya_ms`, `SAG_ENABLE_LAYA`) và **Tier E2 LLM Enrichment** (`§9`) đã bị **thay thế** theo [adr-remove-laya-and-r2.md](adr-remove-laya-and-r2.md) và [adr-remove-e2-llm-enrichment.md](adr-remove-e2-llm-enrichment.md). Định tuyến truy vấn thực tế đi qua `services/decision_router.py`; pipeline kiến thức mặc định chỉ chạy `Phase 2C SearchUnit` + `Phase 5A FOUNDATION (E0/E1)`.
+> **ARCHITECTURE RECONCILIATION (2026-11-27 — `SAG-RET-004`):** Đặc tả kiến trúc v1.1 (2026-09-23) đã được đồng bộ với triển khai production thực tế sau đợt audit & remediation:
+> - **Đã loại bỏ:** **Laya Local** (`§13.6`, `§14.1`, `laya_ms`, `SAG_ENABLE_LAYA`), **Cloudflare R2** object-ingest và **Tier E2 LLM Enrichment** (`§9`) theo [adr-remove-laya-and-r2.md](adr-remove-laya-and-r2.md) và [adr-remove-e2-llm-enrichment.md](adr-remove-e2-llm-enrichment.md).
+> - **Query Router (`services/decision_router.py`):** Mặc định `SAG_DECISION_PROVIDER=disabled` (zero-overhead heuristic planner; tùy chọn bật `siliconflow`/`openai_compatible`/`llm` với `Kev-4b` + cache hỗ trợ multi-turn).
+> - **Retrieval & Multi-Hop (`services/search_unit_retrieval_service.py`):** PostgreSQL 16 (source of truth) + Qdrant 1.14 (dense + BM25 sparse hybrid), thực thi đầy đủ 7 trục `RetrievalPlan` gồm `FieldPredicate` `constraints` và `OrderMode` `order`, batch-embed sub-queries (dense+sparse), heuristic RRF/lexical/MMR reranker, và mở rộng multi-hop kết hợp 1-hop `KnowledgeUnitEdge` + damped Personalized PageRank (`igraph.personalized_pagerank`) + artifact-code bridges.
+> - **Routing Tree (`services/universe_tree_service.py` & `services/incremental_tree_service.py`):** Quality gates phân tầng theo quy mô corpus (non-vacuous khi `>= 16` KUs kèm synthetic probe queries, giữ nguyên slot `ACTIVE` cũ nếu candidate bị từ chối) + Checkpoint C incremental delta update cho các lần nạp tài liệu gia tăng nhỏ.
+> - **Generation & Streaming (`services/agent_service.py`):** Progressive token streaming mặc định (`SAG_STREAMING_PROGRESSIVE_ENABLED=true`), entailment verifier cô lập dữ liệu bằng nonce XML delimiter + timeout cấu hình được với deterministic fallback khi timeout. **Research Agent** (`services/research_agent_service.py`) hiện ở trạng thái experimental/opt-in.
 
 **SAG**
 
@@ -22,7 +27,7 @@ Ngày: 23/09/2026
 | Phạm vi            | Document ingestion, search indexing, knowledge organization, retrieval, generation, agent knowledge growth |
 | Source of truth    | PostgreSQL                                                                                                 |
 | Search accelerator | Qdrant                                                                                                     |
-| Query router       | Laya Local (coarse intent only)                                                                            |
+| Query router       | `services/decision_router.py` (mặc định `disabled` -> deterministic planner; tùy chọn `Kev-4b` / LLM)      |
 | Generation         | LLM cấu hình độc lập trong Settings                                                                        |
 
 # Mục lục

@@ -55,7 +55,7 @@ export default function LaunchPage() {
         : authStatus.mode === "password"
           ? await api.login({ email: nextEmail, password })
           : await api.login({ name: nextName });
-      setToken(response.access_token);
+      await setToken(response.access_token);
       toast.success(t("welcome", { name: response.user.name }));
       router.replace("/chat");
     } catch (error) {

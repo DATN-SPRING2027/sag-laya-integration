@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -61,11 +62,15 @@ async def import_knowledge_package(
             namespace = document.metadata.get("octx")
             document_id = namespace.get("document_id") if isinstance(namespace, dict) else None
             if target.exists():
-                if target.read_bytes() != document.raw:
+                existing_raw = await asyncio.to_thread(target.read_bytes)
+                if existing_raw != document.raw:
                     raise OctxPlanError(f"knowledge checkpoint content changed: {document.path}")
             else:
-                target.write_bytes(document.raw)
-                target.chmod(0o600)
+                def _write_target(dest: Path = target, payload: bytes = document.raw) -> None:
+                    dest.write_bytes(payload)
+                    dest.chmod(0o600)
+
+                await asyncio.to_thread(_write_target)
             process_checkpoint = ProcessCheckpoint.model_validate(state.get("process_checkpoint") or {})
 
             async def save_process(value: ProcessCheckpoint, _state: dict = state) -> None:

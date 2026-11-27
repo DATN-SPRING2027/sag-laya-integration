@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import math
+import re
 from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
-import math
-import re
 from typing import Any
 
 from sqlalchemy import and_, case, func, or_, select, tuple_
