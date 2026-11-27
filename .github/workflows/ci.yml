@@ -21,7 +21,7 @@ jobs:
       run:
         working-directory: SAG/apps/api
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -61,7 +61,7 @@ jobs:
       run:
         working-directory: SAG/apps/web
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -82,7 +82,7 @@ jobs:
     name: Validate Docker Compose Configs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Validate compose.yaml
         run: docker compose -f SAG/compose.yaml config --quiet
       - name: Validate compose.postgres.yaml
