@@ -62,7 +62,7 @@
   "devDependencies": {
     "@formatjs/icu-messageformat-parser": "^3.5.14",
     "@types/d3-force": "^3.0.10",
-    "@types/node": "20.19.43",
+    "@types/node": "26.6.6",
     "@types/react": "19.0.7",
     "@types/react-dom": "19.0.3",
     "@types/three": "0.185.1",
