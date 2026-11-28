@@ -1699,6 +1699,112 @@
         "title": "DmAssistantAnswerResponse",
         "type": "object"
       },
+      "DmAssistantErrorDetailOut": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "fields": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/DmAssistantErrorFieldOut"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fields"
+          },
+          "layer": {
+            "title": "Layer",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "request_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request Id"
+          },
+          "retryable": {
+            "title": "Retryable",
+            "type": "boolean"
+          },
+          "stage": {
+            "title": "Stage",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "layer",
+          "stage",
+          "retryable"
+        ],
+        "title": "DmAssistantErrorDetailOut",
+        "type": "object"
+      },
+      "DmAssistantErrorEnvelopeOut": {
+        "additionalProperties": false,
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/DmAssistantErrorDetailOut"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "title": "DmAssistantErrorEnvelopeOut",
+        "type": "object"
+      },
+      "DmAssistantErrorFieldOut": {
+        "additionalProperties": false,
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Loc",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Msg",
+            "type": "string"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "type",
+          "msg"
+        ],
+        "title": "DmAssistantErrorFieldOut",
+        "type": "object"
+      },
       "DmAssistantMessageInput": {
         "additionalProperties": false,
         "properties": {
@@ -11668,6 +11774,62 @@
     "/api/v1/internal/dm-assistant/answer": {
       "post": {
         "operationId": "answer_dm_question_api_v1_internal_dm_assistant_answer_post",
+        "parameters": [
+          {
+            "description": "Continuum BFF service-to-service shared secret token.",
+            "in": "header",
+            "name": "X-SAG-BFF-Service-Token",
+            "required": true,
+            "schema": {
+              "description": "Continuum BFF service-to-service shared secret token.",
+              "minLength": 1,
+              "title": "X-Sag-Bff-Service-Token",
+              "type": "string"
+            }
+          },
+          {
+            "description": "24-hex Continuum organization ObjectId.",
+            "in": "header",
+            "name": "X-Continuum-Organization-Id",
+            "required": true,
+            "schema": {
+              "description": "24-hex Continuum organization ObjectId.",
+              "maxLength": 24,
+              "minLength": 24,
+              "pattern": "^[a-fA-F0-9]{24}$",
+              "title": "X-Continuum-Organization-Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "24-hex Continuum requesting user ObjectId.",
+            "in": "header",
+            "name": "X-Continuum-User-Id",
+            "required": true,
+            "schema": {
+              "description": "24-hex Continuum requesting user ObjectId.",
+              "maxLength": 24,
+              "minLength": 24,
+              "pattern": "^[a-fA-F0-9]{24}$",
+              "title": "X-Continuum-User-Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "24-hex Continuum 1-on-1 DM conversation ObjectId.",
+            "in": "header",
+            "name": "X-Continuum-Conversation-Id",
+            "required": true,
+            "schema": {
+              "description": "24-hex Continuum 1-on-1 DM conversation ObjectId.",
+              "maxLength": 24,
+              "minLength": 24,
+              "pattern": "^[a-fA-F0-9]{24}$",
+              "title": "X-Continuum-Conversation-Id",
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -11689,15 +11851,65 @@
             },
             "description": "Successful Response"
           },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DmAssistantErrorEnvelopeOut"
+                }
+              }
+            },
+            "description": "Unsupported query parameters, invalid Content-Length, or unconfigured LLM provider."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DmAssistantErrorEnvelopeOut"
+                }
+              }
+            },
+            "description": "Missing or invalid X-SAG-BFF-Service-Token or required 24-hex Continuum context headers."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DmAssistantErrorEnvelopeOut"
+                }
+              }
+            },
+            "description": "Request body exceeds the 64 KiB hard HTTP byte limit."
+          },
           "422": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/DmAssistantErrorEnvelopeOut"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Request payload failed schema validation (sanitized envelope without echoed input values)."
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DmAssistantErrorEnvelopeOut"
+                }
+              }
+            },
+            "description": "Upstream LLM returned empty, malformed, non-JSON, or fabricated-citation output."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DmAssistantErrorEnvelopeOut"
+                }
+              }
+            },
+            "description": "Service token authentication is not configured or the upstream LLM provider is temporarily unavailable."
           }
         },
         "summary": "Synthesize a grounded answer strictly from Continuum-supplied 1-on-1 DM excerpts",

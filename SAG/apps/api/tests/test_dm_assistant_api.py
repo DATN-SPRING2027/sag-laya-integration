@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import secrets
+from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -13,22 +14,30 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI
 
-from sag_api.api.v1 import api_router
+from sag_api.api.v1.dm_assistant import DM_ASSISTANT_MAX_BODY_BYTES
 from sag_api.api.v1.dm_assistant import router as dm_assistant_router
-from sag_api.core.config import settings
+from sag_api.core.config import Settings, settings
 from sag_api.core.deps import get_llm, get_session
 from sag_api.core.error_taxonomy import ErrorCode, ErrorLayer, ErrorStage
-from sag_api.core.errors import ApiError, ServiceUnavailableError, UpstreamError
+from sag_api.core.errors import ServiceUnavailableError, UpstreamError
 from sag_api.core.security import create_access_token
 from sag_api.core.token_usage import (
     get_runtime_token_usage,
     record_llm_usage,
     reset_runtime_token_usage,
 )
+from sag_api.generation import llm as llm_module
+from sag_api.generation.llm import LLMClient
 from sag_api.main import create_app
+from sag_api.services.dm_assistant_service import (
+    _EMPTY_CONTEXT_ANSWER_EN,
+    _EMPTY_CONTEXT_ANSWER_VI,
+    _INSUFFICIENT_EVIDENCE_FALLBACK_EN,
+    _INSUFFICIENT_EVIDENCE_FALLBACK_VI,
+    _LLM_UNAVAILABLE_MESSAGE,
+)
 
 ENDPOINT = "/api/v1/internal/dm-assistant/answer"
 VALID_SERVICE_TOKEN = "d" * 40
@@ -38,14 +47,7 @@ VALID_CONV_ID = "6adb1ee0ed7cd148fcd0fa37"
 
 
 def _build_app(llm_mock: object) -> FastAPI:
-    app = FastAPI()
-
-    @app.exception_handler(ApiError)
-    async def _handle_api_error(request: Request, exc: ApiError) -> JSONResponse:
-        request_id = getattr(request.state, "request_id", None) or request.headers.get("X-Request-Id")
-        return JSONResponse(status_code=exc.status_code, content=exc.to_envelope(request_id=request_id))
-
-    app.include_router(api_router)
+    app = create_app()
     app.dependency_overrides[get_llm] = lambda: llm_mock
     return app
 
@@ -122,10 +124,25 @@ async def test_dm_assistant_auth_fail_closed_and_header_validation(
     app = _build_app(llm)
 
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-        # Missing BFF service token -> 403 even on malformed empty body (fail-closed before 422)
-        missing_tok = await client.post(ENDPOINT, headers=_dm_headers(token=None), json={})
-        assert missing_tok.status_code == 403
-        assert missing_tok.json()["error"]["code"] == ErrorCode.FORBIDDEN
+        # Missing BFF service token -> 403 even on malformed non-JSON body (runs strictly before JSON parse)
+        malformed_unauth = await client.post(
+            ENDPOINT,
+            headers={**_dm_headers(token=None), "Content-Type": "application/json"},
+            content=b"{not-json",
+        )
+        assert malformed_unauth.status_code == 403
+        assert malformed_unauth.headers.get("cache-control") == "no-store"
+        assert malformed_unauth.json()["error"]["code"] == ErrorCode.FORBIDDEN
+
+        # Missing BFF service token with > 64 KiB body -> 403 (NOT 413/422)
+        huge_unauth = await client.post(
+            ENDPOINT,
+            headers={**_dm_headers(token=None), "Content-Type": "application/json"},
+            content=b"x" * (DM_ASSISTANT_MAX_BODY_BYTES + 4_096),
+        )
+        assert huge_unauth.status_code == 403
+        assert huge_unauth.headers.get("cache-control") == "no-store"
+        assert huge_unauth.json()["error"]["code"] == ErrorCode.FORBIDDEN
 
         # Wrong BFF service token -> 403
         wrong_tok = await client.post(
@@ -136,16 +153,16 @@ async def test_dm_assistant_auth_fail_closed_and_header_validation(
         assert wrong_tok.status_code == 403
         assert wrong_tok.json()["error"]["code"] == ErrorCode.FORBIDDEN
 
-        # User JWT Authorization Bearer does NOT bypass BFF service token -> 403
+        # User JWT Authorization Bearer does NOT bypass BFF service token -> 403 even on malformed JSON
         bearer_only = await client.post(
             ENDPOINT,
-            headers=_user_bearer_headers(),
-            json=_sample_payload(),
+            headers={**_user_bearer_headers(), "Content-Type": "application/json"},
+            content=b"{not-json",
         )
         assert bearer_only.status_code == 403
         assert bearer_only.json()["error"]["code"] == ErrorCode.FORBIDDEN
 
-        # Missing or non-24-hex required context headers -> 403
+        # Missing or non-24-hex required context headers -> 403 even on malformed JSON
         for bad_headers in (
             _dm_headers(org_id=None),
             _dm_headers(user_id=None),
@@ -156,8 +173,13 @@ async def test_dm_assistant_auth_fail_closed_and_header_validation(
             _dm_headers(org_id="6ad88b71ed7cd148fcd0e61g"),  # invalid hex char 'g'
             _dm_headers(conv_id=f" {VALID_CONV_ID} "),
         ):
-            res = await client.post(ENDPOINT, headers=bad_headers, json=_sample_payload())
+            res = await client.post(
+                ENDPOINT,
+                headers={**bad_headers, "Content-Type": "application/json"},
+                content=b"{not-json",
+            )
             assert res.status_code == 403
+            assert res.headers.get("cache-control") == "no-store"
             assert res.json()["error"]["code"] == ErrorCode.FORBIDDEN
 
         # Duplicate required header -> 403
@@ -171,10 +193,15 @@ async def test_dm_assistant_auth_fail_closed_and_header_validation(
         dup_res = await client.post(ENDPOINT, headers=dup_headers, json=_sample_payload())
         assert dup_res.status_code == 403
 
-        # Unconfigured SAG_BFF_SERVICE_TOKEN -> 503 fail-closed (with or without caller token)
+        # Unconfigured SAG_BFF_SERVICE_TOKEN -> 503 fail-closed (even on malformed body)
         monkeypatch.setattr(settings, "bff_service_token", None)
-        unconfigured_with = await client.post(ENDPOINT, headers=_dm_headers(), json=_sample_payload())
+        unconfigured_with = await client.post(
+            ENDPOINT,
+            headers={**_dm_headers(), "Content-Type": "application/json"},
+            content=b"{not-json",
+        )
         assert unconfigured_with.status_code == 503
+        assert unconfigured_with.headers.get("cache-control") == "no-store"
         assert unconfigured_with.json()["error"]["code"] == ErrorCode.SERVICE_UNAVAILABLE
 
         unconfigured_without = await client.post(
@@ -188,6 +215,61 @@ async def test_dm_assistant_auth_fail_closed_and_header_validation(
         monkeypatch.setattr(settings, "bff_service_token", "   ")
         unconfigured_blank = await client.post(ENDPOINT, headers=_dm_headers(), json=_sample_payload())
         assert unconfigured_blank.status_code == 503
+
+    llm.complete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dm_assistant_enforces_http_64kib_body_byte_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "bff_service_token", VALID_SERVICE_TOKEN)
+    llm = SimpleNamespace(configured=True, complete=AsyncMock(return_value="{}"))
+    app = _build_app(llm)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        # 1. Authenticated request with Content-Length > 64 KiB -> 413 payload_too_large
+        oversized_bytes = b'{"question":"' + (b"a" * (DM_ASSISTANT_MAX_BODY_BYTES + 1024)) + b'"}'
+        res_cl = await client.post(
+            ENDPOINT,
+            headers={**_dm_headers(), "Content-Type": "application/json"},
+            content=oversized_bytes,
+        )
+        assert res_cl.status_code == 413
+        assert res_cl.headers.get("cache-control") == "no-store"
+        err_cl = res_cl.json()["error"]
+        assert err_cl["code"] == ErrorCode.PAYLOAD_TOO_LARGE
+        assert err_cl["retryable"] is False
+
+        # 2. Authenticated chunked/streaming body > 64 KiB (no Content-Length) -> 413 payload_too_large
+        chunks_yielded = 0
+
+        async def _chunked_oversized_stream() -> AsyncIterator[bytes]:
+            nonlocal chunks_yielded
+            for _ in range(32):
+                chunks_yielded += 1
+                yield b"x" * 16_384
+
+        res_chunked = await client.post(
+            ENDPOINT,
+            headers={**_dm_headers(), "Content-Type": "application/json"},
+            content=_chunked_oversized_stream(),
+        )
+        assert res_chunked.status_code == 413
+        assert res_chunked.headers.get("cache-control") == "no-store"
+        assert res_chunked.json()["error"]["code"] == ErrorCode.PAYLOAD_TOO_LARGE
+        # Guard aborts immediately once cumulative bytes > 65_536 instead of buffering the full 512 KiB stream
+        assert chunks_yielded <= 6
+
+        # 3. Malformed Content-Length header -> 400 validation_error
+        res_bad_cl = await client.post(
+            ENDPOINT,
+            headers={**_dm_headers(), "Content-Type": "application/json", "Content-Length": "not-an-int"},
+            content=b"{}",
+        )
+        assert res_bad_cl.status_code == 400
+        assert res_bad_cl.headers.get("cache-control") == "no-store"
+        assert res_bad_cl.json()["error"]["code"] == ErrorCode.VALIDATION_ERROR
 
     llm.complete.assert_not_awaited()
 
@@ -213,16 +295,17 @@ async def test_dm_assistant_rejects_query_params_and_enforces_hard_payload_caps(
     app = _build_app(llm)
 
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-        # Query params -> 400 validation_error
+        # Query params -> 400 validation_error even on malformed non-JSON body (pre-parser)
         qp_res = await client.post(
             f"{ENDPOINT}?projectId=proj1",
-            headers=_dm_headers(),
-            json=_sample_payload(),
+            headers={**_dm_headers(), "Content-Type": "application/json"},
+            content=b"{not-json",
         )
         assert qp_res.status_code == 400
+        assert qp_res.headers.get("cache-control") == "no-store"
         assert qp_res.json()["error"]["code"] == ErrorCode.VALIDATION_ERROR
 
-        # Extra body fields (projectId, sourceIds, threadId) -> 422
+        # Extra body fields (projectId, sourceIds, threadId) -> 422 sanitized envelope
         for extra in (
             {"projectId": "proj1"},
             {"sourceIds": ["src1"]},
@@ -234,6 +317,8 @@ async def test_dm_assistant_rejects_query_params_and_enforces_hard_payload_caps(
                 json=_sample_payload(**extra),
             )
             assert res.status_code == 422
+            assert res.headers.get("cache-control") == "no-store"
+            assert res.json()["error"]["code"] == ErrorCode.VALIDATION_ERROR
 
         # Extra field inside message -> 422
         extra_msg_field = _sample_payload(
@@ -258,17 +343,44 @@ async def test_dm_assistant_rejects_query_params_and_enforces_hard_payload_caps(
             )
             assert res.status_code == 422
 
-        # Naive datetime or numeric timestamp -> 422
-        for bad_ts in ("2026-11-28T09:00:00", 1764320400):
-            res = await client.post(
+        # Naive datetime, compact offset, or numeric/string Unix timestamps -> 422 on both timestamp fields
+        for bad_ts in (
+            "2026-11-28T09:00:00",
+            "2026-11-28T09:00:00+0700",
+            "2026-11-28",
+            1700000000,
+            1700000000.5,
+            "1700000000",
+            "1700000000.5",
+            "-1700000000",
+        ):
+            res_ref = await client.post(
                 ENDPOINT,
                 headers=_dm_headers(),
                 json=_sample_payload(referenceNowIso=bad_ts),
             )
-            assert res.status_code == 422
+            assert res_ref.status_code == 422, bad_ts
+
+            res_msg = await client.post(
+                ENDPOINT,
+                headers=_dm_headers(),
+                json=_sample_payload(
+                    messages=[
+                        {
+                            "refId": "M1",
+                            "senderLabel": "Nguyễn An",
+                            "sentAtIso": bad_ts,
+                            "text": "Hello",
+                        }
+                    ]
+                ),
+            )
+            assert res_msg.status_code == 422, bad_ts
 
         # Blank or oversized question / coverageHint -> 422
-        assert (await client.post(ENDPOINT, headers=_dm_headers(), json=_sample_payload(question="   "))).status_code == 422
+        assert (
+            await client.post(ENDPOINT, headers=_dm_headers(), json=_sample_payload(question="   "))
+        ).status_code == 422
         assert (
             await client.post(ENDPOINT, headers=_dm_headers(), json=_sample_payload(question="a" * 2001))
         ).status_code == 422
@@ -374,6 +486,86 @@ async def test_dm_assistant_rejects_query_params_and_enforces_hard_payload_caps(
 
 
 @pytest.mark.asyncio
+async def test_dm_assistant_422_envelope_never_echoes_submitted_question_or_messages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "bff_service_token", VALID_SERVICE_TOKEN)
+    llm = SimpleNamespace(configured=True, complete=AsyncMock(return_value="{}"))
+    app = _build_app(llm)
+
+    secret_question = "CONFIDENTIAL-DM-QUESTION-422"
+    secret_message = "CONFIDENTIAL-DM-MESSAGE-422"
+    secret_sender = "CONFIDENTIAL-DM-SENDER-422"
+
+    payloads = [
+        # 1. Oversized question
+        _sample_payload(question=f"{secret_question}-" + ("q" * 2000)),
+        # 2. Model validator failure (duplicate refId) — Pydantic raw error embeds entire model in `input`
+        _sample_payload(
+            question=secret_question,
+            messages=[
+                {
+                    "refId": "M1",
+                    "senderLabel": secret_sender,
+                    "sentAtIso": "2026-11-27T08:15:00Z",
+                    "text": secret_message,
+                },
+                {
+                    "refId": "M1",
+                    "senderLabel": secret_sender,
+                    "sentAtIso": "2026-11-27T08:16:00Z",
+                    "text": secret_message,
+                },
+            ],
+        ),
+        # 3. Oversized message text
+        _sample_payload(
+            question=secret_question,
+            messages=[
+                {
+                    "refId": "M1",
+                    "senderLabel": secret_sender,
+                    "sentAtIso": "2026-11-27T08:15:00Z",
+                    "text": f"{secret_message}-" + ("m" * 1200),
+                }
+            ],
+        ),
+    ]
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        for payload in payloads:
+            res = await client.post(ENDPOINT, headers=_dm_headers(), json=payload)
+            assert res.status_code == 422
+            assert res.headers.get("cache-control") == "no-store"
+            body = res.json()
+            assert "error" in body
+            assert body["error"]["code"] == ErrorCode.VALIDATION_ERROR
+            assert body["error"]["retryable"] is False
+            assert isinstance(body["error"]["fields"], list) and body["error"]["fields"]
+            for field_err in body["error"]["fields"]:
+                assert "input" not in field_err
+                assert "ctx" not in field_err
+            raw_text = res.text
+            assert secret_question not in raw_text
+            assert secret_message not in raw_text
+            assert secret_sender not in raw_text
+
+        # 4. Authenticated malformed raw JSON -> 422 sanitized envelope without echoing raw body
+        malformed_secret = "CONFIDENTIAL-RAW-JSON-422"
+        res_json = await client.post(
+            ENDPOINT,
+            headers={**_dm_headers(), "Content-Type": "application/json"},
+            content=f'{{"question": "{malformed_secret}"'.encode(),
+        )
+        assert res_json.status_code == 422
+        assert res_json.headers.get("cache-control") == "no-store"
+        assert res_json.json()["error"]["code"] == ErrorCode.VALIDATION_ERROR
+        assert malformed_secret not in res_json.text
+
+    llm.complete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_dm_assistant_empty_messages_short_circuits_without_calling_llm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -402,7 +594,20 @@ async def test_dm_assistant_empty_messages_short_circuits_without_calling_llm(
             "totalTokens": 0,
             "calls": 0,
         }
-        assert len(body["answerText"]) > 20
+        assert body["answerText"] == _EMPTY_CONTEXT_ANSWER_VI
+
+        # English question returns deterministic English copy
+        res_en = await client.post(
+            ENDPOINT,
+            headers=_dm_headers(),
+            json=_sample_payload(
+                question="What did we decide yesterday about PAY-123?",
+                messages=[],
+                partialCoverage=False,
+            ),
+        )
+        assert res_en.status_code == 200
+        assert res_en.json()["answerText"] == _EMPTY_CONTEXT_ANSWER_EN
 
         # partialCoverage=True propagates coverageHint even on short-circuit
         res_partial = await client.post(
@@ -437,7 +642,7 @@ async def test_dm_assistant_unconfigured_llm_returns_400_configuration_error(
 
 
 @pytest.mark.asyncio
-async def test_dm_assistant_grounded_answer_usage_and_partial_coverage(
+async def test_dm_assistant_grounded_answer_usage_and_explicit_utc_normalization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "bff_service_token", VALID_SERVICE_TOKEN)
@@ -493,8 +698,17 @@ async def test_dm_assistant_grounded_answer_usage_and_partial_coverage(
             ENDPOINT,
             headers=_dm_headers(),
             json=_sample_payload(
+                referenceNowIso="2026-11-28T16:00:00+07:00",
                 partialCoverage=True,
                 coverageHint="Chỉ bao gồm 80 tin nhắn đầu tiên trong ngày hôm qua.",
+                messages=[
+                    {
+                        "refId": "M1",
+                        "senderLabel": "Nguyễn An",
+                        "sentAtIso": "2026-11-27T15:15:00+07:00",
+                        "text": "Chốt dời deadline PAY-123 sang thứ Sáu 29/11 lúc 17:00 nhé.",
+                    }
+                ],
             ),
         )
         assert res.status_code == 200
@@ -522,8 +736,10 @@ async def test_dm_assistant_grounded_answer_usage_and_partial_coverage(
     assert "untrusted conversation data" in system_prompt
     assert "NEVER use decorative emojis" in system_prompt
     assert "conflicting dates, figures, or decisions" in system_prompt
-    assert "+07:00" in user_prompt
-    assert "[M1]" in user_prompt
+    # Verify explicit +07:00 -> Z UTC conversion in prompt metadata and excerpts
+    assert '"referenceNowLocal": "2026-11-28T16:00:00+07:00"' in user_prompt
+    assert '"referenceNowUtc": "2026-11-28T09:00:00Z"' in user_prompt
+    assert "[M1] local=2026-11-27T15:15:00+07:00 utc=2026-11-27T08:15:00Z" in user_prompt
 
     global_usage = get_runtime_token_usage()
     assert "dm_assistant" in global_usage["by_component"]
@@ -584,7 +800,7 @@ async def test_dm_assistant_conflicting_sources_cites_both_references(
 @pytest.mark.parametrize(
     "llm_output",
     [
-        # Fabricated refId under ANSWERED
+        # Fabricated refId in citedRefIds under ANSWERED
         json.dumps(
             {
                 "status": "ANSWERED",
@@ -593,7 +809,51 @@ async def test_dm_assistant_conflicting_sources_cites_both_references(
                 "coverageNote": None,
             }
         ),
-        # Fabricated refId even under INSUFFICIENT_EVIDENCE
+        # Fabricated inline [M99] inside answerText even when citedRefIds only has valid ["M1"]
+        json.dumps(
+            {
+                "status": "ANSWERED",
+                "answerText": "Deadline là 29/11 [M1] và xác nhận thêm [M99].",
+                "citedRefIds": ["M1"],
+                "coverageNote": None,
+            }
+        ),
+        # Malformed combined inline bracket [M1, M99]
+        json.dumps(
+            {
+                "status": "ANSWERED",
+                "answerText": "Deadline là 29/11 [M1, M99].",
+                "citedRefIds": ["M1"],
+                "coverageNote": None,
+            }
+        ),
+        # Fabricated [M0] or lowercase [m99] inline citation token
+        json.dumps(
+            {
+                "status": "ANSWERED",
+                "answerText": "Deadline là 29/11 [M0].",
+                "citedRefIds": ["M1"],
+                "coverageNote": None,
+            }
+        ),
+        json.dumps(
+            {
+                "status": "ANSWERED",
+                "answerText": "Deadline là 29/11 [m99].",
+                "citedRefIds": ["M1"],
+                "coverageNote": None,
+            }
+        ),
+        # Fabricated inline [M99] even under INSUFFICIENT_EVIDENCE
+        json.dumps(
+            {
+                "status": "INSUFFICIENT_EVIDENCE",
+                "answerText": "Không đủ căn cứ [M99].",
+                "citedRefIds": [],
+                "coverageNote": None,
+            }
+        ),
+        # Fabricated refId in citedRefIds even under INSUFFICIENT_EVIDENCE
         json.dumps(
             {
                 "status": "INSUFFICIENT_EVIDENCE",
@@ -624,6 +884,7 @@ async def test_dm_assistant_rejects_fabricated_or_invalid_ref_ids_with_502(
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         res = await client.post(ENDPOINT, headers=_dm_headers(), json=_sample_payload())
         assert res.status_code == 502
+        assert res.headers.get("cache-control") == "no-store"
         err = res.json()["error"]
         assert err["code"] == ErrorCode.SCHEMA_VALIDATION_ERROR
         assert err["layer"] == ErrorLayer.LLM.value
@@ -631,21 +892,21 @@ async def test_dm_assistant_rejects_fabricated_or_invalid_ref_ids_with_502(
 
 
 @pytest.mark.asyncio
-async def test_dm_assistant_downgrades_answered_with_empty_cited_refs_and_normalizes_insufficient(
+async def test_dm_assistant_deterministic_insufficient_evidence_copy_for_vi_and_en(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "bff_service_token", VALID_SERVICE_TOKEN)
 
-    # 1. ANSWERED with empty citedRefIds -> downgraded safely to INSUFFICIENT_EVIDENCE
+    # 1. ANSWERED with empty citedRefIds -> downgraded safely with deterministic VI/EN copy
     llm_empty_refs = SimpleNamespace(
         configured=True,
         complete=AsyncMock(
             return_value=json.dumps(
                 {
                     "status": "ANSWERED",
-                    "answerText": "Uncited hallucinated claim that must be stripped.",
+                    "answerText": "Uncited hallucinated claim 🚀 that must be stripped.",
                     "citedRefIds": [],
-                    "coverageNote": None,
+                    "coverageNote": "Ungrounded coverage claim",
                 }
             )
         ),
@@ -655,21 +916,33 @@ async def test_dm_assistant_downgrades_answered_with_empty_cited_refs_and_normal
         transport=httpx.ASGITransport(app=app_downgrade),
         base_url="http://test",
     ) as client:
-        res = await client.post(ENDPOINT, headers=_dm_headers(), json=_sample_payload())
-        assert res.status_code == 200
-        body = res.json()
-        assert body["status"] == "INSUFFICIENT_EVIDENCE"
-        assert body["citedRefIds"] == []
-        assert "Uncited hallucinated claim" not in body["answerText"]
+        res_vi = await client.post(ENDPOINT, headers=_dm_headers(), json=_sample_payload())
+        assert res_vi.status_code == 200
+        body_vi = res_vi.json()
+        assert body_vi["status"] == "INSUFFICIENT_EVIDENCE"
+        assert body_vi["citedRefIds"] == []
+        assert body_vi["answerText"] == _INSUFFICIENT_EVIDENCE_FALLBACK_VI
+        assert body_vi["coverageNote"] is None
 
-    # 2. INSUFFICIENT_EVIDENCE with valid citedRefIds -> normalized to citedRefIds=[]
-    llm_insuff_with_ref = SimpleNamespace(
+        res_en = await client.post(
+            ENDPOINT,
+            headers=_dm_headers(),
+            json=_sample_payload(question="When is the deadline for PAY-123?"),
+        )
+        assert res_en.status_code == 200
+        body_en = res_en.json()
+        assert body_en["status"] == "INSUFFICIENT_EVIDENCE"
+        assert body_en["citedRefIds"] == []
+        assert body_en["answerText"] == _INSUFFICIENT_EVIDENCE_FALLBACK_EN
+
+    # 2. Model-declared INSUFFICIENT_EVIDENCE -> NEVER returns free-form model prose
+    llm_insuff_freeform = SimpleNamespace(
         configured=True,
         complete=AsyncMock(
             return_value=json.dumps(
                 {
                     "status": "INSUFFICIENT_EVIDENCE",
-                    "answerText": "Không đủ căn cứ từ các tin nhắn hiện có.",
+                    "answerText": "UNGROUNDED_FREEFORM_MODEL_TEXT 🚀 I guess maybe Friday?",
                     "citedRefIds": ["M1"],
                     "coverageNote": None,
                 },
@@ -677,16 +950,30 @@ async def test_dm_assistant_downgrades_answered_with_empty_cited_refs_and_normal
             )
         ),
     )
-    app_insuff = _build_app(llm_insuff_with_ref)
+    app_insuff = _build_app(llm_insuff_freeform)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app_insuff),
         base_url="http://test",
     ) as client:
-        res2 = await client.post(ENDPOINT, headers=_dm_headers(), json=_sample_payload())
-        assert res2.status_code == 200
-        body2 = res2.json()
-        assert body2["status"] == "INSUFFICIENT_EVIDENCE"
-        assert body2["citedRefIds"] == []
+        res2_vi = await client.post(ENDPOINT, headers=_dm_headers(), json=_sample_payload())
+        assert res2_vi.status_code == 200
+        body2_vi = res2_vi.json()
+        assert body2_vi["status"] == "INSUFFICIENT_EVIDENCE"
+        assert body2_vi["citedRefIds"] == []
+        assert body2_vi["answerText"] == _INSUFFICIENT_EVIDENCE_FALLBACK_VI
+        assert "UNGROUNDED_FREEFORM_MODEL_TEXT" not in body2_vi["answerText"]
+
+        res2_en = await client.post(
+            ENDPOINT,
+            headers=_dm_headers(),
+            json=_sample_payload(question="Did we agree on the production deployment date?"),
+        )
+        assert res2_en.status_code == 200
+        body2_en = res2_en.json()
+        assert body2_en["status"] == "INSUFFICIENT_EVIDENCE"
+        assert body2_en["citedRefIds"] == []
+        assert body2_en["answerText"] == _INSUFFICIENT_EVIDENCE_FALLBACK_EN
+        assert "UNGROUNDED_FREEFORM_MODEL_TEXT" not in body2_en["answerText"]
 
 
 @pytest.mark.asyncio
@@ -728,10 +1015,49 @@ async def test_dm_assistant_clamps_oversized_answer_text_and_strips_think_fences
     [
         ("   ", ErrorCode.LLM_EMPTY_RESPONSE),
         ("Not JSON at all", ErrorCode.SCHEMA_VALIDATION_ERROR),
-        (json.dumps({"status": "MAYBE", "answerText": "x", "citedRefIds": ["M1"]}), ErrorCode.SCHEMA_VALIDATION_ERROR),
-        (json.dumps({"status": "ANSWERED", "answerText": 123, "citedRefIds": ["M1"]}), ErrorCode.SCHEMA_VALIDATION_ERROR),
-        (json.dumps({"status": "ANSWERED", "answerText": "   ", "citedRefIds": ["M1"]}), ErrorCode.SCHEMA_VALIDATION_ERROR),
-        (json.dumps({"status": "ANSWERED", "answerText": "ok", "citedRefIds": "M1"}), ErrorCode.SCHEMA_VALIDATION_ERROR),
+        # Mixed leading prose + JSON must be rejected strictly
+        (
+            'Here is the JSON:\n{"status": "ANSWERED", "answerText": "Ok [M1].", "citedRefIds": ["M1"]}',
+            ErrorCode.SCHEMA_VALIDATION_ERROR,
+        ),
+        # Trailing non-whitespace prose after JSON must be rejected strictly
+        (
+            '{"status": "ANSWERED", "answerText": "Ok [M1].", "citedRefIds": ["M1"]}\nHope this helps!',
+            ErrorCode.SCHEMA_VALIDATION_ERROR,
+        ),
+        # Trailing prose after markdown code fence must be rejected strictly
+        (
+            '```json\n{"status": "ANSWERED", "answerText": "Ok [M1].", "citedRefIds": ["M1"]}\n```\nExtra note.',
+            ErrorCode.SCHEMA_VALIDATION_ERROR,
+        ),
+        # Multiple JSON objects must be rejected strictly
+        (
+            '{"status": "ANSWERED", "answerText": "Ok [M1].", "citedRefIds": ["M1"]} {"extra": true}',
+            ErrorCode.SCHEMA_VALIDATION_ERROR,
+        ),
+        # Unclosed <think> tag must be rejected strictly
+        (
+            '<think>unfinished reasoning\n{"status": "ANSWERED", "answerText": "Ok [M1].", "citedRefIds": ["M1"]}',
+            ErrorCode.SCHEMA_VALIDATION_ERROR,
+        ),
+        # Non-object top-level JSON array
+        ('[{"status": "ANSWERED"}]', ErrorCode.SCHEMA_VALIDATION_ERROR),
+        (
+            json.dumps({"status": "MAYBE", "answerText": "x", "citedRefIds": ["M1"]}),
+            ErrorCode.SCHEMA_VALIDATION_ERROR,
+        ),
+        (
+            json.dumps({"status": "ANSWERED", "answerText": 123, "citedRefIds": ["M1"]}),
+            ErrorCode.SCHEMA_VALIDATION_ERROR,
+        ),
+        (
+            json.dumps({"status": "ANSWERED", "answerText": "   ", "citedRefIds": ["M1"]}),
+            ErrorCode.SCHEMA_VALIDATION_ERROR,
+        ),
+        (
+            json.dumps({"status": "ANSWERED", "answerText": "ok", "citedRefIds": "M1"}),
+            ErrorCode.SCHEMA_VALIDATION_ERROR,
+        ),
         (
             json.dumps({"status": "ANSWERED", "answerText": "ok", "citedRefIds": ["M1"], "coverageNote": 99}),
             ErrorCode.SCHEMA_VALIDATION_ERROR,
@@ -750,12 +1076,14 @@ async def test_dm_assistant_malformed_llm_json_returns_502(
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         res = await client.post(ENDPOINT, headers=_dm_headers(), json=_sample_payload())
         assert res.status_code == 502
+        assert res.headers.get("cache-control") == "no-store"
         assert res.json()["error"]["code"] == expected_code
 
 
 @pytest.mark.asyncio
-async def test_dm_assistant_timeout_and_provider_errors_propagate_cleanly(
+async def test_dm_assistant_timeout_and_sanitized_provider_errors(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     monkeypatch.setattr(settings, "bff_service_token", VALID_SERVICE_TOKEN)
 
@@ -772,21 +1100,76 @@ async def test_dm_assistant_timeout_and_provider_errors_propagate_cleanly(
         assert res_slow.status_code == 503
         err_slow = res_slow.json()["error"]
         assert err_slow["code"] == ErrorCode.LLM_UNAVAILABLE
+        assert err_slow["message"] == _LLM_UNAVAILABLE_MESSAGE
         assert err_slow["retryable"] is True
 
     monkeypatch.setattr(settings, "llm_timeout_ms", 60_000)
 
-    # 2. Direct TimeoutError -> 503 llm_unavailable
-    timeout_app = _build_app(SimpleNamespace(configured=True, complete=AsyncMock(side_effect=TimeoutError("boom"))))
+    # 2. Direct TimeoutError -> 503 llm_unavailable with fixed safe copy
+    timeout_app = _build_app(
+        SimpleNamespace(configured=True, complete=AsyncMock(side_effect=TimeoutError("CONFIDENTIAL-DM-TEXT")))
+    )
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=timeout_app), base_url="http://test") as client:
         res_timeout = await client.post(ENDPOINT, headers=_dm_headers(), json=_sample_payload())
         assert res_timeout.status_code == 503
         assert res_timeout.json()["error"]["code"] == ErrorCode.LLM_UNAVAILABLE
-        assert res_timeout.json()["error"]["retryable"] is True
+        assert res_timeout.json()["error"]["message"] == _LLM_UNAVAILABLE_MESSAGE
+        assert "CONFIDENTIAL-DM-TEXT" not in res_timeout.text
 
-    # 3. Provider ServiceUnavailableError (429/5xx) -> 503 llm_unavailable
+    # 3. Raw provider 5xx exception embedding chat snippet -> 503 llm_unavailable, NEVER echoed in response or logs
+    class RawProvider5xxError(Exception):
+        def __init__(self, message: str, status_code: int) -> None:
+            super().__init__(message)
+            self.status_code = status_code
+
+    raw_secret_exc = RawProvider5xxError(
+        "Upstream 503 failed on prompt: CONFIDENTIAL-DM-TEXT",
+        status_code=503,
+    )
+    raw_app = _build_app(SimpleNamespace(configured=True, complete=AsyncMock(side_effect=raw_secret_exc)))
+    with caplog.at_level(logging.WARNING, logger="sag.dm_assistant"):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=raw_app), base_url="http://test") as client:
+            res_raw = await client.post(ENDPOINT, headers=_dm_headers(), json=_sample_payload())
+    assert res_raw.status_code == 503
+    assert res_raw.headers.get("cache-control") == "no-store"
+    err_raw = res_raw.json()["error"]
+    assert err_raw["code"] == ErrorCode.LLM_UNAVAILABLE
+    assert err_raw["message"] == _LLM_UNAVAILABLE_MESSAGE
+    assert err_raw["retryable"] is True
+    assert "CONFIDENTIAL-DM-TEXT" not in res_raw.text
+    assert "CONFIDENTIAL-DM-TEXT" not in "\n".join(r.getMessage() for r in caplog.records)
+
+    # 4. Real LLMClient._classify_llm_error for unknown 500/502/503/504 provider exceptions -> 503 llm_unavailable
+    for status_code in (500, 502, 503, 504):
+        async def _failing_litellm(*, _code: int = status_code, **_kwargs: Any) -> Any:
+            raise RawProvider5xxError(
+                f"Upstream {_code} failed on prompt: CONFIDENTIAL-DM-TEXT",
+                status_code=_code,
+            )
+
+        monkeypatch.setattr(llm_module, "_litellm_completion", _failing_litellm)
+        real_llm = LLMClient(
+            Settings(
+                _env_file=None,
+                llm_provider="openai",
+                llm_api_key="sk-test",
+                llm_model="gpt-4o-mini",
+                llm_max_retries=0,
+            )
+        )
+        real_app = _build_app(real_llm)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=real_app), base_url="http://test") as client:
+            res_5xx = await client.post(ENDPOINT, headers=_dm_headers(), json=_sample_payload())
+            assert res_5xx.status_code == 503, status_code
+            err_5xx = res_5xx.json()["error"]
+            assert err_5xx["code"] == ErrorCode.LLM_UNAVAILABLE
+            assert err_5xx["message"] == _LLM_UNAVAILABLE_MESSAGE
+            assert err_5xx["retryable"] is True
+            assert "CONFIDENTIAL-DM-TEXT" not in res_5xx.text
+
+    # 5. Provider ServiceUnavailableError (429/5xx) -> 503 llm_unavailable with sanitized message
     unavail_exc = ServiceUnavailableError(
-        "Rate limit exceeded",
+        "Rate limit exceeded on CONFIDENTIAL-DM-TEXT",
         code=ErrorCode.LLM_UNAVAILABLE,
         layer=ErrorLayer.LLM,
         stage=ErrorStage.GENERATE,
@@ -796,10 +1179,12 @@ async def test_dm_assistant_timeout_and_provider_errors_propagate_cleanly(
         res_unavail = await client.post(ENDPOINT, headers=_dm_headers(), json=_sample_payload())
         assert res_unavail.status_code == 503
         assert res_unavail.json()["error"]["code"] == ErrorCode.LLM_UNAVAILABLE
+        assert res_unavail.json()["error"]["message"] == _LLM_UNAVAILABLE_MESSAGE
+        assert "CONFIDENTIAL-DM-TEXT" not in res_unavail.text
 
-    # 4. Upstream bad request -> 502 llm_bad_request
+    # 6. Upstream bad request -> 502 llm_bad_request with sanitized message (never leaks prompt snippet)
     bad_req_exc = UpstreamError(
-        "Context window exceeded",
+        "Context window exceeded on CONFIDENTIAL-DM-TEXT",
         code=ErrorCode.LLM_BAD_REQUEST,
         layer=ErrorLayer.LLM,
         stage=ErrorStage.GENERATE,
@@ -809,6 +1194,7 @@ async def test_dm_assistant_timeout_and_provider_errors_propagate_cleanly(
         res_bad = await client.post(ENDPOINT, headers=_dm_headers(), json=_sample_payload())
         assert res_bad.status_code == 502
         assert res_bad.json()["error"]["code"] == ErrorCode.LLM_BAD_REQUEST
+        assert "CONFIDENTIAL-DM-TEXT" not in res_bad.text
 
 
 @pytest.mark.asyncio
@@ -866,6 +1252,8 @@ async def test_dm_assistant_prompt_injection_isolation_stateless_and_privacy_log
     body = res.json()
     assert body["status"] == "INSUFFICIENT_EVIDENCE"
     assert body["citedRefIds"] == []
+    assert body["answerText"] == _INSUFFICIENT_EVIDENCE_FALLBACK_VI
+    assert "SECRET_ANSWER_OUT" not in body["answerText"]
 
     # Verify untrusted-data delimiters wrap both question and messages
     assert len(captured_prompts) == 1
@@ -900,9 +1288,36 @@ def test_openapi_snapshot_matches_live_app_schema() -> None:
     live_schema = create_app().openapi()
 
     assert ENDPOINT in live_schema["paths"]
-    assert "post" in live_schema["paths"][ENDPOINT]
+    operation = live_schema["paths"][ENDPOINT]["post"]
     assert "DmAssistantAnswerRequest" in live_schema["components"]["schemas"]
     assert "DmAssistantAnswerResponse" in live_schema["components"]["schemas"]
+    assert "DmAssistantErrorEnvelopeOut" in live_schema["components"]["schemas"]
+
+    # Assert all 4 required headers are documented in OpenAPI parameters
+    header_params = {
+        param["name"]: param
+        for param in operation.get("parameters", [])
+        if param.get("in") == "header"
+    }
+    for required_header in (
+        "X-SAG-BFF-Service-Token",
+        "X-Continuum-Organization-Id",
+        "X-Continuum-User-Id",
+        "X-Continuum-Conversation-Id",
+    ):
+        assert required_header in header_params, f"Missing OpenAPI header: {required_header}"
+        assert header_params[required_header]["required"] is True
+
+    # Assert all success and error responses are documented with standard envelope schema
+    responses = operation.get("responses", {})
+    for status_code in ("200", "400", "403", "413", "422", "502", "503"):
+        assert status_code in responses, f"Missing OpenAPI response status: {status_code}"
+    for error_status in ("400", "403", "413", "422", "502", "503"):
+        schema_ref = responses[error_status]["content"]["application/json"]["schema"].get("$ref")
+        assert schema_ref == "#/components/schemas/DmAssistantErrorEnvelopeOut", (
+            f"Unexpected schema for {error_status}: {schema_ref}"
+        )
+
     assert snapshot == live_schema, (
         "SAG/docs/openapi/sag-api.openapi.json has drifted from create_app().openapi(). "
         "Regenerate the snapshot before committing."

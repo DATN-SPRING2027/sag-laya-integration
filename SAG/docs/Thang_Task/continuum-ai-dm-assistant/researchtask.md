@@ -177,3 +177,53 @@ All facts below were verified directly against tracked source files on `origin/m
   git log -1 --stat
   git push -u origin feat/Thang-continuum-ai-dm-sag-be-api
   ```
+
+---
+
+## 8. Codex Review Hardening Round (PR #92 — P1/P2/P3 Remediation)
+
+### 8.1. Verified Findings & Remediation Plan
+1. **[P1-3] Pre-Parser Auth & HTTP Body Byte-Cap Guard (`sag_api/api/v1/dm_assistant.py`, `sag_api/main.py`, `sag_api/core/error_taxonomy.py`, `sag_api/core/errors.py`):**
+   - FastAPI 0.139.0 parses request body JSON and Pydantic models before executing route `Depends(...)`, allowing unauthenticated malformed JSON (`422`) or unbounded body buffering before auth.
+   - Add `ErrorCode.PAYLOAD_TOO_LARGE = "payload_too_large"` and `PayloadTooLargeError` (`413`).
+   - Implement `DmAssistantGuardMiddleware` (registered in `create_app()`, plus defense-in-depth `DmAssistantRoute(APIRoute)`) scoped to `POST /api/v1/internal/dm-assistant/answer` that runs strictly before any body bytes are read:
+     - `503 service_unavailable` when `SAG_BFF_SERVICE_TOKEN` is unconfigured/blank.
+     - `403 forbidden` when `X-SAG-BFF-Service-Token` is missing/duplicate/invalid (including `Authorization: Bearer`-only callers) or any of the three 24-hex `X-Continuum-{Organization,User,Conversation}-Id` headers is missing/duplicate/invalid.
+     - `400 validation_error` when any query parameter is present or `Content-Length` is malformed/duplicate.
+     - `413 payload_too_large` (with `Cache-Control: no-store`) when `Content-Length > 65_536` (64 KiB) OR when streamed ASGI `receive` chunks exceed `65_536` bytes without buffering unbounded memory.
+   - Ensure `Cache-Control: no-store` is set on every response (success and error) for `/api/v1/internal/dm-assistant/answer`.
+2. **[P2-5] Strict Single JSON Object, Inline `[M#]` Ref Binding & Deterministic `INSUFFICIENT_EVIDENCE` Copy (`sag_api/services/dm_assistant_service.py`):**
+   - Replace permissive `decode_json_object` fallback with strict single-JSON-object parsing: strip only well-formed leading `<think>...</think>` and at most one outer surrounding markdown code fence, then require `json.loads` to decode the entire remaining string into one JSON object (`dict`); reject mixed prose, trailing text, multiple objects, or unclosed `<think>` with `502 schema_validation_error`.
+   - Scan `answerText` for all inline `[M(\d+)]`, `[M[^\]]*]`, and lowercase `[m\d+]` citation tokens; reject any inline token not in input `valid_ref_ids` with `502 schema_validation_error`.
+   - On all `INSUFFICIENT_EVIDENCE` outputs (empty short-circuit, model-declared insufficient, or uncited `ANSWERED` downgrade), discard free-form model text and return deterministic emoji-free Vietnamese (default) or English copy with `citedRefIds: []`.
+3. **[P2-6] OpenAPI Snapshot Parity & Sanitized 422 Envelope (`sag_api/main.py`, `sag_api/api/v1/dm_assistant.py`, `sag_api/schemas/dm_assistant.py`, `SAG/docs/openapi/sag-api.openapi.json`):**
+   - Register a global `RequestValidationError` (`422`) handler in `main.py` emitting the standard `{"error": {"code": "validation_error", ...}}` envelope while stripping raw `input` and `ctx` values so user questions/DM text are never echoed back.
+   - Document all 4 required headers (`X-SAG-BFF-Service-Token`, `X-Continuum-Organization-Id`, `X-Continuum-User-Id`, `X-Continuum-Conversation-Id`) and all error responses (`400`, `403`, `413`, `422`, `502`, `503`) on `POST /api/v1/internal/dm-assistant/answer` and regenerate `SAG/docs/openapi/sag-api.openapi.json`.
+4. **[P2-7] Sanitized Provider Errors & Consistent `503 llm_unavailable` Mapping (`sag_api/generation/llm.py`, `sag_api/services/dm_assistant_service.py`):**
+   - Expand `_classify_llm_error()` in `llm.py` so all provider `5xx` (`500 <= status < 600`), `408`, `429`, and connection/timeout errors map consistently to `503 ServiceUnavailableError(code=ErrorCode.LLM_UNAVAILABLE)`.
+   - Never expose raw provider exception strings in DM assistant HTTP responses or logs: map all LLM timeouts, 429, 5xx, network, and generic provider errors to `503 llm_unavailable` (`retryable: true`) with fixed safe message `"DM assistant LLM synthesis is temporarily unavailable."`, and sanitize `400`/`502` LLM errors to fixed safe copy.
+5. **[P3-1] Strict RFC 3339 Timestamp Validation & Explicit UTC Conversion (`sag_api/schemas/dm_assistant.py`, `sag_api/services/dm_assistant_service.py`):**
+   - Require strict RFC 3339 datetime strings with explicit `Z` or `±HH:MM` offset on `referenceNowIso` and `sentAtIso` (rejecting numeric ints/floats and digit-only Unix timestamp strings such as `"1700000000"`).
+   - Explicitly convert `.astimezone(timezone.utc)` before formatting UTC prompt timestamps (`referenceNowUtc` and `utc=...`) using canonical `Z` notation.
+
+### 8.2. Hardening Verification Results
+- **Changed Files (`10` files on `feat/Thang-continuum-ai-dm-sag-be-api`):**
+  - `SAG/docs/Thang_Task/continuum-ai-dm-assistant/researchtask.md` — Recorded PR #92 Codex hardening plan and verified outcomes.
+  - `SAG/apps/api/sag_api/core/error_taxonomy.py` — Added `ErrorCode.PAYLOAD_TOO_LARGE = "payload_too_large"`.
+  - `SAG/apps/api/sag_api/core/errors.py` — Added `PayloadTooLargeError` (`413`).
+  - `SAG/apps/api/sag_api/generation/llm.py` — Expanded `_classify_llm_error` so all provider `5xx` (`500 <= status < 600`), `408`, `429`, and connection/timeout errors map consistently to `503 ServiceUnavailableError(code=ErrorCode.LLM_UNAVAILABLE)`.
+  - `SAG/apps/api/sag_api/main.py` — Mounted `DmAssistantGuardMiddleware` and registered sanitized `RequestValidationError` (`422`) handler returning standard `{"error": {"code": "validation_error", ..., "fields": [...]}}` without raw `input`/`ctx`.
+  - `SAG/apps/api/sag_api/schemas/dm_assistant.py` — Enforced strict RFC 3339 timestamps with explicit `Z` or `±HH:MM` offset (rejecting numeric/digit-only Unix timestamps) and added `DmAssistantErrorEnvelopeOut` OpenAPI schemas.
+  - `SAG/apps/api/sag_api/api/v1/dm_assistant.py` — Added `DmAssistantGuardMiddleware` + `DmAssistantRoute` pre-parser auth/query/64 KiB body byte-cap guard (`403`/`503`/`400`/`413` + `Cache-Control: no-store`), explicit OpenAPI `Header(...)` declarations for all 4 required headers, and explicit OpenAPI error response schemas (`400`/`403`/`413`/`422`/`502`/`503`).
+  - `SAG/apps/api/sag_api/services/dm_assistant_service.py` — Added strict single-JSON-object parser (`_parse_strict_json_object`), inline `[M#]` / `[M...]` / `[m#]` ref validation (`_validate_inline_citations`), deterministic emoji-free VI/EN copy for all `INSUFFICIENT_EVIDENCE` paths, sanitized fixed-copy LLM error mapping (`503 llm_unavailable`), and explicit UTC `.astimezone(UTC)` (`Z`) prompt timestamp normalization.
+  - `SAG/docs/openapi/sag-api.openapi.json` — Regenerated from live `create_app().openapi()`.
+  - `SAG/apps/api/tests/test_dm_assistant_api.py` — Expanded suite using live `create_app()` covering pre-parser `403`/`503`/`400` on malformed/oversized bodies, `Content-Length` + streamed chunked `413 payload_too_large`, strict JSON & inline `[M#]` refusal (`502`), deterministic VI/EN `INSUFFICIENT_EVIDENCE` copy, non-echoing sanitized `422` envelope, raw 5xx provider error sanitization (`503 llm_unavailable`), RFC 3339 Unix rejection + `+07:00 -> Z` UTC normalization, and OpenAPI header/response parity.
+- **Checks Executed (`$env:UV_PROJECT_ENVIRONMENT='C:\Users\KAYT\.cache\sag-api-venv'`):**
+  - `uv run --no-sync ruff check sag_api tests` → **PASS** (`All checks passed!`, exit `0`)
+  - `uv run --no-sync pytest -q tests/test_dm_assistant_api.py tests/test_handover_assist.py tests/test_p1_runtime_llm_prompt.py tests/test_full_audit_remediation.py tests/test_p2_json_and_protocol.py` → **PASS** (`84 passed in 24.96s`, exit `0`)
+  - `uv run --no-sync pytest -q --ignore=tests/test_litellm_mcp_compatibility.py` → **PASS** (`955 passed, 5 skipped, 0 failed in 257.96s`, exit `0`; only the pre-existing Windows-local `litellm==1.111.0` fixture in `test_litellm_mcp_compatibility.py` ignored as documented in §6)
+- **Database / Configuration / Security / Rollback Impact:**
+  - **Database / Migrations:** **None.**
+  - **Configuration:** **None.**
+  - **Security & Privacy:** Eliminates unauthenticated JSON parsing / unbounded body buffering (`403`/`503` before reading body, `413` at `65_536` bytes), strips raw user input from all `422` validation responses, sanitizes all upstream LLM provider exceptions to fixed safe copy in both HTTP responses and logs, blocks mixed-prose JSON and fabricated inline `[M#]` citations (`502`), enforces deterministic `INSUFFICIENT_EVIDENCE` copy, and guarantees `Cache-Control: no-store` on all DM assistant responses.
+  - **Rollback:** Revert the hardening commit on `feat/Thang-continuum-ai-dm-sag-be-api`; zero schema or migration rollback needed.

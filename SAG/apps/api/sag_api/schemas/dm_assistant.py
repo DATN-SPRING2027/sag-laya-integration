@@ -13,6 +13,9 @@ DmAssistantStatus = Literal["ANSWERED", "INSUFFICIENT_EVIDENCE"]
 
 DM_REF_ID_PATTERN = r"^M[1-9][0-9]{0,2}$"
 DM_REF_ID_RE = re.compile(DM_REF_ID_PATTERN)
+_RFC3339_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:[Zz]|[+-]\d{2}:\d{2})$"
+)
 
 MAX_DM_QUESTION_CHARS = 2_000
 MAX_DM_TIMEZONE_CHARS = 64
@@ -32,15 +35,15 @@ def _strip_if_str(value: object) -> object:
     return value
 
 
-def _reject_numeric_timestamp(value: object) -> object:
-    if isinstance(value, (bool, int, float)):
-        raise ValueError("Timestamp must be an ISO-8601 string with timezone offset")
-    if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped:
-            raise ValueError("Timestamp must be a non-empty ISO-8601 string")
-        return stripped
-    return value
+def _validate_rfc3339_timestamp(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("Timestamp must be an RFC 3339 datetime string with explicit timezone offset")
+    stripped = value.strip()
+    if not stripped or not _RFC3339_DATETIME_RE.fullmatch(stripped):
+        raise ValueError(
+            "Timestamp must be an RFC 3339 datetime string with explicit timezone offset (Z or ±HH:MM)"
+        )
+    return stripped
 
 
 class StrictModel(BaseModel):
@@ -67,8 +70,8 @@ class DmAssistantMessageInput(StrictModel):
 
     @field_validator("sentAtIso", mode="before")
     @classmethod
-    def _validate_sent_at_type(cls, value: object) -> object:
-        return _reject_numeric_timestamp(value)
+    def _validate_sent_at_type(cls, value: object) -> str:
+        return _validate_rfc3339_timestamp(value)
 
 
 class DmAssistantAnswerRequest(StrictModel):
@@ -95,8 +98,8 @@ class DmAssistantAnswerRequest(StrictModel):
 
     @field_validator("referenceNowIso", mode="before")
     @classmethod
-    def _validate_reference_now_type(cls, value: object) -> object:
-        return _reject_numeric_timestamp(value)
+    def _validate_reference_now_type(cls, value: object) -> str:
+        return _validate_rfc3339_timestamp(value)
 
     @field_validator("timezone")
     @classmethod
@@ -113,13 +116,12 @@ class DmAssistantAnswerRequest(StrictModel):
         total_chars = 0
         for message in self.messages:
             if message.refId in seen_refs:
-                raise ValueError(f"Duplicate message refId: {message.refId}")
+                raise ValueError("Duplicate message refId")
             seen_refs.add(message.refId)
             total_chars += len(message.text)
         if total_chars > MAX_DM_TOTAL_CONTEXT_CHARS:
             raise ValueError(
-                f"Total message text length ({total_chars}) exceeds hard limit of "
-                f"{MAX_DM_TOTAL_CONTEXT_CHARS} characters"
+                f"Total message text length exceeds hard limit of {MAX_DM_TOTAL_CONTEXT_CHARS} characters"
             )
         return self
 
@@ -145,12 +147,32 @@ class DmAssistantAnswerResponse(StrictModel):
         seen: set[str] = set()
         for ref_id in self.citedRefIds:
             if ref_id != ref_id.strip() or not DM_REF_ID_RE.fullmatch(ref_id):
-                raise ValueError(f"Invalid citedRefId format: {ref_id}")
+                raise ValueError("Invalid citedRefId format")
             if ref_id in seen:
-                raise ValueError(f"Duplicate citedRefId: {ref_id}")
+                raise ValueError("Duplicate citedRefId")
             seen.add(ref_id)
         if self.status == "ANSWERED" and not self.citedRefIds:
             raise ValueError("ANSWERED status requires at least one citedRefId")
         if self.status == "INSUFFICIENT_EVIDENCE" and self.citedRefIds:
             raise ValueError("INSUFFICIENT_EVIDENCE status must not include citedRefIds")
         return self
+
+
+class DmAssistantErrorFieldOut(StrictModel):
+    loc: list[str | int]
+    type: str
+    msg: str
+
+
+class DmAssistantErrorDetailOut(StrictModel):
+    code: str
+    message: str
+    layer: str
+    stage: str
+    retryable: bool
+    request_id: str | None = None
+    fields: list[DmAssistantErrorFieldOut] | None = None
+
+
+class DmAssistantErrorEnvelopeOut(StrictModel):
+    error: DmAssistantErrorDetailOut

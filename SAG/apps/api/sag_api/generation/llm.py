@@ -111,15 +111,28 @@ def _classify_llm_error(e: Exception, *, stage: ErrorStage) -> ApiError:
     status = getattr(e, "status_code", None)
     safe_text = sanitize_llm_error_message(e)
     detail = f"{name}: {safe_text}" if safe_text else name
-    # 超时 / 限流 / 服务暂不可用 —— 可安全重试
+    # 超时 / 限流 / 连接失败 / 5xx 服务暂不可用 —— 可安全重试
     _retryable_names = {
         "Timeout",
+        "TimeoutError",
         "APITimeoutError",
+        "APIConnectionError",
         "RateLimitError",
         "ServiceUnavailableError",
         "InternalServerError",
+        "BadGatewayError",
+        "GatewayTimeoutError",
+        "ConnectError",
+        "ConnectTimeout",
+        "ReadTimeout",
+        "WriteTimeout",
+        "PoolTimeout",
+        "RemoteProtocolError",
     }
-    if name in _retryable_names or status in {408, 429, 503}:
+    is_retryable_status = status in {408, 429} or (
+        isinstance(status, int) and not isinstance(status, bool) and 500 <= status < 600
+    )
+    if name in _retryable_names or isinstance(e, (TimeoutError, ConnectionError)) or is_retryable_status:
         return ServiceUnavailableError(
             f"模型调用暂时失败（{name}），请稍后重试：{safe_text}",
             code=ErrorCode.LLM_UNAVAILABLE,
