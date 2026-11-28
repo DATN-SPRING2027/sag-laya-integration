@@ -1573,6 +1573,206 @@
         "title": "DifyRetrievalSetting",
         "type": "object"
       },
+      "DmAssistantAnswerRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "coverageHint": {
+            "anyOf": [
+              {
+                "maxLength": 500,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Coveragehint"
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/DmAssistantMessageInput"
+            },
+            "maxItems": 80,
+            "title": "Messages",
+            "type": "array"
+          },
+          "partialCoverage": {
+            "default": false,
+            "title": "Partialcoverage",
+            "type": "boolean"
+          },
+          "queryMode": {
+            "enum": [
+              "TIME_WINDOW",
+              "KEYWORD",
+              "HYBRID"
+            ],
+            "title": "Querymode",
+            "type": "string"
+          },
+          "question": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Question",
+            "type": "string"
+          },
+          "referenceNowIso": {
+            "format": "date-time",
+            "title": "Referencenowiso",
+            "type": "string"
+          },
+          "timezone": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Timezone",
+            "type": "string"
+          }
+        },
+        "required": [
+          "question",
+          "timezone",
+          "referenceNowIso",
+          "queryMode",
+          "messages"
+        ],
+        "title": "DmAssistantAnswerRequest",
+        "type": "object"
+      },
+      "DmAssistantAnswerResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "answerText": {
+            "maxLength": 4000,
+            "minLength": 1,
+            "title": "Answertext",
+            "type": "string"
+          },
+          "citedRefIds": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 20,
+            "title": "Citedrefids",
+            "type": "array"
+          },
+          "coverageNote": {
+            "anyOf": [
+              {
+                "maxLength": 500,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Coveragenote"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "status": {
+            "enum": [
+              "ANSWERED",
+              "INSUFFICIENT_EVIDENCE"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/DmAssistantUsageOut"
+          }
+        },
+        "required": [
+          "status",
+          "answerText",
+          "usage"
+        ],
+        "title": "DmAssistantAnswerResponse",
+        "type": "object"
+      },
+      "DmAssistantMessageInput": {
+        "additionalProperties": false,
+        "properties": {
+          "refId": {
+            "maxLength": 4,
+            "minLength": 2,
+            "pattern": "^M[1-9][0-9]{0,2}$",
+            "title": "Refid",
+            "type": "string"
+          },
+          "senderLabel": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Senderlabel",
+            "type": "string"
+          },
+          "sentAtIso": {
+            "format": "date-time",
+            "title": "Sentatiso",
+            "type": "string"
+          },
+          "text": {
+            "maxLength": 1200,
+            "minLength": 1,
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "refId",
+          "senderLabel",
+          "sentAtIso",
+          "text"
+        ],
+        "title": "DmAssistantMessageInput",
+        "type": "object"
+      },
+      "DmAssistantUsageOut": {
+        "additionalProperties": false,
+        "properties": {
+          "cachedTokens": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Cachedtokens",
+            "type": "integer"
+          },
+          "calls": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Calls",
+            "type": "integer"
+          },
+          "inputTokens": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Inputtokens",
+            "type": "integer"
+          },
+          "outputTokens": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Outputtokens",
+            "type": "integer"
+          },
+          "totalTokens": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Totaltokens",
+            "type": "integer"
+          }
+        },
+        "title": "DmAssistantUsageOut",
+        "type": "object"
+      },
       "DocumentExtractedChunkItem": {
         "properties": {
           "block_type": {
@@ -11465,6 +11665,47 @@
         ]
       }
     },
+    "/api/v1/internal/dm-assistant/answer": {
+      "post": {
+        "operationId": "answer_dm_question_api_v1_internal_dm_assistant_answer_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DmAssistantAnswerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DmAssistantAnswerResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Synthesize a grounded answer strictly from Continuum-supplied 1-on-1 DM excerpts",
+        "tags": [
+          "dm-assistant"
+        ]
+      }
+    },
     "/api/v1/jobs/{job_id}": {
       "get": {
         "operationId": "get_job_api_v1_jobs__job_id__get",
@@ -13945,7 +14186,7 @@
     },
     "/api/v1/sources/{source_id}/documents/{document_id}/file": {
       "get": {
-        "description": "Original file (preview/download). Returns 404 when file has been cleaned up.",
+        "description": "Original file download. Always forces attachment + safe MIME for active content.",
         "operationId": "get_file_api_v1_sources__source_id__documents__document_id__file_get",
         "parameters": [
           {
@@ -14260,7 +14501,7 @@
     },
     "/api/v1/sources/{source_id}/documents/{document_id}/preview": {
       "get": {
-        "description": "Return preview directly consumable by browser; text is normalized to UTF-8 while download preserves raw bytes.",
+        "description": "Return preview directly consumable by browser; text is normalized to UTF-8 while active content is forced to safe attachment.",
         "operationId": "get_preview_api_v1_sources__source_id__documents__document_id__preview_get",
         "parameters": [
           {
