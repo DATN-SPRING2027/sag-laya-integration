@@ -11879,7 +11879,7 @@
                 }
               }
             },
-            "description": "Request body exceeds the 64 KiB hard HTTP byte limit."
+            "description": "Request body exceeds the 128 KiB hard HTTP byte limit."
           },
           "422": {
             "content": {

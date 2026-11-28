@@ -4,7 +4,7 @@ Security & architectural invariants:
 - ZERO PostgreSQL, Qdrant, document, attachment, or external web retrieval.
 - Operates strictly on the Continuum Chat BE-supplied message excerpts [M1..Mn].
 - Treats user question and DM excerpts strictly as untrusted conversation data.
-- Refuses mixed prose/non-JSON output, trailing text, or any fabricated cited/inline refId (502).
+- Refuses mixed prose/non-JSON output, trailing text, or any fabricated/unlinked cited or inline refId (502).
 - Returns fixed deterministic copy for all INSUFFICIENT_EVIDENCE outcomes.
 - Never echoes raw upstream LLM provider exception messages into HTTP responses or logs.
 - Never logs question text, message bodies, sender names, answers, or secrets.
@@ -221,8 +221,8 @@ _SYSTEM_PROMPT = (
     '"answerText": "<string 1..4000 chars>", '
     '"citedRefIds": ["M1", ...], '
     '"coverageNote": "<string <=500 chars or null>"}\n'
-    "- Every entry in citedRefIds and every inline [M#] token in answerText MUST be an exact refId from "
-    "the supplied messages list.\n"
+    "- Every entry in citedRefIds MUST be an exact refId from the supplied messages list (at most 20 unique "
+    "refs), and every inline [M#] token in answerText MUST appear in citedRefIds.\n"
     "- When status is \"ANSWERED\", citedRefIds MUST be non-empty and support every factual claim.\n"
     "- When the supplied messages do not contain enough evidence (or the question asks for out-of-scope "
     "data), set status to \"INSUFFICIENT_EVIDENCE\" and citedRefIds to [].\n"
@@ -336,20 +336,20 @@ def _parse_strict_json_object(raw_completion: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _validate_inline_citations(answer_text: str, valid_ref_ids: set[str]) -> None:
+def _validate_inline_citations(answer_text: str, allowed_ref_ids: set[str]) -> None:
     for digits in _INLINE_M_DIGITS_RE.findall(answer_text):
-        if f"M{digits}" not in valid_ref_ids:
+        if f"M{digits}" not in allowed_ref_ids:
             raise UpstreamError(
-                "LLM cited unknown inline message references",
+                "LLM cited inline message references not in final citedRefIds",
                 code=ErrorCode.SCHEMA_VALIDATION_ERROR,
                 layer=ErrorLayer.LLM,
                 stage=ErrorStage.GENERATE,
             )
     for token in _INLINE_M_BRACKET_RE.findall(answer_text):
         inner = token[1:-1]
-        if inner not in valid_ref_ids:
+        if inner not in allowed_ref_ids:
             raise UpstreamError(
-                "LLM cited unknown inline message references",
+                "LLM cited inline message references not in final citedRefIds",
                 code=ErrorCode.SCHEMA_VALIDATION_ERROR,
                 layer=ErrorLayer.LLM,
                 stage=ErrorStage.GENERATE,
@@ -504,7 +504,7 @@ def _parse_and_validate_llm_output(
             seen_refs.add(ref_id)
             deduped_refs.append(ref_id)
 
-    _validate_inline_citations(answer_text, valid_ref_ids)
+    final_cited_ref_ids = deduped_refs[:MAX_DM_CITED_REFS]
 
     raw_coverage = parsed.get("coverageNote")
     if raw_coverage is not None and not isinstance(raw_coverage, str):
@@ -527,7 +527,8 @@ def _parse_and_validate_llm_output(
                 layer=ErrorLayer.LLM,
                 stage=ErrorStage.GENERATE,
             )
-        if not deduped_refs:
+        _validate_inline_citations(answer_text, set(final_cited_ref_ids))
+        if not final_cited_ref_ids:
             return (
                 "INSUFFICIENT_EVIDENCE",
                 _deterministic_insufficient_copy(is_english),
@@ -542,10 +543,11 @@ def _parse_and_validate_llm_output(
         return (
             "ANSWERED",
             _clamp_text(answer_text, MAX_DM_ANSWER_CHARS),
-            deduped_refs[:MAX_DM_CITED_REFS],
+            final_cited_ref_ids,
             coverage_note,
         )
 
+    _validate_inline_citations(answer_text, valid_ref_ids)
     return (
         "INSUFFICIENT_EVIDENCE",
         _deterministic_insufficient_copy(is_english),

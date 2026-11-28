@@ -9,13 +9,14 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request
+from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from sag_api import __version__
 from sag_api.api.v1 import api_router
-from sag_api.api.v1.dm_assistant import DmAssistantGuardMiddleware
+from sag_api.api.v1.dm_assistant import DM_ASSISTANT_ANSWER_PATH, DmAssistantGuardMiddleware
 from sag_api.branding import PRODUCT_NAME
 from sag_api.core.config import _INSECURE_SECRETS, settings
 from sag_api.core.db import SessionLocal, dispose_db, init_db
@@ -158,6 +159,9 @@ def create_app() -> FastAPI:
         request: Request,
         exc: RequestValidationError,
     ) -> JSONResponse:
+        if request.url.path.rstrip("/") != DM_ASSISTANT_ANSWER_PATH:
+            return await request_validation_exception_handler(request, exc)
+
         request_id = getattr(request.state, "request_id", None)
         fields: list[dict[str, object]] = []
         for err in exc.errors()[:20]:
@@ -177,7 +181,11 @@ def create_app() -> FastAPI:
         }
         if request_id:
             error["request_id"] = request_id
-        return JSONResponse(status_code=422, content={"error": error})
+        return JSONResponse(
+            status_code=422,
+            content={"error": error},
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.exception_handler(Exception)
     async def _handle_unexpected(request: Request, exc: Exception) -> JSONResponse:

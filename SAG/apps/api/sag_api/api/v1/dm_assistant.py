@@ -32,7 +32,8 @@ from sag_api.schemas.dm_assistant import (
 from sag_api.services.dm_assistant_service import generate_dm_assistant_answer
 
 DM_ASSISTANT_ANSWER_PATH = "/api/v1/internal/dm-assistant/answer"
-DM_ASSISTANT_MAX_BODY_BYTES = 65_536
+DM_ASSISTANT_MAX_BODY_BYTES = 131_072
+_BODY_TOO_LARGE_MESSAGE = "DM assistant request body exceeds 128 KiB limit"
 _HEX24_PATTERN = r"^[a-fA-F0-9]{24}$"
 _HEX24_RE = re.compile(_HEX24_PATTERN)
 _NO_STORE_HEADERS = {"Cache-Control": "no-store"}
@@ -48,7 +49,7 @@ _DM_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     },
     413: {
         "model": DmAssistantErrorEnvelopeOut,
-        "description": "Request body exceeds the 64 KiB hard HTTP byte limit.",
+        "description": "Request body exceeds the 128 KiB hard HTTP byte limit.",
     },
     422: {
         "model": DmAssistantErrorEnvelopeOut,
@@ -97,7 +98,7 @@ def _check_content_length_header(request: Request, max_body_bytes: int) -> None:
     if not raw_length or not raw_length.isascii() or not raw_length.isdigit():
         raise BadRequestError("Invalid Content-Length header")
     if int(raw_length) > max_body_bytes:
-        raise PayloadTooLargeError("DM assistant request body exceeds 64 KiB limit")
+        raise PayloadTooLargeError(_BODY_TOO_LARGE_MESSAGE)
 
 
 async def verify_dm_assistant_request_headers(request: Request) -> DmAssistantContext:
@@ -128,13 +129,13 @@ async def _enforce_body_limit_on_request(request: Request, max_body_bytes: int) 
     async for chunk in request.stream():
         total_bytes += len(chunk)
         if total_bytes > max_body_bytes:
-            raise PayloadTooLargeError("DM assistant request body exceeds 64 KiB limit")
+            raise PayloadTooLargeError(_BODY_TOO_LARGE_MESSAGE)
         buffered.extend(chunk)
     request._body = bytes(buffered)
 
 
 class DmAssistantGuardMiddleware:
-    """Pure ASGI pre-parser auth and 64 KiB body-cap guard scoped to the DM assistant endpoint."""
+    """Pure ASGI pre-parser auth and 128 KiB body-cap guard scoped to the DM assistant endpoint."""
 
     def __init__(self, app: ASGIApp, *, max_body_bytes: int = DM_ASSISTANT_MAX_BODY_BYTES) -> None:
         self.app = app
@@ -175,7 +176,7 @@ class DmAssistantGuardMiddleware:
                     scope,
                     receive,
                     send,
-                    PayloadTooLargeError("DM assistant request body exceeds 64 KiB limit"),
+                    PayloadTooLargeError(_BODY_TOO_LARGE_MESSAGE),
                     request_id=request_id,
                 )
                 return

@@ -134,7 +134,7 @@ async def test_dm_assistant_auth_fail_closed_and_header_validation(
         assert malformed_unauth.headers.get("cache-control") == "no-store"
         assert malformed_unauth.json()["error"]["code"] == ErrorCode.FORBIDDEN
 
-        # Missing BFF service token with > 64 KiB body -> 403 (NOT 413/422)
+        # Missing BFF service token with > 128 KiB body -> 403 (NOT 413/422)
         huge_unauth = await client.post(
             ENDPOINT,
             headers={**_dm_headers(token=None), "Content-Type": "application/json"},
@@ -220,15 +220,57 @@ async def test_dm_assistant_auth_fail_closed_and_header_validation(
 
 
 @pytest.mark.asyncio
-async def test_dm_assistant_enforces_http_64kib_body_byte_cap(
+async def test_dm_assistant_enforces_http_128kib_body_byte_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    assert DM_ASSISTANT_MAX_BODY_BYTES == 131_072
     monkeypatch.setattr(settings, "bff_service_token", VALID_SERVICE_TOKEN)
-    llm = SimpleNamespace(configured=True, complete=AsyncMock(return_value="{}"))
+    llm = SimpleNamespace(
+        configured=True,
+        complete=AsyncMock(
+            return_value=json.dumps(
+                {
+                    "status": "ANSWERED",
+                    "answerText": "Đã tổng hợp đầy đủ ngữ cảnh tiếng Việt [M1].",
+                    "citedRefIds": ["M1"],
+                    "coverageNote": None,
+                },
+                ensure_ascii=False,
+            )
+        ),
+    )
     app = _build_app(llm)
 
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-        # 1. Authenticated request with Content-Length > 64 KiB -> 413 payload_too_large
+        # 1. Valid ~90 KiB Vietnamese UTF-8 payload within 24,000 message chars -> 200 ACCEPTED (NOT 413)
+        vi_payload = _sample_payload(
+            question="Tóm tắt giúp mình: " + ("ế" * 1_800),
+            coverageHint="ế" * 480,
+            messages=[
+                {
+                    "refId": f"M{i}",
+                    "senderLabel": "Nguyễn Thị Phương Thảo — " + ("ế" * 90),
+                    "sentAtIso": "2026-11-27T08:15:00.000Z",
+                    "text": "ế" * 600,
+                }
+                for i in range(1, 41)
+            ],
+        )
+        assert sum(len(m["text"]) for m in vi_payload["messages"]) == 24_000
+        vi_bytes = json.dumps(vi_payload, ensure_ascii=False).encode("utf-8")
+        assert 85_000 <= len(vi_bytes) <= 114_688
+        res_vi = await client.post(
+            ENDPOINT,
+            headers={**_dm_headers(), "Content-Type": "application/json"},
+            content=vi_bytes,
+        )
+        assert res_vi.status_code == 200
+        assert res_vi.headers.get("cache-control") == "no-store"
+        assert res_vi.json()["status"] == "ANSWERED"
+        assert llm.complete.await_count == 1
+        llm.complete.reset_mock()
+
+        # 2. Authenticated request with Content-Length > 128 KiB -> 413 payload_too_large
         oversized_bytes = b'{"question":"' + (b"a" * (DM_ASSISTANT_MAX_BODY_BYTES + 1024)) + b'"}'
         res_cl = await client.post(
             ENDPOINT,
@@ -241,7 +283,7 @@ async def test_dm_assistant_enforces_http_64kib_body_byte_cap(
         assert err_cl["code"] == ErrorCode.PAYLOAD_TOO_LARGE
         assert err_cl["retryable"] is False
 
-        # 2. Authenticated chunked/streaming body > 64 KiB (no Content-Length) -> 413 payload_too_large
+        # 3. Authenticated chunked/streaming body > 128 KiB (no Content-Length) -> 413 payload_too_large
         chunks_yielded = 0
 
         async def _chunked_oversized_stream() -> AsyncIterator[bytes]:
@@ -258,10 +300,10 @@ async def test_dm_assistant_enforces_http_64kib_body_byte_cap(
         assert res_chunked.status_code == 413
         assert res_chunked.headers.get("cache-control") == "no-store"
         assert res_chunked.json()["error"]["code"] == ErrorCode.PAYLOAD_TOO_LARGE
-        # Guard aborts immediately once cumulative bytes > 65_536 instead of buffering the full 512 KiB stream
-        assert chunks_yielded <= 6
+        # Guard aborts immediately once cumulative bytes > 131_072 instead of buffering the full 512 KiB stream
+        assert chunks_yielded <= 10
 
-        # 3. Malformed Content-Length header -> 400 validation_error
+        # 4. Malformed Content-Length header -> 400 validation_error
         res_bad_cl = await client.post(
             ENDPOINT,
             headers={**_dm_headers(), "Content-Type": "application/json", "Content-Length": "not-an-int"},
@@ -561,6 +603,41 @@ async def test_dm_assistant_422_envelope_never_echoes_submitted_question_or_mess
         assert res_json.headers.get("cache-control") == "no-store"
         assert res_json.json()["error"]["code"] == ErrorCode.VALIDATION_ERROR
         assert malformed_secret not in res_json.text
+
+    llm.complete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dm_assistant_422_handler_scoped_strictly_to_dm_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "bff_service_token", VALID_SERVICE_TOKEN)
+    llm = SimpleNamespace(configured=True, complete=AsyncMock(return_value="{}"))
+    app = _build_app(llm)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        # Existing non-DM validated POST route MUST preserve standard FastAPI HTTPValidationError ({"detail": [...]})
+        non_dm_res = await client.post("/api/v1/auth/register", json={"invalid": True})
+        assert non_dm_res.status_code == 422
+        non_dm_body = non_dm_res.json()
+        assert "detail" in non_dm_body
+        assert isinstance(non_dm_body["detail"], list) and non_dm_body["detail"]
+        assert "error" not in non_dm_body
+
+        # DM assistant route MUST return the sanitized custom 422 envelope without echoing raw input
+        secret_input = "SECRET-DM-ONLY-422-INPUT"
+        dm_res = await client.post(
+            ENDPOINT,
+            headers=_dm_headers(),
+            json=_sample_payload(question=f"{secret_input}-" + ("q" * 2000)),
+        )
+        assert dm_res.status_code == 422
+        assert dm_res.headers.get("cache-control") == "no-store"
+        dm_body = dm_res.json()
+        assert "error" in dm_body
+        assert "detail" not in dm_body
+        assert dm_body["error"]["code"] == ErrorCode.VALIDATION_ERROR
+        assert secret_input not in dm_res.text
 
     llm.complete.assert_not_awaited()
 
@@ -889,6 +966,161 @@ async def test_dm_assistant_rejects_fabricated_or_invalid_ref_ids_with_502(
         assert err["code"] == ErrorCode.SCHEMA_VALIDATION_ERROR
         assert err["layer"] == ErrorLayer.LLM.value
         assert err["stage"] == ErrorStage.GENERATE.value
+
+
+@pytest.mark.asyncio
+async def test_dm_assistant_binds_inline_citations_to_final_cited_ref_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "bff_service_token", VALID_SERVICE_TOKEN)
+
+    two_message_payload = _sample_payload(
+        messages=[
+            {
+                "refId": "M1",
+                "senderLabel": "Nguyễn An",
+                "sentAtIso": "2026-11-27T08:00:00Z",
+                "text": "PAY-123 chốt deadline 29/11.",
+            },
+            {
+                "refId": "M2",
+                "senderLabel": "Trần Bình",
+                "sentAtIso": "2026-11-27T08:05:00Z",
+                "text": "Xác nhận deploy lúc 17:00.",
+            },
+        ]
+    )
+
+    twenty_one_message_payload = _sample_payload(
+        messages=[
+            {
+                "refId": f"M{i}",
+                "senderLabel": "Nguyễn An",
+                "sentAtIso": f"2026-11-27T08:{i:02d}:00Z",
+                "text": f"Cập nhật hạng mục số {i}.",
+            }
+            for i in range(1, 22)
+        ]
+    )
+
+    # 1. Model cites valid input [M2] inline while citedRefIds only contains ["M1"] -> 502 schema_validation_error
+    llm_missing_from_cited = SimpleNamespace(
+        configured=True,
+        complete=AsyncMock(
+            return_value=json.dumps(
+                {
+                    "status": "ANSWERED",
+                    "answerText": "Deadline 29/11 [M1] và deploy lúc 17:00 [M2].",
+                    "citedRefIds": ["M1"],
+                    "coverageNote": None,
+                },
+                ensure_ascii=False,
+            )
+        ),
+    )
+    app_missing = _build_app(llm_missing_from_cited)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app_missing), base_url="http://test") as client:
+        res_missing = await client.post(ENDPOINT, headers=_dm_headers(), json=two_message_payload)
+        assert res_missing.status_code == 502
+        assert res_missing.headers.get("cache-control") == "no-store"
+        assert res_missing.json()["error"]["code"] == ErrorCode.SCHEMA_VALIDATION_ERROR
+
+    # 2. Model cites >20 refs (M1..M21) and puts [M21] inline (dropped by 20-ref cap) -> 502 schema_validation_error
+    llm_dropped_by_cap = SimpleNamespace(
+        configured=True,
+        complete=AsyncMock(
+            return_value=json.dumps(
+                {
+                    "status": "ANSWERED",
+                    "answerText": "Hạng mục mở đầu [M1] và chốt cuối cùng [M21].",
+                    "citedRefIds": [f"M{i}" for i in range(1, 22)],
+                    "coverageNote": None,
+                },
+                ensure_ascii=False,
+            )
+        ),
+    )
+    app_cap_violation = _build_app(llm_dropped_by_cap)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app_cap_violation),
+        base_url="http://test",
+    ) as client:
+        res_cap_fail = await client.post(ENDPOINT, headers=_dm_headers(), json=twenty_one_message_payload)
+        assert res_cap_fail.status_code == 502
+        assert res_cap_fail.headers.get("cache-control") == "no-store"
+        assert res_cap_fail.json()["error"]["code"] == ErrorCode.SCHEMA_VALIDATION_ERROR
+
+    # 3. Model puts [M1] inline under ANSWERED with citedRefIds=[] -> 502 schema_validation_error
+    llm_inline_with_empty_cited = SimpleNamespace(
+        configured=True,
+        complete=AsyncMock(
+            return_value=json.dumps(
+                {
+                    "status": "ANSWERED",
+                    "answerText": "PAY-123 chốt deadline 29/11 [M1].",
+                    "citedRefIds": [],
+                    "coverageNote": None,
+                },
+                ensure_ascii=False,
+            )
+        ),
+    )
+    app_empty_cited = _build_app(llm_inline_with_empty_cited)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app_empty_cited),
+        base_url="http://test",
+    ) as client:
+        res_empty_cited = await client.post(ENDPOINT, headers=_dm_headers(), json=two_message_payload)
+        assert res_empty_cited.status_code == 502
+        assert res_empty_cited.headers.get("cache-control") == "no-store"
+        assert res_empty_cited.json()["error"]["code"] == ErrorCode.SCHEMA_VALIDATION_ERROR
+
+    # 4. Valid case: all inline [M1], [M2] are present in final citedRefIds -> 200 ANSWERED
+    llm_valid = SimpleNamespace(
+        configured=True,
+        complete=AsyncMock(
+            return_value=json.dumps(
+                {
+                    "status": "ANSWERED",
+                    "answerText": "Deadline 29/11 [M1] và deploy lúc 17:00 [M2].",
+                    "citedRefIds": ["M1", "M2"],
+                    "coverageNote": None,
+                },
+                ensure_ascii=False,
+            )
+        ),
+    )
+    app_valid = _build_app(llm_valid)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app_valid), base_url="http://test") as client:
+        res_valid = await client.post(ENDPOINT, headers=_dm_headers(), json=two_message_payload)
+        assert res_valid.status_code == 200
+        assert res_valid.headers.get("cache-control") == "no-store"
+        body_valid = res_valid.json()
+        assert body_valid["status"] == "ANSWERED"
+        assert body_valid["citedRefIds"] == ["M1", "M2"]
+
+    # 5. Valid cap boundary: 21 cited refs capped to M1..M20 while inline refs only use [M1] and [M20] -> 200 ANSWERED
+    llm_valid_cap = SimpleNamespace(
+        configured=True,
+        complete=AsyncMock(
+            return_value=json.dumps(
+                {
+                    "status": "ANSWERED",
+                    "answerText": "Đã tổng hợp các hạng mục từ [M1] đến [M20].",
+                    "citedRefIds": [f"M{i}" for i in range(1, 22)],
+                    "coverageNote": None,
+                },
+                ensure_ascii=False,
+            )
+        ),
+    )
+    app_valid_cap = _build_app(llm_valid_cap)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app_valid_cap), base_url="http://test") as client:
+        res_valid_cap = await client.post(ENDPOINT, headers=_dm_headers(), json=twenty_one_message_payload)
+        assert res_valid_cap.status_code == 200
+        body_cap = res_valid_cap.json()
+        assert body_cap["status"] == "ANSWERED"
+        assert body_cap["citedRefIds"] == [f"M{i}" for i in range(1, 21)]
 
 
 @pytest.mark.asyncio
@@ -1317,6 +1549,7 @@ def test_openapi_snapshot_matches_live_app_schema() -> None:
         assert schema_ref == "#/components/schemas/DmAssistantErrorEnvelopeOut", (
             f"Unexpected schema for {error_status}: {schema_ref}"
         )
+    assert "128 KiB" in responses["413"]["description"]
 
     assert snapshot == live_schema, (
         "SAG/docs/openapi/sag-api.openapi.json has drifted from create_app().openapi(). "

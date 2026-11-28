@@ -227,3 +227,37 @@ All facts below were verified directly against tracked source files on `origin/m
   - **Configuration:** **None.**
   - **Security & Privacy:** Eliminates unauthenticated JSON parsing / unbounded body buffering (`403`/`503` before reading body, `413` at `65_536` bytes), strips raw user input from all `422` validation responses, sanitizes all upstream LLM provider exceptions to fixed safe copy in both HTTP responses and logs, blocks mixed-prose JSON and fabricated inline `[M#]` citations (`502`), enforces deterministic `INSUFFICIENT_EVIDENCE` copy, and guarantees `Cache-Control: no-store` on all DM assistant responses.
   - **Rollback:** Revert the hardening commit on `feat/Thang-continuum-ai-dm-sag-be-api`; zero schema or migration rollback needed.
+
+---
+
+## 9. Codex Round 2 P2 Remediation (PR #92)
+
+### 9.1. Findings & Fixes
+1. **[P2 · 128 KiB HTTP Body Byte-Cap Aligned with BE UTF-8 Budget (`sag_api/api/v1/dm_assistant.py`):**
+   - 24,000 Vietnamese UTF-8 characters (up to 3 bytes/char) plus JSON metadata can legitimately reach ~95–112 KiB, exceeding the previous 64 KiB cap.
+   - Raised `DM_ASSISTANT_MAX_BODY_BYTES = 131_072` (128 KiB, coordinated with `DATN_BE`'s `<= 114_688` B / 112 KiB serialized UTF-8 JSON cap) and updated OpenAPI `413` documentation + error message.
+   - Retained both `Content-Length` pre-check and chunked streaming byte-counter returning `413 payload_too_large` + `Cache-Control: no-store` strictly before JSON parsing for payloads `> 131_072` bytes (while unauthenticated `> 131_072` byte requests still return `403 forbidden`).
+2. **[P2 · DM-Scoped Sanitized `422` Validation Handler (`sag_api/main.py`):**
+   - Scoped the custom sanitized `RequestValidationError` (`422`) handler strictly to `DM_ASSISTANT_ANSWER_PATH` (`/api/v1/internal/dm-assistant/answer`), returning the sanitized `{"error": {"code": "validation_error", ...}}` envelope without `input`/`ctx` plus `Cache-Control: no-store`.
+   - All other SAG routes delegate cleanly to FastAPI's built-in `await request_validation_exception_handler(request, exc)` so existing routes preserve their published `HTTPValidationError` (`{"detail": [...]}`) contract.
+3. **[P2 · Inline `[M#]` Strictly Bound to Final Returned `citedRefIds` (`sag_api/services/dm_assistant_service.py`):**
+   - Computed deduplicated, validated `final_cited_ref_ids = deduped_refs[:MAX_DM_CITED_REFS]` (capped at 20 refs) first on `ANSWERED` responses and enforced `_validate_inline_citations(answer_text, set(final_cited_ref_ids))` so every inline `[M#]` token in `answerText` MUST appear in the final returned `citedRefIds` (rejecting omitted or cap-truncated inline refs with `502 schema_validation_error`).
+   - Updated the system prompt instruction to match and preserved fabricated inline-ref rejection (`502`) under `INSUFFICIENT_EVIDENCE`.
+
+### 9.2. Round 2 Verification Results
+- **Changed Files (`6` files on `feat/Thang-continuum-ai-dm-sag-be-api`):**
+  - `SAG/apps/api/sag_api/api/v1/dm_assistant.py` — Raised `DM_ASSISTANT_MAX_BODY_BYTES` from `65_536` to `131_072` (128 KiB), unified `_BODY_TOO_LARGE_MESSAGE`, and updated OpenAPI `413` response description.
+  - `SAG/apps/api/sag_api/main.py` — Scoped the sanitized `RequestValidationError` (`422`) handler strictly to `DM_ASSISTANT_ANSWER_PATH` (with explicit `Cache-Control: no-store`) and delegated all other routes to `fastapi.exception_handlers.request_validation_exception_handler`.
+  - `SAG/apps/api/sag_api/services/dm_assistant_service.py` — Computed `final_cited_ref_ids = deduped_refs[:MAX_DM_CITED_REFS]` first and bound `_validate_inline_citations(answer_text, set(final_cited_ref_ids))` on `ANSWERED` outputs (rejecting omitted or 20-ref-cap-truncated inline `[M#]` tokens with `502 schema_validation_error`), while keeping fabricated inline ref rejection on `INSUFFICIENT_EVIDENCE` and tightening the system prompt contract.
+  - `SAG/docs/openapi/sag-api.openapi.json` — Regenerated from live `create_app().openapi()` (1-line sync on `413` description: `64 KiB` → `128 KiB`).
+  - `SAG/apps/api/tests/test_dm_assistant_api.py` — Updated 128 KiB body-cap tests (including ~92 KiB valid Vietnamese UTF-8 payload within 24,000 chars returning `200`, `> 131_072` B `Content-Length`/chunked returning `413`, and unauth `> 131_072` B returning `403`), added non-DM `POST /api/v1/auth/register` standard FastAPI `422` (`{"detail": [...]}`) preservation test, and added inline-to-final-`citedRefIds` binding tests (omitted `[M2]`, cap-truncated `[M21]`, empty `citedRefIds` with inline `[M1]`, valid `[M1]/[M2]`, and valid 20-ref cap boundary).
+  - `SAG/docs/Thang_Task/continuum-ai-dm-assistant/researchtask.md` — Recorded Codex Round 2 P2 remediation and verified outcomes.
+- **Checks Executed (`$env:UV_PROJECT_ENVIRONMENT='C:\Users\KAYT\.cache\sag-api-venv'`):**
+  - `uv run --no-sync ruff check sag_api tests` → **PASS** (`All checks passed!`, exit `0`)
+  - `uv run --no-sync pytest -q tests/test_dm_assistant_api.py tests/test_handover_assist.py` → **PASS** (`46 passed in 37.00s`, exit `0`)
+  - `uv run --no-sync pytest -q tests/test_dm_assistant_api.py tests/test_handover_assist.py tests/test_all_projects_chat_scope.py tests/test_answer_actions_api.py tests/test_branch_lineage_api.py tests/test_p2_conflicts_api.py` → **PASS** (`92 passed in 58.78s`, exit `0`)
+- **Database / Configuration / Security / Rollback Impact:**
+  - **Database / Migrations:** **None.**
+  - **Configuration:** **None.**
+  - **Security & Contract Parity:** Preserves pre-parser auth (`403`/`503`) and 128 KiB body cap (`413` + `Cache-Control: no-store`) while accommodating full 24,000-char Vietnamese UTF-8 payloads aligned with BE's 112 KiB budget; preserves standard FastAPI `HTTPValidationError` (`{"detail": [...]}`) on all legacy SAG routes while keeping DM `422` sanitized; guarantees every inline `[M#]` returned in `ANSWERED` `answerText` exists in the final returned `citedRefIds` (`<= 20` refs).
+  - **Rollback:** Revert the Round 2 commit on `feat/Thang-continuum-ai-dm-sag-be-api`; zero schema or migration rollback needed.
