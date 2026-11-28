@@ -110,6 +110,13 @@ class ValidationError(ApiError):
     code = ErrorCode.VALIDATION_ERROR
 
 
+class PayloadTooLargeError(ApiError):
+    """请求体大小超过上限（HTTP 413）。"""
+
+    status_code = 413
+    code = ErrorCode.PAYLOAD_TOO_LARGE
+
+
 class AuthError(ApiError):
     """未认证或凭证无效。"""
 

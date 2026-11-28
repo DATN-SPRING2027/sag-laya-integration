@@ -47,6 +47,9 @@ class ErrorCode(StrEnum):
     VALIDATION_ERROR = "validation_error"
     """输入参数校验失败（422）。"""
 
+    PAYLOAD_TOO_LARGE = "payload_too_large"
+    """请求体大小超过上限（413）。"""
+
     UNAUTHORIZED = "unauthorized"
     """未认证或凭证无效（401）。"""
 

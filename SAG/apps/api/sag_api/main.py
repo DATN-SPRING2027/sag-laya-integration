@@ -9,11 +9,14 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from sag_api import __version__
 from sag_api.api.v1 import api_router
+from sag_api.api.v1.dm_assistant import DM_ASSISTANT_ANSWER_PATH, DmAssistantGuardMiddleware
 from sag_api.branding import PRODUCT_NAME
 from sag_api.core.config import _INSECURE_SECRETS, settings
 from sag_api.core.db import SessionLocal, dispose_db, init_db
@@ -138,6 +141,7 @@ def create_app() -> FastAPI:
             r"172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}"
             r")(:\d+)?"
         )
+    app.add_middleware(DmAssistantGuardMiddleware)
     app.add_middleware(CORSMiddleware, **cors_kwargs)
     # 请求追踪（放在 CORS 之后添加 → 更外层执行，最先分配 request_id）
     app.add_middleware(RequestContextMiddleware)
@@ -148,6 +152,39 @@ def create_app() -> FastAPI:
         return JSONResponse(
             status_code=exc.status_code,
             content=exc.to_envelope(request_id=request_id),
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def _handle_request_validation_error(
+        request: Request,
+        exc: RequestValidationError,
+    ) -> JSONResponse:
+        if request.url.path.rstrip("/") != DM_ASSISTANT_ANSWER_PATH:
+            return await request_validation_exception_handler(request, exc)
+
+        request_id = getattr(request.state, "request_id", None)
+        fields: list[dict[str, object]] = []
+        for err in exc.errors()[:20]:
+            raw_loc = err.get("loc", ())
+            loc = [part if isinstance(part, (str, int)) else str(part) for part in raw_loc]
+            err_type = str(err.get("type") or "validation_error")
+            raw_msg = str(err.get("msg") or "Invalid request field")
+            msg = raw_msg if len(raw_msg) <= 200 else raw_msg[:199].rstrip() + "…"
+            fields.append({"loc": loc, "type": err_type, "msg": msg})
+        error: dict[str, object] = {
+            "code": ErrorCode.VALIDATION_ERROR,
+            "message": "Request validation failed",
+            "layer": ErrorLayer.API.value,
+            "stage": ErrorStage.UNKNOWN.value,
+            "retryable": False,
+            "fields": fields,
+        }
+        if request_id:
+            error["request_id"] = request_id
+        return JSONResponse(
+            status_code=422,
+            content={"error": error},
+            headers={"Cache-Control": "no-store"},
         )
 
     @app.exception_handler(Exception)

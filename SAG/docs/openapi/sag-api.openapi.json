@@ -1573,6 +1573,312 @@
         "title": "DifyRetrievalSetting",
         "type": "object"
       },
+      "DmAssistantAnswerRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "coverageHint": {
+            "anyOf": [
+              {
+                "maxLength": 500,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Coveragehint"
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/DmAssistantMessageInput"
+            },
+            "maxItems": 80,
+            "title": "Messages",
+            "type": "array"
+          },
+          "partialCoverage": {
+            "default": false,
+            "title": "Partialcoverage",
+            "type": "boolean"
+          },
+          "queryMode": {
+            "enum": [
+              "TIME_WINDOW",
+              "KEYWORD",
+              "HYBRID"
+            ],
+            "title": "Querymode",
+            "type": "string"
+          },
+          "question": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Question",
+            "type": "string"
+          },
+          "referenceNowIso": {
+            "format": "date-time",
+            "title": "Referencenowiso",
+            "type": "string"
+          },
+          "timezone": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Timezone",
+            "type": "string"
+          }
+        },
+        "required": [
+          "question",
+          "timezone",
+          "referenceNowIso",
+          "queryMode",
+          "messages"
+        ],
+        "title": "DmAssistantAnswerRequest",
+        "type": "object"
+      },
+      "DmAssistantAnswerResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "answerText": {
+            "maxLength": 4000,
+            "minLength": 1,
+            "title": "Answertext",
+            "type": "string"
+          },
+          "citedRefIds": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 20,
+            "title": "Citedrefids",
+            "type": "array"
+          },
+          "coverageNote": {
+            "anyOf": [
+              {
+                "maxLength": 500,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Coveragenote"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "status": {
+            "enum": [
+              "ANSWERED",
+              "INSUFFICIENT_EVIDENCE"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/DmAssistantUsageOut"
+          }
+        },
+        "required": [
+          "status",
+          "answerText",
+          "usage"
+        ],
+        "title": "DmAssistantAnswerResponse",
+        "type": "object"
+      },
+      "DmAssistantErrorDetailOut": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "fields": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/DmAssistantErrorFieldOut"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fields"
+          },
+          "layer": {
+            "title": "Layer",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "request_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request Id"
+          },
+          "retryable": {
+            "title": "Retryable",
+            "type": "boolean"
+          },
+          "stage": {
+            "title": "Stage",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "layer",
+          "stage",
+          "retryable"
+        ],
+        "title": "DmAssistantErrorDetailOut",
+        "type": "object"
+      },
+      "DmAssistantErrorEnvelopeOut": {
+        "additionalProperties": false,
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/DmAssistantErrorDetailOut"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "title": "DmAssistantErrorEnvelopeOut",
+        "type": "object"
+      },
+      "DmAssistantErrorFieldOut": {
+        "additionalProperties": false,
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Loc",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Msg",
+            "type": "string"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "type",
+          "msg"
+        ],
+        "title": "DmAssistantErrorFieldOut",
+        "type": "object"
+      },
+      "DmAssistantMessageInput": {
+        "additionalProperties": false,
+        "properties": {
+          "refId": {
+            "maxLength": 4,
+            "minLength": 2,
+            "pattern": "^M[1-9][0-9]{0,2}$",
+            "title": "Refid",
+            "type": "string"
+          },
+          "senderLabel": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Senderlabel",
+            "type": "string"
+          },
+          "sentAtIso": {
+            "format": "date-time",
+            "title": "Sentatiso",
+            "type": "string"
+          },
+          "text": {
+            "maxLength": 1200,
+            "minLength": 1,
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "refId",
+          "senderLabel",
+          "sentAtIso",
+          "text"
+        ],
+        "title": "DmAssistantMessageInput",
+        "type": "object"
+      },
+      "DmAssistantUsageOut": {
+        "additionalProperties": false,
+        "properties": {
+          "cachedTokens": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Cachedtokens",
+            "type": "integer"
+          },
+          "calls": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Calls",
+            "type": "integer"
+          },
+          "inputTokens": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Inputtokens",
+            "type": "integer"
+          },
+          "outputTokens": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Outputtokens",
+            "type": "integer"
+          },
+          "totalTokens": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Totaltokens",
+            "type": "integer"
+          }
+        },
+        "title": "DmAssistantUsageOut",
+        "type": "object"
+      },
       "DocumentExtractedChunkItem": {
         "properties": {
           "block_type": {
@@ -11465,6 +11771,153 @@
         ]
       }
     },
+    "/api/v1/internal/dm-assistant/answer": {
+      "post": {
+        "operationId": "answer_dm_question_api_v1_internal_dm_assistant_answer_post",
+        "parameters": [
+          {
+            "description": "Continuum BFF service-to-service shared secret token.",
+            "in": "header",
+            "name": "X-SAG-BFF-Service-Token",
+            "required": true,
+            "schema": {
+              "description": "Continuum BFF service-to-service shared secret token.",
+              "minLength": 1,
+              "title": "X-Sag-Bff-Service-Token",
+              "type": "string"
+            }
+          },
+          {
+            "description": "24-hex Continuum organization ObjectId.",
+            "in": "header",
+            "name": "X-Continuum-Organization-Id",
+            "required": true,
+            "schema": {
+              "description": "24-hex Continuum organization ObjectId.",
+              "maxLength": 24,
+              "minLength": 24,
+              "pattern": "^[a-fA-F0-9]{24}$",
+              "title": "X-Continuum-Organization-Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "24-hex Continuum requesting user ObjectId.",
+            "in": "header",
+            "name": "X-Continuum-User-Id",
+            "required": true,
+            "schema": {
+              "description": "24-hex Continuum requesting user ObjectId.",
+              "maxLength": 24,
+              "minLength": 24,
+              "pattern": "^[a-fA-F0-9]{24}$",
+              "title": "X-Continuum-User-Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "24-hex Continuum 1-on-1 DM conversation ObjectId.",
+            "in": "header",
+            "name": "X-Continuum-Conversation-Id",
+            "required": true,
+            "schema": {
+              "description": "24-hex Continuum 1-on-1 DM conversation ObjectId.",
+              "maxLength": 24,
+              "minLength": 24,
+              "pattern": "^[a-fA-F0-9]{24}$",
+              "title": "X-Continuum-Conversation-Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DmAssistantAnswerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DmAssistantAnswerResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DmAssistantErrorEnvelopeOut"
+                }
+              }
+            },
+            "description": "Unsupported query parameters, invalid Content-Length, or unconfigured LLM provider."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DmAssistantErrorEnvelopeOut"
+                }
+              }
+            },
+            "description": "Missing or invalid X-SAG-BFF-Service-Token or required 24-hex Continuum context headers."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DmAssistantErrorEnvelopeOut"
+                }
+              }
+            },
+            "description": "Request body exceeds the 128 KiB hard HTTP byte limit."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DmAssistantErrorEnvelopeOut"
+                }
+              }
+            },
+            "description": "Request payload failed schema validation (sanitized envelope without echoed input values)."
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DmAssistantErrorEnvelopeOut"
+                }
+              }
+            },
+            "description": "Upstream LLM returned empty, malformed, non-JSON, or fabricated-citation output."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DmAssistantErrorEnvelopeOut"
+                }
+              }
+            },
+            "description": "Service token authentication is not configured or the upstream LLM provider is temporarily unavailable."
+          }
+        },
+        "summary": "Synthesize a grounded answer strictly from Continuum-supplied 1-on-1 DM excerpts",
+        "tags": [
+          "dm-assistant"
+        ]
+      }
+    },
     "/api/v1/jobs/{job_id}": {
       "get": {
         "operationId": "get_job_api_v1_jobs__job_id__get",
@@ -13945,7 +14398,7 @@
     },
     "/api/v1/sources/{source_id}/documents/{document_id}/file": {
       "get": {
-        "description": "Original file (preview/download). Returns 404 when file has been cleaned up.",
+        "description": "Original file download. Always forces attachment + safe MIME for active content.",
         "operationId": "get_file_api_v1_sources__source_id__documents__document_id__file_get",
         "parameters": [
           {
@@ -14260,7 +14713,7 @@
     },
     "/api/v1/sources/{source_id}/documents/{document_id}/preview": {
       "get": {
-        "description": "Return preview directly consumable by browser; text is normalized to UTF-8 while download preserves raw bytes.",
+        "description": "Return preview directly consumable by browser; text is normalized to UTF-8 while active content is forced to safe attachment.",
         "operationId": "get_preview_api_v1_sources__source_id__documents__document_id__preview_get",
         "parameters": [
           {
